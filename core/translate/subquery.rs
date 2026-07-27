@@ -139,6 +139,10 @@ fn count_shared_cte_references_in_plan(counts: &mut HashMap<usize, usize>, plan:
                 &right_most.non_from_clause_subqueries,
             );
         }
+        Plan::RecursiveCte(recursive_cte) => {
+            count_shared_cte_references_in_plan(counts, &recursive_cte.initial_query);
+            count_shared_cte_references_in_plan(counts, &recursive_cte.recursive_query);
+        }
         Plan::Delete(_) | Plan::Update(_) => {}
     }
 }
@@ -168,6 +172,10 @@ pub(crate) fn mark_shared_cte_materialization_requirements(
                     &mut right_most.table_references,
                     &mut right_most.non_from_clause_subqueries,
                 );
+            }
+            Plan::RecursiveCte(recursive_cte) => {
+                annotate_plan(&mut recursive_cte.initial_query);
+                annotate_plan(&mut recursive_cte.recursive_query);
             }
             Plan::Delete(_) | Plan::Update(_) => {}
         }
@@ -1144,6 +1152,10 @@ fn update_column_used_masks(
                 }
                 propagate_outer_refs_from_select_plan(table_refs, right_most)?;
             }
+            Plan::RecursiveCte(recursive_cte) => {
+                propagate_outer_refs_from_plan(table_refs, &recursive_cte.initial_query)?;
+                propagate_outer_refs_from_plan(table_refs, &recursive_cte.recursive_query)?;
+            }
             Plan::Delete(_) | Plan::Update(_) => {
                 return Err(crate::LimboError::InternalError(
                     "DELETE/UPDATE plans should not appear in FROM clause subqueries".into(),
@@ -1206,6 +1218,10 @@ fn pre_materialize_multi_ref_ctes(
                 pre_materialize_multi_ref_ctes_in_select_plan(program, select_plan, t_ctx)?;
             }
             pre_materialize_multi_ref_ctes_in_select_plan(program, right_most, t_ctx)?;
+        }
+        Plan::RecursiveCte(recursive_cte) => {
+            pre_materialize_multi_ref_ctes(program, &mut recursive_cte.initial_query, t_ctx)?;
+            pre_materialize_multi_ref_ctes(program, &mut recursive_cte.recursive_query, t_ctx)?;
         }
         Plan::Delete(_) | Plan::Update(_) => {}
     }
@@ -1401,7 +1417,9 @@ pub fn emit_from_clause_subqueries(
                                 format!("SCAN {table_name}")
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
+                        Scan::VirtualTable { .. }
+                        | Scan::Subquery { .. }
+                        | Scan::RecursiveCteInput => {
                             format!("SCAN {table_name}")
                         }
                     }
@@ -1689,6 +1707,9 @@ pub fn emit_from_clause_subquery(
                 emit_program_for_compound_select(program, &resolver, plan_clone)?
                     .expect("compound CTE in coroutine mode must have result register")
             }
+            Plan::RecursiveCte(recursive_cte) => {
+                super::recursive_cte::emit_recursive_cte(program, &t_ctx.resolver, recursive_cte)?
+            }
             Plan::Delete(_) | Plan::Update(_) => {
                 unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
             }
@@ -1773,6 +1794,9 @@ fn emit_indexed_materialized_subquery(
             let plan_clone = plan.clone();
             let resolver = t_ctx.resolver.fork();
             emit_program_for_compound_select(program, &resolver, plan_clone)?;
+        }
+        Plan::RecursiveCte(_) => {
+            unreachable!("recursive CTEs require table-backed materialization for indexed access")
         }
         Plan::Delete(_) | Plan::Update(_) => {
             unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
@@ -1869,6 +1893,9 @@ fn emit_materialized_subquery_table(
             let plan_clone = plan.clone();
             let resolver = t_ctx.resolver.fork();
             emit_program_for_compound_select(program, &resolver, plan_clone)?;
+        }
+        Plan::RecursiveCte(recursive_cte) => {
+            super::recursive_cte::emit_recursive_cte(program, &t_ctx.resolver, recursive_cte)?;
         }
         Plan::Delete(_) | Plan::Update(_) => {
             unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")

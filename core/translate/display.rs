@@ -61,7 +61,7 @@ pub(crate) fn format_eqp_detail(table: &JoinedTable) -> String {
                         format!("SCAN {table_name}")
                     }
                 }
-                Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
+                Scan::VirtualTable { .. } | Scan::Subquery { .. } | Scan::RecursiveCteInput => {
                     format!("SCAN {table_name}")
                 }
             }
@@ -228,6 +228,13 @@ impl Display for Plan {
                 }
                 Ok(())
             }
+            Self::RecursiveCte(plan) => {
+                writeln!(f, "RECURSIVE CTE {}", plan.name)?;
+                writeln!(f, "INITIAL QUERY:")?;
+                plan.initial_query.fmt(f)?;
+                writeln!(f, "RECURSIVE QUERY:")?;
+                plan.recursive_query.fmt(f)
+            }
             Self::Delete(delete_plan) => delete_plan.fmt(f),
             Self::Update(update_plan) => update_plan.fmt(f),
         }
@@ -280,7 +287,9 @@ impl Display for SelectPlan {
                                 writeln!(f, "{indent}SCAN {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
+                        Scan::VirtualTable { .. }
+                        | Scan::Subquery { .. }
+                        | Scan::RecursiveCteInput => {
                             writeln!(f, "{indent}SCAN {table_name}")?;
                         }
                     }
@@ -403,7 +412,9 @@ impl Display for DeletePlan {
                                 writeln!(f, "{indent}DELETE FROM {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
+                        Scan::VirtualTable { .. }
+                        | Scan::Subquery { .. }
+                        | Scan::RecursiveCteInput => {
                             writeln!(f, "{indent}DELETE FROM {table_name}")?;
                         }
                     }
@@ -529,7 +540,9 @@ impl fmt::Display for UpdatePlan {
                                 writeln!(f, "{indent}{action} {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
+                        Scan::VirtualTable { .. }
+                        | Scan::Subquery { .. }
+                        | Scan::RecursiveCteInput => {
                             if i == 0 {
                                 writeln!(f, "{indent}UPDATE {table_name}")?;
                             } else {
@@ -692,6 +705,15 @@ impl ToTokens for Plan {
                     s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
                 }
             }
+            Self::RecursiveCte(plan) => {
+                plan.initial_query.to_tokens(s, context)?;
+                if plan.union_all {
+                    ast::CompoundOperator::UnionAll.to_tokens(s, context)?;
+                } else {
+                    ast::CompoundOperator::Union.to_tokens(s, context)?;
+                }
+                plan.recursive_query.to_tokens(s, context)?;
+            }
             Self::Delete(delete) => delete.to_tokens(s, context)?,
             Self::Update(update) => update.to_tokens(s, context)?,
         }
@@ -713,7 +735,7 @@ impl ToTokens for JoinedTable {
         _context: &C,
     ) -> Result<(), S::Error> {
         match &self.table {
-            Table::BTree(..) | Table::Virtual(..) => {
+            Table::BTree(..) | Table::Virtual(..) | Table::RecursiveCteInput(..) => {
                 let name = self.table.get_name();
                 s.append(TokenType::TK_ID, Some(name))?;
                 if self.identifier != name {

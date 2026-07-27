@@ -1,7 +1,7 @@
 use crate::translate::emitter::TranslateCtx;
 use crate::translate::expr::{translate_expr_no_constant_opt, NoConstantOptReason};
 use crate::translate::plan::{QueryDestination, SelectPlan};
-use crate::translate::result_row::emit_offset;
+use crate::translate::result_row::{emit_columns_to_destination, emit_offset};
 use crate::turso_assert_eq;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::{to_u16, IdxInsertFlags, InsertFlags, Insn};
@@ -25,6 +25,7 @@ pub fn emit_values(
         }
         QueryDestination::EphemeralIndex { .. } => emit_toplevel_values(program, plan, t_ctx)?,
         QueryDestination::EphemeralTable { .. } => emit_toplevel_values(program, plan, t_ctx)?,
+        QueryDestination::RecursiveCteQueue { .. } => emit_toplevel_values(program, plan, t_ctx)?,
         QueryDestination::ExistsSubqueryResult { result_reg } => {
             program.emit_insn(Insn::Integer {
                 value: 1,
@@ -206,6 +207,9 @@ fn emit_values_to_destination(
         }
         QueryDestination::EphemeralTable { .. } => {
             emit_values_to_table(program, plan, start_reg, row_len);
+        }
+        destination @ QueryDestination::RecursiveCteQueue { .. } => {
+            emit_columns_to_destination(program, destination, start_reg, row_len)?;
         }
         QueryDestination::ExistsSubqueryResult { result_reg } => {
             program.emit_insn(Insn::Integer {

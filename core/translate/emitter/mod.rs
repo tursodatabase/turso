@@ -1071,6 +1071,10 @@ pub fn emit_program(
         Plan::CompoundSelect { .. } => {
             emit_program_for_compound_select(program, resolver, plan).map(|_| ())
         }
+        Plan::RecursiveCte(mut recursive_cte) => {
+            super::recursive_cte::emit_recursive_cte(program, resolver, &mut recursive_cte)
+                .map(|_| ())
+        }
     }
 }
 

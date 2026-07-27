@@ -166,6 +166,7 @@ pub fn emit_program_for_compound_select(
     let reg_result_cols_start = match &query_destination {
         QueryDestination::CoroutineYield { .. }
         | QueryDestination::EphemeralTable { .. }
+        | QueryDestination::RecursiveCteQueue { .. }
         | QueryDestination::EphemeralIndex { .. } => Some(program.alloc_registers(num_result_cols)),
         QueryDestination::ResultRows => None,
         other => {
@@ -198,7 +199,7 @@ pub fn emit_program_for_compound_select(
     // to write to the collection index instead of ResultRows.
     let mut plan = plan;
     if has_order_by {
-        set_compound_plan_destinations(&mut plan, &query_destination);
+        set_select_plan_destination(&mut plan, &query_destination);
     }
 
     program.with_scoped_result_cols_start(|program| {
@@ -290,6 +291,7 @@ fn emit_compound_select(
                     QueryDestination::EphemeralIndex { .. }
                         | QueryDestination::CoroutineYield { .. }
                         | QueryDestination::EphemeralTable { .. }
+                        | QueryDestination::RecursiveCteQueue { .. }
                 ) {
                     plan.query_destination = right_most.query_destination.clone();
                 }
@@ -740,22 +742,24 @@ fn read_intersect_rows(
     Ok(())
 }
 
-/// Recursively sets the query_destination of all SelectPlans within a CompoundSelect.
-/// This ensures UNION ALL subselects write to the collection index instead of ResultRows.
-fn set_compound_plan_destinations(plan: &mut Plan, dest: &QueryDestination) {
+/// Sets where a SELECT plan writes its rows, including each query in a compound SELECT.
+pub(crate) fn set_select_plan_destination(plan: &mut Plan, destination: &QueryDestination) {
     match plan {
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
             for (subplan, _) in left.iter_mut() {
-                subplan.query_destination = dest.clone();
+                subplan.query_destination = destination.clone();
             }
-            right_most.query_destination = dest.clone();
+            right_most.query_destination = destination.clone();
         }
         Plan::Select(select_plan) => {
-            select_plan.query_destination = dest.clone();
+            select_plan.query_destination = destination.clone();
         }
-        _ => {}
+        Plan::RecursiveCte(plan) => plan.query_destination = destination.clone(),
+        Plan::Delete(_) | Plan::Update(_) => {
+            unreachable!("only SELECT plans have query destinations")
+        }
     }
 }
 
