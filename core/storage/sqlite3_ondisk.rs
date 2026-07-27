@@ -1298,37 +1298,84 @@ pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
     }
 }
 
+/// Per-byte continuation flags of a SQLite varint (high bit of each byte).
+const VARINT_CONT_MASK: u64 = 0x8080_8080_8080_8080;
+/// Per-byte payload bits of a SQLite varint (low 7 bits of each byte).
+const VARINT_DATA_MASK: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+
+/// Fold 7-bit groups packed one per byte (least significant group in byte 0,
+/// every byte `<= 0x7f`) into one contiguous integer.
+#[inline(always)]
+fn fold_varint_groups(x: u64) -> u64 {
+    let x = ((x & 0x7f00_7f00_7f00_7f00) >> 1) | (x & 0x007f_007f_007f_007f);
+    let x = ((x & 0x3fff_0000_3fff_0000) >> 2) | (x & 0x0000_3fff_0000_3fff);
+    ((x & 0x0fff_ffff_0000_0000) >> 4) | (x & 0x0000_0000_0fff_ffff)
+}
+
+/// Decode a varint of 1-8 bytes from an 8-byte little-endian window, or
+/// return `None` when all 8 bytes carry continuation bits (a 9-byte varint;
+/// the caller must consume the 9th byte).
+///
+/// The word trick replaces the byte-at-a-time loop, whose data-dependent exit
+/// branch mispredicts on the mixed varint lengths found in record headers:
+/// the length falls out of one `trailing_zeros`, and the value is assembled
+/// branch-free by reversing the on-disk big-endian group order with a byte
+/// swap and folding the 8-bit-spaced groups down to 7-bit spacing.
+#[inline(always)]
+fn decode_varint_window(word: u64) -> Option<(u64, usize)> {
+    let stops = !word & VARINT_CONT_MASK;
+    if stops == 0 {
+        return None;
+    }
+    let len = stops.trailing_zeros() as usize / 8 + 1;
+    let x = (word & VARINT_DATA_MASK).swap_bytes() >> (8 * (8 - len));
+    Some((fold_varint_groups(x), len))
+}
+
+/// Complete a 9-byte varint: `word` holds the first 8 bytes (all with
+/// continuation bits), `c` is the 9th byte, which contributes all 8 bits.
+#[inline(always)]
+fn complete_varint9(word: u64, c: u8) -> Result<(u64, usize)> {
+    let v = fold_varint_groups((word & VARINT_DATA_MASK).swap_bytes());
+    // Values requiring 9 bytes must have non-zero in the top 8 bits (value >= 1<<56).
+    // Since the final value is `(v<<8) + c`, the top 8 bits (v >> 48) must not be 0.
+    // If those are zero, this should be treated as corrupt.
+    // Perf? the comparison + branching happens only in parsing 9-byte varint which is rare.
+    if unlikely((v >> 48) == 0) {
+        bail_corrupt_error!("Invalid varint");
+    }
+    Ok(((v << 8) + c as u64, 9))
+}
+
+/// Scalar decode for buffers shorter than a full 8-byte window (typically the
+/// tail of a record header). Buffers this short can never hold a 9-byte
+/// varint, so running out of bytes before a terminator is corruption.
+fn read_varint_short(buf: &[u8]) -> Result<(u64, usize)> {
+    debug_assert!(buf.len() < 8);
+    let mut v: u64 = 0;
+    for (i, &c) in buf.iter().enumerate() {
+        v = (v << 7) + (c & 0x7f) as u64;
+        if (c & 0x80) == 0 {
+            return Ok((v, i + 1));
+        }
+    }
+    mark_unlikely();
+    bail_corrupt_error!("Invalid varint")
+}
+
 /// Reads varint integer from the buffer.
 /// This function is similar to `sqlite3GetVarint32`
 #[inline(always)]
 pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
-    let mut v: u64 = 0;
-    for i in 0..8 {
-        match buf.get(i) {
-            Some(c) => {
-                v = (v << 7) + (c & 0x7f) as u64;
-                if (c & 0x80) == 0 {
-                    return Ok((v, i + 1));
-                }
-            }
-            None => {
-                mark_unlikely();
-                crate::bail_corrupt_error!("Invalid varint");
-            }
-        }
+    let Some(window) = buf.first_chunk::<8>() else {
+        return read_varint_short(buf);
+    };
+    let word = u64::from_le_bytes(*window);
+    if let Some(decoded) = decode_varint_window(word) {
+        return Ok(decoded);
     }
     match buf.get(8) {
-        Some(&c) => {
-            // Values requiring 9 bytes must have non-zero in the top 8 bits (value >= 1<<56).
-            // Since the final value is `(v<<8) + c`, the top 8 bits (v >> 48) must not be 0.
-            // If those are zero, this should be treated as corrupt.
-            // Perf? the comparison + branching happens only in parsing 9-byte varint which is rare.
-            if unlikely((v >> 48) == 0) {
-                bail_corrupt_error!("Invalid varint");
-            }
-            v = (v << 8) + c as u64;
-            Ok((v, 9))
-        }
+        Some(&c) => complete_varint9(word, c),
         None => {
             mark_unlikely();
             bail_corrupt_error!("Invalid varint");
@@ -1339,24 +1386,26 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
 #[inline(always)]
 /// Reads a varint from the buffer, returning None if more data is needed.
 pub fn read_varint_partial(buf: &[u8]) -> Result<Option<(u64, usize)>> {
-    let mut v: u64 = 0;
-    for i in 0..8 {
-        let Some(&c) = buf.get(i) else {
-            return Ok(None);
-        };
-        v = (v << 7) + (c & 0x7f) as u64;
-        if (c & 0x80) == 0 {
-            return Ok(Some((v, i + 1)));
+    let Some(window) = buf.first_chunk::<8>() else {
+        // Short buffer: decode what is there; running out of bytes before a
+        // terminator means more data is needed.
+        let mut v: u64 = 0;
+        for (i, &c) in buf.iter().enumerate() {
+            v = (v << 7) + (c & 0x7f) as u64;
+            if (c & 0x80) == 0 {
+                return Ok(Some((v, i + 1)));
+            }
         }
-    }
-    let Some(&c) = buf.get(8) else {
         return Ok(None);
     };
-    if unlikely((v >> 48) == 0) {
-        bail_corrupt_error!("Invalid varint");
+    let word = u64::from_le_bytes(*window);
+    if let Some(decoded) = decode_varint_window(word) {
+        return Ok(Some(decoded));
     }
-    v = (v << 8) + c as u64;
-    Ok(Some((v, 9)))
+    match buf.get(8) {
+        Some(&c) => complete_varint9(word, c).map(Some),
+        None => Ok(None),
+    }
 }
 
 /// Compute the length of a varint encoding for a given u64 value.
@@ -2333,6 +2382,114 @@ mod tests {
     #[case(&[0x80; 9])] // bits set without end
     fn test_read_varint_malformed_inputs(#[case] buf: &[u8]) {
         assert!(read_varint(buf).is_err());
+    }
+
+    /// Byte-at-a-time reference decoder: the implementation `read_varint`
+    /// used before the word-at-a-time rewrite, kept as its specification.
+    fn read_varint_reference(buf: &[u8]) -> Option<(u64, usize)> {
+        let mut v: u64 = 0;
+        for i in 0..8 {
+            let c = *buf.get(i)?;
+            v = (v << 7) + (c & 0x7f) as u64;
+            if (c & 0x80) == 0 {
+                return Some((v, i + 1));
+            }
+        }
+        let c = *buf.get(8)?;
+        if (v >> 48) == 0 {
+            return None; // non-canonical 9-byte encoding is corrupt
+        }
+        Some(((v << 8) + c as u64, 9))
+    }
+
+    fn assert_varint_matches_reference(buf: &[u8]) {
+        let expected = read_varint_reference(buf);
+        assert_eq!(
+            read_varint(buf).ok(),
+            expected,
+            "read_varint mismatch on {buf:02x?}"
+        );
+        // read_varint_partial must agree whenever the buffer is complete;
+        // its None-vs-error split for incomplete input is checked separately.
+        if let Some(decoded) = expected {
+            assert_eq!(
+                read_varint_partial(buf).unwrap(),
+                Some(decoded),
+                "read_varint_partial mismatch on {buf:02x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_varint_differential_vs_reference() {
+        // Exhaustive 1- and 2-byte buffers
+        for a in 0..=255u8 {
+            assert_varint_matches_reference(&[a]);
+            for b in 0..=255u8 {
+                assert_varint_matches_reference(&[a, b]);
+            }
+        }
+        // Every length 1-9: all-continuation prefix, terminator at position k
+        for k in 0..12usize {
+            let mut buf = [0xffu8; 12];
+            buf[k] &= 0x7f;
+            for len in 0..=12 {
+                assert_varint_matches_reference(&buf[..len]);
+            }
+        }
+        // Non-canonical 9-byte encodings (leading zero groups) are corrupt
+        let mut buf = [0x80u8; 9];
+        buf[8] = 0x01;
+        assert!(read_varint(&buf).is_err());
+        assert!(read_varint_partial(&buf).is_err());
+        // Deterministic pseudo-random buffers (LCG), all truncations
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for _ in 0..50_000 {
+            let mut buf = [0u8; 12];
+            for byte in buf.iter_mut() {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *byte = (state >> 33) as u8;
+            }
+            for len in 0..=12 {
+                assert_varint_matches_reference(&buf[..len]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_read_varint_round_trip() {
+        let mut values = vec![0u64, 1, 127, 128, 129, 240, 255, 16383, 16384, u64::MAX];
+        for shift in 7..64 {
+            let v = 1u64 << shift;
+            values.extend([v - 1, v, v + 1]);
+        }
+        for &v in &values {
+            let mut buf = [0u8; 9];
+            let n = write_varint(&mut buf, v);
+            assert_eq!(read_varint(&buf[..n]).unwrap(), (v, n), "value {v}");
+            assert_eq!(
+                read_varint_partial(&buf[..n]).unwrap(),
+                Some((v, n)),
+                "value {v}"
+            );
+            // Trailing garbage after the varint must not affect the decode
+            let mut extended = [0xaau8; 12];
+            extended[..n].copy_from_slice(&buf[..n]);
+            assert_eq!(read_varint(&extended).unwrap(), (v, n), "value {v}");
+            // Every strict prefix is incomplete: an error for read_varint and
+            // None for read_varint_partial (no prefix of a canonical varint
+            // reaches the 9-byte corruption check).
+            for cut in 0..n {
+                assert!(read_varint(&buf[..cut]).is_err(), "value {v} cut {cut}");
+                assert_eq!(
+                    read_varint_partial(&buf[..cut]).unwrap(),
+                    None,
+                    "value {v} cut {cut}"
+                );
+            }
+        }
     }
 
     #[test]
