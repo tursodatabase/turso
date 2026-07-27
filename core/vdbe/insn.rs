@@ -1083,10 +1083,9 @@ pub enum Insn {
         collation: Option<CollationSeq>,
     },
 
-    /// Mirror-image of AggStep: fires when a row crosses the frame-start
-    /// cursor on its way out of the frame. The runtime arm undoes the
-    /// matching xStep — sum subtracts, count decrements, position
-    /// counters advance.
+    /// Mirror-image of AggStep. Retracts a previously stepped aggregate
+    /// input, or advances a window function when a row crosses the
+    /// frame-start cursor.
     AggInverse {
         acc_reg: usize,
         col: usize,
