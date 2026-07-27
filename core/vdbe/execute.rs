@@ -8031,6 +8031,9 @@ pub fn op_function(
                 }
             }
             JsonFunc::JsonReplace => {
+                if arg_count % 2 == 0 {
+                    bail_constraint_error!("json_replace() needs an odd number of arguments")
+                }
                 if let Ok(json) = json_replace(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
@@ -8041,6 +8044,9 @@ pub fn op_function(
                 }
             }
             JsonFunc::JsonbReplace => {
+                if arg_count % 2 == 0 {
+                    bail_constraint_error!("json_replace() needs an odd number of arguments")
+                }
                 if let Ok(json) = jsonb_replace(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
@@ -8051,6 +8057,9 @@ pub fn op_function(
                 }
             }
             JsonFunc::JsonInsert => {
+                if arg_count % 2 == 0 {
+                    bail_constraint_error!("json_insert() needs an odd number of arguments")
+                }
                 if let Ok(json) = json_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
@@ -8061,6 +8070,9 @@ pub fn op_function(
                 }
             }
             JsonFunc::JsonbInsert => {
+                if arg_count % 2 == 0 {
+                    bail_constraint_error!("json_insert() needs an odd number of arguments")
+                }
                 if let Ok(json) = jsonb_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
