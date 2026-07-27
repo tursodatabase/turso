@@ -91,12 +91,29 @@ Starlark is deterministic by design: a function body has no access to ambient st
 
 The classification is used for optimization: a deterministic UDF called with constant arguments is evaluated **once per statement** rather than once per row, and deterministic UDFs are eligible for the same repeated-expression sharing as deterministic built-ins. A body that calls `random()` or `datetime('now')` (directly or through another UDF) is evaluated on every row, like the built-ins themselves.
 
+## Expression indexes
+
+Deterministic functions can be used in expression indexes and in the `WHERE` clause of partial indexes:
+
+```sql
+CREATE FUNCTION double(x INTEGER) RETURNS INTEGER
+LANGUAGE starlark AS 'return x * 2';
+
+CREATE TABLE t(x INTEGER);
+CREATE INDEX i_double ON t(double(x));
+
+SELECT x FROM t WHERE double(x) = 14;  -- uses i_double
+```
+
+Because such an index stores values computed with the function's current body, a function that any index depends on (directly or through other functions it calls) cannot be dropped or replaced; drop the index first. Non-deterministic functions are rejected in index expressions, and indexes on user-defined functions can only be created in the main database.
+
 ## Errors
 
 - Creating a function whose name matches a built-in function is an error.
 - Creating a function that already exists without `OR REPLACE` is an error.
 - The body is parsed and validated at creation time; syntax errors are reported by `CREATE FUNCTION`, not at first call.
 - Calling a function with the wrong number of arguments is an error.
+- Replacing a function that an index depends on is an error; drop the index first.
 
 ## See Also
 

@@ -22,6 +22,8 @@ DROP FUNCTION [IF EXISTS] function-name;
 
 DROP FUNCTION removes the named function from the database schema and its persisted definition. The function must exist unless the `IF EXISTS` clause is specified.
 
+A function cannot be dropped while an expression index or partial index depends on it, directly or through other functions that call it; drop the index first.
+
 ### Clauses
 
 | Clause | Description |

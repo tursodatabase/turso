@@ -147,3 +147,56 @@ fn test_udfs_require_experimental_flag() {
         conn.close().unwrap();
     }
 }
+
+#[test]
+fn test_udf_expression_index_survives_reopen() {
+    let path = TempDir::new().unwrap().keep().join("udf_expr_index.db");
+
+    {
+        let db = TempDatabase::new_with_existent_with_opts(&path, udf_opts());
+        let conn = db.connect_limbo();
+        conn.execute(
+            "CREATE FUNCTION double(x INTEGER) RETURNS INTEGER LANGUAGE starlark AS 'return x * 2'",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (3), (1), (7)").unwrap();
+        conn.execute("CREATE INDEX i_double ON t(double(x))")
+            .unwrap();
+        conn.close().unwrap();
+    }
+
+    {
+        let db = TempDatabase::new_with_existent_with_opts(&path, udf_opts());
+        let conn = db.connect_limbo();
+
+        conn.execute("INSERT INTO t VALUES (5)").unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t WHERE double(x) = 10");
+        assert_eq!(rows, vec![(5,)]);
+
+        let plan: Vec<(String,)> = conn
+            .exec_rows("EXPLAIN QUERY PLAN SELECT x FROM t WHERE double(x) = 6")
+            .into_iter()
+            .map(|(_, _, _, detail): (i64, i64, i64, String)| (detail,))
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|(detail,)| detail.contains("USING INDEX i_double")),
+            "expected index seek after reopen, got plan: {plan:?}"
+        );
+
+        let check: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(check, vec![("ok".to_string(),)]);
+
+        let err = conn.execute("DROP FUNCTION double").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot drop function double: index i_double on table t depends on it"),
+            "unexpected error: {err}"
+        );
+
+        conn.execute("DROP INDEX i_double").unwrap();
+        conn.execute("DROP FUNCTION double").unwrap();
+        conn.close().unwrap();
+    }
+}

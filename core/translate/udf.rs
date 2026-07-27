@@ -72,6 +72,15 @@ pub fn translate_create_function(
     if existing.is_some() && !or_replace {
         bail_parse_error!("function {normalized_name} already exists");
     }
+    if existing.is_some() {
+        if let Some((index_name, table_name)) =
+            find_index_dependency(resolver.schema(), &normalized_name)
+        {
+            bail_parse_error!(
+                "cannot replace function {normalized_name}: index {index_name} on table {table_name} depends on it"
+            );
+        }
+    }
 
     // Canonical SQL for persistence: no OR REPLACE, no schema qualifier, body
     // as an escaped string literal so it re-parses without dollar-quoting.
@@ -106,6 +115,13 @@ pub fn translate_drop_function(
             return Ok(());
         }
         bail_parse_error!("no such function: {normalized_name}");
+    }
+    if let Some((index_name, table_name)) =
+        find_index_dependency(resolver.schema(), &normalized_name)
+    {
+        bail_parse_error!(
+            "cannot drop function {normalized_name}: index {index_name} on table {table_name} depends on it"
+        );
     }
 
     let functions_table = resolver
@@ -423,6 +439,96 @@ pub fn udf_is_deterministic(resolver: &Resolver, func: &FunctionDef) -> bool {
         }
     }
     true
+}
+
+pub fn udf_is_schema_deterministic(
+    functions: &HashMap<String, Arc<FunctionDef>>,
+    func: &FunctionDef,
+) -> bool {
+    let mut visited: Vec<String> = vec![func.name.clone()];
+    let mut worklist: Vec<(String, usize)> = func.calls.clone();
+    while let Some((name, arg_count)) = worklist.pop() {
+        if matches!(name.as_str(), "str" | "int" | "float" | "len") && arg_count == 1 {
+            continue;
+        }
+        if matches!(
+            name.as_str(),
+            "date" | "time" | "datetime" | "unixepoch" | "julianday" | "strftime" | "timediff"
+        ) {
+            return false;
+        }
+        match crate::function::Func::resolve_function(&name, arg_count) {
+            Ok(Some(builtin)) => {
+                if !builtin.is_deterministic() {
+                    return false;
+                }
+            }
+            Ok(None) => match functions.get(&name) {
+                Some(callee) => {
+                    if visited.contains(&callee.name) {
+                        continue;
+                    }
+                    visited.push(callee.name.clone());
+                    worklist.extend(callee.calls.iter().cloned());
+                }
+                None => return false,
+            },
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+fn collect_expr_function_calls(expr: &ast::Expr, out: &mut Vec<(String, usize)>) {
+    let _ = crate::translate::expr::walk_expr(expr, &mut |e: &ast::Expr| -> Result<
+        crate::translate::expr::WalkControl,
+    > {
+        if let ast::Expr::FunctionCall { name, args, .. } = e {
+            out.push((normalize_ident(name.as_str()), args.len()));
+        }
+        Ok(crate::translate::expr::WalkControl::Continue)
+    });
+}
+
+fn calls_reach_function(
+    functions: &HashMap<String, Arc<FunctionDef>>,
+    mut worklist: Vec<(String, usize)>,
+    target: &str,
+) -> bool {
+    let mut visited: Vec<String> = Vec::new();
+    while let Some((name, _)) = worklist.pop() {
+        if name == target {
+            return true;
+        }
+        if let Some(callee) = functions.get(&name) {
+            if visited.contains(&callee.name) {
+                continue;
+            }
+            visited.push(callee.name.clone());
+            worklist.extend(callee.calls.iter().cloned());
+        }
+    }
+    false
+}
+
+fn find_index_dependency(schema: &crate::schema::Schema, target: &str) -> Option<(String, String)> {
+    for (table_name, indexes) in schema.indexes.iter() {
+        for index in indexes {
+            let mut calls = Vec::new();
+            for column in &index.columns {
+                if let Some(expr) = &column.expr {
+                    collect_expr_function_calls(expr, &mut calls);
+                }
+            }
+            if let Some(where_clause) = &index.where_clause {
+                collect_expr_function_calls(where_clause, &mut calls);
+            }
+            if calls_reach_function(&schema.functions, calls, target) {
+                return Some((index.name.clone(), table_name.clone()));
+            }
+        }
+    }
+    None
 }
 
 struct LoopLabels {
