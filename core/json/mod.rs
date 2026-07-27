@@ -99,8 +99,14 @@ pub fn convert_dbtype_to_jsonb(val: impl AsValueRef, strict: Conv) -> crate::Res
 fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
     let zero_pos = memchr::memchr(0, slice).unwrap_or(slice.len());
     let truncated = &slice[..zero_pos];
-    let str = simdutf8::basic::from_utf8(truncated)
-        .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
+    // simdutf8 wins on bulk input but has per-call setup that loses to std on
+    // tiny payloads.
+    let str = if truncated.len() < 64 {
+        std::str::from_utf8(truncated).ok()
+    } else {
+        simdutf8::basic::from_utf8(truncated).ok()
+    }
+    .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
     Jsonb::from_str_with_mode(str, mode).map_err(Into::into)
 }
 

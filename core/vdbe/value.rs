@@ -1557,8 +1557,22 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);
     }
+    if needle.len() > haystack.len() {
+        return None;
+    }
     if haystack.len() < SIMD_SEARCH_MIN_HAYSTACK {
-        return haystack.windows(needle.len()).position(|w| w == needle);
+        // memchr over first-byte candidates; no memmem searcher setup.
+        let last_start = haystack.len() - needle.len();
+        let tail = &needle[1..];
+        let mut start = 0;
+        while let Some(off) = memchr::memchr(needle[0], &haystack[start..last_start + 1]) {
+            let i = start + off;
+            if haystack[i + 1..i + needle.len()] == *tail {
+                return Some(i);
+            }
+            start = i + 1;
+        }
+        return None;
     }
     memchr::memmem::find(haystack, needle)
 }

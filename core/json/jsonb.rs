@@ -49,15 +49,29 @@ fn find_control_byte(bytes: &[u8]) -> Option<usize> {
 /// Position of the first byte that terminates or complicates a JSON string:
 /// the closing `quote`, a backslash, or a control byte (`< 0x20`).
 ///
-/// One fused chunked pass that LLVM autovectorizes. `memchr2` cannot fold in
-/// the control-byte range test, and a separate second pass costs more than it
-/// saves on the short strings typical of JSON keys and values.
+/// Most JSON strings are short keys/values whose terminator sits within the
+/// first few bytes, so the prefix is scanned scalar with per-byte early exit;
+/// only long strings continue into the chunked OR-accumulated scan that LLVM
+/// autovectorizes. `memchr2` cannot fold in the control-byte range test, and
+/// a chunk-first scan wastes work on the short-string common case.
 #[inline]
 fn find_string_special(bytes: &[u8], quote: u8) -> Option<usize> {
-    const CHUNK: usize = 16;
+    const SCALAR_PREFIX: usize = 16;
+    const CHUNK: usize = 32;
     let is_special = |b: u8| (b == quote) | (b == b'\\') | (b < 0x20);
-    let mut offset = 0;
-    let mut chunks = bytes.chunks_exact(CHUNK);
+
+    let scalar_end = bytes.len().min(SCALAR_PREFIX);
+    for (i, &b) in bytes[..scalar_end].iter().enumerate() {
+        if is_special(b) {
+            return Some(i);
+        }
+    }
+    if scalar_end == bytes.len() {
+        return None;
+    }
+
+    let mut offset = SCALAR_PREFIX;
+    let mut chunks = bytes[SCALAR_PREFIX..].chunks_exact(CHUNK);
     for chunk in &mut chunks {
         let mut any = false;
         for &b in chunk {
@@ -1104,7 +1118,12 @@ impl Jsonb {
             }
             ElementType::TEXT | ElementType::TEXTJ | ElementType::TEXT5 | ElementType::TEXTRAW => {
                 let payload = &self.data[payload_start..payload_end];
-                simdutf8::basic::from_utf8(payload).map_err(|_| {
+                if payload.len() < 64 {
+                    from_utf8(payload).ok()
+                } else {
+                    simdutf8::basic::from_utf8(payload).ok()
+                }
+                .ok_or_else(|| {
                     LimboError::ParseError("Invalid UTF-8 in text payload".to_string())
                 })?;
                 Ok(())
@@ -1351,9 +1370,14 @@ impl Jsonb {
 
         match kind {
             ElementType::TEXT | ElementType::TEXTRAW | ElementType::TEXTJ => {
-                let word = simdutf8::basic::from_utf8(word_slice).map_err(|_| {
-                    LimboError::ParseError("Failed to serialize string!".to_string())
-                })?;
+                // simdutf8 wins on bulk input but has per-call setup that
+                // loses to std on the short strings typical of JSON.
+                let word = if word_slice.len() < 64 {
+                    from_utf8(word_slice).ok()
+                } else {
+                    simdutf8::basic::from_utf8(word_slice).ok()
+                }
+                .ok_or_else(|| LimboError::ParseError("Failed to serialize string!".to_string()))?;
 
                 // Only control bytes need escaping for TEXTJ (its payload
                 // already carries JSON escape sequences verbatim); TEXT also
