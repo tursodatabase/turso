@@ -7,7 +7,7 @@ use crate::catalog::{self, PostgresDialect};
 use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast;
 use turso_pg_parser::translator::{
-    is_comment_on, is_grant_or_revoke_stmt, is_refresh_matview, try_extract_copy_from,
+    grant_or_revoke_command_tag, is_comment_on, is_refresh_matview, try_extract_copy_from,
     try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
     PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PostgreSQLTranslator,
 };
@@ -248,7 +248,7 @@ fn try_prepare_special(conn: &Arc<Connection>, sql: &str) -> Result<Option<State
         return Ok(Some(noop_statement(conn)?));
     }
 
-    if is_grant_or_revoke_stmt(&parse_result) {
+    if grant_or_revoke_command_tag(&parse_result).is_some() {
         return Ok(Some(noop_statement(conn)?));
     }
 

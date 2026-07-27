@@ -21,6 +21,7 @@ turso_core = { workspace = true, default-features = true, features = [
     "conn_raw_api",
 ] }
 turso_pg = { workspace = true }
+turso_pg_parser = { workspace = true }
 
 [lints]
 workspace = true

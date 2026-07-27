@@ -1232,6 +1232,12 @@ fn wire_grant_and_revoke_return_command_tags() {
 
         let tags = client.query_command_tags("REVOKE SELECT ON docs FROM reader");
         assert_eq!(tags, ["REVOKE"]);
+
+        let tags = client.query_command_tags("GRANT reader TO alice");
+        assert_eq!(tags, ["GRANT ROLE"]);
+
+        let tags = client.query_command_tags("REVOKE reader FROM alice");
+        assert_eq!(tags, ["REVOKE ROLE"]);
     });
 }
 

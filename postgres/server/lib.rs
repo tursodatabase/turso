@@ -10,6 +10,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::Value;
 use turso_pg::{split_statements, Connection, PgConnection};
+use turso_pg_parser::translator::grant_or_revoke_command_tag;
 
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::portal::{Format, Portal};
@@ -702,10 +703,12 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         // statement is SELECT ... INTO (writable CTEs are unsupported),
         // which PostgreSQL reports as `SELECT n` like CREATE TABLE AS.
         Tag::new("SELECT").with_rows(affected_rows)
-    } else if upper.starts_with("GRANT") {
-        Tag::new("GRANT")
-    } else if upper.starts_with("REVOKE") {
-        Tag::new("REVOKE")
+    } else if upper.starts_with("GRANT") || upper.starts_with("REVOKE") {
+        let parse_result = turso_pg_parser::parse(query)
+            .expect("executed GRANT or REVOKE statement must have parsed successfully");
+        let tag = grant_or_revoke_command_tag(&parse_result)
+            .expect("executed GRANT or REVOKE statement must have a command tag");
+        Tag::new(tag)
     } else {
         Tag::new("OK")
     }

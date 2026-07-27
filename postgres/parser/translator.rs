@@ -4402,19 +4402,20 @@ pub fn is_comment_on(parse_result: &ParseResult) -> bool {
     matches!(&nodes[0].0, NodeRef::CommentStmt(_))
 }
 
-/// Returns true if the parse result is a GRANT or REVOKE statement.
+/// Returns the PostgreSQL command tag for a GRANT or REVOKE statement.
 /// Privileges and role membership are accepted but not persisted or enforced.
-pub fn is_grant_or_revoke_stmt(parse_result: &ParseResult) -> bool {
+pub fn grant_or_revoke_command_tag(parse_result: &ParseResult) -> Option<&'static str> {
     use pg_query::NodeRef;
 
     let nodes = parse_result.protobuf.nodes();
-    if nodes.is_empty() {
-        return false;
+    let node = nodes.first()?;
+    match &node.0 {
+        NodeRef::GrantStmt(stmt) if stmt.is_grant => Some("GRANT"),
+        NodeRef::GrantStmt(_) => Some("REVOKE"),
+        NodeRef::GrantRoleStmt(stmt) if stmt.is_grant => Some("GRANT ROLE"),
+        NodeRef::GrantRoleStmt(_) => Some("REVOKE ROLE"),
+        _ => None,
     }
-    matches!(
-        &nodes[0].0,
-        NodeRef::GrantStmt(_) | NodeRef::GrantRoleStmt(_)
-    )
 }
 
 /// Extracted COPY FROM statement info for use by the connection layer.
