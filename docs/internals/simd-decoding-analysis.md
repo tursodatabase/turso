@@ -198,6 +198,17 @@ Related redundant work found along the way:
   `ValueIterator` overrides `next`/`nth`/`count`/`fold`/`size_hint` but **not
   `last`**, so the default implementation materializes a `ValueRef` for every
   column to reach the last one. Hit once per row on every index-driven scan.
+  *Fixed*: `last` now walks the header and decodes exactly one value.
+- **A corrupt record header hung the query.** `ValueIterator::next` returned a
+  truncated-varint error *without consuming any input*, so every subsequent call
+  reported the same error and `while let Some(..) = next()` never terminated.
+  The default `Iterator::last` is exactly that shape, so a header whose final
+  serial-type varint is cut off by `header_size` — payload `[03][80][80]` is
+  enough — spun forever instead of surfacing corruption. Reachable from any
+  index scan on a malformed file, with no write path involved. *Fixed*: `next`
+  consumes the remaining header before reporting, fusing the iterator for all
+  consumers. This was found while implementing the `last` fix, not during the
+  original survey.
 - An index scan parses the same header 3+ times per row (seek comparison,
   `last_value()` for the rowid, then per-column `op_column`).
 - `op_idx_insert`'s uniqueness check does three parses and two heap `Vec`
@@ -403,12 +414,29 @@ where items 1 and 2 in §6 should come from.
 2. **Fix `op_column`'s quadratic header re-walk.** Portable safe Rust, 26–31x on
    the header walk for wide tables. Prefer a `ColumnRange` opcode over an offset
    cache; measure the narrow-projection case, which a naive memo regresses.
+   *Not done* — this is an architectural change to the hottest opcode in the
+   engine and wants its own PR with end-to-end benchmarks. Note for whoever
+   picks it up: `ImmutableRecord` already has an `invalidate` /
+   `start_serialization` protocol and only three `as_blob_mut` call sites (two
+   of which *are* those methods), so a memo is more fenceable than it first
+   looks — but a `ColumnRange` opcode decided at translation time needs no
+   invalidation reasoning at all, and measured better besides.
 3. **Fix the `from_utf8_unchecked` soundness bug.** Validate with `simdutf8`,
-   ideally once per page rather than per value.
+   ideally once per page rather than per value. *Not done* — needs a decision
+   first on what to do with invalid bytes, since SQLite itself stores and
+   returns them, so rejecting would break compatibility. The likely shape is
+   holding `&[u8]` in `TextRef` and validating only where `&str` semantics are
+   actually required.
 4. **Use `memchr` for the JSON string scanner and the LIKE `%` lookahead**, with
-   a short-input guard (crossover ~16–32 bytes).
+   a short-input guard (crossover ~16–32 bytes). *Not done.*
 5. **Cache compiled regexes and LIKE patterns.** Highest value per line found.
-6. Swap `get_serial_type_size`'s match for a 128-entry table. 1.7x, ~5 lines.
+   *Not done.*
+6. ~~Swap `get_serial_type_size`'s match for a 128-entry table.~~ **Done** — it
+   runs in the same quadratic loop as `read_varint`, so it benefits from the
+   same call-count reduction item 2 would deliver.
+
+Items 1, and the two fixes marked *Done*, are on this branch. Everything else is
+open.
 
 Before any of it, note that there is **no varint benchmark in the repo** (19
 benches in `core/benches/`, none touch varints) and `tpc_h_benchmark` is tracked
