@@ -10,6 +10,12 @@ The driver implements `database/sql` and mirrors the embedded
 driver, so the same application code can run against a local database or
 Turso Cloud.
 
+## Installation
+
+```console
+$ go get turso.tech/database/tursogo-serverless
+```
+
 ## Usage
 
 ```go
