@@ -642,3 +642,164 @@ test max-with-range-on-desc-nulls-first-index {
 expect {
     2
 }
+
+setup pk_data {
+    CREATE TABLE t(a INT, b, PRIMARY KEY(a NULLS LAST));
+    INSERT INTO t VALUES (NULL, 1), (3, 2), (1, 3), (NULL, 4), (2, 5);
+}
+
+test pk-schema-roundtrip {
+    CREATE TABLE t(a INT, b, PRIMARY KEY(a NULLS LAST));
+    CREATE TABLE t2(a INT, b, PRIMARY KEY(a DESC NULLS FIRST, b NULLS LAST));
+    SELECT sql FROM sqlite_schema WHERE type='table' ORDER BY name;
+}
+expect {
+    CREATE TABLE t (a INT, b, PRIMARY KEY (a NULLS LAST))
+    CREATE TABLE t2 (a INT, b, PRIMARY KEY (a DESC NULLS FIRST, b NULLS LAST))
+}
+
+@setup pk_data
+test pk-nulls-last-ordering-elided {
+    SELECT ifnull(a, 'null') FROM t ORDER BY a NULLS LAST LIMIT 3;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup pk_data
+test pk-eqp-elide-order-by {
+    EXPLAIN QUERY PLAN SELECT a FROM t ORDER BY a NULLS LAST;
+}
+expect {
+    1|0|0|SCAN t USING COVERING INDEX sqlite_autoindex_t_1
+}
+
+@setup pk_data
+test pk-range-seek-excludes-null-block {
+    SELECT count(*) FROM t WHERE a > 1;
+}
+expect {
+    2
+}
+
+@setup pk_data
+test pk-min-max {
+    SELECT min(a), max(a) FROM t;
+}
+expect {
+    1|3
+}
+
+test pk-nulls-remain-distinct {
+    CREATE TABLE t(a INT, b, PRIMARY KEY(a NULLS LAST));
+    INSERT INTO t VALUES (NULL, 1), (NULL, 2), (5, 3);
+    SELECT count(*) FROM t;
+}
+expect {
+    3
+}
+
+test pk-duplicate-non-null-rejected {
+    CREATE TABLE t(a INT, b, PRIMARY KEY(a NULLS LAST));
+    INSERT INTO t VALUES (5, 1);
+    INSERT INTO t VALUES (5, 2);
+}
+expect error {
+}
+
+test pk-desc-nulls-first-ordering {
+    CREATE TABLE t(a INT, b, PRIMARY KEY(a DESC NULLS FIRST));
+    INSERT INTO t VALUES (NULL, 1), (3, 2), (1, 3), (NULL, 4), (2, 5);
+    SELECT ifnull(a, 'null') FROM t ORDER BY a DESC NULLS FIRST LIMIT 3;
+}
+expect {
+    null
+    null
+    3
+}
+
+@setup pk_data
+test pk-maintenance-preserves-order {
+    DELETE FROM t WHERE b = 2;
+    UPDATE t SET a = 7 WHERE b = 1;
+    INSERT INTO t VALUES (0, 6), (NULL, 7);
+    SELECT ifnull(a, 'null') FROM t ORDER BY a NULLS LAST;
+}
+expect {
+    0
+    1
+    2
+    7
+    null
+    null
+}
+
+@setup pk_data
+test pk-integrity-after-maintenance {
+    DELETE FROM t WHERE b = 2;
+    UPDATE t SET a = 7 WHERE b = 1;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+test pk-nulls-inert-on-without-rowid {
+    CREATE TABLE t(a INT, b, PRIMARY KEY(a NULLS LAST)) WITHOUT ROWID;
+    INSERT INTO t VALUES (1, 1), (2, 2);
+    SELECT count(*) FROM t;
+}
+expect {
+    2
+}
+
+test pk-nulls-on-rowid-alias-keeps-alias {
+    CREATE TABLE t(a INTEGER, b, PRIMARY KEY(a NULLS LAST));
+    INSERT INTO t(b) VALUES (10);
+    INSERT INTO t(a, b) VALUES (NULL, 20);
+    SELECT a, rowid, a IS rowid FROM t ORDER BY rowid;
+}
+expect {
+    1|1|1
+    2|2|1
+}
+
+test pk-nulls-on-rowid-alias-creates-no-index {
+    CREATE TABLE t(a INTEGER, b, PRIMARY KEY(a NULLS LAST));
+    CREATE TABLE t2(a INTEGER, b, PRIMARY KEY(a DESC));
+    SELECT count(*) FROM sqlite_schema WHERE type='index';
+}
+expect {
+    0
+}
+
+test pk-nulls-on-non-integer-pk-is-not-alias {
+    CREATE TABLE t(a INT, b, PRIMARY KEY(a NULLS LAST));
+    INSERT INTO t(a, b) VALUES (NULL, 10);
+    INSERT INTO t(a, b) VALUES (NULL, 20);
+    SELECT ifnull(a, 'null'), a IS rowid FROM t ORDER BY rowid;
+}
+expect {
+    null|0
+    null|0
+}
+
+test pk-upsert-plain-target {
+    CREATE TABLE t(a INT, b, PRIMARY KEY(a NULLS LAST));
+    INSERT INTO t VALUES (5, 0);
+    INSERT INTO t VALUES (5, 1) ON CONFLICT(a) DO UPDATE SET b = excluded.b;
+    SELECT a, b FROM t;
+}
+expect {
+    5|1
+}
+
+test unique-table-constraint-nulls-still-rejected {
+    CREATE TABLE t(a, UNIQUE(a NULLS LAST));
+}
+expect error {
+    NULLS
+}

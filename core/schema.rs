@@ -3124,6 +3124,7 @@ pub struct UniqueSetColumn {
     pub name: String,
     pub sort_order: SortOrder,
     pub collation: Option<CollationSeq>,
+    pub nulls_order: Option<NullsOrder>,
 }
 
 #[derive(Clone, Debug)]
@@ -4447,8 +4448,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     if *auto_increment {
                         has_autoincrement = true;
                     }
-                    reject_explicit_nulls(columns)?;
-
                     let mut pk_unique_set_columns = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
                         let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
@@ -4466,6 +4465,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             name: col_name.clone(),
                             sort_order,
                             collation,
+                            nulls_order: column.nulls,
                         })?;
                         primary_key_columns.try_push((col_name, sort_order))?;
                     }
@@ -4496,6 +4496,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             name: col_name,
                             sort_order: column.order.unwrap_or(SortOrder::Asc),
                             collation,
+                            nulls_order: None,
                         })?;
                     }
                     let unique_set = UniqueSet {
@@ -4683,6 +4684,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     name: name.clone(),
                                     sort_order: order,
                                     collation: None,
+                                    nulls_order: None,
                                 }]?,
                                 is_primary_key: true,
                                 conflict_clause: *conflict_clause,
@@ -4710,6 +4712,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     name: name.clone(),
                                     sort_order: order,
                                     collation: None,
+                                    nulls_order: None,
                                 }]?,
                                 is_primary_key: false,
                                 conflict_clause: *conflict,
@@ -5863,7 +5866,7 @@ impl Index {
                 .push_within_capacity(IndexColumn {
                     name: normalize_ident(col_name),
                     order: *order,
-                    nulls_order: None,
+                    nulls_order: constraint_columns.get(i).and_then(|c| c.nulls_order),
                     pos_in_table,
                     collation: constraint_columns
                         .get(i)

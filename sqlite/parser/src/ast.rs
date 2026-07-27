@@ -1615,7 +1615,7 @@ pub enum SortOrder {
 }
 
 /// `NULLS FIRST` or `NULLS LAST`
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum NullsOrder {
     /// `NULLS FIRST`

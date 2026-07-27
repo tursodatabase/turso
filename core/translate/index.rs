@@ -884,8 +884,8 @@ pub fn resolve_sorted_columns(
 
 /// SQLite rejects explicit `NULLS FIRST`/`NULLS LAST` wherever an index key
 /// is defined or matched (see `sqlite3HasExplicitNulls`). Turso implements
-/// the clause for CREATE INDEX, so only table PRIMARY KEY/UNIQUE constraints
-/// and UPSERT conflict targets still reject it.
+/// the clause for CREATE INDEX and table PRIMARY KEY constraints, so only
+/// table UNIQUE constraints and UPSERT conflict targets still reject it.
 pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
     for sc in cols {
         if let Some(nulls) = sc.nulls {
