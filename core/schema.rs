@@ -1270,7 +1270,7 @@ impl Schema {
                     crate::incremental::view::state_table_belongs_to_view(table_name, &name)
                 })
                 .cloned()
-                .collect();
+                .try_collect()?;
             for table in hidden_tables {
                 self.remove_table(&table);
                 self.remove_indices_for_table(&table);
@@ -1305,7 +1305,7 @@ impl Schema {
         let views = self
             .table_to_materialized_views
             .entry(table_name)
-            .or_default();
+            .or_insert_with(|| vec![]);
         if !views.contains(&view_name) {
             views.push(view_name);
             views.sort();
@@ -1340,13 +1340,13 @@ impl Schema {
         let mut pending = initially_touched
             .into_iter()
             .map(|name| normalize_ident(&name))
-            .collect::<Vec<_>>();
+            .try_collect::<Vec<_>>()?;
         while let Some(view_name) = pending.pop() {
             if !self.is_materialized_view(&view_name) || !reachable.insert(view_name.clone()) {
                 continue;
             }
             if let Some(dependents) = self.table_to_materialized_views.get(&view_name) {
-                pending.extend(dependents.iter().cloned());
+                pending.try_extend(dependents.iter().cloned())?;
             }
         }
 
@@ -1368,9 +1368,9 @@ impl Schema {
         let mut ready = indegree
             .iter()
             .filter_map(|(name, degree)| (*degree == 0).then_some(name.clone()))
-            .collect::<Vec<_>>();
+            .try_collect::<Vec<_>>()?;
         ready.sort_by(|left, right| right.cmp(left));
-        let mut ordered = Vec::with_capacity(reachable.len());
+        let mut ordered = Vec::try_with_capacity_ext(reachable.len())?;
         while let Some(view_name) = ready.pop() {
             ordered.push(view_name.clone());
             if let Some(dependents) = self.table_to_materialized_views.get(&view_name) {
@@ -2091,7 +2091,7 @@ impl Schema {
                     })? += 1;
                     dependents
                         .entry(dependency)
-                        .or_default()
+                        .or_insert_with(|| vec![])
                         .push(view_name.clone());
                 }
             }
@@ -2100,9 +2100,9 @@ impl Schema {
         let mut ready = indegree
             .iter()
             .filter_map(|(name, degree)| (*degree == 0).then_some(name.clone()))
-            .collect::<Vec<_>>();
+            .try_collect::<Vec<_>>()?;
         ready.sort_by(|left, right| right.cmp(left));
-        let mut order = Vec::with_capacity(names.len());
+        let mut order = Vec::try_with_capacity_ext(names.len())?;
         while let Some(view_name) = ready.pop() {
             order.push(view_name.clone());
             if let Some(children) = dependents.get(&view_name) {
@@ -2138,7 +2138,7 @@ impl Schema {
                         ))
                     })
             })
-            .collect()
+            .try_collect::<Result<Vec<_>>>()?
     }
 
     /// Populate materialized views parsed from the schema.
@@ -2170,7 +2170,7 @@ impl Schema {
                 .keys()
                 .filter(|k| crate::incremental::view::state_key_belongs_to_view(k, &view_name))
                 .cloned()
-                .collect();
+                .try_collect()?;
             for key in state_keys {
                 let index_root = dbsp_state_index_roots.get(&key).copied().unwrap_or(0);
                 let table_root = dbsp_state_roots.get(&key).copied().unwrap_or(0);
@@ -6304,7 +6304,7 @@ mod tests {
             ordered
                 .into_iter()
                 .map(|(name, _)| name)
-                .collect::<Vec<_>>(),
+                .collect::<std::vec::Vec<_>>(),
             vec!["first", "second", "third"]
         );
     }

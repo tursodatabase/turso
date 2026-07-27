@@ -1,4 +1,6 @@
 #[cfg(test)]
+use crate::alloc::TursoIteratorExt;
+#[cfg(test)]
 use crate::incremental::view::ViewChangeSubscription;
 use crate::numeric::Numeric;
 use crate::sync::Arc;
@@ -390,6 +392,10 @@ mod tests {
         changes: Vec<(i64, Vec<Value>, isize)>,
     ) {
         for (rowid, values, weight) in changes {
+            let values = values
+                .into_iter()
+                .try_collect()
+                .expect("test row allocation should succeed");
             if weight > 0 {
                 tx_state.insert("test_table", rowid, values);
             } else if weight < 0 {
@@ -667,7 +673,7 @@ mod tests {
         tx_state.insert(
             "test_table",
             2,
-            vec![Value::from_i64(2), Value::from_i64(20)],
+            crate::alloc::vec![Value::from_i64(2), Value::from_i64(20)],
         );
 
         // Now seek for row 2 finds it

@@ -474,7 +474,7 @@ pub(super) fn publish_node_output(
         operator_state.output.published_identity,
         operator_state.output.binding_rowids.clone(),
         input.requires_positive_first,
-    );
+    )?;
     let arrangement = emit_output_arrangement(
         program,
         view_name,

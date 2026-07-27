@@ -55,7 +55,7 @@ pub(super) fn emit_set_op(
             output_contract.emitted_identity,
             output_contract.binding_rowids.clone(),
             requires_positive_first,
-        );
+        )?;
         emit_deduplicating_set_op(
             program,
             view_name,
@@ -87,7 +87,7 @@ fn emit_union_all_delta(
         output_contract.emitted_identity,
         output_contract.binding_rowids.clone(),
         requires_positive_first,
-    );
+    )?;
     for (branch, input) in inputs.iter().enumerate() {
         append_union_all_branch(program, branch, input, &output)?;
     }

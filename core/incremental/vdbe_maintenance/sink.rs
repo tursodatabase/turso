@@ -38,7 +38,7 @@ pub(super) fn emit_terminal_delta(
         view_name,
         sink.root_page,
         num_output_columns,
-    ));
+    )?);
     let view_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: view_cursor_id,

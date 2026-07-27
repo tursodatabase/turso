@@ -116,7 +116,7 @@ type MvccCommitStateMachine = CommitStateMachine<MvccClock, DynAllocator>;
 pub enum ViewDeltaApplyState {
     NotStarted,
     Processing {
-        views: Vec<String>, // view names (all materialized views have storage)
+        views: crate::alloc::Vec<String>, // view names (all materialized views have storage)
         current_index: usize,
         /// The maintenance statement currently being stepped for
         /// `views[current_index]`, parked across I/O yields.
@@ -154,7 +154,7 @@ pub(crate) fn step_view_delta_batch(
 
                 let schema = connection.schema.read();
                 let views = schema.materialized_view_maintenance_order(
-                    connection.transaction_changes.get_view_names(),
+                    connection.transaction_changes.get_view_names()?,
                 )?;
                 for view_name in &views {
                     if let Some(view_mutex) = schema.get_materialized_view(view_name) {

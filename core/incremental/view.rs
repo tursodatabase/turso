@@ -1,3 +1,4 @@
+use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::io::{Buffer, Completion, File, TempFile, IO};
 use crate::schema::{BTreeTable, Schema};
 use crate::sync::{Arc, Mutex};
@@ -86,7 +87,8 @@ pub fn create_dbsp_state_index(
     state_table: &BTreeTable,
 ) -> Result<crate::schema::Index> {
     use crate::schema::{Index, IndexColumn};
-    let mut columns = Vec::with_capacity(state_table.primary_key_columns.len());
+    let mut columns =
+        crate::alloc::Vec::try_with_capacity_ext(state_table.primary_key_columns.len())?;
     for (name, order) in &state_table.primary_key_columns {
         let pos_in_table = state_table
             .columns()
@@ -98,7 +100,7 @@ pub fn create_dbsp_state_index(
                     state_table.name
                 ))
             })?;
-        columns.push(IndexColumn {
+        columns.try_push(IndexColumn {
             name: name.clone(),
             order: *order,
             // Key columns carry the defining query's comparison collation
@@ -107,7 +109,7 @@ pub fn create_dbsp_state_index(
             pos_in_table,
             default: None,
             expr: None,
-        });
+        })?;
     }
     Ok(Index {
         name: "dbsp_state_pk".to_string(),
@@ -135,7 +137,7 @@ pub(crate) enum TableChangeId {
 pub(crate) struct ChangeEvent {
     pub(crate) table_id: TableChangeId,
     pub(crate) rowid: i64,
-    pub(crate) values: Vec<Value>,
+    pub(crate) values: crate::alloc::Vec<Value>,
     pub(crate) weight: isize,
 }
 
@@ -198,7 +200,7 @@ struct PendingSpill {
     /// presents this change again; a different change (UPDATE delete followed
     /// by insert) must be appended after finishing the pending batch.
     triggering_key: i64,
-    triggering_values: Vec<Value>,
+    triggering_values: crate::alloc::Vec<Value>,
     triggering_weight: isize,
 }
 
@@ -259,7 +261,7 @@ impl SharedChangeLog {
         &self,
         table_id: TableChangeId,
         key: i64,
-        values: Vec<Value>,
+        values: crate::alloc::Vec<Value>,
         temp_store: TempStore,
     ) -> Result<IOResult<()>> {
         self.record_change(table_id, key, values, 1, temp_store)
@@ -269,7 +271,7 @@ impl SharedChangeLog {
         &self,
         table_id: TableChangeId,
         key: i64,
-        values: Vec<Value>,
+        values: crate::alloc::Vec<Value>,
         temp_store: TempStore,
     ) -> Result<IOResult<()>> {
         self.record_change(table_id, key, values, -1, temp_store)
@@ -279,7 +281,7 @@ impl SharedChangeLog {
         &self,
         table_id: TableChangeId,
         key: i64,
-        values: Vec<Value>,
+        values: crate::alloc::Vec<Value>,
         weight: isize,
         temp_store: TempStore,
     ) -> Result<IOResult<()>> {
@@ -344,7 +346,7 @@ impl SharedChangeLog {
         &self,
         table_id: TableChangeId,
         key: i64,
-        values: Vec<Value>,
+        values: crate::alloc::Vec<Value>,
         weight: isize,
         temp_store: TempStore,
     ) -> Result<IOResult<()>> {
@@ -430,7 +432,7 @@ fn serialized_change_size(
     weight: isize,
     values: &[Value],
 ) -> Result<usize> {
-    let mut record_values = Vec::with_capacity(values.len() + 3);
+    let mut record_values = crate::alloc::Vec::try_with_capacity_ext(values.len() + 3)?;
     record_values.push(table_id_value(table_id));
     record_values.push(Value::from_i64(key));
     record_values.push(Value::from_i64(weight as i64));
@@ -442,10 +444,10 @@ fn serialized_change_size(
     )
 }
 
-fn serialize_change_events(events: &[ChangeEvent]) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
+fn serialize_change_events(events: &[ChangeEvent]) -> Result<std::vec::Vec<u8>> {
+    let mut output = std::vec::Vec::new();
     for event in events {
-        let mut values = Vec::with_capacity(event.values.len() + 3);
+        let mut values = std::vec::Vec::with_capacity(event.values.len() + 3);
         values.push(table_id_value(&event.table_id));
         values.push(Value::from_i64(event.rowid));
         values.push(Value::from_i64(event.weight as i64));
@@ -482,7 +484,7 @@ impl ViewChangeSubscription {
     }
 
     #[cfg(test)]
-    pub fn insert(&self, table_name: &str, key: i64, values: Vec<Value>) {
+    pub fn insert(&self, table_name: &str, key: i64, values: crate::alloc::Vec<Value>) {
         let table_id = TableChangeId::Name(table_name.to_string());
         self.change_log
             .subscribe_views(std::slice::from_ref(&self.view_name), &table_id);
@@ -497,7 +499,7 @@ impl ViewChangeSubscription {
     }
 
     #[cfg(test)]
-    pub fn delete(&self, table_name: &str, key: i64, values: Vec<Value>) {
+    pub fn delete(&self, table_name: &str, key: i64, values: crate::alloc::Vec<Value>) {
         let table_id = TableChangeId::Name(table_name.to_string());
         self.change_log
             .subscribe_views(std::slice::from_ref(&self.view_name), &table_id);
@@ -613,13 +615,14 @@ impl TransactionChanges {
     }
 
     /// Get all views subscribed to the transaction stream.
-    pub fn get_view_names(&self) -> Vec<String> {
-        self.change_log
+    pub fn get_view_names(&self) -> Result<crate::alloc::Vec<String>> {
+        Ok(self
+            .change_log
             .subscriptions
             .lock()
             .keys()
             .cloned()
-            .collect()
+            .try_collect()?)
     }
 
     /// Record an insertion once and subscribe every dependent view.
@@ -628,7 +631,7 @@ impl TransactionChanges {
         table: &BTreeTable,
         view_names: &[String],
         key: i64,
-        values: Vec<Value>,
+        values: crate::alloc::Vec<Value>,
         temp_store: TempStore,
     ) -> Result<IOResult<()>> {
         let table_id = TableChangeId::RootPage(table.root_page);
@@ -643,7 +646,7 @@ impl TransactionChanges {
         table: &BTreeTable,
         view_names: &[String],
         key: i64,
-        values: Vec<Value>,
+        values: crate::alloc::Vec<Value>,
         temp_store: TempStore,
     ) -> Result<IOResult<()>> {
         let table_id = TableChangeId::RootPage(table.root_page);
@@ -660,7 +663,7 @@ impl TransactionChanges {
         table: &BTreeTable,
         view_names: &[String],
         key: i64,
-        values: Vec<Value>,
+        values: crate::alloc::Vec<Value>,
         weight: isize,
         temp_store: TempStore,
     ) -> Result<IOResult<()>> {
@@ -806,7 +809,7 @@ impl IncrementalView {
     /// Schema reconstruction uses this to order persisted materialized views
     /// before binding them. The executable DAG is still produced by the main
     /// bound planner; this walker is identity metadata only.
-    pub(crate) fn referenced_table_names(select: &ast::Select) -> Vec<String> {
+    pub(crate) fn referenced_table_names(select: &ast::Select) -> std::vec::Vec<String> {
         fn collect_source(
             source: &ast::SelectTable,
             cte_names: &HashSet<String>,

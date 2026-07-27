@@ -26,7 +26,7 @@ pub struct DeltaCursor {
     tail_loaded: bool,
     reading_tail: bool,
     /// Current spill batch, or the in-memory tail.
-    rows: Vec<(i64, Vec<Value>, isize)>,
+    rows: Vec<(i64, crate::alloc::Vec<Value>, isize)>,
     /// Number of base-table columns; the weight is column `num_columns`.
     num_columns: usize,
     /// Position of the current row; `rows.len()` means exhausted.
@@ -227,7 +227,7 @@ fn parse_spilled_delta(
     bytes: &[u8],
     segment: &SpillSegment,
     table_id: Option<&TableChangeId>,
-) -> Result<Vec<(i64, Vec<Value>, isize)>> {
+) -> Result<Vec<(i64, crate::alloc::Vec<Value>, isize)>> {
     let mut rows = Vec::new();
     let mut offset = 0;
     for _ in 0..segment.rows {

@@ -1,9 +1,11 @@
+use crate::alloc::{TursoIteratorExt, TursoVecExt};
 use crate::incremental::dag;
 use crate::schema::{BTreeCharacteristics, BTreeTable, Column};
 use crate::sync::Arc;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{InsertFlags, Insn};
+use crate::Result;
 
 #[derive(Debug, Clone)]
 pub(super) struct EphemeralDelta {
@@ -175,7 +177,7 @@ pub(super) fn open_ephemeral_delta(
     identity: DeltaIdentity,
     binding_rowids: Arc<[bool]>,
     requires_positive_first: bool,
-) -> EphemeralDelta {
+) -> Result<EphemeralDelta> {
     let schema = Arc::new(schema);
     let width = schema.len();
     let identity_width = identity.width();
@@ -214,13 +216,13 @@ pub(super) fn open_ephemeral_delta(
         name,
         0,
         next_metadata_column + width,
-    ));
+    )?);
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id,
         is_table: true,
     });
-    EphemeralDelta {
+    Ok(EphemeralDelta {
         cursor_id,
         identity,
         binding_rowid_columns,
@@ -229,7 +231,7 @@ pub(super) fn open_ephemeral_delta(
         weight_column: next_metadata_column + width,
         schema,
         requires_positive_first,
-    }
+    })
 }
 
 pub(super) fn emit_operator_rowid_delta(
@@ -290,24 +292,24 @@ pub(super) fn synthesized_view_table(
     view_name: &str,
     root_page: i64,
     num_view_columns: usize,
-) -> BTreeTable {
-    let mut columns: Vec<Column> = (0..num_view_columns)
+) -> Result<BTreeTable> {
+    let mut columns: crate::alloc::Vec<Column> = (0..num_view_columns)
         .map(|i| Column::new_default_text(Some(format!("c{i}")), String::new(), None))
-        .collect();
-    columns.push(Column::new_default_text(
+        .try_collect()?;
+    columns.try_push(Column::new_default_text(
         Some("__ivm_weight".to_string()),
         String::new(),
         None,
-    ));
-    BTreeTable::new(
+    ))?;
+    Ok(BTreeTable::new(
         root_page,
         view_name.to_string(),
-        Vec::new(),
+        crate::alloc::vec![],
         columns,
         BTreeCharacteristics::HAS_ROWID,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
         None,
-    )
+    ))
 }

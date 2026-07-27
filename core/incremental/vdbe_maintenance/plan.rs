@@ -221,16 +221,19 @@ fn build_plan_dag_node(
     Ok(root)
 }
 
-fn synthesized_derived_table(name: &str, columns: Vec<crate::schema::Column>) -> BTreeTable {
+fn synthesized_derived_table(
+    name: &str,
+    columns: crate::alloc::Vec<crate::schema::Column>,
+) -> BTreeTable {
     BTreeTable::new(
         0,
         name.to_string(),
-        Vec::new(),
+        crate::alloc::vec![],
         columns,
         crate::schema::BTreeCharacteristics::empty(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
         None,
     )
 }
@@ -1564,12 +1567,12 @@ mod tests {
         Arc::new(BTreeTable::new(
             1,
             "t".to_string(),
-            Vec::new(),
-            Vec::new(),
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             crate::schema::BTreeCharacteristics::HAS_ROWID,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             None,
         ))
     }

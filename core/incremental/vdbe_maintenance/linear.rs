@@ -33,7 +33,7 @@ pub(super) fn emit_filter(
         output_contract.emitted_identity,
         output_contract.binding_rowids.clone(),
         input.requires_positive_first,
-    );
+    )?;
 
     let syms = connection.syms.read();
     let mut resolver = Resolver::new(
@@ -216,7 +216,7 @@ pub(super) fn emit_alias(
         output_contract.emitted_identity,
         output_contract.binding_rowids.clone(),
         input.requires_positive_first,
-    );
+    )?;
     append_alias_values(program, input, &output)?;
     EmittedNodeOutput::from_ephemeral(node_id, output, output_contract)
 }
@@ -239,7 +239,7 @@ pub(super) fn emit_project(
         output_contract.emitted_identity,
         output_contract.binding_rowids.clone(),
         input.requires_positive_first,
-    );
+    )?;
     emit_project_rows(program, input, projections, &output, schema, connection)?;
     EmittedNodeOutput::from_ephemeral(node_id, output, output_contract)
 }
