@@ -3108,31 +3108,51 @@ impl SerialType {
     }
 }
 
+/// Marks serial types 10 and 11, the only values below 128 with no size.
+const INVALID_SERIAL_TYPE_SIZE: u8 = u8::MAX;
+
+/// Data size for every serial type representable in a single-byte varint.
+///
+/// Serial types below 128 cover NULL, all integer widths, floats, the
+/// const-0/1 types, and TEXT/BLOB up to 57 bytes -- which is nearly every
+/// serial type that occurs in practice, so the common path is one load rather
+/// than a jump table. Types 10 and 11 are reserved and have no size.
+static SERIAL_TYPE_SIZES: [u8; 128] = {
+    let mut sizes = [0u8; 128];
+    sizes[1] = 1;
+    sizes[2] = 2;
+    sizes[3] = 3;
+    sizes[4] = 4;
+    sizes[5] = 6;
+    sizes[6] = 8;
+    sizes[7] = 8;
+    sizes[10] = INVALID_SERIAL_TYPE_SIZE;
+    sizes[11] = INVALID_SERIAL_TYPE_SIZE;
+    // TEXT is odd, BLOB is even, and both encode their length as
+    // `(serial - 12) / 2` -- for odd types the truncating division already
+    // discards the low bit, so the two cases need no separate handling.
+    let mut serial = 12;
+    while serial < 128 {
+        sizes[serial] = ((serial - 12) / 2) as u8;
+        serial += 1;
+    }
+    sizes
+};
+
 #[inline(always)]
 pub fn get_serial_type_size(serial: u64) -> Result<usize> {
-    match serial {
-        0 | 8 | 9 => Ok(0),
-        1 => Ok(1),
-        2 => Ok(2),
-        3 => Ok(3),
-        4 => Ok(4),
-        5 => Ok(6),
-        6 | 7 => Ok(8),
-        n if n >= 12 => match n % 2 {
-            0 => Ok(((n - 12) / 2) as usize), // Blob
-            1 => Ok(((n - 13) / 2) as usize), // Text
-            _ => {
-                mark_unlikely();
-                unreachable!();
-            }
-        },
-        _ => {
-            mark_unlikely();
-            Err(LimboError::Corrupt(format!(
-                "Invalid serial type: {serial}"
-            )))
-        }
+    if unlikely(serial >= 128) {
+        // TEXT/BLOB longer than 57 bytes; needs a multi-byte varint, so rare.
+        return Ok(((serial - 12) / 2) as usize);
     }
+    let size = SERIAL_TYPE_SIZES[serial as usize];
+    if unlikely(size == INVALID_SERIAL_TYPE_SIZE) {
+        mark_unlikely();
+        return Err(LimboError::Corrupt(format!(
+            "Invalid serial type: {serial}"
+        )));
+    }
+    Ok(size as usize)
 }
 
 impl<T: AsValueRef> From<T> for SerialType {
@@ -4925,5 +4945,80 @@ mod value_iterator_corrupt_header_tests {
         let payload = [0x01u8];
         let it = ValueIterator::new(&payload).expect("valid empty record");
         assert!(it.last().is_none());
+    }
+}
+
+#[cfg(test)]
+mod serial_type_size_tests {
+    use super::*;
+
+    /// The implementation this table replaced, kept verbatim as an oracle.
+    fn reference_serial_type_size(serial: u64) -> Option<usize> {
+        match serial {
+            0 | 8 | 9 => Some(0),
+            1 => Some(1),
+            2 => Some(2),
+            3 => Some(3),
+            4 => Some(4),
+            5 => Some(6),
+            6 | 7 => Some(8),
+            n if n >= 12 => match n % 2 {
+                0 => Some(((n - 12) / 2) as usize), // Blob
+                1 => Some(((n - 13) / 2) as usize), // Text
+                _ => unreachable!(),
+            },
+            _ => None,
+        }
+    }
+
+    fn assert_matches_reference(serial: u64) {
+        let expected = reference_serial_type_size(serial);
+        match (get_serial_type_size(serial), expected) {
+            (Ok(got), Some(want)) => {
+                assert_eq!(got, want, "size mismatch for serial type {serial}")
+            }
+            (Err(_), None) => {}
+            (got, want) => panic!("disagreement for serial type {serial}: {got:?} vs {want:?}"),
+        }
+    }
+
+    #[test]
+    fn matches_reference_exhaustively_below_the_table_boundary() {
+        // Covers every serial type expressible in a one- or two-byte varint,
+        // including the reserved types 10 and 11 and the 127/128 boundary
+        // where the table gives way to arithmetic.
+        for serial in 0..=16_384u64 {
+            assert_matches_reference(serial);
+        }
+    }
+
+    #[test]
+    fn matches_reference_at_boundaries_and_extremes() {
+        let cases = [
+            0,
+            9,
+            10,
+            11,
+            12,
+            13,
+            126,
+            127,
+            128,
+            129,
+            // Largest values a varint can carry.
+            (1u64 << 56) - 1,
+            1u64 << 56,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        for serial in cases {
+            assert_matches_reference(serial);
+        }
+    }
+
+    #[test]
+    fn reserved_serial_types_are_corrupt() {
+        assert!(get_serial_type_size(10).is_err());
+        assert!(get_serial_type_size(11).is_err());
     }
 }
