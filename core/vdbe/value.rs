@@ -1285,15 +1285,28 @@ impl Value {
             // Fall through to pattern_compare if boundary check fails (multi-byte UTF-8)
         }
 
-        // 4. Fast Path: '%abc%' (Contains)
+        // 4. Fast Path: '%abc%', '%abc%def%', ... (ordered substrings)
+        // Greedy leftmost matching per segment is equivalent to SQLite's
+        // patternCompare here: '%a%b%' matches iff 'a' occurs and 'b' occurs
+        // after it, and taking each earliest occurrence never rules out a
+        // later match. TPC-H q13/q16 run this shape per row.
         if !has_escape
             && pattern.len() >= 2
             && pattern.starts_with('%')
             && pattern.ends_with('%')
-            && !pattern[1..pattern.len() - 1].contains(['%', '_'])
+            && !pattern.contains('_')
         {
-            let needle = &pattern[1..pattern.len() - 1];
-            return Ok(contains_ignore_ascii_case(text, needle));
+            let mut haystack = text.as_bytes();
+            for seg in pattern[1..pattern.len() - 1].split('%') {
+                if seg.is_empty() {
+                    continue;
+                }
+                match find_ignore_ascii_case(haystack, seg.as_bytes()) {
+                    Some(i) => haystack = &haystack[i + seg.len()..],
+                    None => return Ok(false),
+                }
+            }
+            return Ok(true);
         }
 
         Ok(pattern_compare(pattern, text, &LIKE_INFO, escape) == CompareResult::Match)
@@ -1335,14 +1348,24 @@ impl Value {
             // Fall through to pattern_compare if boundary check fails (multi-byte UTF-8)
         }
 
-        // 4. Fast Path: '*abc*' (Contains)
+        // 4. Fast Path: '*abc*', '*abc*def*', ... (ordered substrings)
+        // Greedy leftmost matching per segment, as in exec_like's fast path.
         if pattern.len() >= 2
             && pattern.starts_with('*')
             && pattern.ends_with('*')
-            && !pattern[1..pattern.len() - 1].contains(GLOB_CHARS)
+            && !pattern.contains(['?', '['])
         {
-            let needle = &pattern[1..pattern.len() - 1];
-            return Ok(find_subslice(text.as_bytes(), needle.as_bytes()).is_some());
+            let mut haystack = text.as_bytes();
+            for seg in pattern[1..pattern.len() - 1].split('*') {
+                if seg.is_empty() {
+                    continue;
+                }
+                match find_subslice(haystack, seg.as_bytes()) {
+                    Some(i) => haystack = &haystack[i + seg.len()..],
+                    None => return Ok(false),
+                }
+            }
+            return Ok(true);
         }
 
         Ok(pattern_compare(pattern, text, &GLOB_INFO, None) == CompareResult::Match)
@@ -1557,14 +1580,12 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// UTF-8, so its first byte is never a continuation byte and cannot match in
 /// the middle of a multi-byte character.
 #[inline(never)]
-fn contains_ignore_ascii_case(text: &str, needle: &str) -> bool {
-    let haystack = text.as_bytes();
-    let needle = needle.as_bytes();
+fn find_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
-        return true;
+        return Some(0);
     }
     if needle.len() > haystack.len() {
-        return false;
+        return None;
     }
     let last_start = haystack.len() - needle.len();
     let first = needle[0];
@@ -1578,12 +1599,10 @@ fn contains_ignore_ascii_case(text: &str, needle: &str) -> bool {
         } else {
             memchr::memchr2(lower, upper, candidates)
         };
-        let Some(offset) = found else {
-            return false;
-        };
+        let offset = found?;
         let i = start + offset;
         if haystack[i + 1..i + needle.len()].eq_ignore_ascii_case(tail) {
-            return true;
+            return Some(i);
         }
         start = i + 1;
     }
@@ -2889,6 +2908,18 @@ mod tests {
         // An escape char inside the needle must bypass the fast path
         assert!(Value::exec_like("%aXb%", "ab", Some('X')).unwrap());
         assert!(!Value::exec_like("%aXb%", "aXb", Some('X')).unwrap());
+        // Multi-segment: substrings must appear in order
+        assert!(Value::exec_like("%ab%cd%", "xabycdz", None).unwrap());
+        assert!(!Value::exec_like("%ab%cd%", "xcdyabz", None).unwrap());
+        assert!(Value::exec_like("%express%packages%", "EXPRESS PACKAGES", None).unwrap());
+        assert!(!Value::exec_like("%express%packages%", "packages express", None).unwrap());
+        // Greedy leftmost matching must not rule out later segments
+        assert!(Value::exec_like("%aa%a%", "aaa", None).unwrap());
+        assert!(!Value::exec_like("%aa%a%", "aab", None).unwrap());
+        // Consecutive percents collapse
+        assert!(Value::exec_like("%ab%%cd%", "abcd", None).unwrap());
+        // Underscore anywhere bypasses the fast path
+        assert!(Value::exec_like("%a_b%c%", "xaybzc", None).unwrap());
     }
 
     #[test]
@@ -2902,6 +2933,10 @@ mod tests {
         // Inner wildcard chars must bypass the fast path
         assert!(Value::exec_glob("*a?c*", "xxabcyy").unwrap());
         assert!(Value::exec_glob("*a[bd]c*", "xxadcyy").unwrap());
+        // Multi-segment: substrings must appear in order, case-sensitively
+        assert!(Value::exec_glob("*ab*cd*", "xabycdz").unwrap());
+        assert!(!Value::exec_glob("*ab*cd*", "xcdyabz").unwrap());
+        assert!(!Value::exec_glob("*ab*cd*", "xAByCDz").unwrap());
     }
 
     #[test]
