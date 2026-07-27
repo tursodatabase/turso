@@ -1,7 +1,7 @@
 simulator:
   - changed-files:
       - any-glob-to-any-file: "testing/simulator/**/*"
-docs:
+documentation:
   - changed-files:
       - any-glob-to-any-file: "docs/**/*"
 
@@ -92,7 +92,7 @@ storage:
   - changed-files:
       - any-glob-to-any-file: "core/storage/*"
 
-vector:
+vector search:
   - changed-files:
       - any-glob-to-any-file: "core/vector/*"
 
