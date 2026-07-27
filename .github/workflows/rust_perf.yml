@@ -108,7 +108,7 @@ jobs:
           cache-on-failure: true
       - uses: useblacksmith/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
 
       - name: Clickbench
         run: make clickbench

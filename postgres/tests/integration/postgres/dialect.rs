@@ -1964,6 +1964,131 @@ fn test_postgres_similar_to(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_order_by_nulls_first_last(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, NULL), (3, 5), (4, NULL), (5, 20)")
+        .unwrap();
+
+    let run = |sql: &str| -> Vec<Option<i64>> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let mut results = Vec::new();
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    let v = match row.get_value(0) {
+                        Value::Numeric(Numeric::Integer(v)) => Some(*v),
+                        Value::Null => None,
+                        other => panic!("unexpected value: {other:?}"),
+                    };
+                    results.push(v);
+                }
+                StepResult::Done => break,
+                _ => {}
+            }
+        }
+        results
+    };
+
+    // Default ASC ordering treats NULLs as smallest, matching PostgreSQL.
+    assert_eq!(
+        run("SELECT v FROM t ORDER BY v"),
+        vec![None, None, Some(5), Some(10), Some(20)]
+    );
+    assert_eq!(
+        run("SELECT v FROM t ORDER BY v NULLS FIRST"),
+        vec![None, None, Some(5), Some(10), Some(20)]
+    );
+    assert_eq!(
+        run("SELECT v FROM t ORDER BY v NULLS LAST"),
+        vec![Some(5), Some(10), Some(20), None, None]
+    );
+    assert_eq!(
+        run("SELECT v FROM t ORDER BY v DESC NULLS FIRST"),
+        vec![None, None, Some(20), Some(10), Some(5)]
+    );
+    assert_eq!(
+        run("SELECT v FROM t ORDER BY v DESC NULLS LAST"),
+        vec![Some(20), Some(10), Some(5), None, None]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_compound_select_order_by_nulls_first_last(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t1 (v INTEGER)").unwrap();
+    conn.execute("CREATE TABLE t2 (v INTEGER)").unwrap();
+    conn.execute("INSERT INTO t1 VALUES (10), (NULL)").unwrap();
+    conn.execute("INSERT INTO t2 VALUES (5), (NULL)").unwrap();
+
+    let run = |sql: &str| -> Vec<Option<i64>> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let mut results = Vec::new();
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    let v = match row.get_value(0) {
+                        Value::Numeric(Numeric::Integer(v)) => Some(*v),
+                        Value::Null => None,
+                        other => panic!("unexpected value: {other:?}"),
+                    };
+                    results.push(v);
+                }
+                StepResult::Done => break,
+                _ => {}
+            }
+        }
+        results
+    };
+
+    assert_eq!(
+        run("SELECT v FROM t1 UNION SELECT v FROM t2 ORDER BY v NULLS LAST"),
+        vec![Some(5), Some(10), None]
+    );
+    assert_eq!(
+        run("SELECT v FROM t1 UNION SELECT v FROM t2 ORDER BY v NULLS FIRST"),
+        vec![None, Some(5), Some(10)]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_window_order_by_nulls_first_last(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, NULL), (3, 5)")
+        .unwrap();
+
+    // ROW_NUMBER() OVER (ORDER BY v NULLS LAST) ranks NULL last within the
+    // window's own ordering, independent of the query's outer ORDER BY.
+    let mut stmt = conn
+        .prepare("SELECT id, ROW_NUMBER() OVER (ORDER BY v NULLS LAST) FROM t ORDER BY id")
+        .unwrap();
+    let mut results: Vec<(i64, i64)> = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                let Value::Numeric(Numeric::Integer(id)) = row.get_value(0) else {
+                    panic!("expected integer id");
+                };
+                let Value::Numeric(Numeric::Integer(rank)) = row.get_value(1) else {
+                    panic!("expected integer row_number");
+                };
+                results.push((*id, *rank));
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    // id=3 (v=5) ranks 1st, id=1 (v=10) ranks 2nd, id=2 (v=NULL) ranks last.
+    assert_eq!(results, vec![(1, 2), (2, 3), (3, 1)]);
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_generate_series(db: TempDatabase) {
     let conn = db.connect_postgres();
 

@@ -4,10 +4,10 @@ build-backend = 'maturin'
 
 [project]
 name = 'pyturso'
-description = "Turso is a work-in-progress, in-process OLTP database management system, compatible with SQLite."
+description = "Turso is an in-process SQL database written in Rust, compatible with SQLite."
 requires-python = '>=3.10'
 classifiers = [
-    'Development Status :: 3 - Alpha',
+    'Development Status :: 4 - Beta',
     'Programming Language :: Python',
     'Programming Language :: Python :: 3',
     'Programming Language :: Python :: 3 :: Only',

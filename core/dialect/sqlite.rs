@@ -282,6 +282,24 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
             }
             Ok(Some(Func::Window(WindowFunc::NthValue)))
         }
+        "lag" => {
+            if !(1..=3).contains(&arg_count) {
+                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+            }
+            Ok(Some(Func::Window(WindowFunc::Lag)))
+        }
+        "lead" => {
+            if !(1..=3).contains(&arg_count) {
+                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+            }
+            Ok(Some(Func::Window(WindowFunc::Lead)))
+        }
+        "ntile" => {
+            if arg_count != 1 {
+                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+            }
+            Ok(Some(Func::Window(WindowFunc::Ntile)))
+        }
         "timediff" => {
             if arg_count != 2 {
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)

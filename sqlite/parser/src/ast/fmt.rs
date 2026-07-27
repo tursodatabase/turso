@@ -79,12 +79,11 @@ impl<T: Write> TokenStream for WriteTokenStream<'_, T> {
 
         match (ty, ty.as_str(), value) {
             (TK_BLOB, None, value) => {
-                self.write.write_char('X')?;
-                self.write.write_char('\'')?;
                 if let Some(str) = value {
                     self.write.write_str(str)?;
+                } else {
+                    self.write.write_str("X''")?;
                 }
-                self.write.write_char('\'')?;
                 Ok(())
             }
             (_, ty_str, value) => {

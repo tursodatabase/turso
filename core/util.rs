@@ -410,7 +410,9 @@ pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
     match (lhs, rhs) {
         (Literal::Numeric(n1), Literal::Numeric(n2)) => cmp_numeric_strings(n1, n2),
         (Literal::String(s1), Literal::String(s2)) => s1 == s2,
-        (Literal::Blob(b1), Literal::Blob(b2)) => b1 == b2,
+        (Literal::Blob(b1), Literal::Blob(b2)) => {
+            ast::blob_literal_hex(b1).eq_ignore_ascii_case(ast::blob_literal_hex(b2))
+        }
         (Literal::Keyword(k1), Literal::Keyword(k2)) => check_ident_equivalency(k1, k2),
         (Literal::Null, Literal::Null) => true,
         (Literal::True, Literal::True) => true,

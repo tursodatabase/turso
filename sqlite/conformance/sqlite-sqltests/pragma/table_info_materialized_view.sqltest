@@ -1,0 +1,15 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@skip-file-if sqlite "materialized views are a turso-specific feature"
+@requires materialized_views "requires materialized view support"
+
+# Materialized view output columns have no declared PRIMARY KEY metadata.
+test table-info-materialized-view {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;
+    SELECT name, pk FROM pragma_table_info('mv') ORDER BY cid;
+}
+expect {
+    a|0
+    b|0
+}

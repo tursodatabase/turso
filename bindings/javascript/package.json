@@ -16,11 +16,12 @@
     "sync/packages/wasm"
   ],
   "resolutions": {
+    "playwright": "1.61.0",
     "emnapi": "1.4.5",
     "@emnapi/core": "1.8.1",
     "@emnapi/runtime": "1.8.1",
     "@emnapi/wasi-threads": "1.1.0",
     "@napi-rs/cli": "3.1.5"
   },
-  "version": "0.8.0-pre.1"
+  "version": "0.8.0-pre.2"
 }
