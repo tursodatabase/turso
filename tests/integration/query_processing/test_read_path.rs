@@ -1084,3 +1084,96 @@ fn test_parameter_column_names(tmp_db: TempDatabase) {
         assert_eq!(names, expected, "Turso column names mismatch for: {sql}");
     }
 }
+
+/// A fused column-range read (Insn::ColumnRange) must stay correct when
+/// `cursor.record()` yields IO mid-instruction. Records spanning many
+/// overflow pages are scanned through a reopened database whose IO only
+/// completes one queued operation per yield, so the instruction is
+/// re-entered repeatedly while filling its destination registers.
+#[test]
+fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
+    use crate::queued_io::QueuedIo;
+    use std::sync::Arc;
+    use turso_core::{Database, DatabaseOpts, SqliteDialect};
+
+    const ROWS: i64 = 4;
+    // ~100KB of TEXT per row spans dozens of overflow pages, so reading one
+    // record requires many page fetches.
+    const BIG_LEN: i64 = 100_000;
+
+    let io = Arc::new(QueuedIo::new());
+    let path = "column-range-io-reentry.db";
+    let open = |io: Arc<QueuedIo>| -> anyhow::Result<Arc<Database>> {
+        Ok(Database::open_file_with_flags(
+            io,
+            path,
+            Default::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )?)
+    };
+
+    {
+        let db = open(io.clone())?;
+        let conn = db.connect()?;
+        conn.execute("CREATE TABLE t(a INTEGER, b TEXT, c TEXT, d INTEGER, e TEXT)")?;
+        for i in 0..ROWS {
+            conn.execute(
+                format!(
+                    "INSERT INTO t VALUES ({i}, printf('%0{BIG_LEN}d', {i}), 'tail{i}', {}, 'end{i}')",
+                    i * 7
+                )
+                .as_str(),
+            )?;
+        }
+        conn.close()?;
+    }
+
+    // A fresh Database over the same backing file starts with a cold page
+    // cache, so every record (and its overflow chain) must be read back.
+    let db = open(io.clone())?;
+    let conn = db.connect()?;
+    let mut stmt = conn.prepare("SELECT a, b, c, d, e FROM t")?;
+    let mut io_yields = 0usize;
+    let mut rows: Vec<(i64, usize, String, i64, String)> = Vec::new();
+    loop {
+        match stmt.step()? {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                rows.push((
+                    row.get::<i64>(0)?,
+                    row.get::<&str>(1)?.len(),
+                    row.get::<&str>(2)?.to_string(),
+                    row.get::<i64>(3)?,
+                    row.get::<&str>(4)?.to_string(),
+                ));
+            }
+            StepResult::IO | StepResult::Yield => {
+                io_yields += 1;
+                // Complete a single queued operation per yield to maximize
+                // the number of times the column fetch is re-entered.
+                io.step_one()?;
+            }
+            StepResult::Done => break,
+            r => panic!("unexpected step result: {r:?}"),
+        }
+    }
+    assert!(
+        io_yields > 0,
+        "cold-cache overflow scan must yield IO so the column fetch is re-entered"
+    );
+    let expected: Vec<(i64, usize, String, i64, String)> = (0..ROWS)
+        .map(|i| {
+            (
+                i,
+                BIG_LEN as usize,
+                format!("tail{i}"),
+                i * 7,
+                format!("end{i}"),
+            )
+        })
+        .collect();
+    assert_eq!(rows, expected);
+    Ok(())
+}
