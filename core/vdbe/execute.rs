@@ -14483,8 +14483,10 @@ fn format_integrity_check_result(errors: &[IntegrityCheckError]) -> Result<Optio
     if errors.is_empty() {
         Ok(None)
     } else {
-        let errors: crate::alloc::Vec<_> =
-            errors.iter().map(|error| error.to_string()).try_collect()?;
+        let errors: crate::alloc::Vec<_> = crate::with_btree_allocation_site!(
+            IntegrityCheck,
+            errors.iter().map(|error| error.to_string()).try_collect()
+        )?;
         Ok(Some(errors.join("\n")))
     }
 }
