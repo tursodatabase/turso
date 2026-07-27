@@ -175,6 +175,38 @@ impl FailOnDemandAlloc {
     }
 }
 
+#[test]
+fn write_set_take_transfers_entries_without_cloning() {
+    let mut write_set = WriteSet::<TursoAllocator>::new();
+    let row_versions: RowVersions<TursoAllocator> = Arc::new(RwLock::new(crate::alloc::vec![]));
+    let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
+
+    assert!(write_set.insert(row_id, Arc::clone(&row_versions)));
+    let entries_ptr = write_set.entries.as_ptr();
+    let entries_capacity = write_set.entries.capacity();
+    let strong_count = Arc::strong_count(&row_versions);
+
+    let transferred = write_set.take();
+
+    assert!(write_set.entries.is_empty());
+    assert!(write_set.seen.is_empty());
+    assert_eq!(transferred.entries.as_ptr(), entries_ptr);
+    assert_eq!(transferred.entries.capacity(), entries_capacity);
+    assert_eq!(transferred.seen.len(), 1);
+    assert_eq!(Arc::strong_count(&row_versions), strong_count);
+    assert!(Arc::ptr_eq(&transferred.entries[0].1, &row_versions));
+}
+
+#[test]
+#[should_panic(expected = "write set cannot be modified unless transaction is active")]
+fn aborted_transaction_rejects_write_set_insert() {
+    let tx = new_tx(1, 1, TransactionState::Aborted);
+    let row_versions: RowVersions<TursoAllocator> = Arc::new(RwLock::new(crate::alloc::vec![]));
+    let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
+
+    tx.insert_to_write_set(row_id, row_versions);
+}
+
 unsafe impl crate::alloc::ApiAllocator for FailOnDemandAlloc {
     fn allocate(
         &self,

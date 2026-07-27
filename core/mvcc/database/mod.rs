@@ -952,6 +952,10 @@ impl<A: RowVersionAllocator> WriteSet<A> {
         self.entries.iter()
     }
 
+    fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+
     /// Retain entries where `keep(rowid, row_versions)` returns true.
     fn retain<F: FnMut(&RowID, &RowVersions<A>) -> bool>(&mut self, mut keep: F) {
         let seen = &mut self.seen;
@@ -963,11 +967,6 @@ impl<A: RowVersionAllocator> WriteSet<A> {
                 false
             }
         });
-    }
-
-    /// Clones the write set into a [Vec].
-    fn to_vec(&self) -> Vec<(RowID, RowVersions<A>)> {
-        self.entries.clone()
     }
 }
 
@@ -1043,6 +1042,11 @@ impl<A: RowVersionAllocator> Transaction<A> {
     }
 
     fn insert_to_write_set(&self, id: RowID, row_versions: RowVersions<A>) {
+        turso_assert_eq!(
+            self.state,
+            TransactionState::Active,
+            "write set cannot be modified unless transaction is active"
+        );
         // Always record in the current savepoint's `newly_added_to_write_set`.
         // Duplicates here are harmless: `rollback_savepoint_changes` collects
         // touched rowids into a BTreeSet (dedup), and the actual write_set
@@ -6330,6 +6334,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.rollback_tx_inner(tx_id, Some(connection), db);
     }
 
+    #[aristo::intent(
+        "Rollback freezes the transaction before transferring its complete write set; every \
+         recorded row-version chain is then visited from the transferred storage without cloning \
+         or allocating a snapshot.",
+        verify = "test",
+        id = "rollback_transfers_frozen_write_set"
+    )]
     fn rollback_tx_inner(&self, tx_id: TxID, connection: Option<&Connection>, db: usize) {
         let tx_unlocked = self
             .txs
@@ -6367,10 +6378,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             self.release_exclusive_tx(&tx_id);
         }
 
-        // Snapshot under the lock so we can drop it before recursing into
-        // `rollback_rowid` (which may take other locks).
-        let write_set_snapshot: Vec<(RowID, RowVersions<A>)> = tx.write_set.lock().to_vec();
-        for (_rowid, row_versions) in &write_set_snapshot {
+        // Transfer ownership under the lock so we can drop it before taking
+        // row-version-chain locks.
+        let write_set = tx.write_set.lock().take();
+        for (_rowid, row_versions) in write_set.entries {
             for rv in row_versions.write().iter_mut() {
                 rollback_row_version(tx_id, rv);
             }
