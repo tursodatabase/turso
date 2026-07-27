@@ -1769,12 +1769,111 @@ pub fn op_column(
         },
         insn
     );
+    op_column_impl(
+        program,
+        state,
+        *cursor_id,
+        ColumnFetch::Single {
+            column: *column,
+            dest: *dest,
+            default,
+        },
+    )
+}
+
+pub fn op_column_range(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        ColumnRange {
+            cursor_id,
+            start_column,
+            dest,
+            defaults,
+        },
+        insn
+    );
+    op_column_impl(
+        program,
+        state,
+        *cursor_id,
+        ColumnFetch::Range {
+            start_column: *start_column,
+            dest: *dest,
+            defaults,
+        },
+    )
+}
+
+/// What a Column-family instruction fetches once the cursor is positioned:
+/// a single column, or a run of consecutive columns that shares one record
+/// header walk.
+#[derive(Clone, Copy)]
+enum ColumnFetch<'a> {
+    Single {
+        column: usize,
+        dest: usize,
+        default: &'a Option<Value>,
+    },
+    Range {
+        start_column: usize,
+        dest: usize,
+        defaults: &'a [Option<Value>],
+    },
+}
+
+impl ColumnFetch<'_> {
+    /// Writes NULL to every destination register of this fetch.
+    fn set_null_dests(&self, state: &mut ProgramState) {
+        match *self {
+            ColumnFetch::Single { dest, .. } => state.registers[dest].set_null(),
+            ColumnFetch::Range { dest, defaults, .. } => {
+                for reg in &mut state.registers[dest..dest + defaults.len()] {
+                    reg.set_null();
+                }
+            }
+        }
+    }
+
+    fn fetch(
+        &self,
+        program: &Program,
+        state: &mut ProgramState,
+        cursor_id: usize,
+    ) -> Result<InsnFunctionStepResult> {
+        match *self {
+            ColumnFetch::Single {
+                column,
+                dest,
+                default,
+            } => op_column_fetch(program, state, cursor_id, column, dest, default),
+            ColumnFetch::Range {
+                start_column,
+                dest,
+                defaults,
+            } => op_column_range_fetch(program, state, cursor_id, start_column, dest, defaults),
+        }
+    }
+}
+
+/// Shared driver for Column and ColumnRange: resolves any pending deferred
+/// seek through the resumable `OpColumnState` machine, then runs the fetch.
+#[inline(always)]
+fn op_column_impl(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    fetch: ColumnFetch<'_>,
+) -> Result<InsnFunctionStepResult> {
     // Fast path: no deferred seek pending and no suspended state machine. The
     // column fetch either completes or yields IO with nothing persisted, so the
     // op-state slot (enum write + drop on clear) is bypassed entirely. On IO
     // resume the slot is still idle and this path re-executes.
-    if state.active_op_state.is_idle() && state.deferred_seeks[*cursor_id].is_none() {
-        let result = op_column_fetch(program, state, *cursor_id, *column, *dest, default)?;
+    if state.active_op_state.is_idle() && state.deferred_seeks[cursor_id].is_none() {
+        let result = fetch.fetch(program, state, cursor_id)?;
         if matches!(result, InsnFunctionStepResult::Step) {
             state.pc += 1;
         }
@@ -1783,7 +1882,7 @@ pub fn op_column(
     'outer: loop {
         match *state.active_op_state.column() {
             OpColumnState::Start => {
-                if let Some(deferred) = state.deferred_seeks[*cursor_id].take() {
+                if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
                     *state.active_op_state.column() = OpColumnState::Rowid {
                         index_cursor_id: deferred.index_cursor_id,
                         table_cursor_id: deferred.table_cursor_id,
@@ -1804,7 +1903,7 @@ pub fn op_column(
                         _ => panic!("unexpected cursor type"),
                     }
                 }) else {
-                    state.registers[*dest].set_null();
+                    fetch.set_null_dests(state);
                     break 'outer;
                 };
                 *state.active_op_state.column() = OpColumnState::Seek {
@@ -1839,7 +1938,7 @@ pub fn op_column(
                 *state.active_op_state.column() = OpColumnState::GetColumn;
             }
             OpColumnState::GetColumn => {
-                let result = op_column_fetch(program, state, *cursor_id, *column, *dest, default)?;
+                let result = fetch.fetch(program, state, cursor_id)?;
                 if !matches!(result, InsnFunctionStepResult::Step) {
                     // IO yield: the slot stays at GetColumn so the resume
                     // re-enters this arm.
@@ -1926,21 +2025,7 @@ fn op_column_fetch(
             };
 
             // DEFAULT handling
-            let Some(ref default) = default else {
-                state.registers[dest].set_null();
-                return Ok(InsnFunctionStepResult::Step);
-            };
-            match (default, &mut state.registers[dest]) {
-                (Value::Text(new_text), Register::Value(Value::Text(existing_text))) => {
-                    existing_text.do_extend(new_text)?;
-                }
-                (Value::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
-                    existing_blob.do_extend(new_blob)?;
-                }
-                _ => {
-                    state.registers[dest].set_value(default.clone());
-                }
-            }
+            apply_column_default(default, &mut state.registers[dest])?;
         }
         CursorType::Sorter => {
             let record = {
@@ -2004,6 +2089,226 @@ fn op_column_fetch(
         }
         CursorType::VirtualTable(_) => {
             panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
+        }
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Applies a Column default to the register of a column missing from a short
+/// record: the default value when present, NULL otherwise. Reuses the
+/// register's existing TEXT/BLOB allocation like the record decode path does.
+fn apply_column_default(default: &Option<Value>, reg: &mut Register) -> Result<()> {
+    let Some(default) = default else {
+        reg.set_null();
+        return Ok(());
+    };
+    match (default, reg) {
+        (Value::Text(new_text), Register::Value(Value::Text(existing_text))) => {
+            existing_text.do_extend(new_text)?;
+        }
+        (Value::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
+            existing_blob.do_extend(new_blob)?;
+        }
+        (default, reg) => {
+            reg.set_value(default.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Fetches `defaults.len()` consecutive columns of the cursor's current row
+/// into consecutive registers starting at `dest`, walking the record header
+/// exactly once. Returns `Step` on completion; any IO is propagated without
+/// persisting state, so callers can safely re-invoke after the completion
+/// finishes (destination registers written before a yield are rewritten with
+/// identical values on re-entry, since the cursor does not move within one
+/// instruction).
+fn op_column_range_fetch(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    start_column: usize,
+    dest: usize,
+    defaults: &[Option<Value>],
+) -> Result<InsnFunctionStepResult> {
+    let count = defaults.len();
+
+    // MaterializedView cursors (and any other cursor kind that reads columns
+    // through its own column-at-a-time API) get the single-column fetch per
+    // column. Emission never fuses those cursors, so this is a correctness
+    // fallback, not a fast path.
+    if matches!(state.get_cursor(cursor_id), Cursor::MaterializedView(_)) {
+        return op_column_range_fetch_per_column(
+            program,
+            state,
+            cursor_id,
+            start_column,
+            dest,
+            defaults,
+        );
+    }
+
+    let (_, cursor_type) = program
+        .cursor_ref
+        .get(cursor_id)
+        .expect("cursor_id should exist in cursor_ref");
+    match cursor_type {
+        CursorType::BTreeTable(_)
+        | CursorType::BTreeIndex(_)
+        | CursorType::MaterializedView(_, _) => {
+            let filled = {
+                let cursor_ref =
+                    must_be_btree_cursor!(cursor_id, program.cursor_ref, state, "ColumnRange");
+                let cursor = cursor_ref.as_btree_mut();
+
+                if cursor.get_null_flag() {
+                    tracing::trace!("op_column_range(null_flag)");
+                    for reg in &mut state.registers[dest..dest + count] {
+                        reg.set_null();
+                    }
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+
+                let record_result = return_if_io!(cursor.record());
+                let Some(record) = record_result else {
+                    // Cursor is not positioned on a valid row (e.g., empty
+                    // table). Return NULL, not the columns' default values;
+                    // DEFAULT handling below is for when the record exists but
+                    // has fewer columns than expected.
+                    for reg in &mut state.registers[dest..dest + count] {
+                        reg.set_null();
+                    }
+                    return Ok(InsnFunctionStepResult::Step);
+                };
+
+                let mut payload_iterator = record.iter()?;
+                payload_iterator
+                    .fill_n_into_registers(start_column, &mut state.registers[dest..dest + count])?
+            };
+            if filled < count {
+                branches::mark_unlikely();
+                // The record has fewer columns than expected.
+                for (default, reg) in defaults[filled..]
+                    .iter()
+                    .zip(&mut state.registers[dest + filled..dest + count])
+                {
+                    apply_column_default(default, reg)?;
+                }
+            }
+        }
+        CursorType::Sorter => {
+            let record = {
+                let cursor = state.get_cursor(cursor_id);
+                let cursor = cursor.as_sorter_mut();
+                cursor.record().cloned()
+            };
+            if let Some(record) = record {
+                let mut payload_iterator = record.iter()?;
+                let filled = payload_iterator.fill_n_into_registers(
+                    start_column,
+                    &mut state.registers[dest..dest + count],
+                )?;
+                for (default, reg) in defaults[filled..]
+                    .iter()
+                    .zip(&mut state.registers[dest + filled..dest + count])
+                {
+                    apply_column_default(default, reg)?;
+                }
+            } else {
+                for reg in &mut state.registers[dest..dest + count] {
+                    reg.set_null();
+                }
+            }
+        }
+        CursorType::Pseudo(_) => {
+            let content_reg = crate::get_cursor!(state, cursor_id)
+                .as_pseudo_mut()
+                .content_reg();
+            // The record is read while decoding into the destination
+            // registers, so the content register must lie outside the
+            // destination range.
+            if content_reg >= dest && content_reg < dest + count {
+                return Err(LimboError::InternalError(format!(
+                    "ColumnRange: pseudo-cursor content register {content_reg} must not overlap destination registers {dest}..{}",
+                    dest + count
+                )));
+            }
+            let (content, dest_regs) = if content_reg < dest {
+                let (left, right) = state.registers.split_at_mut(dest);
+                (&mut left[content_reg], &mut right[..count])
+            } else {
+                let (left, right) = state.registers.split_at_mut(dest + count);
+                (&mut right[content_reg - (dest + count)], &mut left[dest..])
+            };
+            match content {
+                Register::Record(record) => {
+                    // Decode straight into the registers; going through owned
+                    // Values would allocate for every TEXT/BLOB column on
+                    // every row.
+                    let mut payload_iterator = record.iter()?;
+                    let filled = payload_iterator.fill_n_into_registers(start_column, dest_regs)?;
+                    if filled < count {
+                        // A pseudo cursor is opened with num_fields matching
+                        // the record built for it, so every emitted column
+                        // index is in range. NULL on a missing column matches
+                        // the b-tree arm.
+                        turso_debug_assert!(
+                            false,
+                            "pseudo-cursor column out of range for record",
+                            { "start_column": start_column, "filled": filled }
+                        );
+                        for reg in &mut dest_regs[filled..] {
+                            reg.set_null();
+                        }
+                    }
+                }
+                _ => {
+                    for reg in dest_regs {
+                        reg.set_null();
+                    }
+                }
+            }
+        }
+        CursorType::IndexMethod(..) => {
+            return op_column_range_fetch_per_column(
+                program,
+                state,
+                cursor_id,
+                start_column,
+                dest,
+                defaults,
+            );
+        }
+        CursorType::VirtualTable(_) => {
+            panic!("Insn:ColumnRange on virtual table cursor, use Insn:VColumn instead");
+        }
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Correctness fallback for cursor kinds without a shared record payload:
+/// runs the single-column fetch for each column of the range. Any IO yield is
+/// propagated with nothing persisted; on re-invoke, columns before the yield
+/// are re-fetched into the same registers with identical values.
+fn op_column_range_fetch_per_column(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    start_column: usize,
+    dest: usize,
+    defaults: &[Option<Value>],
+) -> Result<InsnFunctionStepResult> {
+    for (i, default) in defaults.iter().enumerate() {
+        let result = op_column_fetch(
+            program,
+            state,
+            cursor_id,
+            start_column + i,
+            dest + i,
+            default,
+        )?;
+        if !matches!(result, InsnFunctionStepResult::Step) {
+            return Ok(result);
         }
     }
     Ok(InsnFunctionStepResult::Step)
