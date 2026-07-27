@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3 as _stdlib_sqlite3
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import TracebackType
@@ -844,6 +845,8 @@ class Cursor:
         rf = self.row_factory
         if rf is None:
             return row_values
+        if isinstance(rf, type) and issubclass(rf, _stdlib_sqlite3.Row):
+            raise TypeError("sqlite3.Row is not supported as a row_factory on turso connections; use turso.Row instead")
         if isinstance(rf, type) and issubclass(rf, Row):
             return rf(self, Row(self, row_values))  # type: ignore[call-arg]
         if callable(rf):
