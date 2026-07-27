@@ -519,7 +519,7 @@ pub(super) fn emit_inner_join(
         output_contract.emitted_identity,
         output_contract.binding_rowids.clone(),
         true,
-    );
+    )?;
     let eph_cursor_id = channel.cursor_id;
 
     // [transport identity..., binding rowids..., natural join row..., weight].
@@ -827,7 +827,7 @@ pub(super) fn emit_left_join(
         output_contract.emitted_identity,
         output_contract.binding_rowids.clone(),
         true,
-    );
+    )?;
     let natural_width = contract
         .inputs
         .iter()

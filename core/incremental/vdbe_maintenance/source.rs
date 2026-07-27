@@ -77,7 +77,7 @@ pub(super) fn materialize_delta_source(
         source_contract.emitted_identity,
         source_contract.binding_rowids.clone(),
         false,
-    );
+    )?;
     emit_base_scan_delta(
         program,
         view_name,

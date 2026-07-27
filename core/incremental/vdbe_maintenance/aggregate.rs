@@ -56,7 +56,7 @@ pub(super) fn emit_group_aggregate(
         output_contract.emitted_identity,
         output_contract.binding_rowids.clone(),
         false,
-    );
+    )?;
     emit_group_aggregate_rows(
         program,
         view_name,

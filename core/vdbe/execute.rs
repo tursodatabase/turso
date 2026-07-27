@@ -7056,7 +7056,7 @@ pub fn op_agg_context_load(
         mark_unlikely();
         LimboError::InternalError(format!("aggregate {func:?} has no fixed-width state"))
     })?;
-    let mut payload = crate::alloc::Vec::new();
+    let mut payload = crate::alloc::vec![];
     payload.try_reserve(width)?;
     for j in 0..width {
         payload.push(state.registers[*payload_start_reg + j].get_value().clone());
@@ -11560,7 +11560,7 @@ pub struct OpInsertState {
 
 struct ChangeLogRoute {
     table: Arc<crate::schema::BTreeTable>,
-    dependent_views: Vec<String>,
+    dependent_views: crate::alloc::Vec<String>,
     is_materialized_view: bool,
 }
 
