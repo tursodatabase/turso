@@ -95,6 +95,7 @@ pub(super) fn seed_ephemeral_stream_cache<'a>(
     program: &mut ProgramBuilder,
     channel: &EphemeralDelta,
     remap: &BindingRemap,
+    table_references: &TableReferences,
     resolver: &mut Resolver<'a>,
 ) -> Result<()> {
     resolver.enable_expr_to_reg_cache();
@@ -110,7 +111,7 @@ pub(super) fn seed_ephemeral_stream_cache<'a>(
             default: None,
         });
         let bound = remap_bound_expr(expr, remap)?;
-        resolver.cache_expr_reg(std::borrow::Cow::Owned(bound), value_reg, false, None);
+        cache_stream_expr_reg(resolver, bound, value_reg, table_references)?;
     }
     turso_assert!(
         channel.binding_rowid_columns.len() == channel.schema.bindings.len(),
@@ -147,4 +148,41 @@ pub(super) fn seed_ephemeral_stream_cache<'a>(
         resolver.cache_expr_reg(std::borrow::Cow::Owned(expr), value_reg, false, None);
     }
     Ok(())
+}
+
+/// Cache one materialized stream value with the collation context a regular
+/// column read would have produced.
+///
+/// Stateful operators publish synthetic expressions such as `SUM(x)`. Those
+/// results do not inherit the argument column's collation, so only SQL's
+/// column-like forms and an explicit `COLLATE` carry context across the
+/// physical stream boundary.
+pub(super) fn cache_stream_expr_reg<'a>(
+    resolver: &mut Resolver<'a>,
+    expr: ast::Expr,
+    value_reg: usize,
+    table_references: &TableReferences,
+) -> Result<()> {
+    fn carries_collation(expr: &ast::Expr) -> bool {
+        match expr {
+            ast::Expr::Column { .. } | ast::Expr::RowId { .. } | ast::Expr::Collate(_, _) => true,
+            ast::Expr::Cast { expr, .. } | ast::Expr::Unary(ast::UnaryOperator::Positive, expr) => {
+                carries_collation(expr)
+            }
+            ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => carries_collation(&exprs[0]),
+            _ => false,
+        }
+    }
+
+    if carries_collation(&expr) {
+        resolver.cache_scalar_expr_reg(
+            std::borrow::Cow::Owned(expr),
+            value_reg,
+            false,
+            table_references,
+        )
+    } else {
+        resolver.cache_expr_reg(std::borrow::Cow::Owned(expr), value_reg, false, None);
+        Ok(())
+    }
 }

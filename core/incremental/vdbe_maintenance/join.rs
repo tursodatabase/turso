@@ -1,4 +1,4 @@
-use super::binding::{make_joined_table, remap_bound_expr, BindingRemap};
+use super::binding::{cache_stream_expr_reg, make_joined_table, remap_bound_expr, BindingRemap};
 use super::output::{DeltaSource, EmittedNodeOutput, NodeOutput, NodeOutputContract};
 use super::plan::OperatorStateDef;
 use super::stream::{
@@ -398,7 +398,7 @@ fn emit_join_phase(
                 _ => program.emit_column_or_rowid(cursor_ids[pos], physical_column, value_reg),
             }
             let bound = remap_bound_expr(expr, &binding_remap)?;
-            resolver.cache_expr_reg(std::borrow::Cow::Owned(bound), value_reg, false, None);
+            cache_stream_expr_reg(&mut *resolver, bound, value_reg, &table_references)?;
         }
         for (binding_index, binding) in input.schema.bindings.iter().enumerate() {
             let rowid_reg = program.alloc_register();
