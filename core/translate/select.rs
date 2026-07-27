@@ -422,32 +422,43 @@ fn prepare_one_select_plan(
                             BindingBehavior::ResultColumnsNotAllowed,
                         )?;
                     }
-                    if let Some(base_name) = window_def.window.base.as_ref() {
-                        let base_name = normalize_ident(base_name.as_str());
-                        // SQLite chains WINDOW-clause definitions only to an
-                        // earlier definition. An unresolved base here is left
-                        // alone and may still be used as an ordinary name.
-                        if let Some(base) = named_windows
-                            .iter()
-                            .rfind(|window| window.name == base_name)
-                        {
-                            if !partition_by.is_empty() {
+                    // Chain a `w2 AS (w1 ORDER BY ...)` definition to its base
+                    // window, mirroring `sqlite3WindowChain` (window.c:1276)
+                    // as SQLite's grammar invokes it — from the
+                    // `windowdefn_list ::= windowdefn_list COMMA windowdefn`
+                    // rule only. Consequences ported faithfully: only EARLIER
+                    // definitions in the same WINDOW clause are candidates,
+                    // and the clause's first definition is never chained at
+                    // all, so its base name (and any forward reference) is
+                    // silently ignored rather than an error.
+                    if let Some(base) = &window_def.window.base {
+                        if !named_windows.is_empty() {
+                            let base_name = normalize_ident(base.as_str());
+                            let Some(base_def) =
+                                named_windows.iter().rfind(|d| d.name == base_name)
+                            else {
+                                crate::bail_parse_error!("no such window: {}", base_name);
+                            };
+                            if !window_def.window.partition_by.is_empty() {
                                 crate::bail_parse_error!(
-                                    "cannot override PARTITION clause of window: {base_name}"
+                                    "cannot override PARTITION clause of window: {}",
+                                    base_name
                                 );
                             }
-                            if base.has_frame_clause {
-                                crate::bail_parse_error!(
-                                    "cannot override frame specification of window: {base_name}"
-                                );
-                            }
-                            let base_bound = base
+                            let base_bound = base_def
                                 .bound
                                 .as_ref()
-                                .expect("named windows are bound before functions are resolved");
+                                .expect("named defs retain bound until function resolution");
                             if !base_bound.order_by.is_empty() && !order_by.is_empty() {
                                 crate::bail_parse_error!(
-                                    "cannot override ORDER BY clause of window: {base_name}"
+                                    "cannot override ORDER BY clause of window: {}",
+                                    base_name
+                                );
+                            }
+                            if base_def.user_frame_clause.is_some() {
+                                crate::bail_parse_error!(
+                                    "cannot override frame specification of window: {}",
+                                    base_name
                                 );
                             }
                             partition_by.clone_from(&base_bound.partition_by);
@@ -463,7 +474,6 @@ fn prepare_one_select_plan(
                             partition_by,
                             order_by,
                         }),
-                        has_frame_clause: window_def.window.frame_clause.is_some(),
                     });
                 }
             }
