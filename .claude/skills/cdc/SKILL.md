@@ -339,3 +339,76 @@ Run: `cargo test -- test_cdc` (integration) or `cargo test -p turso_sync_engine 
 10. **Backward-compatible version detection.** Pre-existing v1 CDC tables (without `turso_cdc_version`) are detected by checking table existence before creation. Existing tables get `CdcVersion::V1` inserted into the version table.
 11. **Typed version enum.** `CdcVersion` enum with `#[repr(u8)]` and `Ord`/`PartialOrd` enables feature gating via integer comparison (`has_commit_record()` = `self >= V2`). `Display`/`FromStr` handles database round-trip.
 12. **CDC and MVCC mutual exclusion.** Enabling CDC when MVCC is active (or vice versa) returns an error. Checked at PRAGMA set time and journal mode switch time.
+
+## Sync Engine Watermark Bookkeeping (pull generations, floors, rebase)
+
+Learned from analyzing PR #8065 (quadratic pull/push under continuous bidirectional
+sync) and implementing the confirmed-watermark/pending-push fix. Key facts:
+
+### Coordinate system
+- CDC `change_id`s are **epoch-local**: every pull rebase drops `turso_cdc`
+  (the remote apply replaces the DB content) and rebuilds it by re-capturing
+  replayed local changes, which **renumbers** all ids. The *pull generation*
+  (`pull_gen`) is the epoch counter; ids from different generations are not
+  comparable. Renumbering is unavoidable in general: logical remote apply can
+  emit its own CDC rows below the re-captured ones, and `use_transform` can
+  map one old change to 0..k new rows (`Skip`/`Rewrite`).
+- The **sync row** (`turso_sync_last_change_id`, per client) exists locally
+  and remotely. The remote row is written **atomically with each push batch**
+  (`send_push_batch` bundles data + `TURSO_SYNC_UPSERT_LAST_CHANGE_ID` +
+  COMMIT into one hrana batch) — it is the authoritative record of what the
+  server applied. The local row is written by the rebase (`gen+1`, translated
+  acknowledged boundary).
+
+### Two floors with different meanings — never conflate them
+- **Push floor** = "what the server has". Sources: live remote row read
+  (`fetch_last_change_id`, same-gen only), persisted confirmed watermark,
+  resolved pending push.
+- **Replay floor** (rebase) = "what the *pulled state being applied* contains".
+  A push confirmed **after the pull request was issued** may be absent from the
+  pulled state: its changes must be REPLAYED (not skipped), yet must NOT be
+  re-pushed. Hence: replay floor uses the **issue-time** confirmed snapshot
+  (`DbChangesStatus::confirmed_at_issue`), while translation of the
+  not-to-be-re-pushed boundary uses the **apply-time** confirmed value.
+- Boundary translation across a renumbering is only possible **during the
+  rebase replay loop**, where old ids and freshly captured new ids coexist:
+  track `max_local_change_id()` after replaying each change whose old id is at
+  or below the boundary.
+
+### Failure modes this bookkeeping prevents
+- **O(n²) sync**: on any gen mismatch both floors used to collapse to 0 →
+  every push re-sent the whole CDC history and every rebase re-captured it
+  (WAL grows without bound). Gen mismatch is the *steady state* when pull and
+  push run as independent loops (JS bindings do exactly that; the pull's cut
+  races the in-flight push).
+- **Duplicate apply**: re-pushing an already-applied batch re-applies stale row
+  images *later in the server order* and can clobber other clients' newer
+  writes. Duplicate replay is NOT idempotent under concurrency — never assume
+  it is safe.
+- **Failed-but-applied push**: response lost but server applied the batch. Must
+  be recorded (`DatabaseMetadata::pending_push`) BEFORE the request leaves,
+  with frozen send-time `(pull_gen, last_change_id)`; resolved later by
+  comparing the server row against the frozen coordinates (valid across any
+  number of rebases). Batches are atomic server-side, so `row >= sent_last`
+  ⟺ landed.
+
+### Server contract (load-bearing, assert it)
+A pull issued at time t must return state containing every push this client
+confirmed before t. Checkable only when the pulled row is same-gen
+(`pulled row >= confirmed_at_issue`, else protocol error); the gen-mismatch
+branch trusts it blindly. The dev sync server (`cli/sync_server.rs`) serves
+cuts pinned at request-arrival `wal_state().max_frame`, so it satisfies the
+contract; the client-side pull/push race is what makes cuts predate pushes.
+
+### Misc sharp edges
+- A replayed DELETE over a row absent from the pulled state captures NOTHING —
+  old→new id mapping has holes; boundary tracking must simply not advance
+  (this is also why `preserve_local_replay_floor` clamps the local row for
+  deletes).
+- Transform `Skip` entries never reach the server but are real local changes:
+  the remote row only advances past non-skipped ids; do not confirm past a
+  skipped entry's id ahead of its surrounding pushes.
+- `sync()` = push-then-pull sequentially and cannot produce gen mismatch
+  against the dev server; the pathology needs concurrent `pull()`/`push()`
+  loops (see `concurrent-updates` test in
+  `bindings/javascript/sync/packages/*/promise.test.ts`).

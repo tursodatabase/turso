@@ -38,7 +38,7 @@ use crate::{
         DatabaseRowTransformResult, DatabaseSchemaKind, DatabaseSchemaReplay,
         DatabaseStatementReplay, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
         DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbSyncInfo, DbSyncStatus,
-        PartialBootstrapStrategy, PartialSyncOpts, SyncEngineIoResult,
+        PartialBootstrapStrategy, PartialSyncOpts, PendingPush, SyncEngineIoResult,
     },
     wal_session::WalSession,
     Result,
@@ -2666,11 +2666,17 @@ pub async fn read_last_change_id<Ctx>(
     }
 }
 
+/// Read the local pull generation and the live remote sync row for
+/// `client_id`. Returns `(source_pull_gen, Some((target_pull_gen,
+/// target_change_id)))`, or `None` when the remote has no row yet. The row is
+/// the authoritative record of what the remote applied — it is written
+/// atomically with every push batch — so the caller resolves push floors and
+/// pending-push outcomes against it.
 pub async fn fetch_last_change_id<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
     source_conn: &Arc<turso_core::Connection>,
     client_id: &str,
-) -> Result<(i64, Option<i64>)> {
+) -> Result<(i64, Option<(i64, i64)>)> {
     tracing::info!("fetch_last_change_id: client_id={client_id}");
 
     // fetch last_change_id from the target DB in order to guarantee atomic replay of changes and avoid conflicts in case of failure
@@ -2745,16 +2751,12 @@ pub async fn fetch_last_change_id<IO: SyncEngineIo, Ctx>(
     if target_pull_gen > source_pull_gen {
         return Err(Error::DatabaseSyncEngineError(format!("protocol error: target_pull_gen > source_pull_gen: {target_pull_gen} > {source_pull_gen}")));
     }
-    let last_change_id = if target_pull_gen == source_pull_gen {
-        Some(target_change_id)
-    } else {
-        Some(0)
-    };
-    Ok((source_pull_gen, last_change_id))
+    Ok((source_pull_gen, Some((target_pull_gen, target_change_id))))
 }
 
 pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
+    engine: &crate::database_sync_engine::DatabaseSyncEngine<IO>,
     source: &DatabaseTape,
     client_id: &str,
     opts: &DatabaseSyncEngineOpts,
@@ -2762,9 +2764,65 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
     tracing::info!("push_logical_changes: client_id={client_id}");
     let source_conn = connect_untracked(source)?;
 
-    let (source_pull_gen, mut last_change_id) =
-        fetch_last_change_id(ctx, &source_conn, client_id).await?;
-    let replay_floor_change_id = last_change_id.unwrap_or(0);
+    let (source_pull_gen, remote_row) = fetch_last_change_id(ctx, &source_conn, client_id).await?;
+
+    // Resolve the confirmed watermark and any pending push with an unknown
+    // outcome. The server sync row is written atomically with each push
+    // batch, so a pending batch landed iff the row reached its frozen
+    // send-time coordinates - a check that stays valid across rebases because
+    // the send-time coordinates are never renumbered.
+    let (mut confirmed, pending) = {
+        let meta = engine.meta();
+        let confirmed = if meta.confirmed_pull_gen == source_pull_gen {
+            meta.confirmed_change_id
+        } else {
+            0
+        };
+        (confirmed, meta.pending_push.clone())
+    };
+    if let Some(pending) = pending {
+        let landed = remote_row.is_some_and(|(row_gen, row_id)| {
+            row_gen == pending.sent_pull_gen && row_id >= pending.sent_last_change_id
+        });
+        // a landed batch can be folded into the confirmed watermark only when
+        // its translated boundary is still in the current numbering
+        if landed && pending.cur_pull_gen == source_pull_gen {
+            confirmed = confirmed.max(pending.cur_change_id);
+        }
+        tracing::info!(
+            "push_logical_changes: client_id={client_id}, pending push resolved: landed={landed}, pending={pending:?}"
+        );
+        let folded = confirmed;
+        engine
+            .update_meta(ctx.coro, |m| {
+                m.pending_push = None;
+                if landed {
+                    m.confirmed_pull_gen = source_pull_gen;
+                    m.confirmed_change_id = folded;
+                }
+            })
+            .await?;
+    }
+    if let Some((row_gen, row_id)) = remote_row {
+        // Only this client's pushes write its sync row, and every push starts
+        // at or above the confirmed watermark - so a same-generation row below
+        // it means the remote lost acknowledged state (e.g. was restored from
+        // an older backup). Re-pushing silently could apply stale row images
+        // over other clients' newer writes, so fail loudly instead.
+        if row_gen == source_pull_gen && row_id < confirmed {
+            return Err(Error::DatabaseSyncEngineError(format!(
+                "protocol error: remote sync row ({row_gen}, {row_id}) is behind the locally confirmed watermark ({source_pull_gen}, {confirmed})"
+            )));
+        }
+    }
+    let mut floor = confirmed;
+    if let Some((row_gen, row_id)) = remote_row {
+        if row_gen == source_pull_gen {
+            floor = floor.max(row_id);
+        }
+    }
+    let replay_floor_change_id = floor;
+    let mut last_change_id = if floor > 0 { Some(floor) } else { None };
 
     tracing::debug!("push_logical_changes: last_change_id={:?}", last_change_id);
 
@@ -2829,18 +2887,70 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                 if !must_push {
                     continue;
                 }
+                let transformed = if opts.use_transform {
+                    Some(apply_transformation(ctx, &batch, &generator).await?)
+                } else {
+                    None
+                };
+                // last change id that will actually reach the remote: the
+                // remote sync row advances only past non-skipped changes
+                let sent_last_change_id = batch
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(i, _)| {
+                        transformed
+                            .as_ref()
+                            .is_none_or(|t| !matches!(t[*i], DatabaseRowTransformResult::Skip))
+                    })
+                    .map(|(_, change)| change.change_id);
+                let Some(sent_last_change_id) = sent_last_change_id else {
+                    // the transform skipped the whole batch - nothing will
+                    // reach the remote, so there is nothing to send or record
+                    batch.clear();
+                    continue;
+                };
+                // persist the pending-push record BEFORE the request leaves
+                // the process: if the response is lost, this is the only
+                // record that the batch may have been applied - without it the
+                // batch would be pushed (and applied) twice after a rebase
+                engine
+                    .update_meta(ctx.coro, |m| {
+                        m.pending_push = Some(PendingPush {
+                            sent_pull_gen: source_pull_gen,
+                            sent_last_change_id,
+                            cur_pull_gen: source_pull_gen,
+                            cur_change_id: sent_last_change_id,
+                        });
+                    })
+                    .await?;
                 let (rows_changed, next_change_id) = send_push_batch(
                     ctx,
                     &generator,
-                    opts,
+                    transformed,
                     &batch,
                     client_id,
                     source_pull_gen,
                     last_change_id,
                 )
                 .await?;
+                assert!(
+                    next_change_id == sent_last_change_id,
+                    "sent batch boundary must match the pending record: {next_change_id} != {sent_last_change_id}"
+                );
                 total_rows_changed += rows_changed;
                 last_change_id = Some(next_change_id);
+                engine
+                    .update_meta(ctx.coro, |m| {
+                        m.pending_push = None;
+                        if m.confirmed_pull_gen == source_pull_gen {
+                            m.confirmed_change_id = m.confirmed_change_id.max(next_change_id);
+                        } else {
+                            m.confirmed_pull_gen = source_pull_gen;
+                            m.confirmed_change_id = next_change_id;
+                        }
+                    })
+                    .await?;
                 batch.clear();
             }
         }
@@ -2862,27 +2972,29 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
     ))
 }
 
-/// Build and send a single push batch over HTTP. The caller owns the
-/// per-batch slice of changes; transformations (if enabled) run lazily here so
-/// the user-defined transform sees one batch's worth of rows at a time —
-/// matching the streaming semantics of the outer loop.
+/// Build and send a single push batch over HTTP. The caller pre-computes the
+/// transformation results (if enabled) for exactly this batch — they are taken
+/// as a parameter so the caller can persist the pending-push watermark (the
+/// last post-transform change id that will reach the remote) BEFORE the
+/// request leaves the process.
 ///
 /// Returns the count of rows that actually produced SQL steps
 /// (post-transformation, excluding `Skip`).
-async fn send_push_batch<IO: SyncEngineIo, Ctx>(
+pub async fn send_push_batch<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
     generator: &DatabaseReplayGenerator,
-    opts: &DatabaseSyncEngineOpts,
+    mut transformed: Option<Vec<DatabaseRowTransformResult>>,
     batch_changes: &[DatabaseTapeRowChange],
     client_id: &str,
     source_pull_gen: i64,
     mut last_change_id: Option<i64>,
 ) -> Result<(i64, i64)> {
-    let mut transformed = if opts.use_transform {
-        Some(apply_transformation(ctx, batch_changes, generator).await?)
-    } else {
-        None
-    };
+    assert!(
+        transformed
+            .as_ref()
+            .is_none_or(|t| t.len() == batch_changes.len()),
+        "transformation results must match the batch"
+    );
 
     let step = |query, args| BatchStep {
         stmt: Stmt {

@@ -1259,3 +1259,131 @@ test('push failure leaves server state on transaction boundary', async ({ server
     const rows = await (await db2.prepare('SELECT x FROM q ORDER BY x')).all();
     expect(rows).toEqual([{ x: 0 }, { x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }]);
 })
+
+// Rebase racing an in-flight push: the pull below is issued (and its state is
+// cut on the server) BEFORE the racing push lands, but applied after the push
+// confirmed. The rebase must still replay the racing change locally (the
+// pulled state lacks it), and the next push must NOT re-send it — a re-sent
+// row image is applied later in the server order and clobbers other clients'
+// newer writes.
+test('pull racing a push must not re-push confirmed changes', { timeout: 30000 }, async ({ server }) => {
+    let releaseHeldPull = () => { };
+    let heldPull: Promise<void> | null = null;
+    const racingFetch: typeof fetch = async (input, init) => {
+        if (heldPull !== null && input.toString().includes('/pull-updates')) {
+            const gate = heldPull;
+            heldPull = null;
+            const response = fetch(input, init); // the request reaches the server NOW
+            await gate;                          // the response is parked until released
+            return response;
+        }
+        return fetch(input, init);
+    };
+
+    const a = await connect({ path: ':memory:', url: server.dbUrl(), fetch: racingFetch });
+    await a.exec("CREATE TABLE IF NOT EXISTS race(k TEXT PRIMARY KEY, v)");
+    await a.exec("DELETE FROM race");
+    await a.exec("INSERT INTO race VALUES ('k', 'a1')");
+    await a.push();
+    await a.pull();
+
+    // another client pushes anything: its sync-row update rewrites the shared
+    // sync bookkeeping page server-side, so A's parked pull below ships that
+    // page and re-materializes A's row in its pre-rebase generation
+    const b = await connect({ path: ':memory:', url: server.dbUrl() });
+    await b.exec("INSERT INTO race VALUES ('seed', 's')");
+    await b.push();
+
+    await a.exec("UPDATE race SET v = 'a2' WHERE k = 'k'");
+
+    heldPull = new Promise<void>(resolve => { releaseHeldPull = resolve; });
+    const parkedPull = a.pull();
+    await new Promise(resolve => setTimeout(resolve, 200)); // let the pull request reach the server first
+    await a.push();                                         // confirmed AFTER the pull was issued
+    releaseHeldPull();
+    await parkedPull;                                       // rebase onto the pre-push state
+
+    // the rebase must keep A's own committed write visible locally
+    expect(await (await a.prepare("SELECT v FROM race WHERE k = 'k'")).all()).toEqual([{ v: 'a2' }]);
+
+    // another client overwrites the row...
+    await b.pull();
+    await b.exec("UPDATE race SET v = 'b3' WHERE k = 'k'");
+    await b.push();
+
+    // ...and A's next push must not clobber it with the stale 'a2' image
+    await a.push();
+    await b.pull();
+    expect(await (await b.prepare("SELECT v FROM race WHERE k = 'k'")).all()).toEqual([{ v: 'b3' }]);
+    await a.close();
+    await b.close();
+})
+
+// A push whose response is lost after the server applied it ("failed-but-
+// applied") must not be re-sent once a rebase renumbers the CDC: the server
+// already applied the batch, and a duplicate would land later in the server
+// order, resurrecting stale values over other clients' newer writes.
+test('lost push response must not re-apply the batch after a rebase', { timeout: 30000 }, async ({ server }) => {
+    let releaseHeldPull = () => { };
+    let heldPull: Promise<void> | null = null;
+    let losePushResponse = false;
+    const faultyFetch: typeof fetch = async (input, init) => {
+        if (heldPull !== null && input.toString().includes('/pull-updates')) {
+            const gate = heldPull;
+            heldPull = null;
+            const response = fetch(input, init);
+            await gate;
+            return response;
+        }
+        if (losePushResponse && init?.method === 'POST' && input.toString().endsWith('/v2/pipeline')) {
+            const body = init.body ? new TextDecoder().decode(init.body as Uint8Array) : '';
+            if (body.includes('BEGIN IMMEDIATE')) {
+                losePushResponse = false;
+                await fetch(input, init); // the server applies the batch...
+                // ...but the client never learns about it
+                return new Response('injected: push response lost', { status: 500 });
+            }
+        }
+        return fetch(input, init);
+    };
+
+    const a = await connect({ path: ':memory:', url: server.dbUrl(), fetch: faultyFetch });
+    await a.exec("CREATE TABLE IF NOT EXISTS lost(k TEXT PRIMARY KEY, v)");
+    await a.exec("DELETE FROM lost");
+    await a.exec("INSERT INTO lost VALUES ('k', 'a1')");
+    await a.push();
+    await a.pull();
+
+    const b = await connect({ path: ':memory:', url: server.dbUrl() });
+    await b.exec("INSERT INTO lost VALUES ('seed', 's')");
+    await b.push();
+
+    // the lost batch carries an update and a delete: the delete exercises
+    // re-capture holes during the rebase replay (a replayed delete over an
+    // absent row captures nothing)
+    await a.exec("UPDATE lost SET v = 'a2' WHERE k = 'k'");
+    await a.exec("INSERT INTO lost VALUES ('tmp', 'x')");
+    await a.exec("DELETE FROM lost WHERE k = 'tmp'");
+
+    heldPull = new Promise<void>(resolve => { releaseHeldPull = resolve; });
+    const parkedPull = a.pull();
+    await new Promise(resolve => setTimeout(resolve, 200));
+    losePushResponse = true;
+    await expect(a.push()).rejects.toThrow(); // applied server-side, response lost
+    releaseHeldPull();
+    await parkedPull;                         // rebase onto the pre-push state
+
+    expect(await (await a.prepare("SELECT v FROM lost WHERE k = 'k'")).all()).toEqual([{ v: 'a2' }]);
+
+    await b.pull();
+    await b.exec("UPDATE lost SET v = 'b3' WHERE k = 'k'");
+    await b.push();
+
+    // A's next push must discover that the lost batch landed and send nothing
+    await a.push();
+    await b.pull();
+    expect(await (await b.prepare("SELECT v FROM lost WHERE k = 'k'")).all()).toEqual([{ v: 'b3' }]);
+    expect(await (await b.prepare("SELECT count(*) AS cnt FROM lost WHERE k = 'tmp'")).all()).toEqual([{ cnt: 0 }]);
+    await a.close();
+    await b.close();
+})
