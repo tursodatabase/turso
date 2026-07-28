@@ -1,5 +1,24 @@
 @database :memory:
 
+# MVCC AUTOINCREMENT bookkeeping writes must not leak into the user-visible
+# change counters reported by the SQL-over-HTTP protocol.
+test mvcc-autoincrement-change-counters-exclude-sequence-bookkeeping {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t_changes (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT);
+    INSERT INTO t_changes (val) VALUES ('a');
+    SELECT changes(), total_changes();
+    INSERT INTO t_changes (val) VALUES ('b');
+    SELECT changes(), total_changes();
+    INSERT INTO t_changes (val) VALUES ('c'), ('d');
+    SELECT changes(), total_changes();
+}
+expect {
+    mvcc
+    1|1
+    1|2
+    2|4
+}
+
 # MVCC autoincrement: sqlite_sequence has correct high-water mark after checkpoint
 test mvcc-autoincrement-sqlite-sequence-after-checkpoint {
     PRAGMA journal_mode = 'mvcc';
