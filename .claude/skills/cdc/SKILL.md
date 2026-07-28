@@ -412,3 +412,12 @@ contract; the client-side pull/push race is what makes cuts predate pushes.
   against the dev server; the pathology needs concurrent `pull()`/`push()`
   loops (see `concurrent-updates` test in
   `bindings/javascript/sync/packages/*/promise.test.ts`).
+- KNOWN PROTOCOL GAP (as of July 2026): an HTTP-layer retry (`retryFetch`)
+  that re-delivers a push batch whose response was lost re-APPLIES the data
+  later in the server order — the sync row stays correct (same value
+  rewritten) but the duplicate apply can clobber other clients' interleaved
+  writes, one level below what `pending_push` can see. Fix requires a
+  server-side guard: apply a batch only when the sync row still equals the
+  batch's floor (conditional row UPDATE, abort txn on zero affected rows).
+  The row-boundary contract also assumes at most one in-flight push per
+  client id — overlapping pushes could commit out of order and regress it.
