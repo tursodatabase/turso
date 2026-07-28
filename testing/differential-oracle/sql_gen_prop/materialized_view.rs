@@ -54,6 +54,8 @@ enum Shape {
     Star,
     /// SELECT c1, c2, c3 FROM t WHERE <predicate>
     FilteredColumns,
+    /// SELECT c1, c2, c3 FROM t WHERE <comparisons joined with AND or OR>
+    ComparisonFilter,
     /// SELECT g, COUNT(*) FROM t GROUP BY g
     Aggregate,
     /// SELECT t.a, u.b FROM t JOIN u ON t.a = u.b
@@ -137,6 +139,7 @@ pub fn create_materialized_view(schema: &Schema) -> BoxedStrategy<CreateMaterial
     let mut shapes = vec![
         (1, Shape::Star),
         (2, Shape::FilteredColumns),
+        (2, Shape::ComparisonFilter),
         (1, Shape::Aggregate),
         (1, Shape::ComplexFilterSelfJoin),
     ];
@@ -221,6 +224,9 @@ fn select_for_shape(
                 })
                 .boxed()
         }
+        Shape::ComparisonFilter if source.columns.len() >= 2 && !filterable.is_empty() => {
+            comparison_filter(&source, filterable)
+        }
         Shape::Aggregate if !filterable.is_empty() => {
             let group = &filterable[0];
             // Turso refuses a materialized view whose count alias equals the GROUP BY column.
@@ -245,7 +251,10 @@ fn select_for_shape(
         Shape::ComplexFilterSelfJoin if integer_columns >= 2 => (0..COMPLEX_PREDICATE_KINDS)
             .prop_map(move |kind| complex_filter_self_join(&source, kind))
             .boxed(),
-        Shape::Star | Shape::FilteredColumns | Shape::ComplexFilterSelfJoin => Just((
+        Shape::Star
+        | Shape::FilteredColumns
+        | Shape::ComparisonFilter
+        | Shape::ComplexFilterSelfJoin => Just((
             format!("SELECT * FROM {name}"),
             view_columns(&source.columns),
         ))
@@ -468,6 +477,135 @@ fn predicate(filterable: &[ColumnDef], kind: u32) -> String {
     }
 }
 
+fn comparison_filter(
+    table: &Table,
+    filterable: Vec<ColumnDef>,
+) -> BoxedStrategy<(String, Vec<ColumnDef>)> {
+    let projected = &table.columns[..table.columns.len().min(3)];
+    let projection = projected
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let select = format!("SELECT {projection} FROM {}", table.name);
+    let output_columns = view_columns(projected);
+    let comparison = comparison(filterable);
+    (
+        comparison.clone(),
+        proptest::collection::vec((prop_oneof![Just("AND"), Just("OR")], comparison), 0..=2),
+    )
+        .prop_map(move |(first, rest)| {
+            let predicate = rest
+                .into_iter()
+                .fold(first, |acc, (op, next)| format!("{acc} {op} {next}"));
+            (
+                format!("{select} WHERE {predicate}"),
+                output_columns.clone(),
+            )
+        })
+        .boxed()
+}
+
+const COMPARISON_OPERATORS: [&str; 6] = ["=", "!=", "<", "<=", ">", ">="];
+
+/// Turso's IVM filter compares without column affinity: `int_col = '5'` keeps
+/// other rows than SQLite. Raise this weight once the filter applies affinity.
+const AFFINITY_CONVERTED_LITERAL_WEIGHT: u32 = 0;
+
+/// The column comes first and literals are never negative, because Turso
+/// refuses `1 < c` and `c < -1` in a materialized view.
+fn comparison(filterable: Vec<ColumnDef>) -> BoxedStrategy<String> {
+    (
+        proptest::sample::select(filterable.clone()),
+        proptest::sample::select(COMPARISON_OPERATORS.as_slice()),
+    )
+        .prop_flat_map(move |(column, op)| {
+            comparison_operand(&column, &filterable)
+                .prop_map(move |operand| format!("{} {op} {operand}", column.name))
+        })
+        .boxed()
+}
+
+/// A literal or column that SQLite compares with `column` without converting
+/// it, unless `AFFINITY_CONVERTED_LITERAL_WEIGHT` is raised.
+fn comparison_operand(column: &ColumnDef, filterable: &[ColumnDef]) -> BoxedStrategy<String> {
+    let text = column.data_type == DataType::Text;
+    let other_columns: Vec<String> = filterable
+        .iter()
+        .filter(|c| c.name != column.name && (c.data_type == DataType::Text) == text)
+        .map(|c| c.name.clone())
+        .collect();
+    let mut operands = vec![
+        (4, same_type_literal(column.data_type)),
+        (2, Just("NULL".to_string()).boxed()),
+        (2, other_type_literal(column.data_type)),
+        (
+            AFFINITY_CONVERTED_LITERAL_WEIGHT,
+            affinity_converted_literal(column.data_type),
+        ),
+    ];
+    if !other_columns.is_empty() {
+        operands.push((2, proptest::sample::select(other_columns).boxed()));
+    }
+    proptest::strategy::Union::new_weighted(
+        operands
+            .into_iter()
+            .filter(|(weight, _)| *weight > 0)
+            .collect(),
+    )
+    .boxed()
+}
+
+fn same_type_literal(data_type: DataType) -> BoxedStrategy<String> {
+    match data_type {
+        DataType::Text => letters_literal(),
+        DataType::Real => real_literal(),
+        DataType::Integer | DataType::Null => integer_literal(),
+        DataType::Blob => unreachable!("filterable columns are never BLOB"),
+    }
+}
+
+/// Text that is not a number and blobs keep their type under every affinity;
+/// numbers keep it under every affinity but TEXT.
+fn other_type_literal(data_type: DataType) -> BoxedStrategy<String> {
+    let blob = Just("X'62'".to_string()).boxed();
+    match data_type {
+        DataType::Text => blob,
+        DataType::Integer | DataType::Null => {
+            prop_oneof![letters_literal(), blob, real_literal()].boxed()
+        }
+        DataType::Real => prop_oneof![letters_literal(), blob, integer_literal()].boxed(),
+        DataType::Blob => unreachable!("filterable columns are never BLOB"),
+    }
+}
+
+fn affinity_converted_literal(data_type: DataType) -> BoxedStrategy<String> {
+    match data_type {
+        DataType::Text => integer_literal(),
+        DataType::Integer | DataType::Real | DataType::Null => {
+            (0i64..=5).prop_map(|i| format!("'{i}'")).boxed()
+        }
+        DataType::Blob => unreachable!("filterable columns are never BLOB"),
+    }
+}
+
+fn letters_literal() -> BoxedStrategy<String> {
+    proptest::string::string_regex("[a-c]{1,2}")
+        .unwrap()
+        .prop_map(|s| format!("'{s}'"))
+        .boxed()
+}
+
+fn integer_literal() -> BoxedStrategy<String> {
+    (0i64..=5).prop_map(|i| i.to_string()).boxed()
+}
+
+fn real_literal() -> BoxedStrategy<String> {
+    proptest::sample::select(["0.0", "1.0", "2.5", "3.5"].as_slice())
+        .prop_map(str::to_string)
+        .boxed()
+}
+
 /// Generate a DROP VIEW statement for an existing materialized view.
 pub fn drop_materialized_view(schema: &Schema) -> BoxedStrategy<DropViewStatement> {
     let names: Vec<String> = schema
@@ -540,6 +678,41 @@ mod tests {
             prop_assert!(sql.starts_with("CREATE MATERIALIZED VIEW"));
             prop_assert_eq!(sql.replacen("MATERIALIZED ", "", 1), stmt.plain_view_sql());
             prop_assert!(!stmt.output_columns.is_empty());
+        }
+    }
+
+    #[test]
+    fn comparison_filters_cover_every_operator_null_and_or_but_no_affinity_converted_literal() {
+        let schema = schema_with_matview();
+        let users = &schema.tables[0];
+        let strategy = comparison_filter(users, users.filterable_columns().cloned().collect());
+        let mut runner = proptest::test_runner::TestRunner::deterministic();
+        let sqls: Vec<String> = (0..500)
+            .map(|_| strategy.new_tree(&mut runner).unwrap().current().0)
+            .collect();
+        for op in COMPARISON_OPERATORS {
+            assert!(sqls.iter().any(|sql| sql.contains(&format!(" {op} NULL"))));
+            assert!(sqls.iter().any(|sql| {
+                sql.contains(&format!("name {op} team")) || sql.contains(&format!("team {op} name"))
+            }));
+        }
+        assert!(sqls.iter().any(|sql| sql.contains(" AND ")));
+        assert!(sqls.iter().any(|sql| sql.contains(" OR ")));
+        assert!(sqls.iter().any(|sql| sql.contains("X'62'")));
+        assert!(sqls.iter().any(|sql| {
+            COMPARISON_OPERATORS
+                .iter()
+                .any(|op| sql.contains(&format!("id {op} '")))
+        }));
+        for sql in &sqls {
+            assert!(!sql.contains('-'), "{sql}");
+            for i in 0..=5 {
+                assert!(!sql.contains(&format!("'{i}'")), "{sql}");
+                for op in COMPARISON_OPERATORS {
+                    assert!(!sql.contains(&format!("name {op} {i}")), "{sql}");
+                    assert!(!sql.contains(&format!("{i} {op} ")), "{sql}");
+                }
+            }
         }
     }
 
