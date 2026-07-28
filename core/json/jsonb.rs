@@ -436,7 +436,10 @@ impl PathOperation for DeleteOperation {
                 json.read_header(array_value_idx)?;
             let delta = 0 - (array_value_size + array_value_header_size) as isize;
 
-            let end_pos = array_value_idx + array_value_size + array_value_header_size;
+            let end_pos = json.element_end(
+                array_value_idx,
+                &[array_value_size, array_value_header_size],
+            )?;
             json.data.drain(array_value_idx..end_pos);
 
             let h_delta = if matches!(
@@ -460,7 +463,10 @@ impl PathOperation for DeleteOperation {
             let (JsonbHeader(_, key_size), key_header_size) = json.read_header(key_idx)?;
             let delta = 0 - (value_header_size + value_size + key_size + key_header_size) as isize;
 
-            let end_pos = key_idx + value_header_size + value_size + key_size + key_header_size;
+            let end_pos = json.element_end(
+                key_idx,
+                &[value_header_size, value_size, key_size, key_header_size],
+            )?;
             json.data.drain(key_idx..end_pos);
 
             json.update_parent_references(stack, delta + target.delta)?;
@@ -670,9 +676,8 @@ impl PathOperation for SearchOperation {
             target.field_value_index
         };
         let (JsonbHeader(_, size), header_size) = json.read_header(idx)?;
-        self.value
-            .data
-            .extend_from_slice(&json.data[idx..idx + header_size + size]);
+        let end = json.element_end(idx, &[header_size, size])?;
+        self.value.data.extend_from_slice(&json.data[idx..end]);
 
         Ok(())
     }
@@ -956,6 +961,25 @@ impl Jsonb {
         let (header, offset) = JsonbHeader::from_slice(cursor, &self.data)?;
 
         Ok((header, offset))
+    }
+
+    /// Offset one past the element at `cursor`, rejecting a declared size that
+    /// runs past the buffer.
+    ///
+    /// Checked here rather than relying on validation having run: the size
+    /// fields are caller-controlled, and the `header_size == 15` marker reads an
+    /// 8-byte size, so the addition can overflow too.
+    fn element_end(&self, cursor: usize, sizes: &[usize]) -> Result<usize> {
+        let mut end = cursor;
+        for size in sizes {
+            end = end
+                .checked_add(*size)
+                .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+        }
+        if end > self.data.len() {
+            return Err(LimboError::ParseError("malformed JSON".to_string()));
+        }
+        Ok(end)
     }
 
     pub fn element_type(&self) -> Result<ElementType> {
@@ -4670,4 +4694,55 @@ mod path_operations_tests {
         assert!(result.is_err());
     }
 
+    /// A child element whose declared size runs past the buffer must not reach
+    /// the slice in `SearchOperation` or the `drain` in `DeleteOperation`.
+    ///
+    /// Blob-sourced documents are validated on the way in, so no SQL input
+    /// reaches these ranges today. The checks exist because the sizes are
+    /// caller-controlled and a range derived from them must not depend on a
+    /// validation pass having run somewhere else: that coupling is what made
+    /// the sibling `from_utf8_unchecked` defect undefined behaviour rather than
+    /// a clean error.
+    #[test]
+    fn malformed_element_size_is_rejected_before_slicing() {
+        // ARRAY (type 11, inline payload size 8) whose single child is a TEXT5
+        // with a 1-byte size marker declaring 200 bytes, in a 9-byte buffer.
+        let bytes = [0x8Bu8, 0xC7, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let path = create_path(vec![
+            PathElement::Root(),
+            PathElement::ArrayLocator(Some(0)),
+        ]);
+
+        let mut jsonb = Jsonb {
+            data: crate::alloc::vec![0x8B, 0xC7, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        };
+        let mut search = SearchOperation::new(bytes.len()).unwrap();
+        assert!(
+            jsonb.operate_on_path(&path, &mut search).is_err(),
+            "oversized child size must not be sliced out of bounds"
+        );
+
+        let mut jsonb = Jsonb {
+            data: crate::alloc::vec![0x8B, 0xC7, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        };
+        let mut delete = DeleteOperation::new();
+        assert!(
+            jsonb.operate_on_path(&path, &mut delete).is_err(),
+            "oversized child size must not be drained out of bounds"
+        );
+    }
+
+    #[test]
+    fn element_end_rejects_overflow_and_out_of_range() {
+        let jsonb = Jsonb {
+            data: crate::alloc::vec![0x0C, 0x00],
+        };
+
+        // Sum overflows usize (the 8-byte size marker can declare this).
+        assert!(jsonb.element_end(1, &[usize::MAX, 2]).is_err());
+        // Sum is representable but past the 2-byte buffer.
+        assert!(jsonb.element_end(0, &[3]).is_err());
+        // Exactly the end of the buffer is in range.
+        assert!(jsonb.element_end(0, &[2]).is_ok());
+    }
 }
