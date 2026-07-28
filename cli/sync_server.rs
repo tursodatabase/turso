@@ -137,8 +137,7 @@ impl TursoSyncServer {
             };
             let headers = String::from_utf8_lossy(&request_data[..header_end]);
             if let Some(content_length) = parse_content_length(&headers) {
-                let body_start = header_end + 4;
-                let total_expected = body_start + content_length;
+                let total_expected = request_end(header_end, content_length)?;
                 while request_data.len() < total_expected {
                     let n = stream.read(&mut buffer)?;
                     if n == 0 {
@@ -1130,6 +1129,14 @@ fn db_size_from_page(page: &[u8]) -> u32 {
     u32::from_be_bytes(page[28..32].try_into().unwrap())
 }
 
+/// A client controls Content-Length, so the end of the body has to be
+/// computed without trusting it to fit.
+fn request_end(header_end: usize, content_length: usize) -> Result<usize> {
+    (header_end + 4)
+        .checked_add(content_length)
+        .ok_or_else(|| anyhow!("HTTP request length overflows: {content_length}"))
+}
+
 fn find_header_end(data: &[u8], start: usize) -> Option<usize> {
     (start..data.len().saturating_sub(3)).find(|&i| &data[i..i + 4] == b"\r\n\r\n")
 }
@@ -1259,5 +1266,11 @@ mod tests {
             }
             assert_eq!(found, Some(expected), "missed terminator at chunk {chunk}");
         }
+    }
+
+    #[test]
+    fn rejects_content_length_that_overflows() {
+        assert!(request_end(0, usize::MAX).is_err());
+        assert_eq!(request_end(10, 5).unwrap(), 19);
     }
 }
