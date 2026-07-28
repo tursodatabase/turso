@@ -406,6 +406,50 @@ def test_row_factory_keys(provider):
     conn.close()
 
 
+def test_stdlib_sqlite3_row_factory_rejected():
+    """sqlite3.Row cannot work with turso cursors (its C constructor requires a
+    real sqlite3.Cursor), so fetching raises an error that points at turso.Row
+    instead of the cryptic C-level TypeError."""
+    conn = turso.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE t (id INTEGER, name TEXT)")
+    conn.execute("INSERT INTO t VALUES (1, 'alice')")
+    with pytest.raises(TypeError, match="turso.Row"):
+        conn.execute("SELECT * FROM t").fetchone()
+    conn.close()
+
+
+def test_stdlib_sqlite3_row_subclass_rejected_on_cursor():
+    """Rejection also applies to per-cursor assignment and sqlite3.Row subclasses."""
+    conn = turso.connect(":memory:")
+
+    class SubRow(sqlite3.Row):
+        pass
+
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id INTEGER)")
+    cur.execute("INSERT INTO t VALUES (1)")
+    cur.row_factory = SubRow
+    cur.execute("SELECT * FROM t")
+    with pytest.raises(TypeError, match="turso.Row"):
+        cur.fetchall()
+    conn.close()
+
+
+def test_turso_row_factory_works_where_stdlib_row_is_rejected():
+    """turso.Row is the supported replacement and provides the same interface."""
+    conn = turso.connect(":memory:")
+    conn.row_factory = turso.Row
+    conn.execute("CREATE TABLE t (id INTEGER, name TEXT)")
+    conn.execute("INSERT INTO t VALUES (1, 'alice')")
+    row = conn.execute("SELECT * FROM t").fetchone()
+    assert row["id"] == 1
+    assert row["name"] == "alice"
+    assert row[0] == 1
+    assert row.keys() == ["id", "name"]
+    conn.close()
+
+
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_parameterized_query(provider):
     conn = connect(provider, ":memory:")
