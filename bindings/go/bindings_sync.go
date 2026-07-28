@@ -45,7 +45,7 @@ const (
 type TursoSyncDatabaseConfig struct {
 	// Path to the main database file (auxiliary files will derive names from this path)
 	Path string
-	// optional remote url (libsql://..., https://... or http://...)
+	// optional remote url (libsql://..., turso://..., https://... or http://...)
 	// this URL will be saved in the database metadata file in order to be able to reuse it if later client will be constructed without explicit remote url
 	RemoteUrl string
 	// Namespace for remote host

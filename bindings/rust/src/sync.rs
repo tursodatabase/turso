@@ -90,7 +90,8 @@ impl std::str::FromStr for RemoteEncryptionCipher {
 pub struct Builder {
     // Absolute or relative path to local database file (":memory:" is supported).
     path: String,
-    // Remote URL base. Supports https://, http:// and libsql:// (translated to https://).
+    // Remote URL base. Supports https://, http://, libsql:// and turso:// (the latter two are
+    // translated to https://).
     remote_url: Option<String>,
     // Optional authorization token provider (static string or async callback).
     auth_token: Option<AuthTokenFn>,
@@ -591,10 +592,14 @@ impl Future for AsyncOpFuture {
     }
 }
 
-// Normalize remote base URL, mapping libsql:// to https:// and validating allowed schemes.
+// Normalize remote base URL, mapping libsql:// and turso:// to https:// and validating allowed
+// schemes.
 fn normalize_base_url(input: &str) -> std::result::Result<String, String> {
     let s = input.trim();
-    let s = if let Some(rest) = s.strip_prefix("libsql://") {
+    let s = if let Some(rest) = s
+        .strip_prefix("libsql://")
+        .or_else(|| s.strip_prefix("turso://"))
+    {
         format!("https://{rest}")
     } else {
         s.to_string()
@@ -948,6 +953,29 @@ mod tests {
             .take(8)
             .map(char::from)
             .collect()
+    }
+
+    #[test]
+    fn normalize_base_url_schemes() {
+        use crate::sync::normalize_base_url;
+
+        assert_eq!(
+            normalize_base_url("libsql://db.turso.io").unwrap(),
+            "https://db.turso.io"
+        );
+        assert_eq!(
+            normalize_base_url("turso://db.turso.io").unwrap(),
+            "https://db.turso.io"
+        );
+        assert_eq!(
+            normalize_base_url("https://db.turso.io/").unwrap(),
+            "https://db.turso.io"
+        );
+        assert_eq!(
+            normalize_base_url("http://localhost:8080").unwrap(),
+            "http://localhost:8080"
+        );
+        assert!(normalize_base_url("ftp://db.turso.io").is_err());
     }
 
     #[test]

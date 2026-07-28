@@ -614,6 +614,9 @@ func normalizeUrl(base string) string {
 	if cut, ok := strings.CutPrefix(base, "libsql://"); ok {
 		return "https://" + cut
 	}
+	if cut, ok := strings.CutPrefix(base, "turso://"); ok {
+		return "https://" + cut
+	}
 	return base
 }
 

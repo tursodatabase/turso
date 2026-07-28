@@ -85,7 +85,7 @@ impl PyRemoteEncryptionCipher {
 pub struct PyTursoSyncDatabaseConfig {
     // path to the main database file (auxilary files like metadata, WAL, revert, changes will derive names from this path)
     pub path: String,
-    // optional remote url (libsql://..., https://... or http://...)
+    // optional remote url (libsql://..., turso://..., https://... or http://...)
     // this URL will be saved in the database metadata file in order to be able to reuse it if later client will be constructed without explicit remote url
     pub remote_url: Option<String>,
     // arbitrary client name which will be used as a prefix for unique client id
