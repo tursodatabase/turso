@@ -32,7 +32,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode                            p1   p2   p3  p4              p5  comment
-   0                    Init             0  117    0                   0  Start at 117
+   0                    Init             0  116    0                   0  Start at 116
    1                    Once            54    0    0                   0  goto 54
    2                    BeginSubrtn      2    0    0                   0  r[2]=NULL
    3                    Null             0    1    0                   0  r[1]=NULL
@@ -127,28 +127,27 @@ addr  opcode                            p1   p2   p3  p4              p5  commen
   92  Return                            33    0    0                   0
   93  OpenRead                           5    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
   94  OpenRead                           6    8    0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
-  95  Rewind                             2  116    0                   0  Rewind  ephemeral()
-  96    Column                           2    0   20                   0  r[20]=ephemeral().category_id
-  97    Column                           2    1   21                   0  r[21]=ephemeral().avg_price
-  98    Copy                            20   39    0                   0  r[39]=r[20]
-  99    IsNull                          39  115    0                   0  if (r[39]==NULL) goto 115
- 100    Affinity                        39    1    0                   0  r[39..40] = C
- 101    SeekGE                           6  115   39                   0  key=[39..39]
- 102      IdxGT                          6  115   39                   0  key=[39..39]
- 103      DeferredSeek                   6    5    0                   0
- 104      Column                         5    3   41                   0  r[41]=products.price
- 105      RealAffinity                  41    0    0                   0
- 106      Copy                           1   43    0                   0  r[43]=r[1]
- 107      Multiply                      43   44   42                   0  r[42]=r[43]*r[44]
- 108      Le                            41   42  114  Binary           0  if r[41]<=r[42] goto 114
- 109      Column                         5    1   36                   0  r[36]=products.name
- 110      Column                         5    3   37                   0  r[37]=products.price
- 111      RealAffinity                  37    0    0                   0
- 112      Copy                          21   38    0                   0  r[38]=r[21]
- 113      ResultRow                     36    3    0                   0  output=r[36..38]
- 114    Next                             6  102    0                   0
- 115  Next                               2   96    0                   0
- 116  Halt                               0    0    0                   0
- 117  Transaction                        0    1   11                   0  iDb=0 tx_mode=Read
- 118  Real                               0   44    0  0.8              0  r[44]=0.8
- 119  Goto                               0    1    0                   0
+  95  Rewind                             2  115    0                   0  Rewind  ephemeral()
+  96    ColumnRange                      2    0   20  2                0  r[20..21]=ephemeral().category_id..avg_price
+  97    Copy                            20   39    0                   0  r[39]=r[20]
+  98    IsNull                          39  114    0                   0  if (r[39]==NULL) goto 114
+  99    Affinity                        39    1    0                   0  r[39..40] = C
+ 100    SeekGE                           6  114   39                   0  key=[39..39]
+ 101      IdxGT                          6  114   39                   0  key=[39..39]
+ 102      DeferredSeek                   6    5    0                   0
+ 103      Column                         5    3   41                   0  r[41]=products.price
+ 104      RealAffinity                  41    0    0                   0
+ 105      Copy                           1   43    0                   0  r[43]=r[1]
+ 106      Multiply                      43   44   42                   0  r[42]=r[43]*r[44]
+ 107      Le                            41   42  113  Binary           0  if r[41]<=r[42] goto 113
+ 108      Column                         5    1   36                   0  r[36]=products.name
+ 109      Column                         5    3   37                   0  r[37]=products.price
+ 110      RealAffinity                  37    0    0                   0
+ 111      Copy                          21   38    0                   0  r[38]=r[21]
+ 112      ResultRow                     36    3    0                   0  output=r[36..38]
+ 113    Next                             6  101    0                   0
+ 114  Next                               2   96    0                   0
+ 115  Halt                               0    0    0                   0
+ 116  Transaction                        0    1   11                   0  iDb=0 tx_mode=Read
+ 117  Real                               0   44    0  0.8              0  r[44]=0.8
+ 118  Goto                               0    1    0                   0
