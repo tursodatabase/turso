@@ -110,8 +110,10 @@ pub struct PyTursoSyncDatabaseConfig {
     // /pull-updates HTTP requests of >= this many bytes each. None (default) bootstraps
     // in a single round-trip. no-op when partial-sync uses the query bootstrap strategy.
     pub pull_bytes_threshold: Option<usize>,
-    // use MVCC logical-log stream for incremental V1 pulls
-    pub logical_mvcc_pull: bool,
+    // sync-protocol override: None (default) auto-detects the remote protocol
+    // from the first pull-updates response; Some(true) forces MVCC logical-log
+    // streams; Some(false) forces page streams
+    pub logical_mvcc_pull: Option<bool>,
 }
 
 #[pymethods]
@@ -129,7 +131,7 @@ impl PyTursoSyncDatabaseConfig {
         remote_encryption_cipher=None,
         push_operations_threshold=None,
         pull_bytes_threshold=None,
-        logical_mvcc_pull=false,
+        logical_mvcc_pull=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -144,7 +146,7 @@ impl PyTursoSyncDatabaseConfig {
         remote_encryption_cipher: Option<PyRemoteEncryptionCipher>,
         push_operations_threshold: Option<usize>,
         pull_bytes_threshold: Option<usize>,
-        logical_mvcc_pull: bool,
+        logical_mvcc_pull: Option<bool>,
     ) -> Self {
         Self {
             path,

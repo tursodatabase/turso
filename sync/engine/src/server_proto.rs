@@ -72,6 +72,20 @@ pub enum PullUpdatesApplyMode {
     ReplaceBase = 1,
 }
 
+/// Sync protocol the remote database speaks for incremental pulls, advertised
+/// by the server in every pull-updates response (including page bootstraps).
+/// `Unspecified` means the server predates the field; callers fall back to
+/// sniffing the revision shape.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+#[derive(prost::Enumeration)]
+#[repr(i32)]
+pub enum PullUpdatesProtocol {
+    Unspecified = 0,
+    Pages = 1,
+    MvccLogical = 2,
+}
+
 #[derive(prost::Message)]
 pub struct PageSetRawEncodingProto {}
 
@@ -124,6 +138,8 @@ pub struct PullUpdatesRespProtoBody {
     pub apply_mode: i32,
     #[prost(optional, message, tag = "7")]
     pub mvcc_log: Option<MvccLogicalLogMetadataProto>,
+    #[prost(enumeration = "PullUpdatesProtocol", tag = "8")]
+    pub protocol: i32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -532,7 +548,7 @@ pub(crate) mod bytes_as_base64_pad {
 mod pull_updates_tests {
     use super::{
         MvccLogicalLogMetadataProto, MvccLogicalLogRangeProto, PageSetRawEncodingProto,
-        PageUpdatesEncodingReq, PullUpdatesApplyMode, PullUpdatesReqProtoBody,
+        PageUpdatesEncodingReq, PullUpdatesApplyMode, PullUpdatesProtocol, PullUpdatesReqProtoBody,
         PullUpdatesRespProtoBody, PullUpdatesStreamKind,
     };
     use prost::Message;
@@ -561,6 +577,7 @@ mod pull_updates_tests {
     fn pull_updates_mvcc_log_header_round_trips_metadata() {
         let header = PullUpdatesRespProtoBody {
             server_revision: "rev-42".to_string(),
+            protocol: PullUpdatesProtocol::MvccLogical as i32,
             db_size: 3,
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,

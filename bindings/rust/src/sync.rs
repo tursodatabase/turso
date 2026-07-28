@@ -107,8 +107,10 @@ pub struct Builder {
     remote_encryption_key: Option<String>,
     // Encryption cipher for the Turso Cloud database
     remote_encryption_cipher: Option<RemoteEncryptionCipher>,
-    // Use MVCC logical-log incremental pulls instead of page-stream pulls.
-    logical_mvcc_pull: bool,
+    // Sync-protocol override: None (default) auto-detects the remote protocol
+    // from the first pull-updates response; Some(true) forces MVCC logical-log
+    // pulls; Some(false) forces page-stream pulls.
+    logical_mvcc_pull: Option<bool>,
     // Experimental engine features to enable on the local synced database.
     // These mirror the local [`crate::Builder`] flags so synced databases
     // expose the same SQL surface as their local-only counterparts. Local
@@ -138,7 +140,7 @@ impl Builder {
             partial_sync_config_experimental: None,
             remote_encryption_key: None,
             remote_encryption_cipher: None,
-            logical_mvcc_pull: false,
+            logical_mvcc_pull: None,
             enable_attach: false,
             enable_custom_types: false,
             enable_index_method: false,
@@ -292,12 +294,14 @@ impl Builder {
         self
     }
 
-    /// Use MVCC logical-log incremental pulls.
+    /// Override the sync protocol used for incremental pulls.
     ///
-    /// MVCC-mode remotes accept page-stream pulls only for bootstrap; callers
-    /// using legacy WAL/page sync should keep the default `false` value.
+    /// By default the protocol is auto-detected from the first pull-updates
+    /// response and persisted in the sync metadata, so calling this is only
+    /// needed for tests or as an escape hatch: `true` forces MVCC logical-log
+    /// pulls, `false` forces page-stream pulls.
     pub fn with_logical_mvcc_pull(mut self, enable: bool) -> Self {
-        self.logical_mvcc_pull = enable;
+        self.logical_mvcc_pull = Some(enable);
         self
     }
 
@@ -1016,14 +1020,21 @@ mod tests {
     }
 
     #[test]
-    fn logical_mvcc_pull_is_opt_in() {
+    fn logical_mvcc_pull_defaults_to_auto_detection() {
         use crate::sync::Builder;
 
-        assert!(!Builder::new_remote(":memory:").logical_mvcc_pull);
-        assert!(
+        assert_eq!(Builder::new_remote(":memory:").logical_mvcc_pull, None);
+        assert_eq!(
             Builder::new_remote(":memory:")
                 .with_logical_mvcc_pull(true)
-                .logical_mvcc_pull
+                .logical_mvcc_pull,
+            Some(true)
+        );
+        assert_eq!(
+            Builder::new_remote(":memory:")
+                .with_logical_mvcc_pull(false)
+                .logical_mvcc_pull,
+            Some(false)
         );
     }
 
