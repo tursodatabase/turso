@@ -319,7 +319,7 @@ mod tests {
             DbChangesStreamKind::Pages,
             false
         ));
-        let floor = resolve_local_replay_floor_change_id(false, 7, 7, Some(12), 7, 34);
+        let floor = resolve_local_replay_floor_change_id(false, 7, 7, Some(12), None, 7, 34);
         assert_eq!(floor, Some(12));
     }
 
@@ -329,20 +329,40 @@ mod tests {
             DbChangesStreamKind::LegacyPages,
             false
         ));
-        let floor = resolve_local_replay_floor_change_id(true, 7, 7, Some(12), 7, 34);
+        let floor = resolve_local_replay_floor_change_id(true, 7, 7, Some(12), None, 7, 34);
         assert_eq!(floor, Some(34));
     }
 
     #[test]
     fn local_replay_ignores_last_pushed_hint_from_stale_pull_generation() {
-        let floor = resolve_local_replay_floor_change_id(true, 7, 7, Some(12), 6, 34);
+        let floor = resolve_local_replay_floor_change_id(true, 7, 7, Some(12), None, 6, 34);
         assert_eq!(floor, Some(12));
     }
 
     #[test]
     fn raw_wal_replay_preserves_existing_floor_when_hints_are_disabled() {
-        let floor = resolve_local_replay_floor_change_id(false, 7, 7, Some(12), 7, 34);
+        let floor = resolve_local_replay_floor_change_id(false, 7, 7, Some(12), None, 7, 34);
         assert_eq!(floor, Some(12));
+    }
+
+    #[test]
+    fn local_replay_floor_falls_back_to_acknowledged_watermark_on_pull_gen_mismatch() {
+        // Without the acknowledgment, a stale remote sync row collapses the
+        // floor to nothing and the whole CDC history would be re-captured.
+        let floor = resolve_local_replay_floor_change_id(false, 7, 6, Some(12), None, 0, 0);
+        assert_eq!(floor, None);
+        // The locally persisted acknowledgment carries the floor across the
+        // generation mismatch.
+        let floor = resolve_local_replay_floor_change_id(false, 7, 6, Some(12), Some(20), 0, 0);
+        assert_eq!(floor, Some(20));
+    }
+
+    #[test]
+    fn local_replay_floor_uses_max_of_remote_row_and_acknowledged_watermark() {
+        let floor = resolve_local_replay_floor_change_id(false, 7, 7, Some(12), Some(20), 0, 0);
+        assert_eq!(floor, Some(20));
+        let floor = resolve_local_replay_floor_change_id(false, 7, 7, Some(25), Some(20), 0, 0);
+        assert_eq!(floor, Some(25));
     }
 
     #[test]
@@ -835,6 +855,8 @@ mod tests {
             last_pushed_pull_gen_hint: 0,
             last_pushed_change_id_hint: 0,
             last_pushed_replay_floor_change_id_hint: 0,
+            acknowledged_pull_gen: 0,
+            acknowledged_change_id: 0,
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
             logical_mvcc_pull_active: true,
@@ -984,6 +1006,8 @@ mod tests {
             last_pushed_pull_gen_hint: 0,
             last_pushed_change_id_hint: 0,
             last_pushed_replay_floor_change_id_hint: 0,
+            acknowledged_pull_gen: 0,
+            acknowledged_change_id: 0,
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
             logical_mvcc_pull_active: true,
@@ -1158,6 +1182,8 @@ mod tests {
             last_pushed_pull_gen_hint: 0,
             last_pushed_change_id_hint: 0,
             last_pushed_replay_floor_change_id_hint: 0,
+            acknowledged_pull_gen: 0,
+            acknowledged_change_id: 0,
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
             logical_mvcc_pull_active: true,
@@ -2210,18 +2236,42 @@ fn should_replay_raw_pages_on_sql_conn(
         )
 }
 
+/// Outcome of applying one batch of remote changes to the local database.
+struct AppliedRemoteChanges {
+    revert_since_wal_watermark: u64,
+    logical_table_names_by_stable_id: BTreeMap<u64, String>,
+    followup_revision: Option<DatabasePullRevision>,
+    /// `(pull_gen, change_id)` written to the local sync row by this apply;
+    /// mirrored into the metadata acknowledgment fields by the caller. `None`
+    /// when the apply did not touch the sync row.
+    persisted_sync_watermark: Option<(i64, i64)>,
+}
+
 fn resolve_local_replay_floor_change_id(
     use_pushed_change_hint: bool,
     local_pull_gen: i64,
     remote_pull_gen: i64,
     remote_last_change_id: Option<i64>,
+    acknowledged_change_id: Option<i64>,
     last_pushed_pull_gen_hint: i64,
     last_pushed_change_id_hint: i64,
 ) -> Option<i64> {
+    // `acknowledged_change_id` is this client's locally persisted record of how
+    // far its CDC entries (in the current change-id numbering) are contained in
+    // the remote database. It was established against an older pulled snapshot,
+    // and snapshots only move forward, so it stays valid against the snapshot
+    // being applied now. When the remote sync row belongs to an older pull
+    // generation its change ids are not comparable to the current numbering;
+    // fall back to the local acknowledgment instead of collapsing the floor to
+    // zero, which would re-capture (and later re-push) the entire acknowledged
+    // history on every pull whose snapshot predates this client's latest push.
     let mut last_change_id = if remote_pull_gen == local_pull_gen {
-        remote_last_change_id
+        match (remote_last_change_id, acknowledged_change_id) {
+            (Some(remote), Some(acknowledged)) => Some(remote.max(acknowledged)),
+            (remote, acknowledged) => remote.or(acknowledged),
+        }
     } else {
-        Some(0)
+        acknowledged_change_id
     };
 
     if use_pushed_change_hint
@@ -2346,6 +2396,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     last_pushed_change_id_hint: 0,
                     last_pushed_pull_gen_hint: 0,
                     last_pushed_replay_floor_change_id_hint: 0,
+                    acknowledged_pull_gen: 0,
+                    acknowledged_change_id: 0,
                     last_pull_unix_time: Some(io.current_time_wall_clock().secs),
                     last_push_unix_time: None,
                     partial_bootstrap_server_revision: if partial {
@@ -2393,6 +2445,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     last_pushed_change_id_hint: 0,
                     last_pushed_pull_gen_hint: 0,
                     last_pushed_replay_floor_change_id_hint: 0,
+                    acknowledged_pull_gen: 0,
+                    acknowledged_change_id: 0,
                     last_pull_unix_time: None,
                     last_push_unix_time: None,
                     partial_bootstrap_server_revision: None,
@@ -3078,8 +3132,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 &remote_changes.revision,
             )
             .await;
-        let Ok((revert_since_wal_watermark, logical_table_names_by_stable_id, followup_revision)) =
-            pull_result
+        let Ok(AppliedRemoteChanges {
+            revert_since_wal_watermark,
+            logical_table_names_by_stable_id,
+            followup_revision,
+            persisted_sync_watermark,
+        }) = pull_result
         else {
             return Err(pull_result.err().unwrap());
         };
@@ -3102,6 +3160,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             m.last_pushed_replay_floor_change_id_hint = 0;
             m.last_pull_unix_time = Some(remote_changes.time.secs);
             m.logical_table_names_by_stable_id = logical_table_names_by_stable_id;
+            if let Some((pull_gen, change_id)) = persisted_sync_watermark {
+                m.acknowledged_pull_gen = pull_gen;
+                m.acknowledged_change_id = change_id;
+            }
         })
         .await?;
         Ok(())
@@ -3190,6 +3252,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 local_pull_gen,
                 local_pull_gen,
                 local_last_change_id,
+                None,
                 last_pushed_pull_gen_hint,
                 last_pushed_change_id_hint,
             );
@@ -3340,7 +3403,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         changes_file: &Arc<dyn turso_core::File>,
         stream_kind: DbChangesStreamKind,
         remote_revision: &DatabasePullRevision,
-    ) -> Result<(u64, BTreeMap<u64, String>, Option<DatabasePullRevision>)> {
+    ) -> Result<AppliedRemoteChanges> {
         tracing::info!("apply_changes(path={})", self.main_db_path);
 
         let (_, watermark) = self.checkpoint_passive(coro).await?;
@@ -3391,11 +3454,17 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             local_last_change_id,
             replace_base_pages,
         );
-        let (last_pushed_pull_gen_hint, last_pushed_change_id_hint) = {
+        let (last_pushed_pull_gen_hint, last_pushed_change_id_hint, acknowledged_change_id) = {
             let meta = self.meta();
+            // The persisted acknowledgment is only meaningful while the local
+            // sync row is still in the generation it was recorded for.
+            let acknowledged_change_id = (meta.acknowledged_pull_gen == local_pull_gen
+                && meta.acknowledged_change_id > 0)
+                .then_some(meta.acknowledged_change_id);
             (
                 meta.last_pushed_pull_gen_hint,
                 meta.last_pushed_change_id_hint,
+                acknowledged_change_id,
             )
         };
 
@@ -3421,6 +3490,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     local_pull_gen,
                     local_pull_gen,
                     local_last_change_id,
+                    None,
                     last_pushed_pull_gen_hint,
                     last_pushed_change_id_hint,
                 )
@@ -3482,11 +3552,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             None
         };
 
-        let apply_result: Result<(
-            u64,
-            BTreeMap<u64, String>,
-            Option<DatabasePullRevision>,
-        )> = async {
+        let apply_result: Result<AppliedRemoteChanges> = async {
+            // (pull_gen, change_id) written to the local sync row by this
+            // apply, mirrored into the metadata acknowledgment by the caller.
+            let mut persisted_sync_watermark: Option<(i64, i64)> = None;
             let mut main_session = Some(DatabaseWalSession::new(coro, main_session).await?);
 
             // Phase 1 (start): rollback local changes from the WAL
@@ -3834,6 +3903,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 local_pull_gen,
                 remote_pull_gen,
                 remote_last_change_id,
+                acknowledged_change_id,
                 last_pushed_pull_gen_hint,
                 last_pushed_change_id_hint,
             );
@@ -3892,6 +3962,24 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             let replayed_local_changes = !local_changes.is_empty();
             let recaptured_local_changes = replayed_local_changes;
             let mut preserve_local_replay_floor = None;
+            // Old-numbering watermark of changes already contained in the
+            // remote database: the applied snapshot acknowledged everything up
+            // to the replay floor, and a completed push in the current
+            // generation acknowledged everything up to the pushed hint (the
+            // push got a server response even if this snapshot predates it).
+            // Replayed changes at or below this watermark are re-captured into
+            // the recreated turso_cdc, so track the highest re-captured change
+            // id they produce — that boundary is the acknowledgment in the new
+            // numbering and must not be pushed again.
+            let acknowledged_watermark_old = {
+                let hint = if last_pushed_pull_gen_hint == local_pull_gen {
+                    last_pushed_change_id_hint
+                } else {
+                    0
+                };
+                replay_floor.max(hint)
+            };
+            let mut acknowledged_boundary: i64 = 0;
             tracing::info!(
                 "apply_changes(path={}): collected {} changes, skipped_internal_local_changes={}",
                 self.main_db_path,
@@ -3933,6 +4021,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         ))
                     })
                     .inspect_err(|e| tracing::error!("update_last_change_id failed: {e}"))?;
+                    persisted_sync_watermark = Some((local_pull_gen + 1, 0));
                 }
 
                 let mut cdc_enabled_for_local_replay = false;
@@ -3999,6 +4088,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 for (i, change) in local_changes.into_iter().enumerate() {
                     let preserve_original_change_floor =
                         matches!(&change.change, DatabaseTapeRowChangeType::Delete { .. });
+                    let original_change_id = change.change_id;
                     let original_change_floor = change.change_id.saturating_sub(1);
                     let operation = if should_transform_local_change(&change) {
                         if let Some(transformed) = &mut transformed {
@@ -4050,6 +4140,15 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                             "failed to replay local change after remote apply: {error}",
                         ))
                     })?;
+                    if original_change_id <= acknowledged_watermark_old
+                        && cdc_enabled_for_local_replay
+                        && !replace_base_pages
+                        && !raw_page_replay_on_sql_conn
+                    {
+                        acknowledged_boundary = max_local_change_id(coro, phase_conn)
+                            .await?
+                            .unwrap_or(acknowledged_boundary);
+                    }
                 }
                 assert!(!replay.conn().get_auto_commit());
             }
@@ -4111,6 +4210,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         )
                         .await?;
                     }
+                    persisted_sync_watermark = Some((local_pull_gen + 1, synced_change_id));
                 }
                 // Publish the post-apply schema to the shared cache exactly once, and only
                 // after any turso_cdc recreation above. Publishing between the replay commit
@@ -4119,11 +4219,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 logical_conn.publish_schema_if_newer();
                 let logical_table_names_by_stable_id =
                     read_logical_replay_table_map(coro, &logical_conn).await?;
-                return Ok((
-                    logical_conn.wal_state()?.max_frame,
+                return Ok(AppliedRemoteChanges {
+                    revert_since_wal_watermark: logical_conn.wal_state()?.max_frame,
                     logical_table_names_by_stable_id,
                     followup_revision,
-                ));
+                    persisted_sync_watermark,
+                });
             }
             let raw_replay_refresh = replace_base_pages || raw_page_replay_on_sql_conn;
             let recreate_cdc =
@@ -4218,17 +4319,23 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     self.main_db_path,
                     change_id
                 );
-                let synced_change_id = synced_change_id_after_remote_apply(
-                    recaptured_local_changes,
-                    pre_apply_local_change_id,
-                    change_id,
-                );
-                let synced_change_id =
-                    if recaptured_local_changes && (replace_base_pages || raw_page_replay_on_sql_conn)
-                    {
+                let synced_change_id = if replace_base_pages || raw_page_replay_on_sql_conn {
+                    let synced_change_id = synced_change_id_after_remote_apply(
+                        recaptured_local_changes,
+                        pre_apply_local_change_id,
+                        change_id,
+                    );
+                    if recaptured_local_changes {
                         post_remote_apply_change_id
                     } else {
                         synced_change_id
+                    }
+                } else {
+                    // The recreated turso_cdc holds only re-captured local
+                    // changes; exactly those at or below the acknowledged
+                    // boundary are already contained in the remote database.
+                    // Everything above it is still pushable.
+                    acknowledged_boundary
                 };
                 let synced_change_id = preserve_local_replay_floor
                     .map_or(synced_change_id, |floor| synced_change_id.min(floor));
@@ -4246,17 +4353,19 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         "failed to persist sync high-water mark after raw remote apply: {error}",
                     ))
                 })?;
+                persisted_sync_watermark = Some((local_pull_gen + 1, synced_change_id));
             }
 
             let logical_table_names_by_stable_id =
                 read_logical_replay_table_map(coro, &main_conn).await?;
             let revert_since_wal_watermark =
                 revert_since_wal_watermark.unwrap_or(main_conn.wal_state()?.max_frame);
-            Ok((
+            Ok(AppliedRemoteChanges {
                 revert_since_wal_watermark,
                 logical_table_names_by_stable_id,
                 followup_revision,
-            ))
+                persisted_sync_watermark,
+            })
         }
         .await;
 
@@ -4298,8 +4407,18 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.meta().remote_url(),
             self.opts.remote_encryption_key.as_deref(),
         );
-        let (pull_gen, replay_floor_change_id, change_id) =
-            push_logical_changes(ctx, &self.main_tape, &self.client_unique_id, &self.opts).await?;
+        let acknowledged = {
+            let meta = self.meta();
+            (meta.acknowledged_pull_gen, meta.acknowledged_change_id)
+        };
+        let (pull_gen, replay_floor_change_id, change_id) = push_logical_changes(
+            ctx,
+            &self.main_tape,
+            &self.client_unique_id,
+            &self.opts,
+            acknowledged,
+        )
+        .await?;
 
         self.update_meta(coro, |m| {
             m.last_pushed_pull_gen_hint = pull_gen;
