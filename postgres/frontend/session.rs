@@ -391,7 +391,7 @@ fn handle_pg_drop_schema_public(conn: &Arc<Connection>, cascade: bool) -> Result
     }
 
     for table_name in table_names {
-        let mut stmt = conn.prepare(&format!("DROP TABLE \"{table_name}\""))?;
+        let mut stmt = conn.prepare(format!("DROP TABLE \"{table_name}\""))?;
         stmt.run_ignore_rows()?;
     }
     Ok(())
@@ -399,7 +399,7 @@ fn handle_pg_drop_schema_public(conn: &Arc<Connection>, cascade: bool) -> Result
 
 fn drop_all_tables_in_schema(conn: &Arc<Connection>, schema_name: &str) -> Result<()> {
     for table_name in list_user_tables(conn, Some(schema_name))? {
-        let mut stmt = conn.prepare(&format!("DROP TABLE \"{schema_name}\".\"{table_name}\"",))?;
+        let mut stmt = conn.prepare(format!("DROP TABLE \"{schema_name}\".\"{table_name}\"",))?;
         stmt.run_ignore_rows()?;
     }
     Ok(())

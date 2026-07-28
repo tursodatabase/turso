@@ -167,17 +167,9 @@ impl Drop for SchemaReparseGuard {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct PrepareOptions {
     pub unqualified_database_search_path: Option<Vec<String>>,
-}
-
-impl Default for PrepareOptions {
-    fn default() -> Self {
-        Self {
-            unqualified_database_search_path: None,
-        }
-    }
 }
 
 /// Re-entrant state for [`Connection::reparse_schema_nonblock`] and the
