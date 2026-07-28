@@ -1120,8 +1120,11 @@ When **Change Data Capture (CDC)** is enabled for a connection, Turso automatica
 - **`change_txn_id` (INTEGER)**  
   Identifier grouping records that belong to the same transaction.  
   - All records of a transaction, including its COMMIT record, share the same value (the `change_id` of the first record in the transaction).  
+  - `-1` for the COMMIT record of a statement outside an explicit transaction that changed no rows.  
 
 Every transaction ends with a COMMIT record (`change_type = 2`). Statements executed outside an explicit transaction commit individually, so each one produces its own COMMIT record. Inside a `BEGIN ... COMMIT` block, a single COMMIT record is written when the transaction commits. Because a COMMIT record has NULL in all data columns, it appears as a mostly empty row when you select from the CDC table.
+
+An explicit transaction that captures no changes, for example one whose only statement is an `UPDATE` matching zero rows, commits without writing a COMMIT record. Outside an explicit transaction, a statement that changes no rows still writes a COMMIT record with `change_txn_id = -1`.
 
 > CDC records are visible even before a transaction commits. 
 > Operations that fail (e.g., constraint violations) are not recorded in CDC.

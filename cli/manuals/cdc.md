@@ -102,6 +102,12 @@ All records belonging to the same transaction, including its COMMIT record,
 share the same `change_txn_id` value (the `change_id` of the first record in
 the transaction).
 
+An explicit transaction that captures no changes, for example one whose only
+statement is an `UPDATE` matching zero rows, commits without writing a COMMIT
+record. Outside an explicit transaction, a statement that changes no rows
+still writes a COMMIT record; since there are no row records to take a
+`change_txn_id` from, its `change_txn_id` is -1.
+
 ## Querying Changes
 
 Once CDC is enabled, you can query the changes table like any other table:
@@ -200,6 +206,10 @@ COMMIT;
 ```
 
 If a transaction rolls back, no CDC entries remain for those changes.
+
+An explicit transaction that commits without capturing any changes leaves no
+trace either: its COMMIT record is only written when the transaction recorded
+at least one change.
 
 ## Schema Changes
 
