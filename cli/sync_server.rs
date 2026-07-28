@@ -37,6 +37,7 @@ const MVCC_TX_HEADER_SIZE: usize = 24;
 const MVCC_TX_EXT_HEADER_SIZE: usize = 40;
 const MVCC_TX_TRAILER_SIZE: usize = 8;
 const MVCC_TX_FRAME_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
+const MAX_HEADER_BYTES: usize = 32 * 1024;
 
 pub struct TursoSyncServer {
     address: String,
@@ -126,21 +127,27 @@ impl TursoSyncServer {
             let unscanned = request_data.len().saturating_sub(3);
             request_data.extend_from_slice(&buffer[..n]);
 
-            if let Some(header_end) = find_header_end(&request_data, unscanned) {
-                let headers = String::from_utf8_lossy(&request_data[..header_end]);
-                if let Some(content_length) = parse_content_length(&headers) {
-                    let body_start = header_end + 4;
-                    let total_expected = body_start + content_length;
-                    while request_data.len() < total_expected {
-                        let n = stream.read(&mut buffer)?;
-                        if n == 0 {
-                            break;
-                        }
-                        request_data.extend_from_slice(&buffer[..n]);
-                    }
+            let Some(header_end) = find_header_end(&request_data, unscanned) else {
+                if request_data.len() > MAX_HEADER_BYTES {
+                    return Err(anyhow!(
+                        "HTTP request headers exceed {MAX_HEADER_BYTES} bytes"
+                    ));
                 }
-                break;
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request_data[..header_end]);
+            if let Some(content_length) = parse_content_length(&headers) {
+                let body_start = header_end + 4;
+                let total_expected = body_start + content_length;
+                while request_data.len() < total_expected {
+                    let n = stream.read(&mut buffer)?;
+                    if n == 0 {
+                        break;
+                    }
+                    request_data.extend_from_slice(&buffer[..n]);
+                }
             }
+            break;
         }
 
         let (method, path, body) = parse_http_request(&request_data)?;
