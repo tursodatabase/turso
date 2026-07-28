@@ -2516,3 +2516,20 @@ test func7-pg-411 {
 expect {
     0.5
 }
+
+# The integer path cast straight to u64, so a negative argument wrapped and
+# overflowed inside the uuid crate.
+@skip-if sqlite "uuid7 is a turso extension"
+test uuid7-str-negative-timestamp {
+	select uuid7_str(-1);
+}
+expect error {
+	Invalid timestamp
+}
+
+@skip-if sqlite "uuid7 is a turso extension"
+test uuid7-negative-timestamp {
+	select uuid7(-1);
+}
+expect {
+}
