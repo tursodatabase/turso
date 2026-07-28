@@ -195,6 +195,7 @@ pub struct Resolver<'a> {
     /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
+    unqualified_database_search_path: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -285,6 +286,7 @@ impl<'a> Resolver<'a> {
         enable_custom_types: bool,
         dqs_dml: DoubleQuotedDml,
         dialect: Arc<dyn crate::dialect::Dialect>,
+        unqualified_database_search_path: &Option<Vec<String>>,
     ) -> Self {
         let has_temp_schema = temp_database.read().is_some();
         Self {
@@ -306,6 +308,7 @@ impl<'a> Resolver<'a> {
             trigger_context: None,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
+            unqualified_database_search_path: unqualified_database_search_path.clone(),
         }
     }
 
@@ -337,6 +340,7 @@ impl<'a> Resolver<'a> {
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            unqualified_database_search_path: self.unqualified_database_search_path.clone(),
         }
     }
 
@@ -360,6 +364,7 @@ impl<'a> Resolver<'a> {
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            unqualified_database_search_path: self.unqualified_database_search_path.clone(),
         }
     }
 
@@ -592,6 +597,22 @@ impl<'a> Resolver<'a> {
             return Ok(crate::TEMP_DB_ID);
         }
 
+        if let Some(search_path) = &self.unqualified_database_search_path {
+            for schema_name in search_path {
+                let Some(database_id) = self.resolve_search_path_database_id(schema_name) else {
+                    continue;
+                };
+                if self.with_schema(database_id, |schema| {
+                    schema_contains_object(schema, object_name)
+                }) {
+                    return Ok(database_id);
+                }
+            }
+            return Err(LimboError::ParseError(format!(
+                "no such object: {object_name}"
+            )));
+        }
+
         if self.with_schema(crate::MAIN_DB_ID, |schema| {
             schema_contains_object(schema, object_name)
         }) {
@@ -607,6 +628,13 @@ impl<'a> Resolver<'a> {
         }
 
         Ok(crate::MAIN_DB_ID)
+    }
+
+    fn resolve_search_path_database_id(&self, schema_name: &str) -> Option<usize> {
+        if schema_name.eq_ignore_ascii_case("public") {
+            return Some(crate::MAIN_DB_ID);
+        }
+        self.get_attached_database(schema_name).map(|x| x.0)
     }
 
     fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {

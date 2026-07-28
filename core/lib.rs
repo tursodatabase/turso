@@ -136,7 +136,7 @@ use tracing::{instrument, Level};
 use turso_macros::AtomicEnum;
 use turso_parser::{ast, ast::Cmd};
 
-pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
+pub use connection::{resolve_ext_path, Connection, PrepareOptions, Row, StepResult, SymbolTable};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use dialect::{Dialect, SqliteDialect};
 pub use error::{io_error, CompletionError, LimboError};
