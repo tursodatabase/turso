@@ -3,11 +3,11 @@
 use proptest::prelude::*;
 use std::fmt;
 
+use crate::constant_false::delete_or_update_where_clause;
 use crate::expression::{Expression, ExpressionContext, ExpressionProfile};
 use crate::function::builtin_functions;
 use crate::profile::StatementProfile;
 use crate::schema::{ColumnDef, Schema, TableRef};
-use crate::select::optional_where_clause;
 
 // =============================================================================
 // UPDATE STATEMENT PROFILE
@@ -105,7 +105,7 @@ pub fn update_for_table(
     let schema_clone = schema.clone();
     let profile_clone = profile.clone();
     if updatable.is_empty() {
-        return optional_where_clause(&table_clone, &schema_clone, &profile_clone)
+        return delete_or_update_where_clause(&table_clone, &schema_clone, &profile_clone)
             .prop_map(move |where_clause| UpdateStatement {
                 table: table_name.clone(),
                 assignments: vec![],
@@ -135,7 +135,7 @@ pub fn update_for_table(
 
     (
         proptest::sample::subsequence(col_indices, 1..=updatable.len()),
-        optional_where_clause(&table_clone, &schema_clone, &profile_clone),
+        delete_or_update_where_clause(&table_clone, &schema_clone, &profile_clone),
     )
         .prop_flat_map(move |(indices, where_clause)| {
             let selected_cols: Vec<&ColumnDef> =

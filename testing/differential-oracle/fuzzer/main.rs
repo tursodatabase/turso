@@ -108,6 +108,14 @@ struct Args {
     /// `--matview`, else 0.
     #[arg(long)]
     redundant_dml_probability: Option<f64>,
+
+    /// Turn on CDC on the Turso connection and check the records each
+    /// statement writes: one COMMIT record per transaction that changed
+    /// rows, and records that add up to each table's row count change. With
+    /// `--generator sql-gen-prop`, DELETE and UPDATE also get WHERE clauses
+    /// that are always false. Not supported with `--mvcc`.
+    #[arg(long)]
+    cdc: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -152,6 +160,7 @@ struct ConfigRecord {
     max_batch_size: usize,
     reopen_probability: Option<f64>,
     redundant_dml_probability: Option<f64>,
+    cdc: bool,
 }
 
 /// Summary written to the JSON report file.
@@ -178,6 +187,7 @@ impl ConfigRecord {
             max_batch_size: args.max_batch_size,
             reopen_probability: args.reopen_probability,
             redundant_dml_probability: args.redundant_dml_probability,
+            cdc: args.cdc,
         }
     }
 }
@@ -318,6 +328,9 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
     if args.reopen_probability.is_some_and(|p| p > 0.0) && (!args.matview || args.mvcc) {
         anyhow::bail!("--reopen-probability requires --matview and does not support --mvcc");
     }
+    if args.cdc && args.mvcc {
+        anyhow::bail!("--cdc does not support --mvcc");
+    }
     if args.max_batch_size < 2 {
         anyhow::bail!("--max-batch-size must be at least 2");
     }
@@ -367,6 +380,7 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
         max_batch_size: args.max_batch_size,
         reopen_probability,
         redundant_dml_probability,
+        cdc: args.cdc,
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);

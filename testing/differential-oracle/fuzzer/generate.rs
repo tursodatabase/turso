@@ -349,6 +349,7 @@ impl PropTestBackend {
         recursive_cte_focus: bool,
         weight_profile: WeightProfile,
         matview: bool,
+        cdc: bool,
     ) -> Self {
         let test_runner = TestRunner::new_with_rng(
             proptest::test_runner::Config::default(),
@@ -394,6 +395,9 @@ impl PropTestBackend {
             // Repeated keys let a DELETE or UPDATE empty a group and let a
             // replace hit an existing row.
             profile.generation.value = profile.generation.value.narrow();
+        }
+        if cdc {
+            profile.constant_false_where_weight = 2;
         }
         Self {
             test_runner,
@@ -585,7 +589,7 @@ mod tests {
                 .allow_order_dependent_aggregates
         );
 
-        let prop = PropTestBackend::new([1; 32], false, WeightProfile::default(), false);
+        let prop = PropTestBackend::new([1; 32], false, WeightProfile::default(), false, false);
         assert!(
             !prop
                 .profile
@@ -727,7 +731,7 @@ mod tests {
                 p.drop_index_weight,
             ]
         }
-        let backend = PropTestBackend::new([1; 32], false, WeightProfile::Ddl, false);
+        let backend = PropTestBackend::new([1; 32], false, WeightProfile::Ddl, false, false);
         let expected = weights(&prop_statement_profile(&WeightProfile::Ddl.stmt_weights()));
         assert_ne!(
             expected,
