@@ -144,6 +144,22 @@ pub struct DatabaseMetadata {
     pub last_pushed_change_id_hint: i64,
     #[serde(default)]
     pub last_pushed_replay_floor_change_id_hint: i64,
+    /// Pull generation in which `acknowledged_change_id` was recorded. The
+    /// acknowledgment is only meaningful while the local sync row is still in
+    /// this generation; a rebase re-numbers CDC change ids and re-records both
+    /// fields.
+    #[serde(default)]
+    pub acknowledged_pull_gen: i64,
+    /// Highest local CDC change id (in the numbering of
+    /// `acknowledged_pull_gen`) whose effect is known to be contained in the
+    /// remote database. Established against a pulled snapshot, and snapshots
+    /// only move forward, so it stays valid for every later pull. Push uses it
+    /// as a floor when the remote sync row belongs to an older generation,
+    /// and the rebase replay floor uses it for the same case — without it both
+    /// floors collapse to zero on a generation mismatch and the entire CDC
+    /// history is re-captured and re-pushed on every pull/push cycle.
+    #[serde(default)]
+    pub acknowledged_change_id: i64,
     pub partial_bootstrap_server_revision: Option<DatabasePullRevision>,
     #[serde(default)]
     pub fresh_bootstrap_pending_cdc_ack: bool,

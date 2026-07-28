@@ -2670,11 +2670,23 @@ pub async fn fetch_last_change_id<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
     source_conn: &Arc<turso_core::Connection>,
     client_id: &str,
+    acknowledged: (i64, i64),
 ) -> Result<(i64, Option<i64>)> {
     tracing::info!("fetch_last_change_id: client_id={client_id}");
 
     // fetch last_change_id from the target DB in order to guarantee atomic replay of changes and avoid conflicts in case of failure
     let (source_pull_gen, _) = read_last_change_id(ctx.coro, source_conn, client_id).await?;
+    // Change ids at or below this floor are known to be contained in the
+    // remote database (recorded by the last pull rebase in the current change
+    // id numbering), even when the remote sync row still belongs to an older
+    // pull generation. Without it a push after any rebase would fall back to
+    // change id zero and re-send the entire CDC history.
+    let (acknowledged_pull_gen, acknowledged_change_id) = acknowledged;
+    let acknowledged_floor = if acknowledged_pull_gen == source_pull_gen {
+        acknowledged_change_id.max(0)
+    } else {
+        0
+    };
     tracing::info!(
         "fetch_last_change_id: client_id={client_id}, source_pull_gen={source_pull_gen}"
     );
@@ -2746,9 +2758,13 @@ pub async fn fetch_last_change_id<IO: SyncEngineIo, Ctx>(
         return Err(Error::DatabaseSyncEngineError(format!("protocol error: target_pull_gen > source_pull_gen: {target_pull_gen} > {source_pull_gen}")));
     }
     let last_change_id = if target_pull_gen == source_pull_gen {
-        Some(target_change_id)
+        Some(target_change_id.max(acknowledged_floor))
     } else {
-        Some(0)
+        // The remote sync row predates the last local rebase, so its change
+        // ids live in an older numbering. The locally recorded acknowledgment
+        // still bounds what the remote already contains in the current
+        // numbering.
+        Some(acknowledged_floor)
     };
     Ok((source_pull_gen, last_change_id))
 }
@@ -2758,12 +2774,13 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
     source: &DatabaseTape,
     client_id: &str,
     opts: &DatabaseSyncEngineOpts,
+    acknowledged: (i64, i64),
 ) -> Result<(i64, i64, i64)> {
     tracing::info!("push_logical_changes: client_id={client_id}");
     let source_conn = connect_untracked(source)?;
 
     let (source_pull_gen, mut last_change_id) =
-        fetch_last_change_id(ctx, &source_conn, client_id).await?;
+        fetch_last_change_id(ctx, &source_conn, client_id, acknowledged).await?;
     let replay_floor_change_id = last_change_id.unwrap_or(0);
 
     tracing::debug!("push_logical_changes: last_change_id={:?}", last_change_id);
