@@ -9,6 +9,7 @@
 //! 6. Re-introspecting schemas after DDL statements
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::panic::RefUnwindSafe;
 use std::path::PathBuf;
@@ -23,6 +24,7 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::Database;
 
+use crate::cdc;
 use crate::generate::{
     GeneratedStatement, GeneratorKind, PropTestBackend, SqlGenBackend, SqlGenerator, WeightProfile,
 };
@@ -211,6 +213,9 @@ pub struct SimConfig {
     /// verify after every statement that each view equals a fresh evaluation
     /// of its defining query.
     pub ivm: bool,
+    /// Turn on CDC on the Turso connection and check its records after every
+    /// statement.
+    pub cdc: bool,
 }
 
 impl Default for SimConfig {
@@ -230,6 +235,7 @@ impl Default for SimConfig {
             recursive_cte_focus: false,
             weight_profile: WeightProfile::default(),
             ivm: false,
+            cdc: false,
         }
     }
 }
@@ -354,6 +360,8 @@ pub struct Fuzzer {
     pub out_dir: PathBuf,
     /// Captures panic hook info (location + backtrace) for the last panic.
     panic_context: Arc<Mutex<Option<String>>>,
+    /// The last CDC change id before the current Turso transaction began.
+    cdc_transaction_start: std::cell::Cell<i64>,
 }
 
 impl RefUnwindSafe for Fuzzer {}
@@ -413,6 +421,12 @@ impl Fuzzer {
             .context("Failed to ATTACH on SQLite")?;
         tracing::info!("Attached ':memory:' AS aux on both connections");
 
+        if config.cdc {
+            turso_conn
+                .execute(cdc::ENABLE_CDC)
+                .context("Failed to turn on CDC on Turso")?;
+        }
+
         // Enable MVCC after ATTACH (ATTACH is not supported in MVCC mode)
         if config.mvcc {
             turso_conn
@@ -429,6 +443,7 @@ impl Fuzzer {
             io,
             out_dir,
             panic_context: Arc::new(Mutex::new(None)),
+            cdc_transaction_start: std::cell::Cell::new(0),
         })
     }
 
@@ -641,6 +656,7 @@ impl Fuzzer {
                     seed_bytes,
                     self.config.recursive_cte_focus,
                     self.config.ivm,
+                    self.config.cdc,
                 ))
             }
         };
@@ -816,6 +832,9 @@ impl Fuzzer {
                 *ctx.lock() = Some(format!("{info}\n{bt}"));
             }));
 
+            let writes_rows = stmt.mutates_data && !stmt.is_ddl;
+            let cdc_mark = self.cdc_mark(writes_rows.then_some(&schema))?;
+
             let ivm_ref = ivm_state.as_ref();
             let oracle_result = std::panic::catch_unwind(|| {
                 let result =
@@ -895,6 +914,8 @@ impl Fuzzer {
                 }
             }
 
+            self.check_cdc(cdc_mark, &stmt.sql, stats, executed_sql)?;
+
             if stmt.is_ddl {
                 schema = self.introspect_and_verify_schemas().map_err(|e| {
                     anyhow::anyhow!(
@@ -915,6 +936,82 @@ impl Fuzzer {
         *coverage_out = generator.take_coverage();
 
         Ok(())
+    }
+
+    /// Remember where the CDC records of the next statement start. With a
+    /// schema, also count the rows of its tables.
+    fn cdc_mark(&self, count_rows_of: Option<&sql_gen::Schema>) -> Result<Option<CdcMark>> {
+        if !self.config.cdc {
+            return Ok(None);
+        }
+        let statement_start = cdc::last_change_id(&self.turso_conn)?;
+        if self.turso_conn.get_auto_commit() {
+            self.cdc_transaction_start.set(statement_start);
+        }
+        let row_counts = count_rows_of
+            .map(|schema| self.turso_row_counts(schema))
+            .transpose()?;
+        Ok(Some(CdcMark {
+            statement_start,
+            row_counts,
+        }))
+    }
+
+    fn check_cdc(
+        &self,
+        mark: Option<CdcMark>,
+        sql: &str,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<()> {
+        let Some(mark) = mark else {
+            return Ok(());
+        };
+        let transaction = cdc::records_after(&self.turso_conn, self.cdc_transaction_start.get())?;
+        let statement: Vec<cdc::Record> = transaction
+            .iter()
+            .filter(|r| r.change_id > mark.statement_start)
+            .cloned()
+            .collect();
+        let mut failure =
+            cdc::check_transaction(&transaction, self.turso_conn.get_auto_commit()).err();
+        if let (None, Some(before)) = (&failure, &mark.row_counts) {
+            let schema = self.get_schema()?;
+            let after = self.turso_row_counts(&schema)?;
+            failure = cdc::check_row_counts(&statement, before, &after).err();
+        }
+        let Some(reason) = failure else {
+            return Ok(());
+        };
+        stats.oracle_failures += 1;
+        executed_sql.push(format!("-- CDC CHECK FAILED: {sql}"));
+        let records: Vec<String> = transaction.iter().map(|r| r.to_string()).collect();
+        bail!(
+            "CDC check failed: {reason}\n  SQL: {sql}\n  Records of the transaction: {}",
+            records.join(", ")
+        );
+    }
+
+    /// Row counts by table name. CDC records name a table without its
+    /// database, so tables of the same name in main and aux add up. Temp
+    /// tables are left out: CDC never records a change to them.
+    fn turso_row_counts(&self, schema: &sql_gen::Schema) -> Result<BTreeMap<String, i64>> {
+        let mut counts = BTreeMap::new();
+        for table in &schema.tables {
+            if table.database.as_deref() == Some("temp") {
+                continue;
+            }
+            let sql = format!("SELECT count(*) FROM {}", table.qualified_name());
+            let QueryResult::Rows(rows) = DifferentialOracle::execute_turso(&self.turso_conn, &sql)
+            else {
+                bail!("{sql} returned no row");
+            };
+            let QueryValue::Integer(count) = &rows.rows()[0].0[0] else {
+                bail!("{sql} returned {:?}", rows.rows()[0]);
+            };
+            *counts.entry(table.name.clone()).or_insert(0) += *count;
+        }
+        Ok(counts)
     }
 
     /// Run `PRAGMA integrity_check` on both databases and fail if either reports corruption.
@@ -1122,6 +1219,12 @@ impl Fuzzer {
     }
 }
 
+/// Where the CDC records of one statement start.
+struct CdcMark {
+    statement_start: i64,
+    row_counts: Option<BTreeMap<String, i64>>,
+}
+
 fn push_warning_comments(executed_sql: &mut Vec<String>, stmt_idx: usize, reason: &str) {
     for (line_idx, line) in reason.lines().enumerate() {
         executed_sql.push(format!(
@@ -1159,6 +1262,7 @@ mod tests {
             recursive_cte_focus: false,
             weight_profile: WeightProfile::default(),
             ivm: false,
+            cdc: false,
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());

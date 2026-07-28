@@ -348,10 +348,15 @@ pub struct PropTestBackend {
 
 impl PropTestBackend {
     pub fn new(seed_bytes: [u8; 32], recursive_cte_focus: bool) -> Self {
-        Self::new_with_options(seed_bytes, recursive_cte_focus, false)
+        Self::new_with_options(seed_bytes, recursive_cte_focus, false, false)
     }
 
-    pub fn new_with_options(seed_bytes: [u8; 32], recursive_cte_focus: bool, ivm: bool) -> Self {
+    pub fn new_with_options(
+        seed_bytes: [u8; 32],
+        recursive_cte_focus: bool,
+        ivm: bool,
+        cdc: bool,
+    ) -> Self {
         let test_runner = TestRunner::new_with_rng(
             proptest::test_runner::Config::default(),
             proptest::test_runner::TestRng::from_seed(
@@ -387,6 +392,9 @@ impl PropTestBackend {
             // materialized views diverge from SQLite by design.
             profile.drop_table_weight = 0;
             profile.alter_table = sql_gen_prop::WeightedProfile::new(0);
+        }
+        if cdc {
+            profile.constant_false_where_weight = 2;
         }
         Self {
             test_runner,
