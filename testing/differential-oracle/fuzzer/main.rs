@@ -80,6 +80,14 @@ struct Args {
     /// defining query.
     #[arg(long, conflicts_with = "mvcc")]
     ivm: bool,
+
+    /// Turn on CDC on the Turso connection and check the records each
+    /// statement writes: one COMMIT record per transaction that changed
+    /// rows, and records that add up to each table's row count change. With
+    /// `--generator sql-gen-prop`, DELETE and UPDATE also get WHERE clauses
+    /// that are always false. Not supported with `--mvcc`.
+    #[arg(long, conflicts_with = "mvcc")]
+    cdc: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -119,6 +127,7 @@ struct ConfigRecord {
     recursive_cte_focus: bool,
     profile: String,
     ivm: bool,
+    cdc: bool,
 }
 
 /// Summary written to the JSON report file.
@@ -140,6 +149,7 @@ impl ConfigRecord {
             recursive_cte_focus: args.recursive_cte_focus,
             profile: format!("{:?}", args.profile),
             ivm: args.ivm,
+            cdc: args.cdc,
         }
     }
 }
@@ -290,6 +300,7 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
         recursive_cte_focus: args.recursive_cte_focus,
         weight_profile: args.profile,
         ivm: args.ivm,
+        cdc: args.cdc,
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);
