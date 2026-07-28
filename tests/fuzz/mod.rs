@@ -1,5 +1,6 @@
 pub mod cte;
 pub mod custom_types;
+pub mod damaged_header;
 pub mod expression_index;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 pub mod fts;
