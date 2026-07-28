@@ -758,3 +758,19 @@ test percentile-correlated-bad-fraction-all-null-inner-errors {
 }
 expect error {
 }
+
+# percentile_disc takes a fraction. step() used to validate on [0, 100] while
+# finalize() indexed by fraction, so anything above 1.0 read past the end of
+# the sorted values.
+test percentile_disc_rejects_percentage {
+    SELECT percentile_disc(x, 100) FROM (SELECT 1 AS x UNION ALL SELECT 2);
+}
+expect {
+}
+
+test percentile_disc_accepts_fraction {
+    SELECT CAST(percentile_disc(x, 0.5) AS TEXT) FROM (SELECT 1 AS x UNION ALL SELECT 2);
+}
+expect {
+    1.0
+}

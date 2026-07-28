@@ -3413,3 +3413,51 @@ test json_set_array_append_after_object_key {
 expect {
     {"a":[1,2,3,4]}
 }
+
+# A BLOB argument is read as JSONB, so every element type, payload size and
+# text byte in it is caller-controlled. Validation used to be skipped whenever
+# the payload exceeded 7 bytes, which let arbitrary bytes reach
+# str::from_utf8_unchecked through an object key, and a child element could
+# declare a payload larger than the containing buffer.
+#
+# SQLite is more lenient here: it renders an invalid UTF-8 key with replacement
+# characters rather than rejecting the document.
+
+@skip-if sqlite "sqlite renders malformed jsonb leniently"
+test jsonb-truncated-utf8-key {
+    SELECT json_extract(x'9C79616161616161F000', '$.a');
+}
+expect error {
+    malformed JSON
+}
+
+@skip-if sqlite "sqlite renders malformed jsonb leniently"
+test jsonb-invalid-utf8-key {
+    SELECT json_extract(x'9C79FFFFFFFFFFFFFF00', '$.a');
+}
+expect error {
+    malformed JSON
+}
+
+@skip-if sqlite "sqlite renders malformed jsonb leniently"
+test jsonb-oversized-child-extract {
+    SELECT json_extract(x'8BC7C8000000000000', '$[0]');
+}
+expect error {
+    malformed JSON
+}
+
+@skip-if sqlite "sqlite renders malformed jsonb leniently"
+test jsonb-oversized-child-array-length {
+    SELECT json_array_length(x'8BC7C8000000000000', '$[0]');
+}
+expect error {
+    malformed JSON
+}
+
+@skip-if sqlite "sqlite renders malformed jsonb leniently"
+test jsonb-oversized-child-remove {
+    SELECT json_remove(x'8BC7C8000000000000', '$[0]');
+}
+expect {
+}
