@@ -160,6 +160,9 @@ pub struct StatementProfile {
     pub update: WeightedProfile<UpdateProfile>,
     /// DELETE weight and optional generation profile.
     pub delete: WeightedProfile<DeleteProfile>,
+    /// Weight of a constant-false WHERE on DELETE and UPDATE, against 10 for
+    /// the usual optional WHERE. 0 never generates one.
+    pub constant_false_where_weight: u32,
 
     // DDL weights - Tables
     /// CREATE TABLE weight and optional generation profile.
@@ -222,6 +225,7 @@ impl Default for StatementProfile {
             upsert_weight: 0,
             update: WeightedProfile::new(15),
             delete: WeightedProfile::new(10),
+            constant_false_where_weight: 0,
 
             // DDL - less frequent
             create_table: WeightedProfile::new(2),
@@ -265,6 +269,7 @@ impl StatementProfile {
             upsert_weight: 0,
             update: WeightedProfile::new(0),
             delete: WeightedProfile::new(0),
+            constant_false_where_weight: 0,
             create_table: WeightedProfile::new(0),
             create_table_as_weight: 0,
             drop_table_weight: 0,

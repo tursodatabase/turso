@@ -9,6 +9,7 @@
 //! 6. Re-introspecting schemas after DDL statements
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, RefUnwindSafe};
 use std::path::PathBuf;
@@ -22,6 +23,7 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::Database;
 
+use crate::cdc;
 use crate::generate::{
     Generated, GeneratedStatement, GeneratorKind, Matviews, PropTestBackend, SqlGenBackend,
     SqlGenerator, WeightProfile,
@@ -216,6 +218,9 @@ pub struct SimConfig {
     pub reopen_probability: f64,
     /// Probability that a write that passed the check runs again unchanged.
     pub redundant_dml_probability: f64,
+    /// Turn on CDC on the Turso connection and check its records after every
+    /// statement.
+    pub cdc: bool,
 }
 
 impl Default for SimConfig {
@@ -240,6 +245,7 @@ impl Default for SimConfig {
             max_batch_size: 10,
             reopen_probability: 0.0,
             redundant_dml_probability: 0.0,
+            cdc: false,
         }
     }
 }
@@ -383,6 +389,8 @@ pub struct Fuzzer {
     panic_context: Arc<Mutex<Option<String>>>,
     /// The SQL that the current step runs, reported when the step panics.
     current_sql: RefCell<String>,
+    /// The last CDC change id before the current Turso transaction began.
+    cdc_transaction_start: std::cell::Cell<i64>,
 }
 
 /// What one iteration of the run loop does.
@@ -449,6 +457,7 @@ impl Fuzzer {
             out_dir,
             panic_context: Arc::new(Mutex::new(None)),
             current_sql: RefCell::new(String::new()),
+            cdc_transaction_start: std::cell::Cell::new(0),
         })
     }
 
@@ -620,6 +629,7 @@ impl Fuzzer {
                     self.config.recursive_cte_focus,
                     self.config.weight_profile,
                     self.config.matview,
+                    self.config.cdc,
                 ))
             }
         };
@@ -764,7 +774,7 @@ impl Fuzzer {
         if self.config.verbose {
             tracing::info!("Statement {i} [BATCH]: {} statements", stmts.len());
         }
-        let (turso, sqlite) = self.execute_on_both("BEGIN", executed_sql);
+        let (turso, sqlite) = self.execute_transaction_control("BEGIN", stats, executed_sql)?;
         if matches!(turso, QueryResult::Error(_)) || matches!(sqlite, QueryResult::Error(_)) {
             stats.oracle_failures += 1;
             bail!("BEGIN failed:\n  Turso: {turso:?}\n  SQLite: {sqlite:?}");
@@ -773,11 +783,12 @@ impl Fuzzer {
             self.current_sql.borrow_mut().clone_from(&stmt.sql);
             self.run_statement(i, stmt, schema, matviews, stats, executed_sql)?;
         }
-        let (turso, sqlite) = self.execute_on_both("COMMIT", executed_sql);
+        let (turso, sqlite) = self.execute_transaction_control("COMMIT", stats, executed_sql)?;
         match (&turso, &sqlite) {
             (QueryResult::Error(turso_err), QueryResult::Error(_)) => {
                 executed_sql.push(format!("-- COMMIT failed on both: {turso_err}"));
-                let (turso, sqlite) = self.execute_on_both("ROLLBACK", executed_sql);
+                let (turso, sqlite) =
+                    self.execute_transaction_control("ROLLBACK", stats, executed_sql)?;
                 if matches!(turso, QueryResult::Error(_)) || matches!(sqlite, QueryResult::Error(_))
                 {
                     stats.oracle_failures += 1;
@@ -797,6 +808,18 @@ impl Fuzzer {
             _ => {}
         }
         self.verify_matviews(matviews, stats, executed_sql)
+    }
+
+    fn execute_transaction_control(
+        &self,
+        sql: &str,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<(QueryResult, QueryResult)> {
+        let mark = self.cdc_mark(None)?;
+        let results = self.execute_on_both(sql, executed_sql);
+        self.check_cdc(mark, sql, stats, executed_sql)?;
+        Ok(results)
     }
 
     fn execute_on_both(
@@ -974,6 +997,8 @@ impl Fuzzer {
             tracing::info!("Statement {} [{}]: {}", i, stmt_type, stmt.sql);
         }
 
+        let writes_rows = stmt.mutates_data && !stmt.is_ddl;
+        let cdc_mark = self.cdc_mark(writes_rows.then_some(&*schema))?;
         match check_differential(&self.turso_conn(), &self.sqlite_conn, schema, stmt) {
             OracleResult::Pass => {
                 stats.statements_executed += 1;
@@ -1013,6 +1038,7 @@ impl Fuzzer {
                 return Err(anyhow::anyhow!("Oracle failure: {reason}"));
             }
         }
+        self.check_cdc(cdc_mark, &stmt.sql, stats, executed_sql)?;
 
         if stmt.is_ddl {
             self.drop_matviews_sqlite_cannot_read(matviews, stats, executed_sql)?;
@@ -1032,6 +1058,80 @@ impl Fuzzer {
             self.verify_matviews(matviews, stats, executed_sql)?;
         }
         Ok(true)
+    }
+
+    /// Remember where the CDC records of the next statement start. With a
+    /// schema, also count the rows of its tables.
+    fn cdc_mark(&self, count_rows_of: Option<&sql_gen::Schema>) -> Result<Option<CdcMark>> {
+        if !self.config.cdc {
+            return Ok(None);
+        }
+        let conn = self.turso_conn();
+        let statement_start = cdc::last_change_id(&conn)?;
+        if conn.get_auto_commit() {
+            self.cdc_transaction_start.set(statement_start);
+        }
+        let row_counts = count_rows_of
+            .map(|schema| self.turso_row_counts(schema))
+            .transpose()?;
+        Ok(Some(CdcMark {
+            statement_start,
+            row_counts,
+        }))
+    }
+
+    fn check_cdc(
+        &self,
+        mark: Option<CdcMark>,
+        sql: &str,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<()> {
+        let Some(mark) = mark else {
+            return Ok(());
+        };
+        let conn = self.turso_conn();
+        let transaction = cdc::records_after(&conn, self.cdc_transaction_start.get())?;
+        let statement: Vec<cdc::Record> = transaction
+            .iter()
+            .filter(|r| r.change_id > mark.statement_start)
+            .cloned()
+            .collect();
+        let mut failure = cdc::check_transaction(&transaction, conn.get_auto_commit()).err();
+        if let (None, Some(before)) = (&failure, &mark.row_counts) {
+            let schema = self.get_schema()?;
+            let after = self.turso_row_counts(&schema)?;
+            failure = cdc::check_row_counts(&statement, before, &after).err();
+        }
+        let Some(reason) = failure else {
+            return Ok(());
+        };
+        stats.oracle_failures += 1;
+        executed_sql.push(format!("-- CDC CHECK FAILED: {sql}"));
+        let records: Vec<String> = transaction.iter().map(|r| r.to_string()).collect();
+        bail!(
+            "CDC check failed: {reason}\n  SQL: {sql}\n  Records of the transaction: {}",
+            records.join(", ")
+        );
+    }
+
+    /// Row counts by table name. CDC records name a table without its
+    /// database, so tables of the same name in main, temp and aux add up.
+    fn turso_row_counts(&self, schema: &sql_gen::Schema) -> Result<BTreeMap<String, i64>> {
+        let mut counts = BTreeMap::new();
+        for table in &schema.tables {
+            let sql = format!("SELECT count(*) FROM {}", table.qualified_name());
+            let QueryResult::Rows(rows) =
+                DifferentialOracle::execute_turso(&self.turso_conn(), &sql)
+            else {
+                bail!("{sql} returned no row");
+            };
+            let SqlValue::Integer(count) = rows[0].0[0] else {
+                bail!("{sql} returned {:?}", rows[0]);
+            };
+            *counts.entry(table.name.clone()).or_insert(0) += count;
+        }
+        Ok(counts)
     }
 
     /// Compare every materialized view on Turso with the plain view on SQLite.
@@ -1333,6 +1433,12 @@ impl Fuzzer {
     }
 }
 
+/// Where the CDC records of one statement start.
+struct CdcMark {
+    statement_start: i64,
+    row_counts: Option<BTreeMap<String, i64>>,
+}
+
 /// Open the Turso database file in `io` and attach an in-memory `aux` database,
 /// as SQLite has one.
 fn open_turso(
@@ -1355,6 +1461,11 @@ fn open_turso(
     turso_conn
         .execute("ATTACH ':memory:' AS aux")
         .context("Failed to ATTACH on Turso")?;
+    if config.cdc {
+        turso_conn
+            .execute(cdc::ENABLE_CDC)
+            .context("Failed to turn on CDC on Turso")?;
+    }
     Ok((turso_db, turso_conn))
 }
 
@@ -1401,28 +1512,29 @@ mod tests {
             max_batch_size: 10,
             reopen_probability: 0.0,
             redundant_dml_probability: 0.0,
+            cdc: false,
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());
     }
 
     fn matview_fuzzer() -> TestFuzzer {
+        test_fuzzer(SimConfig {
+            seed: 7,
+            generator: GeneratorKind::SqlGenProp,
+            matview: true,
+            ..SimConfig::default()
+        })
+    }
+
+    fn test_fuzzer(config: SimConfig) -> TestFuzzer {
         static NEXT_OUT_DIR: AtomicUsize = AtomicUsize::new(0);
         let out_dir = std::env::temp_dir().join(format!(
             "differential-fuzzer-test-{}-{}",
             std::process::id(),
             NEXT_OUT_DIR.fetch_add(1, Ordering::Relaxed)
         ));
-        let fuzzer = Fuzzer::with_out_dir(
-            SimConfig {
-                seed: 7,
-                generator: GeneratorKind::SqlGenProp,
-                matview: true,
-                ..SimConfig::default()
-            },
-            out_dir.clone(),
-        )
-        .unwrap();
+        let fuzzer = Fuzzer::with_out_dir(config, out_dir.clone()).unwrap();
         TestFuzzer { fuzzer, out_dir }
     }
 
@@ -1724,6 +1836,123 @@ mod tests {
         assert!(err.starts_with("Matview data mismatch in 'v'"), "{err}");
         assert!(err.contains("SQLite integrity check failed"), "{err}");
         assert_eq!(stats.oracle_failures, 2);
+    }
+
+    fn cdc_fuzzer_with_table_t() -> (TestFuzzer, sql_gen::Schema) {
+        let fuzzer = test_fuzzer(SimConfig {
+            seed: 7,
+            generator: GeneratorKind::SqlGenProp,
+            cdc: true,
+            ..SimConfig::default()
+        });
+        fuzzer.execute_on_both("CREATE TABLE t(a INTEGER, b TEXT)", &mut Vec::new());
+        let schema = fuzzer.introspect_and_verify_schemas().unwrap();
+        (fuzzer, schema)
+    }
+
+    fn turso_without_cdc(fuzzer: &Fuzzer, sql: &str) {
+        let conn = fuzzer.turso_conn();
+        conn.execute("PRAGMA capture_data_changes_conn('off')")
+            .unwrap();
+        conn.execute(sql).unwrap();
+        conn.execute(cdc::ENABLE_CDC).unwrap();
+    }
+
+    #[test]
+    fn writes_in_autocommit_mode_and_in_a_batch_pass_the_cdc_check() {
+        let (fuzzer, mut schema) = cdc_fuzzer_with_table_t();
+        let (mut stats, mut executed_sql) = (SimStats::default(), Vec::new());
+        let mut matviews = Matviews::new();
+
+        fuzzer
+            .run_statement(
+                0,
+                &write("INSERT INTO t VALUES (1, 'x'), (2, 'y')"),
+                &mut schema,
+                &mut matviews,
+                &mut stats,
+                &mut executed_sql,
+            )
+            .unwrap();
+        fuzzer
+            .run_batch(
+                1,
+                &[
+                    write("UPDATE t SET b = 'z' WHERE a = 1"),
+                    write("DELETE FROM t WHERE a = 2"),
+                ],
+                &mut schema,
+                &mut matviews,
+                &mut stats,
+                &mut executed_sql,
+            )
+            .unwrap();
+
+        let records: Vec<String> = cdc::records_after(&fuzzer.turso_conn(), 0)
+            .unwrap()
+            .iter()
+            .map(|r| r.to_string())
+            .collect();
+        assert_eq!(
+            records,
+            [
+                "#1 INSERT sqlite_schema txn=1",
+                "#2 COMMIT txn=1",
+                "#3 INSERT t txn=3",
+                "#4 INSERT t txn=3",
+                "#5 COMMIT txn=3",
+                "#6 UPDATE t txn=6",
+                "#7 DELETE t txn=6",
+                "#8 COMMIT txn=6"
+            ]
+        );
+        assert_eq!(stats.oracle_failures, 0);
+    }
+
+    #[test]
+    fn a_commit_record_without_a_change_before_it_fails_the_cdc_check() {
+        let (fuzzer, _) = cdc_fuzzer_with_table_t();
+        let (mut stats, mut executed_sql) = (SimStats::default(), Vec::new());
+        let mark = fuzzer.cdc_mark(None).unwrap();
+
+        turso_without_cdc(
+            &fuzzer,
+            "INSERT INTO turso_cdc(change_type, change_txn_id) VALUES (2, 7)",
+        );
+
+        let err = fuzzer
+            .check_cdc(mark, "SELECT 1", &mut stats, &mut executed_sql)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("CDC check failed: a COMMIT record without a change before it"),
+            "{err}"
+        );
+        assert_eq!(stats.oracle_failures, 1);
+    }
+
+    #[test]
+    fn a_row_change_without_a_record_fails_the_cdc_check() {
+        let (fuzzer, schema) = cdc_fuzzer_with_table_t();
+        let (mut stats, mut executed_sql) = (SimStats::default(), Vec::new());
+        let mark = fuzzer.cdc_mark(Some(&schema)).unwrap();
+
+        turso_without_cdc(&fuzzer, "INSERT INTO t VALUES (1, 'x')");
+
+        let err = fuzzer
+            .check_cdc(
+                mark,
+                "INSERT INTO t VALUES (1, 'x')",
+                &mut stats,
+                &mut executed_sql,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with(
+                "CDC check failed: table t: the row count changed by 1, but the records add up to 0"
+            ),
+            "{err}"
+        );
     }
 
     #[test]
