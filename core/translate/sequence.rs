@@ -140,7 +140,7 @@ pub fn emit_sequence_backing_table(
         cursor: seq_cursor_id,
         key_reg: base_reg, // base_reg holds the start value
         record_reg,
-        flag: InsertFlags::new().require_seek(),
+        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
 
@@ -286,7 +286,7 @@ pub fn emit_disk_read_nextval(
         cursor: cursor_id,
         key_reg: target_register,
         record_reg,
-        flag: InsertFlags::new().require_seek(),
+        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
 
@@ -519,7 +519,7 @@ pub fn emit_disk_advance_past(
         cursor: cursor_id,
         key_reg: value_reg,
         record_reg,
-        flag: InsertFlags::new().require_seek(),
+        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
     let seq_name_reg = program.emit_string8_new_reg(seq_name.to_string());
@@ -622,7 +622,8 @@ pub(crate) fn emit_backing_table_compaction(
     program.emit_insn(Insn::Delete {
         cursor_id,
         table_name: seq_name.to_string(),
-        is_part_of_update: false,
+        // Sequence compaction is internal bookkeeping, not a SQL row change.
+        is_part_of_update: true,
     });
     program.preassign_label_to_next_insn(skip_delete_label);
     program.emit_insn(Insn::Next {
@@ -695,7 +696,8 @@ pub(crate) fn emit_sqlite_sequence_sync(
     program.emit_insn(Insn::Delete {
         cursor_id: sseq_cursor,
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
-        is_part_of_update: false,
+        // sqlite_sequence maintenance is excluded from changes().
+        is_part_of_update: true,
     });
     program.preassign_label_to_next_insn(skip_delete_label);
     program.emit_insn(Insn::Next {
@@ -734,7 +736,7 @@ pub(crate) fn emit_sqlite_sequence_sync(
         cursor: sseq_cursor,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new().require_seek(),
+        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
     program.emit_insn(Insn::Close {
