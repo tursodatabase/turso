@@ -6,6 +6,8 @@
 //! NOTE: Corruption tests are disabled when the "checksum" feature is enabled,
 //! because checksums will detect byte-level corruption before integrity_check runs.
 
+#[cfg(not(feature = "checksum"))]
+use crate::common::limbo_exec_rows;
 use crate::common::TempDatabase;
 #[cfg(not(feature = "checksum"))]
 use std::fs::OpenOptions;
@@ -367,6 +369,11 @@ fn test_integrity_check_cell_out_of_range(db: TempDatabase) {
 // ERROR CASE TESTS: FreelistCountMismatch
 // =============================================================================
 
+#[cfg(not(feature = "checksum"))]
+const FREELIST_TRUNK_PTR_OFFSET: u64 = 32;
+#[cfg(not(feature = "checksum"))]
+const FREELIST_PAGE_COUNT_OFFSET: u64 = 36;
+
 /// Test detection of FreelistCountMismatch error
 /// Creates a database with freelist pages, then corrupts the count
 #[cfg(not(feature = "checksum"))]
@@ -406,13 +413,16 @@ fn test_integrity_check_freelist_count_mismatch(db: TempDatabase) {
             .open(&db.path)
             .unwrap();
 
-        // Read current freelist trunk page (offset 32-35) and count (offset 36-39)
         let mut header = [0u8; 100];
         file.seek(SeekFrom::Start(0)).unwrap();
         file.read_exact(&mut header).unwrap();
 
-        let freelist_trunk = u32::from_be_bytes([header[32], header[33], header[34], header[35]]);
-        let freelist_count = u32::from_be_bytes([header[36], header[37], header[38], header[39]]);
+        let trunk_offset = FREELIST_TRUNK_PTR_OFFSET as usize;
+        let count_offset = FREELIST_PAGE_COUNT_OFFSET as usize;
+        let freelist_trunk =
+            u32::from_be_bytes(header[trunk_offset..trunk_offset + 4].try_into().unwrap());
+        let freelist_count =
+            u32::from_be_bytes(header[count_offset..count_offset + 4].try_into().unwrap());
 
         // We deleted 90 rows, so we must have freelist pages
         assert!(freelist_trunk > 0, "Expected freelist trunk page");
@@ -420,7 +430,8 @@ fn test_integrity_check_freelist_count_mismatch(db: TempDatabase) {
 
         // Increase the freelist count by 10, creating a mismatch
         let corrupted_count = freelist_count + 10;
-        file.seek(SeekFrom::Start(36)).unwrap();
+        file.seek(SeekFrom::Start(FREELIST_PAGE_COUNT_OFFSET))
+            .unwrap();
         file.write_all(&corrupted_count.to_be_bytes()).unwrap();
         file.sync_all().unwrap();
     }
@@ -442,6 +453,179 @@ fn test_integrity_check_freelist_count_mismatch(db: TempDatabase) {
             );
         }
     }
+}
+
+/// Populates a database until its freelist holds a few pages, checkpointed to disk.
+#[cfg(not(feature = "checksum"))]
+fn setup_db_with_freelist(db: &TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, data TEXT);")
+        .unwrap();
+    for i in 0..100 {
+        conn.execute(format!(
+            "INSERT INTO t1 VALUES ({}, '{}');",
+            i,
+            "x".repeat(100)
+        ))
+        .unwrap();
+    }
+    checkpoint_database(&conn);
+
+    // Delete rows to create freelist pages
+    conn.execute("DELETE FROM t1 WHERE id > 10;").unwrap();
+    checkpoint_database(&conn);
+}
+
+/// Overwrites the 4-byte big-endian header field at `offset` with zero,
+/// asserting it was non-zero before.
+#[cfg(not(feature = "checksum"))]
+fn zero_header_field(path: &std::path::Path, offset: u64) {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+
+    let mut field = [0u8; 4];
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.read_exact(&mut field).unwrap();
+    assert!(
+        u32::from_be_bytes(field) > 0,
+        "expected non-zero header field at offset {offset}"
+    );
+
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(&0u32.to_be_bytes()).unwrap();
+    file.sync_all().unwrap();
+}
+
+/// Opens a private copy of `path` so oracle queries never mutate the fixture.
+/// The returned `TempDir` must outlive the connection - sqlite creates its
+/// journal next to the copy.
+#[cfg(not(feature = "checksum"))]
+fn open_sqlite_oracle_copy(path: &std::path::Path) -> (tempfile::TempDir, rusqlite::Connection) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let copy = dir.path().join("oracle.db");
+    std::fs::copy(path, &copy).unwrap();
+    let conn = rusqlite::Connection::open(&copy).unwrap();
+    (dir, conn)
+}
+
+/// Runs the same allocating INSERTs through sqlite3 on a private copy of `path`.
+/// Returns sqlite's row count, or its error message.
+#[cfg(not(feature = "checksum"))]
+fn sqlite_allocate_probe(path: &std::path::Path) -> Result<i64, String> {
+    let (_dir, sqlite) = open_sqlite_oracle_copy(path);
+    for i in 100..300 {
+        let sql = format!("INSERT INTO t1 VALUES ({}, '{}');", i, "x".repeat(100));
+        if let Err(e) = sqlite.execute(&sql, []) {
+            return Err(e.to_string());
+        }
+    }
+    Ok(sqlite
+        .query_row("SELECT count(*) FROM t1", [], |row| row.get(0))
+        .unwrap())
+}
+
+/// sqlite3's `PRAGMA integrity_check` on a private copy of `path`.
+#[cfg(not(feature = "checksum"))]
+fn sqlite_integrity_check(path: &std::path::Path) -> String {
+    let (_dir, sqlite) = open_sqlite_oracle_copy(path);
+    sqlite
+        .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+        .unwrap()
+}
+
+/// A stale trunk with a zero freelist count is tolerated, not rejected - same as sqlite3.
+#[cfg(not(feature = "checksum"))]
+#[turso_macros::test]
+fn test_allocate_page_stale_freelist_trunk_is_tolerated(db: TempDatabase) {
+    setup_db_with_freelist(&db);
+    zero_header_field(&db.path, FREELIST_PAGE_COUNT_OFFSET);
+
+    let sqlite_rows =
+        sqlite_allocate_probe(&db.path).expect("sqlite3 tolerates a stale freelist trunk");
+    let sqlite_integrity = sqlite_integrity_check(&db.path);
+
+    let db = TempDatabase::new_with_existent(&db.path);
+    let conn = db.connect_limbo();
+
+    for i in 100..300 {
+        conn.execute(format!(
+            "INSERT INTO t1 VALUES ({}, '{}');",
+            i,
+            "x".repeat(100)
+        ))
+        .unwrap();
+    }
+    let rows = limbo_exec_rows(&conn, "SELECT count(*) FROM t1");
+    assert_eq!(
+        rows,
+        vec![vec![rusqlite::types::Value::Integer(sqlite_rows)]]
+    );
+
+    // Both engines leak the stale chain for integrity_check to report.
+    let sqlite_freelist = sqlite_integrity
+        .lines()
+        .find(|line| line.starts_with("Freelist:"))
+        .unwrap_or_else(|| {
+            panic!("expected sqlite3 to report the leaked chain: {sqlite_integrity}")
+        });
+    let result = run_integrity_check(&conn);
+    assert!(
+        result.contains(sqlite_freelist),
+        "integrity_check disagrees with sqlite3: {result} vs {sqlite_freelist}"
+    );
+}
+
+/// The mirror state - a positive freelist count with no trunk - is SQLITE_CORRUPT.
+/// Turso must reject it too and stay usable afterwards.
+#[cfg(not(feature = "checksum"))]
+#[turso_macros::test]
+fn test_allocate_page_freelist_count_without_trunk_errors_corrupt(db: TempDatabase) {
+    setup_db_with_freelist(&db);
+    zero_header_field(&db.path, FREELIST_TRUNK_PTR_OFFSET);
+
+    let sqlite_err = sqlite_allocate_probe(&db.path)
+        .expect_err("sqlite3 rejects a freelist count with no trunk");
+    assert!(
+        sqlite_err.contains("malformed"),
+        "expected sqlite3 to report a malformed image, got: {sqlite_err}"
+    );
+
+    let db = TempDatabase::new_with_existent(&db.path);
+    let conn = db.connect_limbo();
+
+    // Inserts that fit into existing pages commit fine (each is its own
+    // autocommit transaction); the first one needing a page allocation must
+    // fail with Corrupt.
+    let mut succeeded = 0i64;
+    let mut result = Ok(());
+    for i in 100..300 {
+        result = conn.execute(format!(
+            "INSERT INTO t1 VALUES ({}, '{}');",
+            i,
+            "x".repeat(100)
+        ));
+        if result.is_err() {
+            break;
+        }
+        succeeded += 1;
+    }
+    match result {
+        Err(e) => assert!(
+            e.to_string().contains("freelist_pages"),
+            "expected Corrupt error about the trunkless freelist count, got: {e}"
+        ),
+        Ok(_) => panic!("expected INSERT to fail with Corrupt on freelist count without trunk"),
+    }
+
+    // The failed statement rolls back; the connection stays usable.
+    let rows = limbo_exec_rows(&conn, "SELECT count(*) FROM t1");
+    assert_eq!(
+        rows,
+        vec![vec![rusqlite::types::Value::Integer(11 + succeeded)]]
+    );
 }
 
 // =============================================================================
