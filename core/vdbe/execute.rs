@@ -10140,16 +10140,20 @@ pub fn op_insert(
                         if !flag.has(InsertFlags::SKIP_LAST_ROWID) {
                             program.connection.update_last_rowid(rowid);
                         }
-                        if flag.has(InsertFlags::SKIP_STATEMENT_CHANGE_COUNT) {
-                            state.record_total_change();
-                        } else {
-                            state.record_statement_change();
+                        if !flag.has(InsertFlags::SKIP_ALL_CHANGE_COUNTS) {
+                            if flag.has(InsertFlags::SKIP_STATEMENT_CHANGE_COUNT) {
+                                state.record_total_change();
+                            } else {
+                                state.record_statement_change();
+                            }
                         }
                     }
-                } else if flag.has(InsertFlags::SKIP_STATEMENT_CHANGE_COUNT) {
-                    state.record_total_change();
-                } else {
-                    state.record_statement_change();
+                } else if !flag.has(InsertFlags::SKIP_ALL_CHANGE_COUNTS) {
+                    if flag.has(InsertFlags::SKIP_STATEMENT_CHANGE_COUNT) {
+                        state.record_total_change();
+                    } else {
+                        state.record_statement_change();
+                    }
                 }
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
