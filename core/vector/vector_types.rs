@@ -337,6 +337,19 @@ impl<'a> Vector<'a> {
                     dims_bytes[2],
                     dims_bytes[3],
                 ]) as usize;
+                // Layout is [values: n * f32][idx: n * u32][dims: u32]. Every
+                // `idx` entry comes from the blob and is used to index a dense
+                // `dims` buffer, so check it here rather than in each consumer.
+                let entries = (original_len - 4) / 8;
+                for entry in data[entries * 4..entries * 8].chunks_exact(4) {
+                    let index =
+                        u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]) as usize;
+                    if index >= dims {
+                        return Err(LimboError::InvalidArgument(format!(
+                            "f32 sparse vector index {index} out of range for {dims} dims"
+                        )));
+                    }
+                }
                 let owned = owned.map(|mut x| {
                     x.truncate(original_len - 4);
                     x
@@ -894,6 +907,42 @@ pub(crate) mod tests {
                 assert_eq!(parsed.dims, dims);
             }
         }
+    }
+
+    /// Every sparse consumer (vector_to_text, vector_convert) uses `idx` to index a
+    /// dense buffer of `dims` elements, and both fields come straight from the blob.
+    /// Out-of-range indices must be rejected while the blob is parsed, not when a
+    /// particular consumer happens to trip over them.
+    #[test]
+    fn sparse_vector_index_out_of_range_is_rejected() {
+        // values = [1.0], idx = [0xFFFFFFFF], dims = 1
+        let err = Vector::from_slice(&[
+            0x00, 0x00, 0x80, 0x3F, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x09,
+        ])
+        .expect_err("out of range sparse index must be rejected");
+        assert!(matches!(err, LimboError::InvalidArgument(_)), "{err}");
+
+        // values = [1.0], idx = [1], dims = 1 -- one past the end is still out of range
+        assert!(Vector::from_slice(&[
+            0x00, 0x00, 0x80, 0x3F, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x09,
+        ])
+        .is_err());
+    }
+
+    /// A well-formed sparse blob keeps parsing and densifying correctly.
+    #[test]
+    fn valid_sparse_vector_still_parses() {
+        // values = [1.0], idx = [0], dims = 3. Parsed from an owned blob so the
+        // pointer is f32-aligned, the way blobs reaching the SQL layer are.
+        let vector = Vector::from_slice_owned(&[
+            0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x09,
+        ])
+        .expect("well-formed sparse vector must parse");
+        assert_eq!(vector.vector_type, VectorType::Float32Sparse);
+        assert_eq!(vector.dims, 3);
+        assert_eq!(operations::text::vector_to_text(&vector), "[1,0,0]");
+        let dense = operations::convert::vector_convert(vector, VectorType::Float32Dense).unwrap();
+        assert_eq!(dense.as_f32_slice(), [1.0, 0.0, 0.0]);
     }
 
     #[test]
