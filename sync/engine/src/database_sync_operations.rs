@@ -127,32 +127,18 @@ fn pull_updates_apply_mode(header: &PullUpdatesRespProtoBody) -> Result<PullUpda
     })
 }
 
-/// Detects the remote's sync protocol from a pull-updates response header.
+/// Detects the remote's sync protocol from the `protocol` field of a
+/// pull-updates response header.
 ///
-/// Prefers the explicit `protocol` field. For servers that predate it, falls
-/// back to the revision shape: MVCC revisions serialize as
-/// `{"generation":..,"log_offset":..}` while WAL diskless revisions use
-/// `{"generation":..,"wal_fragment_no":..}` (and legacy revisions are not
-/// JSON objects at all).
+/// Servers deploy before SDK releases, so a response without the field (or
+/// with an unknown future value) comes from a page-protocol server by
+/// definition — MVCC databases only exist behind servers that advertise it.
 pub(crate) fn detect_remote_pull_protocol(header: &PullUpdatesRespProtoBody) -> RemotePullProtocol {
     match PullUpdatesProtocol::try_from(header.protocol) {
-        Ok(PullUpdatesProtocol::Pages) => return RemotePullProtocol::Pages,
-        Ok(PullUpdatesProtocol::MvccLogical) => return RemotePullProtocol::MvccLogical,
-        Ok(PullUpdatesProtocol::Unspecified) | Err(_) => {}
-    }
-    #[derive(serde::Deserialize)]
-    struct MvccRevisionProbe {
-        #[serde(rename = "generation")]
-        _generation: u64,
-        #[serde(rename = "log_offset")]
-        _log_offset: u64,
-    }
-    if header.server_revision.is_empty() {
-        RemotePullProtocol::Unknown
-    } else if serde_json::from_str::<MvccRevisionProbe>(&header.server_revision).is_ok() {
-        RemotePullProtocol::MvccLogical
-    } else {
-        RemotePullProtocol::Pages
+        Ok(PullUpdatesProtocol::MvccLogical) => RemotePullProtocol::MvccLogical,
+        Ok(PullUpdatesProtocol::Pages | PullUpdatesProtocol::Unspecified) | Err(_) => {
+            RemotePullProtocol::Pages
+        }
     }
 }
 
@@ -5551,12 +5537,12 @@ mod tests {
     }
 
     #[test]
-    fn detect_remote_pull_protocol_prefers_explicit_field() {
+    fn detect_remote_pull_protocol_reads_the_explicit_field_only() {
         use crate::server_proto::PullUpdatesProtocol;
         use crate::types::RemotePullProtocol;
 
-        let header = |protocol: i32, revision: &str| PullUpdatesRespProtoBody {
-            server_revision: revision.to_string(),
+        let header = |protocol: i32| PullUpdatesRespProtoBody {
+            server_revision: "g1:o0".to_string(),
             db_size: 0,
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,
@@ -5566,68 +5552,23 @@ mod tests {
             protocol,
         };
 
-        // Explicit field wins even when the revision shape disagrees.
         assert_eq!(
-            detect_remote_pull_protocol(&header(
-                PullUpdatesProtocol::Pages as i32,
-                r#"{"generation":1,"log_offset":9}"#
-            )),
-            RemotePullProtocol::Pages
-        );
-        assert_eq!(
-            detect_remote_pull_protocol(&header(
-                PullUpdatesProtocol::MvccLogical as i32,
-                r#"{"generation":1,"wal_fragment_no":9}"#
-            )),
-            RemotePullProtocol::MvccLogical
-        );
-    }
-
-    #[test]
-    fn detect_remote_pull_protocol_falls_back_to_revision_shape_for_old_servers() {
-        use crate::server_proto::PullUpdatesProtocol;
-        use crate::types::RemotePullProtocol;
-
-        let header = |protocol: i32, revision: &str| PullUpdatesRespProtoBody {
-            server_revision: revision.to_string(),
-            db_size: 0,
-            raw_encoding: Some(PageSetRawEncodingProto {}),
-            zstd_encoding: None,
-            stream_kind: PullUpdatesStreamKind::Pages as i32,
-            apply_mode: PullUpdatesApplyMode::Incremental as i32,
-            mvcc_log: None,
-            protocol,
-        };
-        let unspecified = PullUpdatesProtocol::Unspecified as i32;
-
-        // MVCC revisions carry log_offset; WAL diskless revisions carry
-        // wal_fragment_no; legacy revisions are not JSON objects at all.
-        assert_eq!(
-            detect_remote_pull_protocol(&header(
-                unspecified,
-                r#"{"generation":4,"log_offset":128}"#
-            )),
+            detect_remote_pull_protocol(&header(PullUpdatesProtocol::MvccLogical as i32)),
             RemotePullProtocol::MvccLogical
         );
         assert_eq!(
-            detect_remote_pull_protocol(&header(
-                unspecified,
-                r#"{"generation":4,"wal_fragment_no":7}"#
-            )),
+            detect_remote_pull_protocol(&header(PullUpdatesProtocol::Pages as i32)),
+            RemotePullProtocol::Pages
+        );
+        // Servers deploy before SDK releases: a missing field (old server)
+        // or an unknown future value means a page-protocol server.
+        assert_eq!(
+            detect_remote_pull_protocol(&header(PullUpdatesProtocol::Unspecified as i32)),
             RemotePullProtocol::Pages
         );
         assert_eq!(
-            detect_remote_pull_protocol(&header(unspecified, "g142")),
+            detect_remote_pull_protocol(&header(99)),
             RemotePullProtocol::Pages
-        );
-        assert_eq!(
-            detect_remote_pull_protocol(&header(unspecified, "")),
-            RemotePullProtocol::Unknown
-        );
-        // Unknown enum values from newer servers degrade to the fallback.
-        assert_eq!(
-            detect_remote_pull_protocol(&header(99, r#"{"generation":4,"log_offset":128}"#)),
-            RemotePullProtocol::MvccLogical
         );
     }
 }

@@ -365,6 +365,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                         sync_engine_opts.partial_sync_opts.is_some()
                     })?,
                 };
+                let fresh_bootstrap = metadata.is_none() && sync_engine_opts.bootstrap_if_empty;
                 let metadata = database_sync_engine::DatabaseSyncEngine::bootstrap_db(
                     &coro,
                     io.clone(),
@@ -398,6 +399,15 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_opts,
                 )
                 .await?;
+                // A fresh MVCC bootstrap only carries the last durable
+                // generation base; catch up to the retained logical log so
+                // the database is current at connect time (no-op for
+                // page-protocol replicas).
+                if fresh_bootstrap {
+                    sync_engine_opened
+                        .catch_up_after_fresh_bootstrap(&coro)
+                        .await?;
+                }
                 *sync_engine.lock() = Some(sync_engine_opened);
                 Ok(None)
             })

@@ -163,14 +163,10 @@ pub struct DatabaseMetadata {
     pub partial_bootstrap_server_revision: Option<DatabasePullRevision>,
     #[serde(default)]
     pub fresh_bootstrap_pending_cdc_ack: bool,
-    /// Operative switch for MVCC logical pulls; kept as a bool (mirroring
-    /// `remote_pull_protocol == MvccLogical`) so metadata files stay readable
-    /// by older engine versions.
-    #[serde(default)]
-    pub logical_mvcc_pull_active: bool,
     /// Detected remote sync protocol; source of truth for pull dispatch.
-    /// Older metadata files deserialize to `Unknown` and are migrated in
-    /// [`DatabaseMetadata::load`] from `logical_mvcc_pull_active`.
+    /// Metadata files written before this field existed deserialize to
+    /// `Unknown` and are pinned to `Pages` in [`DatabaseMetadata::load`]
+    /// (MVCC logical sync never shipped without this field).
     #[serde(default)]
     pub remote_pull_protocol: RemotePullProtocol,
     #[serde(default)]
@@ -271,17 +267,15 @@ impl DatabaseMetadata {
                 let mut meta: DatabaseMetadata = serde_json::from_value(value).map_err(|err|
                     Error::JsonDecode(format!("unable to parse metadata file with version {version}: {err}"))
                 )?;
-                // Migrate metadata written before remote_pull_protocol existed:
-                // a replica that already holds a revision has talked to the
-                // server, so the legacy bool is authoritative for its protocol.
+                // Metadata written before remote_pull_protocol existed belongs
+                // to a page-protocol replica (MVCC logical sync never shipped
+                // without this field). A replica that already holds a revision
+                // has talked to the server, so pin it to Pages; deferred
+                // replicas stay Unknown and detect on first contact.
                 if meta.remote_pull_protocol == RemotePullProtocol::Unknown
                     && meta.synced_revision.is_some()
                 {
-                    meta.remote_pull_protocol = if meta.logical_mvcc_pull_active {
-                        RemotePullProtocol::MvccLogical
-                    } else {
-                        RemotePullProtocol::Pages
-                    };
+                    meta.remote_pull_protocol = RemotePullProtocol::Pages;
                 }
                 Ok(meta)
             }
@@ -293,6 +287,10 @@ impl DatabaseMetadata {
     pub fn dump(&self) -> Result<Vec<u8>> {
         let data = serde_json::to_string(self)?;
         Ok(data.into_bytes())
+    }
+    /// True when this replica syncs via MVCC logical-log pulls.
+    pub fn logical_mvcc_pull_active(&self) -> bool {
+        self.remote_pull_protocol == RemotePullProtocol::MvccLogical
     }
 }
 
@@ -769,16 +767,16 @@ mod tests {
 
         assert_eq!(meta.last_pushed_replay_floor_change_id_hint, 0);
         assert!(!meta.fresh_bootstrap_pending_cdc_ack);
-        assert!(!meta.logical_mvcc_pull_active);
+        assert!(!meta.logical_mvcc_pull_active());
         assert!(meta.logical_table_names_by_stable_id.is_empty());
     }
 
     #[test]
-    fn metadata_load_migrates_pre_protocol_files_from_legacy_bool() {
-        // A pre-remote_pull_protocol replica that already holds a revision has
-        // talked to the server, so the legacy bool is authoritative. This is
-        // what keeps existing page-protocol (WAL) replicas on the exact same
-        // code path after upgrading the engine.
+    fn metadata_load_pins_pre_protocol_replicas_with_revisions_to_pages() {
+        // A replica whose metadata predates remote_pull_protocol is a
+        // page-protocol replica by definition (MVCC logical sync never
+        // shipped without the field). Pinning it to Pages keeps existing
+        // WAL replicas on the exact same code path after upgrading.
         let pages_meta = DatabaseMetadata::load(
             br#"{
                 "version": "v1",
@@ -796,30 +794,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pages_meta.remote_pull_protocol, RemotePullProtocol::Pages);
-        assert!(!pages_meta.logical_mvcc_pull_active);
-
-        let logical_meta = DatabaseMetadata::load(
-            br#"{
-                "version": "v1",
-                "client_unique_id": "client-a",
-                "synced_revision": {"type": "v1", "revision": "{\"generation\":3,\"log_offset\":128}"},
-                "revert_since_wal_salt": null,
-                "revert_since_wal_watermark": 0,
-                "last_pull_unix_time": null,
-                "last_push_unix_time": null,
-                "last_pushed_pull_gen_hint": 0,
-                "last_pushed_change_id_hint": 0,
-                "partial_bootstrap_server_revision": null,
-                "logical_mvcc_pull_active": true,
-                "saved_configuration": null
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(
-            logical_meta.remote_pull_protocol,
-            RemotePullProtocol::MvccLogical
-        );
-        assert!(logical_meta.logical_mvcc_pull_active);
+        assert!(!pages_meta.logical_mvcc_pull_active());
     }
 
     #[test]
@@ -864,12 +839,11 @@ mod tests {
         )
         .unwrap();
         meta.remote_pull_protocol = RemotePullProtocol::MvccLogical;
-        meta.logical_mvcc_pull_active = true;
         let reloaded = DatabaseMetadata::load(&meta.dump().unwrap()).unwrap();
         assert_eq!(
             reloaded.remote_pull_protocol,
             RemotePullProtocol::MvccLogical
         );
-        assert!(reloaded.logical_mvcc_pull_active);
+        assert!(reloaded.logical_mvcc_pull_active());
     }
 }
