@@ -14,6 +14,10 @@
 //!     fetches with gaps, the shape projections and expressions compile to.
 //!   - filter_agg_106  : SELECT sum(c98) .. WHERE c52 > 0 -- two fetches
 //!     separated by a conditional jump, the TPC-H per-expression shape.
+//!   - where_high_project_low_106 : a late filter column then ten early
+//!     projection columns -- the common backwards jump compilers emit.
+//!   - select_desc_106 : strictly descending projection -- the worst case
+//!     for forward-resume caching, the best case for per-column arrays.
 //!
 //! Columns alternate INTEGER and TEXT so header varint widths and serial types
 //! are non-uniform, like real schemas.
@@ -61,6 +65,24 @@ const QUERIES: &[(&str, &str, usize)] = &[
     (
         "filter_agg_106",
         "SELECT sum(c98) FROM t106 WHERE c52 > 0",
+        20_000,
+    ),
+    // High filter column, low projection run: the WHERE fetch walks deep
+    // into the header, then the projection jumps backwards. A resume-point
+    // cache restarts at the jump; per-column arrays serve the low run from
+    // the walk the filter already paid for.
+    (
+        "where_high_project_low_106",
+        "SELECT c0, c1, c2, c3, c4, c5, c6, c7, c8, c9 FROM t106 WHERE c104 > 0",
+        20_000,
+    ),
+    // Strictly descending projection: every fetch is a backwards jump, the
+    // worst case for any forward-resume scheme (it degenerates to a full
+    // re-walk per fetch) and the best case for per-column arrays (one walk
+    // on the first fetch, O(1) for the rest).
+    (
+        "select_desc_106",
+        "SELECT c105, c84, c63, c42, c21, c0 FROM t106",
         20_000,
     ),
 ];

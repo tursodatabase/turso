@@ -3123,7 +3123,7 @@ pub(crate) mod serial_decode_stats {
         SERIAL_TYPE_DECODES.with(|c| c.get())
     }
 
-    pub(super) fn bump() {
+    pub(crate) fn bump() {
         SERIAL_TYPE_DECODES.with(|c| c.set(c.get() + 1));
     }
 }
@@ -3141,7 +3141,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
     #[inline(always)]
     fn nth_into_register(&mut self, n: usize, dest: &mut Register) -> Option<Result<()>> {
         use crate::storage::sqlite3_ondisk::read_varint;
-        use crate::types::{get_serial_type_size, Extendable, Text};
+        use crate::types::get_serial_type_size;
 
         let mut header = self.header_section_ref();
         let mut data = self.data_section_ref();
@@ -3190,203 +3190,217 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
         self.set_header_section(&header[bytes_read..]);
 
         // Decode directly into register based on serial type
-        match serial_type {
-            // NULL
-            0 => {
-                self.set_data_section(data);
-                dest.set_null();
-            }
-            // I8
-            1 => {
-                if unlikely(data.is_empty()) {
-                    return Some(Err(LimboError::Corrupt("Invalid 1-byte int".into())));
-                }
-                self.set_data_section(&data[1..]);
-                dest.set_int(data[0] as i8 as i64);
-            }
-            // I16
-            2 => {
-                if unlikely(data.len() < 2) {
-                    return Some(Err(LimboError::Corrupt("Invalid 2-byte int".into())));
-                }
-                self.set_data_section(&data[2..]);
-                dest.set_int(i16::from_be_bytes([data[0], data[1]]) as i64);
-            }
-            // I24
-            3 => {
-                if unlikely(data.len() < 3) {
-                    return Some(Err(LimboError::Corrupt("Invalid 3-byte int".into())));
-                }
-                self.set_data_section(&data[3..]);
-                let sign_extension = if data[0] <= 0x7F { 0 } else { 0xFF };
-                dest.set_int(
-                    i32::from_be_bytes([sign_extension, data[0], data[1], data[2]]) as i64,
-                );
-            }
-            // I32
-            4 => {
-                if unlikely(data.len() < 4) {
-                    return Some(Err(LimboError::Corrupt("Invalid 4-byte int".into())));
-                }
-                self.set_data_section(&data[4..]);
-                dest.set_int(i32::from_be_bytes([data[0], data[1], data[2], data[3]]) as i64);
-            }
-            // I48
-            5 => {
-                if unlikely(data.len() < 6) {
-                    return Some(Err(LimboError::Corrupt("Invalid 6-byte int".into())));
-                }
-                self.set_data_section(&data[6..]);
-                let sign_extension = if data[0] <= 0x7F { 0 } else { 0xFF };
-                dest.set_int(i64::from_be_bytes([
-                    sign_extension,
-                    sign_extension,
-                    data[0],
-                    data[1],
-                    data[2],
-                    data[3],
-                    data[4],
-                    data[5],
-                ]));
-            }
-            // I64
-            6 => {
-                if unlikely(data.len() < 8) {
-                    return Some(Err(LimboError::Corrupt("Invalid 8-byte int".into())));
-                }
-                self.set_data_section(&data[8..]);
-                dest.set_int(i64::from_be_bytes([
-                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                ]));
-            }
-            // F64
-            7 => {
-                if unlikely(data.len() < 8) {
-                    return Some(Err(LimboError::Corrupt("Invalid 8-byte float".into())));
-                }
-                self.set_data_section(&data[8..]);
-                let val = f64::from_be_bytes([
-                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                ]);
-                if let Some(nn) = NonNan::new(val) {
-                    dest.set_float(nn);
-                } else {
-                    dest.set_null();
-                }
-            }
-            // CONST_INT0
-            8 => {
-                self.set_data_section(data);
-                dest.set_int(0);
-            }
-            // CONST_INT1
-            9 => {
-                self.set_data_section(data);
-                dest.set_int(1);
-            }
-            // Reserved
-            10 | 11 => {
-                mark_unlikely();
-                return Some(Err(LimboError::Corrupt(format!(
-                    "Reserved serial type: {serial_type}"
-                ))));
-            }
-            // BLOB (n >= 12 && n & 1 == 0)
-            n if n >= 12 && n & 1 == 0 => crate::with_value_blob_allocation_site!(RecordDecode, {
-                let content_size = ((n - 12) / 2) as usize;
-                if unlikely(data.len() < content_size) {
-                    return Some(Err(LimboError::Corrupt("Invalid Blob value".into())));
-                }
-                self.set_data_section(&data[content_size..]);
-                let blob_data = &data[..content_size];
-                match dest {
-                    Register::Value(Value::Blob(existing_blob)) => {
-                        if let Err(err) = existing_blob.do_extend(&blob_data) {
-                            return Some(Err(err));
-                        }
-                    }
-                    _ => {
-                        let blob = match crate::types::value_blob_from_slice(blob_data) {
-                            Ok(blob) => blob,
-                            Err(err) => return Some(Err(err.into())),
-                        };
-                        if let Err(err) = dest.set_blob(blob) {
-                            return Some(Err(err));
-                        }
-                    }
-                }
-            }),
-            // TEXT (n >= 13 && n & 1 == 1)
-            n if n >= 13 && n & 1 == 1 => {
-                let content_size = ((n - 13) / 2) as usize;
-                if unlikely(data.len() < content_size) {
-                    return Some(Err(LimboError::Corrupt("Invalid Text value".into())));
-                }
-                self.set_data_section(&data[content_size..]);
-                let text_data = &data[..content_size];
-                // SAFETY: TEXT serial type contains valid UTF-8
-                let text_str = if cfg!(debug_assertions) {
-                    match std::str::from_utf8(text_data) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return Some(Err(LimboError::InternalError(format!(
-                                "Invalid UTF-8 in TEXT serial type: {e}"
-                            ))));
-                        }
-                    }
-                } else {
-                    unsafe { std::str::from_utf8_unchecked(text_data) }
-                };
-                match dest {
-                    Register::Value(Value::Text(existing_text)) => {
-                        if let Err(err) = existing_text.do_extend(&text_str) {
-                            return Some(Err(err));
-                        }
-                    }
-                    _ => {
-                        if let Err(err) = dest.set_text(Text::new(text_str.to_string())) {
-                            return Some(Err(err));
-                        }
-                    }
-                }
-            }
-            _ => {
-                mark_unlikely();
-                return Some(Err(LimboError::Corrupt(format!(
-                    "Invalid serial type: {serial_type}"
-                ))));
-            }
-        }
+        let consumed = match serial_value_into_register(serial_type, data, dest) {
+            Ok(n) => n,
+            Err(e) => return Some(Err(e)),
+        };
+        self.set_data_section(&data[consumed..]);
 
         Some(Ok(()))
     }
 }
 
-/// Extension trait for [crate::types::ImmutableRecord] giving `Insn::Column` a
-/// header walk that resumes from the record's cached parse frontier, so
-/// fetching every column of an N-column row costs O(N) serial-type decodes
-/// per row instead of O(N^2).
-pub trait RecordFrontierExt {
-    /// Decodes column `col` directly into `dest`, resuming the header walk
-    /// from wherever the previous fetch on this record stopped. Same contract
-    /// as [ValueIteratorExt::nth_into_register]: `Some(Ok(()))` on success,
+/// Decodes one value of `serial_type` from the start of `data` directly into
+/// `dest`, returning how many data bytes the value occupies. Shared by the
+/// sequential header walk ([ValueIteratorExt::nth_into_register]) and the
+/// O(1) header-cache hit path ([RecordHeaderExt::column_into_register]).
+#[inline(always)]
+pub(crate) fn serial_value_into_register(
+    serial_type: u64,
+    data: &[u8],
+    dest: &mut Register,
+) -> Result<usize> {
+    use crate::types::{Extendable, Text};
+    match serial_type {
+        // NULL
+        0 => {
+            dest.set_null();
+            Ok(0)
+        }
+        // I8
+        1 => {
+            if unlikely(data.is_empty()) {
+                return Err(LimboError::Corrupt("Invalid 1-byte int".into()));
+            }
+            dest.set_int(data[0] as i8 as i64);
+            Ok(1)
+        }
+        // I16
+        2 => {
+            if unlikely(data.len() < 2) {
+                return Err(LimboError::Corrupt("Invalid 2-byte int".into()));
+            }
+            dest.set_int(i16::from_be_bytes([data[0], data[1]]) as i64);
+            Ok(2)
+        }
+        // I24
+        3 => {
+            if unlikely(data.len() < 3) {
+                return Err(LimboError::Corrupt("Invalid 3-byte int".into()));
+            }
+            let sign_extension = if data[0] <= 0x7F { 0 } else { 0xFF };
+            dest.set_int(i32::from_be_bytes([sign_extension, data[0], data[1], data[2]]) as i64);
+            Ok(3)
+        }
+        // I32
+        4 => {
+            if unlikely(data.len() < 4) {
+                return Err(LimboError::Corrupt("Invalid 4-byte int".into()));
+            }
+            dest.set_int(i32::from_be_bytes([data[0], data[1], data[2], data[3]]) as i64);
+            Ok(4)
+        }
+        // I48
+        5 => {
+            if unlikely(data.len() < 6) {
+                return Err(LimboError::Corrupt("Invalid 6-byte int".into()));
+            }
+            let sign_extension = if data[0] <= 0x7F { 0 } else { 0xFF };
+            dest.set_int(i64::from_be_bytes([
+                sign_extension,
+                sign_extension,
+                data[0],
+                data[1],
+                data[2],
+                data[3],
+                data[4],
+                data[5],
+            ]));
+            Ok(6)
+        }
+        // I64
+        6 => {
+            if unlikely(data.len() < 8) {
+                return Err(LimboError::Corrupt("Invalid 8-byte int".into()));
+            }
+            dest.set_int(i64::from_be_bytes([
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+            ]));
+            Ok(8)
+        }
+        // F64
+        7 => {
+            if unlikely(data.len() < 8) {
+                return Err(LimboError::Corrupt("Invalid 8-byte float".into()));
+            }
+            let val = f64::from_be_bytes([
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+            ]);
+            if let Some(nn) = NonNan::new(val) {
+                dest.set_float(nn);
+            } else {
+                dest.set_null();
+            }
+            Ok(8)
+        }
+        // CONST_INT0
+        8 => {
+            dest.set_int(0);
+            Ok(0)
+        }
+        // CONST_INT1
+        9 => {
+            dest.set_int(1);
+            Ok(0)
+        }
+        // Reserved
+        10 | 11 => {
+            mark_unlikely();
+            Err(LimboError::Corrupt(format!(
+                "Reserved serial type: {serial_type}"
+            )))
+        }
+        // BLOB (n >= 12 && n & 1 == 0)
+        n if n >= 12 && n & 1 == 0 => crate::with_value_blob_allocation_site!(RecordDecode, {
+            let content_size = ((n - 12) / 2) as usize;
+            if unlikely(data.len() < content_size) {
+                return Err(LimboError::Corrupt("Invalid Blob value".into()));
+            }
+            let blob_data = &data[..content_size];
+            match dest {
+                Register::Value(Value::Blob(existing_blob)) => {
+                    existing_blob.do_extend(&blob_data)?;
+                }
+                _ => {
+                    let blob = crate::types::value_blob_from_slice(blob_data)?;
+                    dest.set_blob(blob)?;
+                }
+            }
+            Ok(content_size)
+        }),
+        // TEXT (n >= 13 && n & 1 == 1)
+        n if n >= 13 && n & 1 == 1 => {
+            let content_size = ((n - 13) / 2) as usize;
+            if unlikely(data.len() < content_size) {
+                return Err(LimboError::Corrupt("Invalid Text value".into()));
+            }
+            let text_data = &data[..content_size];
+            // SAFETY: TEXT serial type contains valid UTF-8
+            let text_str = if cfg!(debug_assertions) {
+                match std::str::from_utf8(text_data) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Err(LimboError::InternalError(format!(
+                            "Invalid UTF-8 in TEXT serial type: {e}"
+                        )));
+                    }
+                }
+            } else {
+                unsafe { std::str::from_utf8_unchecked(text_data) }
+            };
+            match dest {
+                Register::Value(Value::Text(existing_text)) => {
+                    existing_text.do_extend(&text_str)?;
+                }
+                _ => {
+                    dest.set_text(Text::new(text_str.to_string()))?;
+                }
+            }
+            Ok(content_size)
+        }
+        _ => {
+            mark_unlikely();
+            Err(LimboError::Corrupt(format!(
+                "Invalid serial type: {serial_type}"
+            )))
+        }
+    }
+}
+
+/// Extension trait for [crate::types::ImmutableRecord] giving `Insn::Column`
+/// an SQLite-style header cache: the record retains every parsed column's
+/// serial type and data offset, so fetching all N columns of a row costs N
+/// serial-type decodes total — in any access order — and re-fetching an
+/// already-parsed column is O(1).
+pub trait RecordHeaderExt {
+    /// Decodes column `col` directly into `dest`. Same contract as
+    /// [ValueIteratorExt::nth_into_register]: `Some(Ok(()))` on success,
     /// `Some(Err(..))` on parse error, `None` when the record has fewer than
     /// `col + 1` columns.
     fn column_into_register(&self, col: usize, dest: &mut Register) -> Option<Result<()>>;
 }
 
-impl RecordFrontierExt for crate::types::ImmutableRecord {
+impl RecordHeaderExt for crate::types::ImmutableRecord {
     #[inline(always)]
     fn column_into_register(&self, col: usize, dest: &mut Register) -> Option<Result<()>> {
-        let (skip, mut iter) = match self.resume_iter(col) {
-            Ok(v) => v,
+        let (serial_type, data_off) = match self.ensure_parsed_through(col) {
+            Ok(Some(slot)) => slot,
+            Ok(None) => return None,
             Err(e) => return Some(Err(e)),
         };
-        let res = iter.nth_into_register(skip, dest);
-        if let Some(Ok(())) = res {
-            self.commit_frontier(col, &iter);
+        let payload = self.get_payload();
+        // The cached offset comes from the header's own size claims; a header
+        // promising more data than the payload holds is caught here, exactly
+        // where the sequential walk would catch it.
+        let Some(data) = payload.get(data_off..) else {
+            return Some(Err(LimboError::Corrupt(
+                "Data section too small for indicated serial type size".into(),
+            )));
+        };
+        match serial_value_into_register(serial_type, data, dest) {
+            Ok(_) => Some(Ok(())),
+            Err(e) => Some(Err(e)),
         }
-        res
     }
 }
 
@@ -3397,9 +3411,9 @@ mod tests {
 
     /// The record header must be walked once per row, not once per column:
     /// a SELECT * over N columns costs N serial-type decodes per row. Without
-    /// the parse-frontier cache each Column re-parses the header from the
-    /// start, costing sum(i+1 for i in 0..N) = N*(N+1)/2 decodes per row
-    /// (55 for the 10 columns here).
+    /// the header cache each Column re-parses the header from the start,
+    /// costing sum(i+1 for i in 0..N) = N*(N+1)/2 decodes per row (55 for
+    /// the 10 columns here).
     #[test]
     fn select_star_serial_type_decodes_are_linear_in_columns() {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
@@ -3438,11 +3452,11 @@ mod tests {
 
     /// A WHERE fetch and the projection fetch execute as separate
     /// instructions with a conditional jump in between, so no batching
-    /// applies — the record's parse frontier alone carries the walk across
-    /// dispatches: c4 costs 5 decodes, then c9 resumes for 5 more instead of
-    /// re-walking all 10 from byte zero.
+    /// applies — the record's header cache alone carries the walk across
+    /// dispatches: c4 costs 5 decodes, then c9 extends the parse for 5 more
+    /// instead of re-walking all 10 from byte zero.
     #[test]
-    fn filtered_late_column_resumes_frontier_across_instructions() {
+    fn filtered_late_column_extends_header_cache_across_instructions() {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
         let db =
             crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
@@ -3469,7 +3483,7 @@ mod tests {
     }
 
     /// A sparse ascending projection shares one header walk per row through
-    /// the parse frontier: c2 costs 3 decodes, then c5 resumes for 3 more and
+    /// the header cache: c2 costs 3 decodes, then c5 extends for 3 more and
     /// c9 for 4, i.e. 10 per row — never re-decoding a serial type. Restarting
     /// from scratch for every column would cost 3 + 6 + 10 = 19 per row.
     #[test]
@@ -3493,6 +3507,40 @@ mod tests {
             assert_eq!(row.get::<i64>(0).unwrap(), 2);
             assert_eq!(row.get::<String>(1).unwrap(), "c");
             assert_eq!(row.get::<String>(2).unwrap(), "e");
+            rows += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(serial_decode_stats::count(), 10);
+    }
+
+    /// A descending projection is the pattern a single resume point cannot
+    /// serve: a frontier restarts the walk for every fetch (10 + 5 + 1 = 16
+    /// decodes per row), and no-cache costs the same 16. The per-column
+    /// arrays parse the header once on the first (highest) fetch and serve
+    /// the rest O(1): 10 decodes per row.
+    #[test]
+    fn descending_projection_hits_header_cache() {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let db =
+            crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE t(c0 INTEGER, c1 TEXT, c2 INTEGER, c3 TEXT, c4 INTEGER, \
+             c5 TEXT, c6 INTEGER, c7 TEXT, c8 INTEGER, c9 TEXT)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (0, 'a', 2, 'b', 4, 'c', 6, 'd', 8, 'e')")
+            .unwrap();
+
+        let mut stmt = conn.prepare("SELECT c9, c4, c0 FROM t").unwrap();
+        serial_decode_stats::reset();
+        let mut rows = 0;
+        stmt.run_with_row_callback(|row| {
+            assert_eq!(row.get::<String>(0).unwrap(), "e");
+            assert_eq!(row.get::<i64>(1).unwrap(), 4);
+            assert_eq!(row.get::<i64>(2).unwrap(), 0);
             rows += 1;
             Ok(())
         })

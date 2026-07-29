@@ -48,7 +48,7 @@ use crate::vdbe::metrics::HashJoinMetrics;
 use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ColumnRuns;
-use crate::vdbe::RecordFrontierExt;
+use crate::vdbe::RecordHeaderExt;
 use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
     registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
@@ -1927,38 +1927,26 @@ fn op_column_run(
         return Ok(InsnFunctionStepResult::Step);
     };
 
-    let first_column = ColumnRuns::op_column(ops[0]);
-    let (first_skip, mut iter) = record.resume_iter(first_column)?;
-    let mut prev_column = first_column;
-    let mut last_decoded = None;
-    let mut idx = 0;
-    while idx < run_len {
-        let op = ops[idx];
-        let column = ColumnRuns::op_column(op);
-        let skip = if idx == 0 {
-            first_skip
-        } else {
-            column - prev_column - 1
-        };
-        prev_column = column;
-        match iter.nth_into_register(skip, &mut state.registers[ColumnRuns::op_dest(op)]) {
-            Some(Ok(())) => {
-                last_decoded = Some(column);
-                idx += 1;
-            }
-            Some(Err(e)) => return Err(e),
-            None => {
-                branches::mark_unlikely();
-                break;
-            }
-        }
-    }
-    // An exhausted header cannot seed a later fetch (anything past the last
-    // column restarts or misses anyway), so skip the store on the common
-    // whole-row scan.
-    if let (Some(column), false) = (last_decoded, iter.header_section_ref().is_empty()) {
-        record.commit_frontier(column, &iter);
-    }
+    // One borrow and one header walk serve the whole run; the walk fills the
+    // record's header cache, so later out-of-run fetches stay O(1).
+    let payload = record.get_payload();
+    let registers = &mut state.registers;
+    let idx = record.ensure_run_into(
+        ops.iter().map(|&op| ColumnRuns::op_column(op)),
+        |i, serial_type, data_off| {
+            let Some(data) = payload.get(data_off..) else {
+                return Err(LimboError::Corrupt(
+                    "Data section too small for indicated serial type size".into(),
+                ));
+            };
+            crate::vdbe::serial_value_into_register(
+                serial_type,
+                data,
+                &mut registers[ColumnRuns::op_dest(ops[i])],
+            )
+            .map(|_| ())
+        },
+    )?;
     // Cold tail: the record is shorter than the run (rows written before
     // ALTER TABLE ADD COLUMN). Ascending columns mean every remaining column
     // is also past the end; fill each from its instruction's DEFAULT.

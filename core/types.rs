@@ -24,7 +24,7 @@ use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{Completion, CompletionError, Result, IO};
 use std::borrow::{Borrow, Cow};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::fmt::{Debug, Display};
 use std::future::Future;
@@ -1137,35 +1137,93 @@ mod immutable_record {
         //
         // payload is the std::vec::Vec<u8> but in order to use Register which holds ImmutableRecord as a Value - we store std::vec::Vec<u8> as Value::Blob
         payload: Value,
-        // Where the last header walk over `payload` stopped, so the next column
-        // fetch resumes mid-header instead of re-decoding every serial type from
-        // byte zero (SQLite's aOffset/nHdrParsed cache, collapsed to a frontier).
-        // Every `&mut` route to the payload passes through [Self::as_blob_mut],
-        // which resets this; a stale frontier can therefore never survive a
-        // payload change.
-        parse_cache: Cell<ParseFrontier>,
+        // SQLite-style header cache (VdbeCursor's aType[]/aOffset[]/nHdrParsed
+        // ensemble): serial type and absolute data offset of every column
+        // parsed so far, extended incrementally as later columns are fetched,
+        // making any re-fetch of a parsed column O(1). Every `&mut` route to
+        // the payload passes through [Self::as_blob_mut], which clears this;
+        // a stale entry can therefore never survive a payload change.
+        parse_cache: RefCell<HeaderCache>,
     }
 
-    /// Resume point of an incremental record-header walk: columns `0..cols_parsed`
-    /// have been decoded, the next serial type starts at `header_off` and its data
-    /// at `data_off` (both absolute payload offsets), and the header ends at
-    /// `header_end`. `header_off == 0` means "no walk cached" — offset zero always
-    /// holds the header-size varint, never a serial type.
-    #[derive(Clone, Copy)]
-    struct ParseFrontier {
-        cols_parsed: u32,
-        header_off: u32,
-        header_end: u32,
-        data_off: u32,
+    /// Incremental record-header parse: `cols[i]` holds column `i`'s serial
+    /// type and the absolute payload offset of its data. `hdr_next` is the
+    /// absolute offset of the next unparsed serial type (0 while nothing has
+    /// been parsed — offset zero always holds the header-size varint, never a
+    /// serial type), `hdr_end` the end of the header section, and `data_next`
+    /// the data offset of the next unparsed column.
+    struct HeaderCache {
+        cols: Vec<(u64, usize)>,
+        hdr_next: usize,
+        hdr_end: usize,
+        data_next: usize,
     }
 
-    impl ParseFrontier {
+    impl HeaderCache {
         const EMPTY: Self = Self {
-            cols_parsed: 0,
-            header_off: 0,
-            header_end: 0,
-            data_off: 0,
+            cols: Vec::new(),
+            hdr_next: 0,
+            hdr_end: 0,
+            data_next: 0,
         };
+
+        fn clear(&mut self) {
+            // Keeps `cols`' allocation: cursors refill the same record for
+            // every row, so steady-state caching stays allocation-free.
+            self.cols.clear();
+            self.hdr_next = 0;
+            self.hdr_end = 0;
+            self.data_next = 0;
+        }
+    }
+
+    /// First touch of a payload: validates the header-size varint exactly
+    /// like [ValueIterator::new] (so malformed headers fail identically with
+    /// or without the cache) and reserves the column array once — every
+    /// serial type is at least one header byte, so the remaining header
+    /// length bounds the column count and the pushes in [extend_cache] never
+    /// reallocate (clear() retains the capacity afterwards).
+    fn init_cache(cache: &mut HeaderCache, payload: &[u8]) -> Result<(), LimboError> {
+        let (header_size, header_varint_len) = read_varint(payload)?;
+        let header_size = header_size as usize;
+        if header_size > payload.len()
+            || header_varint_len > payload.len()
+            || header_varint_len > header_size
+        {
+            return Err(LimboError::Corrupt(
+                "Payload too small for indicated header size".into(),
+            ));
+        }
+        let cap = header_size - header_varint_len;
+        let have = cache.cols.capacity();
+        if have < cap {
+            cache.cols.try_reserve_exact(cap - have)?;
+        }
+        cache.hdr_next = header_varint_len;
+        cache.hdr_end = header_size;
+        cache.data_next = header_size;
+        Ok(())
+    }
+
+    /// Parses serial types forward until column `col` is covered or the
+    /// header is exhausted, appending each to the cache. Requires an
+    /// initialized cache.
+    #[inline]
+    fn extend_cache(cache: &mut HeaderCache, payload: &[u8], col: usize) -> Result<(), LimboError> {
+        while cache.cols.len() <= col && cache.hdr_next < cache.hdr_end {
+            #[cfg(test)]
+            crate::vdbe::serial_decode_stats::bump();
+            let (serial_type, n) = read_varint(&payload[cache.hdr_next..cache.hdr_end])?;
+            let size = get_serial_type_size(serial_type)?;
+            let data_off = cache.data_next;
+            cache.data_next = cache
+                .data_next
+                .checked_add(size)
+                .ok_or_else(|| LimboError::Corrupt("Serial type sizes overflow".into()))?;
+            cache.hdr_next += n;
+            cache.cols.push((serial_type, data_off));
+        }
+        Ok(())
     }
 
     // SAFETY: all ImmutableRecord instances are intended to be used in a single thread
@@ -1177,8 +1235,9 @@ mod immutable_record {
         fn clone(&self) -> Self {
             Self {
                 payload: self.payload.clone(),
-                // The clone holds identical bytes, so the frontier stays valid.
-                parse_cache: self.parse_cache.clone(),
+                // Cloning the parsed arrays would allocate; the clone
+                // rebuilds its cache lazily on first fetch instead.
+                parse_cache: RefCell::new(HeaderCache::EMPTY),
             }
         }
     }
@@ -1554,68 +1613,58 @@ mod immutable_record {
             iter(self.get_payload())
         }
 
-        /// Resumes the header walk for a fetch of column `col`: the returned
-        /// iterator sits at the cached frontier (or at column zero when no
-        /// frontier is usable, e.g. after a payload change or a backwards
-        /// fetch) and the returned count says how many columns it still has
-        /// to skip to reach `col`.
-        #[inline(always)]
-        pub(crate) fn resume_iter(
+        /// Extends the header parse to cover column `col` and returns its
+        /// serial type and absolute data offset, or `None` when the record
+        /// has fewer than `col + 1` columns. An already-parsed column is
+        /// O(1); an unparsed one costs one varint decode, paid at most once
+        /// per column for the life of the payload bytes.
+        #[inline]
+        pub(crate) fn ensure_parsed_through(
             &self,
             col: usize,
-        ) -> Result<(usize, ValueIterator<'_>), LimboError> {
+        ) -> Result<Option<(u64, usize)>, LimboError> {
             let payload = self.get_payload();
-            let f = self.parse_cache.get();
-            let (cols_parsed, header_off, header_end, data_off) = (
-                f.cols_parsed as usize,
-                f.header_off as usize,
-                f.header_end as usize,
-                f.data_off as usize,
-            );
-            // The in-bounds re-checks are defensive: every payload mutation
-            // resets the frontier, so stored offsets describe current bytes.
-            if header_off != 0
-                && cols_parsed <= col
-                && header_off <= header_end
-                && header_end <= payload.len()
-                && data_off <= payload.len()
-            {
-                let iter = ValueIterator::from_parts(
-                    &payload[header_off..header_end],
-                    &payload[data_off..],
-                );
-                return Ok((col - cols_parsed, iter));
+            let mut cache = self.parse_cache.borrow_mut();
+            if let Some(&slot) = cache.cols.get(col) {
+                return Ok(Some(slot));
             }
-            Ok((col, ValueIterator::new(payload)?))
+            if cache.hdr_next == 0 {
+                init_cache(&mut cache, payload)?;
+            }
+            extend_cache(&mut cache, payload, col)?;
+            Ok(cache.cols.get(col).copied())
         }
 
-        /// Stores `iter`'s position as the new frontier after column `col`
-        /// was decoded from it. `iter` must come from [Self::resume_iter] on
-        /// this record; anything else fails the bounds checks and stores
-        /// nothing.
-        #[inline(always)]
-        pub(crate) fn commit_frontier(&self, col: usize, iter: &ValueIterator<'_>) {
+        /// Walks the header once for a strictly ascending sequence of
+        /// columns, calling `emit(i, serial_type, data_offset)` for each
+        /// requested column that exists, in order, and returning how many
+        /// were emitted. One borrow and one walk serve the whole run — the
+        /// fused-Column fast path — while the walk populates the cache so
+        /// later fetches in any order stay O(1).
+        pub(crate) fn ensure_run_into(
+            &self,
+            cols: impl Iterator<Item = usize>,
+            mut emit: impl FnMut(usize, u64, usize) -> Result<(), LimboError>,
+        ) -> Result<usize, LimboError> {
             let payload = self.get_payload();
-            let base = payload.as_ptr() as usize;
-            let header = iter.header_section_ref();
-            let data = iter.data_section_ref();
-            let header_off = (header.as_ptr() as usize).wrapping_sub(base);
-            let data_off = (data.as_ptr() as usize).wrapping_sub(base);
-            let header_end = header_off + header.len();
-            // Records too large for u32 offsets simply never cache;
-            // correctness does not depend on a frontier being stored.
-            if header_end <= payload.len()
-                && data_off <= payload.len()
-                && payload.len() <= u32::MAX as usize
-                && col < u32::MAX as usize
-            {
-                self.parse_cache.set(ParseFrontier {
-                    cols_parsed: (col + 1) as u32,
-                    header_off: header_off as u32,
-                    header_end: header_end as u32,
-                    data_off: data_off as u32,
-                });
+            let mut cache = self.parse_cache.borrow_mut();
+            if cache.hdr_next == 0 {
+                init_cache(&mut cache, payload)?;
             }
+            let mut emitted = 0;
+            for (i, col) in cols.enumerate() {
+                if cache.cols.len() <= col {
+                    extend_cache(&mut cache, payload, col)?;
+                }
+                match cache.cols.get(col) {
+                    Some(&(serial_type, data_off)) => {
+                        emit(i, serial_type, data_off)?;
+                        emitted = i + 1;
+                    }
+                    None => break,
+                }
+            }
+            Ok(emitted)
         }
 
         #[inline]
@@ -1708,7 +1757,7 @@ mod immutable_record {
             payload.try_reserve_exact(payload_capacity)?;
             Ok(Self {
                 payload: Value::Blob(payload),
-                parse_cache: Cell::new(ParseFrontier::EMPTY),
+                parse_cache: RefCell::new(HeaderCache::EMPTY),
             })
         }
 
@@ -1723,7 +1772,7 @@ mod immutable_record {
         pub fn from_buf(buf: RecordBuf) -> Self {
             Self {
                 payload: Value::Blob(buf.0),
-                parse_cache: Cell::new(ParseFrontier::EMPTY),
+                parse_cache: RefCell::new(HeaderCache::EMPTY),
             }
         }
 
@@ -1734,14 +1783,14 @@ mod immutable_record {
             buf.try_extend(payload.iter().copied())?;
             Ok(Self {
                 payload: Value::Blob(buf),
-                parse_cache: Cell::new(ParseFrontier::EMPTY),
+                parse_cache: RefCell::new(HeaderCache::EMPTY),
             })
         }
 
         pub const fn from_bin_record(payload: ValueBlob) -> Self {
             Self {
                 payload: Value::Blob(payload),
-                parse_cache: Cell::new(ParseFrontier::EMPTY),
+                parse_cache: RefCell::new(HeaderCache::EMPTY),
             }
         }
 
@@ -1857,7 +1906,7 @@ mod immutable_record {
             writer.assert_finish_capacity();
             Ok(Self {
                 payload: Value::Blob(buf),
-                parse_cache: Cell::new(ParseFrontier::EMPTY),
+                parse_cache: RefCell::new(HeaderCache::EMPTY),
             })
         }
 
@@ -1879,9 +1928,9 @@ mod immutable_record {
 
         #[inline]
         pub fn as_blob_mut(&mut self) -> &mut ValueBlob {
-            // Sole `&mut` route to the payload bytes: dropping the frontier here
-            // makes stale resume offsets unreachable after any payload change.
-            self.parse_cache.set(ParseFrontier::EMPTY);
+            // Sole `&mut` route to the payload bytes: clearing the cache here
+            // makes stale offsets unreachable after any payload change.
+            self.parse_cache.borrow_mut().clear();
             match &mut self.payload {
                 Value::Blob(b) => b,
                 _ => panic!("payload must be a blob"),
@@ -2052,17 +2101,6 @@ impl<'a> ValueIterator<'a> {
             header_section: Cell::new(&payload[header_varint_len..header_size]),
             data_section: Cell::new(&payload[header_size..]),
         })
-    }
-
-    /// An iterator resuming mid-record: `header` is the unread tail of the
-    /// header section and `data` the payload from the next unread column's
-    /// data onward. Used by [ImmutableRecord]'s frontier cache.
-    #[inline(always)]
-    const fn from_parts(header: &'a [u8], data: &'a [u8]) -> Self {
-        Self {
-            header_section: Cell::new(header),
-            data_section: Cell::new(data),
-        }
     }
 
     /// Returns `true` if the payload is empty or the record has no columns.
@@ -4935,55 +4973,74 @@ mod tests {
         }
     }
 
-    /// Drives [ImmutableRecord::resume_iter]/[ImmutableRecord::commit_frontier]
-    /// through the access patterns op_column produces and checks both the
-    /// decoded values and the number of columns each resume still skips.
+    /// Drives [ImmutableRecord::ensure_parsed_through] through ascending,
+    /// backwards, and past-the-end access, counting serial-type decodes: each
+    /// column's type is decoded at most once for the life of the payload, and
+    /// re-fetches in any order are cache hits.
     #[test]
-    fn test_parse_frontier_resume_and_restart() {
+    fn test_header_cache_decodes_each_column_once() {
+        use crate::vdbe::serial_decode_stats;
+
         let values: Vec<Value> = (0..6).map(Value::from_i64).collect();
-        let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
-
-        let fetch = |col: usize, expected_skip: usize| {
-            let (skip, mut iter) = record.resume_iter(col).unwrap();
-            assert_eq!(skip, expected_skip, "unexpected skip for column {col}");
-            let value = iter.nth(skip).unwrap().unwrap();
-            record.commit_frontier(col, &iter);
-            assert_eq!(value, ValueRef::from_i64(col as i64));
-        };
-
-        // Ascending fetches resume where the previous one stopped.
-        fetch(0, 0);
-        fetch(1, 0);
-        fetch(3, 1);
-        fetch(5, 1);
-        // A backwards fetch restarts from scratch...
-        fetch(2, 2);
-        // ...and leaves a frontier later fetches resume from again.
-        fetch(4, 1);
-    }
-
-    /// A fetch past the end of a short record must not disturb the stored
-    /// frontier, and any payload mutation must drop it.
-    #[test]
-    fn test_parse_frontier_short_record_and_invalidation() {
-        let values: Vec<Value> = (0..3).map(Value::from_i64).collect();
         let mut record = ImmutableRecord::from_values(&values, values.len()).unwrap();
 
-        let (skip, mut iter) = record.resume_iter(1).unwrap();
-        assert_eq!(iter.nth(skip).unwrap().unwrap(), ValueRef::from_i64(1));
-        record.commit_frontier(1, &iter);
+        let slot = |record: &ImmutableRecord, col: usize| {
+            record.ensure_parsed_through(col).unwrap().unwrap()
+        };
 
-        // Column 7 does not exist: the walk runs off the header and returns
-        // None without committing, so the frontier still resumes at column 2.
-        let (skip, mut iter) = record.resume_iter(7).unwrap();
-        assert_eq!(skip, 5);
-        assert!(iter.nth(skip).is_none());
-        let (skip, _) = record.resume_iter(2).unwrap();
-        assert_eq!(skip, 0);
+        // First fetch of column 3 parses types 0..=3.
+        serial_decode_stats::reset();
+        let (_, off3) = slot(&record, 3);
+        assert_eq!(serial_decode_stats::count(), 4);
 
-        // Any &mut route to the payload resets the frontier.
+        // A backwards fetch is a cache hit, not a restart.
+        let (_, off1) = slot(&record, 1);
+        assert_eq!(serial_decode_stats::count(), 4);
+        assert!(off1 < off3, "data offsets must be ordered by column");
+
+        // Extending to the last column decodes only the remaining types.
+        slot(&record, 5);
+        assert_eq!(serial_decode_stats::count(), 6);
+
+        // Past the end: the header is exhausted, no decodes, no slot.
+        assert!(record.ensure_parsed_through(7).unwrap().is_none());
+        assert_eq!(serial_decode_stats::count(), 6);
+
+        // Re-fetching every column in reverse order costs nothing.
+        for col in (0..6).rev() {
+            slot(&record, col);
+        }
+        assert_eq!(serial_decode_stats::count(), 6);
+
+        // Any &mut route to the payload clears the cache; the next fetch
+        // re-parses from the header start.
         record.as_blob_mut();
-        let (skip, _) = record.resume_iter(2).unwrap();
-        assert_eq!(skip, 2);
+        serial_decode_stats::reset();
+        slot(&record, 2);
+        assert_eq!(serial_decode_stats::count(), 3);
+    }
+
+    /// A cloned record shares bytes but not the parsed cache: the clone
+    /// rebuilds lazily and both stay coherent with their own payloads.
+    #[test]
+    fn test_header_cache_clone_starts_cold() {
+        use crate::vdbe::serial_decode_stats;
+
+        let values: Vec<Value> = (0..4).map(Value::from_i64).collect();
+        let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+        record.ensure_parsed_through(3).unwrap().unwrap();
+
+        let clone = record.clone();
+        serial_decode_stats::reset();
+        let (_, off2) = clone.ensure_parsed_through(2).unwrap().unwrap();
+        assert_eq!(serial_decode_stats::count(), 3);
+        assert_eq!(
+            clone.ensure_parsed_through(2).unwrap().unwrap().1,
+            off2,
+            "clone's cache must describe the clone's own payload"
+        );
+        // The original's fully-parsed cache is untouched by the clone.
+        record.ensure_parsed_through(3).unwrap().unwrap();
+        assert_eq!(serial_decode_stats::count(), 3);
     }
 }
