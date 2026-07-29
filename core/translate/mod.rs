@@ -23,6 +23,11 @@ pub(crate) mod group_by;
 pub(crate) mod index;
 pub(crate) mod insert;
 pub(crate) mod integrity_check;
+// TODO(declarative-ir phase 1b): remove the dead_code allowance once
+// translate_expr routes value-position expressions through the IR.
+// See docs/internals/declarative-bytecode-compiler.md.
+#[allow(dead_code, unused_imports)]
+pub(crate) mod ir;
 pub(crate) mod logical;
 pub(crate) mod main_loop;
 pub(crate) mod optimizer;
