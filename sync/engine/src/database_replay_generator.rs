@@ -48,7 +48,7 @@ impl DatabaseReplayGenerator {
         change: &DatabaseTapeRowChange,
     ) -> Result<DatabaseRowMutation> {
         match &change.change {
-            DatabaseTapeRowChangeType::Delete { before } => Ok(DatabaseRowMutation {
+            DatabaseTapeRowChangeType::Delete { before, .. } => Ok(DatabaseRowMutation {
                 change_time: change.change_time,
                 table_name: change.table_name.to_string(),
                 id: change.id,
@@ -133,20 +133,7 @@ impl DatabaseReplayGenerator {
         }
         match change {
             DatabaseChangeType::Delete => {
-                if let Some(pk_column_indices) = info.pk_column_indices.as_ref() {
-                    let mut values = <crate::alloc::Vec<turso_core::Value> as TursoAllocExt>::new();
-                    for pk in pk_column_indices {
-                        let value = if info.rowid_alias_pk_column_index == Some(*pk) {
-                            turso_core::Value::from_i64(id)
-                        } else {
-                            std::mem::replace(&mut record[*pk], turso_core::Value::Null)
-                        };
-                        values.push(value);
-                    }
-                    values
-                } else {
-                    crate::alloc::vec![turso_core::Value::from_i64(id)]
-                }
+                unreachable!("DELETE replay values are built by replay_delete_values")
             }
             DatabaseChangeType::Insert => {
                 if let Some(pk) = info.rowid_alias_pk_column_index {
@@ -203,6 +190,80 @@ impl DatabaseReplayGenerator {
             }
         }
     }
+
+    pub fn replay_delete_values(
+        &self,
+        info: &ReplayInfo,
+        id: i64,
+        mut before: crate::alloc::Vec<turso_core::Value>,
+        key: Option<crate::alloc::Vec<turso_core::Value>>,
+    ) -> Result<crate::alloc::Vec<turso_core::Value>> {
+        if info.is_ddl_replay {
+            return Ok(<crate::alloc::Vec<turso_core::Value> as TursoAllocExt>::new());
+        }
+        if let Some(key) = key {
+            let Some(pk_column_indices) = info.pk_column_indices.as_ref() else {
+                return Err(Error::DatabaseTapeError(format!(
+                    "DELETE primary-key projection cannot be used with a rowid replay query: {}",
+                    info.query
+                )));
+            };
+            if key.len() != pk_column_indices.len() {
+                return Err(Error::DatabaseTapeError(format!(
+                    "DELETE primary-key projection has {} values, expected {}: {}",
+                    key.len(),
+                    pk_column_indices.len(),
+                    info.query
+                )));
+            }
+            return Ok(key);
+        }
+        let Some(pk_column_indices) = info.pk_column_indices.as_ref() else {
+            return Ok(crate::alloc::vec![turso_core::Value::from_i64(id)]);
+        };
+        let mut values = <crate::alloc::Vec<turso_core::Value> as TursoAllocExt>::new();
+        for &pk in pk_column_indices {
+            let value = if info.rowid_alias_pk_column_index == Some(pk) {
+                turso_core::Value::from_i64(id)
+            } else {
+                let Some(value) = before.get_mut(pk) else {
+                    return Err(Error::DatabaseTapeError(format!(
+                        "DELETE before image is missing primary-key column {pk}: {}",
+                        info.query
+                    )));
+                };
+                std::mem::replace(value, turso_core::Value::Null)
+            };
+            values.push(value);
+        }
+        Ok(values)
+    }
+
+    /// Whether a DELETE replay must fall back to the implicit rowid: only when
+    /// the change carries neither a primary-key projection nor a before image.
+    /// In that case the rowid is the row's only identity, so replaying it
+    /// requires rowid preservation — and `delete_query` additionally rejects
+    /// the fallback for tables whose PRIMARY KEY is not the rowid, where a
+    /// rowid-based delete could target the wrong row.
+    pub(crate) fn delete_uses_rowid(
+        &self,
+        before: &[turso_core::Value],
+        key: Option<&[turso_core::Value]>,
+    ) -> Result<bool> {
+        if key.is_some() {
+            return Ok(false);
+        }
+        if !before.is_empty() {
+            return Ok(false);
+        }
+        if self.opts.use_implicit_rowid {
+            return Ok(true);
+        }
+        Err(Error::DatabaseTapeError(
+            "DELETE replay without a row image requires implicit rowid preservation".to_string(),
+        ))
+    }
+
     pub async fn replay_info<Ctx>(
         &self,
         coro: &Coro<Ctx>,
@@ -214,7 +275,7 @@ impl DatabaseReplayGenerator {
         if table_name == SQLITE_SCHEMA_TABLE {
             // sqlite_schema table: type, name, tbl_name, rootpage, sql
             match &change.change {
-                DatabaseTapeRowChangeType::Delete { before } => {
+                DatabaseTapeRowChangeType::Delete { before, .. } => {
                     assert!(before.len() == 5);
                     let Some(turso_core::Value::Text(entity_type)) = before.first() else {
                         panic!(
@@ -284,8 +345,9 @@ impl DatabaseReplayGenerator {
             }
         } else {
             match &change.change {
-                DatabaseTapeRowChangeType::Delete { .. } => {
-                    let delete = self.delete_query(coro, table_name).await?;
+                DatabaseTapeRowChangeType::Delete { before, key } => {
+                    let use_rowid = self.delete_uses_rowid(before, key.as_deref())?;
+                    let delete = self.delete_query(coro, table_name, use_rowid).await?;
                     Ok(delete)
                 }
                 DatabaseTapeRowChangeType::Update { updates, after, .. } => {
@@ -465,6 +527,7 @@ impl DatabaseReplayGenerator {
         &self,
         coro: &Coro<Ctx>,
         table_name: &str,
+        use_rowid: bool,
     ) -> Result<ReplayInfo> {
         let (column_names, pk_column_indices, rowid_alias_pk_column_index) =
             self.table_columns_info(coro, table_name).await?;
@@ -474,7 +537,20 @@ impl DatabaseReplayGenerator {
         }
         let use_implicit_rowid = self.opts.use_implicit_rowid;
         let quoted_table_name = quote_ident(table_name);
-        if pk_column_indices.is_empty() {
+        if use_rowid || pk_column_indices.is_empty() {
+            // A rowid-based delete is exact only when the rowid IS the row's
+            // identity: tables with no PRIMARY KEY, or a rowid-alias INTEGER
+            // PRIMARY KEY. For any other PK the local rowid can diverge from
+            // the remote's, so a delete that arrived without a primary-key
+            // projection (and without a before image) must fail instead of
+            // possibly deleting the wrong row. A current server always encodes
+            // the projection for such tables, so this only rejects logs from
+            // servers predating the portable delete extension.
+            if use_rowid && !pk_column_indices.is_empty() && rowid_alias_pk_column_index.is_none() {
+                return Err(Error::DatabaseTapeError(format!(
+                    "DELETE for table '{table_name}' has no primary-key projection and no before image, but its PRIMARY KEY is not the rowid; refusing rowid-based replay"
+                )));
+            }
             let query = format!("DELETE FROM {quoted_table_name} WHERE rowid = ?");
             tracing::trace!("delete_query: table_name={table_name}, query={query}, use_implicit_rowid={use_implicit_rowid}");
             return Ok(ReplayInfo {
@@ -622,7 +698,7 @@ impl DatabaseReplayGenerator {
         let mut table_info_stmt = self.conn.prepare(format!(
             "SELECT cid, name, type, pk FROM pragma_table_info({table_name_literal})"
         ))?;
-        let mut pk_column_indices = Vec::with_capacity(1);
+        let mut pk_columns = Vec::with_capacity(1);
         let mut column_names = Vec::new();
         let mut column_types = Vec::new();
         while let Some(column) = run_stmt_once(coro, &mut table_info_stmt).await? {
@@ -649,12 +725,32 @@ impl DatabaseReplayGenerator {
                     "unexpected column type for pragma_table_info query".to_string(),
                 ));
             };
-            if *pk == 1 {
-                pk_column_indices.push(*column_id as usize);
+            let column_id = usize::try_from(*column_id).map_err(|_| {
+                Error::DatabaseTapeError(format!(
+                    "negative column index returned for table '{table_name}'"
+                ))
+            })?;
+            if column_id != column_names.len() {
+                return Err(Error::DatabaseTapeError(format!(
+                    "non-contiguous column index {column_id} returned for table '{table_name}'"
+                )));
+            }
+            if *pk > 0 {
+                let pk_ordinal = usize::try_from(*pk).map_err(|_| {
+                    Error::DatabaseTapeError(format!(
+                        "invalid primary key ordinal returned for table '{table_name}'"
+                    ))
+                })?;
+                pk_columns.push((pk_ordinal, column_id));
             }
             column_names.push(name.as_str().to_string());
             column_types.push(column_type.as_str().to_string());
         }
+        pk_columns.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+        let pk_column_indices = pk_columns
+            .into_iter()
+            .map(|(_, column_id)| column_id)
+            .collect::<Vec<_>>();
         let rowid_alias_pk_column_index = if pk_column_indices.len() == 1 {
             let pk = pk_column_indices[0];
             column_types

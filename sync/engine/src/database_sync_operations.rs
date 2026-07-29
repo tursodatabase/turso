@@ -72,6 +72,7 @@ const MVCC_OP_UPDATE_HEADER: u8 = 4;
 const MVCC_OP_FLAG_PORTABLE_EXTENSION: u8 = 1 << 1;
 const MVCC_SQLITE_SCHEMA_TABLE_ID: i64 = -1;
 const MVCC_DELETE_EXT_IDENTITY_RECORD_FIELD: u64 = 1;
+const MVCC_DELETE_EXT_PK_RECORD_FIELD: u64 = 2;
 const PORTABLE_TXN_META_CLIENT_KEY: &str = "client";
 const SQLITE_INTERNAL_PREFIX: &str = "sqlite_";
 const SQLITE_SCHEMA_TABLE: &str = "sqlite_schema";
@@ -209,6 +210,11 @@ fn logical_op_to_tape_operations(
                     change_time: commit_ts,
                     change: DatabaseTapeRowChangeType::Delete {
                         before: turso_core::alloc::vec![],
+                        key: if op.record.is_empty() {
+                            None
+                        } else {
+                            Some(parse_bin_record(&op.record)?)
+                        },
                     },
                     table_name: op.table_name,
                     id: op.rowid,
@@ -328,7 +334,7 @@ fn sqlite_schema_change_name(change: &DatabaseTapeRowChange) -> Result<Option<St
         return Ok(None);
     }
     let values = match &change.change {
-        DatabaseTapeRowChangeType::Delete { before } => before,
+        DatabaseTapeRowChangeType::Delete { before, .. } => before,
         DatabaseTapeRowChangeType::Insert { after } => after,
         DatabaseTapeRowChangeType::Update { after, .. } => after,
     };
@@ -1067,37 +1073,35 @@ fn skip_mvcc_proto_field(buf: &[u8], cursor: &mut usize, wire_type: u64) -> Resu
     Ok(())
 }
 
-fn decode_mvcc_delete_identity_record(extension: &[u8]) -> Result<Vec<u8>> {
+fn decode_mvcc_delete_record(extension: &[u8], record_field: u64) -> Result<Vec<u8>> {
     let mut cursor = 0usize;
-    let mut identity_record = Vec::new();
+    let mut record = Vec::new();
     while cursor < extension.len() {
         let key = read_mvcc_proto_varint(extension, &mut cursor)?;
         let field = key >> 3;
         let wire_type = key & 7;
-        if field == MVCC_DELETE_EXT_IDENTITY_RECORD_FIELD && wire_type == 2 {
+        if field == record_field && wire_type == 2 {
             let len =
                 usize::try_from(read_mvcc_proto_varint(extension, &mut cursor)?).map_err(|_| {
                     Error::DatabaseSyncEngineError(
-                        "MVCC delete identity record length overflows usize".to_string(),
+                        "MVCC delete record length overflows usize".to_string(),
                     )
                 })?;
             let end = cursor.checked_add(len).ok_or_else(|| {
-                Error::DatabaseSyncEngineError(
-                    "MVCC delete identity record length overflow".to_string(),
-                )
+                Error::DatabaseSyncEngineError("MVCC delete record length overflow".to_string())
             })?;
             if end > extension.len() {
                 return Err(Error::DatabaseSyncEngineError(
-                    "truncated MVCC delete identity record".to_string(),
+                    "truncated MVCC delete record".to_string(),
                 ));
             }
-            identity_record = extension[cursor..end].to_vec();
+            record = extension[cursor..end].to_vec();
             cursor = end;
         } else {
             skip_mvcc_proto_field(extension, &mut cursor, wire_type)?;
         }
     }
-    Ok(identity_record)
+    Ok(record)
 }
 
 fn portable_string(strings: &[String], idx: u64, context: &str) -> Result<String> {
@@ -1372,7 +1376,10 @@ fn decode_recovery_ops_to_logical_txn(
                 let mut payload_cursor = 0usize;
                 let rowid = read_mvcc_sqlite_varint(payload, &mut payload_cursor)? as i64;
                 if table_id == MVCC_SQLITE_SCHEMA_TABLE_ID {
-                    let identity_record = decode_mvcc_delete_identity_record(portable_extension)?;
+                    let identity_record = decode_mvcc_delete_record(
+                        portable_extension,
+                        MVCC_DELETE_EXT_IDENTITY_RECORD_FIELD,
+                    )?;
                     if identity_record.is_empty() {
                         return Err(Error::DatabaseSyncEngineError(
                             "MVCC sqlite_schema delete is missing portable identity record"
@@ -1382,11 +1389,15 @@ fn decode_recovery_ops_to_logical_txn(
                     schema_deltas.entry(rowid).or_default().old =
                         Some(decode_schema_row(&identity_record)?);
                 } else if let Some(table_name) = object_names.get(&table_id) {
+                    let primary_key_record = decode_mvcc_delete_record(
+                        portable_extension,
+                        MVCC_DELETE_EXT_PK_RECORD_FIELD,
+                    )?;
                     row_ops.push(LogicalOp {
                         op_type: LogicalOpType::DeleteRow as i32,
                         table_name: table_name.clone(),
                         rowid,
-                        record: Bytes::new(),
+                        record: Bytes::from(primary_key_record),
                         sql: String::new(),
                         user_version: None,
                         application_id: None,
@@ -3025,14 +3036,13 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
                     }
                 }
                 match &change.change {
-                    DatabaseTapeRowChangeType::Delete { before } => {
-                        let values = generator.replay_values(
+                    DatabaseTapeRowChangeType::Delete { before, key } => {
+                        let values = generator.replay_delete_values(
                             &replay_info,
-                            replay_info.change_type,
                             change.id,
                             before.clone(),
-                            None,
-                        );
+                            key.clone(),
+                        )?;
                         sql_over_http_requests
                             .push(step(replay_info.query.clone(), convert_to_args(values)))
                     }
@@ -4322,6 +4332,32 @@ mod tests {
         recovery_payload.extend_from_slice(&payload);
     }
 
+    fn append_test_table_delete(
+        recovery_payload: &mut Vec<u8>,
+        table_id: i64,
+        rowid: i64,
+        primary_key_record: &[u8],
+    ) {
+        let mut payload = Vec::new();
+        write_test_varint(rowid as u64, &mut payload);
+
+        let mut extension = Vec::new();
+        write_test_varint(
+            (super::MVCC_DELETE_EXT_PK_RECORD_FIELD << 3) | 2,
+            &mut extension,
+        );
+        write_test_varint(primary_key_record.len() as u64, &mut extension);
+        extension.extend_from_slice(primary_key_record);
+
+        recovery_payload.push(super::MVCC_OP_DELETE_TABLE);
+        recovery_payload.push(super::MVCC_OP_FLAG_PORTABLE_EXTENSION);
+        recovery_payload.extend_from_slice(&(table_id as i32).to_le_bytes());
+        write_test_varint(payload.len() as u64, recovery_payload);
+        recovery_payload.extend_from_slice(&payload);
+        write_test_varint(extension.len() as u64, recovery_payload);
+        recovery_payload.extend_from_slice(&extension);
+    }
+
     fn raw_mvcc_log_frame_from_payloads(
         commit_ts: u64,
         portable_payload: &[u8],
@@ -4441,6 +4477,7 @@ mod tests {
             turso_core::Value::from_i64(1),
             turso_core::Value::build_text("one"),
         ]);
+        let primary_key_record = record(&[turso_core::Value::from_i64(1)]);
         let portable_txn = super::PortableLogicalTxn {
             end_offset: 104,
             commit_ts: 77,
@@ -4467,12 +4504,13 @@ mod tests {
             &schema_record,
         );
         append_test_table_upsert(&mut recovery_payload, table_id, 1, &row_record);
+        append_test_table_delete(&mut recovery_payload, table_id, 1, &primary_key_record);
 
         let salt = 0x0123_4567_89ab_cdefu64;
         let log_header = raw_mvcc_log_header(salt);
         let initial_crc = crc32c::crc32c(&salt.to_le_bytes());
         let (frame, _) =
-            raw_mvcc_log_frame_with_crc(77, &portable_payload, &recovery_payload, 2, initial_crc);
+            raw_mvcc_log_frame_with_crc(77, &portable_payload, &recovery_payload, 3, initial_crc);
         let end_offset = (log_header.len() + frame.len()) as u64;
         let header = PullUpdatesRespProtoBody {
             protocol: 0,
@@ -4502,7 +4540,7 @@ mod tests {
         assert_eq!(txns[0].end_offset, 104);
         assert_eq!(txns[0].commit_ts, 77);
         assert_eq!(txns[0].origin_client_id, "client-a");
-        assert_eq!(txns[0].ops.len(), 2);
+        assert_eq!(txns[0].ops.len(), 3);
         assert_eq!(txns[0].ops[0].op_type, LogicalOpType::Schema as i32);
         assert_eq!(txns[0].ops[0].schema_name, "t");
         assert_eq!(txns[0].ops[0].stable_table_id, 0);
@@ -4510,6 +4548,10 @@ mod tests {
         assert_eq!(txns[0].ops[1].table_name, "t");
         assert_eq!(txns[0].ops[1].rowid, 1);
         assert_eq!(txns[0].ops[1].record, row_record);
+        assert_eq!(txns[0].ops[2].op_type, LogicalOpType::DeleteRow as i32);
+        assert_eq!(txns[0].ops[2].table_name, "t");
+        assert_eq!(txns[0].ops[2].rowid, 1);
+        assert_eq!(txns[0].ops[2].record, primary_key_record);
     }
 
     #[test]
@@ -5287,11 +5329,24 @@ mod tests {
                     schema_name: String::new(),
                     stable_table_id: 9,
                 },
+                LogicalOp {
+                    op_type: LogicalOpType::DeleteRow as i32,
+                    table_name: String::new(),
+                    rowid: 99,
+                    record: record(&[turso_core::Value::from_i64(1)]),
+                    sql: String::new(),
+                    user_version: None,
+                    application_id: None,
+                    schema_action: None,
+                    schema_kind: None,
+                    schema_name: String::new(),
+                    stable_table_id: 9,
+                },
             ],
         };
 
         let operations = logical_txn_to_tape_operations(&txn).unwrap();
-        assert_eq!(operations.len(), 2);
+        assert_eq!(operations.len(), 3);
         assert!(matches!(
             &operations[0],
             DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Create { sql })
@@ -5305,6 +5360,20 @@ mod tests {
                 assert!(matches!(
                     change.change,
                     DatabaseTapeRowChangeType::Insert { .. }
+                ));
+            }
+            other => panic!("expected row change, got {other:?}"),
+        }
+        match &operations[2] {
+            DatabaseTapeOperation::RowChange(change) => {
+                assert_eq!(change.table_name, "items");
+                assert_eq!(change.id, 99);
+                assert!(matches!(
+                    &change.change,
+                    DatabaseTapeRowChangeType::Delete {
+                        before,
+                        key: Some(key)
+                    } if before.is_empty() && *key == vec![turso_core::Value::from_i64(1)]
                 ));
             }
             other => panic!("expected row change, got {other:?}"),
