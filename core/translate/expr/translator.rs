@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::compiler::{add, compile_scalar, constant, Compile};
 
 /// Reason why [translate_expr_no_constant_opt()] was called.
 #[derive(Debug)]
@@ -431,6 +432,34 @@ pub fn translate_expr(
                         dst_reg: target_register,
                         extra_amount: 0,
                     });
+                }
+                return Ok(target_register);
+            }
+
+            if let (
+                ast::Operator::Add,
+                ast::Expr::Literal(ast::Literal::Numeric(lhs)),
+                ast::Expr::Literal(ast::Literal::Numeric(rhs)),
+            ) = (op, e1.as_ref(), e2.as_ref())
+            {
+                let lhs = parse_numeric_literal(lhs)?;
+                let rhs = parse_numeric_literal(rhs)?;
+                let scalar = if exprs_are_equivalent(e1, e2) {
+                    compile_scalar(
+                        constant(lhs)
+                            .map(|value| (value, value))
+                            .and_then(|(lhs, rhs)| add(lhs, rhs)),
+                    )?
+                } else {
+                    compile_scalar(
+                        constant(lhs)
+                            .then(constant(rhs))
+                            .and_then(|(lhs, rhs)| add(lhs, rhs)),
+                    )?
+                };
+                scalar.lower_into(program, target_register)?;
+                if let Some(span) = constant_span {
+                    program.constant_span_end(span);
                 }
                 return Ok(target_register);
             }
