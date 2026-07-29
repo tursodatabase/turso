@@ -328,6 +328,7 @@ impl DatabaseChange {
                         "cdc_mode must be set to either 'full' or 'before'".to_string(),
                     )
                 })?)?,
+                key: None,
             },
             DatabaseChangeType::Update => DatabaseTapeRowChangeType::Update {
                 before: parse_bin_record(self.before.ok_or_else(|| {
@@ -390,6 +391,7 @@ impl DatabaseChange {
                         "cdc_mode must be set to either 'full' or 'after'".to_string(),
                     )
                 })?)?,
+                key: None,
             },
             DatabaseChangeType::Commit => {
                 return Err(Error::DatabaseTapeError(
@@ -541,6 +543,9 @@ pub enum DatabaseRowTransformResult {
 pub enum DatabaseTapeRowChangeType {
     Delete {
         before: crate::alloc::Vec<turso_core::Value>,
+        /// Primary-key values in declared key order when the source only
+        /// provides a delete key rather than a complete before image.
+        key: Option<crate::alloc::Vec<turso_core::Value>>,
     },
     Update {
         before: crate::alloc::Vec<turso_core::Value>,
@@ -614,9 +619,10 @@ pub struct DatabaseTapeRowChange {
 impl std::fmt::Debug for DatabaseTapeRowChangeType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Delete { before } => f
+            Self::Delete { before, key } => f
                 .debug_struct("Delete")
                 .field("before.len()", &before.len())
+                .field("key.len()", &key.as_ref().map(|key| key.len()))
                 .finish(),
             Self::Update {
                 before,
