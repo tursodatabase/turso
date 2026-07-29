@@ -56,32 +56,67 @@ fn compiler_literal_value(literal: &ast::Literal) -> Result<Option<Value>> {
     }
 }
 
-fn compiler_for_case_outputs(
-    then_expr: &ast::Expr,
-    else_expr: Option<&ast::Expr>,
-) -> Result<Option<(BoxedCompile<ValueId>, BoxedCompile<ValueId>)>> {
-    let Some(then_compiler) = compiler_for_expr(then_expr)? else {
-        return Ok(None);
-    };
-    let else_compiler = match else_expr {
-        Some(else_expr) => {
-            let Some(compiler) = compiler_for_expr(else_expr)? else {
-                return Ok(None);
-            };
-            compiler
-        }
-        None => constant(Value::Null).boxed(),
-    };
-    Ok(Some((then_compiler, else_compiler)))
+#[derive(Clone, Copy)]
+enum ExternalInputs {
+    Allow,
+    Deny,
 }
 
-fn compiler_for_expr(expr: &ast::Expr) -> Result<Option<BoxedCompile<ValueId>>> {
+struct DeferredExpr<'a> {
+    compiler: BoxedCompile<ValueId>,
+    inputs: Vec<&'a ast::Expr>,
+}
+
+fn compiler_for_child<'a, CanCompileAdd>(
+    expr: &'a ast::Expr,
+    inputs: &mut Vec<&'a ast::Expr>,
+    external_inputs: ExternalInputs,
+    can_compile_add: &CanCompileAdd,
+) -> Result<Option<BoxedCompile<ValueId>>>
+where
+    CanCompileAdd: Fn(&ast::Expr, &ast::Expr) -> bool + ?Sized,
+{
+    let input_count = inputs.len();
+    if let Some(compiler) = compiler_for_expr(expr, inputs, external_inputs, can_compile_add)? {
+        return Ok(Some(compiler));
+    }
+    inputs.truncate(input_count);
+    match external_inputs {
+        ExternalInputs::Allow => {
+            let index = u32::try_from(inputs.len()).map_err(|_| {
+                LimboError::InternalError("too many deferred compiler inputs".to_owned())
+            })?;
+            inputs.push(expr);
+            Ok(Some(input(InputId::new(index)).boxed()))
+        }
+        ExternalInputs::Deny => Ok(None),
+    }
+}
+
+fn compiler_for_expr<'a, CanCompileAdd>(
+    expr: &'a ast::Expr,
+    inputs: &mut Vec<&'a ast::Expr>,
+    external_inputs: ExternalInputs,
+    can_compile_add: &CanCompileAdd,
+) -> Result<Option<BoxedCompile<ValueId>>>
+where
+    CanCompileAdd: Fn(&ast::Expr, &ast::Expr) -> bool + ?Sized,
+{
     match expr {
         ast::Expr::Literal(literal) => {
             Ok(compiler_literal_value(literal)?.map(|value| constant(value).boxed()))
         }
-        ast::Expr::Binary(lhs, ast::Operator::Add, rhs) => {
-            let Some(lhs_compiler) = compiler_for_expr(lhs)? else {
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            compiler_for_child(&exprs[0], inputs, external_inputs, can_compile_add)
+        }
+        ast::Expr::Binary(lhs, ast::Operator::Add, rhs)
+            if expr_vector_size(lhs)? == 1
+                && expr_vector_size(rhs)? == 1
+                && can_compile_add(lhs, rhs) =>
+        {
+            let Some(lhs_compiler) =
+                compiler_for_child(lhs, inputs, external_inputs, can_compile_add)?
+            else {
                 return Ok(None);
             };
             let compiler = if exprs_are_equivalent(lhs, rhs) {
@@ -90,7 +125,9 @@ fn compiler_for_expr(expr: &ast::Expr) -> Result<Option<BoxedCompile<ValueId>>> 
                     .and_then(|(lhs, rhs)| add(lhs, rhs))
                     .boxed()
             } else {
-                let Some(rhs_compiler) = compiler_for_expr(rhs)? else {
+                let Some(rhs_compiler) =
+                    compiler_for_child(rhs, inputs, external_inputs, can_compile_add)?
+                else {
                     return Ok(None);
                 };
                 lhs_compiler
@@ -106,13 +143,30 @@ fn compiler_for_expr(expr: &ast::Expr) -> Result<Option<BoxedCompile<ValueId>>> 
             else_expr,
         } if base.is_none() && when_then_pairs.len() == 1 => {
             let (when_expr, then_expr) = &when_then_pairs[0];
-            let Some(when_compiler) = compiler_for_expr(when_expr)? else {
-                return Ok(None);
-            };
-            let Some((then_compiler, else_compiler)) =
-                compiler_for_case_outputs(then_expr, else_expr.as_deref())?
+            let Some(when_compiler) =
+                compiler_for_child(when_expr, inputs, external_inputs, can_compile_add)?
             else {
                 return Ok(None);
+            };
+            let Some(then_compiler) =
+                compiler_for_child(then_expr, inputs, ExternalInputs::Deny, can_compile_add)?
+            else {
+                return Ok(None);
+            };
+            let else_compiler = match else_expr.as_deref() {
+                Some(else_expr) => {
+                    let Some(compiler) = compiler_for_child(
+                        else_expr,
+                        inputs,
+                        ExternalInputs::Deny,
+                        can_compile_add,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    compiler
+                }
+                None => constant(Value::Null).boxed(),
             };
             Ok(Some(
                 when_compiler.branch(then_compiler, else_compiler).boxed(),
@@ -120,6 +174,61 @@ fn compiler_for_expr(expr: &ast::Expr) -> Result<Option<BoxedCompile<ValueId>>> 
         }
         _ => Ok(None),
     }
+}
+
+fn deferred_expr<'a, CanCompileAdd>(
+    expr: &'a ast::Expr,
+    can_compile_add: &CanCompileAdd,
+) -> Result<Option<DeferredExpr<'a>>>
+where
+    CanCompileAdd: Fn(&ast::Expr, &ast::Expr) -> bool + ?Sized,
+{
+    let mut inputs = Vec::new();
+    let Some(compiler) =
+        compiler_for_expr(expr, &mut inputs, ExternalInputs::Allow, can_compile_add)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(DeferredExpr { compiler, inputs }))
+}
+
+fn translate_deferred_expr(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<bool> {
+    let can_compile_add = |lhs: &ast::Expr, rhs: &ast::Expr| {
+        find_custom_type_operator(lhs, rhs, &ast::Operator::Add, referenced_tables, resolver)
+            .is_none()
+    };
+    let Some(deferred) = deferred_expr(expr, &can_compile_add)? else {
+        return Ok(false);
+    };
+    let mut input_registers = Vec::with_capacity(deferred.inputs.len());
+    let mut collation_ctx = None;
+    for expr in deferred.inputs {
+        let register = program.alloc_register();
+        program.reset_collation();
+        translate_expr(program, referenced_tables, expr, register, resolver)?;
+        let input_collation_ctx = program.curr_collation_ctx();
+        collation_ctx = match (collation_ctx, input_collation_ctx) {
+            (Some((_, true)), _) => collation_ctx,
+            (_, Some((collation, true))) => Some((collation, true)),
+            (None, input_collation_ctx) => input_collation_ctx,
+            (collation_ctx, _) => collation_ctx,
+        };
+        input_registers.push(register);
+    }
+    let ir = compile_scalar(deferred.compiler)?;
+    if input_registers.is_empty() {
+        ir.lower_into(program, target_register)?;
+    } else {
+        ir.lower_into_with_inputs(program, target_register, &input_registers)?;
+    }
+    program.set_collation(collation_ctx);
+    Ok(true)
 }
 
 /// Translate an expression into bytecode via [translate_expr()], and forbid any constant values from being hoisted
@@ -256,52 +365,6 @@ pub fn translate_expr(
             program.constant_span_end(span);
         }
         return Ok(target_register);
-    }
-
-    let deferred_root = matches!(
-        expr,
-        ast::Expr::Binary(_, ast::Operator::Add, _) | ast::Expr::Case { .. }
-    );
-    if deferred_root {
-        if let Some(compiler) = compiler_for_expr(expr)? {
-            compile_scalar(compiler)?.lower_into(program, target_register)?;
-            if let Some(span) = constant_span {
-                program.constant_span_end(span);
-            }
-            return Ok(target_register);
-        }
-        if let ast::Expr::Case {
-            base,
-            when_then_pairs,
-            else_expr,
-        } = expr
-        {
-            if base.is_none() && when_then_pairs.len() == 1 {
-                let (when_expr, then_expr) = &when_then_pairs[0];
-                if let Some((then_compiler, else_compiler)) =
-                    compiler_for_case_outputs(then_expr, else_expr.as_deref())?
-                {
-                    let condition_register = program.alloc_register();
-                    translate_expr(
-                        program,
-                        referenced_tables,
-                        when_expr,
-                        condition_register,
-                        resolver,
-                    )?;
-                    let compiler = input(InputId::new(0)).branch(then_compiler, else_compiler);
-                    compile_scalar(compiler)?.lower_into_with_inputs(
-                        program,
-                        target_register,
-                        &[condition_register],
-                    )?;
-                    if let Some(span) = constant_span {
-                        program.constant_span_end(span);
-                    }
-                    return Ok(target_register);
-                }
-            }
-        }
     }
 
     match expr {
@@ -560,6 +623,21 @@ pub fn translate_expr(
                 return Ok(target_register);
             }
 
+            if matches!(op, ast::Operator::Add)
+                && translate_deferred_expr(
+                    program,
+                    referenced_tables,
+                    expr,
+                    target_register,
+                    resolver,
+                )?
+            {
+                if let Some(span) = constant_span {
+                    program.constant_span_end(span);
+                }
+                return Ok(target_register);
+            }
+
             binary_expr_shared(
                 program,
                 referenced_tables,
@@ -577,6 +655,14 @@ pub fn translate_expr(
             when_then_pairs,
             else_expr,
         } => {
+            if translate_deferred_expr(program, referenced_tables, expr, target_register, resolver)?
+            {
+                if let Some(span) = constant_span {
+                    program.constant_span_end(span);
+                }
+                return Ok(target_register);
+            }
+
             // There's two forms of CASE, one which checks a base expression for equality
             // against the WHEN values, and returns the corresponding THEN value if it matches:
             //   CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'many' END
@@ -3238,4 +3324,82 @@ pub fn translate_expr(
     }
 
     Ok(target_register)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use turso_parser::parser::Parser;
+
+    fn first_result_expr(sql: &str) -> Box<ast::Expr> {
+        let command = Parser::new(sql.as_bytes())
+            .next_cmd()
+            .unwrap()
+            .expect("SQL must contain a statement");
+        let ast::Cmd::Stmt(ast::Stmt::Select(select)) = command else {
+            panic!("expected SELECT statement");
+        };
+        let ast::OneSelect::Select { columns, .. } = select.body.select else {
+            panic!("expected simple SELECT");
+        };
+        let ast::ResultColumn::Expr(expr, _) = columns.into_iter().next().unwrap() else {
+            panic!("expected expression result column");
+        };
+        expr
+    }
+
+    #[test]
+    fn deferred_add_collects_recursive_inputs() {
+        let expr = first_result_expr("SELECT (a + 1) + (?1 + abs(b))");
+
+        let deferred = deferred_expr(&expr, &|_, _| true).unwrap().unwrap();
+        let ir = compile_scalar(deferred.compiler).unwrap().to_string();
+
+        assert_eq!(deferred.inputs.len(), 3);
+        assert!(matches!(
+            deferred.inputs[0],
+            ast::Expr::Id(_) | ast::Expr::Name(_)
+        ));
+        assert!(matches!(deferred.inputs[1], ast::Expr::Variable(_)));
+        assert!(matches!(deferred.inputs[2], ast::Expr::FunctionCall { .. }));
+        assert!(ir.contains("input @0"));
+        assert!(ir.contains("input @1"));
+        assert!(ir.contains("input @2"));
+    }
+
+    #[test]
+    fn deferred_case_does_not_collect_branch_inputs() {
+        let expr = first_result_expr("SELECT CASE WHEN flag THEN abs(value) ELSE 0 END");
+
+        assert!(deferred_expr(&expr, &|_, _| true).unwrap().is_none());
+    }
+
+    #[test]
+    fn add_externalizes_a_case_subexpression_as_one_input() {
+        let expr = first_result_expr("SELECT CASE WHEN flag THEN abs(value) ELSE 0 END + 1");
+
+        let deferred = deferred_expr(&expr, &|_, _| true).unwrap().unwrap();
+
+        assert_eq!(deferred.inputs.len(), 1);
+        assert!(matches!(deferred.inputs[0], ast::Expr::Case { .. }));
+    }
+
+    #[test]
+    fn add_externalizes_a_semantically_specialized_subexpression() {
+        let expr = first_result_expr("SELECT (a + 1) + 2");
+        let can_compile_add =
+            |lhs: &ast::Expr, _: &ast::Expr| matches!(lhs, ast::Expr::Parenthesized(_));
+
+        let deferred = deferred_expr(&expr, &can_compile_add).unwrap().unwrap();
+
+        assert_eq!(deferred.inputs.len(), 1);
+        assert!(matches!(deferred.inputs[0], ast::Expr::Binary(..)));
+    }
+
+    #[test]
+    fn row_valued_addition_stays_on_the_legacy_error_path() {
+        let expr = first_result_expr("SELECT (1, 2) + (3, 4)");
+
+        assert!(deferred_expr(&expr, &|_, _| true).unwrap().is_none());
+    }
 }

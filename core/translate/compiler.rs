@@ -1275,4 +1275,48 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn column_addition_uses_symbolic_inputs() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection.execute("CREATE TABLE numbers(a, b)").unwrap();
+        connection
+            .execute("INSERT INTO numbers VALUES (1, 2), (NULL, 3), (-4, 5)")
+            .unwrap();
+
+        let rows = connection
+            .prepare("SELECT a + b, a + a, (a + 1) + (b + 2) FROM numbers ORDER BY rowid")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::from_i64(3), Value::from_i64(2), Value::from_i64(6),],
+                vec![Value::Null, Value::Null, Value::Null],
+                vec![Value::from_i64(1), Value::from_i64(-8), Value::from_i64(4),],
+            ]
+        );
+    }
+
+    #[test]
+    fn parameter_addition_uses_symbolic_inputs() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        let mut statement = connection.prepare("SELECT ?1 + 2, (?1 + ?2) + 1").unwrap();
+        statement
+            .bind_at(1.try_into().unwrap(), Value::from_i64(40))
+            .unwrap();
+        statement
+            .bind_at(2.try_into().unwrap(), Value::from_i64(1))
+            .unwrap();
+
+        let rows = statement.run_collect_rows().unwrap();
+
+        assert_eq!(rows, vec![vec![Value::from_i64(42), Value::from_i64(42)]]);
+    }
 }

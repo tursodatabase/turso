@@ -54,4 +54,15 @@ execution; unsupported fragments return to the established expression emitter.
 Values produced outside a region enter through symbolic input slots. Physical
 register bindings are supplied only to the lowering boundary, allowing legacy
 expression producers to feed declarative regions without placing register
-numbers in the IR.
+numbers in the IR. Input collection walks supported scalar expression trees, so
+columns, parameters, and legacy subexpressions can participate in one deferred
+region while preserving their source evaluation order. Collection is
+transactional: if a subtree cannot be represented safely, speculative inputs
+are discarded before that subtree is treated as one external value.
+
+Conditional branches only admit branch bodies that are fully represented in
+the IR. An unsupported branch body sends the whole conditional back to the
+legacy emitter instead of evaluating that body as an eager external input.
+Likewise, SQL-specific operator implementations remain atomic external inputs;
+the surrounding expression may be deferred without bypassing custom-type
+dispatch.
