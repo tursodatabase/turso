@@ -115,6 +115,11 @@ pub struct ExprArena {
     next_slot: u32,
     /// AST expressions backing [`Node::Opaque`] leaves.
     opaques: Vec<ast::Expr>,
+    /// Indices into `opaques` that participate in [`Self::opaque`]
+    /// dedup; entries created by [`Self::opaque_unique`] are excluded so
+    /// a nondeterministic leaf can never be shared with, or shadowed by,
+    /// a deduping one.
+    opaque_dedup_pool: Vec<u32>,
 }
 
 impl ExprArena {
@@ -181,19 +186,39 @@ impl ExprArena {
 
     /// An opaque leaf backed by `expr`, lowered by delegation to the
     /// eager path. Structurally equal expressions share a node (linear
-    /// scan — opaque leaves per expression are few).
+    /// scan — opaque leaves per expression are few), so repeated
+    /// deterministic reads compute once per region. Never use this for
+    /// expressions containing nondeterministic functions — sharing would
+    /// collapse distinct evaluations; use [`Self::opaque_unique`].
     pub fn opaque(&mut self, expr: &ast::Expr) -> ValId {
-        let id = match self.opaques.iter().position(|e| e == expr) {
-            Some(index) => OpaqueId(u32::try_from(index).expect("opaque table bounded by nodes")),
+        match self
+            .opaque_dedup_pool
+            .iter()
+            .find(|&&index| self.opaques[index as usize] == *expr)
+        {
+            Some(&index) => self.intern(Node::Opaque(OpaqueId(index))),
             None => {
-                let id = OpaqueId(
-                    u32::try_from(self.opaques.len())
-                        .expect("expression arena exceeded u32::MAX opaque leaves"),
-                );
-                self.opaques.push(expr.clone());
+                let id = self.opaque_unique(expr);
+                let Node::Opaque(opaque) = self.node(id) else {
+                    unreachable!("opaque_unique returns an opaque node");
+                };
+                self.opaque_dedup_pool.push(opaque.0);
                 id
             }
-        };
+        }
+    }
+
+    /// An opaque leaf that never shares with structurally equal
+    /// expressions: every call yields a distinct value that lowers (and
+    /// thus evaluates) separately. Required for leaves containing
+    /// nondeterministic functions, where SQLite semantics demand one
+    /// evaluation per occurrence.
+    pub fn opaque_unique(&mut self, expr: &ast::Expr) -> ValId {
+        let id = OpaqueId(
+            u32::try_from(self.opaques.len())
+                .expect("expression arena exceeded u32::MAX opaque leaves"),
+        );
+        self.opaques.push(expr.clone());
         self.intern(Node::Opaque(id))
     }
 
@@ -281,6 +306,25 @@ mod tests {
         assert_ne!(arena.slot(s1), arena.slot(s2));
         // Two reads of the same slot are the same value within a region.
         assert_eq!(arena.slot(s1), arena.slot(s1));
+    }
+
+    #[test]
+    fn opaque_dedup_vs_unique() {
+        let mut arena = ExprArena::new();
+        let expr = ast::Expr::RowId {
+            database: None,
+            table: ast::TableInternalId::default(),
+        };
+        // Deduping constructor: structurally equal exprs share a value.
+        assert_eq!(arena.opaque(&expr), arena.opaque(&expr));
+        // Unique constructor: every call is a distinct value, and it
+        // never joins the dedup pool.
+        let unique = arena.opaque_unique(&expr);
+        assert_ne!(unique, arena.opaque_unique(&expr));
+        assert_ne!(unique, arena.opaque(&expr));
+        // Opaque leaves are never constant.
+        let shared = arena.opaque(&expr);
+        assert!(!arena.is_constant(shared));
     }
 
     #[test]

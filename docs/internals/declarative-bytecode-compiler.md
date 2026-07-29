@@ -224,12 +224,25 @@ lift — goes last.
       play, custom-typed columns (operator overloads), array operands of
       `||` (ArrayConcat), SELF_TABLE placeholders. Function calls did NOT
       make this slice — they need contiguous argument blocks, moved to 1d.
-- [ ] 1d. Function calls as nodes. Needs the contiguous-register-group
-      concept: `Insn::Function` takes its args in adjacent registers, so
-      lowering a FnCall must allocate a block and `lower_into` each arg
-      slot (mirroring the eager shape). Start with pure scalar functions
-      on the generic `Function` path; leave specialized emission
-      (datetime folds, JSON fast paths, aggregates) to the eager path.
+- [x] 1d. Scalar function calls join as **opaque leaves** (same
+      delegation mechanism as columns), covering ALL scalar functions —
+      generic, JSON, datetime, specialized emission — because the whole
+      call (dispatch, arg translation, contiguous arg blocks) is emitted
+      by the eager path at the leaf. Constant calls still hoist: the
+      delegated `translate_expr` opens its own constant span. Dedup
+      policy: deterministic calls share a node (`abs(x)+abs(x)` computes
+      once, matching the eager equivalent-operand branch); calls
+      containing nondeterministic functions get `opaque_unique` — one
+      evaluation per occurrence, per SQLite. NOTE: this *fixes* a
+      pre-existing divergence in IR-covered trees — eager Turso shares
+      `random() - random()` via `exprs_are_equivalent` (always 0; SQLite
+      evaluates twice); the eager path still has that bug where it
+      applies. Function results carry no collation (SQLite rule; the
+      eager path instead leaks the last arg's collation state — the IR's
+      static None is the correct behavior, conformance-validated).
+      Aggregates/window/unknown functions fall back for identical error
+      parity. First-class FnCall nodes (with contiguous-register-group
+      allocation) come later, when the allocator phase lands.
 - [ ] 1e. Comparisons with affinity + collation payloads
       (`CmpInsFlags`, `comparison_affinity`), value-position only
       (`Insn::Eq/Ne/Lt/…` value mode / `Bool` results).

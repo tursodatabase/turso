@@ -1,9 +1,10 @@
 use turso_parser::ast::{self, UnaryOperator};
 
 use crate::alloc::TursoIteratorExt;
+use crate::function::Func;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::sanitize_string;
+use crate::translate::expr::{expr_contains_nondeterministic_scalar_function, sanitize_string};
 use crate::translate::plan::TableReferences;
 use crate::util::parse_numeric_literal;
 use crate::{Numeric, Result, Value, ValueBlob};
@@ -204,6 +205,44 @@ pub(crate) fn try_build_value(
             }
             // The eager RowId arm does no collation bookkeeping.
             Some(Built::plain(arena.opaque(expr)))
+        }
+        ast::Expr::FunctionCall {
+            name,
+            args,
+            filter_over,
+            ..
+        } => {
+            let Some(resolver) = ctx.resolver else {
+                return Ok(None);
+            };
+            // Window and aggregate uses are misuse errors in value
+            // position; leave them to the eager path so the error
+            // message and site stay identical.
+            if filter_over.over_clause.is_some() {
+                return Ok(None);
+            }
+            let Some(func) = resolver.resolve_function(name.as_str(), args.len())? else {
+                // Unknown function: fall back so the eager path raises
+                // its "no such function" error.
+                return Ok(None);
+            };
+            if matches!(func, Func::Agg(_) | Func::Window(_)) {
+                return Ok(None);
+            }
+            // Scalar calls become opaque leaves: lowering delegates the
+            // whole call (dispatch, specialized emission, argument
+            // translation) back to the eager path. Only deterministic
+            // calls may share a node — SQLite semantics require each
+            // occurrence of e.g. random() to evaluate separately.
+            //
+            // Function results carry no collation (SQLite: only COLLATE
+            // and column references have collating sequences).
+            let val = if expr_contains_nondeterministic_scalar_function(expr, resolver)? {
+                arena.opaque_unique(expr)
+            } else {
+                arena.opaque(expr)
+            };
+            Some(Built::plain(val))
         }
         _ => None,
     })
