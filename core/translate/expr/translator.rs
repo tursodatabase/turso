@@ -112,6 +112,8 @@ pub(super) fn open_expr_constant_span(
 
 /// If `expr` is cached in the resolver's expression-register cache, emit a Copy
 /// (plus custom-type decode when needed), set the collation context, and return true.
+/// The miss path is just the cache probe so the hot [translate_expr] fast path
+/// stays call-free; the hit path is outlined.
 #[inline]
 pub(super) fn try_emit_cached_expr_reg(
     program: &mut ProgramBuilder,
@@ -120,9 +122,28 @@ pub(super) fn try_emit_cached_expr_reg(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<bool> {
-    let Some((reg, needs_decode, collation_ctx)) = resolver.resolve_cached_expr_reg(expr) else {
+    let Some(cache_hit) = resolver.resolve_cached_expr_reg(expr) else {
         return Ok(false);
     };
+    emit_cached_expr_reg(
+        program,
+        referenced_tables,
+        expr,
+        target_register,
+        resolver,
+        cache_hit,
+    )?;
+    Ok(true)
+}
+
+fn emit_cached_expr_reg(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+    (reg, needs_decode, collation_ctx): crate::translate::emitter::CachedExprRegHit,
+) -> Result<()> {
     program.emit_insn(Insn::Copy {
         src_reg: reg,
         dst_reg: target_register,
@@ -169,7 +190,7 @@ pub(super) fn try_emit_cached_expr_reg(
         }
     }
     program.set_collation(collation_ctx);
-    Ok(true)
+    Ok(())
 }
 
 /// Try to satisfy `expr` from an expression index; returns true if the value was emitted.
