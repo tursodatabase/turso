@@ -441,60 +441,38 @@ impl<'a> ExprIr<'a> {
                 });
                 program.preassign_label_to_next_insn(label);
             }
-            VExpr::Binary {
-                lhs,
-                rhs,
-                op,
-                shared,
-            } => {
-                self.lower_binary(
-                    program,
-                    referenced_tables,
-                    resolver,
-                    id,
-                    *lhs,
-                    *rhs,
-                    *op,
-                    *shared,
-                    target_register,
-                )?;
+            VExpr::Binary { .. } => {
+                self.lower_binary(program, referenced_tables, resolver, id, target_register)?;
             }
-            VExpr::Case {
-                base,
-                when_then,
-                else_expr,
-            } => {
-                self.lower_case(
-                    program,
-                    referenced_tables,
-                    resolver,
-                    base.as_ref().copied(),
-                    when_then,
-                    else_expr.as_ref().copied(),
-                    target_register,
-                )?;
+            VExpr::Case { .. } => {
+                self.lower_case(program, referenced_tables, resolver, id, target_register)?;
             }
         }
         Ok(())
     }
 
     /// Mirrors [emit_binary_expr_scalar] with value emission mode.
-    #[allow(clippy::too_many_arguments)]
     fn lower_binary(
         &self,
         program: &mut ProgramBuilder,
         referenced_tables: Option<&TableReferences>,
         resolver: &Resolver,
         id: VId,
-        lhs: VId,
-        rhs: VId,
-        op: ast::Operator,
-        shared: bool,
         target_register: usize,
     ) -> Result<()> {
+        let node = self.node(id);
+        let VExpr::Binary {
+            lhs,
+            rhs,
+            op,
+            shared,
+        } = node.kind
+        else {
+            unreachable!("lower_binary requires a Binary node")
+        };
         // The emission helpers inspect the operand ASTs for affinity and
         // collation; recover them from the node's own AST back-pointer.
-        let ast::Expr::Binary(e1, _, e2) = self.node(id).ast else {
+        let ast::Expr::Binary(e1, _, e2) = node.ast else {
             unreachable!("Binary node must point at a Binary AST expression")
         };
         if shared {
@@ -551,11 +529,18 @@ impl<'a> ExprIr<'a> {
         program: &mut ProgramBuilder,
         referenced_tables: Option<&TableReferences>,
         resolver: &Resolver,
-        base: Option<VId>,
-        when_then: &[(VId, VId)],
-        else_expr: Option<VId>,
+        id: VId,
         target_register: usize,
     ) -> Result<()> {
+        let VExpr::Case {
+            base,
+            when_then,
+            else_expr,
+        } = &self.node(id).kind
+        else {
+            unreachable!("lower_case requires a Case node")
+        };
+        let (base, else_expr) = (*base, *else_expr);
         let return_label = program.allocate_label();
         let mut next_case_label = program.allocate_label();
         // Only allocate a reg to hold the base expression if one was provided;
