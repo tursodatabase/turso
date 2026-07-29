@@ -1,5 +1,7 @@
 use super::*;
-use crate::translate::compiler::{add, compile_scalar, constant, BoxedCompile, Compile, ValueId};
+use crate::translate::compiler::{
+    add, compile_scalar, constant, input, BoxedCompile, Compile, InputId, ValueId,
+};
 
 /// Reason why [translate_expr_no_constant_opt()] was called.
 #[derive(Debug)]
@@ -54,6 +56,25 @@ fn compiler_literal_value(literal: &ast::Literal) -> Result<Option<Value>> {
     }
 }
 
+fn compiler_for_case_outputs(
+    then_expr: &ast::Expr,
+    else_expr: Option<&ast::Expr>,
+) -> Result<Option<(BoxedCompile<ValueId>, BoxedCompile<ValueId>)>> {
+    let Some(then_compiler) = compiler_for_expr(then_expr)? else {
+        return Ok(None);
+    };
+    let else_compiler = match else_expr {
+        Some(else_expr) => {
+            let Some(compiler) = compiler_for_expr(else_expr)? else {
+                return Ok(None);
+            };
+            compiler
+        }
+        None => constant(Value::Null).boxed(),
+    };
+    Ok(Some((then_compiler, else_compiler)))
+}
+
 fn compiler_for_expr(expr: &ast::Expr) -> Result<Option<BoxedCompile<ValueId>>> {
     match expr {
         ast::Expr::Literal(literal) => {
@@ -88,17 +109,10 @@ fn compiler_for_expr(expr: &ast::Expr) -> Result<Option<BoxedCompile<ValueId>>> 
             let Some(when_compiler) = compiler_for_expr(when_expr)? else {
                 return Ok(None);
             };
-            let Some(then_compiler) = compiler_for_expr(then_expr)? else {
+            let Some((then_compiler, else_compiler)) =
+                compiler_for_case_outputs(then_expr, else_expr.as_deref())?
+            else {
                 return Ok(None);
-            };
-            let else_compiler = match else_expr {
-                Some(else_expr) => {
-                    let Some(compiler) = compiler_for_expr(else_expr)? else {
-                        return Ok(None);
-                    };
-                    compiler
-                }
-                None => constant(Value::Null).boxed(),
             };
             Ok(Some(
                 when_compiler.branch(then_compiler, else_compiler).boxed(),
@@ -255,6 +269,38 @@ pub fn translate_expr(
                 program.constant_span_end(span);
             }
             return Ok(target_register);
+        }
+        if let ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } = expr
+        {
+            if base.is_none() && when_then_pairs.len() == 1 {
+                let (when_expr, then_expr) = &when_then_pairs[0];
+                if let Some((then_compiler, else_compiler)) =
+                    compiler_for_case_outputs(then_expr, else_expr.as_deref())?
+                {
+                    let condition_register = program.alloc_register();
+                    translate_expr(
+                        program,
+                        referenced_tables,
+                        when_expr,
+                        condition_register,
+                        resolver,
+                    )?;
+                    let compiler = input(InputId::new(0)).branch(then_compiler, else_compiler);
+                    compile_scalar(compiler)?.lower_into_with_inputs(
+                        program,
+                        target_register,
+                        &[condition_register],
+                    )?;
+                    if let Some(span) = constant_span {
+                        program.constant_span_end(span);
+                    }
+                    return Ok(target_register);
+                }
+            }
         }
     }
 

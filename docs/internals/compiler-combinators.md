@@ -50,3 +50,8 @@ resources or loops.
 Supported expression fragments are assembled recursively. Boxing erases the
 concrete Rust type of heterogeneous combinator trees while preserving deferred
 execution; unsupported fragments return to the established expression emitter.
+
+Values produced outside a region enter through symbolic input slots. Physical
+register bindings are supplied only to the lowering boundary, allowing legacy
+expression producers to feed declarative regions without placing register
+numbers in the IR.

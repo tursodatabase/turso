@@ -212,6 +212,20 @@ impl ValueId {
     }
 }
 
+/// A symbolic value supplied when an IR region is lowered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InputId(u32);
+
+impl InputId {
+    pub(crate) const fn new(index: u32) -> Self {
+        Self(index)
+    }
+
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BlockId(u32);
 
@@ -223,6 +237,7 @@ impl BlockId {
 
 #[derive(Debug)]
 enum ScalarOp {
+    Input(InputId),
     Constant(Value),
     Add { lhs: ValueId, rhs: ValueId },
 }
@@ -230,7 +245,7 @@ enum ScalarOp {
 impl ScalarOp {
     fn operands(&self) -> impl Iterator<Item = ValueId> + '_ {
         let operands = match self {
-            Self::Constant(_) => [None, None],
+            Self::Input(_) | Self::Constant(_) => [None, None],
             Self::Add { lhs, rhs } => [Some(*lhs), Some(*rhs)],
         };
         operands.into_iter().flatten()
@@ -298,6 +313,7 @@ pub(crate) struct IrBuilder {
     blocks: SmallVec<[BlockUnderConstruction; 4]>,
     current: BlockId,
     next_value: u32,
+    input_count: u32,
 }
 
 impl IrBuilder {
@@ -311,6 +327,7 @@ impl IrBuilder {
             }],
             current: BlockId(0),
             next_value: 0,
+            input_count: 0,
         }
     }
 
@@ -323,6 +340,11 @@ impl IrBuilder {
     }
 
     fn push(&mut self, op: ScalarOp) -> Result<ValueId> {
+        if let ScalarOp::Input(input) = &op {
+            self.input_count = self.input_count.max(input.0.checked_add(1).ok_or_else(|| {
+                LimboError::InternalError("compiler IR input identifier overflow".to_owned())
+            })?);
+        }
         let result = self.allocate_value()?;
         self.blocks[self.current.index()]
             .instructions
@@ -415,6 +437,7 @@ impl IrBuilder {
         let program = IrProgram {
             blocks,
             value_count: self.next_value,
+            input_count: self.input_count,
         };
         program.verify()?;
         Ok(program)
@@ -432,6 +455,7 @@ struct Definition {
 pub(crate) struct IrProgram {
     blocks: SmallVec<[BasicBlock; 4]>,
     value_count: u32,
+    input_count: u32,
 }
 
 impl IrProgram {
@@ -444,6 +468,7 @@ impl IrProgram {
 
         let block_count = self.blocks.len();
         let mut definitions = vec![None; self.value_count as usize];
+        let mut inputs = vec![false; self.input_count as usize];
         let mut predecessors = vec![Vec::new(); block_count];
         let mut return_count = 0;
 
@@ -465,6 +490,14 @@ impl IrProgram {
                 )?;
             }
             for (instruction_index, instruction) in block.instructions.iter().enumerate() {
+                if let ScalarOp::Input(input) = &instruction.op {
+                    let Some(used) = inputs.get_mut(input.index()) else {
+                        return Err(LimboError::InternalError(format!(
+                            "compiler IR references out-of-range input {input:?}"
+                        )));
+                    };
+                    *used = true;
+                }
                 Self::record_definition(
                     &mut definitions,
                     instruction.result,
@@ -513,6 +546,11 @@ impl IrProgram {
         if let Some(missing) = definitions.iter().position(Option::is_none) {
             return Err(LimboError::InternalError(format!(
                 "compiler IR value %{missing} has no definition"
+            )));
+        }
+        if let Some(missing) = inputs.iter().position(|used| !used) {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR input @{missing} is not referenced"
             )));
         }
         if return_count != 1 {
@@ -655,12 +693,39 @@ impl IrProgram {
         program: &mut ProgramBuilder,
         target_register: usize,
     ) -> Result<()> {
+        self.lower_into_with_inputs(program, target_register, &[])
+    }
+
+    /// Bind symbolic inputs to existing registers and lower the region.
+    pub(crate) fn lower_into_with_inputs(
+        self,
+        program: &mut ProgramBuilder,
+        target_register: usize,
+        input_registers: &[usize],
+    ) -> Result<()> {
         self.verify()?;
+        if input_registers.len() != self.input_count as usize {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR expects {} inputs, received {}",
+                self.input_count,
+                input_registers.len()
+            )));
+        }
         let output = self.output();
+        let mut input_values = vec![None; self.value_count as usize];
+        for block in &self.blocks {
+            for instruction in &block.instructions {
+                if let ScalarOp::Input(input) = &instruction.op {
+                    input_values[instruction.result.index()] = Some(*input);
+                }
+            }
+        }
         let registers = (0..self.value_count)
             .map(|value| {
                 if ValueId(value) == output {
                     target_register
+                } else if let Some(input) = input_values[value as usize] {
+                    input_registers[input.index()]
                 } else {
                     program.alloc_register()
                 }
@@ -696,6 +761,16 @@ impl IrProgram {
             for instruction in &block.instructions {
                 let destination = registers[instruction.result.index()];
                 match &instruction.op {
+                    ScalarOp::Input(input) => {
+                        let source = input_registers[input.index()];
+                        if source != destination {
+                            program.emit_insn(Insn::Copy {
+                                src_reg: source,
+                                dst_reg: destination,
+                                extra_amount: 0,
+                            });
+                        }
+                    }
                     ScalarOp::Constant(Value::Null) => program.emit_insn(Insn::Null {
                         dest: destination,
                         dest_end: None,
@@ -795,6 +870,7 @@ impl fmt::Display for IrProgram {
             for instruction in &block.instructions {
                 write!(f, "  %{} = ", instruction.result.0)?;
                 match &instruction.op {
+                    ScalarOp::Input(input) => writeln!(f, "input @{}", input.0)?,
                     ScalarOp::Constant(value) => writeln!(f, "constant {value:?}")?,
                     ScalarOp::Add { lhs, rhs } => {
                         writeln!(f, "add %{}, %{}", lhs.0, rhs.0)?;
@@ -833,6 +909,20 @@ impl fmt::Display for IrProgram {
 }
 
 pub(crate) struct Constant(Value);
+
+pub(crate) struct Input(InputId);
+
+pub(crate) const fn input(id: InputId) -> Input {
+    Input(id)
+}
+
+impl Compile for Input {
+    type Output = ValueId;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        builder.push(ScalarOp::Input(self.0))
+    }
+}
 
 pub(crate) fn constant(value: Value) -> Constant {
     Constant(value)
@@ -973,6 +1063,45 @@ mod tests {
     }
 
     #[test]
+    fn symbolic_inputs_are_bound_only_during_lowering() {
+        let compiler = input(InputId::new(0))
+            .then(constant(Value::from_i64(2)))
+            .and_then(|(lhs, rhs)| add(lhs, rhs));
+        let ir = compile_scalar(compiler).unwrap();
+        assert!(ir.to_string().contains("%0 = input @0"));
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 3, 0));
+
+        ir.lower_into_with_inputs(&mut program, 7, &[4]).unwrap();
+
+        assert!(matches!(
+            &program.insns[..],
+            [
+                (Insn::Integer { value: 2, dest: 1 }, _),
+                (
+                    Insn::Add {
+                        lhs: 4,
+                        rhs: 1,
+                        dest: 7,
+                    },
+                    _
+                ),
+            ]
+        ));
+    }
+
+    #[test]
+    fn lowering_rejects_missing_input_bindings() {
+        let ir = compile_scalar(input(InputId::new(0))).unwrap();
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 1, 0));
+
+        let error = ir.lower_into(&mut program, 1).unwrap_err();
+
+        assert!(error.to_string().contains("expects 1 inputs, received 0"));
+    }
+
+    #[test]
     fn verifier_rejects_use_without_dominance() {
         let ir = IrProgram {
             blocks: smallvec![
@@ -1018,6 +1147,7 @@ mod tests {
                 },
             ],
             value_count: 2,
+            input_count: 0,
         };
 
         let error = ir.verify().unwrap_err();
@@ -1114,6 +1244,35 @@ mod tests {
                 Value::from_i64(10),
                 Value::from_i64(11),
             ]]
+        );
+    }
+
+    #[test]
+    fn case_with_external_condition_runs_through_control_flow_ir() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection.execute("CREATE TABLE flags(value)").unwrap();
+        connection
+            .execute("INSERT INTO flags VALUES (1), (0), (NULL)")
+            .unwrap();
+
+        let rows = connection
+            .prepare(
+                "SELECT value, CASE WHEN value THEN 10 + 1 ELSE 20 + 2 END \
+                 FROM flags ORDER BY rowid",
+            )
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::from_i64(1), Value::from_i64(11)],
+                vec![Value::from_i64(0), Value::from_i64(22)],
+                vec![Value::Null, Value::from_i64(22)],
+            ]
         );
     }
 }
