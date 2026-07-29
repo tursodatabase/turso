@@ -2,6 +2,7 @@ mod abandoned_create_index;
 mod abandoned_statement_pager;
 mod assert_details;
 mod attach;
+mod checkpoint_crash_atomicity;
 mod common;
 mod conflict_resolution;
 mod custom_types;

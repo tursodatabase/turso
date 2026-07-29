@@ -4620,9 +4620,9 @@ impl Pager {
                 } => {
                     let checkpoint_lock_source = self.checkpoint_state.read().lock_source;
                     let res = return_if_io!(match checkpoint_lock_source {
-                        CheckpointLockSource::Acquire => wal.checkpoint(self, mode),
+                        CheckpointLockSource::Acquire => wal.checkpoint(self, mode, sync_mode),
                         CheckpointLockSource::HeldByCaller => {
-                            wal.vacuum_checkpoint_with_held_lock(self)
+                            wal.vacuum_checkpoint_with_held_lock(self, sync_mode)
                         }
                     });
                     let mut state = self.checkpoint_state.write();
