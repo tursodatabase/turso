@@ -21,6 +21,76 @@ const SIZE_MARKER_32BIT: u8 = 14;
 const MAX_JSON_DEPTH: usize = 1000;
 const INFINITY_CHAR_COUNT: u8 = 8;
 
+/// Position of the first byte `<= 0x1F` (JSON control character), if any.
+///
+/// Chunked OR-accumulation instead of `iter().position` so LLVM can vectorize
+/// the scan; `memchr` cannot express a byte-range search.
+fn find_control_byte(bytes: &[u8]) -> Option<usize> {
+    const CHUNK: usize = 32;
+    let mut offset = 0;
+    let mut chunks = bytes.chunks_exact(CHUNK);
+    for chunk in &mut chunks {
+        let mut any = 0u8;
+        for &b in chunk {
+            any |= u8::from(b <= 0x1F);
+        }
+        if any != 0 {
+            return chunk.iter().position(|&b| b <= 0x1F).map(|p| offset + p);
+        }
+        offset += CHUNK;
+    }
+    chunks
+        .remainder()
+        .iter()
+        .position(|&b| b <= 0x1F)
+        .map(|p| offset + p)
+}
+
+/// Position of the first byte a JSON string rendering must escape or stop at:
+/// `quote`, a backslash, or a control byte (`< 0x20`).
+///
+/// The prefix is scanned scalar with per-byte early exit — escapes near the
+/// start are common enough that chunk-first scanning wastes work — and only
+/// longer clean runs continue into the chunked OR-accumulated scan that LLVM
+/// autovectorizes. `memchr2` cannot fold in the control-byte range test.
+#[inline]
+fn find_string_special(bytes: &[u8], quote: u8) -> Option<usize> {
+    const SCALAR_PREFIX: usize = 16;
+    const CHUNK: usize = 32;
+    let is_special = |b: u8| (b == quote) | (b == b'\\') | (b < 0x20);
+
+    let scalar_end = bytes.len().min(SCALAR_PREFIX);
+    for (i, &b) in bytes[..scalar_end].iter().enumerate() {
+        if is_special(b) {
+            return Some(i);
+        }
+    }
+    if scalar_end == bytes.len() {
+        return None;
+    }
+
+    let mut offset = SCALAR_PREFIX;
+    let mut chunks = bytes[SCALAR_PREFIX..].chunks_exact(CHUNK);
+    for chunk in &mut chunks {
+        let mut any = false;
+        for &b in chunk {
+            any |= is_special(b);
+        }
+        if any {
+            return chunk
+                .iter()
+                .position(|&b| is_special(b))
+                .map(|p| offset + p);
+        }
+        offset += CHUNK;
+    }
+    chunks
+        .remainder()
+        .iter()
+        .position(|&b| is_special(b))
+        .map(|p| offset + p)
+}
+
 const fn make_whitespace_table() -> [u8; 256] {
     let mut table = [0u8; 256];
 
@@ -1047,7 +1117,12 @@ impl Jsonb {
             }
             ElementType::TEXT | ElementType::TEXTJ | ElementType::TEXT5 | ElementType::TEXTRAW => {
                 let payload = &self.data[payload_start..payload_end];
-                std::str::from_utf8(payload).map_err(|_| {
+                if payload.len() < 64 {
+                    from_utf8(payload).ok()
+                } else {
+                    simdutf8::basic::from_utf8(payload).ok()
+                }
+                .ok_or_else(|| {
                     LimboError::ParseError("Invalid UTF-8 in text payload".to_string())
                 })?;
                 Ok(())
@@ -1294,36 +1369,47 @@ impl Jsonb {
 
         match kind {
             ElementType::TEXT | ElementType::TEXTRAW | ElementType::TEXTJ => {
-                let word = from_utf8(word_slice).map_err(|_| {
-                    LimboError::ParseError("Failed to serialize string!".to_string())
-                })?;
+                // simdutf8 wins on bulk input but has per-call setup that
+                // loses to std on the short strings typical of JSON.
+                let word = if word_slice.len() < 64 {
+                    from_utf8(word_slice).ok()
+                } else {
+                    simdutf8::basic::from_utf8(word_slice).ok()
+                }
+                .ok_or_else(|| LimboError::ParseError("Failed to serialize string!".to_string()))?;
+
+                // Only control bytes need escaping for TEXTJ (its payload
+                // already carries JSON escape sequences verbatim); TEXT also
+                // escapes quotes and backslashes. Jump between escape sites
+                // with a vectorized scan instead of testing every byte.
+                let textj = *kind == ElementType::TEXTJ;
+                let find_escape = |bytes: &[u8]| -> Option<usize> {
+                    if textj {
+                        find_control_byte(bytes)
+                    } else {
+                        find_string_special(bytes, b'"')
+                    }
+                };
 
                 let mut last_end = 0;
                 let bytes = word.as_bytes();
-                for i in 0..bytes.len() {
+                while let Some(off) = find_escape(&bytes[last_end..]) {
+                    let i = last_end + off;
                     let b = bytes[i];
-                    let needs_escape = if *kind == ElementType::TEXTJ {
-                        b <= 0x1F
-                    } else {
-                        b == b'"' || b == b'\\' || b <= 0x1F
-                    };
-
-                    if needs_escape {
-                        string.push_str(&word[last_end..i]);
-                        match b {
-                            b'"' => string.push_str("\\\""),
-                            b'\\' => string.push_str("\\\\"),
-                            0x08 => string.push_str("\\b"),
-                            0x0C => string.push_str("\\f"),
-                            b'\n' => string.push_str("\\n"),
-                            b'\r' => string.push_str("\\r"),
-                            b'\t' => string.push_str("\\t"),
-                            c => {
-                                let _ = write!(string, "\\u{c:04x}");
-                            }
+                    string.push_str(&word[last_end..i]);
+                    match b {
+                        b'"' => string.push_str("\\\""),
+                        b'\\' => string.push_str("\\\\"),
+                        0x08 => string.push_str("\\b"),
+                        0x0C => string.push_str("\\f"),
+                        b'\n' => string.push_str("\\n"),
+                        b'\r' => string.push_str("\\r"),
+                        b'\t' => string.push_str("\\t"),
+                        c => {
+                            let _ = write!(string, "\\u{c:04x}");
                         }
-                        last_end = i + 1;
                     }
+                    last_end = i + 1;
                 }
                 string.push_str(&word[last_end..]);
             }
@@ -1832,39 +1918,43 @@ impl Jsonb {
         let mut len = 0;
 
         if quoted {
-            // Try to find the closing quote and check for simple string
+            // Simple string fast path: the string is simple if the closing
+            // quote appears before any backslash or control byte. This stays
+            // a scalar per-byte loop on purpose: parsed JSON strings are
+            // overwhelmingly short keys/values, and benchmarks showed both a
+            // memchr2 two-pass scan and a chunked vectorized scan losing to
+            // it here (see find_string_special, which serialization does use
+            // for its longer, rarer-escape payloads).
             let mut end_pos = pos;
-            let is_simple = true;
-
+            let mut found = false;
             while end_pos < input.len() {
                 let c = input[end_pos];
                 if c == quote {
-                    // Found end of string - check if it's simple
-                    if is_simple {
-                        let len = end_pos - pos;
-                        let header_pos = self.data.len();
-
-                        // Write header and content
-                        if len <= 11 {
-                            self.data
-                                .push((ElementType::TEXT as u8) | ((len as u8) << 4));
-                        } else {
-                            self.write_element_header(header_pos, ElementType::TEXT, len, false)
-                                .map_err(|_| PError::Message {
-                                    msg: "Failed to write header".to_string(),
-                                    location: Some(pos),
-                                })?;
-                        }
-
-                        self.data.extend_from_slice(&input[pos..end_pos]);
-                        return Ok(end_pos + 1); // Skip past closing quote
-                    }
+                    found = true;
                     break;
                 } else if c == b'\\' || c < 32 {
-                    // Not a simple string
                     break;
                 }
                 end_pos += 1;
+            }
+            if found {
+                let len = end_pos - pos;
+                let header_pos = self.data.len();
+
+                // Write header and content
+                if len <= 11 {
+                    self.data
+                        .push((ElementType::TEXT as u8) | ((len as u8) << 4));
+                } else {
+                    self.write_element_header(header_pos, ElementType::TEXT, len, false)
+                        .map_err(|_| PError::Message {
+                            msg: "Failed to write header".to_string(),
+                            location: Some(pos),
+                        })?;
+                }
+
+                self.data.extend_from_slice(&input[pos..end_pos]);
+                return Ok(end_pos + 1); // Skip past closing quote
             }
         }
 

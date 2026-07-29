@@ -330,7 +330,6 @@ impl Value {
     }
 
     pub fn exec_quote(&self) -> Self {
-        use std::fmt::Write;
         match self {
             Value::Null => Value::build_text("NULL"),
             Value::Numeric(Numeric::Integer(i)) => Value::build_text(i.to_string()),
@@ -341,24 +340,36 @@ impl Value {
                 // SQLite returns X'hexdigits' for blobs
                 let mut quoted = String::with_capacity(3 + b.len() * 2);
                 quoted.push_str("X'");
-                for byte in b.iter() {
-                    write!(&mut quoted, "{byte:02X}").expect("unable to write hex bytes");
-                }
+                quoted.push_str(&hex_string_upper(b));
                 quoted.push('\'');
                 Value::build_text(quoted)
             }
             Value::Text(s) => {
                 let mut quoted = String::with_capacity(s.as_str().len() + 2);
                 quoted.push('\'');
-                for c in s.as_str().chars() {
-                    if c == '\0' {
-                        break;
-                    } else if c == '\'' {
-                        quoted.push('\'');
-                        quoted.push(c);
-                    } else {
+                if s.as_str().len() < SIMD_SEARCH_MIN_HAYSTACK {
+                    // One fused pass: NUL truncation and quote doubling in
+                    // the same loop, so short strings are scanned once.
+                    for c in s.as_str().chars() {
+                        if c == '\0' {
+                            break;
+                        }
+                        if c == '\'' {
+                            quoted.push('\'');
+                        }
                         quoted.push(c);
                     }
+                } else {
+                    let text = sqlite_text_prefix(s.as_str());
+                    // Jump between quotes to double with SIMD byte search
+                    // instead of testing every character.
+                    let mut last_end = 0;
+                    for i in memchr::memchr_iter(b'\'', text.as_bytes()) {
+                        quoted.push_str(&text[last_end..i]);
+                        quoted.push_str("''");
+                        last_end = i + 1;
+                    }
+                    quoted.push_str(&text[last_end..]);
                 }
                 quoted.push('\'');
                 Value::build_text(quoted)
@@ -572,10 +583,7 @@ impl Value {
             if pattern.is_empty() {
                 return Value::from_i64(1);
             }
-            let result = reg
-                .windows(pattern.len())
-                .position(|window| window == *pattern)
-                .map_or(0, |i| i + 1);
+            let result = find_subslice(reg, pattern).map_or(0, |i| i + 1);
             return Value::from_i64(result as i64);
         }
 
@@ -597,7 +605,7 @@ impl Value {
             }
         };
 
-        match reg.find(pattern) {
+        match find_subslice(reg.as_bytes(), pattern.as_bytes()) {
             Some(byte_pos) => {
                 // Convert byte position to character position (1-indexed)
                 let char_pos = reg[..byte_pos].chars().count() + 1;
@@ -621,9 +629,9 @@ impl Value {
         match self {
             Value::Text(_) | Value::Numeric(_) => {
                 let text = self.to_string();
-                Value::build_text(hex::encode_upper(text))
+                Value::build_text(hex_string_upper(text.as_bytes()))
             }
-            Value::Blob(blob_bytes) => Value::build_text(hex::encode_upper(blob_bytes)),
+            Value::Blob(blob_bytes) => Value::build_text(hex_string_upper(blob_bytes)),
             Value::Null => Value::build_text(""),
         }
     }
@@ -636,9 +644,10 @@ impl Value {
                     Some(text) => {
                         let input = &text[0..text.find('\0').unwrap_or(text.len())];
                         let mut bytes = crate::alloc::vec![0; input.len() / 2];
-                        match hex::decode_to_slice(input, &mut bytes) {
-                            Ok(()) => Value::from_blob(bytes),
-                            Err(_) => Value::Null,
+                        if hex_decode(input.as_bytes(), &mut bytes) {
+                            Value::from_blob(bytes)
+                        } else {
+                            Value::Null
                         }
                     }
                     None => Value::Null,
@@ -1028,10 +1037,11 @@ impl Value {
                     return Ok(Value::Text(source.clone()));
                 }
 
-                let result = source
-                    .as_str()
-                    .replace(pattern.as_str(), replacement.as_str());
-                Ok(Value::build_text(result))
+                Ok(Value::build_text(replace_all(
+                    source.as_str(),
+                    pattern.as_str(),
+                    replacement.as_str(),
+                )))
             }
             _ => unreachable!("text cast should never fail"),
         }
@@ -1292,6 +1302,30 @@ impl Value {
             // Fall through to pattern_compare if boundary check fails (multi-byte UTF-8)
         }
 
+        // 4. Fast Path: '%abc%', '%abc%def%', ... (ordered substrings)
+        // Greedy leftmost matching per segment is equivalent to SQLite's
+        // patternCompare here: '%a%b%' matches iff 'a' occurs and 'b' occurs
+        // after it, and taking each earliest occurrence never rules out a
+        // later match. TPC-H q13/q16 run this shape per row.
+        if !has_escape
+            && pattern.len() >= 2
+            && pattern.starts_with('%')
+            && pattern.ends_with('%')
+            && !pattern.contains('_')
+        {
+            let mut haystack = text.as_bytes();
+            for seg in pattern[1..pattern.len() - 1].split('%') {
+                if seg.is_empty() {
+                    continue;
+                }
+                match find_ignore_ascii_case(haystack, seg.as_bytes()) {
+                    Some(i) => haystack = &haystack[i + seg.len()..],
+                    None => return Ok(false),
+                }
+            }
+            return Ok(true);
+        }
+
         Ok(pattern_compare(pattern, text, &LIKE_INFO, escape) == CompareResult::Match)
     }
 
@@ -1329,6 +1363,26 @@ impl Value {
                 return Ok(&text[start..] == suffix);
             }
             // Fall through to pattern_compare if boundary check fails (multi-byte UTF-8)
+        }
+
+        // 4. Fast Path: '*abc*', '*abc*def*', ... (ordered substrings)
+        // Greedy leftmost matching per segment, as in exec_like's fast path.
+        if pattern.len() >= 2
+            && pattern.starts_with('*')
+            && pattern.ends_with('*')
+            && !pattern.contains(['?', '['])
+        {
+            let mut haystack = text.as_bytes();
+            for seg in pattern[1..pattern.len() - 1].split('*') {
+                if seg.is_empty() {
+                    continue;
+                }
+                match find_subslice(haystack, seg.as_bytes()) {
+                    Some(i) => haystack = &haystack[i + seg.len()..],
+                    None => return Ok(false),
+                }
+            }
+            return Ok(true);
         }
 
         Ok(pattern_compare(pattern, text, &GLOB_INFO, None) == CompareResult::Match)
@@ -1508,6 +1562,135 @@ const GLOB_INFO: PatternInfo = PatternInfo {
     match_set: Some('['),
     no_case: false,
 };
+
+/// Below this haystack size the scalar search wins: `memmem::find`'s per-call
+/// searcher construction costs more than scanning the whole haystack.
+const SIMD_SEARCH_MIN_HAYSTACK: usize = 64;
+
+/// Uppercase hex encoding: scalar nibble lookup for small inputs, where
+/// faster-hex's per-call dispatch and buffer setup cost more than the whole
+/// encode, SIMD above the gate.
+fn hex_string_upper(bytes: &[u8]) -> String {
+    if bytes.len() < SIMD_SEARCH_MIN_HAYSTACK {
+        const LUT: &[u8; 16] = b"0123456789ABCDEF";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for &b in bytes {
+            out.push(LUT[(b >> 4) as usize] as char);
+            out.push(LUT[(b & 0x0f) as usize] as char);
+        }
+        out
+    } else {
+        faster_hex::hex_string_upper(bytes)
+    }
+}
+
+/// Hex decoding of pure (separator-free) input into `out`, which the caller
+/// sizes to `input.len() / 2`. Scalar for small inputs, SIMD above the gate.
+/// Returns false on odd-length input or a non-hex digit, matching
+/// `faster_hex::hex_decode`'s error cases.
+fn hex_decode(input: &[u8], out: &mut [u8]) -> bool {
+    if input.len() >= SIMD_SEARCH_MIN_HAYSTACK {
+        return faster_hex::hex_decode(input, out).is_ok();
+    }
+    if input.len() % 2 != 0 {
+        return false;
+    }
+    for (pair, byte) in input.chunks_exact(2).zip(out.iter_mut()) {
+        let (hi, lo) = (
+            (pair[0] as char).to_digit(16),
+            (pair[1] as char).to_digit(16),
+        );
+        let (Some(hi), Some(lo)) = (hi, lo) else {
+            return false;
+        };
+        *byte = ((hi << 4) | lo) as u8;
+    }
+    true
+}
+
+/// replace() body: SIMD `memmem` scan over large sources, std's searcher for
+/// small ones. Outlined for the same code-size reason as [`find_subslice`].
+#[inline(never)]
+fn replace_all(source: &str, pattern: &str, replacement: &str) -> String {
+    if source.len() < SIMD_SEARCH_MIN_HAYSTACK {
+        return source.replace(pattern, replacement);
+    }
+    let mut result = String::with_capacity(source.len());
+    let mut last_end = 0;
+    for i in memchr::memmem::find_iter(source.as_bytes(), pattern.as_bytes()) {
+        result.push_str(&source[last_end..i]);
+        result.push_str(replacement);
+        last_end = i + pattern.len();
+    }
+    result.push_str(&source[last_end..]);
+    result
+}
+
+/// Substring search: SIMD `memmem` for large haystacks, scalar for small.
+///
+/// `#[inline(never)]` keeps the expanded memmem machinery out of the callers,
+/// whose other (non-search) paths otherwise pay for the code bloat.
+#[inline(never)]
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    if haystack.len() < SIMD_SEARCH_MIN_HAYSTACK {
+        // memchr over first-byte candidates; no memmem searcher setup.
+        let last_start = haystack.len() - needle.len();
+        let tail = &needle[1..];
+        let mut start = 0;
+        while let Some(off) = memchr::memchr(needle[0], &haystack[start..last_start + 1]) {
+            let i = start + off;
+            if haystack[i + 1..i + needle.len()] == *tail {
+                return Some(i);
+            }
+            start = i + 1;
+        }
+        return None;
+    }
+    memchr::memmem::find(haystack, needle)
+}
+
+/// ASCII-case-insensitive substring search built on SIMD byte search.
+///
+/// SQLite's LIKE folds only ASCII letters, so candidate positions are located
+/// by scanning for both case variants of the needle's first byte with memchr,
+/// then confirmed with a byte-wise ASCII-case-insensitive comparison.
+/// Byte-level matching is equivalent to char-level here: the needle is valid
+/// UTF-8, so its first byte is never a continuation byte and cannot match in
+/// the middle of a multi-byte character.
+#[inline(never)]
+fn find_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    let last_start = haystack.len() - needle.len();
+    let first = needle[0];
+    let (lower, upper) = (first.to_ascii_lowercase(), first.to_ascii_uppercase());
+    let tail = &needle[1..];
+    let mut start = 0;
+    loop {
+        let candidates = &haystack[start..last_start + 1];
+        let found = if lower == upper {
+            memchr::memchr(first, candidates)
+        } else {
+            memchr::memchr2(lower, upper, candidates)
+        };
+        let offset = found?;
+        let i = start + offset;
+        if haystack[i + 1..i + needle.len()].eq_ignore_ascii_case(tail) {
+            return Some(i);
+        }
+        start = i + 1;
+    }
+}
 
 /// LIKE and GLOB pattern matching based on SQLite's patternCompare algorithm (src/func.c).
 /// Uses recursive descent with early termination via `NoWildcardMatch` to avoid
@@ -2227,6 +2410,10 @@ mod tests {
         );
         let expected = Value::build_text("2.042747795102219097e+05");
         assert_eq!(input.exec_quote(), expected);
+
+        let input = blob(&[0x01, 0xab, 0xff]);
+        let expected = Value::build_text("X'01ABFF'");
+        assert_eq!(input.exec_quote(), expected);
     }
 
     #[test]
@@ -2781,6 +2968,59 @@ mod tests {
         assert!(!Value::exec_like("%a.a", "aaaa", None).unwrap());
         assert!(!Value::exec_like("a.a%", "aaaa", None).unwrap());
         assert!(!Value::exec_like("%a.ab", "aaaa", None).unwrap());
+    }
+
+    #[test]
+    fn test_like_contains_fast_path() {
+        // ASCII case folding, both directions
+        assert!(Value::exec_like("%AbC%", "xxabcyy", None).unwrap());
+        assert!(Value::exec_like("%abc%", "xxABCyy", None).unwrap());
+        // Repeated candidate first bytes before the real match
+        assert!(Value::exec_like("%aab%", "aaaaab", None).unwrap());
+        assert!(!Value::exec_like("%aab%", "aaaaa", None).unwrap());
+        // Needle longer than text
+        assert!(!Value::exec_like("%abcdef%", "abc", None).unwrap());
+        // Empty needle matches everything
+        assert!(Value::exec_like("%%", "anything", None).unwrap());
+        assert!(Value::exec_like("%%", "", None).unwrap());
+        // Multi-byte UTF-8 needles are matched exactly, without case folding
+        assert!(Value::exec_like("%€b%", "a€bc", None).unwrap());
+        assert!(!Value::exec_like("%äb%", "ÄB", None).unwrap());
+        // Needle at the very start and very end
+        assert!(Value::exec_like("%ab%", "abzz", None).unwrap());
+        assert!(Value::exec_like("%ab%", "zzab", None).unwrap());
+        // An escape char inside the needle must bypass the fast path
+        assert!(Value::exec_like("%aXb%", "ab", Some('X')).unwrap());
+        assert!(!Value::exec_like("%aXb%", "aXb", Some('X')).unwrap());
+        // Multi-segment: substrings must appear in order
+        assert!(Value::exec_like("%ab%cd%", "xabycdz", None).unwrap());
+        assert!(!Value::exec_like("%ab%cd%", "xcdyabz", None).unwrap());
+        assert!(Value::exec_like("%express%packages%", "EXPRESS PACKAGES", None).unwrap());
+        assert!(!Value::exec_like("%express%packages%", "packages express", None).unwrap());
+        // Greedy leftmost matching must not rule out later segments
+        assert!(Value::exec_like("%aa%a%", "aaa", None).unwrap());
+        assert!(!Value::exec_like("%aa%a%", "aab", None).unwrap());
+        // Consecutive percents collapse
+        assert!(Value::exec_like("%ab%%cd%", "abcd", None).unwrap());
+        // Underscore anywhere bypasses the fast path
+        assert!(Value::exec_like("%a_b%c%", "xaybzc", None).unwrap());
+    }
+
+    #[test]
+    fn test_glob_contains_fast_path() {
+        assert!(Value::exec_glob("*abc*", "xxabcyy").unwrap());
+        // GLOB is case-sensitive
+        assert!(!Value::exec_glob("*abc*", "xxABCyy").unwrap());
+        assert!(Value::exec_glob("**", "anything").unwrap());
+        assert!(Value::exec_glob("**", "").unwrap());
+        assert!(!Value::exec_glob("*abc*", "ab").unwrap());
+        // Inner wildcard chars must bypass the fast path
+        assert!(Value::exec_glob("*a?c*", "xxabcyy").unwrap());
+        assert!(Value::exec_glob("*a[bd]c*", "xxadcyy").unwrap());
+        // Multi-segment: substrings must appear in order, case-sensitively
+        assert!(Value::exec_glob("*ab*cd*", "xabycdz").unwrap());
+        assert!(!Value::exec_glob("*ab*cd*", "xcdyabz").unwrap());
+        assert!(!Value::exec_glob("*ab*cd*", "xAByCDz").unwrap());
     }
 
     #[test]

@@ -2328,9 +2328,7 @@ pub fn op_array_element(
                     // contain invalid UTF-8 (from_utf8_unchecked in the
                     // record decoder). Validate and demote to blob if needed.
                     if let ValueRef::Text(t) = &vref {
-                        if t.value.as_bytes().iter().any(|&b| b > 0x7F)
-                            && std::str::from_utf8(t.value.as_bytes()).is_err()
-                        {
+                        if simdutf8::basic::from_utf8(t.value.as_bytes()).is_err() {
                             return Value::from_slice(t.value.as_bytes());
                         }
                     }

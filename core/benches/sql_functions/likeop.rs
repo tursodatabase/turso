@@ -433,3 +433,61 @@ fn glob_unicode_pattern(bencher: Bencher) {
         ))
     });
 }
+
+// =============================================================================
+// Contains Fast-Path Benchmarks (SIMD-sensitive sizes)
+// =============================================================================
+
+#[cfg(feature = "nanosecond-bench")]
+#[turso_macros::divan_bench]
+fn like_contains_long_text_match(bencher: Bencher) {
+    let pattern = "%lazy dog%";
+    let text = "the quick brown fox jumps over a sleeping cat. ".repeat(20) + "the lazy dog sleeps";
+    bencher.bench_local(|| {
+        black_box(Value::exec_like(
+            black_box(pattern),
+            black_box(&text),
+            Some('\\'),
+        ))
+        .unwrap()
+    });
+}
+
+#[cfg(feature = "nanosecond-bench")]
+#[turso_macros::divan_bench]
+fn like_contains_long_text_no_match(bencher: Bencher) {
+    let pattern = "%lazy dog%";
+    let text = "the quick brown fox jumps over a sleeping cat. ".repeat(20);
+    bencher.bench_local(|| {
+        black_box(Value::exec_like(
+            black_box(pattern),
+            black_box(&text),
+            Some('\\'),
+        ))
+        .unwrap()
+    });
+}
+
+#[cfg(feature = "nanosecond-bench")]
+#[turso_macros::divan_bench]
+fn glob_contains_long_text(bencher: Bencher) {
+    let pattern = "*lazy dog*";
+    let text = "the quick brown fox jumps over a sleeping cat. ".repeat(20) + "the lazy dog sleeps";
+    bencher.bench_local(|| black_box(Value::exec_glob(black_box(pattern), black_box(&text))));
+}
+
+#[cfg(feature = "nanosecond-bench")]
+#[turso_macros::divan_bench]
+fn like_multi_segment_long_text(bencher: Bencher) {
+    // TPC-H q13 shape: two ordered segments over a comment-length text
+    let pattern = "%express%packages%";
+    let text = "carefully final deposits detect slyly agai express nag quickly packages haggle";
+    bencher.bench_local(|| {
+        black_box(Value::exec_like(
+            black_box(pattern),
+            black_box(text),
+            Some('\\'),
+        ))
+        .unwrap()
+    });
+}
