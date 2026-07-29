@@ -1733,3 +1733,232 @@ expect {
     2|1,3
     3|1,3
 }
+
+test recursive-cte-priority-queue-nulls-first-recursion-produced {
+    WITH r(x) AS (
+        VALUES(2)
+        UNION ALL SELECT NULL FROM r WHERE x = 2
+        UNION ALL SELECT x + 1 FROM r WHERE x < 4
+        ORDER BY 1 NULLS FIRST
+    )
+    SELECT coalesce(x, 'N') FROM r;
+}
+expect {
+    2
+    N
+    3
+    4
+}
+
+test recursive-cte-priority-queue-nulls-last-recursion-produced {
+    WITH r(x) AS (
+        VALUES(2)
+        UNION ALL SELECT NULL FROM r WHERE x = 2
+        UNION ALL SELECT x + 1 FROM r WHERE x < 4
+        ORDER BY 1 NULLS LAST
+    )
+    SELECT coalesce(x, 'N') FROM r;
+}
+expect {
+    2
+    3
+    4
+    N
+}
+
+test recursive-cte-union-nocase-dedup-of-recursion-produced-row {
+    WITH c(v) AS (
+        SELECT 'a'
+        UNION
+        SELECT CASE v WHEN 'a' THEN 'A' WHEN 'A' THEN 'b' END COLLATE NOCASE FROM c
+    )
+    SELECT v FROM c;
+}
+expect {
+    a
+}
+
+test recursive-cte-priority-queue-collation-on-recursion-produced-rows {
+    WITH c(v, n) AS (
+        SELECT 'c', 0
+        UNION ALL
+        SELECT char(unicode(v) - 1) COLLATE NOCASE, n + 1 FROM c WHERE n < 2
+        ORDER BY 1 COLLATE NOCASE DESC
+    )
+    SELECT v FROM c;
+}
+expect {
+    c
+    b
+    a
+}
+
+@skip-if sqlite "SQLite reports 'circular reference' for this shape"
+test recursive-cte-except-between-anchor-and-recursive-rejected {
+    WITH c(x) AS (SELECT 1 EXCEPT SELECT x + 1 FROM c WHERE x < 3)
+    SELECT x FROM c;
+}
+expect error {
+    recursive CTEs must use UNION ALL or UNION between the initial and recursive queries
+}
+
+@skip-if sqlite "SQLite reports 'circular reference' for this shape"
+test recursive-cte-mixed-union-operators-between-recursive-arms-rejected {
+    WITH c(x) AS (
+        SELECT 1
+        UNION SELECT x + 1 FROM c WHERE x < 3
+        UNION ALL SELECT x + 10 FROM c WHERE x < 2
+    )
+    SELECT x FROM c;
+}
+expect error {
+    recursive CTE queries must use the same UNION operator
+}
+
+test recursive-cte-aggregate-in-second-recursive-arm-rejected {
+    WITH c(x) AS (
+        SELECT 1
+        UNION ALL SELECT x FROM c WHERE 0
+        UNION ALL SELECT max(x) FROM c
+    )
+    SELECT x FROM c;
+}
+expect error {
+    recursive aggregate queries not supported
+}
+
+test recursive-cte-window-in-second-recursive-arm-rejected {
+    WITH c(x) AS (
+        SELECT 1
+        UNION ALL SELECT x FROM c WHERE 0
+        UNION ALL SELECT row_number() OVER () FROM c
+    )
+    SELECT x FROM c;
+}
+expect error {
+    cannot use window functions in recursive queries
+}
+
+@skip-if sqlite "SQLite only inspects the rightmost arm and executes this (finding: over-enforcement divergence)"
+test recursive-cte-window-in-non-rightmost-recursive-arm-rejected {
+    WITH c(x) AS (
+        SELECT 1
+        UNION ALL SELECT row_number() OVER () FROM c WHERE 0
+        UNION ALL SELECT x FROM c WHERE 0
+    )
+    SELECT x FROM c;
+}
+expect error {
+    cannot use window functions in recursive queries
+}
+
+test recursive-cte-limit-with-negative-offset {
+    WITH s(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM s WHERE x < 5)
+    SELECT x FROM s LIMIT 3 OFFSET -2;
+}
+expect {
+    1
+    2
+    3
+}
+
+test recursive-cte-blob-through-dedup-index-and-queue {
+    WITH b(v) AS (
+        SELECT x'01'
+        UNION SELECT x'0102' FROM b WHERE length(v) = 1
+        UNION SELECT x'01' FROM b
+    )
+    SELECT hex(v) FROM b;
+}
+expect {
+    01
+    0102
+}
+
+test recursive-cte-megabyte-payload-through-queue {
+    WITH big(n, s) AS (
+        SELECT 1, zeroblob(1000000)
+        UNION ALL
+        SELECT n + 1, s FROM big WHERE n < 3
+    )
+    SELECT n, length(s) FROM big;
+}
+expect {
+    1|1000000
+    2|1000000
+    3|1000000
+}
+
+test recursive-cte-temp-table-in-recursive-arm {
+    CREATE TEMP TABLE temp_edges_for_recursion(a);
+    INSERT INTO temp_edges_for_recursion VALUES(1),(2);
+    WITH r(x) AS (
+        VALUES(0)
+        UNION ALL
+        SELECT temp_edges_for_recursion.a
+          FROM temp_edges_for_recursion JOIN r ON temp_edges_for_recursion.a = r.x + 1
+    )
+    SELECT x FROM r;
+}
+expect {
+    0
+    1
+    2
+}
+
+test recursive-cte-window-function-in-anchor-arm {
+    WITH w(x) AS (
+        SELECT row_number() OVER ()
+        UNION ALL
+        SELECT x + 1 FROM w WHERE x < 3
+    )
+    SELECT x FROM w;
+}
+expect {
+    1
+    2
+    3
+}
+
+# Pins the current EQP shape (no SETUP/RECURSIVE STEP nodes yet); update alongside codegen changes.
+@skip-if sqlite "EXPLAIN QUERY PLAN output is engine-specific"
+test recursive-cte-explain-query-plan-shape {
+    EXPLAIN QUERY PLAN WITH s(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM s WHERE x < 3)
+    SELECT x FROM s;
+}
+expect {
+    1|0|0|SCAN s
+    16|1|0|SCAN s
+}
+
+# Pins the Sudoku-pattern divergence: unqualified recursive-row refs in subqueries should resolve.
+@skip-if sqlite "SQLite resolves unqualified recursive-row references inside subqueries and returns 1,2,3"
+test recursive-cte-correlated-subquery-unqualified-column-pinned-divergence {
+    WITH t(x) AS (
+        SELECT 1
+        UNION ALL
+        SELECT x + 1 FROM t WHERE x < 3 AND EXISTS (SELECT 1 WHERE x > 0)
+    )
+    SELECT x FROM t;
+}
+expect error {
+    no such column: x
+}
+
+# Pins the monotonicity-enforcement bypass: the laundered aggregate must eventually be rejected.
+@skip-if sqlite "SQLite rejects this with 'multiple recursive references'"
+test recursive-cte-nested-with-laundered-aggregate-pinned-divergence {
+    WITH RECURSIVE c(x, m) AS (
+        WITH t AS (SELECT max(x) AS m FROM c)
+        SELECT 1, 0
+        UNION ALL
+        SELECT x + 1, (SELECT m FROM t) FROM c WHERE x < 4
+    )
+    SELECT * FROM c;
+}
+expect {
+    1|0
+    2|1
+    3|1
+    4|1
+}

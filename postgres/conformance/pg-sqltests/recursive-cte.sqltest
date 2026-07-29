@@ -1,0 +1,95 @@
+@database :memory:
+
+test recursive-counter {
+    WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3)
+    SELECT n FROM t ORDER BY n;
+}
+expect {
+    1
+    2
+    3
+}
+
+test recursive-union-dedup-terminates-cycle {
+    WITH RECURSIVE g(n) AS (SELECT 1 UNION SELECT (n + 1) % 4 FROM g)
+    SELECT n FROM g ORDER BY n;
+}
+expect {
+    0
+    1
+    2
+    3
+}
+
+test recursive-graph-traversal {
+    CREATE TABLE edges(src INT, dst INT);
+    INSERT INTO edges VALUES (1, 2), (2, 3);
+    WITH RECURSIVE walk(n) AS (
+        SELECT 1 UNION ALL SELECT e.dst FROM edges e JOIN walk w ON e.src = w.n
+    )
+    SELECT n FROM walk ORDER BY n;
+}
+expect {
+    1
+    2
+    3
+}
+
+test recursive-aggregate-in-recursive-term-rejected {
+    WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT max(n) FROM t)
+    SELECT n FROM t;
+}
+expect error {}
+
+test recursive-self-reference-in-subquery-rejected {
+    WITH RECURSIVE t(n) AS (
+        SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n IN (SELECT n FROM t)
+    )
+    SELECT n FROM t;
+}
+expect error {}
+
+test recursive-intersect-rejected {
+    WITH RECURSIVE t(n) AS (SELECT 1 INTERSECT SELECT n FROM t)
+    SELECT n FROM t;
+}
+expect error {}
+
+test recursive-explicit-column-count-mismatch-rejected {
+    WITH RECURSIVE t(a, b) AS (SELECT 1 UNION ALL SELECT a FROM t)
+    SELECT * FROM t;
+}
+expect error {}
+
+test recursive-cte-in-insert-select {
+    CREATE TABLE sink(v INT);
+    INSERT INTO sink
+    WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3)
+    SELECT n FROM t;
+    SELECT count(*) FROM sink;
+}
+expect {
+    3
+}
+
+test recursive-cte-in-create-table-as {
+    CREATE TABLE built AS
+    WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3)
+    SELECT n FROM t;
+    SELECT count(*) FROM built;
+}
+expect {
+    3
+}
+
+test recursive-cte-behind-view {
+    CREATE VIEW v AS
+    WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3)
+    SELECT n FROM t;
+    SELECT n FROM v ORDER BY n;
+}
+expect {
+    1
+    2
+    3
+}

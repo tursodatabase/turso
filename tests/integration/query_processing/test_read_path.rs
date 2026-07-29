@@ -1058,3 +1058,114 @@ fn test_parameter_column_names(tmp_db: TempDatabase) {
         assert_eq!(names, expected, "Turso column names mismatch for: {sql}");
     }
 }
+
+#[turso_macros::test]
+fn recursive_cte_statement_reset_reexecution(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE s(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM s WHERE x < 5) SELECT x FROM s",
+    )?;
+    let mut first = vec![];
+    stmt.run_with_row_callback(|row| {
+        first.push(row.get::<&Value>(0).unwrap().clone());
+        Ok(())
+    })?;
+    stmt.reset()?;
+    let mut second = vec![];
+    stmt.run_with_row_callback(|row| {
+        second.push(row.get::<&Value>(0).unwrap().clone());
+        Ok(())
+    })?;
+    assert_eq!(first, (1..=5).map(Value::from_i64).collect::<Vec<_>>());
+    assert_eq!(first, second);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn recursive_cte_named_parameter_bound_in_recursive_arm(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE s(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM s WHERE x < :cap) SELECT count(*) FROM s",
+    )?;
+    stmt.bind_at(1.try_into()?, Value::from_i64(7))?;
+    stmt.run_with_row_callback(|row| {
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(7));
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[turso_macros::test]
+fn recursive_cte_parameter_as_body_limit(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE s(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM s LIMIT ?) SELECT count(*) FROM s",
+    )?;
+    stmt.bind_at(1.try_into()?, Value::from_i64(4))?;
+    stmt.run_with_row_callback(|row| {
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(4));
+        Ok(())
+    })?;
+    Ok(())
+}
+
+// Finding: NullRow on the recursive-input pseudo cursor panics; expected rows are SQLite's.
+#[turso_macros::test]
+#[ignore = "recursive input on the nullable side of an outer join panics (set_null_flag on pseudo cursor)"]
+fn recursive_cte_outer_join_null_extends_recursive_input(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    limbo_exec_rows(&conn, "CREATE TABLE e(id INT)");
+    limbo_exec_rows(&conn, "INSERT INTO e VALUES (1), (2), (5)");
+    let rows = limbo_exec_rows(
+        &conn,
+        "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT e.id + 10 FROM e LEFT JOIN s ON s.x = 99) SELECT x FROM s LIMIT 2",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(11)]
+        ]
+    );
+    Ok(())
+}
+
+// Finding: a CTE referenced with an argument list must error like SQLite, not recurse forever.
+#[turso_macros::test]
+#[ignore = "cte(args) is accepted as a table-valued function and loops forever"]
+fn recursive_cte_reference_with_argument_list_must_error(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    limbo_exec_rows(&conn, "CREATE TABLE t1(a)");
+    let result = crate::common::limbo_exec_rows_fallible(
+        &tmp_db,
+        &conn,
+        "WITH RECURSIVE cte1(x,y,z) AS (VALUES(1,2,3) UNION ALL SELECT x,4,5 FROM t1 RIGHT JOIN cte1(x)) SELECT * FROM cte1",
+    );
+    assert!(result.is_err());
+    Ok(())
+}
+
+// Finding: >500 compound arms must produce an error, not a native stack overflow.
+#[turso_macros::test]
+#[ignore = "compound selects with ~530+ arms abort with a native stack overflow"]
+fn compound_select_arm_count_must_error_not_crash(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let arms = (0..600).map(|i| format!("SELECT {i}")).collect::<Vec<_>>().join(" UNION ALL ");
+    let sql = format!("WITH c(x) AS ({arms}) SELECT count(*) FROM c");
+    let result = crate::common::limbo_exec_rows_fallible(&tmp_db, &conn, &sql);
+    assert!(result.is_err());
+    Ok(())
+}
+
+// Finding: ~98-deep nested WITH must produce an error, not a native stack overflow.
+#[turso_macros::test]
+#[ignore = "nested WITH at depth ~98 aborts with a native stack overflow"]
+fn nested_with_depth_must_error_not_crash(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let mut sql = "SELECT 1".to_string();
+    for i in 0..150 {
+        sql = format!("WITH n{i} AS ({sql}) SELECT * FROM n{i}");
+    }
+    let _ = crate::common::limbo_exec_rows_fallible(&tmp_db, &conn, &sql);
+    Ok(())
+}

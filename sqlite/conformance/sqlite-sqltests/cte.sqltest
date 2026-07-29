@@ -1463,3 +1463,32 @@ expect {
     1
     2
 }
+
+# Pins finding 8b (regression): an inner WITH shadowing the CTE's own name must resolve, not error.
+@skip-if sqlite "SQLite resolves the inner shadow and returns 1"
+test cte-inner-with-shadowing-own-name-pinned-divergence {
+    WITH t AS (WITH t AS (SELECT 1) SELECT * FROM t) SELECT * FROM t;
+}
+expect error {
+    circular reference: t
+}
+
+# Pins finding 8a (pre-existing): a nested WITH body cannot see outer-scope CTEs.
+@skip-if sqlite "SQLite resolves outer-scope CTEs from nested WITH bodies and returns 1"
+test cte-nested-with-cannot-see-outer-cte-pinned-divergence {
+    WITH a AS (SELECT 1), b AS (WITH c AS (SELECT * FROM a) SELECT * FROM c) SELECT * FROM b;
+}
+expect error {
+    no such table: a
+}
+
+# Pins finding 8d (regression): scope-blind dependency edges close a false cycle between siblings.
+@skip-if sqlite "SQLite resolves the inner sibling shadow and returns 7"
+test cte-sibling-shadow-false-circular-reference-pinned-divergence {
+    WITH b(x) AS (WITH a(x) AS (SELECT 7) SELECT * FROM a),
+         a(x) AS (SELECT * FROM b)
+    SELECT * FROM a;
+}
+expect error {
+    circular reference: a
+}
