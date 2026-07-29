@@ -3358,7 +3358,7 @@ impl Connection {
                             "reserved name {alias} is already in use"
                         )));
                     }
-                    if self.pager.load().has_page_codec() {
+                    if self.pager.load().has_external_page_codec() {
                         return Err(LimboError::InvalidArgument(
                             "ATTACH is unsupported for connections using an external page codec"
                                 .to_string(),
@@ -4501,13 +4501,7 @@ impl Connection {
 
     pub fn set_reserved_bytes(&self, reserved_bytes: u8) -> Result<()> {
         let pager = self.pager.load();
-        if let Some(required_reserved_bytes) = pager.encryption_reserved_space() {
-            if reserved_bytes != required_reserved_bytes {
-                return Err(LimboError::InvalidArgument(format!(
-                    "built-in encryption requires exactly {required_reserved_bytes} reserved bytes"
-                )));
-            }
-        } else if let Some(codec) = pager.page_codec() {
+        if let Some(codec) = pager.page_codec_external() {
             let required_reserved_bytes = codec.required_reserved_bytes();
             if reserved_bytes != required_reserved_bytes {
                 return Err(LimboError::InvalidArgument(format!(
@@ -4535,13 +4529,12 @@ impl Connection {
 
     fn ensure_can_change_encryption_settings(&self) -> Result<()> {
         let pager = self.pager.load();
-        if pager.has_encryption() {
+        if pager.is_encryption_ctx_set() {
             return Err(LimboError::InvalidArgument(
-                "cannot change encryption settings after built-in encryption is configured"
-                    .to_string(),
+                "cannot reset encryption attributes if already set in the session".to_string(),
             ));
         }
-        if pager.has_page_codec() {
+        if pager.has_external_page_codec() {
             return Err(LimboError::InvalidArgument(
                 "cannot configure built-in encryption while an external page codec is installed"
                     .to_string(),

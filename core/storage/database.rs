@@ -59,11 +59,11 @@ impl IOContext {
         self.encryption_context().is_some()
     }
 
-    pub(crate) fn has_page_codec(&self) -> bool {
+    pub(crate) fn has_external_page_codec(&self) -> bool {
         matches!(self.page_transform, PageTransform::Codec(_)) && !self.has_encryption()
     }
 
-    pub(crate) fn page_codec(&self) -> Option<Arc<dyn PageCodec>> {
+    pub(crate) fn page_codec_external(&self) -> Option<Arc<dyn PageCodec>> {
         match &self.page_transform {
             PageTransform::Codec(codec) if !self.has_encryption() => Some(codec.clone()),
             _ => None,

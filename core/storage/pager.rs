@@ -2778,7 +2778,7 @@ impl Pager {
     /// Set the initial page size for the database. Should only be called before the database is initialized
     pub fn set_initial_page_size(&self, size: PageSize) -> Result<()> {
         turso_assert!(!self.db_initialized());
-        if let Some(codec) = self.page_codec() {
+        if let Some(codec) = self.page_codec_external() {
             let reserved_space = codec.required_reserved_bytes();
             if !size.has_valid_reserved_space(reserved_space) {
                 return Err(LimboError::InvalidArgument(format!(
@@ -5698,12 +5698,12 @@ impl Pager {
         self.io_ctx.read().encryption_context().is_some()
     }
 
-    pub(crate) fn has_page_codec(&self) -> bool {
-        self.io_ctx.read().has_page_codec()
+    pub(crate) fn has_external_page_codec(&self) -> bool {
+        self.io_ctx.read().has_external_page_codec()
     }
 
-    pub(crate) fn page_codec(&self) -> Option<Arc<dyn PageCodec>> {
-        self.io_ctx.read().page_codec()
+    pub(crate) fn page_codec_external(&self) -> Option<Arc<dyn PageCodec>> {
+        self.io_ctx.read().page_codec_external()
     }
 
     pub fn is_encryption_enabled(&self) -> bool {
@@ -5722,7 +5722,7 @@ impl Pager {
                     .into(),
             ));
         }
-        if self.has_page_codec() {
+        if self.has_external_page_codec() {
             return Err(LimboError::InvalidArgument(
                 "cannot configure built-in encryption while an external page codec is installed"
                     .into(),

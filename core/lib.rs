@@ -162,12 +162,12 @@ pub use io::{
 };
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
+use storage::page_transform::PageTransform;
 pub use storage::{
     buffer_pool::BufferPool,
-    database::{
-        DatabaseStorage, IOContext, PageCodec, PageCodecHeaderInfo, PageCodecId, PageCodecLocation,
-    },
+    database::{DatabaseStorage, IOContext},
     encryption::{CipherMode, EncryptionContext, EncryptionKey},
+    page_transform::{PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation},
     pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
@@ -736,7 +736,6 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
 
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
-    requires_page_codec: bool,
     page_codec_id: Option<PageCodecId>,
 }
 
@@ -797,42 +796,27 @@ impl fmt::Debug for Database {
     }
 }
 
-struct DatabaseNewArgs<'a> {
-    opts: DatabaseOpts,
-    flags: OpenFlags,
-    path: &'a str,
-    wal_path: &'a str,
-    io: &'a Arc<dyn IO>,
-    db_file: Arc<dyn DatabaseStorage>,
-    encryption_opts: Option<EncryptionOpts>,
-    mv_store_allocator: alloc::DynAllocator,
-    requires_page_codec: bool,
-    page_codec_id: Option<PageCodecId>,
-    dialect: Arc<dyn Dialect>,
-}
-
 impl Database {
     /// Returns true if this database is backed by MemoryIO.
     pub fn is_in_memory_db(&self) -> bool {
         is_memory_like(&self.path)
     }
 
-    fn new(args: DatabaseNewArgs<'_>) -> Result<Self> {
-        let DatabaseNewArgs {
-            opts,
-            flags,
-            path,
-            wal_path,
-            io,
-            db_file,
-            encryption_opts,
-            mv_store_allocator,
-            requires_page_codec,
-            page_codec_id,
-            dialect,
-        } = args;
-        let path = path.to_string();
-        let wal_path = wal_path.to_string();
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        opts: DatabaseOpts,
+        flags: OpenFlags,
+        path: impl Into<String>,
+        wal_path: impl Into<String>,
+        io: &Arc<dyn IO>,
+        db_file: Arc<dyn DatabaseStorage>,
+        encryption_opts: Option<EncryptionOpts>,
+        mv_store_allocator: alloc::DynAllocator,
+        page_codec_id: Option<PageCodecId>,
+        dialect: Arc<dyn Dialect>,
+    ) -> Result<Self> {
+        let path = path.into();
+        let wal_path = wal_path.into();
         let shared_wal = WalFileShared::new_noop();
         let mv_store = ArcSwapOption::empty();
 
@@ -891,7 +875,6 @@ impl Database {
             encryption_cipher_mode: AtomicCipherMode::new(
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
             ),
-            requires_page_codec,
             page_codec_id,
 
             durable_storage: None,
@@ -1199,31 +1182,6 @@ impl Database {
                 .flags(flags)
                 .db_opts(opts)
                 .encryption(encryption_opts),
-        )
-    }
-
-    /// Open a file-backed database with an external page codec.
-    #[cfg(feature = "fs")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_file_with_flags_and_page_codec(
-        io: Arc<dyn IO>,
-        path: &str,
-        flags: OpenFlags,
-        opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
-        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        page_codec: Arc<dyn PageCodec>,
-        dialect: Arc<dyn Dialect>,
-    ) -> Result<Arc<Database>> {
-        Self::open(
-            io,
-            path,
-            OpenOptions::new(dialect)
-                .flags(flags)
-                .db_opts(opts)
-                .encryption(encryption_opts)
-                .durable_storage(durable_storage)
-                .page_codec(page_codec),
         )
     }
 
@@ -1574,38 +1532,6 @@ impl Database {
         result
     }
 
-    /// Async version of database opening with an external page codec.
-    /// Caller must drive the IO loop and pass state between calls.
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_with_flags_bypass_registry_and_page_codec_async(
-        state: &mut OpenDbAsyncState,
-        io: Arc<dyn IO>,
-        path: &str,
-        wal_path: Option<&str>,
-        db_file: Arc<dyn DatabaseStorage>,
-        flags: OpenFlags,
-        opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
-        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        page_codec: Arc<dyn PageCodec>,
-        dialect: Arc<dyn Dialect>,
-    ) -> Result<IOResult<Arc<Database>>> {
-        Self::do_open_async_guarded(
-            state,
-            io,
-            path,
-            wal_path,
-            db_file,
-            flags,
-            opts,
-            encryption_opts,
-            durable_storage,
-            Some(page_codec),
-            alloc::DynAllocator::default(),
-            dialect,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn do_open_async_internal(
         state: &mut OpenDbAsyncState,
@@ -1637,19 +1563,18 @@ impl Database {
                     } else {
                         &format!("{path}-wal")
                     };
-                    let mut db = Self::new(DatabaseNewArgs {
+                    let mut db = Self::new(
                         opts,
                         flags,
                         path,
                         wal_path,
-                        io: &io,
-                        db_file: db_file.clone(),
-                        encryption_opts: encryption_opts.clone(),
-                        mv_store_allocator: allocator.clone(),
-                        requires_page_codec: page_codec.is_some(),
-                        page_codec_id: page_codec.as_deref().map(PageCodec::codec_id),
-                        dialect: dialect.clone(),
-                    })?;
+                        &io,
+                        db_file.clone(),
+                        encryption_opts.clone(),
+                        allocator.clone(),
+                        page_codec.as_deref().map(PageCodec::codec_id),
+                        dialect.clone(),
+                    )?;
                     db.durable_storage.clone_from(&durable_storage);
 
                     // Header validation + WAL recovery runs as a sub state
@@ -1950,6 +1875,48 @@ impl Database {
                     let mode = match HeaderRef::from_pager(pager) {
                         Ok(IOResult::Done(header_ref)) => {
                             let header = header_ref.borrow();
+                            let validate_codec_header = || -> Result<()> {
+                                if self.initialized() {
+                                    let page_transform =
+                                        pager.io_ctx.read().page_transform().clone();
+                                    if let PageTransform::Codec(codec) = page_transform {
+                                        let bootstrap_page_size =
+                                            pager.get_page_size_unchecked().get() as usize;
+                                        let bootstrap_reserved_space =
+                                            pager.get_reserved_space().ok_or_else(|| {
+                                                LimboError::InternalError(
+                                                    "page codec reserved space was not initialized"
+                                                        .to_string(),
+                                                )
+                                            })?;
+                                        let decoded_page_size = header.page_size.get() as usize;
+                                        if decoded_page_size != bootstrap_page_size {
+                                            return Err(LimboError::InvalidArgument(format!(
+                                            "page codec bootstrap page size {bootstrap_page_size} does not match decoded page-1 size {decoded_page_size}"
+                                        )));
+                                        }
+                                        if header.reserved_space != bootstrap_reserved_space {
+                                            return Err(LimboError::InvalidArgument(format!(
+                                            "page codec bootstrap reserved space {bootstrap_reserved_space} does not match decoded page-1 reserved space {}",
+                                            header.reserved_space
+                                        )));
+                                        }
+                                        let required_reserved_space =
+                                            codec.required_reserved_bytes();
+                                        if header.reserved_space != required_reserved_space {
+                                            return Err(LimboError::InvalidArgument(format!(
+                                            "page codec requires exactly {required_reserved_space} reserved bytes, but decoded page 1 provides {}",
+                                            header.reserved_space
+                                        )));
+                                        }
+                                    }
+                                }
+                                Ok(())
+                            };
+                            if let Err(err) = validate_codec_header() {
+                                pager.end_read_tx();
+                                return Err(err);
+                            }
                             if header.vacuum_mode_largest_root_page.get() > 0 {
                                 if header.incremental_vacuum_enabled.get() > 0 {
                                     AutoVacuumMode::Incremental
@@ -2238,7 +2205,7 @@ impl Database {
                 HeaderValidationState::OpenWal {
                     open_mv_store,
                     driver,
-                    pager,
+                    ..
                 } => {
                     // Always open shared WAL and set it in the Database and Pager.
                     // MVCC currently requires a WAL open to function.
@@ -2264,14 +2231,12 @@ impl Database {
                             let shared_authority = self.open_shared_wal_coordination_for_open()?;
                             if let Some(authority) = shared_authority.as_ref() {
                                 if !authority.frame_index_overflowed() {
-                                    let io_ctx = pager.io_ctx.read();
                                     WalFileShared::open_shared_from_authority_if_exists(
                                         &self.io,
                                         &self.wal_path,
                                         flags,
                                         authority,
                                         &self.db_file,
-                                        Some(&io_ctx),
                                     )?
                                 } else {
                                     WalFileShared::open_shared_if_exists(
@@ -2347,7 +2312,7 @@ impl Database {
     /// Rebuild the process-local shared WAL view after a caller restores the
     /// database and WAL files outside the pager.
     pub fn reload_wal_after_external_restore(self: &Arc<Self>) -> Result<()> {
-        if self.requires_page_codec {
+        if self.page_codec_id.is_some() {
             return Err(LimboError::InvalidArgument(
                 "reloading a WAL after external restore is not supported with an external page codec"
                     .to_string(),
@@ -2370,7 +2335,6 @@ impl Database {
                             flags,
                             authority,
                             &self.db_file,
-                            None,
                         )?
                     } else {
                         WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
@@ -2454,12 +2418,12 @@ impl Database {
         encryption_key: Option<EncryptionKey>,
         page_codec: Option<Arc<dyn PageCodec>>,
     ) -> Result<Arc<Connection>> {
-        if self.requires_page_codec && page_codec.is_none() {
+        if self.page_codec_id.is_some() && page_codec.is_none() {
             return Err(LimboError::InvalidArgument(
                 "database requires an external page codec".to_string(),
             ));
         }
-        if !self.requires_page_codec && page_codec.is_some() {
+        if self.page_codec_id.is_none() && page_codec.is_some() {
             return Err(LimboError::InvalidArgument(
                 "database was opened without an external page codec".to_string(),
             ));
@@ -3062,33 +3026,27 @@ impl Database {
         let (header_reserved_bytes, header_page_size) = if self.initialized() {
             let buf = return_if_io!(self.read_db_header_buf(hdr_st));
             if let Some(codec) = page_codec {
-                if let Some(header_info) = codec.probe_header(buf.as_slice())? {
-                    let page_size_u32 = u32::try_from(header_info.page_size).map_err(|_| {
-                        LimboError::InvalidArgument(format!(
-                            "page codec reported invalid page size {}",
-                            header_info.page_size
-                        ))
-                    })?;
-                    let Some(page_size) = PageSize::new(page_size_u32) else {
-                        return Err(LimboError::InvalidArgument(format!(
-                            "page codec reported invalid page size {}",
-                            header_info.page_size
-                        )));
-                    };
-                    if !page_size.has_valid_reserved_space(header_info.reserved_space) {
-                        return Err(LimboError::InvalidArgument(format!(
-                            "page codec reported invalid reserved space {} for page size {}",
-                            header_info.reserved_space,
-                            page_size.get()
-                        )));
-                    }
-                    (Some(header_info.reserved_space), Some(page_size))
-                } else {
-                    return Err(LimboError::InvalidArgument(
-                        "page codec must implement probe_header to reopen an initialized database"
-                            .to_string(),
-                    ));
+                let header_info = codec.bootstrap_page_info(buf.as_slice())?;
+                let page_size_u32 = u32::try_from(header_info.page_size).map_err(|_| {
+                    LimboError::InvalidArgument(format!(
+                        "page codec reported invalid page size {}",
+                        header_info.page_size
+                    ))
+                })?;
+                let Some(page_size) = PageSize::new(page_size_u32) else {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "page codec reported invalid page size {}",
+                        header_info.page_size
+                    )));
+                };
+                if !page_size.has_valid_reserved_space(header_info.reserved_space) {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "page codec reported invalid reserved space {} for page size {}",
+                        header_info.reserved_space,
+                        page_size.get()
+                    )));
                 }
+                (Some(header_info.reserved_space), Some(page_size))
             } else {
                 let reserved = u8::from_be_bytes(buf.as_slice()[20..21].try_into().unwrap());
                 let ps_raw = u16::from_be_bytes(buf.as_slice()[16..18].try_into().unwrap());

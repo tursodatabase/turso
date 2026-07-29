@@ -292,7 +292,7 @@ pub(crate) fn open_vacuum_temp_db(
     let test_path = path.clone();
 
     let (encryption_opts, encryption_key) = vacuum_temp_db_encryption(source_conn)?;
-    let page_codec = source_conn.pager.load().page_codec();
+    let page_codec = source_conn.pager.load().page_codec_external();
     let db = match &page_codec {
         Some(codec) => Database::open(
             source_db.io.clone(),

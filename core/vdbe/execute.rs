@@ -16990,7 +16990,9 @@ fn op_journal_mode_inner(
                             .to_string(),
                     ));
                 }
-                if matches!(new_mode, journal_mode::JournalMode::Mvcc) && pager.has_page_codec() {
+                if matches!(new_mode, journal_mode::JournalMode::Mvcc)
+                    && pager.has_external_page_codec()
+                {
                     return Err(LimboError::InvalidArgument(
                         "external page codecs are not supported with MVCC databases".to_string(),
                     ));
@@ -17517,7 +17519,7 @@ fn op_vacuum_into_inner(
                 // Always use PlatformIO for the output file, even if source
                 // is in-memory. This ensures VACUUM INTO writes to disk.
                 let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
-                let page_codec = source_pager.page_codec();
+                let page_codec = source_pager.page_codec_external();
                 let output_db = match &page_codec {
                     Some(codec) => crate::Database::open(
                         io,
