@@ -18,6 +18,7 @@ representation.
 - Symbolic values have exactly one definition.
 - Every value must dominate its use; loop-carried and merged values enter blocks
   through explicit block parameters.
+- An owned cursor's open effect must dominate every operation that uses it.
 - Intermediate representations contain no physical VDBE locations.
 - Invalid intermediate representations are rejected before VDBE emission.
 - VDBE lowering is deterministic.
@@ -57,10 +58,14 @@ cursor. It emits a cursor `Rewind` terminator, a row block whose parameter is th
 accumulator, a cursor `Next` backedge, and an exit parameter containing either
 the initial value for an empty cursor or the final accumulated value. Column
 reads remain ordered instructions inside the row block. The IR stores a
-symbolic cursor identifier; lowering receives the corresponding physical VDBE
-cursor and only then emits `Rewind`, `Column`, and `Next` instructions. Cursor
-allocation and opening remain at the legacy boundary until cursor resource
-declarations are added to the IR.
+symbolic cursor identifier. External cursors are declared as input resources and
+receive their physical binding at lowering. IR-owned table cursors instead carry
+their `CursorType` as resource metadata; lowering allocates the physical cursor,
+while an ordered `open_read` effect determines where `OpenRead` executes. The
+verifier treats that effect as the cursor's definition, rejecting a read,
+rewind, or advance unless the open dominates it on every control-flow path.
+Only after those checks does lowering emit `OpenRead`, `Rewind`, `Column`, and
+`Next` instructions.
 
 Supported expression fragments are assembled recursively. Boxing erases the
 concrete Rust type of heterogeneous combinator trees while preserving deferred

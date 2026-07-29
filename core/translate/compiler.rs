@@ -10,8 +10,14 @@ use smallvec::{smallvec, SmallVec};
 
 use crate::{
     numeric::Numeric,
+    schema::BTreeTable,
+    sync::Arc,
     types::Value,
-    vdbe::{builder::ProgramBuilder, insn::Insn},
+    vdbe::{
+        builder::{CursorType, ProgramBuilder},
+        insn::Insn,
+        PageIdx,
+    },
     LimboError, Result,
 };
 
@@ -363,11 +369,11 @@ impl InputId {
     }
 }
 
-/// A symbolic cursor bound to an already-allocated VDBE cursor during lowering.
+/// A cursor supplied by the surrounding compiler at the lowering boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct CursorId(u32);
+pub(crate) struct CursorInputId(u32);
 
-impl CursorId {
+impl CursorInputId {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn new(index: u32) -> Self {
         Self(index)
@@ -376,6 +382,22 @@ impl CursorId {
     fn index(self) -> usize {
         self.0 as usize
     }
+}
+
+/// A symbolic cursor resource used by IR operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CursorId(u32);
+
+impl CursorId {
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+#[derive(Debug)]
+enum CursorResource {
+    External(CursorInputId),
+    Owned(CursorType),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -393,6 +415,15 @@ enum ScalarOp {
     Constant(Value),
     Add { lhs: ValueId, rhs: ValueId },
     Column { cursor: CursorId, column: usize },
+}
+
+#[derive(Debug)]
+enum EffectOp {
+    OpenRead {
+        cursor: CursorId,
+        root_page: PageIdx,
+        db: usize,
+    },
 }
 
 impl ScalarOp {
@@ -413,9 +444,34 @@ impl ScalarOp {
 }
 
 #[derive(Debug)]
-struct Instruction {
-    result: ValueId,
-    op: ScalarOp,
+enum Instruction {
+    Value { result: ValueId, op: ScalarOp },
+    Effect(EffectOp),
+}
+
+impl Instruction {
+    fn operands(&self) -> impl Iterator<Item = ValueId> + '_ {
+        match self {
+            Self::Value { op, .. } => Some(op.operands()),
+            Self::Effect(_) => None,
+        }
+        .into_iter()
+        .flatten()
+    }
+
+    fn cursor_use(&self) -> Option<CursorId> {
+        match self {
+            Self::Value { op, .. } => op.cursor(),
+            Self::Effect(EffectOp::OpenRead { .. }) => None,
+        }
+    }
+
+    fn cursor_definition(&self) -> Option<CursorId> {
+        match self {
+            Self::Effect(EffectOp::OpenRead { cursor, .. }) => Some(*cursor),
+            Self::Value { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -518,7 +574,8 @@ pub(crate) struct IrBuilder {
     current: BlockId,
     next_value: u32,
     input_count: u32,
-    cursor_count: u32,
+    cursor_input_count: u32,
+    cursor_resources: SmallVec<[CursorResource; 2]>,
 }
 
 impl IrBuilder {
@@ -533,16 +590,34 @@ impl IrBuilder {
             current: BlockId(0),
             next_value: 0,
             input_count: 0,
-            cursor_count: 0,
+            cursor_input_count: 0,
+            cursor_resources: SmallVec::new(),
         }
     }
 
-    fn record_cursor(&mut self, cursor: CursorId) -> Result<()> {
-        self.cursor_count = self
-            .cursor_count
-            .max(cursor.0.checked_add(1).ok_or_else(|| {
-                LimboError::InternalError("compiler IR cursor identifier overflow".to_owned())
+    fn allocate_cursor(&mut self, resource: CursorResource) -> Result<CursorId> {
+        let id = u32::try_from(self.cursor_resources.len()).map_err(|_| {
+            LimboError::InternalError("compiler IR cursor identifier overflow".to_owned())
+        })?;
+        self.cursor_resources.push(resource);
+        Ok(CursorId(id))
+    }
+
+    fn external_cursor(&mut self, input: CursorInputId) -> Result<CursorId> {
+        self.cursor_input_count = self
+            .cursor_input_count
+            .max(input.0.checked_add(1).ok_or_else(|| {
+                LimboError::InternalError("compiler IR cursor input identifier overflow".to_owned())
             })?);
+        self.allocate_cursor(CursorResource::External(input))
+    }
+
+    fn ensure_cursor_declared(&self, cursor: CursorId) -> Result<()> {
+        if cursor.index() >= self.cursor_resources.len() {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR references undeclared cursor {cursor:?}"
+            )));
+        }
         Ok(())
     }
 
@@ -561,13 +636,24 @@ impl IrBuilder {
             })?);
         }
         if let Some(cursor) = op.cursor() {
-            self.record_cursor(cursor)?;
+            self.ensure_cursor_declared(cursor)?;
         }
         let result = self.allocate_value()?;
         self.blocks[self.current.index()]
             .instructions
-            .push(Instruction { result, op });
+            .push(Instruction::Value { result, op });
         Ok(result)
+    }
+
+    fn push_effect(&mut self, op: EffectOp) -> Result<()> {
+        let cursor = match &op {
+            EffectOp::OpenRead { cursor, .. } => *cursor,
+        };
+        self.ensure_cursor_declared(cursor)?;
+        self.blocks[self.current.index()]
+            .instructions
+            .push(Instruction::Effect(op));
+        Ok(())
     }
 
     fn create_block(&mut self) -> Result<BlockId> {
@@ -623,7 +709,7 @@ impl IrBuilder {
 
     fn terminate(&mut self, terminator: Terminator) -> Result<()> {
         if let Some(cursor) = terminator.cursor() {
-            self.record_cursor(cursor)?;
+            self.ensure_cursor_declared(cursor)?;
         }
         let block = &mut self.blocks[self.current.index()];
         if block.terminator.replace(terminator).is_some() {
@@ -659,7 +745,8 @@ impl IrBuilder {
             blocks,
             value_count: self.next_value,
             input_count: self.input_count,
-            cursor_count: self.cursor_count,
+            cursor_input_count: self.cursor_input_count,
+            cursor_resources: self.cursor_resources,
         };
         program.verify()?;
         Ok(program)
@@ -678,7 +765,8 @@ pub(crate) struct IrProgram {
     blocks: SmallVec<[BasicBlock; 4]>,
     value_count: u32,
     input_count: u32,
-    cursor_count: u32,
+    cursor_input_count: u32,
+    cursor_resources: SmallVec<[CursorResource; 2]>,
 }
 
 impl IrProgram {
@@ -692,9 +780,26 @@ impl IrProgram {
         let block_count = self.blocks.len();
         let mut definitions = vec![None; self.value_count as usize];
         let mut inputs = vec![false; self.input_count as usize];
-        let mut cursors = vec![false; self.cursor_count as usize];
+        let mut cursor_inputs = vec![false; self.cursor_input_count as usize];
+        let mut cursor_definitions = vec![None; self.cursor_resources.len()];
+        let mut cursor_uses = vec![false; self.cursor_resources.len()];
         let mut predecessors = vec![Vec::new(); block_count];
         let mut return_count = 0;
+
+        for (index, resource) in self.cursor_resources.iter().enumerate() {
+            if let CursorResource::External(input) = resource {
+                let Some(used) = cursor_inputs.get_mut(input.index()) else {
+                    return Err(LimboError::InternalError(format!(
+                        "compiler IR references out-of-range cursor input {input:?}"
+                    )));
+                };
+                *used = true;
+                cursor_definitions[index] = Some(Definition {
+                    block: BlockId(0),
+                    instruction: None,
+                });
+            }
+        }
 
         for (block_index, block) in self.blocks.iter().enumerate() {
             if block.id.index() != block_index {
@@ -714,30 +819,52 @@ impl IrProgram {
                 )?;
             }
             for (instruction_index, instruction) in block.instructions.iter().enumerate() {
-                if let ScalarOp::Input(input) = &instruction.op {
-                    let Some(used) = inputs.get_mut(input.index()) else {
-                        return Err(LimboError::InternalError(format!(
-                            "compiler IR references out-of-range input {input:?}"
-                        )));
-                    };
-                    *used = true;
+                if let Instruction::Value { result, op } = instruction {
+                    if let ScalarOp::Input(input) = op {
+                        let Some(used) = inputs.get_mut(input.index()) else {
+                            return Err(LimboError::InternalError(format!(
+                                "compiler IR references out-of-range input {input:?}"
+                            )));
+                        };
+                        *used = true;
+                    }
+                    Self::record_definition(
+                        &mut definitions,
+                        *result,
+                        Definition {
+                            block: block.id,
+                            instruction: Some(instruction_index),
+                        },
+                    )?;
                 }
-                if let Some(cursor) = instruction.op.cursor() {
-                    let Some(used) = cursors.get_mut(cursor.index()) else {
+                if let Some(cursor) = instruction.cursor_use() {
+                    let Some(used) = cursor_uses.get_mut(cursor.index()) else {
                         return Err(LimboError::InternalError(format!(
                             "compiler IR references out-of-range cursor {cursor:?}"
                         )));
                     };
                     *used = true;
                 }
-                Self::record_definition(
-                    &mut definitions,
-                    instruction.result,
-                    Definition {
-                        block: block.id,
-                        instruction: Some(instruction_index),
-                    },
-                )?;
+                if let Some(cursor) = instruction.cursor_definition() {
+                    let Some(resource) = self.cursor_resources.get(cursor.index()) else {
+                        return Err(LimboError::InternalError(format!(
+                            "compiler IR defines out-of-range cursor {cursor:?}"
+                        )));
+                    };
+                    if !matches!(resource, CursorResource::Owned(_)) {
+                        return Err(LimboError::InternalError(format!(
+                            "compiler IR cannot open external cursor {cursor:?}"
+                        )));
+                    }
+                    Self::record_cursor_definition(
+                        &mut cursor_definitions,
+                        cursor,
+                        Definition {
+                            block: block.id,
+                            instruction: Some(instruction_index),
+                        },
+                    )?;
+                }
             }
             for (successor, arguments) in block.terminator.edges() {
                 let Some(target) = self.blocks.get(successor.index()) else {
@@ -757,7 +884,7 @@ impl IrProgram {
                 predecessors[target.id.index()].push(block.id);
             }
             if let Some(cursor) = block.terminator.cursor() {
-                let Some(used) = cursors.get_mut(cursor.index()) else {
+                let Some(used) = cursor_uses.get_mut(cursor.index()) else {
                     return Err(LimboError::InternalError(format!(
                         "compiler IR references out-of-range cursor {cursor:?}"
                     )));
@@ -779,9 +906,19 @@ impl IrProgram {
                 "compiler IR input @{missing} is not referenced"
             )));
         }
-        if let Some(missing) = cursors.iter().position(|used| !used) {
+        if let Some(missing) = cursor_inputs.iter().position(|used| !used) {
             return Err(LimboError::InternalError(format!(
-                "compiler IR cursor ${missing} is not referenced"
+                "compiler IR cursor input &{missing} is not referenced"
+            )));
+        }
+        if let Some(missing) = cursor_definitions.iter().position(Option::is_none) {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR cursor ${missing} is not opened"
+            )));
+        }
+        if let Some(missing) = cursor_uses.iter().position(|used| !used) {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR cursor ${missing} is not used"
             )));
         }
         if return_count != 1 {
@@ -800,11 +937,20 @@ impl IrProgram {
 
         for block in &self.blocks {
             for (instruction_index, instruction) in block.instructions.iter().enumerate() {
-                for operand in instruction.op.operands() {
+                for operand in instruction.operands() {
                     Self::verify_use(
                         &definitions,
                         &dominators,
                         operand,
+                        block.id,
+                        instruction_index,
+                    )?;
+                }
+                if let Some(cursor) = instruction.cursor_use() {
+                    Self::verify_cursor_use(
+                        &cursor_definitions,
+                        &dominators,
+                        cursor,
                         block.id,
                         instruction_index,
                     )?;
@@ -815,6 +961,15 @@ impl IrProgram {
                     &definitions,
                     &dominators,
                     operand,
+                    block.id,
+                    block.instructions.len(),
+                )?;
+            }
+            if let Some(cursor) = block.terminator.cursor() {
+                Self::verify_cursor_use(
+                    &cursor_definitions,
+                    &dominators,
+                    cursor,
                     block.id,
                     block.instructions.len(),
                 )?;
@@ -836,6 +991,24 @@ impl IrProgram {
         if slot.replace(definition).is_some() {
             return Err(LimboError::InternalError(format!(
                 "compiler IR value {value:?} has multiple definitions"
+            )));
+        }
+        Ok(())
+    }
+
+    fn record_cursor_definition(
+        definitions: &mut [Option<Definition>],
+        cursor: CursorId,
+        definition: Definition,
+    ) -> Result<()> {
+        let Some(slot) = definitions.get_mut(cursor.index()) else {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR defines out-of-range cursor {cursor:?}"
+            )));
+        };
+        if slot.replace(definition).is_some() {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR cursor {cursor:?} has multiple definitions"
             )));
         }
         Ok(())
@@ -903,6 +1076,33 @@ impl IrProgram {
         if !valid {
             return Err(LimboError::InternalError(format!(
                 "compiler IR value {value:?} does not dominate its use in {use_block:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn verify_cursor_use(
+        definitions: &[Option<Definition>],
+        dominators: &[Vec<bool>],
+        cursor: CursorId,
+        use_block: BlockId,
+        use_instruction: usize,
+    ) -> Result<()> {
+        let Some(Some(definition)) = definitions.get(cursor.index()) else {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR uses unopened cursor {cursor:?}"
+            )));
+        };
+        let valid = if definition.block == use_block {
+            definition
+                .instruction
+                .is_none_or(|definition| definition < use_instruction)
+        } else {
+            dominators[use_block.index()][definition.block.index()]
+        };
+        if !valid {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR cursor {cursor:?} is not open on every path to {use_block:?}"
             )));
         }
         Ok(())
@@ -976,10 +1176,10 @@ impl IrProgram {
                 input_registers.len()
             )));
         }
-        if cursor_ids.len() != self.cursor_count as usize {
+        if cursor_ids.len() != self.cursor_input_count as usize {
             return Err(LimboError::InternalError(format!(
                 "compiler IR expects {} cursors, received {}",
-                self.cursor_count,
+                self.cursor_input_count,
                 cursor_ids.len()
             )));
         }
@@ -992,12 +1192,24 @@ impl IrProgram {
                 "compiler IR physical cursor {cursor} is not allocated"
             )));
         }
+        let physical_cursors = self
+            .cursor_resources
+            .iter()
+            .map(|resource| match resource {
+                CursorResource::External(input) => cursor_ids[input.index()],
+                CursorResource::Owned(cursor_type) => program.alloc_cursor_id(cursor_type.clone()),
+            })
+            .collect::<SmallVec<[usize; 2]>>();
         let output = self.output();
         let mut input_values = vec![None; self.value_count as usize];
         for block in &self.blocks {
             for instruction in &block.instructions {
-                if let ScalarOp::Input(input) = &instruction.op {
-                    input_values[instruction.result.index()] = Some(*input);
+                if let Instruction::Value {
+                    result,
+                    op: ScalarOp::Input(input),
+                } = instruction
+                {
+                    input_values[result.index()] = Some(*input);
                 }
             }
         }
@@ -1040,52 +1252,71 @@ impl IrProgram {
                 program.preassign_label_to_next_insn(labels[block.id.index()]);
             }
             for instruction in &block.instructions {
-                let destination = registers[instruction.result.index()];
-                match &instruction.op {
-                    ScalarOp::Input(input) => {
-                        let source = input_registers[input.index()];
-                        if source != destination {
-                            program.emit_insn(Insn::Copy {
-                                src_reg: source,
-                                dst_reg: destination,
-                                extra_amount: 0,
-                            });
+                match instruction {
+                    Instruction::Value { result, op } => {
+                        let destination = registers[result.index()];
+                        match op {
+                            ScalarOp::Input(input) => {
+                                let source = input_registers[input.index()];
+                                if source != destination {
+                                    program.emit_insn(Insn::Copy {
+                                        src_reg: source,
+                                        dst_reg: destination,
+                                        extra_amount: 0,
+                                    });
+                                }
+                            }
+                            ScalarOp::Constant(Value::Null) => program.emit_insn(Insn::Null {
+                                dest: destination,
+                                dest_end: None,
+                            }),
+                            ScalarOp::Constant(Value::Numeric(Numeric::Integer(value))) => {
+                                program.emit_insn(Insn::Integer {
+                                    value: *value,
+                                    dest: destination,
+                                });
+                            }
+                            ScalarOp::Constant(Value::Numeric(Numeric::Float(value))) => {
+                                program.emit_insn(Insn::Real {
+                                    value: (*value).into(),
+                                    dest: destination,
+                                });
+                            }
+                            ScalarOp::Constant(Value::Text(value)) => {
+                                program.emit_insn(Insn::String8 {
+                                    value: value.to_string(),
+                                    dest: destination,
+                                });
+                            }
+                            ScalarOp::Constant(Value::Blob(value)) => {
+                                program.emit_insn(Insn::Blob {
+                                    value: value.clone(),
+                                    dest: destination,
+                                });
+                            }
+                            ScalarOp::Add { lhs, rhs } => program.emit_insn(Insn::Add {
+                                lhs: registers[lhs.index()],
+                                rhs: registers[rhs.index()],
+                                dest: destination,
+                            }),
+                            ScalarOp::Column { cursor, column } => {
+                                program.emit_insn(Insn::Column {
+                                    cursor_id: physical_cursors[cursor.index()],
+                                    column: *column,
+                                    dest: destination,
+                                    default: None,
+                                });
+                            }
                         }
                     }
-                    ScalarOp::Constant(Value::Null) => program.emit_insn(Insn::Null {
-                        dest: destination,
-                        dest_end: None,
-                    }),
-                    ScalarOp::Constant(Value::Numeric(Numeric::Integer(value))) => {
-                        program.emit_insn(Insn::Integer {
-                            value: *value,
-                            dest: destination,
-                        });
-                    }
-                    ScalarOp::Constant(Value::Numeric(Numeric::Float(value))) => {
-                        program.emit_insn(Insn::Real {
-                            value: (*value).into(),
-                            dest: destination,
-                        });
-                    }
-                    ScalarOp::Constant(Value::Text(value)) => program.emit_insn(Insn::String8 {
-                        value: value.to_string(),
-                        dest: destination,
-                    }),
-                    ScalarOp::Constant(Value::Blob(value)) => program.emit_insn(Insn::Blob {
-                        value: value.clone(),
-                        dest: destination,
-                    }),
-                    ScalarOp::Add { lhs, rhs } => program.emit_insn(Insn::Add {
-                        lhs: registers[lhs.index()],
-                        rhs: registers[rhs.index()],
-                        dest: destination,
-                    }),
-                    ScalarOp::Column { cursor, column } => program.emit_insn(Insn::Column {
-                        cursor_id: cursor_ids[cursor.index()],
-                        column: *column,
-                        dest: destination,
-                        default: None,
+                    Instruction::Effect(EffectOp::OpenRead {
+                        cursor,
+                        root_page,
+                        db,
+                    }) => program.emit_insn(Insn::OpenRead {
+                        cursor_id: physical_cursors[cursor.index()],
+                        root_page: *root_page,
+                        db: *db,
                     }),
                 }
             }
@@ -1120,7 +1351,7 @@ impl IrProgram {
                         self.emit_edge_copies(program, &registers, *target, arguments);
                     }
                     program.emit_insn(Insn::Rewind {
-                        cursor_id: cursor_ids[cursor.index()],
+                        cursor_id: physical_cursors[cursor.index()],
                         pc_if_empty: labels[if_empty.index()],
                     });
                     program.emit_insn(Insn::Goto {
@@ -1137,7 +1368,7 @@ impl IrProgram {
                         self.emit_edge_copies(program, &registers, *target, arguments);
                     }
                     program.emit_insn(Insn::Next {
-                        cursor_id: cursor_ids[cursor.index()],
+                        cursor_id: physical_cursors[cursor.index()],
                         pc_if_next: labels[if_next.index()],
                     });
                     program.emit_insn(Insn::Goto {
@@ -1162,6 +1393,24 @@ impl IrProgram {
 
 impl fmt::Display for IrProgram {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, resource) in self.cursor_resources.iter().enumerate() {
+            match resource {
+                CursorResource::External(input) => {
+                    writeln!(f, "cursor ${index} = input &{}", input.0)?;
+                }
+                CursorResource::Owned(CursorType::BTreeTable(table)) => writeln!(
+                    f,
+                    "cursor ${index} = btree_table {:?} root {}",
+                    table.name, table.root_page
+                )?,
+                CursorResource::Owned(cursor_type) => {
+                    writeln!(f, "cursor ${index} = {cursor_type:?}")?;
+                }
+            }
+        }
+        if !self.cursor_resources.is_empty() {
+            writeln!(f)?;
+        }
         for (block_index, block) in self.blocks.iter().enumerate() {
             write!(f, "block{}", block.id.0)?;
             if !block.parameters.is_empty() {
@@ -1176,16 +1425,25 @@ impl fmt::Display for IrProgram {
             }
             writeln!(f, ":")?;
             for instruction in &block.instructions {
-                write!(f, "  %{} = ", instruction.result.0)?;
-                match &instruction.op {
-                    ScalarOp::Input(input) => writeln!(f, "input @{}", input.0)?,
-                    ScalarOp::Constant(value) => writeln!(f, "constant {value:?}")?,
-                    ScalarOp::Add { lhs, rhs } => {
-                        writeln!(f, "add %{}, %{}", lhs.0, rhs.0)?;
+                match instruction {
+                    Instruction::Value { result, op } => {
+                        write!(f, "  %{} = ", result.0)?;
+                        match op {
+                            ScalarOp::Input(input) => writeln!(f, "input @{}", input.0)?,
+                            ScalarOp::Constant(value) => writeln!(f, "constant {value:?}")?,
+                            ScalarOp::Add { lhs, rhs } => {
+                                writeln!(f, "add %{}, %{}", lhs.0, rhs.0)?;
+                            }
+                            ScalarOp::Column { cursor, column } => {
+                                writeln!(f, "column ${}[{column}]", cursor.0)?;
+                            }
+                        }
                     }
-                    ScalarOp::Column { cursor, column } => {
-                        writeln!(f, "column ${}[{column}]", cursor.0)?;
-                    }
+                    Instruction::Effect(EffectOp::OpenRead {
+                        cursor,
+                        root_page,
+                        db,
+                    }) => writeln!(f, "  open_read ${} root {root_page} db {db}", cursor.0)?,
                 }
             }
             write!(f, "  ")?;
@@ -1258,6 +1516,49 @@ impl IrProgram {
 pub(crate) struct Constant(Value);
 
 pub(crate) struct Input(InputId);
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct CursorInput(CursorInputId);
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const fn cursor_input(id: CursorInputId) -> CursorInput {
+    CursorInput(id)
+}
+
+impl Compile for CursorInput {
+    type Output = CursorId;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        builder.external_cursor(self.0)
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct OpenReadTable {
+    table: Arc<BTreeTable>,
+    db: usize,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn open_read_table(table: Arc<BTreeTable>, db: usize) -> OpenReadTable {
+    OpenReadTable { table, db }
+}
+
+impl Compile for OpenReadTable {
+    type Output = CursorId;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let root_page = self.table.root_page;
+        let cursor =
+            builder.allocate_cursor(CursorResource::Owned(CursorType::BTreeTable(self.table)))?;
+        builder.push_effect(EffectOp::OpenRead {
+            cursor,
+            root_page,
+            db: self.db,
+        })?;
+        Ok(cursor)
+    }
+}
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Pure<Output>(Output);
@@ -1492,9 +1793,10 @@ mod tests {
 
     #[test]
     fn cursor_fold_builds_effectful_control_flow_with_ssa_state() {
-        let cursor = CursorId::new(0);
-        let compiler = constant(Value::from_i64(0)).fold_cursor(cursor, |sum| {
-            column(cursor, 2).and_then(move |value| add(sum, value))
+        let compiler = cursor_input(CursorInputId::new(0)).and_then(|cursor| {
+            constant(Value::from_i64(0)).fold_cursor(cursor, move |sum| {
+                column(cursor, 2).and_then(move |value| add(sum, value))
+            })
         });
 
         let ir = compile_scalar(compiler).unwrap();
@@ -1502,6 +1804,8 @@ mod tests {
         assert_eq!(
             ir.to_string(),
             concat!(
+                "cursor $0 = input &0\n",
+                "\n",
                 "block0:\n",
                 "  %0 = constant Numeric(Integer(0))\n",
                 "  rewind $0, block1(%0), block2(%0)\n",
@@ -1519,9 +1823,10 @@ mod tests {
 
     #[test]
     fn cursor_fold_binds_the_physical_cursor_only_during_lowering() {
-        let cursor = CursorId::new(0);
-        let compiler = constant(Value::from_i64(0)).fold_cursor(cursor, |sum| {
-            column(cursor, 2).and_then(move |value| add(sum, value))
+        let compiler = cursor_input(CursorInputId::new(0)).and_then(|cursor| {
+            constant(Value::from_i64(0)).fold_cursor(cursor, move |sum| {
+                column(cursor, 2).and_then(move |value| add(sum, value))
+            })
         });
         let ir = compile_scalar(compiler).unwrap();
         let mut program =
@@ -1562,12 +1867,52 @@ mod tests {
     }
 
     #[test]
+    fn owned_cursor_is_allocated_and_opened_only_during_lowering() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE owned(a)", 2).unwrap());
+        let compiler = open_read_table(table, 0).and_then(|cursor| {
+            constant(Value::from_i64(0)).fold_cursor(cursor, move |state| {
+                column(cursor, 0).and_then(move |value| add(state, value))
+            })
+        });
+        let ir = compile_scalar(compiler).unwrap();
+
+        assert!(ir.to_string().starts_with(concat!(
+            "cursor $0 = btree_table \"owned\" root 2\n",
+            "\n",
+            "block0:\n",
+            "  open_read $0 root 2 db 0\n",
+            "  %0 = constant Numeric(Integer(0))\n",
+        )));
+
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 3, 0));
+        ir.lower_into(&mut program, 7).unwrap();
+        program.resolve_labels().unwrap();
+
+        assert_eq!(program.cursor_ref.len(), 1);
+        assert!(matches!(
+            &program.cursor_ref[0].1,
+            CursorType::BTreeTable(_)
+        ));
+        let open = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::OpenRead { cursor_id: 0, .. }))
+            .unwrap();
+        let rewind = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::Rewind { cursor_id: 0, .. }))
+            .unwrap();
+        assert!(open < rewind);
+    }
+
+    #[test]
     fn cursor_fold_rejects_missing_cursor_bindings() {
-        let cursor = CursorId::new(0);
-        let ir = compile_scalar(
+        let ir = compile_scalar(cursor_input(CursorInputId::new(0)).and_then(|cursor| {
             constant(Value::from_i64(0))
-                .fold_cursor(cursor, |state| column(cursor, 0).map(move |_| state)),
-        )
+                .fold_cursor(cursor, move |state| column(cursor, 0).map(move |_| state))
+        }))
         .unwrap();
         let mut program =
             ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 1, 0));
@@ -1579,11 +1924,10 @@ mod tests {
 
     #[test]
     fn cursor_fold_rejects_an_unallocated_physical_cursor() {
-        let cursor = CursorId::new(0);
-        let ir = compile_scalar(
+        let ir = compile_scalar(cursor_input(CursorInputId::new(0)).and_then(|cursor| {
             constant(Value::from_i64(0))
-                .fold_cursor(cursor, |state| column(cursor, 0).map(move |_| state)),
-        )
+                .fold_cursor(cursor, move |state| column(cursor, 0).map(move |_| state))
+        }))
         .unwrap();
         let mut program =
             ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 1, 0));
@@ -1686,7 +2030,7 @@ mod tests {
                 BasicBlock {
                     id: BlockId(0),
                     parameters: SmallVec::new(),
-                    instructions: smallvec![Instruction {
+                    instructions: smallvec![Instruction::Value {
                         result: ValueId(0),
                         op: ScalarOp::Constant(Value::from_i64(1)),
                     }],
@@ -1699,7 +2043,7 @@ mod tests {
                 BasicBlock {
                     id: BlockId(1),
                     parameters: SmallVec::new(),
-                    instructions: smallvec![Instruction {
+                    instructions: smallvec![Instruction::Value {
                         result: ValueId(1),
                         op: ScalarOp::Constant(Value::from_i64(2)),
                     }],
@@ -1726,7 +2070,8 @@ mod tests {
             ],
             value_count: 2,
             input_count: 0,
-            cursor_count: 0,
+            cursor_input_count: 0,
+            cursor_resources: SmallVec::new(),
         };
 
         let error = ir.verify().unwrap_err();
@@ -1757,12 +2102,13 @@ mod tests {
     fn verifier_rejects_wrong_cursor_edge_argument_count() {
         let mut builder = IrBuilder::new();
         let initial = builder.push(ScalarOp::Constant(Value::Null)).unwrap();
+        let cursor = builder.external_cursor(CursorInputId::new(0)).unwrap();
         let row = builder.create_block().unwrap();
         let exit = builder.create_block().unwrap();
         builder.add_block_parameter(row).unwrap();
         builder
             .terminate(Terminator::CursorRewind {
-                cursor: CursorId::new(0),
+                cursor,
                 if_non_empty: row,
                 if_empty: exit,
                 arguments: smallvec![initial],
@@ -1792,7 +2138,7 @@ mod tests {
                 BasicBlock {
                     id: BlockId(0),
                     parameters: SmallVec::new(),
-                    instructions: smallvec![Instruction {
+                    instructions: smallvec![Instruction::Value {
                         result: ValueId(0),
                         op: ScalarOp::Constant(Value::from_i64(1)),
                     }],
@@ -1814,7 +2160,7 @@ mod tests {
                 BasicBlock {
                     id: BlockId(2),
                     parameters: SmallVec::new(),
-                    instructions: smallvec![Instruction {
+                    instructions: smallvec![Instruction::Value {
                         result: ValueId(2),
                         op: ScalarOp::Constant(Value::from_i64(0)),
                     }],
@@ -1832,7 +2178,8 @@ mod tests {
             ],
             value_count: 3,
             input_count: 0,
-            cursor_count: 0,
+            cursor_input_count: 0,
+            cursor_resources: SmallVec::new(),
         };
 
         let error = ir.verify().unwrap_err();
@@ -1866,6 +2213,59 @@ mod tests {
                 ),
             ]
         ));
+    }
+
+    #[test]
+    fn verifier_rejects_a_cursor_opened_on_only_one_path() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE t(a)", 2).unwrap());
+        let mut builder = IrBuilder::new();
+        let cursor = builder
+            .allocate_cursor(CursorResource::Owned(CursorType::BTreeTable(table)))
+            .unwrap();
+        let condition = builder
+            .push(ScalarOp::Constant(Value::from_i64(1)))
+            .unwrap();
+        let opened = builder.create_block().unwrap();
+        let unopened = builder.create_block().unwrap();
+        let merge = builder.create_block().unwrap();
+        builder
+            .terminate(Terminator::Branch {
+                condition,
+                if_true: opened,
+                if_false: unopened,
+            })
+            .unwrap();
+        builder.switch_to(opened).unwrap();
+        builder
+            .push_effect(EffectOp::OpenRead {
+                cursor,
+                root_page: 2,
+                db: 0,
+            })
+            .unwrap();
+        builder
+            .terminate(Terminator::Jump {
+                target: merge,
+                arguments: SmallVec::new(),
+            })
+            .unwrap();
+        builder.switch_to(unopened).unwrap();
+        builder
+            .terminate(Terminator::Jump {
+                target: merge,
+                arguments: SmallVec::new(),
+            })
+            .unwrap();
+        builder.switch_to(merge).unwrap();
+        let value = builder
+            .push(ScalarOp::Column { cursor, column: 0 })
+            .unwrap();
+
+        let error = builder.finish(value).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cursor CursorId(0) is not open on every path to BlockId(3)"));
     }
 
     #[test]
