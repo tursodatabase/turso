@@ -41,11 +41,17 @@ representation.
    programs across incrementally, retaining the existing emitter as a fallback
    until each path has equivalent coverage.
 
-The current IR supports straight-line scalar operations plus conditional
-diamonds with block parameters. This establishes the combinator contract,
-SSA joins, and the separation between symbolic values and VDBE resources
-without prematurely choosing the representation of effectful database
-resources or loops.
+The current IR supports straight-line scalar operations, conditional diamonds,
+and explicit loops with block parameters. This establishes the combinator
+contract, SSA joins and loop-carried values, and the separation between
+symbolic values and VDBE resources without prematurely choosing the
+representation of effectful database resources.
+
+`loop_while` builds a preheader, header, body, and exit. Its initial value and
+each backedge value flow into the same header parameter, so the loop state has
+one SSA definition even though it changes at runtime. The Rust closures used to
+describe the condition and body run once while building IR; repetition exists
+only in the resulting control-flow graph and lowered VDBE program.
 
 Supported expression fragments are assembled recursively. Boxing erases the
 concrete Rust type of heterogeneous combinator trees while preserving deferred

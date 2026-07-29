@@ -83,6 +83,28 @@ pub(crate) trait Compile: Sized {
             if_false,
         }
     }
+
+    /// Repeat `body` while `condition` is truthy, carrying one SSA value.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn loop_while<ConditionFn, Condition, BodyFn, Body>(
+        self,
+        condition: ConditionFn,
+        body: BodyFn,
+    ) -> LoopWhile<Self, ConditionFn, Condition, BodyFn, Body>
+    where
+        Self: Compile<Output = ValueId>,
+        ConditionFn: FnOnce(ValueId) -> Condition,
+        Condition: Compile<Output = ValueId>,
+        BodyFn: FnOnce(ValueId) -> Body,
+        Body: Compile<Output = ValueId>,
+    {
+        LoopWhile {
+            initial: self,
+            condition,
+            body,
+            compilers: PhantomData,
+        }
+    }
 }
 
 type BoxedCompilerFn<Output> = Box<dyn FnOnce(&mut IrBuilder) -> Result<Output>>;
@@ -199,6 +221,57 @@ where
 
         builder.switch_to(merge_block)?;
         Ok(output)
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct LoopWhile<Initial, ConditionFn, Condition, BodyFn, Body> {
+    initial: Initial,
+    condition: ConditionFn,
+    body: BodyFn,
+    compilers: PhantomData<fn() -> (Condition, Body)>,
+}
+
+impl<Initial, ConditionFn, Condition, BodyFn, Body> Compile
+    for LoopWhile<Initial, ConditionFn, Condition, BodyFn, Body>
+where
+    Initial: Compile<Output = ValueId>,
+    ConditionFn: FnOnce(ValueId) -> Condition,
+    Condition: Compile<Output = ValueId>,
+    BodyFn: FnOnce(ValueId) -> Body,
+    Body: Compile<Output = ValueId>,
+{
+    type Output = ValueId;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let initial = self.initial.compile(builder)?;
+        let header = builder.create_block()?;
+        let body = builder.create_block()?;
+        let exit = builder.create_block()?;
+        let carried = builder.add_block_parameter(header)?;
+
+        builder.terminate(Terminator::Jump {
+            target: header,
+            arguments: smallvec![initial],
+        })?;
+
+        builder.switch_to(header)?;
+        let condition = (self.condition)(carried).compile(builder)?;
+        builder.terminate(Terminator::Branch {
+            condition,
+            if_true: body,
+            if_false: exit,
+        })?;
+
+        builder.switch_to(body)?;
+        let next = (self.body)(carried).compile(builder)?;
+        builder.terminate(Terminator::Jump {
+            target: header,
+            arguments: smallvec![next],
+        })?;
+
+        builder.switch_to(exit)?;
+        Ok(carried)
     }
 }
 
@@ -912,6 +985,22 @@ pub(crate) struct Constant(Value);
 
 pub(crate) struct Input(InputId);
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Pure<Output>(Output);
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const fn pure<Output>(output: Output) -> Pure<Output> {
+    Pure(output)
+}
+
+impl<Output> Compile for Pure<Output> {
+    type Output = Output;
+
+    fn compile(self, _builder: &mut IrBuilder) -> Result<Self::Output> {
+        Ok(self.0)
+    }
+}
+
 pub(crate) const fn input(id: InputId) -> Input {
     Input(id)
 }
@@ -969,7 +1058,7 @@ where
 mod tests {
     use super::*;
     use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
-    use crate::{io::MemoryIO, sync::Arc, Database, SqliteDialect};
+    use crate::{io::MemoryIO, sync::Arc, Database, SqliteDialect, Statement};
 
     #[test]
     fn combinators_build_symbolic_ssa_before_lowering() {
@@ -1017,6 +1106,92 @@ mod tests {
                 "  return %1\n",
             )
         );
+    }
+
+    #[test]
+    fn loop_carries_a_value_through_a_header_parameter() {
+        let compiler = constant(Value::from_i64(3)).loop_while(pure, |state| {
+            constant(Value::from_i64(-1)).and_then(move |step| add(state, step))
+        });
+
+        let ir = compile_scalar(compiler).unwrap();
+
+        assert_eq!(
+            ir.to_string(),
+            concat!(
+                "block0:\n",
+                "  %0 = constant Numeric(Integer(3))\n",
+                "  jump block1(%0)\n",
+                "\n",
+                "block1(%1):\n",
+                "  branch %1, block2, block3\n",
+                "\n",
+                "block2:\n",
+                "  %2 = constant Numeric(Integer(-1))\n",
+                "  %3 = add %1, %2\n",
+                "  jump block1(%3)\n",
+                "\n",
+                "block3:\n",
+                "  return %1\n",
+            )
+        );
+    }
+
+    #[test]
+    fn loop_lowering_emits_a_resolved_backedge() {
+        let compiler = constant(Value::from_i64(3)).loop_while(pure, |state| {
+            constant(Value::from_i64(-1)).and_then(move |step| add(state, step))
+        });
+        let ir = compile_scalar(compiler).unwrap();
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 3, 0));
+
+        ir.lower_into(&mut program, 7).unwrap();
+        program.resolve_labels().unwrap();
+
+        assert!(program.insns.iter().enumerate().any(|(pc, (insn, _))| {
+            matches!(
+                insn,
+                Insn::Goto { target_pc } if target_pc.as_offset_int() < u32::try_from(pc).unwrap()
+            )
+        }));
+        assert!(program.insns.iter().all(|(insn, _)| match insn {
+            Insn::Goto { target_pc } | Insn::IfNot { target_pc, .. } => target_pc.is_offset(),
+            _ => true,
+        }));
+    }
+
+    #[test]
+    fn lowered_loop_runs_until_its_carried_value_is_false() {
+        let compiler = constant(Value::from_i64(3)).loop_while(pure, |state| {
+            constant(Value::from_i64(-1)).and_then(move |step| add(state, step))
+        });
+        let ir = compile_scalar(compiler).unwrap();
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        let mut builder =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 12, 4));
+        let result = builder.alloc_register();
+        ir.lower_into(&mut builder, result).unwrap();
+        builder.emit_insn(Insn::ResultRow {
+            start_reg: result,
+            count: 1,
+        });
+        builder.emit_insn(Insn::Halt {
+            err_code: 0,
+            description: String::new(),
+            on_error: None,
+            description_reg: None,
+        });
+        let program = builder
+            .build(connection.clone(), false, "loop compiler test")
+            .unwrap();
+        let mut statement = Statement::new(program, connection.get_pager(), QueryMode::Normal, 0);
+
+        let rows = statement.run_collect_rows().unwrap();
+
+        assert_eq!(rows, vec![vec![Value::from_i64(0)]]);
     }
 
     #[test]
@@ -1172,6 +1347,60 @@ mod tests {
         assert!(error
             .to_string()
             .contains("supplies 0 arguments for 1 parameters"));
+    }
+
+    #[test]
+    fn verifier_rejects_a_loop_condition_defined_only_in_the_body() {
+        let ir = IrProgram {
+            blocks: smallvec![
+                BasicBlock {
+                    id: BlockId(0),
+                    parameters: SmallVec::new(),
+                    instructions: smallvec![Instruction {
+                        result: ValueId(0),
+                        op: ScalarOp::Constant(Value::from_i64(1)),
+                    }],
+                    terminator: Terminator::Jump {
+                        target: BlockId(1),
+                        arguments: smallvec![ValueId(0)],
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    parameters: smallvec![ValueId(1)],
+                    instructions: SmallVec::new(),
+                    terminator: Terminator::Branch {
+                        condition: ValueId(2),
+                        if_true: BlockId(2),
+                        if_false: BlockId(3),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    parameters: SmallVec::new(),
+                    instructions: smallvec![Instruction {
+                        result: ValueId(2),
+                        op: ScalarOp::Constant(Value::from_i64(0)),
+                    }],
+                    terminator: Terminator::Jump {
+                        target: BlockId(1),
+                        arguments: smallvec![ValueId(2)],
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    parameters: SmallVec::new(),
+                    instructions: SmallVec::new(),
+                    terminator: Terminator::Return(ValueId(1)),
+                },
+            ],
+            value_count: 3,
+            input_count: 0,
+        };
+
+        let error = ir.verify().unwrap_err();
+
+        assert!(error.to_string().contains("does not dominate"));
     }
 
     #[test]
