@@ -3085,6 +3085,19 @@ impl Window {
         })
     }
 
+    /// Build an unnamed window from partition/order expressions inherited from
+    /// a named base window.
+    pub fn from_unnamed_bound(bound: NamedWindowBound, frame: Frame) -> Self {
+        Window {
+            name: None,
+            partition_by: bound.partition_by,
+            deduplicated_partition_by_len: None,
+            order_by: bound.order_by,
+            frame,
+            functions: vec![],
+        }
+    }
+
     /// Build a `Window` from a previously-bound named definition plus a
     /// resolved frame.
     pub fn from_named_bound(name: String, bound: NamedWindowBound, frame: Frame) -> Self {
@@ -3135,6 +3148,28 @@ impl Window {
             })
     }
 
+    pub fn is_equivalent_to_bound(&self, bound: &NamedWindowBound, frame: &Frame) -> bool {
+        if &self.frame != frame || self.partition_by.len() != bound.partition_by.len() {
+            return false;
+        }
+        if !self
+            .partition_by
+            .iter()
+            .zip(&bound.partition_by)
+            .all(|(a, b)| exprs_are_equivalent(a, b))
+        {
+            return false;
+        }
+        if self.order_by.len() != bound.order_by.len() {
+            return false;
+        }
+        self.order_by.iter().zip(&bound.order_by).all(
+            |((expr_a, order_a, nulls_a), (expr_b, order_b, nulls_b))| {
+                exprs_are_equivalent(expr_a, expr_b) && order_a == order_b && nulls_a == nulls_b
+            },
+        )
+    }
+
     pub(crate) fn is_default_frame_spec(frame: &Option<FrameClause>) -> bool {
         if let Some(frame_clause) = frame {
             let FrameClause {
@@ -3162,10 +3197,10 @@ impl Window {
     }
 }
 
-/// A named WINDOW clause definition, captured before any function
-/// references it. The frame is intentionally absent: it belongs to the
-/// resolved `Window` instance the planner spawns when a function
-/// attaches (the function's coerced frame decides).
+/// A named WINDOW clause definition, captured before any function references
+/// it. The effective frame belongs to the resolved `Window` instance the
+/// planner spawns when a function attaches. Whether the user wrote a frame is
+/// retained because SQLite forbids chaining from a framed base window.
 ///
 /// `bound` holds the already-bound `partition_by` / `order_by`. The
 /// first `resolve_window` that needs them *takes* them by moving;
@@ -3177,6 +3212,7 @@ impl Window {
 pub struct NamedWindowDef {
     pub name: String,
     pub bound: Option<NamedWindowBound>,
+    pub has_frame_clause: bool,
 }
 
 #[derive(Debug, Clone)]
