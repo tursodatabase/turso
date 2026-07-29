@@ -355,6 +355,16 @@ impl ValueId {
     }
 }
 
+/// An ordered set of SSA values that must occupy consecutive VDBE registers.
+#[derive(Debug)]
+struct ValuePack(SmallVec<[ValueId; 4]>);
+
+impl ValuePack {
+    fn values(&self) -> &[ValueId] {
+        &self.0
+    }
+}
+
 /// A symbolic value supplied when an IR region is lowered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct InputId(u32);
@@ -424,6 +434,9 @@ enum EffectOp {
         root_page: PageIdx,
         db: usize,
     },
+    ResultRow {
+        pack: ValuePack,
+    },
 }
 
 impl ScalarOp {
@@ -451,25 +464,25 @@ enum Instruction {
 
 impl Instruction {
     fn operands(&self) -> impl Iterator<Item = ValueId> + '_ {
-        match self {
-            Self::Value { op, .. } => Some(op.operands()),
-            Self::Effect(_) => None,
-        }
-        .into_iter()
-        .flatten()
+        let (scalar, values) = match self {
+            Self::Value { op, .. } => (Some(op.operands()), &[][..]),
+            Self::Effect(EffectOp::OpenRead { .. }) => (None, &[][..]),
+            Self::Effect(EffectOp::ResultRow { pack }) => (None, pack.values()),
+        };
+        scalar.into_iter().flatten().chain(values.iter().copied())
     }
 
     fn cursor_use(&self) -> Option<CursorId> {
         match self {
             Self::Value { op, .. } => op.cursor(),
-            Self::Effect(EffectOp::OpenRead { .. }) => None,
+            Self::Effect(EffectOp::OpenRead { .. } | EffectOp::ResultRow { .. }) => None,
         }
     }
 
     fn cursor_definition(&self) -> Option<CursorId> {
         match self {
             Self::Effect(EffectOp::OpenRead { cursor, .. }) => Some(*cursor),
-            Self::Value { .. } => None,
+            Self::Value { .. } | Self::Effect(EffectOp::ResultRow { .. }) => None,
         }
     }
 }
@@ -647,9 +660,12 @@ impl IrBuilder {
 
     fn push_effect(&mut self, op: EffectOp) -> Result<()> {
         let cursor = match &op {
-            EffectOp::OpenRead { cursor, .. } => *cursor,
+            EffectOp::OpenRead { cursor, .. } => Some(*cursor),
+            EffectOp::ResultRow { .. } => None,
         };
-        self.ensure_cursor_declared(cursor)?;
+        if let Some(cursor) = cursor {
+            self.ensure_cursor_declared(cursor)?;
+        }
         self.blocks[self.current.index()]
             .instructions
             .push(Instruction::Effect(op));
@@ -819,6 +835,14 @@ impl IrProgram {
                 )?;
             }
             for (instruction_index, instruction) in block.instructions.iter().enumerate() {
+                if matches!(
+                    instruction,
+                    Instruction::Effect(EffectOp::ResultRow { pack }) if pack.values().is_empty()
+                ) {
+                    return Err(LimboError::InternalError(
+                        "compiler IR result row must contain at least one value".to_owned(),
+                    ));
+                }
                 if let Instruction::Value { result, op } = instruction {
                     if let ScalarOp::Input(input) = op {
                         let Some(used) = inputs.get_mut(input.index()) else {
@@ -1318,6 +1342,24 @@ impl IrProgram {
                         root_page: *root_page,
                         db: *db,
                     }),
+                    Instruction::Effect(EffectOp::ResultRow { pack }) => {
+                        let start = program.alloc_registers(pack.values().len());
+                        for (index, value) in pack.values().iter().enumerate() {
+                            let source = registers[value.index()];
+                            let destination = start + index;
+                            if source != destination {
+                                program.emit_insn(Insn::Copy {
+                                    src_reg: source,
+                                    dst_reg: destination,
+                                    extra_amount: 0,
+                                });
+                            }
+                        }
+                        program.emit_insn(Insn::ResultRow {
+                            start_reg: start,
+                            count: pack.values().len(),
+                        });
+                    }
                 }
             }
             match &block.terminator {
@@ -1444,6 +1486,11 @@ impl fmt::Display for IrProgram {
                         root_page,
                         db,
                     }) => writeln!(f, "  open_read ${} root {root_page} db {db}", cursor.0)?,
+                    Instruction::Effect(EffectOp::ResultRow { pack }) => {
+                        write!(f, "  result_row [")?;
+                        Self::fmt_arguments(f, pack.values())?;
+                        writeln!(f, "]")?;
+                    }
                 }
             }
             write!(f, "  ")?;
@@ -1612,6 +1659,31 @@ pub(crate) struct Column {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ResultRow {
+    pack: ValuePack,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn result_row<const N: usize>(values: [ValueId; N]) -> ResultRow {
+    ResultRow {
+        pack: ValuePack(values.into_iter().collect()),
+    }
+}
+
+impl Compile for ResultRow {
+    type Output = ();
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        if self.pack.values().is_empty() {
+            return Err(LimboError::InternalError(
+                "compiler IR result row must contain at least one value".to_owned(),
+            ));
+        }
+        builder.push_effect(EffectOp::ResultRow { pack: self.pack })
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const fn column(cursor: CursorId, column: usize) -> Column {
     Column { cursor, column }
 }
@@ -1675,6 +1747,67 @@ mod tests {
                 "  return %2\n",
             )
         );
+    }
+
+    #[test]
+    fn result_rows_keep_values_symbolic_until_pack_lowering() {
+        let compiler = constant(Value::from_i64(1))
+            .then(constant(Value::from_i64(2)))
+            .and_then(|(first, second)| result_row([first, second]).map(move |()| second));
+
+        let ir = compile_scalar(compiler).unwrap();
+
+        assert_eq!(
+            ir.to_string(),
+            concat!(
+                "block0:\n",
+                "  %0 = constant Numeric(Integer(1))\n",
+                "  %1 = constant Numeric(Integer(2))\n",
+                "  result_row [%0, %1]\n",
+                "  return %1\n",
+            )
+        );
+    }
+
+    #[test]
+    fn lowered_result_row_uses_a_contiguous_register_pack() {
+        let compiler = constant(Value::from_i64(1))
+            .then(constant(Value::from_i64(2)))
+            .and_then(|(first, second)| result_row([first, second]).map(move |()| second));
+        let ir = compile_scalar(compiler).unwrap();
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        let mut builder =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 8, 2));
+        let result = builder.alloc_register();
+        ir.lower_into(&mut builder, result).unwrap();
+        builder.emit_insn(Insn::Halt {
+            err_code: 0,
+            description: String::new(),
+            on_error: None,
+            description_reg: None,
+        });
+        let program = builder
+            .build(connection.clone(), false, "result row compiler test")
+            .unwrap();
+        let mut statement = Statement::new(program, connection.get_pager(), QueryMode::Normal, 0);
+
+        let rows = statement.run_collect_rows().unwrap();
+
+        assert_eq!(rows, vec![vec![Value::from_i64(1), Value::from_i64(2)]]);
+    }
+
+    #[test]
+    fn result_rows_reject_empty_value_packs() {
+        let compiler =
+            constant(Value::from_i64(1)).and_then(|value| result_row([]).map(move |()| value));
+
+        let error = compile_scalar(compiler).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("result row must contain at least one value"));
     }
 
     #[test]
@@ -2075,6 +2208,64 @@ mod tests {
         };
 
         let error = ir.verify().unwrap_err();
+        assert!(error.to_string().contains("does not dominate"));
+    }
+
+    #[test]
+    fn verifier_checks_values_inside_result_row_packs() {
+        let ir = IrProgram {
+            blocks: smallvec![
+                BasicBlock {
+                    id: BlockId(0),
+                    parameters: SmallVec::new(),
+                    instructions: smallvec![Instruction::Value {
+                        result: ValueId(0),
+                        op: ScalarOp::Constant(Value::from_i64(1)),
+                    }],
+                    terminator: Terminator::Branch {
+                        condition: ValueId(0),
+                        if_true: BlockId(1),
+                        if_false: BlockId(2),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    parameters: SmallVec::new(),
+                    instructions: smallvec![Instruction::Value {
+                        result: ValueId(1),
+                        op: ScalarOp::Constant(Value::from_i64(2)),
+                    }],
+                    terminator: Terminator::Jump {
+                        target: BlockId(3),
+                        arguments: SmallVec::new(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    parameters: SmallVec::new(),
+                    instructions: SmallVec::new(),
+                    terminator: Terminator::Jump {
+                        target: BlockId(3),
+                        arguments: SmallVec::new(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    parameters: SmallVec::new(),
+                    instructions: smallvec![Instruction::Effect(EffectOp::ResultRow {
+                        pack: ValuePack(smallvec![ValueId(1)]),
+                    })],
+                    terminator: Terminator::Return(ValueId(0)),
+                },
+            ],
+            value_count: 2,
+            input_count: 0,
+            cursor_input_count: 0,
+            cursor_resources: SmallVec::new(),
+        };
+
+        let error = ir.verify().unwrap_err();
+
         assert!(error.to_string().contains("does not dominate"));
     }
 

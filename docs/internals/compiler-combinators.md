@@ -67,6 +67,13 @@ rewind, or advance unless the open dominates it on every control-flow path.
 Only after those checks does lowering emit `OpenRead`, `Rewind`, `Column`, and
 `Next` instructions.
 
+Row production is an effect over a symbolic `ValuePack`, not an eagerly chosen
+register range. Each pack member remains an ordinary SSA value and must dominate
+the `result_row` effect. During lowering, the backend allocates one consecutive
+register range, copies the member values into that range in order, and emits the
+VDBE `ResultRow`. This lets producer combinators return values independently of
+the contiguous layout required by row consumers.
+
 Supported expression fragments are assembled recursively. Boxing erases the
 concrete Rust type of heterogeneous combinator trees while preserving deferred
 execution; unsupported fragments return to the established expression emitter.
