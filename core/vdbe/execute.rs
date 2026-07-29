@@ -3339,6 +3339,12 @@ pub fn halt(
     } else {
         // Even if deferred violations are present, the statement subtransaction completes successfully when
         // it is part of an interactive transaction.
+        //
+        // Drain index-method state before releasing the statement savepoint.
+        // Otherwise the cursor's Drop fallback performs these writes after
+        // statement success, where an I/O error can no longer be returned to
+        // the caller or rolled back at statement scope.
+        index_method_pre_commit_all(state, pager)?;
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
         // Apply deferred CDC state after successful statement completion
         if let Some(cdc_info) = state.pending_cdc_info.take() {

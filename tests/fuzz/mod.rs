@@ -1,6 +1,8 @@
 pub mod cte;
 pub mod custom_types;
 pub mod expression_index;
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+pub mod fts;
 pub mod grammar_generator;
 pub mod helpers;
 pub mod join;

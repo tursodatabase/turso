@@ -15,7 +15,7 @@ use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::TableMask;
 use crate::{
     function::{AggFunc, Deterministic},
-    index_method::IndexMethodCostEstimate,
+    index_method::{IndexMethodCostContext, IndexMethodCostEstimate},
     numeric::Numeric,
     schema::{
         BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type,
@@ -503,17 +503,22 @@ fn collect_index_method_candidates(
                     &pattern_match.parameters,
                 );
 
+                // Sort and collect arguments before costing so the index
+                // method can inspect captured literals such as LIMIT.
+                let arguments = sorted_arguments_from_parameters(&pattern_match.parameters);
+
                 // Get cost estimate from the index method
                 let cost_estimate = module.init().ok().and_then(|cursor| {
                     let base_rows = base_table_rows
                         .get(table_idx)
                         .map(|r| **r)
                         .unwrap_or(params.rows_per_table_fallback);
-                    cursor.estimate_cost(pattern_match.pattern_idx, base_rows)
+                    cursor.estimate_cost(&IndexMethodCostContext {
+                        pattern_idx: pattern_match.pattern_idx,
+                        base_table_rows: base_rows,
+                        arguments: &arguments,
+                    })
                 });
-
-                // Sort and collect arguments
-                let arguments = sorted_arguments_from_parameters(&pattern_match.parameters);
 
                 candidates.push(IndexMethodCandidate {
                     table_idx,
