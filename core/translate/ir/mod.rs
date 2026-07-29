@@ -29,7 +29,9 @@
 //!   produce identical instruction sequences.
 
 mod arena;
+mod build;
 mod lower;
 
 pub(crate) use arena::{BinOp, ExprArena, Node, SlotId, UnaryOp, ValId};
+pub(crate) use build::try_build_value;
 pub(crate) use lower::Lowerer;

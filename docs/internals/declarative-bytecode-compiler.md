@@ -195,12 +195,18 @@ lift — goes last.
       `ProgramBuilder` with node→register memoization, `lower_into` for
       caller-specified destination registers, unit tests.
       (Landed in this phase's first commit.)
-- [ ] 1b. Wire a first real caller: translate value-position **literals
-      and arithmetic/bitwise/concat binary ops** in
-      `translate_expr` through the IR (build subtree → lower at current
-      position). Constant hoisting for these goes through the existing
-      constant-span mechanism at the integration boundary until Layer 2
-      owns hoisting. All suites green.
+- [x] 1b. First real caller: `translate_expr`'s `Expr::Binary` value arm
+      tries `ir::try_build_value` (literal-only trees over
+      arithmetic/bitwise/concat ops, incl. parenthesization and unary
+      folds mirroring the eager path) and lowers via `Lowerer::lower_into`
+      before falling back to `binary_expr_shared`. Constant hoisting rides
+      the existing constant-span mechanism at the integration boundary
+      until Layer 2 owns hoisting; collation post-state mirrors the eager
+      path. Standalone `Expr::Literal` deliberately stays on the
+      `emit_literal` fast path — a per-literal arena buys nothing until
+      arenas are shared across a statement. Validated: core unit tests,
+      conformance corpus, EXPLAIN shows IR-lowered constants hoisting
+      correctly out of scan loops.
 - [ ] 1c. Add `Column` reads and function calls as nodes; port the
       remaining pure value-position cases of `translate_expr`. Region
       discipline enforced at call sites.
