@@ -62,7 +62,10 @@ use crate::io::{Buffer, Completion, FileSyncType, ReadComplete};
 use crate::numeric::Numeric;
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
-use crate::storage::database::{DatabaseStorage, PageCodecLocation, PageTransform};
+use crate::storage::database::DatabaseStorage;
+use crate::storage::page_transform::{
+    page_codec_completion_error, PageCodecContext, PageLocation, PageTransform,
+};
 use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
 use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -101,7 +104,7 @@ impl PageSize {
     pub const MIN: u32 = 512;
     pub const MAX: u32 = 65536;
     pub const DEFAULT: u16 = 4096;
-    pub const MIN_USABLE_SPACE: u32 = 480;
+    pub(crate) const MIN_USABLE_SPACE: u32 = 480;
 
     /// Interpret a user-provided u32 as either a valid page size or None.
     pub const fn new(size: u32) -> Option<Self> {
@@ -144,7 +147,7 @@ impl PageSize {
         }
     }
 
-    pub const fn has_valid_reserved_space(self, reserved_space: u8) -> bool {
+    pub(crate) const fn has_valid_reserved_space(self, reserved_space: u8) -> bool {
         self.get().saturating_sub(reserved_space as u32) >= Self::MIN_USABLE_SPACE
     }
 
@@ -1975,49 +1978,11 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
     let buf = Arc::new(buf);
 
     match io_ctx.page_transform() {
-        PageTransform::Encryption(ctx) => {
-            let encryption_ctx = ctx.clone();
-            let original_complete = complete;
-
-            let decrypt_complete =
-                Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
-                    let Ok((encrypted_buf, bytes_read)) = res else {
-                        return original_complete(res);
-                    };
-                    turso_assert_greater_than!(
-                        bytes_read,
-                        0,
-                        "expected to read data for encrypted page",
-                        { "page_idx": page_idx }
-                    );
-                    if bytes_read as usize != encrypted_buf.len() {
-                        return original_complete(Ok((encrypted_buf, bytes_read)));
-                    }
-                    match encryption_ctx.decrypt_page(encrypted_buf.as_slice(), page_idx) {
-                        Ok(decrypted_data) => {
-                            encrypted_buf
-                                .as_mut_slice()
-                                .copy_from_slice(&decrypted_data);
-                            original_complete(Ok((encrypted_buf, bytes_read)))
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to decrypt WAL frame data for page_idx={page_idx}: {e}"
-                            );
-                            let err = CompletionError::DecryptionError { page_idx };
-                            original_complete(Err(err));
-                            Some(err)
-                        }
-                    }
-                });
-
-            let new_completion = Completion::new_read(buf, decrypt_complete);
-            io.pread(offset, new_completion)
-        }
-        PageTransform::PageCodec(ctx) => {
+        PageTransform::Codec(ctx) => {
             let page_codec = ctx.clone();
             let original_complete = complete;
             let decoded_buf = Arc::new(buffer_pool.get_page());
+            let codec_context = PageCodecContext::from_page_idx(page_idx, PageLocation::Wal)?;
 
             let decode_complete =
                 Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
@@ -2034,17 +1999,16 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
                         return original_complete(Ok((encoded_buf, bytes_read)));
                     }
                     match page_codec.decode_page(
+                        codec_context,
                         encoded_buf.as_slice(),
                         decoded_buf.as_mut_slice(),
-                        page_idx,
-                        PageCodecLocation::Wal,
                     ) {
                         Ok(()) => original_complete(Ok((decoded_buf.clone(), bytes_read))),
                         Err(e) => {
                             tracing::error!(
                                 "Failed to decode WAL frame data for page_idx={page_idx}: {e}"
                             );
-                            let err = CompletionError::PageCodecError { page_idx };
+                            let err = page_codec_completion_error(page_codec.as_ref(), page_idx);
                             original_complete(Err(err));
                             Some(err)
                         }
@@ -2132,7 +2096,7 @@ pub fn prepare_wal_frame(
 ///
 /// The caller must write every byte after [`WAL_FRAME_HEADER_SIZE`] before computing
 /// the frame checksum or submitting the frame to storage.
-pub fn prepare_wal_frame_header(
+pub(crate) fn prepare_wal_frame_header(
     buffer_pool: &Arc<BufferPool>,
     wal_header: &WalHeader,
     page_number: u32,
@@ -2148,7 +2112,7 @@ pub fn prepare_wal_frame_header(
 }
 
 /// Recompute a frame checksum after transforming its page body in place.
-pub fn recompute_wal_frame_checksum(
+pub(crate) fn recompute_wal_frame_checksum(
     frame: &mut [u8],
     wal_header: &WalHeader,
     prev_checksums: (u32, u32),
