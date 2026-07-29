@@ -17519,15 +17519,13 @@ fn op_vacuum_into_inner(
                 let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
                 let page_codec = source_pager.page_codec();
                 let output_db = match &page_codec {
-                    Some(codec) => crate::Database::open_file_with_flags_and_page_codec(
+                    Some(codec) => crate::Database::open(
                         io,
                         dest_path,
-                        OpenFlags::Create,
-                        output_opts,
-                        None,
-                        None,
-                        codec.clone(),
-                        source_db.dialect(),
+                        crate::OpenOptions::new(source_db.dialect())
+                            .flags(OpenFlags::Create)
+                            .db_opts(output_opts)
+                            .page_codec(codec.clone()),
                     )?,
                     None => crate::Database::open_file_with_flags(
                         io,

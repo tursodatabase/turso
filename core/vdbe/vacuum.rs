@@ -294,15 +294,14 @@ pub(crate) fn open_vacuum_temp_db(
     let (encryption_opts, encryption_key) = vacuum_temp_db_encryption(source_conn)?;
     let page_codec = source_conn.pager.load().page_codec();
     let db = match &page_codec {
-        Some(codec) => Database::open_file_with_flags_and_page_codec(
+        Some(codec) => Database::open(
             source_db.io.clone(),
             &path,
-            OpenFlags::Create,
-            vacuum_target_opts_from_source(source_db),
-            encryption_opts,
-            None,
-            codec.clone(),
-            source_db.dialect(),
+            crate::OpenOptions::new(source_db.dialect())
+                .flags(OpenFlags::Create)
+                .db_opts(vacuum_target_opts_from_source(source_db))
+                .encryption(encryption_opts)
+                .page_codec(codec.clone()),
         )?,
         None => Database::open_file_with_flags(
             source_db.io.clone(),
