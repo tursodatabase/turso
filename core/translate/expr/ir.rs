@@ -37,6 +37,22 @@ fn expr_ir_enabled() -> bool {
     EXPR_IR_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Cheap pre-check inlined into the hot [translate_expr] path: only composite
+/// roots engage the IR, so leaf-heavy workloads (e.g. parameter-only VALUES
+/// lists) pay a single discriminant test and nothing else.
+#[inline]
+pub(super) fn expr_ir_applicable(expr: &ast::Expr) -> bool {
+    matches!(
+        expr,
+        ast::Expr::Binary(..)
+            | ast::Expr::Case { .. }
+            | ast::Expr::IsNull(_)
+            | ast::Expr::NotNull(_)
+            | ast::Expr::Unary(..)
+            | ast::Expr::Parenthesized(_)
+    ) && expr_ir_enabled()
+}
+
 /// Index of a node in [ExprIr::nodes].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct VId(u32);
@@ -90,30 +106,16 @@ pub(super) struct ExprIr<'a> {
 }
 
 impl<'a> ExprIr<'a> {
-    /// Decompose `expr` into the value IR. Returns `None` when the root shape is
-    /// not supported or is a leaf (the caller then uses the eager path, which is
-    /// equivalent and avoids the arena allocation); unsupported *sub*expressions
-    /// become [VExpr::Opaque] leaves lowered via the eager path.
+    /// Decompose `expr` into the value IR. The caller must have checked
+    /// [expr_ir_applicable] first. Returns `None` when the root decomposes to
+    /// an unsupported shape (the caller then uses the eager path, which is
+    /// equivalent); unsupported *sub*expressions become [VExpr::Opaque] leaves
+    /// lowered via the eager path.
     pub(super) fn build(
         expr: &'a ast::Expr,
         referenced_tables: Option<&TableReferences>,
         resolver: &Resolver,
     ) -> Result<Option<ExprIr<'a>>> {
-        if !expr_ir_enabled() {
-            return Ok(None);
-        }
-        // Only engage for composite roots; leaves gain nothing from the arena.
-        if !matches!(
-            expr,
-            ast::Expr::Binary(..)
-                | ast::Expr::Case { .. }
-                | ast::Expr::IsNull(_)
-                | ast::Expr::NotNull(_)
-                | ast::Expr::Unary(..)
-                | ast::Expr::Parenthesized(_)
-        ) {
-            return Ok(None);
-        }
         let mut ir = ExprIr {
             nodes: Vec::with_capacity(8),
             root: VId(0),

@@ -92,6 +92,7 @@ pub fn resolve_expr(
 /// Open a constant span for `expr` if it is constant and no span is already open.
 /// Mirrors the entry behavior of [translate_expr]; used by both the eager path and
 /// the expression IR lowering so hoisting behavior is identical between them.
+#[inline]
 pub(super) fn open_expr_constant_span(
     program: &mut ProgramBuilder,
     expr: &ast::Expr,
@@ -111,6 +112,7 @@ pub(super) fn open_expr_constant_span(
 
 /// If `expr` is cached in the resolver's expression-register cache, emit a Copy
 /// (plus custom-type decode when needed), set the collation context, and return true.
+#[inline]
 pub(super) fn try_emit_cached_expr_reg(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
@@ -171,6 +173,7 @@ pub(super) fn try_emit_cached_expr_reg(
 }
 
 /// Try to satisfy `expr` from an expression index; returns true if the value was emitted.
+#[inline]
 pub(super) fn try_emit_expression_index_lookup(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
@@ -215,12 +218,14 @@ pub fn translate_expr(
 
     // Declarative path: decompose the expression into the value IR and lower it.
     // Falls through to the eager match below when the root shape is not supported.
-    if let Some(expr_ir) = ir::ExprIr::build(expr, referenced_tables, resolver)? {
-        expr_ir.lower_root(program, referenced_tables, resolver, target_register)?;
-        if let Some(span) = constant_span {
-            program.constant_span_end(span);
+    if ir::expr_ir_applicable(expr) {
+        if let Some(expr_ir) = ir::ExprIr::build(expr, referenced_tables, resolver)? {
+            expr_ir.lower_root(program, referenced_tables, resolver, target_register)?;
+            if let Some(span) = constant_span {
+                program.constant_span_end(span);
+            }
+            return Ok(target_register);
         }
-        return Ok(target_register);
     }
 
     match expr {
