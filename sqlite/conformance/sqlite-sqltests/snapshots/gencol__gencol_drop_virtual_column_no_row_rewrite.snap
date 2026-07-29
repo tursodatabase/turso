@@ -23,7 +23,7 @@ addr  opcode         p1  p2  p3  p4                  p5  comment
    6    Ne            5   6  13  Binary               0  if r[5]!=r[6] goto 13
    7    RowId         0   7   0                       0  r[7]=sqlite_schema.rowid
    8    IsNull        7  14   0                       0  if (r[7]==NULL) goto 14
-   9    ColumnRange   0   0   8  4                    0  r[8..11]=sqlite_schema.type..rootpage
+   9    ColumnRange   0   0   8  4                    0  r[8..11]=sqlite_schema.columns[0..3]
   10    Affinity      8   5   0                       0  r[8..13] = B, B, B, D, B
   11    MakeRecord    8   5  13                       0  r[13]=mkrec(r[8..12])
   12    Insert        0  13   7  sqlite_schema        8  intkey=r[7] data=r[13]
