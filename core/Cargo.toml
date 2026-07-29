@@ -17,7 +17,7 @@ name = "turso_core"
 path = "lib.rs"
 
 [features]
-default = ["fs", "uuid", "time", "json", "series", "encryption", "percentile"]
+default = ["fs", "uuid", "time", "json", "series", "encryption", "percentile", "simd"]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
 # Harness-side observability: turns on aristo's instrument surface so the
@@ -51,6 +51,7 @@ codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]
 stacker = ["dep:stacker"]
 percentile = []
+simd = ["dep:simsimd"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = [
@@ -138,7 +139,7 @@ num-traits = "0.2"
 stacker = { version = "0.1", optional = true }
 
 [target.'cfg(not(any(target_family = "wasm", all(target_os = "windows", target_arch = "aarch64"))))'.dependencies]
-simsimd = "6.5.3"
+simsimd = { version = "6.5.3", optional = true }
 
 [target.'cfg(antithesis)'.dependencies]
 antithesis_sdk = { workspace = true, features = ["full"] }
