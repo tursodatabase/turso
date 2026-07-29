@@ -3625,11 +3625,10 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = crate::session::open_database_with_io(
+        let db = turso_core::Database::open(
             io,
             db_path.to_str().unwrap(),
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new(),
+            turso_core::OpenOptions::new(crate::postgres_dialect()),
         )
         .unwrap();
         let conn = crate::Connection::new(db.connect().unwrap());
@@ -3673,11 +3672,10 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = crate::session::open_database_with_io(
+        let db = turso_core::Database::open(
             io,
             db_path.to_str().unwrap(),
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new(),
+            turso_core::OpenOptions::new(crate::postgres_dialect()),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -3733,11 +3731,10 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = crate::session::open_database_with_io(
+        let db = turso_core::Database::open(
             io,
             db_path.to_str().unwrap(),
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new(),
+            turso_core::OpenOptions::new(crate::postgres_dialect()),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -3798,11 +3795,10 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = crate::session::open_database_with_io(
+        let db = turso_core::Database::open(
             io,
             db_path.to_str().unwrap(),
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new(),
+            turso_core::OpenOptions::new(crate::postgres_dialect()),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -3878,11 +3874,10 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = crate::session::open_database_with_io(
+        let db = turso_core::Database::open(
             io,
             db_path.to_str().unwrap(),
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new(),
+            turso_core::OpenOptions::new(crate::postgres_dialect()),
         )
         .unwrap();
 
@@ -3938,11 +3933,10 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = crate::session::open_database_with_io(
+        let db = turso_core::Database::open(
             io,
             db_path.to_str().unwrap(),
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new(),
+            turso_core::OpenOptions::new(crate::postgres_dialect()),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -4009,11 +4003,10 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = crate::session::open_database_with_io(
+        let db = turso_core::Database::open(
             io,
             db_path.to_str().unwrap(),
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new(),
+            turso_core::OpenOptions::new(crate::postgres_dialect()),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -4057,11 +4050,10 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = crate::session::open_database_with_io(
+        let db = turso_core::Database::open(
             io,
             db_path.to_str().unwrap(),
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new(),
+            turso_core::OpenOptions::new(crate::postgres_dialect()),
         )
         .unwrap();
         let conn = db.connect().unwrap();

@@ -3,7 +3,7 @@ use std::str;
 use std::sync::Arc;
 
 use crate::aliases;
-use crate::catalog::{self, PostgresDialect};
+use crate::catalog;
 use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast;
 use turso_pg_parser::translator::{
@@ -17,42 +17,6 @@ use crate::copy::parse_copy_text_format;
 #[derive(Clone)]
 pub struct PgConnection {
     conn: Arc<Connection>,
-}
-
-/// Open a database with the PostgreSQL schema dialect, resolving the IO
-/// backend from `vfs` or the path like [`turso_core::Database::open_new`].
-pub fn open_database(
-    path: &str,
-    vfs: Option<&str>,
-    flags: turso_core::OpenFlags,
-    opts: turso_core::DatabaseOpts,
-) -> Result<(Arc<dyn turso_core::IO>, Arc<turso_core::Database>)> {
-    let io = match vfs {
-        Some(vfs) => turso_core::Database::io_for_vfs(vfs)?,
-        None => turso_core::Database::io_for_path(path)?,
-    };
-    let db = open_database_with_io(io.clone(), path, flags, opts)?;
-    Ok((io, db))
-}
-
-/// Open a database with the PostgreSQL schema dialect on an existing IO
-/// backend.
-pub fn open_database_with_io(
-    io: Arc<dyn turso_core::IO>,
-    path: &str,
-    flags: turso_core::OpenFlags,
-    opts: turso_core::DatabaseOpts,
-) -> Result<Arc<turso_core::Database>> {
-    let file = io.open_file(path, flags, true)?;
-    let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
-    turso_core::Database::open(
-        io,
-        path,
-        turso_core::OpenOptions::new(Arc::new(PostgresDialect))
-            .storage(db_file)
-            .flags(flags)
-            .db_opts(opts),
-    )
 }
 
 impl PgConnection {

@@ -166,11 +166,10 @@ impl TempDatabaseBuilder {
         let io = Arc::new(TestIo {
             io: Arc::new(turso_core::PlatformIO::new().unwrap()),
         });
-        let db = turso_pg::open_database_with_io(
+        let db = Database::open(
             io.clone(),
             db_path.to_str().unwrap(),
-            turso_core::OpenFlags::default(),
-            opts,
+            turso_core::OpenOptions::new(turso_pg::postgres_dialect()).db_opts(opts),
         )
         .unwrap();
 

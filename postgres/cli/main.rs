@@ -114,8 +114,17 @@ fn open_database(
         OpenFlags::default()
     };
 
-    let (io, db) =
-        turso_pg::open_database(db_path, vfs.map(|v| v.as_str()), flags, db_opts.turso_cli())?;
+    let io = match vfs {
+        Some(vfs) => turso_core::Database::io_for_vfs(vfs)?,
+        None => turso_core::Database::io_for_path(db_path)?,
+    };
+    let db = turso_core::Database::open(
+        io.clone(),
+        db_path,
+        turso_core::OpenOptions::new(turso_pg::postgres_dialect())
+            .flags(flags)
+            .db_opts(db_opts.turso_cli()),
+    )?;
     let conn = Connection::new(db.connect()?);
     Ok((io, conn))
 }

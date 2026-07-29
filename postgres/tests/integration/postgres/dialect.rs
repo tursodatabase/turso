@@ -3516,3 +3516,61 @@ fn test_postgres_catalog_conkey_any_matches_no_rows(db: TempDatabase) {
     let rows = stmt.run_collect_rows().unwrap();
     assert_eq!(rows, vec![vec![Value::from_i64(0)]]);
 }
+
+/// `turso_pg::postgres_dialect()` lets callers assemble their own
+/// [`turso_core::OpenOptions`] (custom storage, database options) while
+/// still opening with the PostgreSQL dialect.
+#[test]
+fn test_open_options_with_postgres_dialect() {
+    use std::sync::Arc;
+
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+    let path = "open-options-postgres.db";
+    let file = io
+        .open_file(path, turso_core::OpenFlags::Create, true)
+        .unwrap();
+    let storage = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
+    let db = turso_core::Database::open(
+        io,
+        path,
+        turso_core::OpenOptions::new(turso_pg::postgres_dialect())
+            .storage(storage)
+            .db_opts(turso_core::DatabaseOpts::new()),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+
+    // PostgreSQL-only cast syntax parses through the dialect.
+    let rows = conn
+        .prepare("SELECT 1::int4")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
+
+    // The dialect registered the pg_catalog virtual tables.
+    let rows = conn
+        .prepare("SELECT typname FROM pg_type WHERE typname = 'int4'")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+
+    // DDL stores the frontend-marked schema text.
+    conn.execute("CREATE TABLE t (id integer PRIMARY KEY, name text)")
+        .unwrap();
+    let rows = conn
+        .prepare("SELECT sql FROM sqlite_schema WHERE name = 't'")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    let Value::Text(sql) = &rows[0][0] else {
+        panic!("expected text schema sql");
+    };
+    assert!(
+        sql.as_str().starts_with("/* turso_frontend:postgres */ "),
+        "unexpected stored schema sql: {}",
+        sql.as_str()
+    );
+    conn.close().unwrap();
+}
