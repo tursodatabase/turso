@@ -356,3 +356,57 @@ test view-quoted-column-list {
 expect {
     4
 }
+
+@cross-check-integrity
+test view-star-using-derives-merged-columns {
+    CREATE TABLE view_using_left(x INTEGER, y TEXT);
+    CREATE TABLE view_using_right(x INTEGER, z TEXT);
+    CREATE VIEW view_using AS
+        SELECT * FROM view_using_left JOIN view_using_right USING (x);
+    SELECT name FROM pragma_table_info('view_using') ORDER BY cid;
+}
+expect {
+    x
+    y
+    z
+}
+
+@cross-check-integrity
+test view-star-natural-join-with-derived-table {
+    CREATE TABLE view_natural_right(x INTEGER, z TEXT);
+    CREATE VIEW view_natural AS
+        SELECT *
+        FROM (SELECT 1 AS x, 'left' AS y) AS derived
+        NATURAL JOIN view_natural_right;
+    SELECT name FROM pragma_table_info('view_natural') ORDER BY cid;
+}
+expect {
+    x
+    y
+    z
+}
+
+@cross-check-integrity
+test view-star-using-with-cte {
+    CREATE TABLE view_cte_right(x INTEGER, z TEXT);
+    CREATE VIEW view_cte AS
+        WITH source(x, y) AS (SELECT 1, 'left')
+        SELECT * FROM source JOIN view_cte_right USING (x);
+    SELECT name FROM pragma_table_info('view_cte') ORDER BY cid;
+}
+expect {
+    x
+    y
+    z
+}
+
+@cross-check-integrity
+test view-star-does-not-inherit-source-primary-key {
+    CREATE TABLE view_pk_source(id INTEGER PRIMARY KEY, value TEXT);
+    CREATE VIEW view_pk AS SELECT * FROM view_pk_source;
+    SELECT name, pk FROM pragma_table_info('view_pk') ORDER BY cid;
+}
+expect {
+    id|0
+    value|0
+}

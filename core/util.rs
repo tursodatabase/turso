@@ -1854,203 +1854,375 @@ pub fn validate_select_for_views(
     Ok(())
 }
 
-/// Extract column information from a SELECT statement for view creation
-pub fn extract_view_columns(
+#[derive(Clone)]
+struct ViewSource {
+    qualifiers: Vec<String>,
+    columns: Vec<ViewColumn>,
+}
+
+fn append_view_column_schema(
+    schema: ViewColumnSchema,
+    tables: &mut Vec<ViewTable>,
+) -> Vec<ViewColumn> {
+    let table_offset = tables.len();
+    tables.extend(schema.tables);
+    schema
+        .columns
+        .into_iter()
+        .map(|mut column| {
+            if column.table_index != usize::MAX {
+                column.table_index += table_offset;
+            }
+            column
+        })
+        .collect()
+}
+
+fn view_source_from_select_table(
+    select_table: &ast::SelectTable,
+    schema: &Schema,
+    ctes: &HashMap<String, ViewColumnSchema>,
+    tables: &mut Vec<ViewTable>,
+) -> Result<ViewSource> {
+    match select_table {
+        ast::SelectTable::Table(name, alias, _) => {
+            let table_name = normalize_ident(name.name.as_str());
+            let table_alias = alias.as_ref().map(|a| normalize_ident(a.name().as_str()));
+            let qualifiers = table_alias
+                .clone()
+                .map_or_else(|| vec![table_name.clone()], |alias| vec![alias]);
+
+            if name.db_name.is_none() {
+                if let Some(cte) = ctes.get(&table_name) {
+                    return Ok(ViewSource {
+                        qualifiers,
+                        columns: append_view_column_schema(cte.clone(), tables),
+                    });
+                }
+            }
+
+            let table_index = tables.len();
+            tables.push(ViewTable {
+                name: table_name.clone(),
+                db_name: name.db_name.as_ref().map(|db| normalize_ident(db.as_str())),
+                alias: table_alias,
+            });
+            let columns = schema
+                .get_table(&table_name)
+                .map(|table| {
+                    table
+                        .columns()
+                        .iter()
+                        .cloned()
+                        .map(|column| ViewColumn {
+                            table_index,
+                            column,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(ViewSource {
+                qualifiers,
+                columns,
+            })
+        }
+        ast::SelectTable::Select(select, alias) => {
+            let derived = extract_view_columns_inner(select, schema, ctes)?;
+            Ok(ViewSource {
+                qualifiers: alias
+                    .as_ref()
+                    .map(|a| vec![normalize_ident(a.name().as_str())])
+                    .unwrap_or_default(),
+                columns: append_view_column_schema(derived, tables),
+            })
+        }
+        ast::SelectTable::Sub(from, alias) => {
+            let sources = view_sources_from_clause(from, schema, ctes, tables)?;
+            Ok(ViewSource {
+                qualifiers: alias
+                    .as_ref()
+                    .map(|a| vec![normalize_ident(a.name().as_str())])
+                    .unwrap_or_default(),
+                columns: expand_view_star(&sources),
+            })
+        }
+        ast::SelectTable::TableCall(name, _, alias) => {
+            let table_name = normalize_ident(name.name.as_str());
+            let table_alias = alias.as_ref().map(|a| normalize_ident(a.name().as_str()));
+            let qualifiers = table_alias
+                .clone()
+                .map_or_else(|| vec![table_name.clone()], |alias| vec![alias]);
+            let table_index = tables.len();
+            tables.push(ViewTable {
+                name: table_name.clone(),
+                db_name: name.db_name.as_ref().map(|db| normalize_ident(db.as_str())),
+                alias: table_alias,
+            });
+            let columns = schema
+                .get_table(&table_name)
+                .map(|table| {
+                    table
+                        .columns()
+                        .iter()
+                        .cloned()
+                        .map(|column| ViewColumn {
+                            table_index,
+                            column,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(ViewSource {
+                qualifiers,
+                columns,
+            })
+        }
+    }
+}
+
+fn view_column_name(column: &ViewColumn) -> Option<&str> {
+    column.column.name.as_deref()
+}
+
+fn view_output_column(source: &ViewColumn) -> ViewColumn {
+    ViewColumn {
+        table_index: source.table_index,
+        column: Column::new(
+            source.column.name.clone(),
+            source.column.ty_str.clone(),
+            None,
+            None,
+            source.column.ty(),
+            source.column.collation_opt(),
+            ColDef::default(),
+        ),
+    }
+}
+
+fn view_sources_from_clause(
+    from: &ast::FromClause,
+    schema: &Schema,
+    ctes: &HashMap<String, ViewColumnSchema>,
+    tables: &mut Vec<ViewTable>,
+) -> Result<Vec<(ViewSource, Vec<String>)>> {
+    let first = view_source_from_select_table(&from.select, schema, ctes, tables)?;
+    let mut visible_names: Vec<String> = first
+        .columns
+        .iter()
+        .filter_map(view_column_name)
+        .map(ToOwned::to_owned)
+        .collect();
+    let mut sources = vec![(first, Vec::new())];
+
+    for join in &from.joins {
+        let right = view_source_from_select_table(&join.table, schema, ctes, tables)?;
+        let natural = matches!(
+            join.operator,
+            ast::JoinOperator::TypedJoin(Some(join_type))
+                if join_type.contains(ast::JoinType::NATURAL)
+        );
+        let merged = if natural {
+            if join.constraint.is_some() {
+                return Err(LimboError::ParseError(
+                    "a NATURAL join may not have an ON or USING clause".to_string(),
+                ));
+            }
+            right
+                .columns
+                .iter()
+                .filter(|column| !column.column.hidden())
+                .filter_map(view_column_name)
+                .filter(|right_name| {
+                    sources
+                        .iter()
+                        .flat_map(|(source, _)| &source.columns)
+                        .filter(|column| !column.column.hidden())
+                        .filter_map(view_column_name)
+                        .any(|left_name| left_name.eq_ignore_ascii_case(right_name))
+                })
+                .map(normalize_ident)
+                .collect()
+        } else if let Some(ast::JoinConstraint::Using(names)) = &join.constraint {
+            let mut merged = Vec::with_capacity(names.len());
+            for name in names {
+                let normalized = normalize_ident(name.as_str());
+                let in_left = visible_names
+                    .iter()
+                    .any(|column| column.eq_ignore_ascii_case(&normalized));
+                let in_right = right
+                    .columns
+                    .iter()
+                    .filter_map(view_column_name)
+                    .any(|column| column.eq_ignore_ascii_case(&normalized));
+                if !in_left || !in_right {
+                    return Err(LimboError::ParseError(format!(
+                        "cannot join using column {} - column not present in both tables",
+                        name.as_str()
+                    )));
+                }
+                merged.push(normalized);
+            }
+            merged
+        } else {
+            Vec::new()
+        };
+
+        visible_names.extend(
+            right
+                .columns
+                .iter()
+                .filter_map(view_column_name)
+                .filter(|name| {
+                    !merged
+                        .iter()
+                        .any(|merged_name| merged_name.eq_ignore_ascii_case(name))
+                })
+                .map(ToOwned::to_owned),
+        );
+        sources.push((right, merged));
+    }
+    Ok(sources)
+}
+
+fn expand_view_star(sources: &[(ViewSource, Vec<String>)]) -> Vec<ViewColumn> {
+    sources
+        .iter()
+        .flat_map(|(source, merged)| {
+            source.columns.iter().filter(|column| {
+                !view_column_name(column).is_some_and(|name| {
+                    merged
+                        .iter()
+                        .any(|merged_name| merged_name.eq_ignore_ascii_case(name))
+                })
+            })
+        })
+        .map(view_output_column)
+        .collect()
+}
+
+fn deduplicate_view_column_name(column: &mut ViewColumn, counts: &mut HashMap<String, usize>) {
+    let name = column
+        .column
+        .name
+        .clone()
+        .unwrap_or_else(|| "?".to_string());
+    let count = counts.entry(normalize_ident(&name)).or_insert(0);
+    if *count > 0 {
+        column.column.name = Some(format!("{name}:{count}"));
+    } else {
+        column.column.name = Some(name);
+    }
+    *count += 1;
+}
+
+fn extract_view_columns_inner(
     select_stmt: &ast::Select,
     schema: &Schema,
+    outer_ctes: &HashMap<String, ViewColumnSchema>,
 ) -> Result<ViewColumnSchema> {
+    let mut ctes = outer_ctes.clone();
+    if let Some(with) = &select_stmt.with {
+        for cte in &with.ctes {
+            let mut derived = extract_view_columns_inner(&cte.select, schema, &ctes)?;
+            for (column, explicit_name) in derived.columns.iter_mut().zip(&cte.columns) {
+                column.column.name = Some(explicit_name.col_name.as_str().to_string());
+            }
+            ctes.insert(normalize_ident(cte.tbl_name.as_str()), derived);
+        }
+    }
+
     let mut tables = Vec::new();
     let mut columns = Vec::new();
-    let mut column_name_counts: HashMap<String, usize> = HashMap::default();
+    let mut column_name_counts = HashMap::default();
 
-    // Navigate to the first SELECT in the statement
-    if let ast::OneSelect::Select {
-        ref from,
+    let ast::OneSelect::Select {
+        from,
         columns: select_columns,
         ..
     } = &select_stmt.body.select
-    {
-        // First, extract all tables (from FROM clause and JOINs)
-        if let Some(from) = from {
-            // Add the main table from FROM clause
-            match from.select.as_ref() {
-                ast::SelectTable::Table(qualified_name, alias, _) => {
-                    let table_name = normalize_ident(qualified_name.name.as_str());
-                    let db_name = qualified_name
-                        .db_name
-                        .as_ref()
-                        .map(|db| normalize_ident(db.as_str()));
-                    tables.push(ViewTable {
-                        name: table_name,
-                        db_name,
-                        alias: alias.as_ref().map(|a| normalize_ident(a.name().as_str())),
-                    });
-                }
-                _ => {
-                    // Handle other types like subqueries if needed
-                }
-            }
+    else {
+        return Ok(ViewColumnSchema { tables, columns });
+    };
 
-            // Add tables from JOINs
-            for join in &from.joins {
-                match join.table.as_ref() {
-                    ast::SelectTable::Table(qualified_name, alias, _) => {
-                        let table_name = normalize_ident(qualified_name.name.as_str());
-                        let db_name = qualified_name
-                            .db_name
-                            .as_ref()
-                            .map(|db| normalize_ident(db.as_str()));
-                        tables.push(ViewTable {
-                            name: table_name,
-                            db_name,
-                            alias: alias.as_ref().map(|a| normalize_ident(a.name().as_str())),
-                        });
-                    }
-                    _ => {
-                        // Handle other types like subqueries if needed
-                    }
-                }
-            }
-        }
+    let sources = from
+        .as_ref()
+        .map(|from| view_sources_from_clause(from, schema, &ctes, &mut tables))
+        .transpose()?
+        .unwrap_or_default();
 
-        // Helper function to find table index by name or alias
-        let find_table_index = |name: &str| -> Option<usize> {
-            tables.iter().position(|t| {
-                t.name.eq_ignore_ascii_case(name)
-                    || t.alias
-                        .as_ref()
-                        .is_some_and(|a| a.eq_ignore_ascii_case(name))
-            })
-        };
-
-        // Process each column in the SELECT list
-        for result_col in select_columns.iter() {
-            match result_col {
-                ast::ResultColumn::Expr(expr, alias) => {
-                    // Figure out which table this expression comes from
-                    let table_index = match expr.as_ref() {
-                        ast::Expr::Qualified(table_ref, _col_name) => {
-                            // Column qualified with table name
-                            find_table_index(table_ref.as_str())
-                        }
-                        ast::Expr::Id(_col_name) => {
-                            // Unqualified column - would need to resolve based on schema
-                            // For now, assume it's from the first table if there is one
-                            if !tables.is_empty() {
-                                Some(0)
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None, // Expression, literal, etc.
-                    };
-
-                    let col_name = alias
-                        .as_ref()
-                        // ImplicitColumnName is only for display; skip it
-                        // so we derive the proper column name below.
-                        .filter(|a| !matches!(a, ast::As::ImplicitColumnName(_)))
-                        .map(|a| a.name().as_str().to_string())
-                        .or_else(|| extract_column_name_from_expr(expr))
-                        .unwrap_or_else(|| {
-                            // If we can't extract a simple column name, use the expression itself
-                            expr.to_string()
-                        });
-
-                    columns.push(ViewColumn {
-                        table_index: table_index.unwrap_or(usize::MAX),
-                        column: Column::new_default_text(Some(col_name), "TEXT".to_string(), None),
-                    });
-                }
-                ast::ResultColumn::Star => {
-                    // For SELECT *, expand to all columns from all tables
-                    for (table_idx, table) in tables.iter().enumerate() {
-                        if let Some(table_obj) = schema.get_table(&table.name) {
-                            for table_column in table_obj.columns() {
-                                let col_name =
-                                    table_column.name.clone().unwrap_or_else(|| "?".to_string());
-
-                                // Handle duplicate column names by adding suffix
-                                let final_name =
-                                    if let Some(count) = column_name_counts.get_mut(&col_name) {
-                                        *count += 1;
-                                        format!("{}:{}", col_name, *count - 1)
-                                    } else {
-                                        column_name_counts.insert(col_name.clone(), 1);
-                                        col_name.clone()
-                                    };
-
-                                columns.push(ViewColumn {
-                                    table_index: table_idx,
-                                    column: Column::new(
-                                        Some(final_name),
-                                        table_column.ty_str.clone(),
-                                        None,
-                                        None,
-                                        table_column.ty(),
-                                        table_column.collation_opt(),
-                                        ColDef::default(),
-                                    ),
-                                });
-                            }
-                        }
-                    }
-
-                    // If no tables, create a placeholder
-                    if tables.is_empty() {
-                        columns.push(ViewColumn {
+    for result_column in select_columns {
+        match result_column {
+            ast::ResultColumn::Expr(expr, alias) => {
+                let source_column = match expr.as_ref() {
+                    ast::Expr::Qualified(qualifier, column_name) => sources
+                        .iter()
+                        .find(|(source, _)| {
+                            source
+                                .qualifiers
+                                .iter()
+                                .any(|candidate| candidate.eq_ignore_ascii_case(qualifier.as_str()))
+                        })
+                        .and_then(|(source, _)| {
+                            source.columns.iter().find(|column| {
+                                view_column_name(column).is_some_and(|candidate| {
+                                    candidate.eq_ignore_ascii_case(column_name.as_str())
+                                })
+                            })
+                        }),
+                    ast::Expr::Id(column_name) => sources.iter().find_map(|(source, _)| {
+                        source.columns.iter().find(|column| {
+                            view_column_name(column).is_some_and(|candidate| {
+                                candidate.eq_ignore_ascii_case(column_name.as_str())
+                            })
+                        })
+                    }),
+                    _ => None,
+                };
+                let name = alias
+                    .as_ref()
+                    .filter(|alias| !matches!(alias, ast::As::ImplicitColumnName(_)))
+                    .map(|alias| alias.name().as_str().to_string())
+                    .or_else(|| extract_column_name_from_expr(expr))
+                    .unwrap_or_else(|| expr.to_string());
+                let mut column =
+                    source_column
+                        .map(view_output_column)
+                        .unwrap_or_else(|| ViewColumn {
                             table_index: usize::MAX,
-                            column: Column::new_default_text(
-                                Some("*".to_string()),
-                                "TEXT".to_string(),
-                                None,
-                            ),
+                            column: Column::new_default_text(None, "TEXT".to_string(), None),
                         });
-                    }
+                column.column.name = Some(name);
+                deduplicate_view_column_name(&mut column, &mut column_name_counts);
+                columns.push(column);
+            }
+            ast::ResultColumn::Star => {
+                let mut expanded = expand_view_star(&sources);
+                if expanded.is_empty() {
+                    expanded.push(ViewColumn {
+                        table_index: usize::MAX,
+                        column: Column::new_default_text(
+                            Some("*".to_string()),
+                            "TEXT".to_string(),
+                            None,
+                        ),
+                    });
                 }
-                ast::ResultColumn::TableStar(table_ref) => {
-                    // For table.*, expand to all columns from the specified table
-                    let table_name_str = normalize_ident(table_ref.as_str());
-                    if let Some(table_idx) = find_table_index(&table_name_str) {
-                        if let Some(table) = schema.get_table(&tables[table_idx].name) {
-                            for table_column in table.columns() {
-                                let col_name =
-                                    table_column.name.clone().unwrap_or_else(|| "?".to_string());
-
-                                // Handle duplicate column names by adding suffix
-                                let final_name =
-                                    if let Some(count) = column_name_counts.get_mut(&col_name) {
-                                        *count += 1;
-                                        format!("{}:{}", col_name, *count - 1)
-                                    } else {
-                                        column_name_counts.insert(col_name.clone(), 1);
-                                        col_name.clone()
-                                    };
-
-                                columns.push(ViewColumn {
-                                    table_index: table_idx,
-                                    column: Column::new(
-                                        Some(final_name),
-                                        table_column.ty_str.clone(),
-                                        None,
-                                        None,
-                                        table_column.ty(),
-                                        table_column.collation_opt(),
-                                        ColDef::default(),
-                                    ),
-                                });
-                            }
-                        } else {
-                            // Table not found, create placeholder
-                            columns.push(ViewColumn {
-                                table_index: usize::MAX,
-                                column: Column::new_default_text(
-                                    Some(format!("{table_name_str}.*")),
-                                    "TEXT".to_string(),
-                                    None,
-                                ),
-                            });
-                        }
+                for mut column in expanded {
+                    deduplicate_view_column_name(&mut column, &mut column_name_counts);
+                    columns.push(column);
+                }
+            }
+            ast::ResultColumn::TableStar(table_ref) => {
+                let qualifier = normalize_ident(table_ref.as_str());
+                if let Some((source, _)) = sources.iter().find(|(source, _)| {
+                    source
+                        .qualifiers
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(&qualifier))
+                }) {
+                    for mut column in source.columns.iter().map(view_output_column) {
+                        deduplicate_view_column_name(&mut column, &mut column_name_counts);
+                        columns.push(column);
                     }
                 }
             }
@@ -2058,6 +2230,18 @@ pub fn extract_view_columns(
     }
 
     Ok(ViewColumnSchema { tables, columns })
+}
+
+/// Extract column information from a SELECT statement for view creation.
+///
+/// Bare-star expansion follows the join's visible row shape: columns merged
+/// by NATURAL or USING appear once, while `table.*` still includes every
+/// column from that particular source.
+pub fn extract_view_columns(
+    select_stmt: &ast::Select,
+    schema: &Schema,
+) -> Result<ViewColumnSchema> {
+    extract_view_columns_inner(select_stmt, schema, &HashMap::default())
 }
 
 pub fn rewrite_fk_parent_cols_if_self_ref(
@@ -5132,20 +5316,15 @@ pub mod tests {
         let schema = schema_with_tables(&["CREATE TABLE t (a, b)", "CREATE TABLE u (b)"]);
         let view_sql = "CREATE VIEW v AS SELECT t.a FROM t JOIN u USING (b)";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
-                .unwrap()
-                .expect("view should be rewritten");
-
+        // Renaming t.b breaks the USING join no matter what: u has no c, and
+        // after the rename t has no b. SQLite refuses the ALTER, so the
+        // rewrite must error rather than emit a view that can never be
+        // queried again.
+        let err = rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+            .unwrap_err();
         assert!(
-            !rewritten.sql.contains("USING (b)") && !rewritten.sql.contains("USING(b)"),
-            "{}",
-            rewritten.sql
-        );
-        assert!(
-            rewritten.sql.contains("USING (c)") || rewritten.sql.contains("USING(c)"),
-            "{}",
-            rewritten.sql
+            err.to_string().contains("cannot join using column"),
+            "{err}"
         );
     }
 
