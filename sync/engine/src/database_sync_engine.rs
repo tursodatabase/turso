@@ -34,7 +34,8 @@ use crate::{
         Coro, DatabaseMetadata, DatabasePullRevision, DatabaseRowTransformResult,
         DatabaseSavedConfiguration, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
         DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbChangesStatus, DbChangesStreamKind,
-        PartialSyncOpts, SyncEngineIoResult, SyncEngineStats, DATABASE_METADATA_VERSION,
+        PartialSyncOpts, PushBoundary, SyncEngineIoResult, SyncEngineStats,
+        DATABASE_METADATA_VERSION,
     },
     wal_session::WalSession,
     Result,
@@ -102,12 +103,12 @@ mod tests {
         create_main_db_log_path, create_main_db_wal_path, create_meta_path,
         create_replace_base_marker_path, create_revert_db_wal_path,
         ensure_stream_kind_can_use_legacy_page_apply, logical_mvcc_pull_disable_reason,
-        replace_base_backup_path, resolve_local_replay_floor_change_id,
-        resolve_pending_push_update, should_replay_raw_pages_on_sql_conn,
+        lookup_pulled_boundary, rebased_push_boundaries, replace_base_backup_path,
+        resolve_local_replay_floor_change_id, should_replay_raw_pages_on_sql_conn,
         should_request_logical_pull, should_use_logical_mvcc_pull,
         stream_kind_applies_remote_pages, stream_kind_for_pull_updates_v1_result,
         synced_change_id_after_remote_apply, use_pushed_change_hint_for_local_replay,
-        DatabaseSyncEngine, DatabaseSyncEngineOpts, PendingPushUpdate, ReplaceBaseApplyGuard,
+        DatabaseSyncEngine, DatabaseSyncEngineOpts, ReplaceBaseApplyGuard,
         REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER,
     };
     use crate::{
@@ -129,7 +130,7 @@ mod tests {
         types::{
             Coro, DatabaseMetadata, DatabasePullRevision, DatabaseSavedConfiguration,
             DatabaseSyncEngineProtocolVersion, DbChangesStatus, DbChangesStreamKind,
-            PartialSyncOpts, SyncEngineIoResult, DATABASE_METADATA_VERSION,
+            PartialSyncOpts, PushBoundary, SyncEngineIoResult, DATABASE_METADATA_VERSION,
         },
         Result,
     };
@@ -346,68 +347,70 @@ mod tests {
         assert_eq!(floor, Some(12));
     }
 
+    fn boundary(
+        sent_pull_gen: i64,
+        sent_last_change_id: i64,
+        cur: i64,
+        confirmed: bool,
+    ) -> PushBoundary {
+        PushBoundary {
+            sent_pull_gen,
+            sent_last_change_id,
+            cur_change_id: cur,
+            confirmed,
+        }
+    }
+
     #[test]
-    fn local_replay_floor_falls_back_to_confirmed_watermark_on_pull_gen_mismatch() {
-        // without the watermark a stale sync row collapses the floor to
+    fn local_replay_floor_uses_pulled_boundary_translation_on_pull_gen_mismatch() {
+        // without a matched boundary a stale sync row collapses the floor to
         // nothing and the whole CDC history is re-captured on every rebase
         let floor = resolve_local_replay_floor_change_id(false, 7, 6, Some(12), None, 0, 0);
         assert_eq!(floor, None);
-        // the issue-time confirmed watermark carries the floor across the
-        // generation mismatch: everything it covers was confirmed before the
-        // pull was issued, so the pulled state contains it
+        // the boundary-log translation carries the floor across the
+        // generation mismatch: the pulled state provably contains everything
+        // at or before the boundary it names
         let floor = resolve_local_replay_floor_change_id(false, 7, 6, Some(12), Some(20), 0, 0);
         assert_eq!(floor, Some(20));
     }
 
     #[test]
-    fn local_replay_floor_uses_max_of_sync_row_and_confirmed_watermark() {
-        let floor = resolve_local_replay_floor_change_id(false, 7, 7, Some(12), Some(20), 0, 0);
-        assert_eq!(floor, Some(20));
-        let floor = resolve_local_replay_floor_change_id(false, 7, 7, Some(25), Some(20), 0, 0);
-        assert_eq!(floor, Some(25));
+    fn pulled_boundary_lookup_matches_frozen_send_coordinates() {
+        let log = vec![
+            boundary(5, 10, 3, true),
+            boundary(6, 4, 7, true),
+            boundary(6, 9, 12, false),
+        ];
+        // exact match, regardless of confirmation state
+        assert_eq!(lookup_pulled_boundary(&log, 6, Some(4)), Some(1));
+        assert_eq!(lookup_pulled_boundary(&log, 6, Some(9)), Some(2));
+        // a row that names no retained boundary predates the whole log
+        assert_eq!(lookup_pulled_boundary(&log, 5, Some(2)), None);
+        assert_eq!(lookup_pulled_boundary(&log, 6, None), None);
     }
 
     #[test]
-    fn pending_push_kept_when_apply_does_not_renumber_cdc() {
-        assert!(matches!(
-            resolve_pending_push_update(true, false, true, 7, 5, false),
-            PendingPushUpdate::Keep
-        ));
-        assert!(matches!(
-            resolve_pending_push_update(false, false, false, 7, 0, true),
-            PendingPushUpdate::Keep
-        ));
+    fn rebased_boundaries_carry_exact_translations() {
+        let retained = vec![boundary(6, 9, 12, true), boundary(6, 15, 18, false)];
+        let rebased = rebased_push_boundaries(&retained, &[2, 5], true, 99);
+        assert_eq!(
+            rebased,
+            vec![boundary(6, 9, 2, true), boundary(6, 15, 5, false)]
+        );
+        // frozen send-time coordinates never change - only the translation does
+        assert_eq!(rebased[1].sent_pull_gen, 6);
+        assert_eq!(rebased[1].sent_last_change_id, 15);
     }
 
     #[test]
-    fn pending_push_cleared_when_landed_or_untranslatable() {
-        // proven landed by the pulled state: folded into the confirmed
-        // watermark, the record itself is finished
-        assert!(matches!(
-            resolve_pending_push_update(true, true, true, 7, 5, true),
-            PendingPushUpdate::Clear
-        ));
-        // renumbered without per-change translation (raw page replay): the
-        // boundary cannot be carried over
-        assert!(matches!(
-            resolve_pending_push_update(true, false, false, 7, 0, true),
-            PendingPushUpdate::Clear
-        ));
-    }
-
-    #[test]
-    fn pending_push_translated_into_post_rebase_numbering() {
-        assert!(matches!(
-            resolve_pending_push_update(true, false, true, 7, 5, true),
-            PendingPushUpdate::Translate((8, 5))
-        ));
-        // a pending batch whose changes re-captured nothing (e.g. deletes
-        // replayed over rows absent from the pulled state) translates to a
-        // zero boundary: nothing re-pushable came out of it
-        assert!(matches!(
-            resolve_pending_push_update(true, false, true, 7, 0, true),
-            PendingPushUpdate::Translate((8, 0))
-        ));
+    fn rebased_boundaries_collapse_to_ack_all_without_translation() {
+        // bulk page replay cannot translate per change: keep only the newest
+        // confirmed record with the acknowledge-all watermark, drop the
+        // unconfirmed one (resolved conservatively by the next push)
+        let retained = vec![boundary(6, 9, 12, true), boundary(6, 15, 18, false)];
+        let rebased = rebased_push_boundaries(&retained, &[0, 0], false, 42);
+        assert_eq!(rebased, vec![boundary(6, 9, 42, true)]);
+        assert_eq!(rebased_push_boundaries(&[], &[], false, 42), vec![]);
     }
 
     #[test]
@@ -900,9 +903,8 @@ mod tests {
             last_pushed_pull_gen_hint: 0,
             last_pushed_change_id_hint: 0,
             last_pushed_replay_floor_change_id_hint: 0,
-            confirmed_pull_gen: 0,
-            confirmed_change_id: 0,
-            pending_push: None,
+            push_boundaries_pull_gen: 0,
+            push_boundaries: Vec::new(),
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
             logical_mvcc_pull_active: true,
@@ -1052,9 +1054,8 @@ mod tests {
             last_pushed_pull_gen_hint: 0,
             last_pushed_change_id_hint: 0,
             last_pushed_replay_floor_change_id_hint: 0,
-            confirmed_pull_gen: 0,
-            confirmed_change_id: 0,
-            pending_push: None,
+            push_boundaries_pull_gen: 0,
+            push_boundaries: Vec::new(),
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
             logical_mvcc_pull_active: true,
@@ -1084,7 +1085,6 @@ mod tests {
             revision: DatabasePullRevision::V1 {
                 revision: "g1:o2".to_string(),
             },
-            confirmed_at_issue: (0, 0),
             file_slot: Some(crate::database_sync_operations::MutexSlot {
                 value: changes_file,
                 slot,
@@ -1230,9 +1230,8 @@ mod tests {
             last_pushed_pull_gen_hint: 0,
             last_pushed_change_id_hint: 0,
             last_pushed_replay_floor_change_id_hint: 0,
-            confirmed_pull_gen: 0,
-            confirmed_change_id: 0,
-            pending_push: None,
+            push_boundaries_pull_gen: 0,
+            push_boundaries: Vec::new(),
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
             logical_mvcc_pull_active: true,
@@ -1262,7 +1261,6 @@ mod tests {
             revision: DatabasePullRevision::V1 {
                 revision: "g1:o2".to_string(),
             },
-            confirmed_at_issue: (0, 0),
             file_slot: Some(crate::database_sync_operations::MutexSlot {
                 value: changes_file,
                 slot: Arc::new(Mutex::new(None)),
@@ -1445,7 +1443,6 @@ mod tests {
                                 secs: 10,
                                 micros: 0,
                             },
-                            confirmed_at_issue: (0, 0),
                             revision: new_revision.clone(),
                             file_slot: Some(file_slot),
                             stream_kind: DbChangesStreamKind::ReplaceBasePages,
@@ -2292,45 +2289,68 @@ struct AppliedRemoteChanges {
     revert_since_wal_watermark: u64,
     logical_table_names_by_stable_id: BTreeMap<u64, String>,
     followup_revision: Option<DatabasePullRevision>,
-    /// Confirmed watermark `(pull_gen, change_id)` translated into the
-    /// post-rebase numbering; mirrored into the metadata by the caller.
-    /// `None` when the apply did not renumber the CDC.
-    confirmed_watermark: Option<(i64, i64)>,
-    /// What the caller must do with `DatabaseMetadata::pending_push`.
-    pending_push_update: PendingPushUpdate,
+    /// `(pull_gen, records)` replacement for the push-boundary log, with the
+    /// `cur_change_id` values translated into the post-rebase numbering;
+    /// mirrored into the metadata by the caller. `None` when the apply did
+    /// not renumber the CDC (the stored log stays valid as is).
+    push_boundaries_update: Option<(i64, Vec<PushBoundary>)>,
 }
 
-enum PendingPushUpdate {
-    /// the apply did not renumber the CDC - the record stays valid as is
-    Keep,
-    /// the record was folded into the confirmed watermark (the pulled state
-    /// proved the batch landed) or cannot be translated - forget it
-    Clear,
-    /// the apply renumbered the CDC - `cur` becomes this `(pull_gen,
-    /// change_id)` boundary
-    Translate((i64, i64)),
+/// The pulled state names one of this client's push-batch boundaries in its
+/// sync row (the row is written atomically with every batch). Find it in the
+/// boundary log: its translated `cur_change_id` is the exact replay floor
+/// for this pull - every retained batch at or before it is contained in the
+/// pulled state, everything after is not - no matter how stale the pulled
+/// state is. `None` when the row predates the whole log (then nothing
+/// retained is contained) or names no known boundary.
+fn lookup_pulled_boundary(
+    push_boundaries: &[PushBoundary],
+    remote_pull_gen: i64,
+    remote_last_change_id: Option<i64>,
+) -> Option<usize> {
+    let remote_last_change_id = remote_last_change_id?;
+    push_boundaries.iter().position(|b| {
+        b.sent_pull_gen == remote_pull_gen && b.sent_last_change_id == remote_last_change_id
+    })
 }
 
-/// Decide what happens to `DatabaseMetadata::pending_push` after an apply.
-/// `renumbered` says whether this apply re-numbered the CDC (bumped the local
-/// pull generation) - if it did not, the record stays valid as is.
-fn resolve_pending_push_update(
-    pending_push_exists: bool,
-    pending_push_proven_landed: bool,
-    pending_translated: bool,
-    local_pull_gen: i64,
-    translated_pending_cur: i64,
-    renumbered: bool,
-) -> PendingPushUpdate {
-    if !pending_push_exists || !renumbered {
-        PendingPushUpdate::Keep
-    } else if pending_push_proven_landed || !pending_translated {
-        // proven landed: already folded into the confirmed watermark;
-        // otherwise the boundary cannot be carried across the renumbering
-        // and forgetting it only means a conservative re-push resolution
-        PendingPushUpdate::Clear
+/// Build the post-rebase boundary log. With per-change translation the
+/// retained records carry their exact translated values. Without it (bulk
+/// page replay) per-record translation is impossible: keep only the newest
+/// confirmed record with the acknowledge-all watermark as its value, and
+/// drop an unconfirmed record - same conservative resolution as before,
+/// a lost-response batch may be re-sent after a raw rebase.
+fn rebased_push_boundaries(
+    retained_boundaries: &[PushBoundary],
+    translated_curs: &[i64],
+    translation_ran: bool,
+    ack_all_watermark: i64,
+) -> Vec<PushBoundary> {
+    if translation_ran {
+        retained_boundaries
+            .iter()
+            .zip(translated_curs.iter())
+            .map(|(boundary, cur)| PushBoundary {
+                sent_pull_gen: boundary.sent_pull_gen,
+                sent_last_change_id: boundary.sent_last_change_id,
+                cur_change_id: *cur,
+                confirmed: boundary.confirmed,
+            })
+            .collect()
     } else {
-        PendingPushUpdate::Translate((local_pull_gen + 1, translated_pending_cur))
+        retained_boundaries
+            .iter()
+            .rev()
+            .find(|boundary| boundary.confirmed)
+            .map(|boundary| {
+                vec![PushBoundary {
+                    sent_pull_gen: boundary.sent_pull_gen,
+                    sent_last_change_id: boundary.sent_last_change_id,
+                    cur_change_id: ack_all_watermark,
+                    confirmed: true,
+                }]
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -2339,26 +2359,24 @@ fn resolve_local_replay_floor_change_id(
     local_pull_gen: i64,
     remote_pull_gen: i64,
     remote_last_change_id: Option<i64>,
-    confirmed_at_issue_change_id: Option<i64>,
+    pulled_boundary_change_id: Option<i64>,
     last_pushed_pull_gen_hint: i64,
     last_pushed_change_id_hint: i64,
 ) -> Option<i64> {
-    // `confirmed_at_issue_change_id` is the confirmed watermark snapshotted
-    // when the pull request was issued (already validated by the caller to be
-    // in the local numbering). Every push it covers was confirmed before the
-    // pull left, so the pulled state contains those changes and they must not
-    // be replayed. When the remote sync row belongs to an older generation its
-    // ids are not comparable and the watermark is the only usable floor -
-    // without it the floor collapses to zero and the entire CDC history is
-    // re-captured (and later re-pushed) on every pull whose state predates
-    // this client's latest push.
+    // `pulled_boundary_change_id` is the boundary-log translation of the
+    // pulled sync row into the current local numbering (see
+    // [`lookup_pulled_boundary`]). When the row belongs to an older
+    // generation its ids are not comparable and the translation is the only
+    // usable floor - without it the floor collapses to zero and the entire
+    // CDC history is re-captured (and later re-pushed) on every pull whose
+    // state predates this client's latest push.
     let mut last_change_id = if remote_pull_gen == local_pull_gen {
-        match (remote_last_change_id, confirmed_at_issue_change_id) {
-            (Some(remote), Some(confirmed)) => Some(remote.max(confirmed)),
-            (remote, confirmed) => remote.or(confirmed),
+        match (remote_last_change_id, pulled_boundary_change_id) {
+            (Some(remote), Some(translated)) => Some(remote.max(translated)),
+            (remote, translated) => remote.or(translated),
         }
     } else {
-        confirmed_at_issue_change_id
+        pulled_boundary_change_id
     };
 
     if use_pushed_change_hint
@@ -2483,9 +2501,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     last_pushed_change_id_hint: 0,
                     last_pushed_pull_gen_hint: 0,
                     last_pushed_replay_floor_change_id_hint: 0,
-                    confirmed_pull_gen: 0,
-                    confirmed_change_id: 0,
-                    pending_push: None,
+                    push_boundaries_pull_gen: 0,
+                    push_boundaries: Vec::new(),
                     last_pull_unix_time: Some(io.current_time_wall_clock().secs),
                     last_push_unix_time: None,
                     partial_bootstrap_server_revision: if partial {
@@ -2533,9 +2550,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     last_pushed_change_id_hint: 0,
                     last_pushed_pull_gen_hint: 0,
                     last_pushed_replay_floor_change_id_hint: 0,
-                    confirmed_pull_gen: 0,
-                    confirmed_change_id: 0,
-                    pending_push: None,
+                    push_boundaries_pull_gen: 0,
+                    push_boundaries: Vec::new(),
                     last_pull_unix_time: None,
                     last_push_unix_time: None,
                     partial_bootstrap_server_revision: None,
@@ -3050,15 +3066,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         let now = self.io.current_time_wall_clock();
         let revision = self.meta().synced_revision.clone();
-        // Snapshot the confirmed watermark BEFORE the pull request leaves: the
-        // pulled state is guaranteed to contain only pushes confirmed before
-        // the request was issued. A push confirmed while the pull is in flight
-        // may be absent from the response, and the rebase must replay its
-        // changes rather than skip them.
-        let confirmed_at_issue = {
-            let meta = self.meta();
-            (meta.confirmed_pull_gen, meta.confirmed_change_id)
-        };
         let ctx = &SyncOperationCtx::new(
             coro,
             &self.sync_engine_io,
@@ -3164,7 +3171,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 revision: next_revision,
                 file_slot: None,
                 stream_kind,
-                confirmed_at_issue,
             });
         }
 
@@ -3180,7 +3186,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             revision: next_revision,
             file_slot: Some(file),
             stream_kind,
-            confirmed_at_issue,
         })
     }
 
@@ -3230,15 +3235,13 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 &changes_file,
                 remote_changes.stream_kind,
                 &remote_changes.revision,
-                remote_changes.confirmed_at_issue,
             )
             .await;
         let Ok(AppliedRemoteChanges {
             revert_since_wal_watermark,
             logical_table_names_by_stable_id,
             followup_revision,
-            confirmed_watermark,
-            pending_push_update,
+            push_boundaries_update,
         }) = pull_result
         else {
             return Err(pull_result.err().unwrap());
@@ -3262,19 +3265,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             m.last_pushed_replay_floor_change_id_hint = 0;
             m.last_pull_unix_time = Some(remote_changes.time.secs);
             m.logical_table_names_by_stable_id = logical_table_names_by_stable_id;
-            if let Some((pull_gen, change_id)) = confirmed_watermark {
-                m.confirmed_pull_gen = pull_gen;
-                m.confirmed_change_id = change_id;
-            }
-            match pending_push_update {
-                PendingPushUpdate::Keep => {}
-                PendingPushUpdate::Clear => m.pending_push = None,
-                PendingPushUpdate::Translate((pull_gen, change_id)) => {
-                    if let Some(pending) = &mut m.pending_push {
-                        pending.cur_pull_gen = pull_gen;
-                        pending.cur_change_id = change_id;
-                    }
-                }
+            if let Some((pull_gen, push_boundaries)) = push_boundaries_update {
+                m.push_boundaries_pull_gen = pull_gen;
+                m.push_boundaries = push_boundaries;
             }
         })
         .await?;
@@ -3515,7 +3508,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         changes_file: &Arc<dyn turso_core::File>,
         stream_kind: DbChangesStreamKind,
         remote_revision: &DatabasePullRevision,
-        confirmed_at_issue: (i64, i64),
     ) -> Result<AppliedRemoteChanges> {
         tracing::info!("apply_changes(path={})", self.main_db_path);
 
@@ -3574,28 +3566,18 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 meta.last_pushed_change_id_hint,
             )
         };
-        // The issue-time snapshot bounds the replay floor (a push confirmed
-        // while the pull was in flight may be absent from the pulled state);
-        // the live values bound what must not be re-pushed and are translated
-        // into the new numbering during the local replay below. Both are only
-        // meaningful while still expressed in the current local numbering.
-        let confirmed_at_issue_change_id = (confirmed_at_issue.0 == local_pull_gen
-            && confirmed_at_issue.1 > 0)
-            .then_some(confirmed_at_issue.1);
-        let (confirmed_at_apply_change_id, pending_push, pending_push_exists) = {
+        // The boundary log translates the pulled sync row into the current
+        // numbering (exact replay floor) and names what must never be
+        // re-pushed. Its translated values are only meaningful while still
+        // expressed in the current numbering; a stale log (crash between a
+        // rebase commit and the metadata write) is unusable and dropped.
+        let push_boundaries = {
             let meta = self.meta();
-            let confirmed = (meta.confirmed_pull_gen == local_pull_gen
-                && meta.confirmed_change_id > 0)
-                .then_some(meta.confirmed_change_id);
-            let exists = meta.pending_push.is_some();
-            // a record whose translated boundary is no longer in the current
-            // numbering cannot be carried across this rebase - it will be
-            // cleared below
-            let pending = meta
-                .pending_push
-                .clone()
-                .filter(|p| p.cur_pull_gen == local_pull_gen);
-            (confirmed, pending, exists)
+            if meta.push_boundaries_pull_gen == local_pull_gen {
+                meta.push_boundaries.clone()
+            } else {
+                Vec::new()
+            }
         };
 
         // read schema version after initiating WAL session (in order to read it with consistent max_frame_no)
@@ -4025,29 +4007,29 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     "protocol error: remote_pull_gen > local_pull_gen: {remote_pull_gen} > {local_pull_gen}"
                 )));
             }
-            // CONTRACT: a pull issued at time t returns state containing every
-            // push this client confirmed before t. Only this client's pushes
-            // write its sync row, so when the pulled row is in the current
-            // generation it must be at or above the issue-time confirmed
-            // watermark; a lower value means the server served state that lost
-            // acknowledged pushes, and skipping/replaying based on it would
-            // silently lose or duplicate data.
-            if remote_pull_gen == local_pull_gen {
-                if let Some(confirmed) = confirmed_at_issue_change_id {
-                    let remote_id = remote_last_change_id.unwrap_or(0);
-                    if remote_id < confirmed {
-                        return Err(Error::DatabaseSyncEngineError(format!(
-                            "protocol error: pulled state sync row ({remote_pull_gen}, {remote_id}) is behind the confirmed watermark ({local_pull_gen}, {confirmed})"
-                        )));
-                    }
-                }
-            }
+            // The pulled sync row names one of this client's batch boundaries
+            // (it is written atomically with every batch). On a generation
+            // mismatch its ids are not comparable, but the boundary log holds
+            // the translation: everything at or before the matched boundary is
+            // contained in the pulled state - exactly the replay floor - no
+            // matter how stale the pulled state is. An unmatched row predates
+            // the whole log, so nothing retained is contained and the floor is
+            // empty. A match also proves an unconfirmed batch (response lost)
+            // landed.
+            let pulled_boundary = lookup_pulled_boundary(
+                &push_boundaries,
+                remote_pull_gen,
+                remote_last_change_id,
+            );
+            let pulled_boundary_change_id = (remote_pull_gen != local_pull_gen)
+                .then(|| pulled_boundary.map(|i| push_boundaries[i].cur_change_id))
+                .flatten();
             let last_change_id = resolve_local_replay_floor_change_id(
                 use_pushed_change_hint,
                 local_pull_gen,
                 remote_pull_gen,
                 remote_last_change_id,
-                confirmed_at_issue_change_id,
+                pulled_boundary_change_id,
                 last_pushed_pull_gen_hint,
                 last_pushed_change_id_hint,
             );
@@ -4106,35 +4088,34 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             let replayed_local_changes = !local_changes.is_empty();
             let recaptured_local_changes = replayed_local_changes;
             let mut preserve_local_replay_floor = None;
-            // Pre-rebase-numbering watermark of replayed changes whose effect
-            // is known to be applied on the remote: everything the live
-            // confirmed watermark covers, plus a pending push that the pulled
-            // state itself proves landed (its frozen send-time coordinates are
-            // comparable against the pulled sync row regardless of the local
-            // generation). Re-captured changes at or below this watermark get
-            // new CDC ids that must not be pushed again, so the highest new id
-            // they produce is tracked below as the translated watermark.
-            let mut pending_push_proven_landed = false;
-            let confirmed_watermark_old = {
-                let mut watermark = replay_floor.max(confirmed_at_apply_change_id.unwrap_or(0));
-                if let Some(pending) = &pending_push {
-                    if remote_pull_gen == pending.sent_pull_gen
-                        && remote_last_change_id.unwrap_or(0) >= pending.sent_last_change_id
-                    {
-                        watermark = watermark.max(pending.cur_change_id);
-                        pending_push_proven_landed = true;
-                    }
-                }
-                watermark
+            // Prune boundaries contained in the pulled state: on a
+            // generation match everything in an older generation (pushed
+            // before the current generation existed) plus same-generation
+            // batches at or below the pulled row; on a mismatch everything at
+            // or before the matched boundary. Retained boundaries get their
+            // `cur_change_id` translated into the new numbering below: the
+            // highest re-captured CDC id produced by changes at or below the
+            // old value IS the boundary in the new numbering. Values start at
+            // 0 - a boundary is only what the re-capture proves.
+            let retained_boundaries: Vec<PushBoundary> = if remote_pull_gen == local_pull_gen {
+                let remote_id = remote_last_change_id.unwrap_or(0);
+                push_boundaries
+                    .iter()
+                    .filter(|b| b.sent_pull_gen == local_pull_gen && b.sent_last_change_id > remote_id)
+                    .cloned()
+                    .collect()
+            } else if let Some(matched) = pulled_boundary {
+                push_boundaries[matched + 1..].to_vec()
+            } else {
+                push_boundaries.clone()
             };
-            let mut translated_confirmed: i64 = 0;
-            let mut translated_pending_cur: i64 = 0;
+            let mut translated_boundary_curs: Vec<i64> = vec![0; retained_boundaries.len()];
             // set when the local replay re-captured changes with per-change
-            // boundary tracking, i.e. the translated_* values above are exact
+            // boundary tracking, i.e. the translated values above are exact
             let mut local_replay_translation_ran = false;
-            // (pull_gen, change_id) confirmed watermark as persisted into the
-            // local sync row by this apply, in the post-rebase numbering
-            let mut confirmed_watermark: Option<(i64, i64)> = None;
+            // replacement boundary log as persisted by the caller, in the
+            // post-rebase numbering; None while no renumbering happened
+            let mut push_boundaries_update: Option<(i64, Vec<PushBoundary>)> = None;
             tracing::info!(
                 "apply_changes(path={}): collected {} changes, skipped_internal_local_changes={}",
                 self.main_db_path,
@@ -4176,7 +4157,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         ))
                     })
                     .inspect_err(|e| tracing::error!("update_last_change_id failed: {e}"))?;
-                    confirmed_watermark = Some((local_pull_gen + 1, 0));
+                    push_boundaries_update = Some((local_pull_gen + 1, Vec::new()));
                 }
 
                 let mut cdc_enabled_for_local_replay = false;
@@ -4305,20 +4286,18 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     if cdc_enabled_for_local_replay
                         && !replace_base_pages
                         && !raw_page_replay_on_sql_conn
+                        && retained_boundaries
+                            .iter()
+                            .any(|b| original_change_id <= b.cur_change_id)
                     {
-                        let track_confirmed = original_change_id <= confirmed_watermark_old;
-                        let track_pending = !pending_push_proven_landed
-                            && pending_push
-                                .as_ref()
-                                .is_some_and(|p| original_change_id <= p.cur_change_id);
-                        if track_confirmed || track_pending {
-                            let recaptured_id = max_local_change_id(coro, phase_conn).await?;
-                            if let Some(recaptured_id) = recaptured_id {
-                                if track_confirmed {
-                                    translated_confirmed = recaptured_id;
-                                }
-                                if track_pending {
-                                    translated_pending_cur = recaptured_id;
+                        let recaptured_id = max_local_change_id(coro, phase_conn).await?;
+                        if let Some(recaptured_id) = recaptured_id {
+                            for (boundary, translated) in retained_boundaries
+                                .iter()
+                                .zip(translated_boundary_curs.iter_mut())
+                            {
+                                if original_change_id <= boundary.cur_change_id {
+                                    *translated = recaptured_id;
                                 }
                             }
                         }
@@ -4354,12 +4333,19 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         self.main_db_path,
                         change_id
                     );
+                    let translated_confirmed = retained_boundaries
+                        .iter()
+                        .zip(translated_boundary_curs.iter())
+                        .rev()
+                        .find(|(b, _)| b.confirmed)
+                        .map(|(_, cur)| *cur)
+                        .unwrap_or(0);
                     let synced_change_id = if recaptured_local_changes && raw_page_replay_on_sql_conn
                     {
                         post_remote_apply_change_id
                     } else if local_replay_translation_ran {
-                        // exact translation of the confirmed watermark into the
-                        // post-rebase numbering, tracked during the replay above
+                        // exact translation of the newest confirmed boundary
+                        // into the post-rebase numbering
                         translated_confirmed
                     } else {
                         synced_change_id_after_remote_apply(
@@ -4368,18 +4354,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                             change_id,
                         )
                     };
-                    // the local sync row keeps the historical delete clamp
-                    // (`preserve_local_replay_floor`), but the metadata
-                    // confirmed watermark stays exact: the translation already
-                    // handles deletes that re-captured nothing, and lowering it
-                    // would re-push entries the server already applied
-                    confirmed_watermark = Some((
+                    push_boundaries_update = Some((
                         local_pull_gen + 1,
-                        if local_replay_translation_ran {
-                            translated_confirmed.min(change_id)
-                        } else {
-                            synced_change_id.min(change_id)
-                        },
+                        rebased_push_boundaries(
+                            &retained_boundaries,
+                            &translated_boundary_curs,
+                            local_replay_translation_ran,
+                            synced_change_id.min(change_id),
+                        ),
                     ));
                     let synced_change_id = preserve_local_replay_floor
                         .map_or(synced_change_id, |floor| synced_change_id.min(floor));
@@ -4411,20 +4393,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 logical_conn.publish_schema_if_newer();
                 let logical_table_names_by_stable_id =
                     read_logical_replay_table_map(coro, &logical_conn).await?;
-                let pending_push_update = resolve_pending_push_update(
-                    pending_push_exists,
-                    pending_push_proven_landed,
-                    local_replay_translation_ran && pending_push.is_some(),
-                    local_pull_gen,
-                    translated_pending_cur,
-                    confirmed_watermark.is_some(),
-                );
                 return Ok(AppliedRemoteChanges {
                     revert_since_wal_watermark: logical_conn.wal_state()?.max_frame,
                     logical_table_names_by_stable_id,
                     followup_revision,
-                    confirmed_watermark,
-                    pending_push_update,
+                    push_boundaries_update,
                 });
             }
             let raw_replay_refresh = replace_base_pages || raw_page_replay_on_sql_conn;
@@ -4520,13 +4493,20 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     self.main_db_path,
                     change_id
                 );
+                let translated_confirmed = retained_boundaries
+                    .iter()
+                    .zip(translated_boundary_curs.iter())
+                    .rev()
+                    .find(|(boundary, _)| boundary.confirmed)
+                    .map(|(_, cur)| *cur)
+                    .unwrap_or(0);
                 let synced_change_id =
                     if recaptured_local_changes && (replace_base_pages || raw_page_replay_on_sql_conn)
                     {
                         post_remote_apply_change_id
                     } else if local_replay_translation_ran {
-                        // exact translation of the confirmed watermark into the
-                        // post-rebase numbering, tracked during the replay above
+                        // exact translation of the newest confirmed boundary
+                        // into the post-rebase numbering
                         translated_confirmed
                     } else {
                         synced_change_id_after_remote_apply(
@@ -4535,12 +4515,15 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                             change_id,
                         )
                 };
-                // the local sync row keeps the historical delete clamp
-                // (`preserve_local_replay_floor`), but the metadata confirmed
-                // watermark stays exact: the translation already handles
-                // deletes that re-captured nothing, and lowering it would
-                // re-push entries the server already applied
-                confirmed_watermark = Some((local_pull_gen + 1, synced_change_id.min(change_id)));
+                push_boundaries_update = Some((
+                    local_pull_gen + 1,
+                    rebased_push_boundaries(
+                        &retained_boundaries,
+                        &translated_boundary_curs,
+                        local_replay_translation_ran,
+                        synced_change_id.min(change_id),
+                    ),
+                ));
                 let synced_change_id = preserve_local_replay_floor
                     .map_or(synced_change_id, |floor| synced_change_id.min(floor));
                 let synced_change_id = synced_change_id.min(change_id);
@@ -4563,20 +4546,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 read_logical_replay_table_map(coro, &main_conn).await?;
             let revert_since_wal_watermark =
                 revert_since_wal_watermark.unwrap_or(main_conn.wal_state()?.max_frame);
-            let pending_push_update = resolve_pending_push_update(
-                pending_push_exists,
-                pending_push_proven_landed,
-                local_replay_translation_ran && pending_push.is_some(),
-                local_pull_gen,
-                translated_pending_cur,
-                confirmed_watermark.is_some(),
-            );
             Ok(AppliedRemoteChanges {
                 revert_since_wal_watermark,
                 logical_table_names_by_stable_id,
                 followup_revision,
-                confirmed_watermark,
-                pending_push_update,
+                push_boundaries_update,
             })
         }
         .await;

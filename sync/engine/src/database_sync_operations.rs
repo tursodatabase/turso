@@ -38,7 +38,8 @@ use crate::{
         DatabaseRowTransformResult, DatabaseSchemaKind, DatabaseSchemaReplay,
         DatabaseStatementReplay, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
         DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbSyncInfo, DbSyncStatus,
-        PartialBootstrapStrategy, PartialSyncOpts, PendingPush, SyncEngineIoResult,
+        PartialBootstrapStrategy, PartialSyncOpts, PushBoundary, SyncEngineIoResult,
+        PUSH_BOUNDARIES_LIMIT,
     },
     wal_session::WalSession,
     Result,
@@ -2766,43 +2767,53 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
 
     let (source_pull_gen, remote_row) = fetch_last_change_id(ctx, &source_conn, client_id).await?;
 
-    // Resolve the confirmed watermark and any pending push with an unknown
-    // outcome. The server sync row is written atomically with each push
-    // batch, so a pending batch landed iff the row reached its frozen
-    // send-time coordinates - a check that stays valid across rebases because
-    // the send-time coordinates are never renumbered.
-    let (mut confirmed, pending) = {
-        let meta = engine.meta();
-        let confirmed = if meta.confirmed_pull_gen == source_pull_gen {
-            meta.confirmed_change_id
-        } else {
-            0
-        };
-        (confirmed, meta.pending_push.clone())
-    };
-    if let Some(pending) = pending {
+    // Resolve an unconfirmed boundary (batch sent, response lost) against the
+    // live remote row: the row is written atomically with each batch, so the
+    // batch landed iff the row is at or past its frozen send-time
+    // coordinates - a check that stays valid across rebases because the
+    // send-time coordinates are never renumbered.
+    let unconfirmed = engine
+        .meta()
+        .push_boundaries
+        .iter()
+        .find(|b| !b.confirmed)
+        .cloned();
+    if let Some(unconfirmed) = unconfirmed {
         let landed = remote_row.is_some_and(|(row_gen, row_id)| {
-            row_gen == pending.sent_pull_gen && row_id >= pending.sent_last_change_id
+            row_gen == unconfirmed.sent_pull_gen && row_id >= unconfirmed.sent_last_change_id
         });
-        // a landed batch can be folded into the confirmed watermark only when
-        // its translated boundary is still in the current numbering
-        if landed && pending.cur_pull_gen == source_pull_gen {
-            confirmed = confirmed.max(pending.cur_change_id);
-        }
         tracing::info!(
-            "push_logical_changes: client_id={client_id}, pending push resolved: landed={landed}, pending={pending:?}"
+            "push_logical_changes: client_id={client_id}, unconfirmed boundary resolved: landed={landed}, boundary={unconfirmed:?}"
         );
-        let folded = confirmed;
         engine
             .update_meta(ctx.coro, |m| {
-                m.pending_push = None;
                 if landed {
-                    m.confirmed_pull_gen = source_pull_gen;
-                    m.confirmed_change_id = folded;
+                    for boundary in m.push_boundaries.iter_mut() {
+                        boundary.confirmed = true;
+                    }
+                } else {
+                    // the batch provably never landed - it is not a boundary
+                    // on the remote and its changes are still unconfirmed
+                    m.push_boundaries.retain(|b| b.confirmed);
                 }
             })
             .await?;
     }
+    // push floor: the newest confirmed boundary, usable only while its
+    // translated value is still in the current numbering
+    let confirmed = {
+        let meta = engine.meta();
+        if meta.push_boundaries_pull_gen == source_pull_gen {
+            meta.push_boundaries
+                .iter()
+                .rev()
+                .find(|b| b.confirmed)
+                .map(|b| b.cur_change_id)
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    };
     if let Some((row_gen, row_id)) = remote_row {
         // Only this client's pushes write its sync row, and every push starts
         // at or above the confirmed watermark - so a same-generation row below
@@ -2910,18 +2921,34 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                     batch.clear();
                     continue;
                 };
-                // persist the pending-push record BEFORE the request leaves
-                // the process: if the response is lost, this is the only
-                // record that the batch may have been applied - without it the
-                // batch would be pushed (and applied) twice after a rebase
+                // persist the boundary record BEFORE the request leaves the
+                // process: if the response is lost, this is the only record
+                // that the batch may have been applied - without it the batch
+                // would be pushed (and applied) twice after a rebase
                 engine
                     .update_meta(ctx.coro, |m| {
-                        m.pending_push = Some(PendingPush {
+                        debug_assert!(
+                            m.push_boundaries.iter().all(|b| b.confirmed),
+                            "an unconfirmed boundary must be resolved before sending more"
+                        );
+                        if m.push_boundaries_pull_gen != source_pull_gen {
+                            // translated values in an old numbering are
+                            // unusable - matching them against future pulls
+                            // would produce wrong floors, so start over
+                            m.push_boundaries.clear();
+                            m.push_boundaries_pull_gen = source_pull_gen;
+                        }
+                        m.push_boundaries.push(PushBoundary {
                             sent_pull_gen: source_pull_gen,
                             sent_last_change_id,
-                            cur_pull_gen: source_pull_gen,
                             cur_change_id: sent_last_change_id,
+                            confirmed: false,
                         });
+                        // dropping the oldest confirmed record only costs
+                        // extra replay for pulls staler than the whole log
+                        while m.push_boundaries.len() > PUSH_BOUNDARIES_LIMIT {
+                            m.push_boundaries.remove(0);
+                        }
                     })
                     .await?;
                 let (rows_changed, next_change_id) = send_push_batch(
@@ -2942,12 +2969,8 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                 last_change_id = Some(next_change_id);
                 engine
                     .update_meta(ctx.coro, |m| {
-                        m.pending_push = None;
-                        if m.confirmed_pull_gen == source_pull_gen {
-                            m.confirmed_change_id = m.confirmed_change_id.max(next_change_id);
-                        } else {
-                            m.confirmed_pull_gen = source_pull_gen;
-                            m.confirmed_change_id = next_change_id;
+                        for boundary in m.push_boundaries.iter_mut() {
+                            boundary.confirmed = true;
                         }
                     })
                     .await?;
