@@ -27,7 +27,7 @@ runs:
 
     - name: Install Rust toolchain
       if: steps.cache.outputs.cache-hit != 'true'
-      uses: dtolnay/rust-toolchain@master
+      uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
       with:
         toolchain: ${{ inputs.toolchain }}
 
