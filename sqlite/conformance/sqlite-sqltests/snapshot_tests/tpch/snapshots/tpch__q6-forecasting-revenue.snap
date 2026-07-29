@@ -37,7 +37,7 @@ addr  opcode         p1  p2  p3  p4                                     p5  comm
   11    Gt           15  16  17  Binary                                  0  if r[15]>r[16] goto 17
   12    Column        0   4  20                                          0  r[20]=lineitem.L_QUANTITY
   13    Ge           20  21  17  Binary                                  0  if r[20]>=r[21] goto 17
-  14    ColumnRange   0   5  23  2                                       0  r[23..24]=lineitem.L_EXTENDEDPRICE..L_DISCOUNT
+  14    ColumnRange   0   5  23  2                                       0  r[23..24]=lineitem.columns[5..6]
   15    Multiply     23  24  22                                          0  r[22]=r[23]*r[24]
   16    AggStep       0  22   2  sum                                     0  accum=r[2] step(r[22])
   17  Next            0   4   0                                          0

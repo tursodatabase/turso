@@ -28,7 +28,7 @@ addr  opcode           p1  p2  p3  p4          p5  comment
    6      Ge            3   2  36               0  if r[3]>=r[2] goto 36
    7      RowId         1   4   0               0  r[4]=t.rowid
    8      RowId         1   5   0               0  r[5]=t.rowid
-   9      ColumnRange   1   1   6  2            0  r[6..7]=t.grp..val
+   9      ColumnRange   1   1   6  2            0  r[6..7]=t.columns[1..2]
   10      Delete        1   0   0  t            0
   11      Copy          4   8   0               0  r[8]=r[4]
   12      Copy          6   9   0               0  r[9]=r[6]
@@ -57,7 +57,7 @@ addr  opcode           p1  p2  p3  p4          p5  comment
   35  Next              1   5   0               0
   36  FkCheck           0   0   0               0
   37  Rewind            0  41   0               0  Rewind  ephemeral(t)
-  38    ColumnRange     0   0  23  2            0  r[23..24]=ephemeral(t).id..grp
+  38    ColumnRange     0   0  23  2            0  r[23..24]=ephemeral(t).columns[0..1]
   39    ResultRow      23   2   0               0  output=r[23..24]
   40  Next              0  38   0               0
   41  Halt              0   0   0               0

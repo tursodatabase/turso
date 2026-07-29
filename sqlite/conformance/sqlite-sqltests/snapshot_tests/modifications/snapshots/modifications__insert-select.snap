@@ -26,7 +26,7 @@ addr  opcode            p1  p2  p3  p4                         p5  comment
    4    Column           0   5   9                              0  r[9]=orders.created_at
    5    Ge               9  10  10  Binary                      0  if r[9]>=r[10] goto 10
    6    RowId            0   3   0                              0  r[3]=orders.rowid
-   7    ColumnRange      0   1   4  4                           0  r[4..7]=orders.user_id..total_price
+   7    ColumnRange      0   1   4  4                           0  r[4..7]=orders.columns[1..4]
    8    RealAffinity     7   0   0                              0
    9    Yield            2   0   0                              0
   10  Next               0   4   0                              0

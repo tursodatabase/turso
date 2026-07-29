@@ -56,9 +56,9 @@ addr  opcode                  p1  p2  p3  p4                                    
    9            Column         3  14  15                                          0  r[15]=lineitem.L_SHIPMODE
   10            Eq            15  16  12  Binary                                  0  if r[15]==r[16] goto 12
   11            Ne            15  17  26  Binary                                  0  if r[15]!=r[17] goto 26
-  12            ColumnRange    3  11  19  2                                       0  r[19..20]=lineitem.L_COMMITDATE..L_RECEIPTDATE
+  12            ColumnRange    3  11  19  2                                       0  r[19..20]=lineitem.columns[11..12]
   13            Ge            19  20  26  Binary                                  0  if r[19]>=r[20] goto 26
-  14            ColumnRange    3  10  22  2                                       0  r[22..23]=lineitem.L_SHIPDATE..L_COMMITDATE
+  14            ColumnRange    3  10  22  2                                       0  r[22..23]=lineitem.columns[10..11]
   15            Ge            22  23  26  Binary                                  0  if r[22]>=r[23] goto 26
   16            Column         3  12  25                                          0  r[25]=lineitem.L_RECEIPTDATE
   17            Lt            25  26  26  Binary                                  0  if r[25]<r[26] goto 26

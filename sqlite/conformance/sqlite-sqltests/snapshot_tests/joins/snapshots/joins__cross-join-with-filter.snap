@@ -49,7 +49,7 @@ addr  opcode            p1  p2  p3  p4              p5  comment
   20      IdxGT          2  26  12                   0  key=[12..12]
   21      DeferredSeek   2   1   0                   0
   22      Column         0   1   1                   0  r[1]=customers.name
-  23      ColumnRange    2   1   2  2                0  r[2..3]=ephemeral(ephemeral_products_t2).name..price
+  23      ColumnRange    2   1   2  2                0  r[2..3]=ephemeral(ephemeral_products_t2).columns[1..2]
   24      ResultRow      1   3   0                   0  output=r[1..3]
   25    Next             2  20   0                   0
   26  Next               0   4   0                   0

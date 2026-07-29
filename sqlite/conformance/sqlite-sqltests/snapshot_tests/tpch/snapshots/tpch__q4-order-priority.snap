@@ -56,7 +56,7 @@ addr  opcode                    p1  p2  p3  p4                                  
   15            SeekGE           4  25  19                                          0  key=[19..19]
   16              IdxGT          4  25  19                                          0  key=[19..19]
   17              DeferredSeek   4   3   0                                          0
-  18              ColumnRange    3  11  21  2                                       0  r[21..22]=lineitem.L_COMMITDATE..L_RECEIPTDATE
+  18              ColumnRange    3  11  21  2                                       0  r[21..22]=lineitem.columns[11..12]
   19              Ge            21  22  24  Binary                                  0  if r[21]>=r[22] goto 24
   20              Column         2   5  11                                          0  r[11]=orders.O_ORDERPRIORITY
   21              MakeRecord    11   1  10                                          0  r[10]=mkrec(r[11..11])

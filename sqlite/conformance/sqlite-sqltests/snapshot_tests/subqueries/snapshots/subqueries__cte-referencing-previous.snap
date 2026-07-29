@@ -50,7 +50,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode                    p1  p2  p3  p4              p5  comment
-   0          Init               0  87   0                   0  Start at 87
+   0          Init               0  88   0                   0  Start at 88
    1          InitCoroutine      1  67   2                   0
    2          InitCoroutine      2  56   3                   0
    3          InitCoroutine      3  46   4                   0
@@ -64,7 +64,7 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
   11            DeferredSeek     1   0   0                   0
   12            Column           1   0  15                   0  r[15]=idx_order_items_product.product_id
   13            Column           0   3  16                   0  r[16]=order_items.quantity
-  14            ColumnRange      0   3  19  2                0  r[19..20]=order_items.quantity..unit_price
+  14            ColumnRange      0   3  19  2                0  r[19..20]=order_items.columns[3..4]
   15            RealAffinity    20   0   0                   0
   16            Multiply        19  20  17                   0  r[17]=r[19]*r[20]
   17            Compare         10  15   1  k(1, Binary)     0  r[10..10]==r[15..15]
@@ -111,7 +111,7 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
   58    Yield                    2  66   0                   0
   59    Copy                    21  31   0                   0  r[31]=r[21]
   60    SeekRowid                2  31  65                   0  if (r[31]!=cursor 2 for table products.rowid) goto 65
-  61    ColumnRange              2   1  27  2                0  r[27..28]=products.name..category_id
+  61    ColumnRange              2   1  27  2                0  r[27..28]=products.columns[1..2]
   62    Copy                    22  29   0                   0  r[29]=r[22]
   63    Copy                    23  30   0                   0  r[30]=r[23]
   64    Yield                    1   0   0                   0
@@ -130,13 +130,14 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
   77    SorterInsert             3  35   0  0                0  key=r[35]
   78  Goto                       0  70   0                   0
   79  OpenPseudo                 5  35   3                   0  3 columns in r[35]
-  80  SorterSort                 3  86   0                   0
+  80  SorterSort                 3  87   0                   0
   81    SorterData               3  35   5                   0  r[35]=data
-  82    ColumnRange              5   1  32  2                0  r[32..33]=pseudo.column 1..column 2
-  83    Column                   5   0  34                   0  r[34]=pseudo.column 0
-  84    ResultRow               32   3   0                   0  output=r[32..34]
-  85  SorterNext                 3  81   0                   0
-  86  Halt                       0   0   0                   0
-  87  Transaction                0   1  11                   0  iDb=0 tx_mode=Read
-  88  Integer                 1000  26   0                   0  r[26]=1000
-  89  Goto                       0   1   0                   0
+  82    Column                   5   1  32                   0  r[32]=pseudo.column 1
+  83    Column                   5   2  33                   0  r[33]=pseudo.column 2
+  84    Column                   5   0  34                   0  r[34]=pseudo.column 0
+  85    ResultRow               32   3   0                   0  output=r[32..34]
+  86  SorterNext                 3  81   0                   0
+  87  Halt                       0   0   0                   0
+  88  Transaction                0   1  11                   0  iDb=0 tx_mode=Read
+  89  Integer                 1000  26   0                   0  r[26]=1000
+  90  Goto                       0   1   0                   0

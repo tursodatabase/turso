@@ -26,7 +26,7 @@ addr  opcode                  p1  p2  p3  p4                p5  comment
    5          Gosub           14  43   0                     0  ; go to clear accumulator subroutine
    6          OpenRead         2   2   0  k(6,B,B,B,B,B,B)   0  table=products, root=2, iDb=0
    7          Rewind           2  13   0                     0  Rewind table products
-   8            ColumnRange    2   3  12  2                  0  r[12..13]=products.category..price
+   8            ColumnRange    2   3  12  2                  0  r[12..13]=products.columns[3..4]
    9            RealAffinity  13   0   0                     0
   10            MakeRecord    12   2  11                     0  r[11]=mkrec(r[12..13])
   11            SorterInsert   0  11   0  0                  0  key=r[11]

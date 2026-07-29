@@ -25,7 +25,7 @@ addr  opcode          p1  p2  p3  p4      p5  comment
    7    Le             2   3  26  Binary   0  if r[2]<=r[3] goto 26
    8    RowId          1   4   0           0  r[4]=t1.rowid
    9    RowId          1   5   0           0  r[5]=t1.rowid
-  10    ColumnRange    1   1   6  2        0  r[6..7]=t1.name..value
+  10    ColumnRange    1   1   6  2        0  r[6..7]=t1.columns[1..2]
   11    Column         1   1   8           0  r[8]=t1.name
   12    RowId          1   9   0           0  r[9]=t1.rowid
   13    IdxDelete      2   8   2           1
@@ -44,7 +44,7 @@ addr  opcode          p1  p2  p3  p4      p5  comment
   26  Next             1   5   0           0
   27  FkCheck          0   0   0           0
   28  Rewind           0  32   0           0  Rewind  ephemeral(t1)
-  29    ColumnRange    0   0  20  2        0  r[20..21]=ephemeral(t1).id..name
+  29    ColumnRange    0   0  20  2        0  r[20..21]=ephemeral(t1).columns[0..1]
   30    ResultRow     20   2   0           0  output=r[20..21]
   31  Next             0  29   0           0
   32  Halt             0   0   0           0

@@ -54,7 +54,7 @@ addr  opcode           p1  p2  p3  p4     p5  comment
   37  Goto              0  38   0          0
   38  FkCheck           0   0   0          0
   39  Rewind            1  43   0          0  Rewind  ephemeral(t1)
-  40    ColumnRange     1   0  23  3       0  r[23..25]=ephemeral(t1).id..value
+  40    ColumnRange     1   0  23  3       0  r[23..25]=ephemeral(t1).columns[0..2]
   41    ResultRow      23   3   0          0  output=r[23..25]
   42  Next              1  40   0          0
   43  Halt              0   0   0          0

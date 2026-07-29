@@ -32,7 +32,7 @@ addr  opcode                    p1  p2  p3  p4            p5  comment
    8            Once            17   0   0                 0  goto 17
    9            OpenAutoindex    2   0   0                 0  cursor=2
   10            Rewind           1  11   0                 0  Rewind table purchases
-  11              ColumnRange    1   1  17  2              0  r[17..18]=purchases.customer_id..amount
+  11              ColumnRange    1   1  17  2              0  r[17..18]=purchases.columns[1..2]
   12              RowId          1  19   0                 0  r[19]=purchases.rowid
   13              MakeRecord    17   3  20                 0  r[20]=mkrec(r[17..19]); for ephemeral_purchases_t2
   14              FilterAdd      2  17   1                 0  bloom_filter_add(r[17..18])

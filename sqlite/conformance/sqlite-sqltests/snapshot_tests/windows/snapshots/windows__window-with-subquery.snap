@@ -35,8 +35,8 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode                  p1   p2  p3  p4                     p5  comment
-   0          Init             0  155   0                          0  Start at 155
-   1          InitCoroutine    1  103   2                          0
+   0          Init             0  160   0                          0  Start at 160
+   1          InitCoroutine    1  108   2                          0
    2          InitCoroutine    2   82   3                          0
    3          InitCoroutine    3   15   4                          0
    4          OpenRead         0    2   0  k(5,B,B,B,B,B)          0  table=employees, root=2, iDb=0
@@ -80,7 +80,7 @@ addr  opcode                  p1   p2  p3  p4                     p5  comment
   42            Goto           0   44   0                          0
   43            Goto           0   39   0                          0
   44            AggValue       0   13  14  avg                     0  accum=r[13] dest=r[14]
-  45            ColumnRange    2    1  15  2                       0  r[15..16]=ephemeral(buffer_table_window_0).emp_id..name
+  45            ColumnRange    2    1  15  2                       0  r[15..16]=ephemeral(buffer_table_window_0).columns[1..2]
   46            Column         2    0  17                          0  r[17]=ephemeral(buffer_table_window_0).department
   47            Column         2    3  18                          0  r[18]=ephemeral(buffer_table_window_0).salary
   48            Gosub         22   74   0                          0
@@ -97,7 +97,7 @@ addr  opcode                  p1   p2  p3  p4                     p5  comment
   59          Goto             0   61   0                          0
   60          Goto             0   56   0                          0
   61          AggValue         0   13  14  avg                     0  accum=r[13] dest=r[14]
-  62          ColumnRange      2    1  15  2                       0  r[15..16]=ephemeral(buffer_table_window_0).emp_id..name
+  62          ColumnRange      2    1  15  2                       0  r[15..16]=ephemeral(buffer_table_window_0).columns[1..2]
   63          Column           2    0  17                          0  r[17]=ephemeral(buffer_table_window_0).department
   64          Column           2    3  18                          0  r[18]=ephemeral(buffer_table_window_0).salary
   65          Gosub           22   74   0                          0
@@ -132,63 +132,68 @@ addr  opcode                  p1   p2  p3  p4                     p5  comment
   94        SorterInsert       5   33   0  0                       0  key=r[33]
   95      Goto                 0   84   0                          0
   96      OpenPseudo           6   33   6                          0  6 columns in r[33]
-  97      SorterSort           5  102   0                          0
+  97      SorterSort           5  107   0                          0
   98        SorterData         5   33   6                          0  r[33]=data
-  99        ColumnRange        6    0  27  6                       0  r[27..32]=pseudo.column 0..column 5
- 100        Yield              1    0   0                          0
- 101      SorterNext           5   98   0                          0
- 102      EndCoroutine         1    0   0                          0
- 103      OpenEphemeral        7    1   0                          0  cursor=7 is_table=true
- 104      OpenDup              8    7   0                          0  new_cursor=8, original_cursor=7
- 105      OpenDup              9    7   0                          0  new_cursor=9, original_cursor=7
- 106      Null                 0   56   0                          0  r[56]=NULL
- 107      InitCoroutine        1    0   2                          0
- 108        Yield              1  129   0                          0
- 109        Copy              27   58   0                          0  r[58]=r[27]
- 110        NotNull           56  118   0                          0  r[56]!=NULL -> goto 118
- 111        Null               0   49  49                          0  r[49..49]=NULL; initialize per-cursor peer-reference registers for new partition
- 112        MakeRecord        27    6  60                          0  r[60]=mkrec(r[27..32])
- 113        NewRowid           8   56   0                          0  r[56]=rowid
- 114        Insert             8   60  56  buffer_table_window_0   2  intkey=r[56] data=r[60]
- 115        Rewind             7  117   0                          0  Rewind  ephemeral(buffer_table_window_0)
- 116        Rewind             9  117   0                          0  Rewind  ephemeral(buffer_table_window_0)
- 117        Goto               0  128   0                          0
- 118        MakeRecord        27    6  61                          0  r[61]=mkrec(r[27..32])
- 119        NewRowid           8   56   0                          0  r[56]=rowid
- 120        Insert             8   61  56  buffer_table_window_0   2  intkey=r[56] data=r[61]
- 121        AggStep            0    0  49  row_number              0  accum=r[49] step(r[0])
- 122        Next               9  123   0                          0
- 123        AggValue           0   49  50  row_number              0  accum=r[49] dest=r[50]
- 124        ColumnRange        7    1  51  5                       0  r[51..55]=ephemeral(buffer_table_window_0).emp_id..dept_avg
- 125        Gosub             59  143   0                          0
- 126        Delete             7    0   0  buffer_table_window_0   0
- 127        Next               7  128   0                          0
- 128      Goto                 0  108   0                          0
- 129      Null                 0   57   0                          0  r[57]=NULL; return remaining buffered rows
- 130      Rewind               8  140   0                          0  Rewind  ephemeral(buffer_table_window_0)
- 131      AggStep              0    0  49  row_number              0  accum=r[49] step(r[0])
- 132      Next                 9  133   0                          0
- 133      AggValue             0   49  50  row_number              0  accum=r[49] dest=r[50]
- 134      ColumnRange          7    1  51  5                       0  r[51..55]=ephemeral(buffer_table_window_0).emp_id..dept_avg
- 135      Gosub               59  143   0                          0
- 136      Delete               7    0   0  buffer_table_window_0   0
- 137      Next                 7  139   0                          0
- 138      Goto                 0  140   0                          0
- 139      Goto                 0  133   0                          0
- 140      ResetSorter          7    0   0                          0  cursor=7
- 141    Return                57    0   1                          0
- 142    Goto                   0  154   0                          0
- 143    Copy                  51   42   0                          0  r[42]=r[51]
- 144    Copy                  52   43   0                          0  r[43]=r[52]
- 145    Copy                  53   44   0                          0  r[44]=r[53]
- 146    Copy                  54   45   0                          0  r[45]=r[54]
- 147    Copy                  55   46   0                          0  r[46]=r[55]
- 148    Copy                  54   62   0                          0  r[62]=r[54]
- 149    Copy                  55   63   0                          0  r[63]=r[55]
- 150    Subtract              62   63  47                          0  r[47]=r[62]-r[63]
- 151    Copy                  50   48   0                          0  r[48]=r[50]
- 152    ResultRow             42    7   0                          0  output=r[42..48]
- 153  Return                  59    0   0                          0
- 154  Halt                     0    0   0                          0
- 155  Transaction              0    1   7                          0  iDb=0 tx_mode=Read
- 156  Goto                     0    1   0                          0
+  99        Column             6    0  27                          0  r[27]=pseudo.column 0
+ 100        Column             6    1  28                          0  r[28]=pseudo.column 1
+ 101        Column             6    2  29                          0  r[29]=pseudo.column 2
+ 102        Column             6    3  30                          0  r[30]=pseudo.column 3
+ 103        Column             6    4  31                          0  r[31]=pseudo.column 4
+ 104        Column             6    5  32                          0  r[32]=pseudo.column 5
+ 105        Yield              1    0   0                          0
+ 106      SorterNext           5   98   0                          0
+ 107      EndCoroutine         1    0   0                          0
+ 108      OpenEphemeral        7    1   0                          0  cursor=7 is_table=true
+ 109      OpenDup              8    7   0                          0  new_cursor=8, original_cursor=7
+ 110      OpenDup              9    7   0                          0  new_cursor=9, original_cursor=7
+ 111      Null                 0   56   0                          0  r[56]=NULL
+ 112      InitCoroutine        1    0   2                          0
+ 113        Yield              1  134   0                          0
+ 114        Copy              27   58   0                          0  r[58]=r[27]
+ 115        NotNull           56  123   0                          0  r[56]!=NULL -> goto 123
+ 116        Null               0   49  49                          0  r[49..49]=NULL; initialize per-cursor peer-reference registers for new partition
+ 117        MakeRecord        27    6  60                          0  r[60]=mkrec(r[27..32])
+ 118        NewRowid           8   56   0                          0  r[56]=rowid
+ 119        Insert             8   60  56  buffer_table_window_0   2  intkey=r[56] data=r[60]
+ 120        Rewind             7  122   0                          0  Rewind  ephemeral(buffer_table_window_0)
+ 121        Rewind             9  122   0                          0  Rewind  ephemeral(buffer_table_window_0)
+ 122        Goto               0  133   0                          0
+ 123        MakeRecord        27    6  61                          0  r[61]=mkrec(r[27..32])
+ 124        NewRowid           8   56   0                          0  r[56]=rowid
+ 125        Insert             8   61  56  buffer_table_window_0   2  intkey=r[56] data=r[61]
+ 126        AggStep            0    0  49  row_number              0  accum=r[49] step(r[0])
+ 127        Next               9  128   0                          0
+ 128        AggValue           0   49  50  row_number              0  accum=r[49] dest=r[50]
+ 129        ColumnRange        7    1  51  5                       0  r[51..55]=ephemeral(buffer_table_window_0).columns[1..5]
+ 130        Gosub             59  148   0                          0
+ 131        Delete             7    0   0  buffer_table_window_0   0
+ 132        Next               7  133   0                          0
+ 133      Goto                 0  113   0                          0
+ 134      Null                 0   57   0                          0  r[57]=NULL; return remaining buffered rows
+ 135      Rewind               8  145   0                          0  Rewind  ephemeral(buffer_table_window_0)
+ 136      AggStep              0    0  49  row_number              0  accum=r[49] step(r[0])
+ 137      Next                 9  138   0                          0
+ 138      AggValue             0   49  50  row_number              0  accum=r[49] dest=r[50]
+ 139      ColumnRange          7    1  51  5                       0  r[51..55]=ephemeral(buffer_table_window_0).columns[1..5]
+ 140      Gosub               59  148   0                          0
+ 141      Delete               7    0   0  buffer_table_window_0   0
+ 142      Next                 7  144   0                          0
+ 143      Goto                 0  145   0                          0
+ 144      Goto                 0  138   0                          0
+ 145      ResetSorter          7    0   0                          0  cursor=7
+ 146    Return                57    0   1                          0
+ 147    Goto                   0  159   0                          0
+ 148    Copy                  51   42   0                          0  r[42]=r[51]
+ 149    Copy                  52   43   0                          0  r[43]=r[52]
+ 150    Copy                  53   44   0                          0  r[44]=r[53]
+ 151    Copy                  54   45   0                          0  r[45]=r[54]
+ 152    Copy                  55   46   0                          0  r[46]=r[55]
+ 153    Copy                  54   62   0                          0  r[62]=r[54]
+ 154    Copy                  55   63   0                          0  r[63]=r[55]
+ 155    Subtract              62   63  47                          0  r[47]=r[62]-r[63]
+ 156    Copy                  50   48   0                          0  r[48]=r[50]
+ 157    ResultRow             42    7   0                          0  output=r[42..48]
+ 158  Return                  59    0   0                          0
+ 159  Halt                     0    0   0                          0
+ 160  Transaction              0    1   7                          0  iDb=0 tx_mode=Read
+ 161  Goto                     0    1   0                          0

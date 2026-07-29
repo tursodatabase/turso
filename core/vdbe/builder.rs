@@ -1041,35 +1041,31 @@ impl ProgramBuilder {
             default,
         } = insn
         {
-            self.emit_column_maybe_fused(cursor_id, column, dest, default);
+            self.emit_column_insn(cursor_id, column, dest, default);
             return;
         }
         self.insns.push((insn, self.insns.len()));
     }
 
-    /// Emits a Column instruction, fusing it into an immediately preceding
-    /// Column/ColumnRange on the same cursor when both the column index and
-    /// the destination register are exactly consecutive. The fused ColumnRange
-    /// walks the record header once for the whole run instead of once per
-    /// column.
-    ///
-    /// Fusion is skipped when a label has been anchored to the previous
-    /// instruction: `preassign_label_to_next_insn` promises a jump target at
-    /// the *next* instruction, so this Column must exist as a separate
-    /// instruction for that jump to land on. A label anchored even earlier is
-    /// fine — a jump onto the head of a run executes the whole run, exactly
-    /// like falling through the unfused Column sequence. Raw
-    /// `BranchOffset::Offset` captures of `self.offset()` would be invisible
-    /// here, but jump targets are label-based in this codebase precisely so
-    /// instructions can be reordered (see `preassign_label_to_next_insn`).
-    fn emit_column_maybe_fused(
+    fn emit_column_insn(
         &mut self,
         cursor_id: CursorID,
         column: usize,
         dest: usize,
         default: Option<Value>,
     ) {
-        if self.column_run_fusable(cursor_id) && !self.label_targets_next_insn() {
+        let btree_cursor = matches!(
+            self.cursor_ref.get(cursor_id).map(|(_, kind)| kind),
+            Some(CursorType::BTreeTable(_) | CursorType::BTreeIndex(_))
+        );
+        // A label anchored to the previous instruction must continue to target
+        // this instruction, so it cannot be folded into the previous Column.
+        let previous_is_label_anchor = self
+            .insns
+            .len()
+            .checked_sub(1)
+            .is_some_and(|offset| self.label_to_resolved_offset.contains(&Some(offset as u32)));
+        if btree_cursor && !previous_is_label_anchor {
             if let Some((prev_insn, _)) = self.insns.last_mut() {
                 match prev_insn {
                     Insn::Column {
@@ -1115,33 +1111,6 @@ impl ProgramBuilder {
             },
             self.insns.len(),
         ));
-    }
-
-    /// A fused ColumnRange decodes a run of columns from one shared record
-    /// payload; only cursor kinds whose Column reads work that way are fused.
-    /// The rest (virtual tables never emit Column at all; materialized views
-    /// and index methods read column-at-a-time through their own APIs) keep
-    /// individual Column instructions.
-    fn column_run_fusable(&self, cursor_id: CursorID) -> bool {
-        matches!(
-            self.cursor_ref.get(cursor_id).map(|(_, t)| t),
-            Some(
-                CursorType::BTreeTable(_)
-                    | CursorType::BTreeIndex(_)
-                    | CursorType::Pseudo(_)
-                    | CursorType::Sorter
-            )
-        )
-    }
-
-    /// True when some label has been anchored to the last emitted instruction,
-    /// i.e. it must resolve to whatever instruction is emitted next.
-    fn label_targets_next_insn(&self) -> bool {
-        let Some(last) = self.insns.len().checked_sub(1) else {
-            return false;
-        };
-        let last = last as u32;
-        self.label_to_resolved_offset.contains(&Some(last))
     }
 
     /// Emit an instruction that should not start or extend a constant span on its own.

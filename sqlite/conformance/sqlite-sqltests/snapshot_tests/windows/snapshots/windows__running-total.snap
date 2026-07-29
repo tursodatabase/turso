@@ -29,193 +29,200 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode                   p1   p2   p3  p4                     p5  comment
-   0          Init              0  188    0                          0  Start at 188
-   1          InitCoroutine     1  110    2                          0
-   2          InitCoroutine     2   19    3                          0
+   0          Init              0  195    0                          0  Start at 195
+   1          InitCoroutine     1  117    2                          0
+   2          InitCoroutine     2   22    3                          0
    3          SorterOpen        0    2    0  k(2,B,B)                0  cursor=0
    4          OpenRead          1    3    0  k(5,B,B,B,B,B)          0  table=sales, root=3, iDb=0
    5          Rewind            1   12    0                          0  Rewind table sales
-   6            ColumnRange     1    1    8  2                       0  r[8..9]=sales.emp_id..sale_date
+   6            ColumnRange     1    1    8  2                       0  r[8..9]=sales.columns[1..2]
    7            RowId           1   10    0                          0  r[10]=sales.rowid
    8            Column          1    3   11                          0  r[11]=sales.amount
    9            MakeRecord      8    4    7                          0  r[7]=mkrec(r[8..11])
   10            SorterInsert    0    7    0  0                       0  key=r[7]
   11          Next              1    6    0                          0
   12          OpenPseudo        2    7    4                          0  4 columns in r[7]
-  13          SorterSort        0   18    0                          0
+  13          SorterSort        0   21    0                          0
   14            SorterData      0    7    2                          0  r[7]=data
-  15            ColumnRange     2    0    3  4                       0  r[3..6]=pseudo.column 0..column 3
-  16            Yield           2    0    0                          0
-  17          SorterNext        0   14    0                          0
-  18          EndCoroutine      2    0    0                          0
-  19          SorterOpen        3    1    0  k(1,B)                  0  cursor=3
-  20          OpenEphemeral     4    1    0                          0  cursor=4 is_table=true
-  21          OpenDup           5    4    0                          0  new_cursor=5, original_cursor=4
-  22          OpenDup           6    4    0                          0  new_cursor=6, original_cursor=4
-  23          Null              0   24    0                          0  r[24]=NULL
-  24          Null              0   25    0                          0  r[25]=NULL
-  25          InitCoroutine     2    0    3                          0
-  26            Yield           2   69    0                          0
-  27            Copy            4   27    0                          0  r[27]=r[4]
-  28            Compare         3   25    1  k(1, Binary)            0  r[3..3]==r[25..25]; compare partition keys to detect new partition
-  29            Jump           30   33   30                          0
-  30            Gosub          26   70    0                          0  ; detected new partition
-  31            Null            0   24    0                          0  r[24]=NULL
-  32            Copy            3   25    0                          0  r[25]=r[3]
-  33            NotNull        24   43    0                          0  r[24]!=NULL -> goto 43
-  34            Copy           27   28    0                          0  r[28]=r[27]; initialize per-cursor peer-reference registers for new partition
-  35            Copy           27   29    0                          0  r[29]=r[27]
-  36            Null            0   18   18                          0  r[18..18]=NULL; reset accumulator registers
-  37            MakeRecord      3    4   31                          0  r[31]=mkrec(r[3..6])
-  38            NewRowid        5   24    0                          0  r[24]=rowid
-  39            Insert          5   31   24  buffer_table_window_1   2  intkey=r[24] data=r[31]
-  40            Rewind          4   42    0                          0  Rewind  ephemeral(buffer_table_window_1)
-  41            Rewind          6   42    0                          0  Rewind  ephemeral(buffer_table_window_1)
-  42            Goto            0   68    0                          0
-  43            MakeRecord      3    4   32                          0  r[32]=mkrec(r[3..6])
-  44            NewRowid        5   24    0                          0  r[24]=rowid
-  45            Insert          5   32   24  buffer_table_window_1   2  intkey=r[24] data=r[32]
-  46            Compare        27   29    1  k(1, Binary)            0  r[27..27]==r[29..29]; compare ORDER BY columns to detect peer
-  47            Jump           48   68   48                          0
-  48            Column          6    3   33                          0  r[33]=ephemeral(buffer_table_window_1).amount
-  49            AggStep         0   33   18  sum                     0  accum=r[18] step(r[33])
-  50            Next            6   52    0                          0
-  51            Goto            0   56    0                          0
-  52            Column          6    1   34                          0  r[34]=ephemeral(buffer_table_window_1).sale_date
-  53            Compare        29   34    1  k(1, Binary)            0  r[29..29]==r[34..34]
-  54            Jump           55   48   55                          0
-  55            Copy           34   29    0                          0  r[29]=r[34]
-  56            AggValue        0   18   19  sum                     0  accum=r[18] dest=r[19]
-  57            ColumnRange     4    1   20  2                       0  r[20..21]=ephemeral(buffer_table_window_1).sale_date..sale_id
-  58            Column          4    0   22                          0  r[22]=ephemeral(buffer_table_window_1).emp_id
-  59            Column          4    3   23                          0  r[23]=ephemeral(buffer_table_window_1).amount
-  60            Gosub          30   95    0                          0
-  61            Delete          4    0    0  buffer_table_window_1   0
-  62            Next            4   64    0                          0
-  63            Goto            0   68    0                          0
-  64            Column          4    1   35                          0  r[35]=ephemeral(buffer_table_window_1).sale_date
-  65            Compare        28   35    1  k(1, Binary)            0  r[28..28]==r[35..35]
-  66            Jump           67   57   67                          0
-  67            Copy           35   28    0                          0  r[28]=r[35]
-  68          Goto              0   26    0                          0
-  69          Null              0   26    0                          0  r[26]=NULL; return remaining buffered rows
-  70          Rewind            5   92    0                          0  Rewind  ephemeral(buffer_table_window_1)
-  71          Column            6    3   36                          0  r[36]=ephemeral(buffer_table_window_1).amount
-  72          AggStep           0   36   18  sum                     0  accum=r[18] step(r[36])
-  73          Next              6   75    0                          0
-  74          Goto              0   79    0                          0
-  75          Column            6    1   37                          0  r[37]=ephemeral(buffer_table_window_1).sale_date
-  76          Compare          29   37    1  k(1, Binary)            0  r[29..29]==r[37..37]
-  77          Jump             78   71   78                          0
-  78          Copy             37   29    0                          0  r[29]=r[37]
-  79          AggValue          0   18   19  sum                     0  accum=r[18] dest=r[19]
-  80          ColumnRange       4    1   20  2                       0  r[20..21]=ephemeral(buffer_table_window_1).sale_date..sale_id
-  81          Column            4    0   22                          0  r[22]=ephemeral(buffer_table_window_1).emp_id
-  82          Column            4    3   23                          0  r[23]=ephemeral(buffer_table_window_1).amount
-  83          Gosub            30   95    0                          0
-  84          Delete            4    0    0  buffer_table_window_1   0
-  85          Next              4   87    0                          0
-  86          Goto              0   92    0                          0
-  87          Column            4    1   38                          0  r[38]=ephemeral(buffer_table_window_1).sale_date
-  88          Compare          28   38    1  k(1, Binary)            0  r[28..28]==r[38..38]
-  89          Jump             90   80   90                          0
-  90          Copy             38   28    0                          0  r[28]=r[38]
-  91          Goto              0   79    0                          0
-  92          ResetSorter       4    0    0                          0  cursor=4
-  93        Return             26    0    1                          0
-  94        Goto                0  103    0                          0
-  95        Copy               20   39    0                          0  r[39]=r[20]
-  96        Copy               21   40    0                          0  r[40]=r[21]
-  97        Copy               22   41    0                          0  r[41]=r[22]
-  98        Copy               23   42    0                          0  r[42]=r[23]
-  99        Copy               19   43    0                          0  r[43]=r[19]
- 100        MakeRecord         39    5   17                          0  r[17]=mkrec(r[39..43])
- 101        SorterInsert        3   17    0  0                       0  key=r[17]
- 102      Return               30    0    0                          0
- 103      OpenPseudo            7   17    5                          0  5 columns in r[17]
- 104      SorterSort            3  109    0                          0
- 105        SorterData          3   17    7                          0  r[17]=data
- 106        ColumnRange         7    0   12  5                       0  r[12..16]=pseudo.column 0..column 4
- 107        Yield               1    0    0                          0
- 108      SorterNext            3  105    0                          0
- 109      EndCoroutine          1    0    0                          0
- 110      OpenEphemeral         8    1    0                          0  cursor=8 is_table=true
- 111      OpenDup               9    8    0                          0  new_cursor=9, original_cursor=8
- 112      OpenDup              10    8    0                          0  new_cursor=10, original_cursor=8
- 113      Null                  0   57    0                          0  r[57]=NULL
- 114      InitCoroutine         1    0    2                          0
- 115        Yield               1  153    0                          0
- 116        Copy               12   59    0                          0  r[59]=r[12]
- 117        NotNull            57  127    0                          0  r[57]!=NULL -> goto 127
- 118        Copy               59   60    0                          0  r[60]=r[59]; initialize per-cursor peer-reference registers for new partition
- 119        Copy               59   61    0                          0  r[61]=r[59]
- 120        Null                0   50   50                          0  r[50..50]=NULL; reset accumulator registers
- 121        MakeRecord         12    5   63                          0  r[63]=mkrec(r[12..16])
- 122        NewRowid            9   57    0                          0  r[57]=rowid
- 123        Insert              9   63   57  buffer_table_window_0   2  intkey=r[57] data=r[63]
- 124        Rewind              8  126    0                          0  Rewind  ephemeral(buffer_table_window_0)
- 125        Rewind             10  126    0                          0  Rewind  ephemeral(buffer_table_window_0)
- 126        Goto                0  152    0                          0
- 127        MakeRecord         12    5   64                          0  r[64]=mkrec(r[12..16])
- 128        NewRowid            9   57    0                          0  r[57]=rowid
- 129        Insert              9   64   57  buffer_table_window_0   2  intkey=r[57] data=r[64]
- 130        Compare            59   61    1  k(1, Binary)            0  r[59..59]==r[61..61]; compare ORDER BY columns to detect peer
- 131        Jump              132  152  132                          0
- 132        Column             10    3   65                          0  r[65]=ephemeral(buffer_table_window_0).amount
- 133        AggStep             0   65   50  sum                     0  accum=r[50] step(r[65])
- 134        Next               10  136    0                          0
- 135        Goto                0  140    0                          0
- 136        Column             10    0   66                          0  r[66]=ephemeral(buffer_table_window_0).sale_date
- 137        Compare            61   66    1  k(1, Binary)            0  r[61..61]==r[66..66]
- 138        Jump              139  132  139                          0
- 139        Copy               66   61    0                          0  r[61]=r[66]
- 140        AggValue            0   50   51  sum                     0  accum=r[50] dest=r[51]
- 141        ColumnRange         8    1   52  2                       0  r[52..53]=ephemeral(buffer_table_window_0).sale_id..emp_id
- 142        Column              8    0   54                          0  r[54]=ephemeral(buffer_table_window_0).sale_date
- 143        ColumnRange         8    3   55  2                       0  r[55..56]=ephemeral(buffer_table_window_0).amount..column 4
- 144        Gosub              62  179    0                          0
- 145        Delete              8    0    0  buffer_table_window_0   0
- 146        Next                8  148    0                          0
- 147        Goto                0  152    0                          0
- 148        Column              8    0   67                          0  r[67]=ephemeral(buffer_table_window_0).sale_date
- 149        Compare            60   67    1  k(1, Binary)            0  r[60..60]==r[67..67]
- 150        Jump              151  141  151                          0
- 151        Copy               67   60    0                          0  r[60]=r[67]
- 152      Goto                  0  115    0                          0
- 153      Null                  0   58    0                          0  r[58]=NULL; return remaining buffered rows
- 154      Rewind                9  176    0                          0  Rewind  ephemeral(buffer_table_window_0)
- 155      Column               10    3   68                          0  r[68]=ephemeral(buffer_table_window_0).amount
- 156      AggStep               0   68   50  sum                     0  accum=r[50] step(r[68])
- 157      Next                 10  159    0                          0
- 158      Goto                  0  163    0                          0
- 159      Column               10    0   69                          0  r[69]=ephemeral(buffer_table_window_0).sale_date
- 160      Compare              61   69    1  k(1, Binary)            0  r[61..61]==r[69..69]
- 161      Jump                162  155  162                          0
- 162      Copy                 69   61    0                          0  r[61]=r[69]
- 163      AggValue              0   50   51  sum                     0  accum=r[50] dest=r[51]
- 164      ColumnRange           8    1   52  2                       0  r[52..53]=ephemeral(buffer_table_window_0).sale_id..emp_id
- 165      Column                8    0   54                          0  r[54]=ephemeral(buffer_table_window_0).sale_date
- 166      ColumnRange           8    3   55  2                       0  r[55..56]=ephemeral(buffer_table_window_0).amount..column 4
- 167      Gosub                62  179    0                          0
- 168      Delete                8    0    0  buffer_table_window_0   0
- 169      Next                  8  171    0                          0
- 170      Goto                  0  176    0                          0
- 171      Column                8    0   70                          0  r[70]=ephemeral(buffer_table_window_0).sale_date
- 172      Compare              60   70    1  k(1, Binary)            0  r[60..60]==r[70..70]
- 173      Jump                174  164  174                          0
- 174      Copy                 70   60    0                          0  r[60]=r[70]
- 175      Goto                  0  163    0                          0
- 176      ResetSorter           8    0    0                          0  cursor=8
- 177    Return                 58    0    1                          0
- 178    Goto                    0  187    0                          0
- 179    Copy                   52   44    0                          0  r[44]=r[52]
- 180    Copy                   53   45    0                          0  r[45]=r[53]
- 181    Copy                   54   46    0                          0  r[46]=r[54]
- 182    Copy                   55   47    0                          0  r[47]=r[55]
- 183    Copy                   51   48    0                          0  r[48]=r[51]
- 184    Copy                   56   49    0                          0  r[49]=r[56]
- 185    ResultRow              44    6    0                          0  output=r[44..49]
- 186  Return                   62    0    0                          0
- 187  Halt                      0    0    0                          0
- 188  Transaction               0    1    7                          0  iDb=0 tx_mode=Read
- 189  Goto                      0    1    0                          0
+  15            Column          2    0    3                          0  r[3]=pseudo.column 0
+  16            Column          2    1    4                          0  r[4]=pseudo.column 1
+  17            Column          2    2    5                          0  r[5]=pseudo.column 2
+  18            Column          2    3    6                          0  r[6]=pseudo.column 3
+  19            Yield           2    0    0                          0
+  20          SorterNext        0   14    0                          0
+  21          EndCoroutine      2    0    0                          0
+  22          SorterOpen        3    1    0  k(1,B)                  0  cursor=3
+  23          OpenEphemeral     4    1    0                          0  cursor=4 is_table=true
+  24          OpenDup           5    4    0                          0  new_cursor=5, original_cursor=4
+  25          OpenDup           6    4    0                          0  new_cursor=6, original_cursor=4
+  26          Null              0   24    0                          0  r[24]=NULL
+  27          Null              0   25    0                          0  r[25]=NULL
+  28          InitCoroutine     2    0    3                          0
+  29            Yield           2   72    0                          0
+  30            Copy            4   27    0                          0  r[27]=r[4]
+  31            Compare         3   25    1  k(1, Binary)            0  r[3..3]==r[25..25]; compare partition keys to detect new partition
+  32            Jump           33   36   33                          0
+  33            Gosub          26   73    0                          0  ; detected new partition
+  34            Null            0   24    0                          0  r[24]=NULL
+  35            Copy            3   25    0                          0  r[25]=r[3]
+  36            NotNull        24   46    0                          0  r[24]!=NULL -> goto 46
+  37            Copy           27   28    0                          0  r[28]=r[27]; initialize per-cursor peer-reference registers for new partition
+  38            Copy           27   29    0                          0  r[29]=r[27]
+  39            Null            0   18   18                          0  r[18..18]=NULL; reset accumulator registers
+  40            MakeRecord      3    4   31                          0  r[31]=mkrec(r[3..6])
+  41            NewRowid        5   24    0                          0  r[24]=rowid
+  42            Insert          5   31   24  buffer_table_window_1   2  intkey=r[24] data=r[31]
+  43            Rewind          4   45    0                          0  Rewind  ephemeral(buffer_table_window_1)
+  44            Rewind          6   45    0                          0  Rewind  ephemeral(buffer_table_window_1)
+  45            Goto            0   71    0                          0
+  46            MakeRecord      3    4   32                          0  r[32]=mkrec(r[3..6])
+  47            NewRowid        5   24    0                          0  r[24]=rowid
+  48            Insert          5   32   24  buffer_table_window_1   2  intkey=r[24] data=r[32]
+  49            Compare        27   29    1  k(1, Binary)            0  r[27..27]==r[29..29]; compare ORDER BY columns to detect peer
+  50            Jump           51   71   51                          0
+  51            Column          6    3   33                          0  r[33]=ephemeral(buffer_table_window_1).amount
+  52            AggStep         0   33   18  sum                     0  accum=r[18] step(r[33])
+  53            Next            6   55    0                          0
+  54            Goto            0   59    0                          0
+  55            Column          6    1   34                          0  r[34]=ephemeral(buffer_table_window_1).sale_date
+  56            Compare        29   34    1  k(1, Binary)            0  r[29..29]==r[34..34]
+  57            Jump           58   51   58                          0
+  58            Copy           34   29    0                          0  r[29]=r[34]
+  59            AggValue        0   18   19  sum                     0  accum=r[18] dest=r[19]
+  60            ColumnRange     4    1   20  2                       0  r[20..21]=ephemeral(buffer_table_window_1).columns[1..2]
+  61            Column          4    0   22                          0  r[22]=ephemeral(buffer_table_window_1).emp_id
+  62            Column          4    3   23                          0  r[23]=ephemeral(buffer_table_window_1).amount
+  63            Gosub          30   98    0                          0
+  64            Delete          4    0    0  buffer_table_window_1   0
+  65            Next            4   67    0                          0
+  66            Goto            0   71    0                          0
+  67            Column          4    1   35                          0  r[35]=ephemeral(buffer_table_window_1).sale_date
+  68            Compare        28   35    1  k(1, Binary)            0  r[28..28]==r[35..35]
+  69            Jump           70   60   70                          0
+  70            Copy           35   28    0                          0  r[28]=r[35]
+  71          Goto              0   29    0                          0
+  72          Null              0   26    0                          0  r[26]=NULL; return remaining buffered rows
+  73          Rewind            5   95    0                          0  Rewind  ephemeral(buffer_table_window_1)
+  74          Column            6    3   36                          0  r[36]=ephemeral(buffer_table_window_1).amount
+  75          AggStep           0   36   18  sum                     0  accum=r[18] step(r[36])
+  76          Next              6   78    0                          0
+  77          Goto              0   82    0                          0
+  78          Column            6    1   37                          0  r[37]=ephemeral(buffer_table_window_1).sale_date
+  79          Compare          29   37    1  k(1, Binary)            0  r[29..29]==r[37..37]
+  80          Jump             81   74   81                          0
+  81          Copy             37   29    0                          0  r[29]=r[37]
+  82          AggValue          0   18   19  sum                     0  accum=r[18] dest=r[19]
+  83          ColumnRange       4    1   20  2                       0  r[20..21]=ephemeral(buffer_table_window_1).columns[1..2]
+  84          Column            4    0   22                          0  r[22]=ephemeral(buffer_table_window_1).emp_id
+  85          Column            4    3   23                          0  r[23]=ephemeral(buffer_table_window_1).amount
+  86          Gosub            30   98    0                          0
+  87          Delete            4    0    0  buffer_table_window_1   0
+  88          Next              4   90    0                          0
+  89          Goto              0   95    0                          0
+  90          Column            4    1   38                          0  r[38]=ephemeral(buffer_table_window_1).sale_date
+  91          Compare          28   38    1  k(1, Binary)            0  r[28..28]==r[38..38]
+  92          Jump             93   83   93                          0
+  93          Copy             38   28    0                          0  r[28]=r[38]
+  94          Goto              0   82    0                          0
+  95          ResetSorter       4    0    0                          0  cursor=4
+  96        Return             26    0    1                          0
+  97        Goto                0  106    0                          0
+  98        Copy               20   39    0                          0  r[39]=r[20]
+  99        Copy               21   40    0                          0  r[40]=r[21]
+ 100        Copy               22   41    0                          0  r[41]=r[22]
+ 101        Copy               23   42    0                          0  r[42]=r[23]
+ 102        Copy               19   43    0                          0  r[43]=r[19]
+ 103        MakeRecord         39    5   17                          0  r[17]=mkrec(r[39..43])
+ 104        SorterInsert        3   17    0  0                       0  key=r[17]
+ 105      Return               30    0    0                          0
+ 106      OpenPseudo            7   17    5                          0  5 columns in r[17]
+ 107      SorterSort            3  116    0                          0
+ 108        SorterData          3   17    7                          0  r[17]=data
+ 109        Column              7    0   12                          0  r[12]=pseudo.column 0
+ 110        Column              7    1   13                          0  r[13]=pseudo.column 1
+ 111        Column              7    2   14                          0  r[14]=pseudo.column 2
+ 112        Column              7    3   15                          0  r[15]=pseudo.column 3
+ 113        Column              7    4   16                          0  r[16]=pseudo.column 4
+ 114        Yield               1    0    0                          0
+ 115      SorterNext            3  108    0                          0
+ 116      EndCoroutine          1    0    0                          0
+ 117      OpenEphemeral         8    1    0                          0  cursor=8 is_table=true
+ 118      OpenDup               9    8    0                          0  new_cursor=9, original_cursor=8
+ 119      OpenDup              10    8    0                          0  new_cursor=10, original_cursor=8
+ 120      Null                  0   57    0                          0  r[57]=NULL
+ 121      InitCoroutine         1    0    2                          0
+ 122        Yield               1  160    0                          0
+ 123        Copy               12   59    0                          0  r[59]=r[12]
+ 124        NotNull            57  134    0                          0  r[57]!=NULL -> goto 134
+ 125        Copy               59   60    0                          0  r[60]=r[59]; initialize per-cursor peer-reference registers for new partition
+ 126        Copy               59   61    0                          0  r[61]=r[59]
+ 127        Null                0   50   50                          0  r[50..50]=NULL; reset accumulator registers
+ 128        MakeRecord         12    5   63                          0  r[63]=mkrec(r[12..16])
+ 129        NewRowid            9   57    0                          0  r[57]=rowid
+ 130        Insert              9   63   57  buffer_table_window_0   2  intkey=r[57] data=r[63]
+ 131        Rewind              8  133    0                          0  Rewind  ephemeral(buffer_table_window_0)
+ 132        Rewind             10  133    0                          0  Rewind  ephemeral(buffer_table_window_0)
+ 133        Goto                0  159    0                          0
+ 134        MakeRecord         12    5   64                          0  r[64]=mkrec(r[12..16])
+ 135        NewRowid            9   57    0                          0  r[57]=rowid
+ 136        Insert              9   64   57  buffer_table_window_0   2  intkey=r[57] data=r[64]
+ 137        Compare            59   61    1  k(1, Binary)            0  r[59..59]==r[61..61]; compare ORDER BY columns to detect peer
+ 138        Jump              139  159  139                          0
+ 139        Column             10    3   65                          0  r[65]=ephemeral(buffer_table_window_0).amount
+ 140        AggStep             0   65   50  sum                     0  accum=r[50] step(r[65])
+ 141        Next               10  143    0                          0
+ 142        Goto                0  147    0                          0
+ 143        Column             10    0   66                          0  r[66]=ephemeral(buffer_table_window_0).sale_date
+ 144        Compare            61   66    1  k(1, Binary)            0  r[61..61]==r[66..66]
+ 145        Jump              146  139  146                          0
+ 146        Copy               66   61    0                          0  r[61]=r[66]
+ 147        AggValue            0   50   51  sum                     0  accum=r[50] dest=r[51]
+ 148        ColumnRange         8    1   52  2                       0  r[52..53]=ephemeral(buffer_table_window_0).columns[1..2]
+ 149        Column              8    0   54                          0  r[54]=ephemeral(buffer_table_window_0).sale_date
+ 150        ColumnRange         8    3   55  2                       0  r[55..56]=ephemeral(buffer_table_window_0).columns[3..4]
+ 151        Gosub              62  186    0                          0
+ 152        Delete              8    0    0  buffer_table_window_0   0
+ 153        Next                8  155    0                          0
+ 154        Goto                0  159    0                          0
+ 155        Column              8    0   67                          0  r[67]=ephemeral(buffer_table_window_0).sale_date
+ 156        Compare            60   67    1  k(1, Binary)            0  r[60..60]==r[67..67]
+ 157        Jump              158  148  158                          0
+ 158        Copy               67   60    0                          0  r[60]=r[67]
+ 159      Goto                  0  122    0                          0
+ 160      Null                  0   58    0                          0  r[58]=NULL; return remaining buffered rows
+ 161      Rewind                9  183    0                          0  Rewind  ephemeral(buffer_table_window_0)
+ 162      Column               10    3   68                          0  r[68]=ephemeral(buffer_table_window_0).amount
+ 163      AggStep               0   68   50  sum                     0  accum=r[50] step(r[68])
+ 164      Next                 10  166    0                          0
+ 165      Goto                  0  170    0                          0
+ 166      Column               10    0   69                          0  r[69]=ephemeral(buffer_table_window_0).sale_date
+ 167      Compare              61   69    1  k(1, Binary)            0  r[61..61]==r[69..69]
+ 168      Jump                169  162  169                          0
+ 169      Copy                 69   61    0                          0  r[61]=r[69]
+ 170      AggValue              0   50   51  sum                     0  accum=r[50] dest=r[51]
+ 171      ColumnRange           8    1   52  2                       0  r[52..53]=ephemeral(buffer_table_window_0).columns[1..2]
+ 172      Column                8    0   54                          0  r[54]=ephemeral(buffer_table_window_0).sale_date
+ 173      ColumnRange           8    3   55  2                       0  r[55..56]=ephemeral(buffer_table_window_0).columns[3..4]
+ 174      Gosub                62  186    0                          0
+ 175      Delete                8    0    0  buffer_table_window_0   0
+ 176      Next                  8  178    0                          0
+ 177      Goto                  0  183    0                          0
+ 178      Column                8    0   70                          0  r[70]=ephemeral(buffer_table_window_0).sale_date
+ 179      Compare              60   70    1  k(1, Binary)            0  r[60..60]==r[70..70]
+ 180      Jump                181  171  181                          0
+ 181      Copy                 70   60    0                          0  r[60]=r[70]
+ 182      Goto                  0  170    0                          0
+ 183      ResetSorter           8    0    0                          0  cursor=8
+ 184    Return                 58    0    1                          0
+ 185    Goto                    0  194    0                          0
+ 186    Copy                   52   44    0                          0  r[44]=r[52]
+ 187    Copy                   53   45    0                          0  r[45]=r[53]
+ 188    Copy                   54   46    0                          0  r[46]=r[54]
+ 189    Copy                   55   47    0                          0  r[47]=r[55]
+ 190    Copy                   51   48    0                          0  r[48]=r[51]
+ 191    Copy                   56   49    0                          0  r[49]=r[56]
+ 192    ResultRow              44    6    0                          0  output=r[44..49]
+ 193  Return                   62    0    0                          0
+ 194  Halt                      0    0    0                          0
+ 195  Transaction               0    1    7                          0  iDb=0 tx_mode=Read
+ 196  Goto                      0    1    0                          0

@@ -46,7 +46,7 @@ addr  opcode         p1  p2  p3  p4   p5  comment
   27  Goto            0  48   0        0
   28  SeekRowid       1   1  48        0  if (r[1]!=cursor 1 for table t2.rowid) goto 48
   29  RowId           1  15   0        0  r[15]=t2.rowid
-  30  ColumnRange     1   1  16  2     0  r[16..17]=t2.name..counter
+  30  ColumnRange     1   1  16  2     0  r[16..17]=t2.columns[1..2]
   31  Copy           15  18   2        0  r[18]=r[15]
   32  Copy           17  21   0        0  r[21]=r[17]
   33  Integer         1  22   0        0  r[22]=1
@@ -67,7 +67,7 @@ addr  opcode         p1  p2  p3  p4   p5  comment
   48  Goto            0  49   0        0
   49  FkCheck         0   0   0        0
   50  Rewind          0  54   0        0  Rewind  ephemeral(t2)
-  51    ColumnRange   0   0  32  3     0  r[32..34]=ephemeral(t2).id..counter
+  51    ColumnRange   0   0  32  3     0  r[32..34]=ephemeral(t2).columns[0..2]
   52    ResultRow    32   3   0        0  output=r[32..34]
   53  Next            0  51   0        0
   54  Halt            0   0   0        0

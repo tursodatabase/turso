@@ -15,7 +15,7 @@ addr  opcode         p1  p2  p3  p4             p5  comment
    0  Init            0  14   0                  0  Start at 14
    1  OpenWrite       0   1   1                  0  root=1; iDb=1
    2  Rewind          0  11   0                  0  Rewind  sqlite_schema
-   3    ColumnRange   0   0   1  2               0  r[1..2]=sqlite_schema.type..name
+   3    ColumnRange   0   0   1  2               0  r[1..2]=sqlite_schema.columns[0..1]
    4    String8       0   3   0  trigger         0  r[3]='trigger'
    5    Ne            1   3  10                  0  if r[1]!=r[3] goto 10
    6    String8       0   4   0  tr              0  r[4]='tr'

@@ -79,7 +79,7 @@ addr  opcode                  p1   p2  p3  p4                     p5  comment
   49            AggValue       0   16  20  min                     0  accum=r[16] dest=r[20]
   50            AggValue       0   17  21  max                     0  accum=r[17] dest=r[21]
   51            AggValue       0   18  22  avg                     0  accum=r[18] dest=r[22]
-  52            ColumnRange    2    1  23  2                       0  r[23..24]=ephemeral(buffer_table_window_1).emp_id..name
+  52            ColumnRange    2    1  23  2                       0  r[23..24]=ephemeral(buffer_table_window_1).columns[1..2]
   53            Column         2    0  25                          0  r[25]=ephemeral(buffer_table_window_1).department
   54            Column         2    3  26                          0  r[26]=ephemeral(buffer_table_window_1).salary
   55            Gosub         30   89   0                          0
@@ -104,7 +104,7 @@ addr  opcode                  p1   p2  p3  p4                     p5  comment
   74          AggValue         0   16  20  min                     0  accum=r[16] dest=r[20]
   75          AggValue         0   17  21  max                     0  accum=r[17] dest=r[21]
   76          AggValue         0   18  22  avg                     0  accum=r[18] dest=r[22]
-  77          ColumnRange      2    1  23  2                       0  r[23..24]=ephemeral(buffer_table_window_1).emp_id..name
+  77          ColumnRange      2    1  23  2                       0  r[23..24]=ephemeral(buffer_table_window_1).columns[1..2]
   78          Column           2    0  25                          0  r[25]=ephemeral(buffer_table_window_1).department
   79          Column           2    3  26                          0  r[26]=ephemeral(buffer_table_window_1).salary
   80          Gosub           30   89   0                          0
@@ -150,7 +150,7 @@ addr  opcode                  p1   p2  p3  p4                     p5  comment
  120        Goto               0  122   0                          0
  121        Goto               0  118   0                          0
  122        AggValue           0   50  51  count                   0  accum=r[50] dest=r[51]
- 123        ColumnRange        5    0  52  8                       0  r[52..59]=ephemeral(buffer_table_window_0).emp_id..column 7
+ 123        ColumnRange        5    0  52  8                       0  r[52..59]=ephemeral(buffer_table_window_0).columns[0..7]
  124        Gosub             62  147   0                          0
  125        Delete             5    0   0  buffer_table_window_0   0
  126        Next               5  128   0                          0
@@ -164,7 +164,7 @@ addr  opcode                  p1   p2  p3  p4                     p5  comment
  134      Goto                 0  136   0                          0
  135      Goto                 0  132   0                          0
  136      AggValue             0   50  51  count                   0  accum=r[50] dest=r[51]
- 137      ColumnRange          5    0  52  8                       0  r[52..59]=ephemeral(buffer_table_window_0).emp_id..column 7
+ 137      ColumnRange          5    0  52  8                       0  r[52..59]=ephemeral(buffer_table_window_0).columns[0..7]
  138      Gosub               62  147   0                          0
  139      Delete               5    0   0  buffer_table_window_0   0
  140      Next                 5  142   0                          0

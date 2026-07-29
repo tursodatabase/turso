@@ -44,7 +44,7 @@ addr  opcode                      p1  p2  p3  p4              p5  comment
   10              Gosub           19  48   0                   0  ; go to clear accumulator subroutine
   11              OpenRead         4   7   0  k(5,B,B,B,B,B)   0  table=employees, root=7, iDb=0
   12              Rewind           4  18   0                   0  Rewind table employees
-  13                ColumnRange    4   3  17  2                0  r[17..18]=employees.department..salary
+  13                ColumnRange    4   3  17  2                0  r[17..18]=employees.columns[3..4]
   14                RealAffinity  18   0   0                   0
   15                MakeRecord    17   2  16                   0  r[16]=mkrec(r[17..18])
   16                SorterInsert   2  16   0  0                0  key=r[16]
@@ -88,7 +88,7 @@ addr  opcode                      p1  p2  p3  p4              p5  comment
   54      IsNull                  28  62   0                   0  if (r[28]==NULL) goto 62
   55      SeekGE                   1  62  28                   0  key=[28..28]
   56        IdxGT                  1  62  28                   0  key=[28..28]
-  57        ColumnRange            1   0   6  2                0  r[6..7]=ephemeral(ephemeral_subquery_t6).department..avg_salary
+  57        ColumnRange            1   0   6  2                0  r[6..7]=ephemeral(ephemeral_subquery_t6).columns[0..1]
   58        Column                 1   1  26                   0  r[26]=ephemeral(ephemeral_subquery_t6).avg_salary
   59        Copy                  26   1   0                   0  r[1]=r[26]
   60        DecrJumpZero          27  62   0                   0  if (--r[27]==0) goto 62
@@ -99,7 +99,7 @@ addr  opcode                      p1  p2  p3  p4              p5  comment
   65    Copy                       1  31   0                   0  r[31]=r[1]
   66    Le                        30  31  71  Binary           0  if r[30]<=r[31] goto 71
   67    Column                     0   1   2                   0  r[2]=employees.name
-  68    ColumnRange                0   3   3  2                0  r[3..4]=employees.department..salary
+  68    ColumnRange                0   3   3  2                0  r[3..4]=employees.columns[3..4]
   69    RealAffinity               4   0   0                   0
   70    ResultRow                  2   3   0                   0  output=r[2..4]
   71  Next                         0   3   0                   0

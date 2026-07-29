@@ -34,7 +34,7 @@ addr  opcode          p1  p2  p3  p4        p5  comment
   16  Close            1   0   0             0
   17  SorterOpen       2   2   0  k(2,B,B)   0  cursor=2
   18  Rewind           0  25   0             0  Rewind  ephemeral(compound_collection)
-  19    ColumnRange    0   0   7  2          0  r[7..8]=ephemeral(compound_collection).2..column 1
+  19    ColumnRange    0   0   7  2          0  r[7..8]=ephemeral(compound_collection).columns[0..1]
   20    Copy           7   9   0             0  r[9]=r[7]
   21    Copy           8  10   0             0  r[10]=r[8]
   22    MakeRecord     9   2  11             0  r[11]=mkrec(r[9..10])

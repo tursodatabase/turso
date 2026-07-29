@@ -128,7 +128,7 @@ addr  opcode                            p1   p2   p3  p4              p5  commen
   93  OpenRead                           5    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
   94  OpenRead                           6    8    0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
   95  Rewind                             2  115    0                   0  Rewind  ephemeral()
-  96    ColumnRange                      2    0   20  2                0  r[20..21]=ephemeral().category_id..avg_price
+  96    ColumnRange                      2    0   20  2                0  r[20..21]=ephemeral().columns[0..1]
   97    Copy                            20   39    0                   0  r[39]=r[20]
   98    IsNull                          39  114    0                   0  if (r[39]==NULL) goto 114
   99    Affinity                        39    1    0                   0  r[39..40] = C

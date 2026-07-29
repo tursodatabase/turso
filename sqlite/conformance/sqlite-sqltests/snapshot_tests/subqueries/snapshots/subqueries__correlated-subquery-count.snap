@@ -45,7 +45,7 @@ addr  opcode           p1  p2  p3  p4            p5  comment
   18    Copy            1  12   0                 0  r[12]=r[1]
   19    Lt             12  13  24                 0  if r[12]<r[13] goto 24
   20    RowId           0   2   0                 0  r[2]=orders.rowid
-  21    ColumnRange     0   2   3  2              0  r[3..4]=orders.order_date..total_amount
+  21    ColumnRange     0   2   3  2              0  r[3..4]=orders.columns[2..3]
   22    RealAffinity    4   0   0                 0
   23    ResultRow       2   3   0                 0  output=r[2..4]
   24  Next              0   3   0                 0

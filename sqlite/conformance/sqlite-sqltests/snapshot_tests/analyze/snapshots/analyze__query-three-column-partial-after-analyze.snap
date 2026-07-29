@@ -25,7 +25,7 @@ addr  opcode          p1  p2  p3  p4              p5  comment
    5    Column         0   2   8                   0  r[8]=inventory.product_id
    6    Ne             8   9  10  Binary           0  if r[8]!=r[9] goto 10
    7    RowId          0   1   0                   0  r[1]=inventory.rowid
-   8    ColumnRange    0   3   2  2                0  r[2..3]=inventory.bin_location..quantity
+   8    ColumnRange    0   3   2  2                0  r[2..3]=inventory.columns[3..4]
    9    ResultRow      1   3   0                   0  output=r[1..3]
   10  Next             0   3   0                   0
   11  Halt             0   0   0                   0

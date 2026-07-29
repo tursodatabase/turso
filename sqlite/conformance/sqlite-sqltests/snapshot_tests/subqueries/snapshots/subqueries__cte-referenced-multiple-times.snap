@@ -185,7 +185,7 @@ addr  opcode                                       p1   p2   p3  p4            p
  145  Return                                       52    0    0                 0
  146  OpenRead                                      7    6    0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
  147  Rewind                                        4  159    0                 0  Rewind  ephemeral()
- 148    ColumnRange                                 4    0   39  2              0  r[39..40]=ephemeral().customer_id..total
+ 148    ColumnRange                                 4    0   39  2              0  r[39..40]=ephemeral().columns[0..1]
  149    Copy                                       40   59    0                 0  r[59]=r[40]
  150    Copy                                        1   60    0                 0  r[60]=r[1]
  151    Le                                         59   60  158  Binary         0  if r[59]<=r[60] goto 158

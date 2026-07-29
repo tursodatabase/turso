@@ -22,7 +22,7 @@ addr  opcode         p1  p2  p3  p4  p5  comment
    4  SeekRowid       1   1  24       0  if (r[1]!=cursor 1 for table t1.rowid) goto 24
    5  RowId           1   2   0       0  r[2]=t1.rowid
    6  RowId           1   3   0       0  r[3]=t1.rowid
-   7  ColumnRange     1   1   4  2    0  r[4..5]=t1.name..value
+   7  ColumnRange     1   1   4  2    0  r[4..5]=t1.columns[1..2]
    8  Column          1   1   6       0  r[6]=t1.name
    9  RowId           1   7   0       0  r[7]=t1.rowid
   10  IdxDelete       2   6   2       1
@@ -41,7 +41,7 @@ addr  opcode         p1  p2  p3  p4  p5  comment
   23  Insert          0  17  18       4  intkey=r[18] data=r[17]
   24  FkCheck         0   0   0       0
   25  Rewind          0  29   0       0  Rewind  ephemeral(t1)
-  26    ColumnRange   0   0  19  3    0  r[19..21]=ephemeral(t1).id..value
+  26    ColumnRange   0   0  19  3    0  r[19..21]=ephemeral(t1).columns[0..2]
   27    ResultRow    19   3   0       0  output=r[19..21]
   28  Next            0  26   0       0
   29  Halt            0   0   0       0

@@ -47,7 +47,7 @@ addr  opcode           p1  p2  p3  p4                 p5  comment
   21    RowId           0  12   0                      0  r[12]=ephemeral(ephemeral_scratch).rowid
   22    NotExists       1  33  12                      0
   23    Null            0  13   0                      0  r[13]=NULL
-  24    ColumnRange     1   1  14  2                   0  r[14..15]=products.name..price
+  24    ColumnRange     1   1  14  2                   0  r[14..15]=products.columns[1..2]
   25    Column          1   3  18  0                   0  r[18]=products.quantity
   26    Add            18  19  16                      0  r[16]=r[18]+r[19]
   27    Column          1   4  17                      0  r[17]=products.category
