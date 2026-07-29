@@ -421,12 +421,20 @@ contract; the client-side pull/push race is what makes cuts predate pushes.
   batch's floor (conditional row UPDATE, abort txn on zero affected rows).
   The row-boundary contract also assumes at most one in-flight push per
   client id — overlapping pushes could commit out of order and regress it.
-- IMPLEMENTED DESIGN (branch sync-confirmed-watermark / PR #8069):
-  `DatabaseMetadata::push_boundaries` — an ordered log of batch-boundary
-  records (sent_gen, sent_last, cur, confirmed), one per pushed batch,
-  persisted BEFORE each send, confirmed on response, translated at each
-  rebase, pruned once an applied cut's boundary reaches it (applied cuts are
-  monotone since pulls are incremental from the client revision). Any
+- IMPLEMENTED DESIGN (branch sync-confirmed-watermark / PR #8069): the
+  local-only internal table `turso_sync_push_boundaries` (next to
+  `turso_sync_last_change_id`) — an ordered log of batch-boundary records
+  (sent_gen, sent_last, cur_pull_gen, cur, confirmed), one per pushed batch,
+  persisted in a small txn BEFORE each send, confirmed on response,
+  translated + rewritten by each rebase next to the final sync-row update,
+  pruned once an applied cut's boundary reaches it (applied cuts are
+  monotone since pulls are incremental from the client revision). WAL-mode
+  flow only (logical MVCC never renumbers). NEVER touch this table
+  mid-apply: creating it there publishes a schema that briefly lacks
+  turso_cdc and breaks concurrent CDC-enabled prepares (this exact failure
+  was caught by the concurrent-actions-consistency JS test). Rows carry
+  cur_pull_gen; stale-numbering rows (crash between rebase commit and the
+  post-rebase rewrite) are dropped on read. Any
   consistent cut names some batch end of ours in its sync row, so the rebase
   replay floor is the exact translation of what the cut provably contains —
   under ANY pull lag; no freshness contract exists (an earlier two-scalar
