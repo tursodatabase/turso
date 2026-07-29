@@ -45,6 +45,7 @@ mod condition;
 mod custom_types;
 mod emission;
 pub(crate) mod functions;
+mod ir;
 mod translator;
 mod utils;
 mod vectors;
@@ -68,6 +69,8 @@ use custom_types::*;
 use emission::*;
 #[allow(unused_imports)]
 use functions::*;
+#[allow(unused_imports)]
+use ir::*;
 #[allow(unused_imports)]
 use metadata::*;
 #[allow(unused_imports)]

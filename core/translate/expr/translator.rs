@@ -89,6 +89,104 @@ pub fn resolve_expr(
     translate_expr(program, referenced_tables, expr, dest_reg, resolver)
 }
 
+/// Open a constant span for `expr` if it is constant and no span is already open.
+/// Mirrors the entry behavior of [translate_expr]; used by both the eager path and
+/// the expression IR lowering so hoisting behavior is identical between them.
+pub(super) fn open_expr_constant_span(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    resolver: &Resolver,
+) -> Option<usize> {
+    if expr.is_constant(resolver) {
+        if !program.constant_span_is_open() {
+            Some(program.constant_span_start())
+        } else {
+            None
+        }
+    } else {
+        program.constant_span_end_all();
+        None
+    }
+}
+
+/// If `expr` is cached in the resolver's expression-register cache, emit a Copy
+/// (plus custom-type decode when needed), set the collation context, and return true.
+pub(super) fn try_emit_cached_expr_reg(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<bool> {
+    let Some((reg, needs_decode, collation_ctx)) = resolver.resolve_cached_expr_reg(expr) else {
+        return Ok(false);
+    };
+    program.emit_insn(Insn::Copy {
+        src_reg: reg,
+        dst_reg: target_register,
+        extra_amount: 0,
+    });
+    // Hash join payloads store raw encoded values; apply DECODE for custom
+    // type columns so the result set contains human-readable text.
+    if needs_decode && !program.flags.suppress_custom_type_decode() {
+        if let ast::Expr::Column {
+            table: table_ref_id,
+            column,
+            ..
+        } = expr
+        {
+            if let Some(referenced_tables) = referenced_tables {
+                if let Some((_, table)) = referenced_tables.find_table_by_internal_id(*table_ref_id)
+                {
+                    if let Some(col) = table.get_column_at(*column) {
+                        if let Some(type_def) = resolver
+                            .schema()
+                            .get_type_def(&col.ty_str, table.is_strict())
+                        {
+                            if let Some(decode_expr) = type_def.decode() {
+                                let skip_label = program.allocate_label();
+                                program.emit_insn(Insn::IsNull {
+                                    reg: target_register,
+                                    target_pc: skip_label,
+                                });
+                                emit_type_expr(
+                                    program,
+                                    decode_expr,
+                                    target_register,
+                                    target_register,
+                                    col,
+                                    type_def,
+                                    resolver,
+                                )?;
+                                program.preassign_label_to_next_insn(skip_label);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    program.set_collation(collation_ctx);
+    Ok(true)
+}
+
+/// Try to satisfy `expr` from an expression index; returns true if the value was emitted.
+pub(super) fn try_emit_expression_index_lookup(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+) -> Result<bool> {
+    let has_expression_indexes = referenced_tables.is_some_and(|tables| {
+        tables
+            .joined_tables()
+            .iter()
+            .any(|t| !t.expression_index_usages.is_empty())
+    });
+    Ok(has_expression_indexes
+        && try_emit_expression_index_value(program, referenced_tables, expr, target_register)?)
+}
+
 /// Translate an expression into bytecode.
 #[turso_macros::trace_stack]
 pub fn translate_expr(
@@ -98,65 +196,9 @@ pub fn translate_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
-    let constant_span = if expr.is_constant(resolver) {
-        if !program.constant_span_is_open() {
-            Some(program.constant_span_start())
-        } else {
-            None
-        }
-    } else {
-        program.constant_span_end_all();
-        None
-    };
+    let constant_span = open_expr_constant_span(program, expr, resolver);
 
-    if let Some((reg, needs_decode, collation_ctx)) = resolver.resolve_cached_expr_reg(expr) {
-        program.emit_insn(Insn::Copy {
-            src_reg: reg,
-            dst_reg: target_register,
-            extra_amount: 0,
-        });
-        // Hash join payloads store raw encoded values; apply DECODE for custom
-        // type columns so the result set contains human-readable text.
-        if needs_decode && !program.flags.suppress_custom_type_decode() {
-            if let ast::Expr::Column {
-                table: table_ref_id,
-                column,
-                ..
-            } = expr
-            {
-                if let Some(referenced_tables) = referenced_tables {
-                    if let Some((_, table)) =
-                        referenced_tables.find_table_by_internal_id(*table_ref_id)
-                    {
-                        if let Some(col) = table.get_column_at(*column) {
-                            if let Some(type_def) = resolver
-                                .schema()
-                                .get_type_def(&col.ty_str, table.is_strict())
-                            {
-                                if let Some(decode_expr) = type_def.decode() {
-                                    let skip_label = program.allocate_label();
-                                    program.emit_insn(Insn::IsNull {
-                                        reg: target_register,
-                                        target_pc: skip_label,
-                                    });
-                                    emit_type_expr(
-                                        program,
-                                        decode_expr,
-                                        target_register,
-                                        target_register,
-                                        col,
-                                        type_def,
-                                        resolver,
-                                    )?;
-                                    program.preassign_label_to_next_insn(skip_label);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        program.set_collation(collation_ctx);
+    if try_emit_cached_expr_reg(program, referenced_tables, expr, target_register, resolver)? {
         if let Some(span) = constant_span {
             program.constant_span_end(span);
         }
@@ -164,15 +206,17 @@ pub fn translate_expr(
     }
 
     // At the very start we try to satisfy the expression from an expression index
-    let has_expression_indexes = referenced_tables.is_some_and(|tables| {
-        tables
-            .joined_tables()
-            .iter()
-            .any(|t| !t.expression_index_usages.is_empty())
-    });
-    if has_expression_indexes
-        && try_emit_expression_index_value(program, referenced_tables, expr, target_register)?
-    {
+    if try_emit_expression_index_lookup(program, referenced_tables, expr, target_register)? {
+        if let Some(span) = constant_span {
+            program.constant_span_end(span);
+        }
+        return Ok(target_register);
+    }
+
+    // Declarative path: decompose the expression into the value IR and lower it.
+    // Falls through to the eager match below when the root shape is not supported.
+    if let Some(expr_ir) = ir::ExprIr::build(expr, referenced_tables, resolver)? {
+        expr_ir.lower_root(program, referenced_tables, resolver, target_register)?;
         if let Some(span) = constant_span {
             program.constant_span_end(span);
         }

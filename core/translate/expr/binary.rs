@@ -59,6 +59,32 @@ pub(super) fn binary_expr_shared(
     Ok(target_register)
 }
 
+/// The rules for determining which collating function to use for a binary comparison
+/// operator (=, <, >, <=, >=, !=, IS, and IS NOT) are as follows:
+///
+/// 1. If either operand has an explicit collating function assignment using the postfix COLLATE operator,
+///    then the explicit collating function is used for comparison,
+///    with precedence to the collating function of the left operand.
+///
+/// 2. If either operand is a column, then the collating function of that column is used
+///    with precedence to the left operand. For the purposes of the previous sentence,
+///    a column name preceded by one or more unary "+" operators and/or CAST operators is still considered a column name.
+///
+/// 3. Otherwise, the BINARY collating function is used for comparison.
+pub(super) fn merge_binary_collation_ctx(
+    left_collation_ctx: Option<(CollationSeq, bool)>,
+    right_collation_ctx: Option<(CollationSeq, bool)>,
+) -> Option<(CollationSeq, bool)> {
+    match (left_collation_ctx, right_collation_ctx) {
+        (Some((c_left, true)), _) => Some((c_left, true)),
+        (_, Some((c_right, true))) => Some((c_right, true)),
+        (Some((c_left, from_collate_left)), None) => Some((c_left, from_collate_left)),
+        (None, Some((c_right, from_collate_right))) => Some((c_right, from_collate_right)),
+        (Some((c_left, from_collate_left)), Some((_, false))) => Some((c_left, from_collate_left)),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_binary_expr_scalar(
     program: &mut ProgramBuilder,
@@ -116,32 +142,7 @@ pub(super) fn emit_binary_expr_scalar(
         let right_collation_ctx = program.curr_collation_ctx();
         program.reset_collation();
 
-        /*
-         * The rules for determining which collating function to use for a binary comparison
-         * operator (=, <, >, <=, >=, !=, IS, and IS NOT) are as follows:
-         *
-         * 1. If either operand has an explicit collating function assignment using the postfix COLLATE operator,
-         * then the explicit collating function is used for comparison,
-         * with precedence to the collating function of the left operand.
-         *
-         * 2. If either operand is a column, then the collating function of that column is used
-         * with precedence to the left operand. For the purposes of the previous sentence,
-         * a column name preceded by one or more unary "+" operators and/or CAST operators is still considered a column name.
-         *
-         * 3. Otherwise, the BINARY collating function is used for comparison.
-         */
-        let collation_ctx = {
-            match (left_collation_ctx, right_collation_ctx) {
-                (Some((c_left, true)), _) => Some((c_left, true)),
-                (_, Some((c_right, true))) => Some((c_right, true)),
-                (Some((c_left, from_collate_left)), None) => Some((c_left, from_collate_left)),
-                (None, Some((c_right, from_collate_right))) => Some((c_right, from_collate_right)),
-                (Some((c_left, from_collate_left)), Some((_, false))) => {
-                    Some((c_left, from_collate_left))
-                }
-                _ => None,
-            }
-        };
+        let collation_ctx = merge_binary_collation_ctx(left_collation_ctx, right_collation_ctx);
         program.set_collation(collation_ctx);
 
         match emit_mode {
