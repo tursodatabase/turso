@@ -1006,9 +1006,9 @@ fn main() -> anyhow::Result<()> {
         .expect("Error setting Ctrl-C handler");
     }
 
+    auto_attach_pg_schemas(&conn, &db_file);
     // Server mode: start PG wire protocol server and exit
     if let Some(ref address) = opts.server {
-        auto_attach_pg_schemas(&conn, &db_file);
         let server = TursoPgServer::new(address.clone(), db_file, conn, interrupt_count);
         return server.run();
     }
