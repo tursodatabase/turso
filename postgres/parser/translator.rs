@@ -2422,12 +2422,8 @@ impl PostgreSQLTranslator {
                 // ILIKE/NOT ILIKE → LOWER(lhs) LIKE LOWER(rhs)
                 self.translate_ilike_expr(a_expr)
             }
-            AExprKind::AexprOpAny => {
-                // expr = ANY(array) → stub as 0 (false).
-                // Our pg_catalog tables that use arrays are empty stubs,
-                // so this never actually evaluates.
-                Ok(ast::Expr::Literal(ast::Literal::Numeric("0".to_string())))
-            }
+            AExprKind::AexprOpAny => self.translate_any_all_expr(a_expr, false),
+            AExprKind::AexprOpAll => self.translate_any_all_expr(a_expr, true),
             AExprKind::AexprBetween | AExprKind::AexprBetweenSym => {
                 self.translate_between_expr(a_expr, false)
             }
@@ -2740,6 +2736,80 @@ impl PostgreSQLTranslator {
             .unwrap_or(false);
 
         Ok(ast::Expr::InList { lhs, not, rhs })
+    }
+
+    /// Translate `<lhs> <op> ANY(<array>)` / `<lhs> <op> ALL(<array>)`.
+    /// Only the membership forms are supported: `= ANY` (IN) and `<> ALL`
+    /// (NOT IN); other operators error as not supported. A literal ARRAY[...]
+    /// operand lowers to IN/NOT IN. Any other operand (bound parameter, column,
+    /// expression) lowers to array_contains(array, elem). `= ANY(<subquery>)`
+    /// parses as a SubLink and lowers to InSelect, so it never reaches here.
+    fn translate_any_all_expr(
+        &self,
+        a_expr: &pg_query::protobuf::AExpr,
+        is_all: bool,
+    ) -> Result<ast::Expr, ParseError> {
+        let kw = if is_all { "ALL" } else { "ANY" };
+        let op_name = a_expr
+            .name
+            .first()
+            .and_then(|n| match &n.node {
+                Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .ok_or_else(|| ParseError::ParseError(format!("{kw}: missing operator name")))?;
+
+        // The PG lexer rewrites != to <>.
+        let not = match (op_name, is_all) {
+            ("=", false) => false,
+            ("<>", true) => true,
+            _ => {
+                return Err(ParseError::ParseError(format!(
+                    "{op_name} {kw} (array) is not supported"
+                )));
+            }
+        };
+
+        let lhs_node = a_expr
+            .lexpr
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError(format!("{kw}: missing lhs")))?;
+        let rhs_node = a_expr
+            .rexpr
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError(format!("{kw}: missing rhs")))?;
+        let lhs = self.translate_expr(lhs_node)?;
+
+        if let Some(pg_query::protobuf::node::Node::AArrayExpr(arr)) = &rhs_node.node {
+            let rhs = arr
+                .elements
+                .iter()
+                .map(|e| Ok(Box::new(self.translate_expr(e)?)))
+                .collect::<Result<Vec<_>, ParseError>>()?;
+            return Ok(ast::Expr::InList {
+                lhs: Box::new(lhs),
+                not,
+                rhs,
+            });
+        }
+
+        let array = self.translate_expr(rhs_node)?;
+        let call = ast::Expr::FunctionCall {
+            name: ast::Name::from_string("array_contains"),
+            distinctness: None,
+            args: vec![Box::new(array), Box::new(lhs)],
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        Ok(if not {
+            ast::Expr::Unary(ast::UnaryOperator::Not, Box::new(call))
+        } else {
+            call
+        })
     }
 
     fn translate_like_expr(
@@ -6447,6 +6517,87 @@ mod tests {
             }
         } else {
             panic!("Expected Select statement");
+        }
+    }
+
+    /// Extract the WHERE clause of a translated single SELECT.
+    fn where_clause_of(sql: &str) -> ast::Expr {
+        let translator = PostgreSQLTranslator::new();
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+        let ast::Stmt::Select(select) = translated else {
+            panic!("Expected Select statement");
+        };
+        let ast::OneSelect::Select { where_clause, .. } = &select.body.select else {
+            panic!("Expected Select variant");
+        };
+        *where_clause
+            .as_ref()
+            .expect("Expected WHERE clause")
+            .clone()
+    }
+
+    #[test]
+    fn test_eq_any_array_literal_becomes_in_list() {
+        let wc = where_clause_of("SELECT id FROM t WHERE id = ANY(ARRAY[1, 2, 3])");
+        let ast::Expr::InList { not, rhs, .. } = wc else {
+            panic!("Expected InList for = ANY(array literal), got: {wc:?}");
+        };
+        assert!(!not);
+        assert_eq!(rhs.len(), 3);
+    }
+
+    #[test]
+    fn test_eq_any_param_becomes_array_contains() {
+        let wc = where_clause_of("SELECT id FROM t WHERE id = ANY($1)");
+        let ast::Expr::FunctionCall { name, args, .. } = wc else {
+            panic!("Expected FunctionCall for = ANY(param), got: {wc:?}");
+        };
+        assert_eq!(name.as_str(), "array_contains");
+        assert_eq!(args.len(), 2);
+        assert!(
+            matches!(&*args[0], ast::Expr::Variable(_)),
+            "array argument must come first, got: {:?}",
+            args[0]
+        );
+    }
+
+    #[test]
+    fn test_ne_all_array_literal_becomes_not_in_list() {
+        let wc = where_clause_of("SELECT id FROM t WHERE id <> ALL(ARRAY[1, 2])");
+        let ast::Expr::InList { not, rhs, .. } = wc else {
+            panic!("Expected InList for != ALL(array literal), got: {wc:?}");
+        };
+        assert!(not);
+        assert_eq!(rhs.len(), 2);
+    }
+
+    #[test]
+    fn test_ne_all_param_becomes_not_array_contains() {
+        let wc = where_clause_of("SELECT id FROM t WHERE id != ALL($1)");
+        let ast::Expr::Unary(ast::UnaryOperator::Not, inner) = wc else {
+            panic!("Expected NOT(...) for != ALL(param), got: {wc:?}");
+        };
+        let ast::Expr::FunctionCall { name, .. } = &*inner else {
+            panic!("Expected FunctionCall under NOT, got: {inner:?}");
+        };
+        assert_eq!(name.as_str(), "array_contains");
+    }
+
+    #[test]
+    fn test_unsupported_any_all_operators_error() {
+        let translator = PostgreSQLTranslator::new();
+        for sql in [
+            "SELECT 1 WHERE 2 > ANY(ARRAY[1, 5])",
+            "SELECT 1 WHERE 2 <> ANY(ARRAY[1, 5])",
+            "SELECT 1 WHERE 2 = ALL(ARRAY[2, 2])",
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let err = translator.translate(&parsed).unwrap_err();
+            assert!(
+                err.to_string().contains("not supported"),
+                "expected loud error for {sql}, got: {err}"
+            );
         }
     }
 
