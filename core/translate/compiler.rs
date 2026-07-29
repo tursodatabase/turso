@@ -54,6 +54,15 @@ pub(crate) trait Compile: Sized {
         }
     }
 
+    fn boxed(self) -> BoxedCompile<Self::Output>
+    where
+        Self: 'static,
+    {
+        BoxedCompile {
+            compiler: Box::new(|builder| self.compile(builder)),
+        }
+    }
+
     /// Select one of two compilers using SQL truthiness.
     ///
     /// A false or NULL condition selects `if_false`; every other value selects
@@ -73,6 +82,20 @@ pub(crate) trait Compile: Sized {
             if_true,
             if_false,
         }
+    }
+}
+
+type BoxedCompilerFn<Output> = Box<dyn FnOnce(&mut IrBuilder) -> Result<Output>>;
+
+pub(crate) struct BoxedCompile<Output> {
+    compiler: BoxedCompilerFn<Output>,
+}
+
+impl<Output> Compile for BoxedCompile<Output> {
+    type Output = Output;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        (self.compiler)(builder)
     }
 }
 
@@ -939,6 +962,17 @@ mod tests {
     }
 
     #[test]
+    fn boxed_compilers_preserve_composition() {
+        let lhs = constant(Value::from_i64(40)).boxed();
+        let rhs = constant(Value::from_i64(2)).boxed();
+        let compiler = lhs.then(rhs).and_then(|(lhs, rhs)| add(lhs, rhs)).boxed();
+
+        let ir = compile_scalar(compiler).unwrap();
+
+        assert_eq!(ir.output(), ValueId(2));
+    }
+
+    #[test]
     fn verifier_rejects_use_without_dominance() {
         let ir = IrProgram {
             blocks: smallvec![
@@ -1045,12 +1079,12 @@ mod tests {
         let connection = database.connect().unwrap();
 
         let rows = connection
-            .prepare("SELECT 40 + 2")
+            .prepare("SELECT 40 + 2, (40 + 1) + (1 + 0)")
             .unwrap()
             .run_collect_rows()
             .unwrap();
 
-        assert_eq!(rows, vec![vec![Value::from_i64(42)]]);
+        assert_eq!(rows, vec![vec![Value::from_i64(42), Value::from_i64(42)]]);
     }
 
     #[test]
@@ -1064,7 +1098,8 @@ mod tests {
                 "SELECT CASE WHEN 1 THEN 10 ELSE 20 END, \
                         CASE WHEN 0 THEN 10 ELSE 20 END, \
                         CASE WHEN NULL THEN 10 ELSE 20 END, \
-                        CASE WHEN TRUE THEN 10 END",
+                        CASE WHEN TRUE THEN 10 END, \
+                        CASE WHEN 1 + 0 THEN 10 + 1 ELSE 20 + 2 END",
             )
             .unwrap()
             .run_collect_rows()
@@ -1077,6 +1112,7 @@ mod tests {
                 Value::from_i64(20),
                 Value::from_i64(20),
                 Value::from_i64(10),
+                Value::from_i64(11),
             ]]
         );
     }

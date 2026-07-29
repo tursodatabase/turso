@@ -46,3 +46,7 @@ diamonds with block parameters. This establishes the combinator contract,
 SSA joins, and the separation between symbolic values and VDBE resources
 without prematurely choosing the representation of effectful database
 resources or loops.
+
+Supported expression fragments are assembled recursively. Boxing erases the
+concrete Rust type of heterogeneous combinator trees while preserving deferred
+execution; unsupported fragments return to the established expression emitter.

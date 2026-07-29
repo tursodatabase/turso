@@ -1,5 +1,5 @@
 use super::*;
-use crate::translate::compiler::{add, compile_scalar, constant, Compile};
+use crate::translate::compiler::{add, compile_scalar, constant, BoxedCompile, Compile, ValueId};
 
 /// Reason why [translate_expr_no_constant_opt()] was called.
 #[derive(Debug)]
@@ -50,6 +50,60 @@ fn compiler_literal_value(literal: &ast::Literal) -> Result<Option<Value>> {
         ast::Literal::Null => Ok(Some(Value::Null)),
         ast::Literal::True => Ok(Some(Value::from_i64(1))),
         ast::Literal::False => Ok(Some(Value::from_i64(0))),
+        _ => Ok(None),
+    }
+}
+
+fn compiler_for_expr(expr: &ast::Expr) -> Result<Option<BoxedCompile<ValueId>>> {
+    match expr {
+        ast::Expr::Literal(literal) => {
+            Ok(compiler_literal_value(literal)?.map(|value| constant(value).boxed()))
+        }
+        ast::Expr::Binary(lhs, ast::Operator::Add, rhs) => {
+            let Some(lhs_compiler) = compiler_for_expr(lhs)? else {
+                return Ok(None);
+            };
+            let compiler = if exprs_are_equivalent(lhs, rhs) {
+                lhs_compiler
+                    .map(|value| (value, value))
+                    .and_then(|(lhs, rhs)| add(lhs, rhs))
+                    .boxed()
+            } else {
+                let Some(rhs_compiler) = compiler_for_expr(rhs)? else {
+                    return Ok(None);
+                };
+                lhs_compiler
+                    .then(rhs_compiler)
+                    .and_then(|(lhs, rhs)| add(lhs, rhs))
+                    .boxed()
+            };
+            Ok(Some(compiler))
+        }
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } if base.is_none() && when_then_pairs.len() == 1 => {
+            let (when_expr, then_expr) = &when_then_pairs[0];
+            let Some(when_compiler) = compiler_for_expr(when_expr)? else {
+                return Ok(None);
+            };
+            let Some(then_compiler) = compiler_for_expr(then_expr)? else {
+                return Ok(None);
+            };
+            let else_compiler = match else_expr {
+                Some(else_expr) => {
+                    let Some(compiler) = compiler_for_expr(else_expr)? else {
+                        return Ok(None);
+                    };
+                    compiler
+                }
+                None => constant(Value::Null).boxed(),
+            };
+            Ok(Some(
+                when_compiler.branch(then_compiler, else_compiler).boxed(),
+            ))
+        }
         _ => Ok(None),
     }
 }
@@ -188,6 +242,20 @@ pub fn translate_expr(
             program.constant_span_end(span);
         }
         return Ok(target_register);
+    }
+
+    let deferred_root = matches!(
+        expr,
+        ast::Expr::Binary(_, ast::Operator::Add, _) | ast::Expr::Case { .. }
+    );
+    if deferred_root {
+        if let Some(compiler) = compiler_for_expr(expr)? {
+            compile_scalar(compiler)?.lower_into(program, target_register)?;
+            if let Some(span) = constant_span {
+                program.constant_span_end(span);
+            }
+            return Ok(target_register);
+        }
     }
 
     match expr {
@@ -446,34 +514,6 @@ pub fn translate_expr(
                 return Ok(target_register);
             }
 
-            if let (
-                ast::Operator::Add,
-                ast::Expr::Literal(ast::Literal::Numeric(lhs)),
-                ast::Expr::Literal(ast::Literal::Numeric(rhs)),
-            ) = (op, e1.as_ref(), e2.as_ref())
-            {
-                let lhs = parse_numeric_literal(lhs)?;
-                let rhs = parse_numeric_literal(rhs)?;
-                let scalar = if exprs_are_equivalent(e1, e2) {
-                    compile_scalar(
-                        constant(lhs)
-                            .map(|value| (value, value))
-                            .and_then(|(lhs, rhs)| add(lhs, rhs)),
-                    )?
-                } else {
-                    compile_scalar(
-                        constant(lhs)
-                            .then(constant(rhs))
-                            .and_then(|(lhs, rhs)| add(lhs, rhs)),
-                    )?
-                };
-                scalar.lower_into(program, target_register)?;
-                if let Some(span) = constant_span {
-                    program.constant_span_end(span);
-                }
-                return Ok(target_register);
-            }
-
             binary_expr_shared(
                 program,
                 referenced_tables,
@@ -491,33 +531,6 @@ pub fn translate_expr(
             when_then_pairs,
             else_expr,
         } => {
-            if base.is_none() && when_then_pairs.len() == 1 {
-                let (when_expr, then_expr) = &when_then_pairs[0];
-                if let (ast::Expr::Literal(when_literal), ast::Expr::Literal(then_literal)) =
-                    (when_expr.as_ref(), then_expr.as_ref())
-                {
-                    let when_value = compiler_literal_value(when_literal)?;
-                    let then_value = compiler_literal_value(then_literal)?;
-                    let else_value = match else_expr.as_deref() {
-                        Some(ast::Expr::Literal(literal)) => compiler_literal_value(literal)?,
-                        None => Some(Value::Null),
-                        Some(_) => None,
-                    };
-                    if let (Some(when_value), Some(then_value), Some(else_value)) =
-                        (when_value, then_value, else_value)
-                    {
-                        let ir = compile_scalar(
-                            constant(when_value).branch(constant(then_value), constant(else_value)),
-                        )?;
-                        ir.lower_into(program, target_register)?;
-                        if let Some(span) = constant_span {
-                            program.constant_span_end(span);
-                        }
-                        return Ok(target_register);
-                    }
-                }
-            }
-
             // There's two forms of CASE, one which checks a base expression for equality
             // against the WHEN values, and returns the corresponding THEN value if it matches:
             //   CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'many' END
