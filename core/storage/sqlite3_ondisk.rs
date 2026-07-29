@@ -1088,8 +1088,10 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     content_size
                 ))
             })?;
-            // SAFETY: SerialTypeKind is Text so this buffer is a valid string
-            let val = unsafe { std::str::from_utf8_unchecked(data) };
+            let val = simdutf8::basic::from_utf8(data).map_err(|_| {
+                mark_unlikely();
+                LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
+            })?;
             Ok((
                 ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
                 content_size,
@@ -1216,8 +1218,10 @@ pub fn read_value_serial_type<'a>(
                         content_size
                     ))
                 })?;
-                // SAFETY: SerialTypeKind is Text so this buffer is a valid string
-                let val = unsafe { std::str::from_utf8_unchecked(data) };
+                let val = simdutf8::basic::from_utf8(data).map_err(|_| {
+                    mark_unlikely();
+                    LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
+                })?;
                 Ok((
                     ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
                     content_size,
@@ -2259,6 +2263,23 @@ mod tests {
             result.0.to_owned().expect(crate::alloc::ALLOC_ERR_MSG),
             expected
         );
+    }
+
+    #[test]
+    fn test_text_decoders_reject_invalid_utf8() {
+        for result in [
+            read_value(&[0xff], SerialType::text(1)),
+            read_value_serial_type(&[0xff], 15),
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(LimboError::Corrupt(ref message))
+                        if message == "TEXT value contains invalid UTF-8"
+                ),
+                "unexpected result: {result:?}"
+            );
+        }
     }
 
     #[test]

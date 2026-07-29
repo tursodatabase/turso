@@ -932,7 +932,7 @@ mod tests {
         env,
         process::{Child, Command, Stdio},
         thread::sleep,
-        time::Duration,
+        time::{Duration, Instant},
     };
     use tempfile::TempDir;
     use turso_sync_sdk_kit::rsapi::PartialBootstrapStrategy;
@@ -1063,38 +1063,76 @@ mod tests {
                     client,
                 })
             } else {
-                let port: u16 = rand::rng().random_range(10_000..=65_535);
                 let server_bin = env::var("LOCAL_SYNC_SERVER").unwrap();
 
-                // IMPORTANT: do not use Stdio::piped() here. Nothing reads from
-                // those pipes, so once the kernel pipe buffer (~64 KiB on Linux)
-                // fills, the child blocks forever inside write() and stops
-                // servicing HTTP requests, deadlocking sync operations in
-                // long-running tests like test_sync_parallel_writes_with_sync_ops.
-                let child = Command::new(server_bin)
-                    .args(["--sync-server", &format!("0.0.0.0:{port}")])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .context("failed to spawn local sync server")?;
+                // The random port can be unusable: Windows runners reserve
+                // large chunks of 10_000..=65_535 for Hyper-V (bind fails with
+                // WSAEACCES), and concurrently running tests can collide on
+                // the same port. In both cases the server child exits right
+                // away, so waiting for readiness without watching the child
+                // hangs the test forever. Detect child exit and retry with a
+                // fresh port instead.
+                const SPAWN_ATTEMPTS: u32 = 10;
+                const READY_TIMEOUT: Duration = Duration::from_secs(60);
+                for attempt in 1..=SPAWN_ATTEMPTS {
+                    let port: u16 = rand::rng().random_range(10_000..=65_535);
 
-                let user_url = format!("http://localhost:{port}");
+                    // IMPORTANT: do not use Stdio::piped() here. Nothing reads from
+                    // those pipes, so once the kernel pipe buffer (~64 KiB on Linux)
+                    // fills, the child blocks forever inside write() and stops
+                    // servicing HTTP requests, deadlocking sync operations in
+                    // long-running tests like test_sync_parallel_writes_with_sync_ops.
+                    let mut child = Command::new(&server_bin)
+                        .args(["--sync-server", &format!("0.0.0.0:{port}")])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .context("failed to spawn local sync server")?;
 
-                // wait for server readiness
-                loop {
-                    if client.get(&user_url).send().await.is_ok() {
-                        break;
+                    let user_url = format!("http://localhost:{port}");
+
+                    // wait for server readiness
+                    let started = Instant::now();
+                    loop {
+                        if client.get(&user_url).send().await.is_ok() {
+                            return Ok(Self {
+                                user_url: user_url.clone(),
+                                db_url: user_url,
+                                host: String::new(),
+                                server: Some(child),
+                                client,
+                            });
+                        }
+                        match child
+                            .try_wait()
+                            .context("failed to poll local sync server")?
+                        {
+                            Some(status) => {
+                                // Child exited (most likely the port was
+                                // reserved or already taken): retry.
+                                eprintln!(
+                                    "local sync server on port {port} exited with {status} \
+                                     before becoming ready (attempt {attempt}/{SPAWN_ATTEMPTS})"
+                                );
+                                break;
+                            }
+                            None => {
+                                if started.elapsed() > READY_TIMEOUT {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                    return Err(anyhow!(
+                                        "local sync server on port {port} did not become ready \
+                                         within {READY_TIMEOUT:?}"
+                                    ));
+                                }
+                            }
+                        }
+                        sleep(Duration::from_millis(100));
                     }
-                    sleep(Duration::from_millis(100));
                 }
-
-                Ok(Self {
-                    user_url: user_url.clone(),
-                    db_url: user_url,
-                    host: String::new(),
-                    server: Some(child),
-                    client,
-                })
+                Err(anyhow!(
+                    "local sync server failed to start after {SPAWN_ATTEMPTS} attempts"
+                ))
             }
         }
 

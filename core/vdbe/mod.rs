@@ -3161,18 +3161,11 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 }
                 self.set_data_section(&data[content_size..]);
                 let text_data = &data[..content_size];
-                // SAFETY: TEXT serial type contains valid UTF-8
-                let text_str = if cfg!(debug_assertions) {
-                    match std::str::from_utf8(text_data) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return Some(Err(LimboError::InternalError(format!(
-                                "Invalid UTF-8 in TEXT serial type: {e}"
-                            ))));
-                        }
-                    }
-                } else {
-                    unsafe { std::str::from_utf8_unchecked(text_data) }
+                let Ok(text_str) = simdutf8::basic::from_utf8(text_data) else {
+                    mark_unlikely();
+                    return Some(Err(LimboError::Corrupt(
+                        "TEXT value contains invalid UTF-8".into(),
+                    )));
                 };
                 match dest {
                     Register::Value(Value::Text(existing_text)) => {
@@ -3215,6 +3208,26 @@ mod tests {
         ));
         state.active_op_state.clear();
         assert!(state.active_op_state.parse_schema().is_none());
+    }
+
+    #[test]
+    fn nth_into_register_rejects_invalid_utf8_text() {
+        let payload = [2, 15, 0xff];
+        let mut iterator = crate::types::ValueIterator::new(&payload).unwrap();
+        let mut destination = Register::Value(Value::Null);
+
+        let result = iterator
+            .nth_into_register(0, &mut destination)
+            .expect("record contains one value");
+
+        assert!(
+            matches!(
+                result,
+                Err(LimboError::Corrupt(ref message))
+                    if message == "TEXT value contains invalid UTF-8"
+            ),
+            "unexpected result: {result:?}"
+        );
     }
 
     #[test]
