@@ -77,6 +77,7 @@ libloading = "0.8.6"
 tantivy = { version = "0.26.0", optional = true }
 
 [dependencies]
+futures-core = "0.3.32"
 # aristo SDK from crates.io (0.4.x — latest; also carries the aristo::instrument
 # surface behind the `aristo_instrument` feature, for future state-exposure
 # accessors). Was a local sibling path (../../aristo) pre-OSS; the conformance
