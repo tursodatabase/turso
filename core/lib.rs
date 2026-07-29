@@ -3620,14 +3620,15 @@ mod database_tests {
     use std::sync::Arc;
 
     use super::{is_memory_like, Database, InitState};
-    use crate::storage::encryption::{CipherMode, EncryptionKey};
+    use crate::storage::encryption::EncryptionKey;
+    use crate::storage::page_transform::{
+        PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation,
+    };
     use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::{
-        storage::database::{
-            DatabaseFile, PageCodec, PageCodecHeaderInfo, PageCodecId, PageCodecLocation,
-        },
-        Connection, DatabaseOpts, DatabaseStorage, EncryptionOpts, IOResult, LimboError,
-        OpenDbAsyncState, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, IO,
+        storage::database::DatabaseFile, Connection, DatabaseOpts, DatabaseStorage, EncryptionOpts,
+        IOResult, LimboError, OpenDbAsyncState, OpenFlags, OpenOptions, PlatformIO, SqliteDialect,
+        IO,
     };
 
     #[test]
@@ -3666,23 +3667,21 @@ mod database_tests {
 
         fn encode_page(
             &self,
-            page: &[u8],
+            _context: PageCodecContext,
+            input: &[u8],
             output: &mut [u8],
-            _page_idx: usize,
-            _location: PageCodecLocation,
         ) -> crate::Result<()> {
-            output.copy_from_slice(page);
+            output.copy_from_slice(input);
             Ok(())
         }
 
         fn decode_page(
             &self,
-            page: &[u8],
+            _context: PageCodecContext,
+            input: &[u8],
             output: &mut [u8],
-            _page_idx: usize,
-            _location: PageCodecLocation,
         ) -> crate::Result<()> {
-            output.copy_from_slice(page);
+            output.copy_from_slice(input);
             Ok(())
         }
     }
@@ -3698,14 +3697,14 @@ mod database_tests {
             PageCodecId::new(*b"invalid-header-c")
         }
 
-        fn probe_header(
+        fn bootstrap_page_info(
             &self,
             _raw_page1_prefix: &[u8],
-        ) -> crate::Result<Option<PageCodecHeaderInfo>> {
-            Ok(Some(PageCodecHeaderInfo {
+        ) -> crate::Result<PageCodecHeaderInfo> {
+            Ok(PageCodecHeaderInfo {
                 page_size: self.page_size,
                 reserved_space: self.reserved_space,
-            }))
+            })
         }
 
         fn required_reserved_bytes(&self) -> u8 {
@@ -3714,23 +3713,21 @@ mod database_tests {
 
         fn encode_page(
             &self,
-            page: &[u8],
+            _context: PageCodecContext,
+            input: &[u8],
             output: &mut [u8],
-            _page_idx: usize,
-            _location: PageCodecLocation,
         ) -> crate::Result<()> {
-            output.copy_from_slice(page);
+            output.copy_from_slice(input);
             Ok(())
         }
 
         fn decode_page(
             &self,
-            page: &[u8],
+            _context: PageCodecContext,
+            input: &[u8],
             output: &mut [u8],
-            _page_idx: usize,
-            _location: PageCodecLocation,
         ) -> crate::Result<()> {
-            output.copy_from_slice(page);
+            output.copy_from_slice(input);
             Ok(())
         }
     }
@@ -3757,12 +3754,12 @@ mod database_tests {
             PageCodecId::new(id)
         }
 
-        fn probe_header(
+        fn bootstrap_page_info(
             &self,
             raw_page1_prefix: &[u8],
-        ) -> crate::Result<Option<PageCodecHeaderInfo>> {
+        ) -> crate::Result<PageCodecHeaderInfo> {
             if raw_page1_prefix.len() < 21 {
-                return Ok(None);
+                return Err(LimboError::NotADB);
             }
 
             let decoded_magic = raw_page1_prefix[..16]
@@ -3770,7 +3767,7 @@ mod database_tests {
                 .map(|byte| byte ^ self.mask)
                 .collect::<Vec<_>>();
             if decoded_magic.as_slice() != b"SQLite format 3\0" {
-                return Ok(None);
+                return Err(LimboError::NotADB);
             }
 
             let ps_raw = u16::from_be_bytes([
@@ -3778,10 +3775,10 @@ mod database_tests {
                 raw_page1_prefix[17] ^ self.mask,
             ]);
             let page_size = if ps_raw == 1 { 65536 } else { ps_raw as usize };
-            Ok(Some(PageCodecHeaderInfo {
+            Ok(PageCodecHeaderInfo {
                 page_size,
                 reserved_space: raw_page1_prefix[20] ^ self.mask,
-            }))
+            })
         }
 
         fn required_reserved_bytes(&self) -> u8 {
@@ -3790,23 +3787,21 @@ mod database_tests {
 
         fn encode_page(
             &self,
-            page: &[u8],
+            _context: PageCodecContext,
+            input: &[u8],
             output: &mut [u8],
-            _page_idx: usize,
-            _location: PageCodecLocation,
         ) -> crate::Result<()> {
-            self.transform(page, output);
+            self.transform(input, output);
             Ok(())
         }
 
         fn decode_page(
             &self,
-            page: &[u8],
+            _context: PageCodecContext,
+            input: &[u8],
             output: &mut [u8],
-            _page_idx: usize,
-            _location: PageCodecLocation,
         ) -> crate::Result<()> {
-            self.transform(page, output);
+            self.transform(input, output);
             Ok(())
         }
     }
@@ -3817,22 +3812,22 @@ mod database_tests {
     impl LocationPageCodec {
         const MASK: u8 = 0x6d;
 
-        fn byte_key(page_idx: usize, location: PageCodecLocation, offset: usize) -> u8 {
+        fn byte_key(page_no: u32, location: PageLocation, offset: usize) -> u8 {
             // Persisted transforms must not depend on the host pointer width.
-            let page_id_byte = (page_idx as u64).to_le_bytes()[offset % std::mem::size_of::<u64>()];
+            let page_id_byte = (page_no as u64).to_le_bytes()[offset % std::mem::size_of::<u64>()];
             let page_id_rotation =
                 ((offset / std::mem::size_of::<u64>()) % (u8::BITS as usize)) as u32;
             Self::MASK
                 ^ page_id_byte.rotate_left(page_id_rotation)
                 ^ match location {
-                    PageCodecLocation::Database => 0,
-                    PageCodecLocation::Wal => 0xa5,
+                    PageLocation::Database => 0,
+                    PageLocation::Wal => 0xa5,
                 }
         }
 
-        fn transform(page: &[u8], output: &mut [u8], page_idx: usize, location: PageCodecLocation) {
-            for (offset, (input, output)) in page.iter().zip(output).enumerate() {
-                *output = input ^ Self::byte_key(page_idx, location, offset);
+        fn transform(input: &[u8], output: &mut [u8], context: PageCodecContext) {
+            for (offset, (input, output)) in input.iter().zip(output).enumerate() {
+                *output = input ^ Self::byte_key(context.page_no, context.location, offset);
             }
         }
     }
@@ -3842,12 +3837,12 @@ mod database_tests {
             PageCodecId::new(*b"location-page-co")
         }
 
-        fn probe_header(
+        fn bootstrap_page_info(
             &self,
             raw_page1_prefix: &[u8],
-        ) -> crate::Result<Option<PageCodecHeaderInfo>> {
+        ) -> crate::Result<PageCodecHeaderInfo> {
             if raw_page1_prefix.len() < 21 {
-                return Ok(None);
+                return Err(LimboError::NotADB);
             }
             if !raw_page1_prefix[..16]
                 .iter()
@@ -3856,31 +3851,31 @@ mod database_tests {
                 .all(|((offset, encoded), expected)| {
                     *encoded
                         ^ Self::byte_key(
-                            DatabaseHeader::PAGE_ID,
-                            PageCodecLocation::Database,
+                            DatabaseHeader::PAGE_ID as u32,
+                            PageLocation::Database,
                             offset,
                         )
                         == *expected
                 })
             {
-                return Ok(None);
+                return Err(LimboError::NotADB);
             }
 
             let page_size = u16::from_be_bytes([
                 raw_page1_prefix[16]
-                    ^ Self::byte_key(DatabaseHeader::PAGE_ID, PageCodecLocation::Database, 16),
+                    ^ Self::byte_key(DatabaseHeader::PAGE_ID as u32, PageLocation::Database, 16),
                 raw_page1_prefix[17]
-                    ^ Self::byte_key(DatabaseHeader::PAGE_ID, PageCodecLocation::Database, 17),
+                    ^ Self::byte_key(DatabaseHeader::PAGE_ID as u32, PageLocation::Database, 17),
             ]);
-            Ok(Some(PageCodecHeaderInfo {
+            Ok(PageCodecHeaderInfo {
                 page_size: if page_size == 1 {
                     65_536
                 } else {
                     page_size as usize
                 },
                 reserved_space: raw_page1_prefix[20]
-                    ^ Self::byte_key(DatabaseHeader::PAGE_ID, PageCodecLocation::Database, 20),
-            }))
+                    ^ Self::byte_key(DatabaseHeader::PAGE_ID as u32, PageLocation::Database, 20),
+            })
         }
 
         fn required_reserved_bytes(&self) -> u8 {
@@ -3889,23 +3884,21 @@ mod database_tests {
 
         fn encode_page(
             &self,
-            page: &[u8],
+            context: PageCodecContext,
+            input: &[u8],
             output: &mut [u8],
-            page_idx: usize,
-            location: PageCodecLocation,
         ) -> crate::Result<()> {
-            Self::transform(page, output, page_idx, location);
+            Self::transform(input, output, context);
             Ok(())
         }
 
         fn decode_page(
             &self,
-            page: &[u8],
+            context: PageCodecContext,
+            input: &[u8],
             output: &mut [u8],
-            page_idx: usize,
-            location: PageCodecLocation,
         ) -> crate::Result<()> {
-            Self::transform(page, output, page_idx, location);
+            Self::transform(input, output, context);
             Ok(())
         }
     }
@@ -3915,12 +3908,15 @@ mod database_tests {
         let input = vec![0; 512];
         let mut page_one = vec![0; input.len()];
         let mut page_two_fifty_seven = vec![0; input.len()];
-        LocationPageCodec::transform(&input, &mut page_one, 1, PageCodecLocation::Database);
+        LocationPageCodec::transform(
+            &input,
+            &mut page_one,
+            PageCodecContext::new(1, PageLocation::Database),
+        );
         LocationPageCodec::transform(
             &input,
             &mut page_two_fifty_seven,
-            257,
-            PageCodecLocation::Database,
+            PageCodecContext::new(257, PageLocation::Database),
         );
 
         assert_ne!(page_one, page_two_fifty_seven);
@@ -3929,19 +3925,18 @@ mod database_tests {
         LocationPageCodec::transform(
             &page_two_fifty_seven,
             &mut decoded,
-            257,
-            PageCodecLocation::Database,
+            PageCodecContext::new(257, PageLocation::Database),
         );
         assert_eq!(decoded, input);
     }
 
     #[derive(Debug)]
-    struct XorNoProbePageCodec {
+    struct XorDefaultBootstrapPageCodec {
         mask: u8,
         reserved_bytes: u8,
     }
 
-    impl XorNoProbePageCodec {
+    impl XorDefaultBootstrapPageCodec {
         fn transform(&self, page: &[u8], output: &mut [u8]) {
             for (input, output) in page.iter().zip(output) {
                 *output = input ^ self.mask;
@@ -3949,7 +3944,7 @@ mod database_tests {
         }
     }
 
-    impl PageCodec for XorNoProbePageCodec {
+    impl PageCodec for XorDefaultBootstrapPageCodec {
         fn codec_id(&self) -> PageCodecId {
             let mut id = *b"xor-no-probe----";
             id[15] = self.mask;
@@ -3963,23 +3958,21 @@ mod database_tests {
 
         fn encode_page(
             &self,
-            page: &[u8],
+            _context: PageCodecContext,
+            input: &[u8],
             output: &mut [u8],
-            _page_idx: usize,
-            _location: PageCodecLocation,
         ) -> crate::Result<()> {
-            self.transform(page, output);
+            self.transform(input, output);
             Ok(())
         }
 
         fn decode_page(
             &self,
-            page: &[u8],
+            _context: PageCodecContext,
+            input: &[u8],
             output: &mut [u8],
-            _page_idx: usize,
-            _location: PageCodecLocation,
         ) -> crate::Result<()> {
-            self.transform(page, output);
+            self.transform(input, output);
             Ok(())
         }
     }
@@ -4012,7 +4005,7 @@ mod database_tests {
         loop {
             match Database::open_async(&mut state, io.clone(), path, &options)? {
                 IOResult::Done(db) => return Ok(db),
-                IOResult::IO(completion) => completion.wait(&*io).unwrap(),
+                IOResult::IO(completion) => completion.wait(&*io)?,
             }
         }
     }
@@ -4101,18 +4094,16 @@ mod database_tests {
         let codec: Arc<dyn PageCodec> = Arc::new(IdentityPageCodec);
         let _db = open_with_page_codec(io.clone(), path, codec.clone());
 
-        let err = Database::open_file_with_flags_and_page_codec(
+        let err = Database::open(
             io,
             path,
-            OpenFlags::Create,
-            DatabaseOpts::new(),
-            Some(EncryptionOpts {
-                cipher: "aes256gcm".to_string(),
-                hexkey: "00".repeat(32),
-            }),
-            None,
-            codec,
-            Arc::new(SqliteDialect),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .flags(OpenFlags::Create)
+                .encryption(EncryptionOpts {
+                    cipher: "aes256gcm".to_string(),
+                    hexkey: "00".repeat(32),
+                })
+                .page_codec(codec),
         )
         .unwrap_err();
         assert!(err
@@ -4128,15 +4119,13 @@ mod database_tests {
         let path_str = path.to_str().unwrap();
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
 
-        let err = Database::open_file_with_flags_and_page_codec(
+        let err = Database::open(
             io,
             path_str,
-            OpenFlags::Create,
-            DatabaseOpts::new().with_multiprocess_wal(true),
-            None,
-            None,
-            Arc::new(IdentityPageCodec),
-            Arc::new(SqliteDialect),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .flags(OpenFlags::Create)
+                .db_opts(DatabaseOpts::new().with_multiprocess_wal(true))
+                .page_codec(Arc::new(IdentityPageCodec) as Arc<dyn PageCodec>),
         )
         .unwrap_err();
 
@@ -4160,19 +4149,12 @@ mod database_tests {
         let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(file));
         let mut state = OpenDbAsyncState::new();
 
-        let err = match Database::open_with_flags_bypass_registry_and_page_codec_async(
-            &mut state,
-            io,
-            path,
-            None,
-            db_file,
-            OpenFlags::Create,
-            DatabaseOpts::new().with_multiprocess_wal(true),
-            None,
-            None,
-            Arc::new(IdentityPageCodec),
-            Arc::new(SqliteDialect),
-        ) {
+        let options = OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(db_file)
+            .flags(OpenFlags::Create)
+            .db_opts(DatabaseOpts::new().with_multiprocess_wal(true))
+            .page_codec(Arc::new(IdentityPageCodec) as Arc<dyn PageCodec>);
+        let err = match Database::do_open_async(&mut state, io, path, &options) {
             Err(err) => err,
             Ok(_) => panic!("multiprocess WAL must reject an external page codec"),
         };
@@ -4219,7 +4201,7 @@ mod database_tests {
 
     #[cfg(feature = "fs")]
     #[test]
-    fn page_codec_round_trips_wal_and_checkpointed_database_with_probe_header() {
+    fn page_codec_round_trips_wal_and_checkpointed_database_with_bootstrap_header() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-roundtrip.db");
         let path = path.to_str().unwrap();
@@ -4314,12 +4296,12 @@ mod database_tests {
 
     #[cfg(feature = "fs")]
     #[test]
-    fn page_codec_reopen_requires_header_probe() {
+    fn page_codec_reopen_requires_recoverable_bootstrap_header() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-no-probe-roundtrip.db");
         let path = path.to_str().unwrap();
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let codec: Arc<dyn PageCodec> = Arc::new(XorNoProbePageCodec {
+        let codec: Arc<dyn PageCodec> = Arc::new(XorDefaultBootstrapPageCodec {
             mask: 0x3c,
             reserved_bytes: 1,
         });
@@ -4338,7 +4320,7 @@ mod database_tests {
         let err = open_with_page_codec_result(io, path, codec).unwrap_err();
         assert!(err
             .to_string()
-            .contains("page codec must implement probe_header"));
+            .contains("page codec reported invalid page size"));
     }
 
     #[cfg(feature = "fs")]
@@ -4449,6 +4431,7 @@ mod database_tests {
                 .unwrap();
             conn.execute("create table test(id integer primary key)")
                 .unwrap();
+            conn.execute("pragma wal_checkpoint(truncate)").unwrap();
         }
 
         for (codec, expected_error) in [
@@ -4465,6 +4448,13 @@ mod database_tests {
                     reserved_space: 33,
                 },
                 "page codec reported invalid reserved space 33 for page size 512",
+            ),
+            (
+                InvalidHeaderPageCodec {
+                    page_size: 8192,
+                    reserved_space: 0,
+                },
+                "page codec bootstrap page size 8192 does not match decoded page-1 size 4096",
             ),
         ] {
             let err = open_with_page_codec_result(io.clone(), path, Arc::new(codec)).unwrap_err();
@@ -4688,36 +4678,6 @@ mod database_tests {
             .to_string()
             .contains("page codec requires exactly 1 reserved bytes"));
         assert_eq!(conn.get_reserved_bytes(), Some(1));
-    }
-
-    #[cfg(feature = "fs")]
-    #[test]
-    fn encryption_rejects_reserved_space_mutation() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let path = temp_dir.path().join("encrypted-reserved-space.db");
-        let path = path.to_str().unwrap();
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(
-            io,
-            path,
-            OpenFlags::Create,
-            DatabaseOpts::new().with_encryption(true),
-            None,
-            Arc::new(SqliteDialect),
-        )
-        .unwrap();
-        let conn = db.connect().unwrap();
-        conn.set_encryption_cipher(CipherMode::Aes256Gcm).unwrap();
-        conn.set_encryption_key(EncryptionKey::from_hex_string(&"00".repeat(32)).unwrap())
-            .unwrap();
-        let reserved_before = conn.get_reserved_bytes();
-
-        let err = conn.set_reserved_bytes(0).unwrap_err();
-
-        assert!(err
-            .to_string()
-            .contains("built-in encryption requires exactly 28 reserved bytes"));
-        assert_eq!(conn.get_reserved_bytes(), reserved_before);
     }
 
     #[cfg(feature = "fs")]
