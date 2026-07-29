@@ -11,7 +11,7 @@ The differential fuzzer compares Turso results against SQLite for generated SQL 
 
 ## Location
 
-`testing/differential-oracle/fuzzer/`
+`sqlite/conformance/differential/fuzzer/`
 
 ## Running the Fuzzer
 
@@ -54,7 +54,7 @@ cargo run --bin differential_fuzzer -- loop 50
 
 ```bash
 # Build and run from repo root
-docker build -f testing/differential-oracle/fuzzer/docker-runner/Dockerfile -t fuzzer .
+docker build -f sqlite/conformance/differential/fuzzer/docker-runner/Dockerfile -t fuzzer .
 docker run -e GITHUB_TOKEN=xxx -e SLACK_WEBHOOK_URL=xxx fuzzer
 ```
 

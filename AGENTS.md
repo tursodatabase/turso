@@ -40,7 +40,7 @@ Default: add coverage to the narrowest existing test harness that can express th
 - `testing/cli_tests/` - CLI-focused Python coverage for shell behavior and end-to-end command workflows.
 - `tests/fuzz/` - minimized fuzz regressions and targeted edge cases that are easier to keep as Rust tests.
 - `testing/simulator/` and `testing/concurrent-simulator/` - deterministic concurrency, scheduling, and failure-injection coverage for state-machine and I/O correctness.
-- `testing/differential-oracle/` and `testing/stress/` - differential and long-running stress tooling. Use these for deeper investigation or specialized validation, not as the first stop for a focused regression test.
+- `sqlite/conformance/differential/` and `testing/stress/` - differential and long-running stress tooling. Use these for deeper investigation or specialized validation, not as the first stop for a focused regression test.
 
 ## Structure
 
@@ -52,7 +52,7 @@ limbo/
 ├── cli/            # tursodb CLI (REPL, MCP server, sync server)
 ├── bindings/       # Python, JS, Java, .NET, Go, Rust
 ├── extensions/     # crypto, regexp, csv, fuzzy, ipaddr, percentile
-├── testing/        # simulator/, concurrent-simulator/, differential-oracle/
+├── testing/        # simulator/, concurrent-simulator/
 ├── sync/           # engine/, sdk-kit/ (Turso Cloud sync)
 ├── sdk-kit/        # High-level SDK abstraction
 └── tools/          # dbhash utility

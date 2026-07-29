@@ -167,7 +167,7 @@ export class GithubClient {
 ### Run locally with Docker
 
 \`\`\`
-docker buildx build -t differential-fuzzer:${gitShortHash} -f testing/differential-oracle/fuzzer/docker-runner/Dockerfile . --build-arg GIT_HASH=$(git rev-parse HEAD)
+docker buildx build -t differential-fuzzer:${gitShortHash} -f sqlite/conformance/differential/fuzzer/docker-runner/Dockerfile . --build-arg GIT_HASH=$(git rev-parse HEAD)
 docker run --network host differential-fuzzer:${gitShortHash} ${fault.command}
 \`\`\`
 
