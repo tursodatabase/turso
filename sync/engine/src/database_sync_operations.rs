@@ -305,6 +305,7 @@ pub(crate) fn is_logically_replayable_table(name: &str) -> bool {
     !name.starts_with(SQLITE_INTERNAL_PREFIX)
         && !name.starts_with(TURSO_INTERNAL_PREFIX)
         && name != TURSO_SYNC_TABLE_NAME
+        && name != TURSO_SYNC_PUSH_BOUNDARIES_TABLE_NAME
         && name != TURSO_CDC_TABLE_NAME
         && name != TURSO_CDC_VERSION_TABLE_NAME
 }
@@ -2351,6 +2352,21 @@ pub async fn wal_push<IO: SyncEngineIo, Ctx>(
 }
 
 pub const TURSO_SYNC_TABLE_NAME: &str = "turso_sync_last_change_id";
+/// Local-only internal table holding the push-boundary log (see
+/// [`crate::types::PushBoundary`]). Lives in the database itself - next to
+/// `turso_sync_last_change_id` - so that boundary rows always stay mutually
+/// consistent with the sync row they are interpreted against, and so that the
+/// rebase can persist translated values adjacent to the renumbering that
+/// produced them. Never pushed to the remote.
+pub const TURSO_SYNC_PUSH_BOUNDARIES_TABLE_NAME: &str = "turso_sync_push_boundaries";
+const TURSO_SYNC_CREATE_PUSH_BOUNDARIES_TABLE: &str =
+    "CREATE TABLE IF NOT EXISTS turso_sync_push_boundaries (client_id TEXT, sent_pull_gen INTEGER, sent_last_change_id INTEGER, cur_pull_gen INTEGER, cur_change_id INTEGER, confirmed INTEGER, PRIMARY KEY (client_id, sent_pull_gen, sent_last_change_id))";
+const TURSO_SYNC_SELECT_PUSH_BOUNDARIES: &str =
+    "SELECT sent_pull_gen, sent_last_change_id, cur_pull_gen, cur_change_id, confirmed FROM turso_sync_push_boundaries WHERE client_id = ? ORDER BY sent_pull_gen, sent_last_change_id";
+const TURSO_SYNC_DELETE_PUSH_BOUNDARIES: &str =
+    "DELETE FROM turso_sync_push_boundaries WHERE client_id = ?";
+const TURSO_SYNC_INSERT_PUSH_BOUNDARY: &str =
+    "INSERT INTO turso_sync_push_boundaries (client_id, sent_pull_gen, sent_last_change_id, cur_pull_gen, cur_change_id, confirmed) VALUES (?, ?, ?, ?, ?, ?)";
 pub const TURSO_SYNC_CREATE_TABLE: &str =
     "CREATE TABLE IF NOT EXISTS turso_sync_last_change_id (client_id TEXT PRIMARY KEY, pull_gen INTEGER, change_id INTEGER)";
 pub const TURSO_SYNC_INSERT_LAST_CHANGE_ID: &str =
@@ -2568,32 +2584,44 @@ pub async fn ensure_sync_last_change_id_table<Ctx>(
     conn: &Arc<turso_core::Connection>,
     client_id: &str,
 ) -> Result<()> {
+    ensure_internal_table(
+        coro,
+        conn,
+        TURSO_SYNC_TABLE_NAME,
+        TURSO_SYNC_CREATE_TABLE,
+        &format!("sync high-water mark table initialization: client_id={client_id}"),
+    )
+    .await
+}
+
+async fn ensure_internal_table<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+    table_name: &str,
+    create_sql: &str,
+    context: &str,
+) -> Result<()> {
     for attempt in 0..=2 {
-        match conn.execute(TURSO_SYNC_CREATE_TABLE) {
+        match conn.execute(create_sql) {
             Ok(()) => {
                 conn.publish_schema_if_newer();
                 return Ok(());
             }
             Err(LimboError::ParseError(err)) if err.contains("already exists") => {
                 tracing::debug!(
-                    "update_last_change_id(client_id={client_id}): sync table already exists while initializing; refreshing schema"
+                    "{context}: table already exists while initializing; refreshing schema"
                 );
                 conn.publish_schema_if_newer();
                 return Ok(());
             }
             Err(LimboError::SchemaUpdated) => {
-                tracing::debug!(
-                    "update_last_change_id(client_id={client_id}): schema updated while initializing sync table; refreshing schema"
-                );
+                tracing::debug!("{context}: schema updated while initializing; refreshing schema");
                 force_reparse_schema_with_retry(conn)?;
-                publish_schema_after_external_restore(
-                    conn,
-                    "sync high-water mark table initialization",
-                )?;
+                publish_schema_after_external_restore(conn, context)?;
                 if attempt == 2 {
                     return Ok(());
                 }
-                match has_table(coro, conn, TURSO_SYNC_TABLE_NAME).await {
+                match has_table(coro, conn, table_name).await {
                     Ok(true) => return Ok(()),
                     Ok(false) => continue,
                     Err(Error::TursoError(LimboError::SchemaUpdated)) => continue,
@@ -2604,7 +2632,7 @@ pub async fn ensure_sync_last_change_id_table<Ctx>(
         }
     }
     Err(Error::DatabaseSyncEngineError(format!(
-        "failed to initialize sync high-water mark table after schema refresh: client_id={client_id}"
+        "failed to initialize internal table after schema refresh: {context}"
     )))
 }
 
@@ -2663,6 +2691,137 @@ pub async fn read_last_change_id<Ctx>(
         None => {
             tracing::info!("read_last_change_id: client_id={client_id}, turso_sync_last_change_id client id is not found");
             Ok((0, None))
+        }
+    }
+}
+
+/// Read this client's push-boundary log in log order. Returns an empty log
+/// when the table does not exist yet (the client never pushed) or when the
+/// stored rows are expressed in a numbering other than `cur_pull_gen` - a
+/// crash between a rebase commit and the post-rebase log rewrite leaves
+/// stale-numbering rows behind, and using their translated values would
+/// produce wrong floors; dropping them degrades to the conservative row-only
+/// behavior instead.
+pub async fn read_push_boundaries<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+    client_id: &str,
+    cur_pull_gen: i64,
+) -> Result<Vec<PushBoundary>> {
+    let mut select_stmt = match conn.prepare(TURSO_SYNC_SELECT_PUSH_BOUNDARIES) {
+        Ok(stmt) => stmt,
+        Err(LimboError::ParseError(..)) => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    select_stmt.bind_at(
+        1.try_into().unwrap(),
+        Value::Text(Text::new(client_id.to_string())),
+    )?;
+    let mut boundaries = Vec::new();
+    while let Some(row) = run_stmt_once(coro, &mut select_stmt).await? {
+        let values: Vec<turso_core::Value> = row.get_values().cloned().collect();
+        let int = |i: usize, what: &str| {
+            values[i].as_int().ok_or_else(|| {
+                Error::DatabaseSyncEngineError(format!("unexpected push boundary {what} type"))
+            })
+        };
+        if int(2, "cur_pull_gen")? != cur_pull_gen {
+            tracing::warn!(
+                "read_push_boundaries(client_id={client_id}): dropping stale-numbering boundary log"
+            );
+            return Ok(Vec::new());
+        }
+        boundaries.push(PushBoundary {
+            sent_pull_gen: int(0, "sent_pull_gen")?,
+            sent_last_change_id: int(1, "sent_last_change_id")?,
+            cur_change_id: int(3, "cur_change_id")?,
+            confirmed: int(4, "confirmed")? != 0,
+        });
+    }
+    Ok(boundaries)
+}
+
+/// Replace this client's push-boundary log. Must be called adjacent to the
+/// sync row write it is interpreted against (same transaction when the
+/// caller holds one) so the two stay mutually consistent.
+pub async fn write_push_boundaries<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+    client_id: &str,
+    cur_pull_gen: i64,
+    boundaries: &[PushBoundary],
+) -> Result<()> {
+    tracing::info!(
+        "write_push_boundaries(client_id={client_id}): {} records, cur_pull_gen={cur_pull_gen}",
+        boundaries.len()
+    );
+    if !has_table(coro, conn, TURSO_SYNC_PUSH_BOUNDARIES_TABLE_NAME).await? {
+        ensure_internal_table(
+            coro,
+            conn,
+            TURSO_SYNC_PUSH_BOUNDARIES_TABLE_NAME,
+            TURSO_SYNC_CREATE_PUSH_BOUNDARIES_TABLE,
+            "push boundaries table initialization",
+        )
+        .await?;
+    }
+    let mut delete_stmt = conn.prepare(TURSO_SYNC_DELETE_PUSH_BOUNDARIES)?;
+    delete_stmt.bind_at(
+        1.try_into().unwrap(),
+        Value::Text(Text::new(client_id.to_string())),
+    )?;
+    run_stmt_ignore_rows(coro, &mut delete_stmt).await?;
+    for boundary in boundaries {
+        let mut insert_stmt = conn.prepare(TURSO_SYNC_INSERT_PUSH_BOUNDARY)?;
+        insert_stmt.bind_at(
+            1.try_into().unwrap(),
+            Value::Text(Text::new(client_id.to_string())),
+        )?;
+        insert_stmt.bind_at(
+            2.try_into().unwrap(),
+            Value::from_i64(boundary.sent_pull_gen),
+        )?;
+        insert_stmt.bind_at(
+            3.try_into().unwrap(),
+            Value::from_i64(boundary.sent_last_change_id),
+        )?;
+        insert_stmt.bind_at(4.try_into().unwrap(), Value::from_i64(cur_pull_gen))?;
+        insert_stmt.bind_at(
+            5.try_into().unwrap(),
+            Value::from_i64(boundary.cur_change_id),
+        )?;
+        insert_stmt.bind_at(
+            6.try_into().unwrap(),
+            Value::from_i64(boundary.confirmed as i64),
+        )?;
+        run_stmt_ignore_rows(coro, &mut insert_stmt).await?;
+    }
+    Ok(())
+}
+
+/// Persist the push-boundary log in one transaction: the DELETE + INSERT
+/// rewrite must never be observable half-done, or a crash could lose the only
+/// record of an in-flight batch.
+async fn persist_push_boundaries<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+    client_id: &str,
+    cur_pull_gen: i64,
+    boundaries: &[PushBoundary],
+) -> Result<()> {
+    let mut begin_stmt = conn.prepare("BEGIN IMMEDIATE")?;
+    run_stmt_ignore_rows(coro, &mut begin_stmt).await?;
+    match write_push_boundaries(coro, conn, client_id, cur_pull_gen, boundaries).await {
+        Ok(()) => {
+            let mut commit_stmt = conn.prepare("COMMIT")?;
+            run_stmt_ignore_rows(coro, &mut commit_stmt).await?;
+            Ok(())
+        }
+        Err(err) => {
+            if let Err(rollback_err) = conn.execute("ROLLBACK") {
+                tracing::error!("failed to rollback push boundaries rewrite: {rollback_err}");
+            }
+            Err(err)
         }
     }
 }
@@ -2757,7 +2916,6 @@ pub async fn fetch_last_change_id<IO: SyncEngineIo, Ctx>(
 
 pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
-    engine: &crate::database_sync_engine::DatabaseSyncEngine<IO>,
     source: &DatabaseTape,
     client_id: &str,
     opts: &DatabaseSyncEngineOpts,
@@ -2767,53 +2925,55 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
 
     let (source_pull_gen, remote_row) = fetch_last_change_id(ctx, &source_conn, client_id).await?;
 
+    // The boundary log is maintained for the WAL-mode flow only: the logical
+    // MVCC flow never bumps the pull generation, so its sync-row values stay
+    // directly comparable and need no translation.
+    let boundaries_enabled = !source_conn.mvcc_enabled();
+    let mut boundaries = if boundaries_enabled {
+        read_push_boundaries(ctx.coro, &source_conn, client_id, source_pull_gen).await?
+    } else {
+        Vec::new()
+    };
+
     // Resolve an unconfirmed boundary (batch sent, response lost) against the
     // live remote row: the row is written atomically with each batch, so the
     // batch landed iff the row is at or past its frozen send-time
     // coordinates - a check that stays valid across rebases because the
     // send-time coordinates are never renumbered.
-    let unconfirmed = engine
-        .meta()
-        .push_boundaries
-        .iter()
-        .find(|b| !b.confirmed)
-        .cloned();
-    if let Some(unconfirmed) = unconfirmed {
+    if let Some(unconfirmed) = boundaries.iter().find(|b| !b.confirmed).cloned() {
         let landed = remote_row.is_some_and(|(row_gen, row_id)| {
             row_gen == unconfirmed.sent_pull_gen && row_id >= unconfirmed.sent_last_change_id
         });
         tracing::info!(
             "push_logical_changes: client_id={client_id}, unconfirmed boundary resolved: landed={landed}, boundary={unconfirmed:?}"
         );
-        engine
-            .update_meta(ctx.coro, |m| {
-                if landed {
-                    for boundary in m.push_boundaries.iter_mut() {
-                        boundary.confirmed = true;
-                    }
-                } else {
-                    // the batch provably never landed - it is not a boundary
-                    // on the remote and its changes are still unconfirmed
-                    m.push_boundaries.retain(|b| b.confirmed);
-                }
-            })
-            .await?;
-    }
-    // push floor: the newest confirmed boundary, usable only while its
-    // translated value is still in the current numbering
-    let confirmed = {
-        let meta = engine.meta();
-        if meta.push_boundaries_pull_gen == source_pull_gen {
-            meta.push_boundaries
-                .iter()
-                .rev()
-                .find(|b| b.confirmed)
-                .map(|b| b.cur_change_id)
-                .unwrap_or(0)
+        if landed {
+            for boundary in boundaries.iter_mut() {
+                boundary.confirmed = true;
+            }
         } else {
-            0
+            // the batch provably never landed - it is not a boundary on the
+            // remote and its changes are still unconfirmed
+            boundaries.retain(|b| b.confirmed);
         }
-    };
+        persist_push_boundaries(
+            ctx.coro,
+            &source_conn,
+            client_id,
+            source_pull_gen,
+            &boundaries,
+        )
+        .await?;
+    }
+    // push floor: the newest confirmed boundary. The table is rewritten
+    // adjacent to every sync-row renumbering, so its translated values are
+    // always in the current numbering.
+    let confirmed = boundaries
+        .iter()
+        .rev()
+        .find(|b| b.confirmed)
+        .map(|b| b.cur_change_id)
+        .unwrap_or(0);
     if let Some((row_gen, row_id)) = remote_row {
         // Only this client's pushes write its sync row, and every push starts
         // at or above the confirmed watermark - so a same-generation row below
@@ -2855,7 +3015,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         use_implicit_rowid: false,
     };
 
-    let generator = DatabaseReplayGenerator::new(source_conn, replay_opts);
+    let generator = DatabaseReplayGenerator::new(source_conn.clone(), replay_opts);
 
     let iterate_opts = DatabaseChangesIteratorOpts {
         first_change_id: last_change_id.map(|x| x + 1),
@@ -2925,32 +3085,31 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                 // process: if the response is lost, this is the only record
                 // that the batch may have been applied - without it the batch
                 // would be pushed (and applied) twice after a rebase
-                engine
-                    .update_meta(ctx.coro, |m| {
-                        debug_assert!(
-                            m.push_boundaries.iter().all(|b| b.confirmed),
-                            "an unconfirmed boundary must be resolved before sending more"
-                        );
-                        if m.push_boundaries_pull_gen != source_pull_gen {
-                            // translated values in an old numbering are
-                            // unusable - matching them against future pulls
-                            // would produce wrong floors, so start over
-                            m.push_boundaries.clear();
-                            m.push_boundaries_pull_gen = source_pull_gen;
-                        }
-                        m.push_boundaries.push(PushBoundary {
-                            sent_pull_gen: source_pull_gen,
-                            sent_last_change_id,
-                            cur_change_id: sent_last_change_id,
-                            confirmed: false,
-                        });
-                        // dropping the oldest confirmed record only costs
-                        // extra replay for pulls staler than the whole log
-                        while m.push_boundaries.len() > PUSH_BOUNDARIES_LIMIT {
-                            m.push_boundaries.remove(0);
-                        }
-                    })
+                if boundaries_enabled {
+                    debug_assert!(
+                        boundaries.iter().all(|b| b.confirmed),
+                        "an unconfirmed boundary must be resolved before sending more"
+                    );
+                    boundaries.push(PushBoundary {
+                        sent_pull_gen: source_pull_gen,
+                        sent_last_change_id,
+                        cur_change_id: sent_last_change_id,
+                        confirmed: false,
+                    });
+                    // dropping the oldest confirmed record only costs extra
+                    // replay for pulls staler than the whole log
+                    while boundaries.len() > PUSH_BOUNDARIES_LIMIT {
+                        boundaries.remove(0);
+                    }
+                    persist_push_boundaries(
+                        ctx.coro,
+                        &source_conn,
+                        client_id,
+                        source_pull_gen,
+                        &boundaries,
+                    )
                     .await?;
+                }
                 let (rows_changed, next_change_id) = send_push_batch(
                     ctx,
                     &generator,
@@ -2967,13 +3126,19 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                 );
                 total_rows_changed += rows_changed;
                 last_change_id = Some(next_change_id);
-                engine
-                    .update_meta(ctx.coro, |m| {
-                        for boundary in m.push_boundaries.iter_mut() {
-                            boundary.confirmed = true;
-                        }
-                    })
+                if boundaries_enabled {
+                    for boundary in boundaries.iter_mut() {
+                        boundary.confirmed = true;
+                    }
+                    persist_push_boundaries(
+                        ctx.coro,
+                        &source_conn,
+                        client_id,
+                        source_pull_gen,
+                        &boundaries,
+                    )
                     .await?;
+                }
                 batch.clear();
             }
         }

@@ -144,25 +144,6 @@ pub struct DatabaseMetadata {
     pub last_pushed_change_id_hint: i64,
     #[serde(default)]
     pub last_pushed_replay_floor_change_id_hint: i64,
-    /// Pull generation in which the `cur_change_id` values of
-    /// `push_boundaries` are expressed. A rebase re-numbers CDC change ids;
-    /// every rebase translates the values into the new numbering, so
-    /// consumers must ignore them when this tag does not match the local
-    /// pull generation (e.g. after a crash between the rebase commit and the
-    /// metadata write). The frozen `sent_*` coordinates stay valid always.
-    #[serde(default)]
-    pub push_boundaries_pull_gen: i64,
-    /// Ordered log of push-batch boundaries: one record per batch sent to
-    /// the remote, retained until an applied pull proves the batch is
-    /// contained in the pulled state (or proves a lost batch never landed).
-    /// The remote sync row is written atomically with each batch, so any
-    /// consistent pulled state names one of these boundaries - looking it up
-    /// gives the exact replay floor for that pull, no matter how stale the
-    /// pulled state is. The newest confirmed record is the push floor.
-    /// Capped at [`PUSH_BOUNDARIES_LIMIT`]; dropping old confirmed records
-    /// only costs extra replay for extremely stale pulls, never correctness.
-    #[serde(default)]
-    pub push_boundaries: Vec<PushBoundary>,
     pub partial_bootstrap_server_revision: Option<DatabasePullRevision>,
     #[serde(default)]
     pub fresh_bootstrap_pending_cdc_ack: bool,
@@ -179,17 +160,25 @@ pub struct DatabaseMetadata {
 /// record is never dropped; old confirmed records are.
 pub const PUSH_BOUNDARIES_LIMIT: usize = 32;
 
-/// One push batch boundary.
+/// One push batch boundary — a row of the local-only internal
+/// `turso_sync_push_boundaries` table. One record per batch sent to the
+/// remote, persisted BEFORE the batch leaves, retained until an applied pull
+/// proves the batch contained in the pulled state (or proves a lost batch
+/// never landed). The remote sync row is written atomically with each batch,
+/// so any consistent pulled state names one of these boundaries — looking it
+/// up gives the exact replay floor for that pull, no matter how stale the
+/// pulled state is. The newest confirmed record is the push floor.
 ///
 /// `sent_*` are frozen in the numbering that was current when the batch was
-/// sent: the server sync row is written atomically with the batch, so a
-/// consistent server-side state contains the batch iff its row is at or past
+/// sent: the batch landed iff an observed sync row is at or past
 /// `(sent_pull_gen, sent_last_change_id)` in batch order — a comparison that
 /// stays valid after any number of local rebases. `cur_change_id` is the
-/// same boundary translated into the current local numbering by each rebase
-/// (numbering tagged by `DatabaseMetadata::push_boundaries_pull_gen`).
+/// same boundary translated into the current local numbering by each rebase,
+/// rewritten next to the sync row so the two stay mutually consistent.
 /// `confirmed` is false while the batch response is lost and the outcome is
-/// unknown; at most the newest record can be unconfirmed.
+/// unknown; at most the newest record can be unconfirmed. The log is capped
+/// at [`PUSH_BOUNDARIES_LIMIT`]; dropping old confirmed records only costs
+/// extra replay for pulls staler than the whole log, never correctness.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct PushBoundary {
     pub sent_pull_gen: i64,

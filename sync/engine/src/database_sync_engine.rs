@@ -18,10 +18,11 @@ use crate::{
         apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats,
         apply_transformation, bootstrap_db_file, connect_untracked, count_local_changes, has_table,
         is_logically_replayable_table, max_local_change_id, pull_updates_v1, push_logical_changes,
-        read_last_change_id, read_logical_replay_table_map, read_wal_salt, reset_wal_file,
-        should_replay_local_change, sync_file, update_last_change_id, wait_all_results,
-        wal_apply_from_file, wal_pull_to_file, PullUpdatesV1Result, SyncEngineIoStats,
-        SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
+        read_last_change_id, read_logical_replay_table_map, read_push_boundaries, read_wal_salt,
+        reset_wal_file, should_replay_local_change, sync_file, update_last_change_id,
+        wait_all_results, wal_apply_from_file, wal_pull_to_file, write_push_boundaries,
+        PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER,
+        WAL_FRAME_SIZE,
     },
     database_tape::{
         try_wal_watermark_read_page, DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts,
@@ -903,8 +904,6 @@ mod tests {
             last_pushed_pull_gen_hint: 0,
             last_pushed_change_id_hint: 0,
             last_pushed_replay_floor_change_id_hint: 0,
-            push_boundaries_pull_gen: 0,
-            push_boundaries: Vec::new(),
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
             logical_mvcc_pull_active: true,
@@ -1054,8 +1053,6 @@ mod tests {
             last_pushed_pull_gen_hint: 0,
             last_pushed_change_id_hint: 0,
             last_pushed_replay_floor_change_id_hint: 0,
-            push_boundaries_pull_gen: 0,
-            push_boundaries: Vec::new(),
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
             logical_mvcc_pull_active: true,
@@ -1230,8 +1227,6 @@ mod tests {
             last_pushed_pull_gen_hint: 0,
             last_pushed_change_id_hint: 0,
             last_pushed_replay_floor_change_id_hint: 0,
-            push_boundaries_pull_gen: 0,
-            push_boundaries: Vec::new(),
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
             logical_mvcc_pull_active: true,
@@ -2289,11 +2284,6 @@ struct AppliedRemoteChanges {
     revert_since_wal_watermark: u64,
     logical_table_names_by_stable_id: BTreeMap<u64, String>,
     followup_revision: Option<DatabasePullRevision>,
-    /// `(pull_gen, records)` replacement for the push-boundary log, with the
-    /// `cur_change_id` values translated into the post-rebase numbering;
-    /// mirrored into the metadata by the caller. `None` when the apply did
-    /// not renumber the CDC (the stored log stays valid as is).
-    push_boundaries_update: Option<(i64, Vec<PushBoundary>)>,
 }
 
 /// The pulled state names one of this client's push-batch boundaries in its
@@ -2501,8 +2491,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     last_pushed_change_id_hint: 0,
                     last_pushed_pull_gen_hint: 0,
                     last_pushed_replay_floor_change_id_hint: 0,
-                    push_boundaries_pull_gen: 0,
-                    push_boundaries: Vec::new(),
                     last_pull_unix_time: Some(io.current_time_wall_clock().secs),
                     last_push_unix_time: None,
                     partial_bootstrap_server_revision: if partial {
@@ -2550,8 +2538,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     last_pushed_change_id_hint: 0,
                     last_pushed_pull_gen_hint: 0,
                     last_pushed_replay_floor_change_id_hint: 0,
-                    push_boundaries_pull_gen: 0,
-                    push_boundaries: Vec::new(),
                     last_pull_unix_time: None,
                     last_push_unix_time: None,
                     partial_bootstrap_server_revision: None,
@@ -3241,7 +3227,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             revert_since_wal_watermark,
             logical_table_names_by_stable_id,
             followup_revision,
-            push_boundaries_update,
         }) = pull_result
         else {
             return Err(pull_result.err().unwrap());
@@ -3265,10 +3250,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             m.last_pushed_replay_floor_change_id_hint = 0;
             m.last_pull_unix_time = Some(remote_changes.time.secs);
             m.logical_table_names_by_stable_id = logical_table_names_by_stable_id;
-            if let Some((pull_gen, push_boundaries)) = push_boundaries_update {
-                m.push_boundaries_pull_gen = pull_gen;
-                m.push_boundaries = push_boundaries;
-            }
         })
         .await?;
         Ok(())
@@ -3568,16 +3549,15 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         };
         // The boundary log translates the pulled sync row into the current
         // numbering (exact replay floor) and names what must never be
-        // re-pushed. Its translated values are only meaningful while still
-        // expressed in the current numbering; a stale log (crash between a
-        // rebase commit and the metadata write) is unusable and dropped.
-        let push_boundaries = {
-            let meta = self.meta();
-            if meta.push_boundaries_pull_gen == local_pull_gen {
-                meta.push_boundaries.clone()
-            } else {
-                Vec::new()
-            }
+        // re-pushed. Read it BEFORE the local WAL revert below: boundary rows
+        // written by pushes since the last rebase are rolled back with
+        // everything else and are rewritten - translated - next to the sync
+        // row at the end of the apply. WAL-mode flow only: the logical MVCC
+        // flow never renumbers, so its sync-row values need no translation.
+        let push_boundaries = if main_conn.mvcc_enabled() {
+            Vec::new()
+        } else {
+            read_push_boundaries(coro, &main_conn, &self.client_unique_id, local_pull_gen).await?
         };
 
         // read schema version after initiating WAL session (in order to read it with consistent max_frame_no)
@@ -4113,9 +4093,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             // set when the local replay re-captured changes with per-change
             // boundary tracking, i.e. the translated values above are exact
             let mut local_replay_translation_ran = false;
-            // replacement boundary log as persisted by the caller, in the
-            // post-rebase numbering; None while no renumbering happened
-            let mut push_boundaries_update: Option<(i64, Vec<PushBoundary>)> = None;
             tracing::info!(
                 "apply_changes(path={}): collected {} changes, skipped_internal_local_changes={}",
                 self.main_db_path,
@@ -4157,7 +4134,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         ))
                     })
                     .inspect_err(|e| tracing::error!("update_last_change_id failed: {e}"))?;
-                    push_boundaries_update = Some((local_pull_gen + 1, Vec::new()));
                 }
 
                 let mut cdc_enabled_for_local_replay = false;
@@ -4354,18 +4330,25 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                             change_id,
                         )
                     };
-                    push_boundaries_update = Some((
-                        local_pull_gen + 1,
-                        rebased_push_boundaries(
-                            &retained_boundaries,
-                            &translated_boundary_curs,
-                            local_replay_translation_ran,
-                            synced_change_id.min(change_id),
-                        ),
-                    ));
+                    let rebased_boundaries = rebased_push_boundaries(
+                        &retained_boundaries,
+                        &translated_boundary_curs,
+                        local_replay_translation_ran,
+                        synced_change_id.min(change_id),
+                    );
                     let synced_change_id = preserve_local_replay_floor
                         .map_or(synced_change_id, |floor| synced_change_id.min(floor));
                     let synced_change_id = synced_change_id.min(change_id);
+                    if !logical_conn.mvcc_enabled() {
+                        write_push_boundaries(
+                            coro,
+                            &logical_conn,
+                            &self.client_unique_id,
+                            local_pull_gen + 1,
+                            &rebased_boundaries,
+                        )
+                        .await?;
+                    }
                     if raw_page_replay_on_sql_conn {
                         rebuild_local_sync_metadata_table(
                             coro,
@@ -4397,7 +4380,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     revert_since_wal_watermark: logical_conn.wal_state()?.max_frame,
                     logical_table_names_by_stable_id,
                     followup_revision,
-                    push_boundaries_update,
                 });
             }
             let raw_replay_refresh = replace_base_pages || raw_page_replay_on_sql_conn;
@@ -4515,15 +4497,22 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                             change_id,
                         )
                 };
-                push_boundaries_update = Some((
-                    local_pull_gen + 1,
-                    rebased_push_boundaries(
-                        &retained_boundaries,
-                        &translated_boundary_curs,
-                        local_replay_translation_ran,
-                        synced_change_id.min(change_id),
-                    ),
-                ));
+                let rebased_boundaries = rebased_push_boundaries(
+                    &retained_boundaries,
+                    &translated_boundary_curs,
+                    local_replay_translation_ran,
+                    synced_change_id.min(change_id),
+                );
+                if !main_conn.mvcc_enabled() {
+                    write_push_boundaries(
+                        coro,
+                        &main_conn,
+                        &self.client_unique_id,
+                        local_pull_gen + 1,
+                        &rebased_boundaries,
+                    )
+                    .await?;
+                }
                 let synced_change_id = preserve_local_replay_floor
                     .map_or(synced_change_id, |floor| synced_change_id.min(floor));
                 let synced_change_id = synced_change_id.min(change_id);
@@ -4550,7 +4539,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 revert_since_wal_watermark,
                 logical_table_names_by_stable_id,
                 followup_revision,
-                push_boundaries_update,
             })
         }
         .await;
@@ -4593,14 +4581,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.meta().remote_url(),
             self.opts.remote_encryption_key.as_deref(),
         );
-        let (pull_gen, replay_floor_change_id, change_id) = push_logical_changes(
-            ctx,
-            self,
-            &self.main_tape,
-            &self.client_unique_id,
-            &self.opts,
-        )
-        .await?;
+        let (pull_gen, replay_floor_change_id, change_id) =
+            push_logical_changes(ctx, &self.main_tape, &self.client_unique_id, &self.opts).await?;
 
         self.update_meta(coro, |m| {
             m.last_pushed_pull_gen_hint = pull_gen;
@@ -4640,11 +4622,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         Ok(())
     }
 
-    pub(crate) fn meta(&self) -> std::sync::MutexGuard<'_, DatabaseMetadata> {
+    fn meta(&self) -> std::sync::MutexGuard<'_, DatabaseMetadata> {
         self.meta.lock().unwrap()
     }
 
-    pub(crate) async fn update_meta<Ctx>(
+    async fn update_meta<Ctx>(
         &self,
         coro: &Coro<Ctx>,
         update: impl FnOnce(&mut DatabaseMetadata),
