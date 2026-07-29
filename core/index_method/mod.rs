@@ -78,6 +78,34 @@ pub struct IndexMethodCostEstimate {
     pub estimated_rows: u64,
 }
 
+/// Planning-time inputs available to an index method's cost model.
+///
+/// `arguments` are the query expressions captured from the selected pattern,
+/// ordered by parameter number. They may be literals or runtime expressions;
+/// implementations must treat unknown values conservatively.
+#[derive(Debug, Clone, Copy)]
+pub struct IndexMethodCostContext<'a> {
+    pub pattern_idx: usize,
+    pub base_table_rows: f64,
+    pub arguments: &'a [ast::Expr],
+}
+
+/// Internal index state exposed only to test-helper builds.
+#[cfg(feature = "test_helper")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexMethodTestStats {
+    /// Number of physical files visible in the index method's storage.
+    pub storage_file_count: usize,
+    /// Number of searchable engine segments, when the method is segmented.
+    pub segment_count: Option<usize>,
+    /// Number of connection-local read snapshots retained by the method.
+    pub cached_connection_count: Option<usize>,
+    /// Resident bytes held by retained read-snapshot file caches.
+    pub cached_bytes: Option<usize>,
+    /// Whether the method retained a committed writer for statement reuse.
+    pub cached_writer: Option<bool>,
+}
+
 /// cursor opened for index method and capable of executing DML/DDL/DQL queries for the index method over fixed table
 pub trait IndexMethodCursor {
     /// create necessary components for index method (usually, this is a bunch of btree-s)
@@ -163,11 +191,16 @@ pub trait IndexMethodCursor {
     /// between custom index methods and traditional BTree indexes.
     fn estimate_cost(
         &self,
-        pattern_idx: usize,
-        base_table_rows: f64,
+        context: &IndexMethodCostContext<'_>,
     ) -> Option<IndexMethodCostEstimate> {
-        let _ = (pattern_idx, base_table_rows);
+        let _ = context;
         None
+    }
+
+    /// Return internal storage statistics for invariant tests.
+    #[cfg(feature = "test_helper")]
+    fn test_stats(&self) -> Result<Option<IndexMethodTestStats>> {
+        Ok(None)
     }
 }
 
