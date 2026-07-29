@@ -5316,20 +5316,15 @@ pub mod tests {
         let schema = schema_with_tables(&["CREATE TABLE t (a, b)", "CREATE TABLE u (b)"]);
         let view_sql = "CREATE VIEW v AS SELECT t.a FROM t JOIN u USING (b)";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
-                .unwrap()
-                .expect("view should be rewritten");
-
+        // Renaming t.b breaks the USING join no matter what: u has no c, and
+        // after the rename t has no b. SQLite refuses the ALTER, so the
+        // rewrite must error rather than emit a view that can never be
+        // queried again.
+        let err = rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+            .unwrap_err();
         assert!(
-            !rewritten.sql.contains("USING (b)") && !rewritten.sql.contains("USING(b)"),
-            "{}",
-            rewritten.sql
-        );
-        assert!(
-            rewritten.sql.contains("USING (c)") || rewritten.sql.contains("USING(c)"),
-            "{}",
-            rewritten.sql
+            err.to_string().contains("cannot join using column"),
+            "{err}"
         );
     }
 
