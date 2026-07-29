@@ -1083,10 +1083,9 @@ pub enum Insn {
         collation: Option<CollationSeq>,
     },
 
-    /// Mirror-image of AggStep: fires when a row crosses the frame-start
-    /// cursor on its way out of the frame. The runtime arm undoes the
-    /// matching xStep — sum subtracts, count decrements, position
-    /// counters advance.
+    /// Mirror-image of AggStep. Retracts a previously stepped aggregate
+    /// input, or advances a window function when a row crosses the
+    /// frame-start cursor.
     AggInverse {
         acc_reg: usize,
         col: usize,
@@ -1106,6 +1105,26 @@ pub enum Insn {
     AggValue {
         acc_reg: usize,
         dest_reg: usize,
+        func: AccumulatorFunc,
+    },
+
+    /// Materialize an aggregate accumulator register from its persisted state
+    /// payload, read from `agg_payload_width(func)` registers starting at
+    /// `payload_start_reg`. The counterpart of AggContextStore; used by
+    /// materialized view maintenance to resume a group's aggregate state from
+    /// the view's state table.
+    AggContextLoad {
+        acc_reg: usize,
+        payload_start_reg: usize,
+        func: AccumulatorFunc,
+    },
+
+    /// Persist an aggregate accumulator's state payload into
+    /// `agg_payload_width(func)` registers starting at `payload_start_reg`,
+    /// for storage in a materialized view's state table.
+    AggContextStore {
+        acc_reg: usize,
+        payload_start_reg: usize,
         func: AccumulatorFunc,
     },
 
@@ -2119,6 +2138,8 @@ impl InsnVariants {
             InsnVariants::AggStep => execute::op_agg_step,
             InsnVariants::AggInverse => execute::op_agg_inverse,
             InsnVariants::AggFinal | InsnVariants::AggValue => execute::op_agg_final,
+            InsnVariants::AggContextLoad => execute::op_agg_context_load,
+            InsnVariants::AggContextStore => execute::op_agg_context_store,
             InsnVariants::SorterOpen => execute::op_sorter_open,
             InsnVariants::SorterInsert => execute::op_sorter_insert,
             InsnVariants::SorterSort => execute::op_sorter_sort,

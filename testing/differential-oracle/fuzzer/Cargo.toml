@@ -25,6 +25,7 @@ path = "lib.rs"
 turso_core = { workspace = true, features = ["simulator"] }
 sql_gen_prop = { path = "../sql_gen_prop" }
 sql_gen = { path = "../sql_gen", features = ["serde"] }
+query-result-oracle = { path = "../../query-result-oracle" }
 rusqlite.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true

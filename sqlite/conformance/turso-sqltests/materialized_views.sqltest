@@ -1,6 +1,7 @@
 @database :memory:
 @requires-file materialized_views ""
 @skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
 
 # Test that INSERT with reused primary keys maintains correct aggregate counts
 # When a row is deleted and a new row is inserted with the same primary key
@@ -65,9 +66,9 @@ test matview-aggregation-population {
     SELECT * FROM daily_totals ORDER BY day;
 }
 expect {
-    1|7.0|2
-    2|2.0|2
-    3|4.0|2
+    1|7|2
+    2|2|2
+    3|4|2
 }
 
 test matview-filter-with-groupby {
@@ -81,9 +82,9 @@ test matview-filter-with-groupby {
     SELECT * FROM v ORDER BY yourb;
 }
 expect {
-    3|3.0|1
-    6|6.0|1
-    7|7.0|1
+    3|3|1
+    6|6|1
+    7|7|1
 }
 
 test matview-insert-maintenance {
@@ -101,12 +102,12 @@ test matview-insert-maintenance {
     SELECT * FROM v ORDER BY b;
 }
 expect {
-    3|3.0|1
-    6|6.0|1
-    3|7.0|2
-    6|11.0|2
-    3|7.0|2
-    6|11.0|2
+    3|3|1
+    6|6|1
+    3|7|2
+    6|11|2
+    3|7|2
+    6|11|2
 }
 
 test matview-delete-maintenance {
@@ -128,11 +129,11 @@ test matview-delete-maintenance {
     SELECT * FROM category_sums ORDER BY category;
 }
 expect {
-    A|90.0|3
-    B|60.0|2
-    A|60.0|2
-    B|60.0|2
-    A|60.0|2
+    A|90|3
+    B|60|2
+    A|60|2
+    B|60|2
+    A|60|2
 }
 
 test matview-update-maintenance {
@@ -153,12 +154,12 @@ test matview-update-maintenance {
     SELECT * FROM status_totals ORDER BY status;
 }
 expect {
-    1|400.0|2
-    2|600.0|2
-    1|450.0|2
-    2|600.0|2
-    1|150.0|1
-    2|900.0|3
+    1|400|2
+    2|600|2
+    1|450|2
+    2|600|2
+    1|150|1
+    2|900|3
 }
 
 test matview-integer-primary-key-basic {
@@ -239,12 +240,12 @@ test matview-integer-primary-key-with-aggregation {
     SELECT * FROM v ORDER BY b;
 }
 expect {
-    10|500.0|1
-    20|700.0|2
-    10|600.0|2
-    20|700.0|2
-    10|600.0|2
-    20|400.0|1
+    10|500|1
+    20|700|2
+    10|600|2
+    20|700|2
+    10|600|2
+    20|400|1
 }
 
 test matview-complex-filter-aggregation {
@@ -275,17 +276,17 @@ test matview-complex-filter-aggregation {
     SELECT * FROM account_deposits ORDER BY account;
 }
 expect {
-    100|70.0|2
-    200|100.0|1
-    300|60.0|1
-    100|95.0|3
-    200|100.0|1
-    300|60.0|1
-    100|125.0|3
-    200|100.0|1
-    300|60.0|1
-    100|125.0|3
-    300|60.0|1
+    100|70|2
+    200|100|1
+    300|60|1
+    100|95|3
+    200|100|1
+    300|60|1
+    100|125|3
+    200|100|1
+    300|60|1
+    100|125|3
+    300|60|1
 }
 
 test matview-sum-count-only {
@@ -309,12 +310,12 @@ test matview-sum-count-only {
     SELECT * FROM category_stats ORDER BY category;
 }
 expect {
-    1|80.0|3
-    2|70.0|2
-    1|85.0|4
-    2|70.0|2
-    1|85.0|4
-    2|75.0|2
+    1|80|3
+    2|70|2
+    1|85|4
+    2|70|2
+    1|85|4
+    2|75|2
 }
 
 test matview-empty-table-population {
@@ -330,8 +331,8 @@ test matview-empty-table-population {
 }
 expect {
     0
-    7|2.0|1
-    9|3.0|1
+    7|2|1
+    9|3|1
 }
 
 test matview-all-rows-filtered {
@@ -374,17 +375,17 @@ test matview-mixed-operations-sequence {
     SELECT * FROM customer_totals ORDER BY customer_id;
 }
 expect {
-    100|50.0|1
-    200|75.0|1
-    100|75.0|2
-    200|75.0|1
-    100|75.0|2
-    200|100.0|1
-    100|25.0|1
-    200|100.0|1
-    100|25.0|1
-    200|100.0|1
-    300|150.0|1
+    100|50|1
+    200|75|1
+    100|75|2
+    200|75|1
+    100|75|2
+    200|100|1
+    100|25|1
+    200|100|1
+    100|25|1
+    200|100|1
+    300|150|1
 }
 
 test matview-projections {
@@ -486,13 +487,13 @@ test matview-rollback-aggregation {
     SELECT * FROM product_totals ORDER BY product_id;
 }
 expect {
-    1|300.0|2
-    2|400.0|2
-    1|350.0|3
-    2|400.0|2
-    3|300.0|1
-    1|300.0|2
-    2|400.0|2
+    1|300|2
+    2|400|2
+    1|350|3
+    2|400|2
+    3|300|1
+    1|300|2
+    2|400|2
 }
 
 test matview-rollback-mixed-operations {
@@ -512,12 +513,12 @@ test matview-rollback-mixed-operations {
     SELECT * FROM customer_totals ORDER BY customer;
 }
 expect {
-    100|75.0|2
-    200|75.0|1
-    100|150.0|2
-    200|150.0|1
-    100|75.0|2
-    200|75.0|1
+    100|75|2
+    200|75|1
+    100|150|2
+    200|150|1
+    100|75|2
+    200|75|1
 }
 
 test matview-rollback-filtered-aggregation {
@@ -542,11 +543,11 @@ test matview-rollback-filtered-aggregation {
     SELECT * FROM deposits ORDER BY account;
 }
 expect {
-    100|50.0|1
-    200|100.0|1
-    100|135.0|2
-    100|50.0|1
-    200|100.0|1
+    100|50|1
+    200|100|1
+    100|135|2
+    100|50|1
+    200|100|1
 }
 
 test matview-rollback-empty-view {
@@ -599,8 +600,8 @@ test matview-join-with-aggregation {
     SELECT * FROM user_totals ORDER BY name;
 }
 expect {
-    Alice|250.0
-    Bob|250.0
+    Alice|250
+    Bob|250
 }
 
 test matview-three-way-join {
@@ -641,9 +642,9 @@ test matview-three-way-join-with-aggregation {
     SELECT * FROM sales_totals ORDER BY customer_name, product_name;
 }
 expect {
-    Alice|Gadget|3.0|60.0
-    Alice|Widget|9.0|90.0
-    Bob|Widget|2.0|20.0
+    Alice|Gadget|3|60
+    Alice|Widget|9|90
+    Bob|Widget|2|20
 }
 
 test matview-join-incremental-insert {
@@ -832,9 +833,9 @@ test matview-aggregation-before-join {
     SELECT * FROM customer_order_summary ORDER BY total_quantity DESC;
 }
 expect {
-    Bob|Silver|2|7.0
-    Alice|Gold|3|6.0
-    Charlie|Bronze|1|1.0
+    Bob|Silver|2|7
+    Alice|Gold|3|6
+    Charlie|Bronze|1|1
 }
 
 # Test 4: Join with aggregation AFTER the join
@@ -861,8 +862,8 @@ test matview-aggregation-after-join {
     SELECT * FROM regional_sales ORDER BY total_revenue DESC;
 }
 expect {
-    North|38.0|3150.0
-    South|18.0|1500.0
+    North|38|3150
+    South|18|1500
 }
 
 # Test 5: Modifying both tables in same transaction
@@ -1172,8 +1173,8 @@ test matview-union-with-aggregation {
     SELECT * FROM half_year_summary ORDER BY quarter;
 }
 expect {
-    Q1|68.0|16450.0
-    Q2|105.0|21750.0
+    Q1|68|16450
+    Q2|105|21750
 }
 
 test matview-union-with-join {
@@ -1601,8 +1602,8 @@ test matview-groupby-scalar-function {
     SELECT * FROM yearly_totals ORDER BY 1;
 }
 expect {
-    2020|250.0
-    2021|200.0
+    2020|250
+    2021|200
 }
 
 test matview-groupby-alias {
@@ -1617,8 +1618,8 @@ test matview-groupby-alias {
     SELECT * FROM yearly_totals ORDER BY year;
 }
 expect {
-    2020|250.0
-    2021|200.0
+    2020|250
+    2021|200
 }
 
 test matview-groupby-position {
@@ -1633,8 +1634,8 @@ test matview-groupby-position {
     SELECT * FROM national_yearly ORDER BY nation, year;
 }
 expect {
-    UK|2021|200.0
-    USA|2020|250.0
+    UK|2021|200
+    USA|2020|250
 }
 
 test matview-groupby-scalar-incremental {
@@ -1651,10 +1652,10 @@ test matview-groupby-scalar-incremental {
     SELECT * FROM yearly_totals ORDER BY year;
 }
 expect {
-    2020|100.0
-    2020|250.0
-    2020|250.0
-    2021|200.0
+    2020|100
+    2020|250
+    2020|250
+    2021|200
 }
 
 test matview-groupby-join-position {
@@ -2254,12 +2255,12 @@ test matview-sum-distinct {
     SELECT * FROM sales_summary ORDER BY region;
 }
 expect {
-    North|300.0
-    South|700.0
-    North|300.0
-    South|700.0
-    North|300.0
-    South|1200.0
+    North|300
+    South|700
+    North|300
+    South|700
+    North|300
+    South|1200
 }
 
 test matview-avg-distinct {
@@ -2383,10 +2384,10 @@ test matview-multiple-distinct-aggregates-with-groupby {
     SELECT * FROM multi_distinct ORDER BY grp;
 }
 expect {
-    A|3|100.0|250.0
-    B|3|180.0|600.0
-    A|3|100.0|250.0
-    B|4|260.0|650.0
+    A|3|100|250.0
+    B|3|180|600.0
+    A|3|100|250.0
+    B|4|260|650.0
 }
 
 test matview-multiple-distinct-aggregates-no-groupby {
@@ -2415,8 +2416,8 @@ test matview-multiple-distinct-aggregates-no-groupby {
     SELECT * FROM multi_distinct_global;
 }
 expect {
-    6|280.0|400.0
-    7|360.0|450.0
+    6|280|400.0
+    7|360|450.0
 }
 
 test matview-count-distinct-global-aggregate {
@@ -2442,7 +2443,7 @@ expect {
     4
 }
 
-# Test that dropping a materialized view cleans up the DBSP state table
+# Test that dropping a materialized view cleans up its node-owned state table.
 test matview-drop-cleans-up-dbsp-table {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER);
     INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
@@ -2452,18 +2453,16 @@ test matview-drop-cleans-up-dbsp-table {
     GROUP BY val;
     -- Verify the view exists
     SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND name='v';
-    -- Verify the DBSP state table exists (name pattern: __turso_internal_dbsp_state_v*_v)
-    SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE '__turso_internal_dbsp_state_v%_v';
-    -- Verify the DBSP state index exists
-    SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name LIKE 'sqlite_autoindex___turso_internal_dbsp_state_v%_v_1';
+    -- Verify the aggregate node's state table and index exist.
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE '__turso_internal_dbsp_state_v%_v__n%';
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name LIKE 'sqlite_autoindex___turso_internal_dbsp_state_v%_v__n%_1';
     -- Drop the materialized view
     DROP VIEW v;
     -- Verify the view is gone
     SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND name='v';
-    -- Verify the DBSP state table is gone
-    SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE '__turso_internal_dbsp_state_v%_v';
-    -- Verify the DBSP state index is gone
-    SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name LIKE 'sqlite_autoindex___turso_internal_dbsp_state_v%_v_1';
+    -- Verify the node-owned state is gone.
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE '__turso_internal_dbsp_state_v%_v__n%';
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name LIKE 'sqlite_autoindex___turso_internal_dbsp_state_v%_v__n%_1';
 }
 expect {
     1
@@ -2493,9 +2492,9 @@ test matview-recreate-after-drop {
     SELECT * FROM mv ORDER BY modified_x;
 }
 expect {
-    1|10.0
-    2|20.0
-    3|30.0
+    1|10
+    2|20
+    3|30
     3|40
     4|60
 }

@@ -60,6 +60,7 @@ turso = { workspace = true, features = ["test_helper"] }
 
 # Turso SQL parser (for splitting multi-statement SQL)
 turso_parser = { workspace = true }
+query-result-oracle = { path = "../query-result-oracle" }
 
 # PostgreSQL wire-protocol client (for the pg backend, which drives a
 # spawned tursopg server over TCP)

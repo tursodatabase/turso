@@ -1158,6 +1158,7 @@ pub fn op_open_read(
 
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
+    state.cursor_databases[*cursor_id] = Some(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
         if state.cursors[*cursor_id].is_none() {
@@ -1190,6 +1191,7 @@ pub fn op_open_read(
         CursorType::BTreeTable(table_rc) => table_rc.columns().len(),
         CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),
         CursorType::MaterializedView(table_rc, _) => table_rc.columns().len(),
+        CursorType::ViewDelta { table, .. } => table.columns().len(),
         _ => unreachable!("This should not have happened"),
     };
 
@@ -1215,7 +1217,29 @@ pub fn op_open_read(
     };
 
     match cursor_type {
-        CursorType::MaterializedView(_, view_mutex) => {
+        CursorType::ViewDelta { view_name, table } => {
+            // In-memory cursor over the transaction's captured delta for one
+            // base table of a materialized view. Opened by maintenance
+            // programs when a pending batch is applied; the snapshot is taken
+            // here.
+            let delta_cursor = match program.connection.transaction_changes.get(view_name) {
+                Some(tx_state) => {
+                    let delta = tx_state.table_delta(table);
+                    crate::incremental::vdbe_maintenance::DeltaCursor::new(
+                        delta,
+                        table.columns().len(),
+                    )
+                }
+                None => {
+                    crate::incremental::vdbe_maintenance::DeltaCursor::empty(table.columns().len())
+                }
+            };
+            cursors
+                .get_mut(*cursor_id)
+                .expect("cursor_id should be valid")
+                .replace(Cursor::new_delta(delta_cursor));
+        }
+        CursorType::MaterializedView(_, _) => {
             // This is a materialized view with storage
             // Create btree cursor for reading the persistent data
 
@@ -1226,19 +1250,12 @@ pub fn op_open_read(
             ));
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
 
-            // Get the view name and look up or create its transaction state
-            let view_name = view_mutex.lock().name().to_string();
-            let tx_state = program
-                .connection
-                .view_transaction_states
-                .get_or_create(&view_name);
-
-            // Create materialized view cursor with this view's transaction state
+            // The cursor observes the transaction-wide change-log generation
+            // for read-your-own-writes.
             let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
                 cursor,
-                view_mutex.clone(),
                 pager,
-                tx_state,
+                program.connection.clone(),
             )?;
 
             cursors
@@ -1655,6 +1672,7 @@ pub fn op_open_pseudo(
         },
         insn
     );
+    state.cursor_databases[*cursor_id] = None;
     {
         let cursors = &mut state.cursors;
         let cursor = PseudoCursor::new(*content_reg);
@@ -1697,6 +1715,7 @@ pub fn op_rewind(
                 return_if_io!(mv_cursor.rewind());
                 !mv_cursor.is_valid()?
             }
+            Cursor::Delta(delta_cursor) => !return_if_io!(delta_cursor.rewind()),
             _ => panic!("Rewind on non-btree/materialized-view cursor"),
         }
     };
@@ -1875,6 +1894,11 @@ fn op_column_fetch(
             state.registers[dest].set_value(value);
             return Ok(InsnFunctionStepResult::Step);
         }
+        if let Cursor::Delta(delta_cursor) = cursor {
+            let value = delta_cursor.column(column);
+            state.registers[dest].set_value(value);
+            return Ok(InsnFunctionStepResult::Step);
+        }
         // Fall back to normal handling
     }
 
@@ -2004,6 +2028,9 @@ fn op_column_fetch(
         }
         CursorType::VirtualTable(_) => {
             panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
+        }
+        CursorType::ViewDelta { .. } => {
+            unreachable!("Cursor::Delta columns are handled before cursor_type dispatch");
         }
     }
     Ok(InsnFunctionStepResult::Step)
@@ -3050,6 +3077,7 @@ pub fn op_next(
                 let has_more = return_if_io!(mv_cursor.next());
                 !has_more
             }
+            Cursor::Delta(delta_cursor) => !return_if_io!(delta_cursor.next()),
             Cursor::IndexMethod(_) => {
                 let cursor = cursor.as_index_method_mut();
                 let has_more = return_if_io!(cursor.query_next());
@@ -3262,6 +3290,18 @@ pub fn halt(
 
     if program.is_trigger_subprogram() {
         return Ok(InsnFunctionStepResult::Done);
+    }
+
+    // Maintain materialized views before releasing this write statement's
+    // savepoint. The maintenance program is the sole evaluator for committed
+    // and same-transaction state, and its writes roll back atomically with the
+    // base-table statement on error. Internal helper statements leave the
+    // enclosing root statement in control of this batch.
+    if state.is_active_write && !program.connection.is_nested_stmt() {
+        match program.apply_pending_view_deltas(state, false, pager)? {
+            IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
+            IOResult::Done(()) => {}
+        }
     }
 
     if auto_commit {
@@ -4497,6 +4537,7 @@ pub fn op_savepoint(
 
     match *op {
         SavepointOp::Begin => {
+            let change_log_mark = conn.transaction_changes.change_log_mark();
             conn.with_savepoint_schema_snapshot(
                 |main_schema_snapshot, temp_schema_snapshot, staged_schema_snapshot| {
                     let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
@@ -4548,6 +4589,7 @@ pub fn op_savepoint(
                         name: name.clone(),
                         starts_transaction,
                         deferred_fk_violations,
+                        change_log_mark,
                         main_schema_snapshot,
                         temp_schema_snapshot,
                         staged_schema_snapshot,
@@ -4674,6 +4716,8 @@ pub fn op_savepoint(
             // consistent across tables / indexes / sequences without any
             // I/O.
             if let Some(info) = frame_info {
+                conn.transaction_changes
+                    .rewind_to_mark(info.change_log_mark)?;
                 *conn.schema.write() = info.main_schema_snapshot;
                 if let Some(temp_db) = conn.temp.database.read().as_ref() {
                     match info.temp_schema_snapshot {
@@ -5238,6 +5282,11 @@ pub fn op_row_id(
                     } else {
                         state.registers[*dest].set_null();
                     }
+                } else if let Some(Cursor::Delta(delta_cursor)) = cursors
+                    .get_mut(*cursor_id)
+                    .expect("cursor_id should be valid")
+                {
+                    state.registers[*dest].set_int(delta_cursor.rowid());
                 } else {
                     mark_unlikely();
                     return Err(LimboError::InternalError(
@@ -6164,8 +6213,10 @@ fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
 /// Initialize aggregate payload with default values.
 /// Payload layout by aggregate type:
 /// - Count/Count0: [Integer(0)]
-/// - Sum: [Null, Float(0.0), Integer(0), Integer(0)]  // acc, r_err, approx, ovrfl
-/// - Total: [Float(0.0), Float(0.0), Integer(0), Integer(0)]  // same but starts at 0.0
+/// - Sum: [Null, Float(0.0), Integer(0), Integer(0), Integer(0)]
+///   // acc, r_err, approx, ovrfl, count
+/// - Total: [Float(0.0), Float(0.0), Integer(0), Integer(0), Integer(0)]
+///   // same but starts at 0.0
 /// - Avg: [Float(0.0), Float(0.0), Integer(0)]  // sum, r_err, count - uses KBN like SUM
 /// - Min/Max: [Null]
 /// - GroupConcat/StringAgg: [Null] (becomes Text on first non-null value)
@@ -6182,6 +6233,7 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
             };
             payload.push(acc);
             payload.push(Value::from_f64(0.0));
+            payload.push(Value::from_i64(0));
             payload.push(Value::from_i64(0));
             payload.push(Value::from_i64(0));
         }
@@ -6245,7 +6297,7 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
 /// - **Count**: `[count: Integer]` - increments if arg is not NULL
 /// - **Count0**: `[count: Integer]` - always increments (COUNT(*))
 /// - **Avg**: `[sum: Float, r_err: Float, count: Integer]` - uses KBN compensation like SUM
-/// - **Sum/Total**: `[acc, r_err: Float, approx: Integer, ovrfl: Integer]`
+/// - **Sum/Total**: `[acc, r_err: Float, approx: Integer, ovrfl: Integer, count: Integer]`
 ///   - `acc`: running sum (Null/Integer/Float depending on inputs)
 ///   - `r_err`: Kahan-Babuška-Neumaier compensation term for floating-point precision
 ///   - `approx`: 1 if result is approximate (float arithmetic used)
@@ -6348,12 +6400,23 @@ fn update_agg_payload(
         }
         AggFunc::Sum | AggFunc::Total => {
             // invariant as per init_agg_payload: payload[0] is acc (Null/Integer/Float),
-            // payload[1] is Float (r_err), payload[2] is Integer (approx), payload[3] is Integer (ovrfl)
-            let [acc, r_err_val, approx_val, ovrfl_val, ..] = payload.as_mut_slice() else {
+            // payload[1] is Float (r_err), payload[2] is Integer (approx),
+            // payload[3] is Integer (ovrfl), payload[4] is Integer (count)
+            let [acc, r_err_val, approx_val, ovrfl_val, count_val, ..] = payload.as_mut_slice()
+            else {
                 return Err(LimboError::InternalError(
                     "Sum/Total: payload too short".to_string(),
                 ));
             };
+            if !matches!(arg, Value::Null) {
+                let Value::Numeric(Numeric::Integer(count)) = count_val else {
+                    mark_unlikely();
+                    return Err(LimboError::InternalError(
+                        "Sum/Total: payload[4] is not an integer".to_string(),
+                    ));
+                };
+                *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+            }
             let r_err_f = r_err_val.to_float_or_zero();
             let Value::Numeric(Numeric::Integer(approx_i)) = approx_val else {
                 mark_unlikely();
@@ -6556,6 +6619,188 @@ fn update_agg_payload(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum NumericArg {
+    Integer(i64),
+    Float(f64),
+    Null,
+}
+
+/// Apply the same numeric-affinity classification used by SUM and AVG.
+fn classify_numeric_arg(value: &Value) -> NumericArg {
+    match value {
+        Value::Null => NumericArg::Null,
+        Value::Numeric(Numeric::Integer(value)) => NumericArg::Integer(*value),
+        Value::Numeric(Numeric::Float(value)) => NumericArg::Float(f64::from(*value)),
+        Value::Text(text) => match try_for_float(text.as_str().as_bytes()) {
+            (NumericParseResult::ValidPrefixOnly, ParsedNumber::Integer(value)) => {
+                NumericArg::Float(value as f64)
+            }
+            (_, ParsedNumber::Integer(value)) => NumericArg::Integer(value),
+            (_, ParsedNumber::Float(value)) => NumericArg::Float(value),
+            (_, ParsedNumber::None) => NumericArg::Float(0.0),
+        },
+        Value::Blob(blob) => match try_for_float(blob).1 {
+            ParsedNumber::Integer(value) => NumericArg::Float(value as f64),
+            ParsedNumber::Float(value) => NumericArg::Float(value),
+            ParsedNumber::None => NumericArg::Float(0.0),
+        },
+    }
+}
+
+/// Negate an integer contribution without overflowing on `i64::MIN`.
+fn kbn_step_int_neg(acc: &mut Value, value: i64, state: &mut SumAggState) {
+    if value == i64::MIN {
+        apply_kbn_step_int(acc, i64::MAX, state);
+        apply_kbn_step_int(acc, 1, state);
+    } else {
+        apply_kbn_step_int(acc, -value, state);
+    }
+}
+
+/// Undo one call to `update_agg_payload` for an invertible aggregate.
+fn inverse_agg_payload(func: &AggFunc, arg: &Value, payload: &mut [Value]) -> Result<()> {
+    match func {
+        AggFunc::Count => {
+            if !matches!(arg, Value::Null) {
+                let Some(Value::Numeric(Numeric::Integer(count))) = payload.first_mut() else {
+                    return Err(LimboError::InternalError(
+                        "Count inverse: payload is not an integer".to_string(),
+                    ));
+                };
+                if *count <= 0 {
+                    return Err(LimboError::InternalError(
+                        "Count inverse has no matching aggregate step".to_string(),
+                    ));
+                }
+                *count -= 1;
+            }
+        }
+        AggFunc::Count0 => {
+            let Some(Value::Numeric(Numeric::Integer(count))) = payload.first_mut() else {
+                return Err(LimboError::InternalError(
+                    "Count(*) inverse: payload is not an integer".to_string(),
+                ));
+            };
+            if *count <= 0 {
+                return Err(LimboError::InternalError(
+                    "Count(*) inverse has no matching aggregate step".to_string(),
+                ));
+            }
+            *count -= 1;
+        }
+        AggFunc::Sum | AggFunc::Total => {
+            let parsed = classify_numeric_arg(arg);
+            if matches!(parsed, NumericArg::Null) {
+                return Ok(());
+            }
+            let [acc, r_err_value, approx_value, overflow_value, count_value, ..] = payload else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total inverse: payload too short".to_string(),
+                ));
+            };
+            let Value::Numeric(Numeric::Integer(count)) = count_value else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total inverse: count is not an integer".to_string(),
+                ));
+            };
+            if *count <= 0 {
+                return Err(LimboError::InternalError(
+                    "Sum/Total inverse has no matching aggregate step".to_string(),
+                ));
+            }
+            *count -= 1;
+            if *count == 0 {
+                *acc = if matches!(func, AggFunc::Total) {
+                    Value::from_f64(0.0)
+                } else {
+                    Value::Null
+                };
+                *r_err_value = Value::from_f64(0.0);
+                *approx_value = Value::from_i64(0);
+                *overflow_value = Value::from_i64(0);
+                return Ok(());
+            }
+
+            let Value::Numeric(Numeric::Integer(approx)) = approx_value else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total inverse: approximate flag is not an integer".to_string(),
+                ));
+            };
+            if *approx == 0 {
+                if let NumericArg::Integer(value) = parsed {
+                    if let Value::Numeric(Numeric::Integer(acc)) = acc {
+                        *acc = acc.checked_sub(value).ok_or(LimboError::IntegerOverflow)?;
+                        return Ok(());
+                    }
+                }
+            }
+
+            let Value::Numeric(Numeric::Integer(overflow)) = overflow_value else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total inverse: overflow flag is not an integer".to_string(),
+                ));
+            };
+            let mut state = SumAggState {
+                r_err: r_err_value.to_float_or_zero(),
+                approx: true,
+                ovrfl: *overflow != 0,
+            };
+            match parsed {
+                NumericArg::Integer(value) => kbn_step_int_neg(acc, value, &mut state),
+                NumericArg::Float(value) => apply_kbn_step(acc, -value, &mut state),
+                NumericArg::Null => unreachable!("NULL returned before inverse dispatch"),
+            }
+            *r_err_value = Value::from_f64(state.r_err);
+            *overflow_value = Value::from_i64(state.ovrfl as i64);
+        }
+        AggFunc::Avg => {
+            let parsed = classify_numeric_arg(arg);
+            if matches!(parsed, NumericArg::Null) {
+                return Ok(());
+            }
+            let [sum_value, r_err_value, count_value, ..] = payload else {
+                return Err(LimboError::InternalError(
+                    "Avg inverse: payload too short".to_string(),
+                ));
+            };
+            let Value::Numeric(Numeric::Integer(count)) = count_value else {
+                return Err(LimboError::InternalError(
+                    "Avg inverse: count is not an integer".to_string(),
+                ));
+            };
+            if *count <= 0 {
+                return Err(LimboError::InternalError(
+                    "Avg inverse has no matching aggregate step".to_string(),
+                ));
+            }
+            *count -= 1;
+            if *count == 0 {
+                *sum_value = Value::from_f64(0.0);
+                *r_err_value = Value::from_f64(0.0);
+                return Ok(());
+            }
+
+            let mut state = SumAggState {
+                r_err: r_err_value.to_float_or_zero(),
+                ..Default::default()
+            };
+            match parsed {
+                NumericArg::Integer(value) => kbn_step_int_neg(sum_value, value, &mut state),
+                NumericArg::Float(value) => apply_kbn_step(sum_value, -value, &mut state),
+                NumericArg::Null => unreachable!("NULL returned before inverse dispatch"),
+            }
+            *r_err_value = Value::from_f64(state.r_err);
+        }
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "aggregate {func:?} does not support inverse steps"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Convert the intermediate aggregate state in `payload` into the final result value.
 ///
 /// This finalization logic is shared between both aggregation strategies:
@@ -6574,6 +6819,90 @@ fn update_agg_payload(
 /// - **Min/Max**: Returns the tracked extreme value directly
 /// - **GroupConcat/StringAgg**: Returns the accumulated string
 /// - **JsonGroup***: Parses accumulated raw JSONB bytes into proper JSON output
+pub fn op_agg_context_load(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        AggContextLoad {
+            acc_reg,
+            payload_start_reg,
+            func,
+        },
+        insn
+    );
+    let func = func.expect_agg();
+    let width = agg_payload_width(func).ok_or_else(|| {
+        mark_unlikely();
+        LimboError::InternalError(format!("aggregate {func:?} has no fixed-width state"))
+    })?;
+    let mut payload = crate::alloc::vec![];
+    payload.try_reserve(width)?;
+    for j in 0..width {
+        payload.push(state.registers[*payload_start_reg + j].get_value().clone());
+    }
+    state.registers[*acc_reg] = Register::Aggregate(AggContext::Builtin(payload));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_agg_context_store(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        AggContextStore {
+            acc_reg,
+            payload_start_reg,
+            func,
+        },
+        insn
+    );
+    let func = func.expect_agg();
+    let width = agg_payload_width(func).ok_or_else(|| {
+        mark_unlikely();
+        LimboError::InternalError(format!("aggregate {func:?} has no fixed-width state"))
+    })?;
+    let values: Vec<Value> = match &state.registers[*acc_reg] {
+        Register::Aggregate(AggContext::Builtin(payload)) => {
+            let payload_len = payload.len();
+            turso_assert!(
+                payload_len == width,
+                "aggregate state payload width {payload_len} does not match expected {width}"
+            );
+            payload.to_vec()
+        }
+        _ => {
+            mark_unlikely();
+            return Err(LimboError::InternalError(
+                "AggContextStore on an uninitialized accumulator".to_string(),
+            ));
+        }
+    };
+    for (j, value) in values.into_iter().enumerate() {
+        state.registers[*payload_start_reg + j].set_value(value);
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Number of payload slots for aggregates whose state is a fixed-width value
+/// vector, i.e. the aggregates that can be persisted to a materialized view's
+/// state table and maintained incrementally. Returns None for aggregates with
+/// variable-size or non-invertible state.
+pub(crate) fn agg_payload_width(func: &AggFunc) -> Option<usize> {
+    match func {
+        AggFunc::Count | AggFunc::Count0 => Some(1),
+        AggFunc::Avg => Some(3),
+        AggFunc::Sum | AggFunc::Total => Some(5),
+        _ => None,
+    }
+}
+
 fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
     let val = match func {
         AggFunc::Count | AggFunc::Count0 => payload[0].clone(),
@@ -6602,7 +6931,7 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
             }
         }
         AggFunc::Total => {
-            // Payload: [acc, r_err, approx, ovrfl]
+            // Payload: [acc, r_err, approx, ovrfl, count]
             let acc = &payload[0];
             let approx = payload[2].as_int().unwrap_or(0) != 0;
             let r_err = payload[1].to_float_or_zero();
@@ -7137,14 +7466,17 @@ pub fn op_agg_inverse(
         return op_window_inverse(state, *acc_reg, *col, win_func);
     }
 
-    // Aggregate window functions all carry RANGE UNBOUNDED PRECEDING TO
-    // CURRENT ROW as their coerced frame, so the frame start never moves
-    // and AggInverse is never emitted for them. Reaching this arm is a
-    // planner bug.
-    unreachable!(
-        "AggInverse fired for aggregate {} but no inverse arm is wired",
-        func.expect_agg()
-    );
+    let func = func.expect_agg();
+    let arg = state.registers[*col].get_value().clone();
+    let Register::Aggregate(aggregate) = &mut state.registers[*acc_reg] else {
+        return Err(LimboError::InternalError(format!(
+            "AggInverse: accumulator register {} is not initialized",
+            *acc_reg
+        )));
+    };
+    inverse_agg_payload(func, &arg, aggregate.payload_mut())?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_agg_step(
@@ -10458,6 +10790,56 @@ pub struct OpInsertState {
     pub is_noop_update: bool,
 }
 
+struct ChangeLogRoute {
+    table: Arc<crate::schema::BTreeTable>,
+    dependent_views: crate::alloc::Vec<String>,
+    is_materialized_view: bool,
+}
+
+/// Resolve change-log routing from the btree being written, never from the
+/// SQL spelling carried in the opcode for tracing/update hooks.
+fn change_log_route(
+    program: &Program,
+    state: &ProgramState,
+    cursor_id: usize,
+) -> Result<Option<ChangeLogRoute>> {
+    // Materialized views currently live in main. Writes to temp or attached
+    // databases must not be resolved through main's schema just because a
+    // table there happens to have the same name or root page.
+    if state.cursor_databases.get(cursor_id).copied().flatten() != Some(MAIN_DB_ID) {
+        return Ok(None);
+    }
+    let cursor_table = match program.cursor_ref.get(cursor_id) {
+        Some((_, CursorType::BTreeTable(table)))
+        | Some((_, CursorType::MaterializedView(table, _))) => table.clone(),
+        _ => return Ok(None),
+    };
+    let schema = program.connection.schema.read();
+    // Maintenance write cursors intentionally use a synthetic physical
+    // descriptor that includes the trailing weight column. Resolve the bound
+    // cursor back to the schema-owned descriptor so change capture always
+    // deals in the relation's logical row shape.
+    let Some(table) = schema.get_btree_table(&cursor_table.name) else {
+        return Ok(None);
+    };
+    // A zero root belongs to a cursor whose btree is assigned at runtime
+    // (CREATE) or to an ephemeral relation. Otherwise the root is part of the
+    // bound relation identity and must still match the current schema.
+    if cursor_table.root_page != 0 && cursor_table.root_page != table.root_page {
+        return Err(LimboError::InternalError(format!(
+            "changed btree {} has root {}, but the current schema binds it to root {}",
+            cursor_table.name, cursor_table.root_page, table.root_page
+        )));
+    }
+    let dependent_views = schema.get_dependent_materialized_views(&table.name);
+    let is_materialized_view = schema.is_materialized_view(&table.name);
+    Ok(Some(ChangeLogRoute {
+        table,
+        dependent_views,
+        is_materialized_view,
+    }))
+}
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum OpInsertSubState {
     /// If this insert overwrites a record, capture the old record for incremental view maintenance.
@@ -10486,6 +10868,89 @@ pub enum OpInsertSubState {
     ApplyViewChange,
 }
 
+fn materialized_view_record_change(
+    table_name: &str,
+    table: &crate::schema::BTreeTable,
+    mut physical_values: crate::alloc::Vec<Value>,
+    direction: isize,
+) -> Result<(crate::alloc::Vec<Value>, isize)> {
+    let logical_width = table.columns().len();
+    if physical_values.len() != logical_width + 1 {
+        return Err(LimboError::Corrupt(format!(
+            "materialized view {table_name} record has {} fields, expected {} logical fields and one weight",
+            physical_values.len(),
+            logical_width
+        )));
+    }
+    let stored_weight = match physical_values.pop() {
+        Some(Value::Numeric(Numeric::Integer(weight))) => weight,
+        _ => {
+            return Err(LimboError::Corrupt(format!(
+                "materialized view {table_name} record has a non-integer weight"
+            )));
+        }
+    };
+    if stored_weight <= 0 {
+        return Err(LimboError::Corrupt(format!(
+            "materialized view {table_name} record has non-positive weight {stored_weight}"
+        )));
+    }
+    let stored_weight = isize::try_from(stored_weight).map_err(|_| {
+        LimboError::Corrupt(format!(
+            "materialized view {table_name} weight does not fit the maintenance weight type"
+        ))
+    })?;
+    let weight = stored_weight.checked_mul(direction).ok_or_else(|| {
+        LimboError::Corrupt(format!(
+            "materialized view {table_name} maintenance weight overflow"
+        ))
+    })?;
+    Ok((physical_values, weight))
+}
+
+fn normalize_table_change_record(
+    table: &crate::schema::BTreeTable,
+    rowid: i64,
+    mut values: crate::alloc::Vec<Value>,
+) -> Result<crate::alloc::Vec<Value>> {
+    if values.len() > table.columns().len() {
+        return Err(LimboError::Corrupt(format!(
+            "table {} record has {} fields, but the schema has {} columns",
+            table.name,
+            values.len(),
+            table.columns().len()
+        )));
+    }
+
+    values.try_reserve(table.columns().len() - values.len())?;
+    for column in table.columns().iter().skip(values.len()) {
+        let mut value = if column.is_rowid_alias() {
+            Value::from_i64(rowid)
+        } else if let Some(default) = column.default.as_deref() {
+            crate::translate::alter::eval_constant_default_value(default)?
+        } else {
+            Value::Null
+        };
+        if let Some(converted) = column.affinity().convert(&value) {
+            value = match converted {
+                Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
+                Either::Left(_) => {
+                    unreachable!("affinity conversion returned an unexpected borrowed value")
+                }
+                Either::Right(value) => value,
+            };
+        }
+        values.push(value);
+    }
+
+    for (index, column) in table.columns().iter().enumerate() {
+        if column.is_rowid_alias() {
+            values[index] = Value::from_i64(rowid);
+        }
+    }
+    Ok(values)
+}
+
 pub fn op_insert(
     program: &Program,
     state: &mut ProgramState,
@@ -10506,18 +10971,14 @@ pub fn op_insert(
     loop {
         match state.active_op_state.insert().sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
-                let has_dependent_views = {
-                    let schema = program.connection.schema.read();
-                    !schema
-                        .get_dependent_materialized_views(table_name)
-                        .is_empty()
-                };
+                let has_change_log_subscribers = change_log_route(program, state, *cursor_id)?
+                    .is_some_and(|route| !route.dependent_views.is_empty());
                 // If there are no dependent views, we don't need to capture the old record.
                 // We also don't need to do it if the rowid of the UPDATEd row was changed, because
                 // op_delete already captured the deletion for IVM, and this insert only needs to
                 // record the new row (which ApplyViewChange handles without old_record).
                 let needs_capture =
-                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                    has_change_log_subscribers && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
 
                 if flag.has(InsertFlags::REQUIRE_SEEK) {
                     state.active_op_state.insert().sub_state = OpInsertSubState::Seek;
@@ -10553,14 +11014,10 @@ pub fn op_insert(
                 )? {
                     return Ok(InsnFunctionStepResult::IO(io));
                 }
-                let has_dependent_views = {
-                    let schema = program.connection.schema.read();
-                    !schema
-                        .get_dependent_materialized_views(table_name)
-                        .is_empty()
-                };
+                let has_change_log_subscribers = change_log_route(program, state, *cursor_id)?
+                    .is_some_and(|route| !route.dependent_views.is_empty());
                 let needs_capture =
-                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                    has_change_log_subscribers && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
                 if needs_capture {
                     state.active_op_state.insert().sub_state = OpInsertSubState::CaptureRecord;
                 } else {
@@ -10590,15 +11047,18 @@ pub fn op_insert(
                     if key == insert_key {
                         let maybe_record = return_if_io!(cursor.record());
                         if let Some(record) = maybe_record {
-                            let mut values = record.get_values_owned()?;
-                            let schema = program.connection.schema.read();
-                            if let Some(table) = schema.get_table(table_name) {
-                                for (i, col) in table.columns().iter().enumerate() {
-                                    if col.is_rowid_alias() && i < values.len() {
-                                        values[i] = Value::from_i64(key);
-                                    }
-                                }
-                            }
+                            let values = record.get_values_owned()?;
+                            let route =
+                                change_log_route(program, state, *cursor_id)?.ok_or_else(|| {
+                                    LimboError::InternalError(format!(
+                                        "changed btree for {table_name} missing from schema"
+                                    ))
+                                })?;
+                            let values = if route.is_materialized_view {
+                                values
+                            } else {
+                                normalize_table_change_record(&route.table, key, values)?
+                            };
                             Some((key, values))
                         } else {
                             None
@@ -10749,9 +11209,9 @@ pub fn op_insert(
                         state.record_statement_change();
                     }
                 }
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                if !dependent_views.is_empty() {
+                let has_change_log_subscribers = change_log_route(program, state, *cursor_id)?
+                    .is_some_and(|route| !route.dependent_views.is_empty());
+                if has_change_log_subscribers {
                     if !has_rowid {
                         return Err(LimboError::ParseError(
                             "WITHOUT ROWID tables with dependent materialized views are not supported"
@@ -10764,9 +11224,16 @@ pub fn op_insert(
                 break;
             }
             OpInsertSubState::ApplyViewChange => {
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                assert!(!dependent_views.is_empty());
+                if state.active_op_state.insert().is_noop_update {
+                    state.active_op_state.insert().old_record = None;
+                    break;
+                }
+                let route = change_log_route(program, state, *cursor_id)?.ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "changed btree for {table_name} missing from schema"
+                    ))
+                })?;
+                assert!(!route.dependent_views.is_empty());
 
                 let (key, values) = {
                     let key = match &state.registers[*key_reg].get_value() {
@@ -10787,37 +11254,65 @@ pub fn op_insert(
                     };
 
                     // Add insertion of new row to view deltas
-                    let mut new_values = record.get_values_owned()?;
-
-                    // Fix rowid alias columns: replace Null with actual rowid value
-                    let schema = program.connection.schema.read();
-                    if let Some(table) = schema.get_table(table_name) {
-                        for (i, col) in table.columns().iter().enumerate() {
-                            if col.is_rowid_alias() && i < new_values.len() {
-                                new_values[i] = Value::from_i64(key);
-                            }
-                        }
-                    }
+                    let new_values = record.get_values_owned()?;
+                    let new_values = if route.is_materialized_view {
+                        new_values
+                    } else {
+                        normalize_table_change_record(&route.table, key, new_values)?
+                    };
 
                     (key, new_values)
                 };
 
                 if let Some((key, values)) = state.active_op_state.insert().old_record.take() {
-                    for view_name in dependent_views.iter() {
-                        let tx_state = program
-                            .connection
-                            .view_transaction_states
-                            .get_or_create(view_name);
-                        tx_state.delete(table_name, key, values.to_vec());
+                    if route.is_materialized_view {
+                        let (values, weight) = materialized_view_record_change(
+                            &route.table.name,
+                            &route.table,
+                            values,
+                            -1,
+                        )?;
+                        return_if_io!(program.connection.transaction_changes.change(
+                            &route.table,
+                            &route.dependent_views,
+                            key,
+                            values,
+                            weight,
+                            program.connection.get_temp_store(),
+                        ));
+                    } else {
+                        return_if_io!(program.connection.transaction_changes.delete(
+                            &route.table,
+                            &route.dependent_views,
+                            key,
+                            values,
+                            program.connection.get_temp_store(),
+                        ));
                     }
                 }
-                for view_name in dependent_views.iter() {
-                    let tx_state = program
-                        .connection
-                        .view_transaction_states
-                        .get_or_create(view_name);
-
-                    tx_state.insert(table_name, key, values.to_vec());
+                if route.is_materialized_view {
+                    let (values, weight) = materialized_view_record_change(
+                        &route.table.name,
+                        &route.table,
+                        values,
+                        1,
+                    )?;
+                    return_if_io!(program.connection.transaction_changes.change(
+                        &route.table,
+                        &route.dependent_views,
+                        key,
+                        values,
+                        weight,
+                        program.connection.get_temp_store(),
+                    ));
+                } else {
+                    return_if_io!(program.connection.transaction_changes.insert(
+                        &route.table,
+                        &route.dependent_views,
+                        key,
+                        values,
+                        program.connection.get_temp_store(),
+                    ));
                 }
 
                 break;
@@ -10883,9 +11378,11 @@ pub fn op_delete(
     loop {
         match state.active_op_state.delete().sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                if dependent_views.is_empty() {
+                let Some(route) = change_log_route(program, state, *cursor_id)? else {
+                    state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
+                    continue;
+                };
+                if route.dependent_views.is_empty() {
                     state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
                     continue;
                 }
@@ -10901,16 +11398,12 @@ pub fn op_delete(
                     // Get the current record before deletion and extract values
                     let maybe_record = return_if_io!(cursor.record());
                     if let Some(record) = maybe_record {
-                        let mut values = record.get_values_owned()?;
-
-                        // Fix rowid alias columns: replace Null with actual rowid value
-                        if let Some(table) = schema.get_table(table_name) {
-                            for (i, col) in table.columns().iter().enumerate() {
-                                if col.is_rowid_alias() && i < values.len() {
-                                    values[i] = Value::from_i64(key);
-                                }
-                            }
-                        }
+                        let values = record.get_values_owned()?;
+                        let values = if route.is_materialized_view {
+                            values
+                        } else {
+                            normalize_table_change_record(&route.table, key, values)?
+                        };
                         Some((key, values))
                     } else {
                         None
@@ -10928,26 +11421,46 @@ pub fn op_delete(
                 }
                 // Increment metrics for row write (DELETE is a write operation)
                 state.record_rows_written(1);
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                if dependent_views.is_empty() {
+                let has_change_log_subscribers = change_log_route(program, state, *cursor_id)?
+                    .is_some_and(|route| !route.dependent_views.is_empty());
+                if !has_change_log_subscribers {
                     break;
                 }
                 state.active_op_state.delete().sub_state = OpDeleteSubState::ApplyViewChange;
                 continue;
             }
             OpDeleteSubState::ApplyViewChange => {
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                assert!(!dependent_views.is_empty());
+                let route = change_log_route(program, state, *cursor_id)?.ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "changed btree for {table_name} missing from schema"
+                    ))
+                })?;
+                assert!(!route.dependent_views.is_empty());
                 let maybe_deleted_record = state.active_op_state.delete().deleted_record.take();
                 if let Some((key, values)) = maybe_deleted_record {
-                    for view_name in dependent_views {
-                        let tx_state = program
-                            .connection
-                            .view_transaction_states
-                            .get_or_create(&view_name);
-                        tx_state.delete(table_name, key, values.to_vec());
+                    if route.is_materialized_view {
+                        let (values, weight) = materialized_view_record_change(
+                            &route.table.name,
+                            &route.table,
+                            values,
+                            -1,
+                        )?;
+                        return_if_io!(program.connection.transaction_changes.change(
+                            &route.table,
+                            &route.dependent_views,
+                            key,
+                            values,
+                            weight,
+                            program.connection.get_temp_store(),
+                        ));
+                    } else {
+                        return_if_io!(program.connection.transaction_changes.delete(
+                            &route.table,
+                            &route.dependent_views,
+                            key,
+                            values,
+                            program.connection.get_temp_store(),
+                        ));
                     }
                 }
                 break;
@@ -11750,6 +12263,7 @@ pub fn op_open_write(
     }
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
+    state.cursor_databases[*cursor_id] = Some(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
         if state.cursors[*cursor_id].is_none() {
@@ -13056,6 +13570,7 @@ pub fn op_close(
         .get_mut(*cursor_id)
         .expect("cursor_id should be valid")
         .take();
+    state.cursor_databases[*cursor_id] = None;
     if let Some(deferred_seek) = state.deferred_seeks.get_mut(*cursor_id) {
         deferred_seek.take();
     }
@@ -13597,21 +14112,41 @@ pub fn op_populate_materialized_views(
 
     let conn = program.connection.clone();
 
-    // For each view, get its cursor and root page
-    let mut view_info = Vec::new();
-    {
-        let cursors_ref = &state.cursors;
-        for (view_name, cursor_id) in cursors {
-            // Get the cursor to find the root page
-            let cursor = cursors_ref
-                .get(*cursor_id)
-                .and_then(|c| c.as_ref())
-                .ok_or_else(|| {
-                    LimboError::InternalError(format!("Cursor {cursor_id} not found"))
-                })?;
+    // Each view is populated by its maintenance program compiled with the
+    // base table as input (every row weight +1); the statement is parked in
+    // ProgramState across I/O yields. The write cursor opened by the CREATE
+    // program is only used to learn the view btree's root page — the
+    // population program opens its own cursor.
+    loop {
+        if state.populate_matviews_state.is_none() {
+            state.populate_matviews_state = Some(crate::vdbe::PopulateMatViewsState {
+                view_idx: 0,
+                stmt: None,
+            });
+        }
+        let view_idx = state
+            .populate_matviews_state
+            .as_ref()
+            .expect("populate state was just initialized")
+            .view_idx;
 
-            let root_page = match cursor {
-                crate::types::Cursor::BTree(btree_cursor) => btree_cursor.root_page(),
+        if view_idx >= cursors.len() {
+            state.populate_matviews_state = None;
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+
+        let (view_name, cursor_id) = &cursors[view_idx];
+
+        let needs_build = state
+            .populate_matviews_state
+            .as_ref()
+            .expect("populate state exists")
+            .stmt
+            .is_none();
+        if needs_build {
+            let root_page = match state.cursors.get(*cursor_id).and_then(|c| c.as_ref()) {
+                Some(crate::types::Cursor::BTree(btree_cursor)) => btree_cursor.root_page(),
                 _ => {
                     return Err(LimboError::InternalError(
                         "Expected BTree cursor for materialized view".into(),
@@ -13619,48 +14154,71 @@ pub fn op_populate_materialized_views(
                 }
             };
 
-            view_info.push((view_name.clone(), root_page, *cursor_id));
-        }
-    }
-
-    // Now populate the views (after releasing the schema borrow)
-    for (view_name, _root_page, cursor_id) in view_info {
-        let schema = conn.schema.read();
-        if let Some(view) = schema.get_materialized_view(&view_name) {
-            let mut view = view.lock();
-            // Drop the schema borrow before calling populate_from_table
-            drop(schema);
-
-            // Get the cursor for writing
-            // Get a mutable reference to the cursor
-            let cursors_ref = &mut state.cursors;
-            let cursor = cursors_ref
-                .get_mut(cursor_id)
-                .and_then(|c| c.as_mut())
-                .ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "Cursor {cursor_id} not found for population"
-                    ))
-                })?;
-
-            // Extract the BTreeCursor
-            let btree_cursor = match cursor {
-                crate::types::Cursor::BTree(btree_cursor) => btree_cursor,
-                _ => {
-                    return Err(LimboError::InternalError(
-                        "Expected BTree cursor for materialized view population".into(),
-                    ));
-                }
+            let schema = conn.schema.read();
+            let Some(view_mutex) = schema.get_materialized_view(view_name) else {
+                return Err(LimboError::InternalError(format!(
+                    "materialized view {view_name} missing from schema during population"
+                )));
             };
+            let (select, num_view_columns) = {
+                let view = view_mutex.lock();
+                (
+                    view.select_stmt.clone(),
+                    view.column_schema.flat_columns().len(),
+                )
+            };
+            let populate_program =
+                crate::incremental::vdbe_maintenance::compile_maintenance_program(
+                    view_name,
+                    &select,
+                    root_page,
+                    num_view_columns,
+                    crate::incremental::vdbe_maintenance::MaintenanceInput::BaseTable,
+                    &schema,
+                    &conn,
+                )?;
+            state
+                .populate_matviews_state
+                .as_mut()
+                .expect("populate state exists")
+                .stmt = Some(Box::new(crate::statement::Statement::new_with_origin(
+                populate_program,
+                pager.clone(),
+                crate::QueryMode::Normal,
+                0,
+                crate::statement::StatementOrigin::Subprogram,
+                false,
+            )));
+        }
 
-            // Now populate it with the cursor for writing
-            return_if_io!(view.populate_from_table(&conn, pager, btree_cursor.as_mut()));
+        let populate_state = state
+            .populate_matviews_state
+            .as_mut()
+            .expect("populate state exists");
+        let statement = populate_state
+            .stmt
+            .as_mut()
+            .expect("population statement was just built");
+        match statement.step_subprogram()? {
+            StepResult::Done => {
+                populate_state.stmt = None;
+                populate_state.view_idx += 1;
+            }
+            StepResult::IO | StepResult::Yield => {
+                let Some(io) = statement.take_io_completions() else {
+                    continue;
+                };
+                return Ok(InsnFunctionStepResult::IO(io));
+            }
+            StepResult::Row => {
+                return Err(LimboError::InternalError(
+                    "materialized view population program produced a row".to_string(),
+                ));
+            }
+            StepResult::Busy => return Err(LimboError::Busy),
+            StepResult::Interrupt => return Err(LimboError::Interrupt),
         }
     }
-
-    // All views populated, advance to next instruction
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_read_cookie(
@@ -14053,6 +14611,7 @@ pub fn op_open_ephemeral(
         Insn::OpenAutoindex { cursor_id } => (*cursor_id, false),
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
+    state.cursor_databases[cursor_id] = None;
     let mv_store = program.connection.mv_store();
     match state.active_op_state.open_ephemeral() {
         OpOpenEphemeralState::Start => {
@@ -14222,6 +14781,9 @@ pub fn op_open_ephemeral(
                 CursorType::MaterializedView(_, _) => {
                     panic!("OpenEphemeral on materialized view cursor");
                 }
+                CursorType::ViewDelta { .. } => {
+                    panic!("OpenEphemeral on view delta cursor");
+                }
             }
 
             state.pc += 1;
@@ -14245,6 +14807,7 @@ pub fn op_open_dup(
         },
         insn
     );
+    state.cursor_databases[*new_cursor_id] = state.cursor_databases[*original_cursor_id];
     let mv_store = program.connection.mv_store();
 
     let original_cursor = state.get_cursor(*original_cursor_id);
@@ -18119,11 +18682,12 @@ mod tests {
     fn test_init_agg_payload_sum() {
         let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::Sum, &mut payload).unwrap();
-        assert_eq!(payload.len(), 4);
+        assert_eq!(payload.len(), 5);
         assert_eq!(payload[0], Value::Null); // acc
         assert_eq!(payload[1], Value::from_f64(0.0)); // r_err
         assert_eq!(payload[2], Value::from_i64(0)); // approx
         assert_eq!(payload[3], Value::from_i64(0)); // ovrfl
+        assert_eq!(payload[4], Value::from_i64(0)); // count
     }
 
     #[test]
@@ -18134,6 +18698,182 @@ mod tests {
         assert_eq!(payload[0], Value::from_f64(0.0)); // sum
         assert_eq!(payload[1], Value::from_f64(0.0)); // r_err
         assert_eq!(payload[2], Value::from_i64(0)); // count
+    }
+
+    #[test]
+    fn test_agg_inverse_retracts_sum_input() {
+        let stmt = prepare_test_statement();
+        let mut payload = crate::alloc::vec![];
+        init_agg_payload(&AggFunc::Sum, &mut payload).unwrap();
+        update_agg_payload(
+            &AggFunc::Sum,
+            &Value::from_i64(10),
+            None,
+            &mut payload,
+            CollationSeq::Binary,
+            || Ok(None),
+        )
+        .unwrap();
+        update_agg_payload(
+            &AggFunc::Sum,
+            &Value::from_i64(3),
+            None,
+            &mut payload,
+            CollationSeq::Binary,
+            || Ok(None),
+        )
+        .unwrap();
+
+        let mut state = ProgramState::new(2, 0);
+        state.set_register(0, Register::Aggregate(AggContext::Builtin(payload)));
+        state.set_register(1, Register::Value(Value::from_i64(3)));
+        let insn = Insn::AggInverse {
+            acc_reg: 0,
+            col: 1,
+            delimiter: 0,
+            func: AccumulatorFunc::Agg(AggFunc::Sum),
+            comparator: None,
+        };
+        op_agg_inverse(stmt.get_program(), &mut state, &insn, stmt.get_pager()).unwrap();
+
+        let Register::Aggregate(AggContext::Builtin(payload)) = &state.registers[0] else {
+            panic!("sum accumulator should remain initialized");
+        };
+        assert_eq!(
+            finalize_agg_payload(&AggFunc::Sum, payload).unwrap(),
+            Value::from_i64(10)
+        );
+    }
+
+    #[test]
+    fn test_inverse_agg_payload_round_trips() {
+        fn value_after(func: &AggFunc, stepped: &[Value], inverted: &[Value]) -> Value {
+            let mut payload = crate::alloc::vec![];
+            init_agg_payload(func, &mut payload).unwrap();
+            for value in stepped {
+                update_agg_payload(
+                    func,
+                    value,
+                    None,
+                    &mut payload,
+                    CollationSeq::Binary,
+                    || Ok(None),
+                )
+                .unwrap();
+            }
+            for value in inverted {
+                inverse_agg_payload(func, value, &mut payload).unwrap();
+            }
+            finalize_agg_payload(func, &payload).unwrap()
+        }
+
+        let integers = [Value::from_i64(10), Value::from_i64(20), Value::from_i64(3)];
+        assert_eq!(
+            value_after(&AggFunc::Sum, &integers, &integers[..1]),
+            Value::from_i64(23)
+        );
+        assert_eq!(
+            value_after(&AggFunc::Sum, &integers, &integers),
+            Value::Null
+        );
+        assert_eq!(
+            value_after(&AggFunc::Total, &integers, &integers),
+            Value::from_f64(0.0)
+        );
+        assert_eq!(
+            value_after(&AggFunc::Count0, &integers, &integers[..2]),
+            Value::from_i64(1)
+        );
+        assert_eq!(
+            value_after(
+                &AggFunc::Count,
+                &[Value::Null, Value::from_i64(1)],
+                &[Value::Null]
+            ),
+            Value::from_i64(1)
+        );
+        assert_eq!(
+            value_after(&AggFunc::Avg, &integers, &[Value::from_i64(3)]),
+            Value::from_f64(15.0)
+        );
+
+        let mixed = [
+            Value::from_i64(10),
+            Value::from_f64(2.5),
+            Value::Text("4".into()),
+            Value::Blob(b"1.5".to_vec()),
+        ];
+        assert_eq!(
+            value_after(&AggFunc::Sum, &mixed, &mixed[1..]),
+            Value::from_f64(10.0)
+        );
+
+        let minimum = [Value::from_i64(i64::MIN), Value::from_i64(7)];
+        assert_eq!(
+            value_after(&AggFunc::Sum, &minimum, &minimum[..1]),
+            Value::from_i64(7)
+        );
+    }
+
+    #[test]
+    fn test_inverse_agg_payload_resets_empty_accumulator() {
+        for func in [AggFunc::Sum, AggFunc::Total, AggFunc::Avg] {
+            let mut payload = crate::alloc::vec![];
+            init_agg_payload(&func, &mut payload).unwrap();
+            update_agg_payload(
+                &func,
+                &Value::from_f64(2.5),
+                None,
+                &mut payload,
+                CollationSeq::Binary,
+                || Ok(None),
+            )
+            .unwrap();
+            inverse_agg_payload(&func, &Value::from_f64(2.5), &mut payload).unwrap();
+            update_agg_payload(
+                &func,
+                &Value::from_i64(7),
+                None,
+                &mut payload,
+                CollationSeq::Binary,
+                || Ok(None),
+            )
+            .unwrap();
+
+            let expected = if matches!(func, AggFunc::Sum) {
+                Value::from_i64(7)
+            } else {
+                Value::from_f64(7.0)
+            };
+            assert_eq!(finalize_agg_payload(&func, &payload).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_inverse_agg_payload_rejects_unmatched_and_unsupported_steps() {
+        let mut count = crate::alloc::vec![Value::from_i64(0)];
+        assert!(inverse_agg_payload(&AggFunc::Count0, &Value::Null, &mut count).is_err());
+
+        let mut minimum = crate::alloc::vec![Value::from_i64(1)];
+        assert!(inverse_agg_payload(&AggFunc::Min, &Value::from_i64(1), &mut minimum).is_err());
+
+        let mut sum = crate::alloc::vec![];
+        init_agg_payload(&AggFunc::Sum, &mut sum).unwrap();
+        for value in [i64::MAX, -i64::MAX, i64::MAX] {
+            update_agg_payload(
+                &AggFunc::Sum,
+                &Value::from_i64(value),
+                None,
+                &mut sum,
+                CollationSeq::Binary,
+                || Ok(None),
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            inverse_agg_payload(&AggFunc::Sum, &Value::from_i64(-i64::MAX), &mut sum),
+            Err(LimboError::IntegerOverflow)
+        ));
     }
 
     #[test]
@@ -18173,6 +18913,7 @@ mod tests {
             Value::from_f64(0.0),
             Value::from_i64(0),
             Value::from_i64(0),
+            Value::from_i64(0),
         ];
         update_agg_payload(
             &AggFunc::Sum,
@@ -18195,6 +18936,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(15));
+        assert_eq!(payload[4], Value::from_i64(2));
     }
 
     #[test]
@@ -18204,6 +18946,7 @@ mod tests {
             Value::from_f64(0.0),
             Value::from_i64(0),
             Value::from_i64(0),
+            Value::from_i64(1),
         ];
         update_agg_payload(
             &AggFunc::Sum,
@@ -18215,6 +18958,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(10)); // unchanged
+        assert_eq!(payload[4], Value::from_i64(1)); // count unchanged
     }
 
     #[test]

@@ -125,6 +125,12 @@ pub trait SqlBackend: Send + Sync {
         false
     }
 
+    /// Whether this backend can compare typed materialized-view results with
+    /// their defining SELECT after each statement.
+    fn supports_materialized_view_verification(&self) -> bool {
+        false
+    }
+
     /// Create a new isolated database instance
     async fn create_database(
         &self,
@@ -153,6 +159,17 @@ pub trait DatabaseInstance: Send + Sync {
     /// Execute SQL and return results
     /// For in-memory databases, this will combine any buffered setup SQL with the query.
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, BackendError>;
+
+    /// Execute SQL while checking every live materialized view after each
+    /// successful statement. Only called when the backend advertises support.
+    async fn execute_with_materialized_view_verification(
+        &mut self,
+        _sql: &str,
+    ) -> Result<QueryResult, BackendError> {
+        Err(BackendError::NotAvailable(
+            "typed materialized-view verification is not implemented by this backend".to_string(),
+        ))
+    }
 
     /// Close and cleanup the database, returning a handle that keeps the file alive
     async fn close(self: Box<Self>) -> Result<DatabaseFileHandle, BackendError>;

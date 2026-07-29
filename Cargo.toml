@@ -51,6 +51,7 @@ members = [
     "testing/differential-oracle/sql_gen_prop",
     "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
+    "testing/query-result-oracle",
     "testing/sqltest"
 ]
 exclude = ["perf/latency/limbo"]
@@ -95,6 +96,7 @@ default-members = [
     "testing/differential-oracle/sql_gen_prop",
     "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
+    "testing/query-result-oracle",
     "testing/sqltest"
 ]
 
