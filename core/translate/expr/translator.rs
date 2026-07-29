@@ -44,6 +44,16 @@ pub(super) enum BinaryEmitMode {
     Condition(ConditionMetadata),
 }
 
+fn compiler_literal_value(literal: &ast::Literal) -> Result<Option<Value>> {
+    match literal {
+        ast::Literal::Numeric(value) => parse_numeric_literal(value).map(Some),
+        ast::Literal::Null => Ok(Some(Value::Null)),
+        ast::Literal::True => Ok(Some(Value::from_i64(1))),
+        ast::Literal::False => Ok(Some(Value::from_i64(0))),
+        _ => Ok(None),
+    }
+}
+
 /// Translate an expression into bytecode via [translate_expr()], and forbid any constant values from being hoisted
 /// into the beginning of the program. This is a good idea in most cases where
 /// a register will end up being reused e.g. in a coroutine.
@@ -481,6 +491,33 @@ pub fn translate_expr(
             when_then_pairs,
             else_expr,
         } => {
+            if base.is_none() && when_then_pairs.len() == 1 {
+                let (when_expr, then_expr) = &when_then_pairs[0];
+                if let (ast::Expr::Literal(when_literal), ast::Expr::Literal(then_literal)) =
+                    (when_expr.as_ref(), then_expr.as_ref())
+                {
+                    let when_value = compiler_literal_value(when_literal)?;
+                    let then_value = compiler_literal_value(then_literal)?;
+                    let else_value = match else_expr.as_deref() {
+                        Some(ast::Expr::Literal(literal)) => compiler_literal_value(literal)?,
+                        None => Some(Value::Null),
+                        Some(_) => None,
+                    };
+                    if let (Some(when_value), Some(then_value), Some(else_value)) =
+                        (when_value, then_value, else_value)
+                    {
+                        let ir = compile_scalar(
+                            constant(when_value).branch(constant(then_value), constant(else_value)),
+                        )?;
+                        ir.lower_into(program, target_register)?;
+                        if let Some(span) = constant_span {
+                            program.constant_span_end(span);
+                        }
+                        return Ok(target_register);
+                    }
+                }
+            }
+
             // There's two forms of CASE, one which checks a base expression for equality
             // against the WHEN values, and returns the corresponding THEN value if it matches:
             //   CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'many' END

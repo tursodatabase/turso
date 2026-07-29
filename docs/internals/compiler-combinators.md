@@ -41,7 +41,8 @@ representation.
    programs across incrementally, retaining the existing emitter as a fallback
    until each path has equivalent coverage.
 
-The initial scalar IR is intentionally straight-line. It establishes the
-combinator contract and the separation between symbolic values and VDBE
-registers without prematurely choosing the representation of effectful database
-resources.
+The current IR supports straight-line scalar operations plus conditional
+diamonds with block parameters. This establishes the combinator contract,
+SSA joins, and the separation between symbolic values and VDBE resources
+without prematurely choosing the representation of effectful database
+resources or loops.
