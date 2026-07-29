@@ -947,6 +947,15 @@ impl LogicalLog {
             .expect("advance_offset_after_success called without pending deferred write");
     }
 
+    /// Discard the pending running CRC staged by a deferred write whose
+    /// two-phase commit aborted before the offset advanced.
+    ///
+    /// This must be called on the abort path so no later write chains its
+    /// running CRC from a value staged for a write that never confirmed.
+    pub fn discard_pending_write(&mut self) {
+        self.pending_running_crc = None;
+    }
+
     pub fn sync(&mut self, sync_type: FileSyncType) -> Result<Completion> {
         let completion = Completion::new_sync(move |_| {
             tracing::debug!("logical_log_sync finish");
