@@ -2778,16 +2778,16 @@ impl Pager {
     /// Set the initial page size for the database. Should only be called before the database is initialized
     pub fn set_initial_page_size(&self, size: PageSize) -> Result<()> {
         turso_assert!(!self.db_initialized());
-        let reserved_space = self
-            .get_reserved_space()
-            .unwrap_or_else(|| self.io_ctx.read().get_reserved_space_bytes());
-        if !size.has_valid_reserved_space(reserved_space) {
-            return Err(LimboError::InvalidArgument(format!(
-                "page size {} with reserved space {} leaves less than {} usable bytes",
-                size.get(),
-                reserved_space,
-                PageSize::MIN_USABLE_SPACE
-            )));
+        if let Some(codec) = self.page_codec() {
+            let reserved_space = codec.required_reserved_bytes();
+            if !size.has_valid_reserved_space(reserved_space) {
+                return Err(LimboError::InvalidArgument(format!(
+                    "page size {} with reserved space {} leaves less than {} usable bytes",
+                    size.get(),
+                    reserved_space,
+                    PageSize::MIN_USABLE_SPACE
+                )));
+            }
         }
         let IOResult::Done(mut header) = self.with_header(|header| *header)? else {
             panic!("DB should not be initialized and should not do any IO");
@@ -2884,7 +2884,7 @@ impl Pager {
     }
 
     /// Set the page size. Used internally when page size is determined.
-    pub(crate) fn set_page_size(&self, size: PageSize) {
+    pub fn set_page_size(&self, size: PageSize) {
         self.page_size.store(size.get(), Ordering::SeqCst);
     }
 
@@ -2899,7 +2899,7 @@ impl Pager {
     }
 
     /// Set the reserved space. Must fit in u8.
-    fn set_reserved_space(&self, space: u8) {
+    pub fn set_reserved_space(&self, space: u8) {
         self.reserved_space.store(space as u16, Ordering::SeqCst);
     }
 
@@ -4576,13 +4576,19 @@ impl Pager {
                 CheckpointMode::Restart | CheckpointMode::Truncate { .. }
             )
         {
+            if self.has_page_codec() {
+                // External codecs are restricted to in-process WAL, whose
+                // backfill publication does not install a durable proof.
+                return CheckpointPhase::PublishBackfill {
+                    clear_page_cache,
+                    max_frame: result.wal_total_backfilled,
+                };
+            }
             return CheckpointPhase::ReadDbIdentity {
                 clear_page_cache,
                 read: PendingCheckpointDbIdentityRead {
                     max_frame: result.wal_total_backfilled,
-                    header_buf: Arc::new(Buffer::new_temporary(
-                        self.get_page_size_unchecked().get() as usize,
-                    )),
+                    header_buf: Arc::new(Buffer::new_temporary(PageSize::MIN as usize)),
                     bytes_read: Arc::new(AtomicUsize::new(usize::MAX)),
                     read_sent: false,
                 },
@@ -4813,19 +4819,14 @@ impl Pager {
                     if !read.read_sent {
                         let header_buf = read.header_buf.clone();
                         let bytes_read = read.bytes_read.clone();
-                        let io_ctx = self.io_ctx.read();
-                        let c = self.db_file.read_page(
-                            1,
-                            &io_ctx,
-                            Completion::new_read(header_buf, {
-                                Box::new(move |res| {
-                                    if let Ok((_buf, count)) = res {
-                                        bytes_read.store(count as usize, Ordering::Release);
-                                    }
-                                    None
-                                })
-                            }),
-                        )?;
+                        let c = self.db_file.read_header(Completion::new_read(header_buf, {
+                            Box::new(move |res| {
+                                if let Ok((_buf, count)) = res {
+                                    bytes_read.store(count as usize, Ordering::Release);
+                                }
+                                None
+                            })
+                        }))?;
                         read.read_sent = true;
                         self.checkpoint_state.write().phase = CheckpointPhase::ReadDbIdentity {
                             clear_page_cache,
@@ -5693,22 +5694,15 @@ impl Pager {
         Ok(IOResult::Done(result))
     }
 
-    pub fn has_encryption(&self) -> bool {
-        self.io_ctx.read().has_encryption()
+    pub fn is_encryption_ctx_set(&self) -> bool {
+        self.io_ctx.read().encryption_context().is_some()
     }
 
-    pub fn encryption_reserved_space(&self) -> Option<u8> {
-        self.io_ctx
-            .read()
-            .encryption_context()
-            .map(EncryptionContext::required_reserved_bytes)
-    }
-
-    pub fn has_page_codec(&self) -> bool {
+    pub(crate) fn has_page_codec(&self) -> bool {
         self.io_ctx.read().has_page_codec()
     }
 
-    pub fn page_codec(&self) -> Option<Arc<dyn PageCodec>> {
+    pub(crate) fn page_codec(&self) -> Option<Arc<dyn PageCodec>> {
         self.io_ctx.read().page_codec()
     }
 
@@ -5756,7 +5750,7 @@ impl Pager {
     }
 
     pub(crate) fn set_page_codec(&self, codec: Arc<dyn PageCodec>) -> Result<()> {
-        if self.has_encryption() {
+        if self.is_encryption_ctx_set() {
             return Err(LimboError::InvalidArgument(
                 "cannot install an external page codec while built-in encryption is configured"
                     .into(),
@@ -5804,7 +5798,7 @@ impl Pager {
         wal.set_io_context(self.io_ctx.read().clone())
     }
 
-    pub(crate) fn set_reserved_space_bytes(&self, value: u8) {
+    pub fn set_reserved_space_bytes(&self, value: u8) {
         self.set_reserved_space(value);
     }
 
@@ -6644,9 +6638,7 @@ mod ptrmap_tests {
 #[cfg(all(test, feature = "fs", host_shared_wal))]
 mod checkpoint_phase_tests {
     use super::*;
-    #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
-    use crate::io::PlatformIO;
-    use crate::io::IO;
+    use crate::io::{PlatformIO, IO};
     use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::storage::wal::CheckpointMode;
     use crate::sync::atomic::Ordering;
