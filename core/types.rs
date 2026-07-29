@@ -1137,6 +1137,35 @@ mod immutable_record {
         //
         // payload is the std::vec::Vec<u8> but in order to use Register which holds ImmutableRecord as a Value - we store std::vec::Vec<u8> as Value::Blob
         payload: Value,
+        // Where the last header walk over `payload` stopped, so the next column
+        // fetch resumes mid-header instead of re-decoding every serial type from
+        // byte zero (SQLite's aOffset/nHdrParsed cache, collapsed to a frontier).
+        // Every `&mut` route to the payload passes through [Self::as_blob_mut],
+        // which resets this; a stale frontier can therefore never survive a
+        // payload change.
+        parse_cache: Cell<ParseFrontier>,
+    }
+
+    /// Resume point of an incremental record-header walk: columns `0..cols_parsed`
+    /// have been decoded, the next serial type starts at `header_off` and its data
+    /// at `data_off` (both absolute payload offsets), and the header ends at
+    /// `header_end`. `header_off == 0` means "no walk cached" — offset zero always
+    /// holds the header-size varint, never a serial type.
+    #[derive(Clone, Copy)]
+    struct ParseFrontier {
+        cols_parsed: u32,
+        header_off: u32,
+        header_end: u32,
+        data_off: u32,
+    }
+
+    impl ParseFrontier {
+        const EMPTY: Self = Self {
+            cols_parsed: 0,
+            header_off: 0,
+            header_end: 0,
+            data_off: 0,
+        };
     }
 
     // SAFETY: all ImmutableRecord instances are intended to be used in a single thread
@@ -1148,6 +1177,8 @@ mod immutable_record {
         fn clone(&self) -> Self {
             Self {
                 payload: self.payload.clone(),
+                // The clone holds identical bytes, so the frontier stays valid.
+                parse_cache: self.parse_cache.clone(),
             }
         }
     }
@@ -1523,6 +1554,70 @@ mod immutable_record {
             iter(self.get_payload())
         }
 
+        /// Resumes the header walk for a fetch of column `col`: the returned
+        /// iterator sits at the cached frontier (or at column zero when no
+        /// frontier is usable, e.g. after a payload change or a backwards
+        /// fetch) and the returned count says how many columns it still has
+        /// to skip to reach `col`.
+        #[inline(always)]
+        pub(crate) fn resume_iter(
+            &self,
+            col: usize,
+        ) -> Result<(usize, ValueIterator<'_>), LimboError> {
+            let payload = self.get_payload();
+            let f = self.parse_cache.get();
+            let (cols_parsed, header_off, header_end, data_off) = (
+                f.cols_parsed as usize,
+                f.header_off as usize,
+                f.header_end as usize,
+                f.data_off as usize,
+            );
+            // The in-bounds re-checks are defensive: every payload mutation
+            // resets the frontier, so stored offsets describe current bytes.
+            if header_off != 0
+                && cols_parsed <= col
+                && header_off <= header_end
+                && header_end <= payload.len()
+                && data_off <= payload.len()
+            {
+                let iter = ValueIterator::from_parts(
+                    &payload[header_off..header_end],
+                    &payload[data_off..],
+                );
+                return Ok((col - cols_parsed, iter));
+            }
+            Ok((col, ValueIterator::new(payload)?))
+        }
+
+        /// Stores `iter`'s position as the new frontier after column `col`
+        /// was decoded from it. `iter` must come from [Self::resume_iter] on
+        /// this record; anything else fails the bounds checks and stores
+        /// nothing.
+        #[inline(always)]
+        pub(crate) fn commit_frontier(&self, col: usize, iter: &ValueIterator<'_>) {
+            let payload = self.get_payload();
+            let base = payload.as_ptr() as usize;
+            let header = iter.header_section_ref();
+            let data = iter.data_section_ref();
+            let header_off = (header.as_ptr() as usize).wrapping_sub(base);
+            let data_off = (data.as_ptr() as usize).wrapping_sub(base);
+            let header_end = header_off + header.len();
+            // Records too large for u32 offsets simply never cache;
+            // correctness does not depend on a frontier being stored.
+            if header_end <= payload.len()
+                && data_off <= payload.len()
+                && payload.len() <= u32::MAX as usize
+                && col < u32::MAX as usize
+            {
+                self.parse_cache.set(ParseFrontier {
+                    cols_parsed: (col + 1) as u32,
+                    header_off: header_off as u32,
+                    header_end: header_end as u32,
+                    data_off: data_off as u32,
+                });
+            }
+        }
+
         #[inline]
         /// Returns true if the record contains any NULL values.
         /// This is an optimization that only examines the header (serial types)
@@ -1613,6 +1708,7 @@ mod immutable_record {
             payload.try_reserve_exact(payload_capacity)?;
             Ok(Self {
                 payload: Value::Blob(payload),
+                parse_cache: Cell::new(ParseFrontier::EMPTY),
             })
         }
 
@@ -1627,6 +1723,7 @@ mod immutable_record {
         pub fn from_buf(buf: RecordBuf) -> Self {
             Self {
                 payload: Value::Blob(buf.0),
+                parse_cache: Cell::new(ParseFrontier::EMPTY),
             }
         }
 
@@ -1637,12 +1734,14 @@ mod immutable_record {
             buf.try_extend(payload.iter().copied())?;
             Ok(Self {
                 payload: Value::Blob(buf),
+                parse_cache: Cell::new(ParseFrontier::EMPTY),
             })
         }
 
         pub const fn from_bin_record(payload: ValueBlob) -> Self {
             Self {
                 payload: Value::Blob(payload),
+                parse_cache: Cell::new(ParseFrontier::EMPTY),
             }
         }
 
@@ -1758,6 +1857,7 @@ mod immutable_record {
             writer.assert_finish_capacity();
             Ok(Self {
                 payload: Value::Blob(buf),
+                parse_cache: Cell::new(ParseFrontier::EMPTY),
             })
         }
 
@@ -1778,7 +1878,10 @@ mod immutable_record {
         }
 
         #[inline]
-        pub const fn as_blob_mut(&mut self) -> &mut ValueBlob {
+        pub fn as_blob_mut(&mut self) -> &mut ValueBlob {
+            // Sole `&mut` route to the payload bytes: dropping the frontier here
+            // makes stale resume offsets unreachable after any payload change.
+            self.parse_cache.set(ParseFrontier::EMPTY);
             match &mut self.payload {
                 Value::Blob(b) => b,
                 _ => panic!("payload must be a blob"),
@@ -1949,6 +2052,17 @@ impl<'a> ValueIterator<'a> {
             header_section: Cell::new(&payload[header_varint_len..header_size]),
             data_section: Cell::new(&payload[header_size..]),
         })
+    }
+
+    /// An iterator resuming mid-record: `header` is the unread tail of the
+    /// header section and `data` the payload from the next unread column's
+    /// data onward. Used by [ImmutableRecord]'s frontier cache.
+    #[inline(always)]
+    const fn from_parts(header: &'a [u8], data: &'a [u8]) -> Self {
+        Self {
+            header_section: Cell::new(header),
+            data_section: Cell::new(data),
+        }
     }
 
     /// Returns `true` if the payload is empty or the record has no columns.
@@ -4819,5 +4933,57 @@ mod tests {
         for value in values {
             assert_eq!(value.try_clone().unwrap(), value);
         }
+    }
+
+    /// Drives [ImmutableRecord::resume_iter]/[ImmutableRecord::commit_frontier]
+    /// through the access patterns op_column produces and checks both the
+    /// decoded values and the number of columns each resume still skips.
+    #[test]
+    fn test_parse_frontier_resume_and_restart() {
+        let values: Vec<Value> = (0..6).map(Value::from_i64).collect();
+        let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+
+        let fetch = |col: usize, expected_skip: usize| {
+            let (skip, mut iter) = record.resume_iter(col).unwrap();
+            assert_eq!(skip, expected_skip, "unexpected skip for column {col}");
+            let value = iter.nth(skip).unwrap().unwrap();
+            record.commit_frontier(col, &iter);
+            assert_eq!(value, ValueRef::from_i64(col as i64));
+        };
+
+        // Ascending fetches resume where the previous one stopped.
+        fetch(0, 0);
+        fetch(1, 0);
+        fetch(3, 1);
+        fetch(5, 1);
+        // A backwards fetch restarts from scratch...
+        fetch(2, 2);
+        // ...and leaves a frontier later fetches resume from again.
+        fetch(4, 1);
+    }
+
+    /// A fetch past the end of a short record must not disturb the stored
+    /// frontier, and any payload mutation must drop it.
+    #[test]
+    fn test_parse_frontier_short_record_and_invalidation() {
+        let values: Vec<Value> = (0..3).map(Value::from_i64).collect();
+        let mut record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+
+        let (skip, mut iter) = record.resume_iter(1).unwrap();
+        assert_eq!(iter.nth(skip).unwrap().unwrap(), ValueRef::from_i64(1));
+        record.commit_frontier(1, &iter);
+
+        // Column 7 does not exist: the walk runs off the header and returns
+        // None without committing, so the frontier still resumes at column 2.
+        let (skip, mut iter) = record.resume_iter(7).unwrap();
+        assert_eq!(skip, 5);
+        assert!(iter.nth(skip).is_none());
+        let (skip, _) = record.resume_iter(2).unwrap();
+        assert_eq!(skip, 0);
+
+        // Any &mut route to the payload resets the frontier.
+        record.as_blob_mut();
+        let (skip, _) = record.resume_iter(2).unwrap();
+        assert_eq!(skip, 2);
     }
 }

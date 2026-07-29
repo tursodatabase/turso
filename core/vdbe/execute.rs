@@ -47,6 +47,8 @@ use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::metrics::HashJoinMetrics;
 use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
+use crate::vdbe::ColumnRuns;
+use crate::vdbe::RecordFrontierExt;
 use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
     registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
@@ -1774,6 +1776,15 @@ pub fn op_column(
     // op-state slot (enum write + drop on clear) is bypassed entirely. On IO
     // resume the slot is still idle and this path re-executes.
     if state.active_op_state.is_idle() && state.deferred_seeks[*cursor_id].is_none() {
+        let run_len = program.column_runs.lens[state.pc as usize];
+        // Tracing observes each instruction from the dispatch loop, so runs
+        // stay per-instruction whenever it is on.
+        if run_len > 1
+            && !program.connection.get_vdbe_trace()
+            && !tracing::enabled!(tracing::Level::TRACE)
+        {
+            return op_column_run(program, state, *cursor_id, run_len as usize);
+        }
         let result = op_column_fetch(program, state, *cursor_id, *column, *dest, default)?;
         if matches!(result, InsnFunctionStepResult::Step) {
             state.pc += 1;
@@ -1855,6 +1866,126 @@ pub fn op_column(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Applies a Column instruction's DEFAULT (or NULL when there is none) to
+/// `dest` after the row's record turned out to have fewer columns than the
+/// instruction expects. Extends in place when the register already holds a
+/// value of the default's type so per-row default fills stay allocation-free.
+#[inline(always)]
+fn column_default_into_register(dest: &mut Register, default: &Option<Value>) -> Result<()> {
+    let Some(default) = default else {
+        dest.set_null();
+        return Ok(());
+    };
+    match (default, dest) {
+        (Value::Text(new_text), Register::Value(Value::Text(existing_text))) => {
+            existing_text.do_extend(new_text)?;
+        }
+        (Value::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
+            existing_blob.do_extend(new_blob)?;
+        }
+        (default, dest) => {
+            dest.set_value(default.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Executes the run of `run_len` Column instructions starting at `state.pc`
+/// in a single dispatch: one cursor resolve, one record fetch and one shared
+/// header walk fill every destination register in the run. Reached only from
+/// the op_column fast path (no suspended op-state, no deferred seek) for runs
+/// precomputed by [crate::vdbe::ColumnRuns::compute]: same b-tree cursor,
+/// strictly ascending columns. Any IO propagates before the first register
+/// write, so re-entry safely re-executes the whole run.
+fn op_column_run(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    run_len: usize,
+) -> Result<InsnFunctionStepResult> {
+    let pc = state.pc as usize;
+    let ops = &program.column_runs.ops[pc..pc + run_len];
+
+    let record = {
+        let cursor = crate::get_cursor!(state, cursor_id);
+        let cursor = cursor.as_btree_mut();
+        if cursor.get_null_flag() {
+            tracing::trace!("op_column_run(null_flag)");
+            None
+        } else {
+            return_if_io!(cursor.record())
+        }
+    };
+
+    let Some(record) = record else {
+        // A null-flagged cursor or missing row NULLs every register in the
+        // run, exactly like each Column instruction would individually.
+        for &op in ops {
+            state.registers[ColumnRuns::op_dest(op)].set_null();
+        }
+        finish_column_run(state, run_len);
+        return Ok(InsnFunctionStepResult::Step);
+    };
+
+    let first_column = ColumnRuns::op_column(ops[0]);
+    let (first_skip, mut iter) = record.resume_iter(first_column)?;
+    let mut prev_column = first_column;
+    let mut last_decoded = None;
+    let mut idx = 0;
+    while idx < run_len {
+        let op = ops[idx];
+        let column = ColumnRuns::op_column(op);
+        let skip = if idx == 0 {
+            first_skip
+        } else {
+            column - prev_column - 1
+        };
+        prev_column = column;
+        match iter.nth_into_register(skip, &mut state.registers[ColumnRuns::op_dest(op)]) {
+            Some(Ok(())) => {
+                last_decoded = Some(column);
+                idx += 1;
+            }
+            Some(Err(e)) => return Err(e),
+            None => {
+                branches::mark_unlikely();
+                break;
+            }
+        }
+    }
+    // An exhausted header cannot seed a later fetch (anything past the last
+    // column restarts or misses anyway), so skip the store on the common
+    // whole-row scan.
+    if let (Some(column), false) = (last_decoded, iter.header_section_ref().is_empty()) {
+        record.commit_frontier(column, &iter);
+    }
+    // Cold tail: the record is shorter than the run (rows written before
+    // ALTER TABLE ADD COLUMN). Ascending columns mean every remaining column
+    // is also past the end; fill each from its instruction's DEFAULT.
+    for (insn, _) in &program.insns[pc + idx..pc + run_len] {
+        let Insn::Column { dest, default, .. } = insn else {
+            unreachable!("column run covers a non-Column instruction");
+        };
+        column_default_into_register(&mut state.registers[*dest], default)?;
+    }
+
+    finish_column_run(state, run_len);
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Advances past an executed Column run. The dispatch loop counts one
+/// executed instruction per dispatch; account for the rest of the run so
+/// metrics match per-instruction execution.
+#[inline(always)]
+fn finish_column_run(state: &mut ProgramState, run_len: usize) {
+    state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(run_len as u64 - 1);
+    state.metrics.insn_executed = state
+        .metrics
+        .insn_executed
+        .saturating_add(run_len as u64 - 1);
+    state.pc += run_len as u32;
+}
+
 /// Fetches one column of the cursor's current row into a register. Returns
 /// `Step` on completion; any IO is propagated without persisting state, so
 /// callers can safely re-invoke after the completion finishes.
@@ -1866,18 +1997,6 @@ fn op_column_fetch(
     dest: usize,
     default: &Option<Value>,
 ) -> Result<InsnFunctionStepResult> {
-    // First check if this is a MaterializedViewCursor
-    {
-        let cursor = state.get_cursor(cursor_id);
-        if let Cursor::MaterializedView(mv_cursor) = cursor {
-            // Handle materialized view column access
-            let value = return_if_io!(mv_cursor.column(column));
-            state.registers[dest].set_value(value);
-            return Ok(InsnFunctionStepResult::Step);
-        }
-        // Fall back to normal handling
-    }
-
     let (_, cursor_type) = program
         .cursor_ref
         .get(cursor_id)
@@ -1887,9 +2006,15 @@ fn op_column_fetch(
         | CursorType::BTreeIndex(_)
         | CursorType::MaterializedView(_, _) => {
             {
-                let cursor_ref =
-                    must_be_btree_cursor!(cursor_id, program.cursor_ref, state, "Column");
-                let cursor = cursor_ref.as_btree_mut();
+                let cursor = crate::get_cursor!(state, cursor_id);
+                // Only MaterializedView-typed slots ever hold one, but they
+                // can also hold a plain btree cursor over the view's storage.
+                if let Cursor::MaterializedView(mv_cursor) = cursor {
+                    let value = return_if_io!(mv_cursor.column(column));
+                    state.registers[dest].set_value(value);
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+                let cursor = cursor.as_btree_mut();
 
                 if cursor.get_null_flag() {
                     tracing::trace!("op_column(null_flag)");
@@ -1907,13 +2032,11 @@ fn op_column_fetch(
                     return Ok(InsnFunctionStepResult::Step);
                 };
 
-                let mut payload_iterator = record.iter()?;
-
-                // Parse the header for serial types incrementally until we have the target column
-                // Use nth_into_register to write directly to the register without
-                // creating intermediate ValueRef allocations
-
-                match payload_iterator.nth_into_register(column, &mut state.registers[dest]) {
+                // Resume the header walk from the record's parse frontier and
+                // write straight into the register: consecutive Column fetches
+                // on the same row each decode a single serial type instead of
+                // re-walking the header from byte zero.
+                match record.column_into_register(column, &mut state.registers[dest]) {
                     Some(result) => {
                         result?;
                         return Ok(InsnFunctionStepResult::Step);
@@ -1926,33 +2049,23 @@ fn op_column_fetch(
             };
 
             // DEFAULT handling
-            let Some(ref default) = default else {
-                state.registers[dest].set_null();
-                return Ok(InsnFunctionStepResult::Step);
-            };
-            match (default, &mut state.registers[dest]) {
-                (Value::Text(new_text), Register::Value(Value::Text(existing_text))) => {
-                    existing_text.do_extend(new_text)?;
-                }
-                (Value::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
-                    existing_blob.do_extend(new_blob)?;
-                }
-                _ => {
-                    state.registers[dest].set_value(default.clone());
-                }
-            }
+            column_default_into_register(&mut state.registers[dest], default)?;
         }
         CursorType::Sorter => {
-            let record = {
-                let cursor = state.get_cursor(cursor_id);
-                let cursor = cursor.as_sorter_mut();
-                cursor.record().cloned()
-            };
+            // get_cursor! keeps the cursor borrow on state.cursors only, so the
+            // record can be decoded straight into state.registers without the
+            // per-column record clone this arm used to make.
+            let record = crate::get_cursor!(state, cursor_id)
+                .as_sorter_mut()
+                .record();
             if let Some(record) = record {
-                state.registers[dest].set_value(match record.get_value_opt(column) {
-                    Some(val) => val.to_owned()?,
-                    None => default.clone().unwrap_or(Value::Null),
-                });
+                match record.column_into_register(column, &mut state.registers[dest]) {
+                    Some(result) => result?,
+                    None => {
+                        branches::mark_unlikely();
+                        state.registers[dest].set_value(default.clone().unwrap_or(Value::Null));
+                    }
+                }
             } else {
                 state.registers[dest].set_null();
             }
@@ -1975,8 +2088,7 @@ fn op_column_fetch(
                 Register::Record(record) => {
                     // Decode straight into the register; going through an owned
                     // Value would allocate for every TEXT/BLOB column on every row.
-                    let mut payload_iterator = record.iter()?;
-                    match payload_iterator.nth_into_register(column, dest_reg) {
+                    match record.column_into_register(column, dest_reg) {
                         Some(result) => result?,
                         // A pseudo cursor is opened with num_fields matching the
                         // record built for it, so every emitted Column index is in

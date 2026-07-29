@@ -1988,10 +1988,12 @@ impl ProgramBuilder {
             && self.flags.is_multi_write()
             && self.may_abort();
 
+        let column_runs = crate::vdbe::ColumnRuns::compute(&self.insns, &self.cursor_ref);
         let prepared = PreparedProgram {
             max_registers: self.next_free_register,
             insns: self.insns,
             cursor_ref: self.cursor_ref,
+            column_runs,
             comments: self.comments,
             parameters: self.parameters,
             change_cnt_on,

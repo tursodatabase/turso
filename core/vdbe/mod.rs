@@ -1519,6 +1519,85 @@ pub struct PreparedProgram {
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
+    /// Per-pc tables describing runs of Column instructions op_column may
+    /// execute in a single dispatch; see [ColumnRuns::compute].
+    pub column_runs: ColumnRuns,
+}
+
+/// Per-pc tables for runs of Column instructions that op_column executes in
+/// one dispatch — same b-tree cursor, strictly ascending column indices —
+/// sharing one cursor resolve, record fetch and header walk.
+///
+/// Runs are a static property of the instruction stream, computed once per
+/// prepare. `lens[pc]` is the length of the maximal such run starting at
+/// `pc` (1 for every other instruction, never consulted there). Because each
+/// entry describes the run *suffix* starting at its pc, a jump into the
+/// middle of a run simply executes the shorter suffix as a batch: no
+/// jump-target analysis is needed and the bytecode itself is unchanged.
+///
+/// `ops` mirrors each batchable Column's `(dest, column)` operands packed
+/// into one dense word per pc, so the run executor's per-column loop reads 8
+/// bytes per element instead of destructuring the full instruction.
+#[derive(Debug, Clone)]
+pub struct ColumnRuns {
+    pub(crate) lens: Vec<u16>,
+    pub(crate) ops: Vec<u64>,
+}
+
+impl ColumnRuns {
+    #[inline(always)]
+    pub(crate) const fn op_column(op: u64) -> usize {
+        (op & u32::MAX as u64) as usize
+    }
+
+    #[inline(always)]
+    pub(crate) const fn op_dest(op: u64) -> usize {
+        (op >> 32) as usize
+    }
+
+    pub(crate) fn compute(
+        insns: &[(Insn, usize)],
+        cursor_ref: &[(Option<CursorKey>, CursorType)],
+    ) -> Self {
+        let n = insns.len();
+        let mut lens = crate::alloc::vec![1u16; n];
+        let mut ops = crate::alloc::vec![0u64; n];
+        let mut cursor = crate::alloc::vec![usize::MAX; n];
+        for (pc, (insn, _)) in insns.iter().enumerate() {
+            let Insn::Column {
+                cursor_id,
+                column,
+                dest,
+                ..
+            } = insn
+            else {
+                continue;
+            };
+            // Only cursors that always resolve to a b-tree at runtime batch;
+            // MaterializedView-typed slots may hold a MaterializedViewCursor,
+            // and sorter/pseudo cursors have their own fetch arms.
+            if !matches!(
+                cursor_ref[*cursor_id].1,
+                CursorType::BTreeTable(_) | CursorType::BTreeIndex(_)
+            ) {
+                continue;
+            }
+            if *column > u32::MAX as usize || *dest > u32::MAX as usize {
+                continue;
+            }
+            cursor[pc] = *cursor_id;
+            ops[pc] = ((*dest as u64) << 32) | *column as u64;
+        }
+        for pc in (0..n.saturating_sub(1)).rev() {
+            if cursor[pc] != usize::MAX
+                && cursor[pc] == cursor[pc + 1]
+                && Self::op_column(ops[pc + 1]) > Self::op_column(ops[pc])
+            {
+                lens[pc] = lens[pc + 1].saturating_add(1);
+            }
+        }
+        Self { lens, ops }
+    }
 }
 
 #[derive(Clone)]
@@ -3025,6 +3104,30 @@ impl Row {
     }
 }
 
+/// Test-only counter of serial-type varint decodes performed by the record
+/// header walk in `nth_into_register`. Lets tests assert that fetching every
+/// column of a row costs O(columns) decodes rather than O(columns^2).
+#[cfg(test)]
+pub(crate) mod serial_decode_stats {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SERIAL_TYPE_DECODES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub fn reset() {
+        SERIAL_TYPE_DECODES.with(|c| c.set(0));
+    }
+
+    pub fn count() -> u64 {
+        SERIAL_TYPE_DECODES.with(|c| c.get())
+    }
+
+    pub(super) fn bump() {
+        SERIAL_TYPE_DECODES.with(|c| c.set(c.get() + 1));
+    }
+}
+
 /// Extension trait for `ValueIterator` that allows writing directly to a `Register`
 /// without allocating intermediate `ValueRef` values.
 pub trait ValueIteratorExt {
@@ -3050,6 +3153,8 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 return None;
             }
 
+            #[cfg(test)]
+            serial_decode_stats::bump();
             let (serial_type, bytes_read) = match read_varint(header) {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
@@ -3074,6 +3179,8 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
             return None;
         }
 
+        #[cfg(test)]
+        serial_decode_stats::bump();
         let (serial_type, bytes_read) = match read_varint(header) {
             Ok(v) => v,
             Err(e) => return Some(Err(e)),
@@ -3255,10 +3362,144 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
     }
 }
 
+/// Extension trait for [crate::types::ImmutableRecord] giving `Insn::Column` a
+/// header walk that resumes from the record's cached parse frontier, so
+/// fetching every column of an N-column row costs O(N) serial-type decodes
+/// per row instead of O(N^2).
+pub trait RecordFrontierExt {
+    /// Decodes column `col` directly into `dest`, resuming the header walk
+    /// from wherever the previous fetch on this record stopped. Same contract
+    /// as [ValueIteratorExt::nth_into_register]: `Some(Ok(()))` on success,
+    /// `Some(Err(..))` on parse error, `None` when the record has fewer than
+    /// `col + 1` columns.
+    fn column_into_register(&self, col: usize, dest: &mut Register) -> Option<Result<()>>;
+}
+
+impl RecordFrontierExt for crate::types::ImmutableRecord {
+    #[inline(always)]
+    fn column_into_register(&self, col: usize, dest: &mut Register) -> Option<Result<()>> {
+        let (skip, mut iter) = match self.resume_iter(col) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+        let res = iter.nth_into_register(skip, dest);
+        if let Some(Ok(())) = res {
+            self.commit_frontier(col, &iter);
+        }
+        res
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    /// The record header must be walked once per row, not once per column:
+    /// a SELECT * over N columns costs N serial-type decodes per row. Without
+    /// the parse-frontier cache each Column re-parses the header from the
+    /// start, costing sum(i+1 for i in 0..N) = N*(N+1)/2 decodes per row
+    /// (55 for the 10 columns here).
+    #[test]
+    fn select_star_serial_type_decodes_are_linear_in_columns() {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let db =
+            crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE t(c0 INTEGER, c1 TEXT, c2 INTEGER, c3 TEXT, c4 INTEGER, \
+             c5 TEXT, c6 INTEGER, c7 TEXT, c8 INTEGER, c9 TEXT)",
+        )
+        .unwrap();
+        for i in 0..3 {
+            conn.execute(
+                format!(
+                    "INSERT INTO t VALUES ({i}, 'a{i}', {i}, 'b{i}', {i}, 'c{i}', {i}, 'd{i}', {i}, 'e{i}')"
+                )
+                .as_str(),
+            )
+            .unwrap();
+        }
+
+        let mut stmt = conn.prepare("SELECT * FROM t").unwrap();
+        serial_decode_stats::reset();
+        let mut rows = 0i64;
+        stmt.run_with_row_callback(|row| {
+            assert_eq!(row.len(), 10);
+            assert_eq!(row.get::<i64>(0).unwrap(), rows);
+            assert_eq!(row.get::<String>(9).unwrap(), format!("e{rows}"));
+            rows += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows, 3);
+        assert_eq!(serial_decode_stats::count(), 3 * 10);
+    }
+
+    /// A WHERE fetch and the projection fetch execute as separate
+    /// instructions with a conditional jump in between, so no batching
+    /// applies — the record's parse frontier alone carries the walk across
+    /// dispatches: c4 costs 5 decodes, then c9 resumes for 5 more instead of
+    /// re-walking all 10 from byte zero.
+    #[test]
+    fn filtered_late_column_resumes_frontier_across_instructions() {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let db =
+            crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE t(c0 INTEGER, c1 TEXT, c2 INTEGER, c3 TEXT, c4 INTEGER, \
+             c5 TEXT, c6 INTEGER, c7 TEXT, c8 INTEGER, c9 TEXT)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (0, 'a', 2, 'b', 4, 'c', 6, 'd', 8, 'e')")
+            .unwrap();
+
+        let mut stmt = conn.prepare("SELECT c9 FROM t WHERE c4 >= 0").unwrap();
+        serial_decode_stats::reset();
+        let mut rows = 0;
+        stmt.run_with_row_callback(|row| {
+            assert_eq!(row.get::<String>(0).unwrap(), "e");
+            rows += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(serial_decode_stats::count(), 10);
+    }
+
+    /// A sparse ascending projection shares one header walk per row through
+    /// the parse frontier: c2 costs 3 decodes, then c5 resumes for 3 more and
+    /// c9 for 4, i.e. 10 per row — never re-decoding a serial type. Restarting
+    /// from scratch for every column would cost 3 + 6 + 10 = 19 per row.
+    #[test]
+    fn sparse_ascending_projection_shares_one_header_walk() {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let db =
+            crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE t(c0 INTEGER, c1 TEXT, c2 INTEGER, c3 TEXT, c4 INTEGER, \
+             c5 TEXT, c6 INTEGER, c7 TEXT, c8 INTEGER, c9 TEXT)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (0, 'a', 2, 'b', 4, 'c', 6, 'd', 8, 'e')")
+            .unwrap();
+
+        let mut stmt = conn.prepare("SELECT c2, c5, c9 FROM t").unwrap();
+        serial_decode_stats::reset();
+        let mut rows = 0;
+        stmt.run_with_row_callback(|row| {
+            assert_eq!(row.get::<i64>(0).unwrap(), 2);
+            assert_eq!(row.get::<String>(1).unwrap(), "c");
+            assert_eq!(row.get::<String>(2).unwrap(), "e");
+            rows += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(serial_decode_stats::count(), 10);
+    }
 
     #[test]
     fn active_opcode_helpers_initialize_defaults() {
