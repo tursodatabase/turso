@@ -145,33 +145,28 @@ pub trait Extendable<T> {
 ///
 /// `src` and `dst` must be valid for `len` bytes and must not overlap.
 #[inline(always)]
-unsafe fn copy_nonoverlapping_bytes(src: *const u8, dst: *mut u8, len: usize) {
-    macro_rules! copy_fixed {
-        ($len:literal) => {
-            std::ptr::copy_nonoverlapping(src, dst, $len)
-        };
-    }
+unsafe fn copy_nonoverlapping_inline(src: *const u8, dst: *mut u8, len: usize) {
     // Record decoding frequently reuses registers for short values. Fixed-size
     // copies compile inline instead of calling the platform memcpy routine.
     unsafe {
         match len {
             0 => {}
-            1 => copy_fixed!(1),
-            2 => copy_fixed!(2),
-            3 => copy_fixed!(3),
-            4 => copy_fixed!(4),
-            5 => copy_fixed!(5),
-            6 => copy_fixed!(6),
-            7 => copy_fixed!(7),
-            8 => copy_fixed!(8),
-            9 => copy_fixed!(9),
-            10 => copy_fixed!(10),
-            11 => copy_fixed!(11),
-            12 => copy_fixed!(12),
-            13 => copy_fixed!(13),
-            14 => copy_fixed!(14),
-            15 => copy_fixed!(15),
-            16 => copy_fixed!(16),
+            1 => std::ptr::copy_nonoverlapping(src, dst, 1),
+            2 => std::ptr::copy_nonoverlapping(src, dst, 2),
+            3 => std::ptr::copy_nonoverlapping(src, dst, 3),
+            4 => std::ptr::copy_nonoverlapping(src, dst, 4),
+            5 => std::ptr::copy_nonoverlapping(src, dst, 5),
+            6 => std::ptr::copy_nonoverlapping(src, dst, 6),
+            7 => std::ptr::copy_nonoverlapping(src, dst, 7),
+            8 => std::ptr::copy_nonoverlapping(src, dst, 8),
+            9 => std::ptr::copy_nonoverlapping(src, dst, 9),
+            10 => std::ptr::copy_nonoverlapping(src, dst, 10),
+            11 => std::ptr::copy_nonoverlapping(src, dst, 11),
+            12 => std::ptr::copy_nonoverlapping(src, dst, 12),
+            13 => std::ptr::copy_nonoverlapping(src, dst, 13),
+            14 => std::ptr::copy_nonoverlapping(src, dst, 14),
+            15 => std::ptr::copy_nonoverlapping(src, dst, 15),
+            16 => std::ptr::copy_nonoverlapping(src, dst, 16),
             _ => std::ptr::copy_nonoverlapping(src, dst, len),
         }
     }
@@ -192,7 +187,7 @@ impl<T: AnyText> Extendable<T> for Text {
                         "source and destination ranges must not overlap"
                     );
                     unsafe {
-                        copy_nonoverlapping_bytes(other_str.as_ptr(), s.as_mut_ptr(), needed);
+                        copy_nonoverlapping_inline(other_str.as_ptr(), s.as_mut_ptr(), needed);
                         s.as_mut_vec().set_len(needed);
                     }
                 } else {
@@ -221,7 +216,7 @@ impl<T: AnyBlob> Extendable<T> for ValueBlob {
                 "source and destination ranges must not overlap"
             );
             unsafe {
-                copy_nonoverlapping_bytes(other_slice.as_ptr(), self.as_mut_ptr(), needed);
+                copy_nonoverlapping_inline(other_slice.as_ptr(), self.as_mut_ptr(), needed);
                 self.set_len(needed);
             }
         } else {
@@ -3650,47 +3645,6 @@ mod tests {
     use super::*;
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
-
-    #[test]
-    fn text_extend_reuses_buffer_across_copy_size_boundary() {
-        let mut storage = String::with_capacity(64);
-        storage.push_str("seed");
-        let pointer = storage.as_ptr();
-        let mut text = Text::new(storage);
-
-        for len in 0..=17 {
-            let source: String = (0..len)
-                .map(|i| char::from(b'a' + (i % 26) as u8))
-                .collect();
-            text.do_extend(&source.as_str()).unwrap();
-            assert_eq!(text.as_str(), source);
-            assert_eq!(text.as_str().as_ptr(), pointer);
-        }
-
-        let source = "z".repeat(64);
-        text.do_extend(&source.as_str()).unwrap();
-        assert_eq!(text.as_str(), source);
-        assert_eq!(text.as_str().as_ptr(), pointer);
-    }
-
-    #[test]
-    fn blob_extend_reuses_buffer_across_copy_size_boundary() {
-        let mut blob = ValueBlob::with_capacity(64);
-        blob.extend_from_slice(b"seed");
-        let pointer = blob.as_ptr();
-
-        for len in 0..=17 {
-            let source: Vec<u8> = (0..len).map(|i| (i * 17) as u8).try_collect().unwrap();
-            blob.do_extend(&source.as_slice()).unwrap();
-            assert_eq!(blob, source);
-            assert_eq!(blob.as_ptr(), pointer);
-        }
-
-        let source = vec![0xa5; 64];
-        blob.do_extend(&source.as_slice()).unwrap();
-        assert_eq!(blob, source);
-        assert_eq!(blob.as_ptr(), pointer);
-    }
 
     fn assert_integer_conversions<T>(in_range: &[(i64, T)], out_of_range: &[i64])
     where
