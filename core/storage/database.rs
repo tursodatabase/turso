@@ -74,8 +74,11 @@ impl IOContext {
         &self.page_transform
     }
 
-    pub fn has_transform(&self) -> bool {
-        !matches!(self.page_transform, PageTransform::None)
+    /// Returns whether page I/O uses a codec transform.
+    ///
+    /// Checksums are maintained separately and do not count as codecs. So encryption
+    pub fn has_codec_transform(&self) -> bool {
+        matches!(self.page_transform, PageTransform::Codec(_))
     }
 
     pub fn reset_checksum(&mut self) {
