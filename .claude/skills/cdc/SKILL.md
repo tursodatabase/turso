@@ -423,12 +423,18 @@ contract; the client-side pull/push race is what makes cuts predate pushes.
   client id — overlapping pushes could commit out of order and regress it.
 - REPLICA CAVEAT: the pull-freshness contract (pull at time t contains every
   push confirmed before t) holds trivially single-primary but breaks with
-  lagging read replicas — which silently breaks the gen-mismatch replay floor
-  (local loss of own confirmed writes) AND pending-push resolution in push()
-  ("provably didn't land" needs boundary reads reflecting all own commits).
-  Enforcement path: session token — client pins the commit position
-  (replication_index) of its last confirmed push; replicas serve pulls and
-  boundary reads only at-or-after it. Fallback: trim nothing on gen mismatch
-  (correct, but re-opens O(n²) CDC/WAL growth). Push floor, translation and
-  no-duplicate properties do NOT depend on freshness — only on boundary
+  lagging read replicas — silently breaking the gen-mismatch replay floor
+  (local loss of own confirmed writes). Pending-push resolution in push()
+  also needs boundary reads reflecting all own commits (read the primary —
+  it's the write path anyway). The contract is NOT fundamental: it is what
+  lets two scalars (confirmed + pending) suffice. Lag-proof generalization:
+  keep an ordered log of batch-boundary records (sent_gen, sent_last, cur) —
+  the shape of pending_push — one per pushed batch, translated at each
+  rebase, pruned once an applied cut's boundary reaches it (applied cuts are
+  monotone since pulls are incremental from the client revision). Any
+  consistent cut names some batch end of ours, so the replay floor becomes
+  the exact translation of what the cut provably contains, under any lag;
+  the issue-time snapshot and the freshness assert then disappear. Log size
+  is bounded by the replication-lag window. Push floor, translation and
+  no-duplicate properties never depended on freshness — only on boundary
   atomicity and confirmed⇒durable.
