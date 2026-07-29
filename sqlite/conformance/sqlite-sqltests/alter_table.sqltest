@@ -455,6 +455,19 @@ expect {
     1|integer|7
 }
 
+@cross-check-integrity
+test alter-table-direct-column-projection-preserves-rowid-and-default {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t VALUES(1, 'one');
+    ALTER TABLE t ADD COLUMN score INTEGER DEFAULT 7;
+    INSERT INTO t VALUES(2, 'two', 8);
+    SELECT id, name, score FROM t;
+}
+expect {
+    1|one|7
+    2|two|8
+}
+
 # https://github.com/tursodatabase/turso/issues/4987
 @cross-check-integrity
 test alter-table-add-column-trailing-named-constraint {

@@ -1,10 +1,13 @@
 use crate::{
     alloc::{TursoFromIterator, TursoIteratorExt},
     emit_explain,
-    schema::{BTreeCharacteristics, BTreeTable},
+    schema::{BTreeCharacteristics, BTreeTable, Table},
     sync::Arc,
     translate::{
         aggregation::emit_ungrouped_aggregation,
+        compiler::{
+            compile_scalar, constant, open_read_table, project_columns, result_row_pack, Compile,
+        },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
             MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
@@ -14,9 +17,9 @@ use crate::{
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
         order_by::EmitOrderBy,
         plan::{
-            BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
-            Operation, QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan,
-            SimpleAggregate,
+            BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, IterationDirection,
+            JoinOrderMember, Operation, QueryDestination, Scan, Search, SeekKeyComponent,
+            SelectPlan, SimpleAggregate,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -25,9 +28,11 @@ use crate::{
         window::{emit_window_flush, EmitWindow},
         ProgramBuilder, Resolver,
     },
-    vdbe::insn::Insn,
-    HashMap, HashSet, Result,
+    types::Value,
+    vdbe::{builder::QueryMode, insn::Insn},
+    HashMap, HashSet, LimboError, Result,
 };
+use smallvec::SmallVec;
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
 use turso_parser::ast::Expr;
@@ -46,8 +51,124 @@ pub fn emit_program_for_select_with_resolver(
     resolver: Resolver,
     mut plan: SelectPlan,
 ) -> Result<()> {
+    let declarative_result_cols_start = program.with_scoped_result_cols_start(|program| {
+        try_emit_declarative_table_scan(program, &resolver, &plan)
+    })?;
+    if let Some(result_cols_start) = declarative_result_cols_start {
+        program.result_columns = plan.result_columns;
+        program.table_references.extend(plan.table_references);
+        program.reg_result_cols_start = Some(result_cols_start);
+        return Ok(());
+    }
+
     let materialized_build_inputs = emit_materialized_build_inputs(program, &resolver, &mut plan)?;
     emit_program_for_select_with_inputs(program, &resolver, plan, materialized_build_inputs)
+}
+
+fn try_emit_declarative_table_scan(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    plan: &SelectPlan,
+) -> Result<Option<usize>> {
+    if matches!(program.get_query_mode(), QueryMode::ExplainQueryPlan)
+        || !matches!(plan.query_destination, QueryDestination::ResultRows)
+        || !matches!(plan.distinctness, Distinctness::NonDistinct)
+        || !plan.where_clause.is_empty()
+        || plan.group_by.is_some()
+        || !plan.order_by.is_empty()
+        || !plan.aggregates.is_empty()
+        || plan.limit.is_some()
+        || plan.offset.is_some()
+        || plan.contains_constant_false_condition
+        || !plan.values.is_empty()
+        || plan.window.is_some()
+        || !plan.non_from_clause_subqueries.is_empty()
+        || plan.simple_aggregate.is_some()
+        || !plan.phantom_params.is_empty()
+        || !plan.table_references.outer_query_refs().is_empty()
+        || plan.result_columns.is_empty()
+    {
+        return Ok(None);
+    }
+
+    let [joined] = plan.table_references.joined_tables() else {
+        return Ok(None);
+    };
+    let [member] = plan.join_order.as_slice() else {
+        return Ok(None);
+    };
+    if member.original_idx != 0
+        || member.table_id != joined.internal_id
+        || member.is_outer
+        || joined.join_info.is_some()
+        || !matches!(
+            joined.op,
+            Operation::Scan(Scan::BTreeTable {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
+            })
+        )
+    {
+        return Ok(None);
+    }
+    let Table::BTree(table) = &joined.table else {
+        return Ok(None);
+    };
+
+    let mut columns = SmallVec::<[usize; 4]>::with_capacity(plan.result_columns.len());
+    for result_column in &plan.result_columns {
+        let Expr::Column {
+            table: table_id,
+            column,
+            ..
+        } = &result_column.expr
+        else {
+            return Ok(None);
+        };
+        if *table_id != joined.internal_id {
+            return Ok(None);
+        }
+        let column_definition = table.columns().get(*column).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "SELECT plan references column {column} outside table {}",
+                table.name
+            ))
+        })?;
+        let requires_frontend_decoding = column_definition.is_virtual_generated()
+            || column_definition.is_array()
+            || resolver.with_schema(joined.database_id, |schema| {
+                schema
+                    .get_type_def_unchecked(&column_definition.ty_str)
+                    .is_some()
+            });
+        if requires_frontend_decoding {
+            return Ok(None);
+        }
+        columns.push(*column);
+    }
+
+    let table = table.clone();
+    let database_id = joined.database_id;
+    let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
+    let compiler = open_read_table(table, database_id, schema_cookie).and_then(move |cursor| {
+        constant(Value::Null).fold_cursor(cursor, move |_state| {
+            project_columns(cursor, columns).and_then(|pack| {
+                let next_state = pack.first();
+                result_row_pack(pack).map(move |()| next_state)
+            })
+        })
+    });
+    let ir = compile_scalar(compiler)?;
+    let target_register = program.alloc_register();
+    let lowered = ir.lower_into(program, target_register)?;
+    let (result_cols_start, result_column_count) = lowered.single_result_row_pack()?;
+    if result_column_count != plan.result_columns.len() {
+        return Err(LimboError::InternalError(format!(
+            "compiler IR lowered {result_column_count} result columns for a {}-column SELECT",
+            plan.result_columns.len()
+        )));
+    }
+    Ok(Some(result_cols_start))
 }
 
 fn emit_program_for_select_with_inputs(
@@ -996,4 +1117,58 @@ fn build_materialized_build_input_plan(
     prune_join_order_for_materialized_inputs(&mut materialize_plan, materialized_build_inputs)?;
 
     Ok(materialize_plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{io::MemoryIO, Database, SqliteDialect};
+
+    #[test]
+    fn simple_table_scan_crosses_the_declarative_compiler_boundary() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO t VALUES (1, 'one')")
+            .unwrap();
+        connection
+            .execute("ALTER TABLE t ADD COLUMN score INTEGER DEFAULT 7")
+            .unwrap();
+
+        let mut statement = connection.prepare("SELECT id, name, score FROM t").unwrap();
+        let instructions = &statement.get_program().insns;
+        let result_row = instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 3, .. }))
+            .expect("table scan must produce its projected row");
+        assert!(
+            instructions[result_row - 3..result_row]
+                .iter()
+                .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })),
+            "symbolic projection values must be packed only during IR lowering"
+        );
+
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![vec![
+                Value::from_i64(1),
+                Value::Text("one".into()),
+                Value::from_i64(7),
+            ]]
+        );
+
+        let query_plan_rows = connection
+            .prepare("EXPLAIN QUERY PLAN SELECT id, name, score FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert!(
+            !query_plan_rows.is_empty(),
+            "EXPLAIN QUERY PLAN must retain the eager emitter's explain tree"
+        );
+    }
 }

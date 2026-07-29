@@ -357,11 +357,33 @@ impl ValueId {
 
 /// An ordered set of SSA values that must occupy consecutive VDBE registers.
 #[derive(Debug)]
-struct ValuePack(SmallVec<[ValueId; 4]>);
+pub(crate) struct ValuePack(SmallVec<[ValueId; 4]>);
 
 impl ValuePack {
     fn values(&self) -> &[ValueId] {
         &self.0
+    }
+
+    pub(crate) fn first(&self) -> ValueId {
+        *self.0.first().expect("compiler value pack is non-empty")
+    }
+}
+
+/// Physical resources allocated while lowering one compiler IR region.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LoweredRegion {
+    result_row_packs: SmallVec<[(usize, usize); 1]>,
+}
+
+impl LoweredRegion {
+    pub(crate) fn single_result_row_pack(&self) -> Result<(usize, usize)> {
+        match self.result_row_packs.as_slice() {
+            [pack] => Ok(*pack),
+            packs => Err(LimboError::InternalError(format!(
+                "compiler IR SELECT expected one result-row pack, lowered {}",
+                packs.len()
+            ))),
+        }
     }
 }
 
@@ -433,6 +455,7 @@ enum EffectOp {
         cursor: CursorId,
         root_page: PageIdx,
         db: usize,
+        schema_cookie: u32,
     },
     ResultRow {
         pack: ValuePack,
@@ -1170,7 +1193,7 @@ impl IrProgram {
         self,
         program: &mut ProgramBuilder,
         target_register: usize,
-    ) -> Result<()> {
+    ) -> Result<LoweredRegion> {
         self.lower_into_with_resources(program, target_register, &[], &[])
     }
 
@@ -1180,7 +1203,7 @@ impl IrProgram {
         program: &mut ProgramBuilder,
         target_register: usize,
         input_registers: &[usize],
-    ) -> Result<()> {
+    ) -> Result<LoweredRegion> {
         self.lower_into_with_resources(program, target_register, input_registers, &[])
     }
 
@@ -1191,7 +1214,7 @@ impl IrProgram {
         target_register: usize,
         input_registers: &[usize],
         cursor_ids: &[usize],
-    ) -> Result<()> {
+    ) -> Result<LoweredRegion> {
         self.verify()?;
         if input_registers.len() != self.input_count as usize {
             return Err(LimboError::InternalError(format!(
@@ -1270,6 +1293,7 @@ impl IrProgram {
             .expect("verified compiler IR has exactly one return");
         let continuation =
             (return_block + 1 != self.blocks.len()).then(|| program.allocate_label());
+        let mut result_row_packs = SmallVec::new();
 
         for block in &self.blocks {
             if targeted[block.id.index()] {
@@ -1324,12 +1348,11 @@ impl IrProgram {
                                 dest: destination,
                             }),
                             ScalarOp::Column { cursor, column } => {
-                                program.emit_insn(Insn::Column {
-                                    cursor_id: physical_cursors[cursor.index()],
-                                    column: *column,
-                                    dest: destination,
-                                    default: None,
-                                });
+                                program.emit_column_or_rowid(
+                                    physical_cursors[cursor.index()],
+                                    *column,
+                                    destination,
+                                );
                             }
                         }
                     }
@@ -1337,13 +1360,18 @@ impl IrProgram {
                         cursor,
                         root_page,
                         db,
-                    }) => program.emit_insn(Insn::OpenRead {
-                        cursor_id: physical_cursors[cursor.index()],
-                        root_page: *root_page,
-                        db: *db,
-                    }),
+                        schema_cookie,
+                    }) => {
+                        program.begin_read_on_database(*db, *schema_cookie)?;
+                        program.emit_insn(Insn::OpenRead {
+                            cursor_id: physical_cursors[cursor.index()],
+                            root_page: *root_page,
+                            db: *db,
+                        });
+                    }
                     Instruction::Effect(EffectOp::ResultRow { pack }) => {
                         let start = program.alloc_registers(pack.values().len());
+                        result_row_packs.push((start, pack.values().len()));
                         for (index, value) in pack.values().iter().enumerate() {
                             let source = registers[value.index()];
                             let destination = start + index;
@@ -1429,7 +1457,7 @@ impl IrProgram {
         if let Some(continuation) = continuation {
             program.preassign_label_to_next_insn(continuation);
         }
-        Ok(())
+        Ok(LoweredRegion { result_row_packs })
     }
 }
 
@@ -1485,7 +1513,12 @@ impl fmt::Display for IrProgram {
                         cursor,
                         root_page,
                         db,
-                    }) => writeln!(f, "  open_read ${} root {root_page} db {db}", cursor.0)?,
+                        schema_cookie,
+                    }) => writeln!(
+                        f,
+                        "  open_read ${} root {root_page} db {db} schema {schema_cookie}",
+                        cursor.0
+                    )?,
                     Instruction::Effect(EffectOp::ResultRow { pack }) => {
                         write!(f, "  result_row [")?;
                         Self::fmt_arguments(f, pack.values())?;
@@ -1584,11 +1617,20 @@ impl Compile for CursorInput {
 pub(crate) struct OpenReadTable {
     table: Arc<BTreeTable>,
     db: usize,
+    schema_cookie: u32,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn open_read_table(table: Arc<BTreeTable>, db: usize) -> OpenReadTable {
-    OpenReadTable { table, db }
+pub(crate) fn open_read_table(
+    table: Arc<BTreeTable>,
+    db: usize,
+    schema_cookie: u32,
+) -> OpenReadTable {
+    OpenReadTable {
+        table,
+        db,
+        schema_cookie,
+    }
 }
 
 impl Compile for OpenReadTable {
@@ -1602,6 +1644,7 @@ impl Compile for OpenReadTable {
             cursor,
             root_page,
             db: self.db,
+            schema_cookie: self.schema_cookie,
         })?;
         Ok(cursor)
     }
@@ -1663,10 +1706,46 @@ pub(crate) struct ResultRow {
     pack: ValuePack,
 }
 
+pub(crate) struct ProjectColumns {
+    cursor: CursorId,
+    columns: SmallVec<[usize; 4]>,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn result_row<const N: usize>(values: [ValueId; N]) -> ResultRow {
     ResultRow {
         pack: ValuePack(values.into_iter().collect()),
+    }
+}
+
+pub(crate) fn result_row_pack(pack: ValuePack) -> ResultRow {
+    ResultRow { pack }
+}
+
+pub(crate) fn project_columns(cursor: CursorId, columns: SmallVec<[usize; 4]>) -> ProjectColumns {
+    ProjectColumns { cursor, columns }
+}
+
+impl Compile for ProjectColumns {
+    type Output = ValuePack;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        if self.columns.is_empty() {
+            return Err(LimboError::InternalError(
+                "compiler IR projection must contain at least one column".to_owned(),
+            ));
+        }
+        let values = self
+            .columns
+            .into_iter()
+            .map(|column| {
+                builder.push(ScalarOp::Column {
+                    cursor: self.cursor,
+                    column,
+                })
+            })
+            .collect::<Result<SmallVec<_>>>()?;
+        Ok(ValuePack(values))
     }
 }
 
@@ -1781,7 +1860,8 @@ mod tests {
         let mut builder =
             ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 8, 2));
         let result = builder.alloc_register();
-        ir.lower_into(&mut builder, result).unwrap();
+        let lowered = ir.lower_into(&mut builder, result).unwrap();
+        assert_eq!(lowered.single_result_row_pack().unwrap().1, 2);
         builder.emit_insn(Insn::Halt {
             err_code: 0,
             description: String::new(),
@@ -2002,7 +2082,7 @@ mod tests {
     #[test]
     fn owned_cursor_is_allocated_and_opened_only_during_lowering() {
         let table = Arc::new(BTreeTable::from_sql("CREATE TABLE owned(a)", 2).unwrap());
-        let compiler = open_read_table(table, 0).and_then(|cursor| {
+        let compiler = open_read_table(table, 0, 0).and_then(|cursor| {
             constant(Value::from_i64(0)).fold_cursor(cursor, move |state| {
                 column(cursor, 0).and_then(move |value| add(state, value))
             })
@@ -2013,7 +2093,7 @@ mod tests {
             "cursor $0 = btree_table \"owned\" root 2\n",
             "\n",
             "block0:\n",
-            "  open_read $0 root 2 db 0\n",
+            "  open_read $0 root 2 db 0 schema 0\n",
             "  %0 = constant Numeric(Integer(0))\n",
         )));
 
@@ -2432,6 +2512,7 @@ mod tests {
                 cursor,
                 root_page: 2,
                 db: 0,
+                schema_cookie: 0,
             })
             .unwrap();
         builder

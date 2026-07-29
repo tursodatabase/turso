@@ -43,9 +43,21 @@ representation.
    until each path has equivalent coverage.
 
 The current IR supports straight-line scalar operations, conditional diamonds,
-explicit loops with block parameters, and a first effectful cursor fold. This
-establishes the combinator contract, SSA joins and loop-carried values, and the
-separation between symbolic values and VDBE resources.
+explicit loops with block parameters, and effectful cursor folds and row
+production. A first production SELECT path uses these pieces for an unfiltered,
+forward scan of one B-tree table whose result expressions are direct columns.
+It composes `open_read`, `fold_cursor`, column projection, and `result_row`, then
+builds and verifies the complete IR before touching `ProgramBuilder`.
+
+That path deliberately falls back when SQL semantics still live in the eager
+frontend: expressions, predicates, ordering, limits, joins, aggregates,
+subqueries, generated values, arrays, and custom-type decoding. `EXPLAIN QUERY
+PLAN` also remains on the eager path until the IR models explain-tree effects.
+Ordinary column lowering does reuse the VDBE backend's logical-column helper, so
+rowid aliases, logical-to-physical column mapping, and ALTER-added defaults keep
+their established behavior. This narrow bridge establishes that a complete
+query loop can cross the deferred compiler boundary while unsupported plans
+continue through the existing emitter.
 
 `loop_while` builds a preheader, header, body, and exit. Its initial value and
 each backedge value flow into the same header parameter, so the loop state has
@@ -62,10 +74,11 @@ symbolic cursor identifier. External cursors are declared as input resources and
 receive their physical binding at lowering. IR-owned table cursors instead carry
 their `CursorType` as resource metadata; lowering allocates the physical cursor,
 while an ordered `open_read` effect determines where `OpenRead` executes. The
-verifier treats that effect as the cursor's definition, rejecting a read,
-rewind, or advance unless the open dominates it on every control-flow path.
-Only after those checks does lowering emit `OpenRead`, `Rewind`, `Column`, and
-`Next` instructions.
+effect also carries its database schema cookie, so lowering registers the read
+transaction for that database before the cursor opens. The verifier treats that
+effect as the cursor's definition, rejecting a read, rewind, or advance unless
+the open dominates it on every control-flow path. Only after those checks does
+lowering emit `OpenRead`, `Rewind`, `Column`, and `Next` instructions.
 
 Row production is an effect over a symbolic `ValuePack`, not an eagerly chosen
 register range. Each pack member remains an ordinary SSA value and must dominate
