@@ -2,6 +2,10 @@ use crate::io::FileSyncType;
 use crate::storage::checksum::ChecksumContext;
 use crate::storage::encryption::EncryptionContext;
 use crate::storage::sqlite3_ondisk::PageSize;
+use crate::storage::page_transform::{
+    page_codec_completion_error, page_codec_encryption_context, page_codec_from_encryption,
+    PageCodec, PageCodecContext, PageLocation, PageTransform,
+};
 use crate::sync::Arc;
 use crate::{io::Completion, Buffer, CompletionError, LimboError, Result};
 use crate::{
@@ -9,103 +13,6 @@ use crate::{
     turso_assert_less_than_or_equal,
 };
 use tracing::{instrument, Level};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PageCodecHeaderInfo {
-    pub page_size: usize,
-    pub reserved_space: u8,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PageCodecLocation {
-    Database,
-    Wal,
-}
-
-/// A stable, non-secret identifier for a page codec configuration.
-///
-/// This identifies the transform configuration rather than the codec
-/// implementation. Callers must return the same value when reopening or
-/// sharing a database with an equivalent codec, and a different value for any
-/// codec that could transform pages differently. Do not include key material.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PageCodecId([u8; 16]);
-
-impl PageCodecId {
-    pub const fn new(bytes: [u8; 16]) -> Self {
-        Self(bytes)
-    }
-}
-
-/// Converts complete SQLite page images between their on-disk and in-memory
-/// representations.
-///
-/// The engine supplies an output buffer exactly as large as the input page,
-/// enforcing SQLite's fixed page-size invariant without codec allocations.
-/// Codecs needing per-page metadata must store it in reserved bytes.
-///
-/// Codecs that support reopening initialized databases must implement
-/// [`Self::probe_header`]. The engine cannot safely decode an arbitrary
-/// full-page transform before it knows the physical page size.
-pub trait PageCodec: Send + Sync {
-    /// Returns a stable, non-secret identifier for this codec configuration.
-    ///
-    /// The identifier is retained by the shared [`crate::Database`] so every
-    /// connection and cached open for the same file uses an equivalent codec.
-    /// It must change whenever the codec could produce different on-disk bytes.
-    fn codec_id(&self) -> PageCodecId;
-
-    /// Reports page layout metadata from the raw prefix of page 1.
-    ///
-    /// Return `None` only when the codec cannot reopen initialized databases.
-    fn probe_header(&self, _raw_page1_prefix: &[u8]) -> Result<Option<PageCodecHeaderInfo>> {
-        Ok(None)
-    }
-
-    /// Returns the exact number of reserved bytes required in every page.
-    fn required_reserved_bytes(&self) -> u8;
-    fn encode_page(
-        &self,
-        page: &[u8],
-        output: &mut [u8],
-        page_idx: usize,
-        location: PageCodecLocation,
-    ) -> Result<()>;
-    fn decode_page(
-        &self,
-        page: &[u8],
-        output: &mut [u8],
-        page_idx: usize,
-        location: PageCodecLocation,
-    ) -> Result<()>;
-}
-
-#[derive(Clone)]
-/// Storage-layer operations applied to complete SQLite page images.
-///
-/// `Checksum` is separate because it only maintains and verifies bytes in the
-/// reserved page tail; it does not transform logical SQLite content.
-pub enum PageTransform {
-    Encryption(EncryptionContext),
-    PageCodec(Arc<dyn PageCodec>),
-    Checksum(ChecksumContext),
-    None,
-}
-
-#[deprecated(note = "renamed to PageTransform")]
-pub type EncryptionOrChecksum = PageTransform;
-
-impl std::fmt::Debug for PageTransform {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            Self::Encryption(_) => "Encryption",
-            Self::PageCodec(_) => "PageCodec",
-            Self::Checksum(_) => "Checksum",
-            Self::None => "None",
-        };
-        f.write_str(name)
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct IOContext {
@@ -115,61 +22,66 @@ pub struct IOContext {
 impl IOContext {
     pub fn encryption_context(&self) -> Option<&EncryptionContext> {
         match &self.page_transform {
-            PageTransform::Encryption(ctx) => Some(ctx),
+            PageTransform::Codec(codec) => page_codec_encryption_context(codec.as_ref()),
             _ => None,
         }
     }
 
     pub fn get_reserved_space_bytes(&self) -> u8 {
         match &self.page_transform {
-            PageTransform::Encryption(ctx) => ctx.required_reserved_bytes(),
-            PageTransform::PageCodec(ctx) => ctx.required_reserved_bytes(),
             PageTransform::Checksum(ctx) => ctx.required_reserved_bytes(),
+            PageTransform::Codec(ctx) => ctx.required_reserved_bytes(),
             PageTransform::None => Default::default(),
         }
     }
 
     pub fn set_encryption(&mut self, encryption_ctx: EncryptionContext) {
-        self.page_transform = PageTransform::Encryption(encryption_ctx);
+        self.page_transform = PageTransform::Codec(page_codec_from_encryption(encryption_ctx));
     }
 
     pub(crate) fn reset_page_size_in_encryption_ctx(&mut self, page_size: PageSize) {
-        if let PageTransform::Encryption(ctx) = &mut self.page_transform {
-            ctx.set_page_size(page_size);
-        }
+        let PageTransform::Codec(codec) = &mut self.page_transform else {
+            return;
+        };
+        let Some(encryption_ctx) = page_codec_encryption_context(codec.as_ref()) else {
+            return;
+        };
+        let mut encryption_ctx = encryption_ctx.clone();
+        encryption_ctx.set_page_size(page_size);
+        *codec = page_codec_from_encryption(encryption_ctx);
     }
 
-    pub fn set_page_codec(&mut self, codec: Arc<dyn PageCodec>) {
-        self.page_transform = PageTransform::PageCodec(codec);
+    pub(crate) fn set_page_codec(&mut self, codec: Arc<dyn PageCodec>) {
+        self.page_transform = PageTransform::Codec(codec);
     }
 
-    pub fn has_encryption(&self) -> bool {
-        matches!(self.page_transform, PageTransform::Encryption(_))
+    pub(crate) fn has_encryption(&self) -> bool {
+        self.encryption_context().is_some()
     }
 
-    pub fn has_page_codec(&self) -> bool {
-        matches!(self.page_transform, PageTransform::PageCodec(_))
+    pub(crate) fn has_page_codec(&self) -> bool {
+        matches!(self.page_transform, PageTransform::Codec(_)) && !self.has_encryption()
     }
 
-    pub fn page_codec(&self) -> Option<Arc<dyn PageCodec>> {
+    pub(crate) fn page_codec(&self) -> Option<Arc<dyn PageCodec>> {
         match &self.page_transform {
-            PageTransform::PageCodec(codec) => Some(codec.clone()),
+            PageTransform::Codec(codec) if !self.has_encryption() => Some(codec.clone()),
             _ => None,
         }
     }
 
-    pub fn page_transform(&self) -> &PageTransform {
+    pub(crate) fn page_transform(&self) -> &PageTransform {
         &self.page_transform
     }
 
-    #[deprecated(note = "renamed to page_transform")]
-    #[allow(deprecated)]
-    pub fn encryption_or_checksum(&self) -> &EncryptionOrChecksum {
-        self.page_transform()
+    pub fn has_transform(&self) -> bool {
+        !matches!(self.page_transform, PageTransform::None)
     }
 
     pub fn reset_checksum(&mut self) {
-        self.page_transform = PageTransform::None;
+        if matches!(self.page_transform, PageTransform::Checksum(_)) {
+            self.page_transform = PageTransform::None;
+        }
     }
 }
 
@@ -189,6 +101,11 @@ impl Default for IOContext {
 /// the storage medium. A database can either be a file on disk, like in SQLite,
 /// or something like a remote page server service.
 pub trait DatabaseStorage: Send + Sync {
+    /// Reads the encoded prefix of page 1 without applying a page transform.
+    ///
+    /// This is only for bootstrapping the page layout before a complete page
+    /// can be read and decoded. Callers that need logical page-1 contents must
+    /// use [`DatabaseStorage::read_page`].
     fn read_header(&self, c: Completion) -> Result<Completion>;
 
     fn read_page(&self, page_idx: usize, io_ctx: &IOContext, c: Completion) -> Result<Completion>;
@@ -238,66 +155,14 @@ impl DatabaseStorage for DatabaseFile {
             return Err(LimboError::IntegerOverflow);
         };
 
-        match &io_ctx.page_transform {
-            PageTransform::Encryption(ctx) => {
-                let encryption_ctx = ctx.clone();
-                let read_buffer = r.buf_arc();
-                let original_c = c.clone();
-                let decrypt_complete =
-                    Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
-                        let (buf, bytes_read) = match res {
-                            Ok((buf, bytes_read)) => (buf, bytes_read),
-                            Err(err) => {
-                                tracing::error!(err = ?err);
-                                original_c.error(err);
-                                return original_c.get_error();
-                            }
-                        };
-                        if bytes_read == 0 {
-                            original_c.error(CompletionError::ShortRead {
-                                page_idx,
-                                expected: buf.len(),
-                                actual: 0,
-                            });
-                            return original_c.get_error();
-                        }
-                        turso_assert_greater_than!(
-                            bytes_read,
-                            0,
-                            "database: expected positive bytes for encrypted page",
-                            { "page_idx": page_idx }
-                        );
-                        if bytes_read as usize != buf.len() {
-                            original_c.complete(bytes_read);
-                            return original_c.get_error();
-                        }
-                        let original_buf = original_c.as_read().buf();
-                        match encryption_ctx.decrypt_page(buf.as_slice(), page_idx) {
-                            Ok(decrypted) => {
-                                original_buf.as_mut_slice().copy_from_slice(&decrypted);
-                                original_c.complete(bytes_read);
-                                original_c.get_error()
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    "Failed to decrypt page data for page_id={page_idx}: {e}"
-                                );
-                                turso_assert!(
-                                    !original_c.failed(),
-                                    "Original completion already has an error"
-                                );
-                                original_c.error(CompletionError::DecryptionError { page_idx });
-                                original_c.get_error()
-                            }
-                        }
-                    });
-                let wrapped_completion = Completion::new_read(read_buffer, decrypt_complete);
-                self.file.pread(pos, wrapped_completion)
-            }
-            PageTransform::PageCodec(ctx) => {
+        match io_ctx.page_transform() {
+            PageTransform::Codec(ctx) => {
                 let page_codec = ctx.clone();
+                // TODO(v): support in-place codec decoding to avoid this extra page buffer.
                 let read_buffer = Arc::new(Buffer::new_temporary(r.buf_arc().len()));
                 let original_c = c;
+                let codec_context =
+                    PageCodecContext::from_page_idx(page_idx, PageLocation::Database)?;
                 let decode_complete =
                     Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
                         let (buf, bytes_read) = match res {
@@ -328,10 +193,9 @@ impl DatabaseStorage for DatabaseFile {
                         }
                         let original_buf = original_c.as_read().buf();
                         match page_codec.decode_page(
+                            codec_context,
                             buf.as_slice(),
                             original_buf.as_mut_slice(),
-                            page_idx,
-                            PageCodecLocation::Database,
                         ) {
                             Ok(()) => {
                                 original_c.complete(bytes_read);
@@ -345,7 +209,10 @@ impl DatabaseStorage for DatabaseFile {
                                     !original_c.failed(),
                                     "Original completion already has an error"
                                 );
-                                original_c.error(CompletionError::PageCodecError { page_idx });
+                                original_c.error(page_codec_completion_error(
+                                    page_codec.as_ref(),
+                                    page_idx,
+                                ));
                                 original_c.get_error()
                             }
                         }
@@ -414,10 +281,9 @@ impl DatabaseStorage for DatabaseFile {
         let Some(pos) = (page_idx as u64 - 1).checked_mul(buffer_size as u64) else {
             return Err(LimboError::IntegerOverflow);
         };
-        let buffer = match &io_ctx.page_transform {
-            PageTransform::Encryption(ctx) => encrypt_buffer(page_idx, buffer, ctx)?,
-            PageTransform::PageCodec(ctx) => {
-                encode_buffer(page_idx, buffer, ctx.as_ref(), PageCodecLocation::Database)?
+        let buffer = match io_ctx.page_transform() {
+            PageTransform::Codec(ctx) => {
+                encode_buffer(page_idx, buffer, ctx.as_ref(), PageLocation::Database)?
             }
             PageTransform::Checksum(ctx) => checksum_buffer(page_idx, buffer, ctx),
             PageTransform::None => buffer,
@@ -441,13 +307,8 @@ impl DatabaseStorage for DatabaseFile {
         let Some(pos) = (first_page_idx as u64 - 1).checked_mul(page_size as u64) else {
             return Err(LimboError::IntegerOverflow);
         };
-        let buffers = match &io_ctx.page_transform() {
-            PageTransform::Encryption(ctx) => buffers
-                .into_iter()
-                .enumerate()
-                .map(|(i, buffer)| encrypt_buffer(first_page_idx + i, buffer, ctx))
-                .collect::<Result<Vec<_>>>()?,
-            PageTransform::PageCodec(ctx) => buffers
+        let buffers = match io_ctx.page_transform() {
+            PageTransform::Codec(ctx) => buffers
                 .into_iter()
                 .enumerate()
                 .map(|(i, buffer)| {
@@ -455,7 +316,7 @@ impl DatabaseStorage for DatabaseFile {
                         first_page_idx + i,
                         buffer,
                         ctx.as_ref(),
-                        PageCodecLocation::Database,
+                        PageLocation::Database,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -498,26 +359,12 @@ fn encode_buffer(
     page_idx: usize,
     buffer: Arc<Buffer>,
     ctx: &dyn PageCodec,
-    location: PageCodecLocation,
+    location: PageLocation,
 ) -> Result<Arc<Buffer>> {
     let encoded = Arc::new(Buffer::new_temporary(buffer.len()));
-    ctx.encode_page(
-        buffer.as_slice(),
-        encoded.as_mut_slice(),
-        page_idx,
-        location,
-    )?;
+    let context = PageCodecContext::from_page_idx(page_idx, location)?;
+    ctx.encode_page(context, buffer.as_slice(), encoded.as_mut_slice())?;
     Ok(encoded)
-}
-
-fn encrypt_buffer(
-    page_idx: usize,
-    buffer: Arc<Buffer>,
-    ctx: &EncryptionContext,
-) -> Result<Arc<Buffer>> {
-    Ok(Arc::new(Buffer::new(
-        ctx.encrypt_page(buffer.as_slice(), page_idx)?,
-    )))
 }
 
 fn checksum_buffer(page_idx: usize, buffer: Arc<Buffer>, ctx: &ChecksumContext) -> Arc<Buffer> {
@@ -529,6 +376,7 @@ fn checksum_buffer(page_idx: usize, buffer: Arc<Buffer>, ctx: &ChecksumContext) 
 #[cfg(test)]
 mod page_codec_tests {
     use super::*;
+    use crate::storage::page_transform::PageCodecId;
     use crate::File;
     use crate::{io::IO, MemoryIO};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -549,12 +397,12 @@ mod page_codec_tests {
 
         fn encode_page(
             &self,
-            page: &[u8],
+            context: PageCodecContext,
+            input: &[u8],
             output: &mut [u8],
-            _page_idx: usize,
-            _location: PageCodecLocation,
         ) -> Result<()> {
-            for (input, output) in page.iter().zip(output) {
+            let _ = context;
+            for (input, output) in input.iter().zip(output) {
                 *output = input ^ self.0;
             }
             Ok(())
@@ -562,12 +410,11 @@ mod page_codec_tests {
 
         fn decode_page(
             &self,
-            page: &[u8],
+            context: PageCodecContext,
+            input: &[u8],
             output: &mut [u8],
-            _page_idx: usize,
-            _location: PageCodecLocation,
         ) -> Result<()> {
-            self.encode_page(page, output, _page_idx, _location)
+            self.encode_page(context, input, output)
         }
     }
 
@@ -593,15 +440,14 @@ mod page_codec_tests {
 
         fn encode_page(
             &self,
-            page: &[u8],
+            _context: PageCodecContext,
+            input: &[u8],
             output: &mut [u8],
-            _page_idx: usize,
-            _location: PageCodecLocation,
         ) -> Result<()> {
             match self {
                 Self::Encode => Err(LimboError::InternalError("codec encode failed".into())),
                 Self::Decode => {
-                    output.copy_from_slice(page);
+                    output.copy_from_slice(input);
                     Ok(())
                 }
             }
@@ -609,14 +455,13 @@ mod page_codec_tests {
 
         fn decode_page(
             &self,
-            page: &[u8],
+            _context: PageCodecContext,
+            input: &[u8],
             output: &mut [u8],
-            _page_idx: usize,
-            _location: PageCodecLocation,
         ) -> Result<()> {
             match self {
                 Self::Encode => {
-                    output.copy_from_slice(page);
+                    output.copy_from_slice(input);
                     Ok(())
                 }
                 Self::Decode => Err(LimboError::InternalError("codec decode failed".into())),
@@ -671,7 +516,7 @@ mod page_codec_tests {
     fn page_codec_encodes_into_fixed_size_database_buffer() {
         let buffer = Arc::new(Buffer::new(vec![1, 2, 3, 4]));
         let encoded =
-            encode_buffer(7, buffer, &XorPageCodec(0xa5), PageCodecLocation::Database).unwrap();
+            encode_buffer(7, buffer, &XorPageCodec(0xa5), PageLocation::Database).unwrap();
         assert_eq!(encoded.as_slice(), &[0xa4, 0xa7, 0xa6, 0xa1]);
     }
 
