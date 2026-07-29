@@ -1,0 +1,356 @@
+//! Backend: emit verified IR into a [`ProgramBuilder`].
+//!
+//! This is where symbolic things become physical: values get registers,
+//! blocks get labels, edges become jumps, and block-parameter binding
+//! becomes register copies on the incoming edge. Nothing upstream of this
+//! file knows about any of those resources.
+//!
+//! Emission is deterministic: blocks are emitted in creation order
+//! (entry first, unreachable blocks skipped), instructions in block
+//! order, and registers are allocated monotonically at definition sites.
+
+use std::collections::HashSet;
+
+use crate::vdbe::builder::ProgramBuilder;
+use crate::vdbe::insn::Insn;
+use crate::vdbe::BranchOffset;
+use crate::{LimboError, Result};
+
+use super::ir::{BinOp, BlockId, Const, Function, Inst, JumpTarget, Terminator, UnaryOp};
+use super::verify::verify;
+
+/// Emit `func` into `program`, leaving the function's result in `dest`.
+///
+/// The IR is verified first; malformed IR is an internal error and never
+/// reaches bytecode. `dest` must already be allocated by the caller (the
+/// usual pre-allocated `target_register` of the eager translation paths).
+pub fn emit_function(program: &mut ProgramBuilder, func: &Function, dest: usize) -> Result<()> {
+    verify(func)
+        .map_err(|e| LimboError::InternalError(format!("compiler IR failed verification: {e}")))?;
+    Emitter::new(program, func, dest).emit()
+}
+
+struct Emitter<'a> {
+    program: &'a mut ProgramBuilder,
+    func: &'a Function,
+    dest: usize,
+    /// Physical register per value, assigned at definition.
+    regs: Vec<Option<usize>>,
+    /// Emission order: entry first, reachable blocks only.
+    order: Vec<BlockId>,
+    /// Label per block, allocated upfront for every reachable block so
+    /// back-edges can reference blocks that were already emitted.
+    labels: Vec<Option<BranchOffset>>,
+    /// Label for the single exit point, if any `Ret` needed a jump.
+    exit_label: Option<BranchOffset>,
+}
+
+impl<'a> Emitter<'a> {
+    fn new(program: &'a mut ProgramBuilder, func: &'a Function, dest: usize) -> Self {
+        // Emission order: creation order restricted to reachable blocks.
+        // Creation order keeps combinator-generated CFGs readable (arms
+        // appear where they were described) and is trivially
+        // deterministic.
+        let mut reachable = vec![false; func.blocks.len()];
+        let mut stack = vec![BlockId::ENTRY];
+        reachable[BlockId::ENTRY.index()] = true;
+        while let Some(block) = stack.pop() {
+            if let Some(terminator) = &func.block(block).terminator {
+                for target in terminator.targets() {
+                    if !reachable[target.block.index()] {
+                        reachable[target.block.index()] = true;
+                        stack.push(target.block);
+                    }
+                }
+            }
+        }
+        let order: Vec<BlockId> = reachable
+            .iter()
+            .enumerate()
+            .filter(|(_, &reachable)| reachable)
+            .map(|(index, _)| BlockId::from_index(index))
+            .collect();
+
+        Self {
+            program,
+            func,
+            dest,
+            regs: vec![None; func.num_values()],
+            labels: vec![None; func.blocks.len()],
+            order,
+            exit_label: None,
+        }
+    }
+
+    fn emit(mut self) -> Result<()> {
+        for i in 0..self.order.len() {
+            let label = self.program.allocate_label();
+            self.labels[self.order[i].index()] = Some(label);
+        }
+        for i in 0..self.order.len() {
+            let block_id = self.order[i];
+            let next = self.order.get(i + 1).copied();
+            self.emit_block(block_id, next)?;
+        }
+        if let Some(exit) = self.exit_label {
+            self.program.preassign_label_to_next_insn(exit);
+        }
+        Ok(())
+    }
+
+    fn emit_block(&mut self, block_id: BlockId, next: Option<BlockId>) -> Result<()> {
+        let label = self.labels[block_id.index()].expect("labels are allocated upfront");
+        self.program.preassign_label_to_next_insn(label);
+        let block = self.func.block(block_id);
+        // Block parameters are given registers when first referenced
+        // (either by an incoming edge emitted earlier, or here).
+        for &param in &block.params {
+            let _ = self.reg_of(param);
+        }
+        for (value, inst) in &block.insts {
+            let value = *value;
+            match inst {
+                Inst::External { reg } => {
+                    // Bind, no code. The value simply *is* that register.
+                    if self.regs[value.index()].is_none() {
+                        self.regs[value.index()] = Some(*reg);
+                    }
+                }
+                Inst::Const(constant) => {
+                    let dest = self.reg_of(value);
+                    let insn = match constant {
+                        Const::Null => Insn::Null {
+                            dest,
+                            dest_end: None,
+                        },
+                        Const::Int(v) => Insn::Integer { value: *v, dest },
+                        Const::Real(v) => Insn::Real {
+                            value: v.value(),
+                            dest,
+                        },
+                        Const::Text(v) => Insn::String8 {
+                            value: v.clone(),
+                            dest,
+                        },
+                        Const::Blob(v) => Insn::Blob {
+                            value: v.clone(),
+                            dest,
+                        },
+                    };
+                    self.program.emit_insn(insn);
+                }
+                Inst::Unary { op, operand } => {
+                    let reg = self.reg_of(*operand);
+                    let dest = self.reg_of(value);
+                    let insn = match op {
+                        UnaryOp::Not => Insn::Not { reg, dest },
+                        UnaryOp::BitNot => Insn::BitNot { reg, dest },
+                    };
+                    self.program.emit_insn(insn);
+                }
+                Inst::Binary { op, lhs, rhs } => {
+                    let lhs = self.reg_of(*lhs);
+                    let rhs = self.reg_of(*rhs);
+                    let dest = self.reg_of(value);
+                    let insn = match op {
+                        BinOp::Add => Insn::Add { lhs, rhs, dest },
+                        BinOp::Subtract => Insn::Subtract { lhs, rhs, dest },
+                        BinOp::Multiply => Insn::Multiply { lhs, rhs, dest },
+                        BinOp::Divide => Insn::Divide { lhs, rhs, dest },
+                        BinOp::Remainder => Insn::Remainder { lhs, rhs, dest },
+                        BinOp::BitAnd => Insn::BitAnd { lhs, rhs, dest },
+                        BinOp::BitOr => Insn::BitOr { lhs, rhs, dest },
+                        BinOp::ShiftLeft => Insn::ShiftLeft { lhs, rhs, dest },
+                        BinOp::ShiftRight => Insn::ShiftRight { lhs, rhs, dest },
+                        BinOp::Concat => Insn::Concat { lhs, rhs, dest },
+                    };
+                    self.program.emit_insn(insn);
+                }
+            }
+        }
+
+        let terminator = block
+            .terminator
+            .as_ref()
+            .expect("verified functions have terminators on reachable blocks");
+        match terminator {
+            Terminator::Jump(target) => {
+                self.emit_edge(target);
+                self.emit_goto_unless_next(target.block, next);
+            }
+            Terminator::Ret { value } => {
+                let reg = self.reg_of(*value);
+                if reg != self.dest {
+                    self.program.emit_insn(Insn::Copy {
+                        src_reg: reg,
+                        dst_reg: self.dest,
+                        extra_amount: 0,
+                    });
+                }
+                if next.is_some() {
+                    let exit = *self
+                        .exit_label
+                        .get_or_insert_with(|| self.program.allocate_label());
+                    self.program.emit_insn(Insn::Goto { target_pc: exit });
+                }
+            }
+            Terminator::Branch {
+                cond,
+                if_true,
+                if_false,
+                if_null,
+            } => {
+                let cond = self.reg_of(*cond);
+                // Truthy first. Arg-carrying edges need their copies to
+                // happen on the edge, so they go through a local
+                // trampoline; bare edges jump straight to the target.
+                let mut trampolines: Vec<(BranchOffset, JumpTarget)> = Vec::new();
+                let true_pc = self.edge_entry_pc(if_true, &mut trampolines);
+                self.program.emit_insn(Insn::If {
+                    reg: cond,
+                    target_pc: true_pc,
+                    jump_if_null: false,
+                });
+                if if_false == if_null {
+                    // False and NULL share the edge: falsy or NULL both
+                    // fall through here.
+                    self.emit_edge(if_false);
+                    // Fallthrough elision is only safe when no trampoline
+                    // code will be emitted between here and the next
+                    // block.
+                    let fallthrough = if trampolines.is_empty() { next } else { None };
+                    self.emit_goto_unless_next(if_false.block, fallthrough);
+                } else {
+                    let false_pc = self.edge_entry_pc(if_false, &mut trampolines);
+                    self.program.emit_insn(Insn::IfNot {
+                        reg: cond,
+                        target_pc: false_pc,
+                        jump_if_null: false,
+                    });
+                    // Neither truthy nor falsy: NULL falls through.
+                    self.emit_edge(if_null);
+                    let fallthrough = if trampolines.is_empty() { next } else { None };
+                    self.emit_goto_unless_next(if_null.block, fallthrough);
+                }
+                for (label, target) in trampolines {
+                    self.program.preassign_label_to_next_insn(label);
+                    self.emit_edge(&target);
+                    self.program.emit_insn(Insn::Goto {
+                        target_pc: self.block_label(target.block),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Where a conditional jump should land for `target`: directly at the
+    /// target block when the edge carries no arguments, otherwise at a
+    /// trampoline that performs the edge's copies first.
+    fn edge_entry_pc(
+        &mut self,
+        target: &JumpTarget,
+        trampolines: &mut Vec<(BranchOffset, JumpTarget)>,
+    ) -> BranchOffset {
+        if target.args.is_empty() {
+            self.block_label(target.block)
+        } else {
+            let label = self.program.allocate_label();
+            trampolines.push((label, target.clone()));
+            label
+        }
+    }
+
+    /// Copy edge arguments into the target's block-parameter registers.
+    /// The copies of one edge are conceptually parallel; when a source
+    /// register is also a destination (possible once loops carry values),
+    /// all sources are staged through fresh temporaries first.
+    fn emit_edge(&mut self, target: &JumpTarget) {
+        let params = &self.func.block(target.block).params;
+        debug_assert_eq!(params.len(), target.args.len());
+        let pairs: Vec<(usize, usize)> = target
+            .args
+            .iter()
+            .zip(params.iter())
+            .map(|(&arg, &param)| (self.reg_of(arg), self.reg_of(param)))
+            .filter(|(src, dst)| src != dst)
+            .collect();
+        let dests: HashSet<usize> = pairs.iter().map(|&(_, dst)| dst).collect();
+        let overlaps = pairs.iter().any(|&(src, _)| dests.contains(&src));
+        if overlaps {
+            let staged: Vec<(usize, usize)> = pairs
+                .iter()
+                .map(|&(src, dst)| {
+                    let temp = self.program.alloc_register();
+                    self.program.emit_insn(Insn::Copy {
+                        src_reg: src,
+                        dst_reg: temp,
+                        extra_amount: 0,
+                    });
+                    (temp, dst)
+                })
+                .collect();
+            for (temp, dst) in staged {
+                self.program.emit_insn(Insn::Copy {
+                    src_reg: temp,
+                    dst_reg: dst,
+                    extra_amount: 0,
+                });
+            }
+        } else {
+            for (src, dst) in pairs {
+                self.program.emit_insn(Insn::Copy {
+                    src_reg: src,
+                    dst_reg: dst,
+                    extra_amount: 0,
+                });
+            }
+        }
+    }
+
+    fn emit_goto_unless_next(&mut self, target: BlockId, next: Option<BlockId>) {
+        if next == Some(target) {
+            // Fallthrough: the target is emitted immediately after. Its
+            // label may still be referenced by other edges; that label is
+            // preassigned when the block is emitted.
+            return;
+        }
+        let label = self.block_label(target);
+        self.program.emit_insn(Insn::Goto { target_pc: label });
+    }
+
+    fn block_label(&self, block: BlockId) -> BranchOffset {
+        self.labels[block.index()].expect("labels are allocated upfront for reachable blocks")
+    }
+
+    fn reg_of(&mut self, value: super::ir::ValueId) -> usize {
+        if let Some(reg) = self.regs[value.index()] {
+            return reg;
+        }
+        // The function result is steered into `dest` by binding the
+        // first Ret value's register to it; everything else gets a fresh
+        // register. External values never reach here: they are bound
+        // when their defining pseudo-instruction is visited, which
+        // dominates (hence precedes in emission) every use.
+        let reg = if self.is_ret_value(value) && !self.dest_taken() {
+            self.dest
+        } else {
+            self.program.alloc_register()
+        };
+        self.regs[value.index()] = Some(reg);
+        reg
+    }
+
+    fn is_ret_value(&self, value: super::ir::ValueId) -> bool {
+        self.order.iter().any(|&block| {
+            matches!(
+                self.func.block(block).terminator,
+                Some(Terminator::Ret { value: v }) if v == value
+            )
+        })
+    }
+
+    fn dest_taken(&self) -> bool {
+        self.regs.iter().flatten().any(|&reg| reg == self.dest)
+    }
+}

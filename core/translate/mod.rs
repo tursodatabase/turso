@@ -12,6 +12,7 @@ pub(crate) mod alter;
 pub(crate) mod analyze;
 pub(crate) mod attach;
 pub(crate) mod collate;
+pub(crate) mod compiler;
 mod compound_select;
 pub(crate) mod delete;
 pub(crate) mod display;

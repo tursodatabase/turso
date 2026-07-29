@@ -435,6 +435,25 @@ pub fn translate_expr(
                 return Ok(target_register);
             }
 
+            // Composable compiler path: expressions the new pipeline can
+            // fully represent (today the literal-only arithmetic/bitwise/
+            // concat subset) are described as compiler values, built into
+            // verified IR, and emitted in one pass. Anything else falls
+            // back to eager emission below.
+            if crate::translate::compiler::try_emit_value_expr(program, expr, target_register)? {
+                // Mirror the eager path's collation post-state: with
+                // literal-only operands the resolved collation context is
+                // always cleared, except in the equivalent-operand branch
+                // which leaves it untouched.
+                if !exprs_are_equivalent(e1, e2) {
+                    program.set_collation(None);
+                }
+                if let Some(span) = constant_span {
+                    program.constant_span_end(span);
+                }
+                return Ok(target_register);
+            }
+
             binary_expr_shared(
                 program,
                 referenced_tables,
