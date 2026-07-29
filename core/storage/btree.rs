@@ -7,7 +7,7 @@ use tracing::{instrument, Level};
 
 use super::{
     pager::PageRef,
-    sqlite3_ondisk::{IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE},
+    sqlite3_ondisk::{IndexInteriorCell, OverflowCell, MINIMUM_CELL_SIZE},
 };
 use crate::alloc::{TursoFromIterator, TursoSliceExt, TursoVecExt};
 #[cfg(any(test, injected_yields))]
@@ -21,7 +21,7 @@ use crate::{
         pager::{BtreePageAllocMode, Pager},
         sqlite3_ondisk::{
             payload_overflows, read_u32, read_varint, write_varint, BTreeCell, DatabaseHeader,
-            PageContent, PageSize, PageType, TableInteriorCell, TableLeafCell, CELL_PTR_SIZE_BYTES,
+            PageContent, PageSize, PageType, TableInteriorCell, CELL_PTR_SIZE_BYTES,
             FREELIST_LEAF_PTR_SIZE, FREELIST_TRUNK_HEADER_SIZE,
             FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
             FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, INTERIOR_PAGE_HEADER_SIZE_BYTES,
@@ -2223,7 +2223,7 @@ impl BTreeCursor {
             .stack
             .get_page_contents_at_level(old_top_idx)
             .unwrap()
-            .cell_index_read_payload_ptr(cur_cell_idx as usize, self.usable_space())?;
+            .cell_read_payload_ptr(cur_cell_idx as usize, self.usable_space())?;
 
         if let Some(next_page) = first_overflow_page {
             let res = self.process_overflow_read(payload, next_page, payload_size)?;
@@ -2662,7 +2662,7 @@ impl BTreeCursor {
             .stack
             .get_page_contents_at_level(old_top_idx)
             .unwrap()
-            .cell_index_read_payload_ptr(cur_cell_idx as usize, self.usable_space())?;
+            .cell_read_payload_ptr(cur_cell_idx as usize, self.usable_space())?;
 
         if let Some(next_page) = first_overflow_page {
             let res = self.process_overflow_read(payload, next_page, payload_size)?;
@@ -6485,27 +6485,8 @@ impl CursorTrait for BTreeCursor {
         let page = self.stack.top_ref();
         let contents = page.get_contents();
         let cell_idx = self.stack.current_cell_index();
-        let cell = contents.cell_get(cell_idx as usize, self.usable_space())?;
-        let (payload, payload_size, first_overflow_page) = match cell {
-            BTreeCell::TableLeafCell(TableLeafCell {
-                payload,
-                payload_size,
-                first_overflow_page,
-                ..
-            }) => (payload, payload_size, first_overflow_page),
-            BTreeCell::IndexInteriorCell(IndexInteriorCell {
-                payload,
-                payload_size,
-                first_overflow_page,
-                ..
-            }) => (payload, payload_size, first_overflow_page),
-            BTreeCell::IndexLeafCell(IndexLeafCell {
-                payload,
-                first_overflow_page,
-                payload_size,
-            }) => (payload, payload_size, first_overflow_page),
-            _ => unreachable!("unexpected page_type"),
-        };
+        let (payload, payload_size, first_overflow_page) =
+            contents.cell_read_payload_ptr(cell_idx as usize, self.usable_space())?;
         if let Some(next_page) = first_overflow_page {
             return_if_io!(self.process_overflow_read(payload, next_page, payload_size))
         } else {
@@ -9997,7 +9978,7 @@ mod tests {
     use crate::{
         storage::{
             btree::{compute_free_space, fill_cell_payload, payload_overflow_threshold_max},
-            sqlite3_ondisk::{BTreeCell, PageContent, PageType},
+            sqlite3_ondisk::{BTreeCell, PageContent, PageType, TableLeafCell},
         },
         types::Value,
         Database, Page, Pager, PlatformIO,
