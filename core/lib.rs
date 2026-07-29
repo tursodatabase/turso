@@ -3617,7 +3617,10 @@ impl Iterator for QueryRunner<'_> {
 
 #[cfg(test)]
 mod database_tests {
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     use super::{is_memory_like, Database, InitState};
     use crate::storage::encryption::EncryptionKey;
@@ -3803,6 +3806,52 @@ mod database_tests {
         ) -> crate::Result<()> {
             self.transform(input, output);
             Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingPageCodec {
+        inner: XorPageCodec,
+        database_page1_decodes: Arc<AtomicUsize>,
+    }
+
+    impl PageCodec for CountingPageCodec {
+        fn codec_id(&self) -> PageCodecId {
+            self.inner.codec_id()
+        }
+
+        fn bootstrap_page_info(
+            &self,
+            raw_page1_prefix: &[u8],
+        ) -> crate::Result<PageCodecHeaderInfo> {
+            self.inner.bootstrap_page_info(raw_page1_prefix)
+        }
+
+        fn required_reserved_bytes(&self) -> u8 {
+            self.inner.required_reserved_bytes()
+        }
+
+        fn encode_page(
+            &self,
+            context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            self.inner.encode_page(context, input, output)
+        }
+
+        fn decode_page(
+            &self,
+            context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            if context.page_no == DatabaseHeader::PAGE_ID as u32
+                && context.location == PageLocation::Database
+            {
+                self.database_page1_decodes.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.decode_page(context, input, output)
         }
     }
 
@@ -4196,6 +4245,46 @@ mod database_tests {
             )
             .is_err(),
             "opening without the codec must not reuse a codec-required database"
+        );
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_checkpoint_decodes_database_page1_for_identity() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-checkpoint-identity.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let database_page1_decodes = Arc::new(AtomicUsize::new(0));
+        let codec: Arc<dyn PageCodec> = Arc::new(CountingPageCodec {
+            inner: XorPageCodec {
+                mask: 0x5a,
+                reserved_bytes: 1,
+            },
+            database_page1_decodes: database_page1_decodes.clone(),
+        });
+        let db = open_with_page_codec(io, path, codec.clone());
+        let conn = db.connect_with_page_codec(codec).unwrap();
+        conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
+        conn.execute(
+            "create table test(id integer primary key, value text);
+             insert into test(value) values ('alpha');",
+        )
+        .unwrap();
+        conn.set_sync_mode(crate::SyncMode::Full);
+
+        database_page1_decodes.store(0, Ordering::Relaxed);
+        let checkpoint = conn
+            .checkpoint(crate::storage::wal::CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            })
+            .unwrap();
+
+        assert!(checkpoint.wal_checkpoint_backfilled > 0);
+        assert_eq!(
+            database_page1_decodes.load(Ordering::Relaxed),
+            1,
+            "checkpoint identity must decode database page 1 exactly once"
         );
     }
 

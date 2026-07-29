@@ -1044,7 +1044,8 @@ struct PendingCheckpointDbIdentityRead {
     max_frame: u64,
     header_buf: Arc<Buffer>,
     bytes_read: Arc<AtomicUsize>,
-    read_sent: bool,
+    read_page: bool,
+    completion: Option<Completion>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -4576,21 +4577,22 @@ impl Pager {
                 CheckpointMode::Restart | CheckpointMode::Truncate { .. }
             )
         {
-            if self.has_page_codec() {
-                // External codecs are restricted to in-process WAL, whose
-                // backfill publication does not install a durable proof.
-                return CheckpointPhase::PublishBackfill {
-                    clear_page_cache,
-                    max_frame: result.wal_total_backfilled,
-                };
-            }
+            // if we are using a custom codec, then we might have to read the whole page 1 so that
+            // it can be decoded. Otherwise reading the header is enough.
+            let read_page = self.io_ctx.read().has_codec_transform();
+            let read_size = if read_page {
+                self.get_page_size_unchecked().get() as usize
+            } else {
+                PageSize::MIN as usize
+            };
             return CheckpointPhase::ReadDbIdentity {
                 clear_page_cache,
                 read: PendingCheckpointDbIdentityRead {
                     max_frame: result.wal_total_backfilled,
-                    header_buf: Arc::new(Buffer::new_temporary(PageSize::MIN as usize)),
+                    header_buf: Arc::new(Buffer::new_temporary(read_size)),
                     bytes_read: Arc::new(AtomicUsize::new(usize::MAX)),
-                    read_sent: false,
+                    read_page,
+                    completion: None,
                 },
             };
         }
@@ -4816,18 +4818,27 @@ impl Pager {
                     clear_page_cache,
                     mut read,
                 } => {
-                    if !read.read_sent {
+                    if read.completion.is_none() {
                         let header_buf = read.header_buf.clone();
                         let bytes_read = read.bytes_read.clone();
-                        let c = self.db_file.read_header(Completion::new_read(header_buf, {
+                        let completion = Completion::new_read(header_buf, {
                             Box::new(move |res| {
                                 if let Ok((_buf, count)) = res {
                                     bytes_read.store(count as usize, Ordering::Release);
                                 }
                                 None
                             })
-                        }))?;
-                        read.read_sent = true;
+                        });
+                        let c = if read.read_page {
+                            self.db_file.read_page(
+                                DatabaseHeader::PAGE_ID,
+                                &self.io_ctx.read(),
+                                completion,
+                            )?
+                        } else {
+                            self.db_file.read_header(completion)?
+                        };
+                        read.completion = Some(c.clone());
                         self.checkpoint_state.write().phase = CheckpointPhase::ReadDbIdentity {
                             clear_page_cache,
                             read,
@@ -4835,7 +4846,32 @@ impl Pager {
                         io_yield_one!(c);
                     }
 
+                    let completion = read
+                        .completion
+                        .as_ref()
+                        .expect("database identity read completion should be set");
+                    if !completion.finished() {
+                        io_yield_one!(completion.clone());
+                    }
+                    if !completion.succeeded() {
+                        return Err(completion
+                            .get_error()
+                            .expect("finished database identity read should have an error")
+                            .into());
+                    }
                     let bytes_read = read.bytes_read.load(Ordering::Acquire);
+                    turso_assert!(
+                        bytes_read != usize::MAX,
+                        "successful database identity read must record the byte count"
+                    );
+                    if read.read_page && bytes_read != read.header_buf.len() {
+                        return Err(CompletionError::ShortRead {
+                            page_idx: DatabaseHeader::PAGE_ID,
+                            expected: read.header_buf.len(),
+                            actual: bytes_read,
+                        }
+                        .into());
+                    }
                     if bytes_read < DatabaseHeader::SIZE {
                         return Err(LimboError::Corrupt(
                             "database header unreadable after checkpoint sync".into(),
