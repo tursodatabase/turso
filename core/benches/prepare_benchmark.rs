@@ -45,13 +45,18 @@ fn execute(db: &Database, conn: &Arc<Connection>, sql: &str) {
     }
 }
 
-/// Open an in-memory database with a small relational schema (indexes
-/// included so the planner has real access paths to choose between).
-fn setup() -> (Arc<Database>, Arc<Connection>) {
+fn open_db() -> (Arc<Database>, Arc<Connection>) {
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect().unwrap();
+    (db, conn)
+}
+
+/// Open an in-memory database with a small relational schema (indexes
+/// included so the planner has real access paths to choose between).
+fn setup() -> (Arc<Database>, Arc<Connection>) {
+    let (db, conn) = open_db();
     for sql in [
         "CREATE TABLE users (
             id INTEGER PRIMARY KEY,
@@ -430,4 +435,121 @@ fn ddl_create_index(bencher: Bencher) {
         bencher,
         "CREATE INDEX orders_user_status_placed ON orders(user_id, status, placed_at)",
     );
+}
+
+// --- Established corpora: TPC-H and ClickBench -----------------------------
+//
+// Prepare-only runs over the industry-standard query sets vendored under
+// `perf/`, so planner work on realistic analytical SQL is tracked per query.
+// Only the schema is needed (statements never execute), so tables stay empty.
+
+/// Standard TPC-H DDL matching the layout of the SQLite conversion the
+/// `perf/tpc-h` scripts download (lovasoa/TPCH-sqlite); the vendored queries
+/// reference these tables and columns.
+const TPCH_SCHEMA: &[&str] = &[
+    "CREATE TABLE nation (n_nationkey INTEGER PRIMARY KEY, n_name TEXT NOT NULL, \
+     n_regionkey INTEGER NOT NULL, n_comment TEXT)",
+    "CREATE TABLE region (r_regionkey INTEGER PRIMARY KEY, r_name TEXT NOT NULL, \
+     r_comment TEXT)",
+    "CREATE TABLE part (p_partkey INTEGER PRIMARY KEY, p_name TEXT NOT NULL, \
+     p_mfgr TEXT NOT NULL, p_brand TEXT NOT NULL, p_type TEXT NOT NULL, \
+     p_size INTEGER NOT NULL, p_container TEXT NOT NULL, p_retailprice REAL NOT NULL, \
+     p_comment TEXT NOT NULL)",
+    "CREATE TABLE supplier (s_suppkey INTEGER PRIMARY KEY, s_name TEXT NOT NULL, \
+     s_address TEXT NOT NULL, s_nationkey INTEGER NOT NULL, s_phone TEXT NOT NULL, \
+     s_acctbal REAL NOT NULL, s_comment TEXT NOT NULL)",
+    "CREATE TABLE partsupp (ps_partkey INTEGER NOT NULL, ps_suppkey INTEGER NOT NULL, \
+     ps_availqty INTEGER NOT NULL, ps_supplycost REAL NOT NULL, ps_comment TEXT NOT NULL, \
+     PRIMARY KEY (ps_partkey, ps_suppkey))",
+    "CREATE TABLE customer (c_custkey INTEGER PRIMARY KEY, c_name TEXT NOT NULL, \
+     c_address TEXT NOT NULL, c_nationkey INTEGER NOT NULL, c_phone TEXT NOT NULL, \
+     c_acctbal REAL NOT NULL, c_mktsegment TEXT NOT NULL, c_comment TEXT NOT NULL)",
+    "CREATE TABLE orders (o_orderkey INTEGER PRIMARY KEY, o_custkey INTEGER NOT NULL, \
+     o_orderstatus TEXT NOT NULL, o_totalprice REAL NOT NULL, o_orderdate TEXT NOT NULL, \
+     o_orderpriority TEXT NOT NULL, o_clerk TEXT NOT NULL, o_shippriority INTEGER NOT NULL, \
+     o_comment TEXT NOT NULL)",
+    "CREATE TABLE lineitem (l_orderkey INTEGER NOT NULL, l_partkey INTEGER NOT NULL, \
+     l_suppkey INTEGER NOT NULL, l_linenumber INTEGER NOT NULL, l_quantity REAL NOT NULL, \
+     l_extendedprice REAL NOT NULL, l_discount REAL NOT NULL, l_tax REAL NOT NULL, \
+     l_returnflag TEXT NOT NULL, l_linestatus TEXT NOT NULL, l_shipdate TEXT NOT NULL, \
+     l_commitdate TEXT NOT NULL, l_receiptdate TEXT NOT NULL, l_shipinstruct TEXT NOT NULL, \
+     l_shipmode TEXT NOT NULL, l_comment TEXT NOT NULL, \
+     PRIMARY KEY (l_orderkey, l_linenumber))",
+];
+
+/// All TPC-H queries except q15, which needs CREATE VIEW (unsupported).
+const TPCH_IDS: [usize; 21] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22,
+];
+
+fn tpch_sql(n: usize) -> &'static str {
+    macro_rules! q {
+        ($num:literal) => {
+            include_str!(concat!("../../perf/tpc-h/queries/", $num, ".sql"))
+        };
+    }
+    match n {
+        1 => q!(1),
+        2 => q!(2),
+        3 => q!(3),
+        4 => q!(4),
+        5 => q!(5),
+        6 => q!(6),
+        7 => q!(7),
+        8 => q!(8),
+        9 => q!(9),
+        10 => q!(10),
+        11 => q!(11),
+        12 => q!(12),
+        13 => q!(13),
+        14 => q!(14),
+        16 => q!(16),
+        17 => q!(17),
+        18 => q!(18),
+        19 => q!(19),
+        20 => q!(20),
+        21 => q!(21),
+        22 => q!(22),
+        _ => unreachable!("q{n} is not benchmarked"),
+    }
+}
+
+#[turso_macros::divan_bench(args = TPCH_IDS)]
+fn corpus_tpch(bencher: Bencher, q: usize) {
+    let (db, conn) = open_db();
+    for ddl in TPCH_SCHEMA {
+        execute(&db, &conn, ddl);
+    }
+    let sql = tpch_sql(q);
+    conn.prepare(sql).unwrap();
+    bencher.bench_local(|| {
+        black_box(conn.prepare(black_box(sql)).unwrap());
+    });
+}
+
+/// All ClickBench queries except q29, which needs REGEXP_REPLACE (an
+/// extension function, not available in core).
+const CLICKBENCH_IDS: [usize; 42] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+    27, 28, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43,
+];
+
+fn clickbench_sql(n: usize) -> &'static str {
+    include_str!("../../perf/clickbench/queries.sql")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("--"))
+        .nth(n - 1)
+        .unwrap()
+}
+
+#[turso_macros::divan_bench(args = CLICKBENCH_IDS)]
+fn corpus_clickbench(bencher: Bencher, q: usize) {
+    let (db, conn) = open_db();
+    execute(&db, &conn, include_str!("../../perf/clickbench/create.sql"));
+    let sql = clickbench_sql(q);
+    conn.prepare(sql).unwrap();
+    bencher.bench_local(|| {
+        black_box(conn.prepare(black_box(sql)).unwrap());
+    });
 }
