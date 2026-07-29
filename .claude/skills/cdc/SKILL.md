@@ -421,20 +421,20 @@ contract; the client-side pull/push race is what makes cuts predate pushes.
   batch's floor (conditional row UPDATE, abort txn on zero affected rows).
   The row-boundary contract also assumes at most one in-flight push per
   client id — overlapping pushes could commit out of order and regress it.
-- REPLICA CAVEAT: the pull-freshness contract (pull at time t contains every
-  push confirmed before t) holds trivially single-primary but breaks with
-  lagging read replicas — silently breaking the gen-mismatch replay floor
-  (local loss of own confirmed writes). Pending-push resolution in push()
-  also needs boundary reads reflecting all own commits (read the primary —
-  it's the write path anyway). The contract is NOT fundamental: it is what
-  lets two scalars (confirmed + pending) suffice. Lag-proof generalization:
-  keep an ordered log of batch-boundary records (sent_gen, sent_last, cur) —
-  the shape of pending_push — one per pushed batch, translated at each
+- IMPLEMENTED DESIGN (branch sync-confirmed-watermark / PR #8069):
+  `DatabaseMetadata::push_boundaries` — an ordered log of batch-boundary
+  records (sent_gen, sent_last, cur, confirmed), one per pushed batch,
+  persisted BEFORE each send, confirmed on response, translated at each
   rebase, pruned once an applied cut's boundary reaches it (applied cuts are
   monotone since pulls are incremental from the client revision). Any
-  consistent cut names some batch end of ours, so the replay floor becomes
-  the exact translation of what the cut provably contains, under any lag;
-  the issue-time snapshot and the freshness assert then disappear. Log size
-  is bounded by the replication-lag window. Push floor, translation and
-  no-duplicate properties never depended on freshness — only on boundary
-  atomicity and confirmed⇒durable.
+  consistent cut names some batch end of ours in its sync row, so the rebase
+  replay floor is the exact translation of what the cut provably contains —
+  under ANY pull lag; no freshness contract exists (an earlier two-scalar
+  revision needed one; it was unverifiable on gen mismatch and replica-
+  hostile). Unconfirmed records (response lost) are resolved against the
+  live boundary read at the next push, or by a cut naming them. Pending-
+  resolution boundary reads must reflect all own commits (read the primary —
+  it's the write path anyway). Log capped (PUSH_BOUNDARIES_LIMIT); dropping
+  old confirmed records only costs extra replay for pulls staler than the
+  whole log. Raw page-replay paths can't translate per change: log collapses
+  to the newest confirmed record with the acknowledge-all watermark.
