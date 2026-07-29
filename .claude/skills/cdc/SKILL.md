@@ -421,3 +421,14 @@ contract; the client-side pull/push race is what makes cuts predate pushes.
   batch's floor (conditional row UPDATE, abort txn on zero affected rows).
   The row-boundary contract also assumes at most one in-flight push per
   client id — overlapping pushes could commit out of order and regress it.
+- REPLICA CAVEAT: the pull-freshness contract (pull at time t contains every
+  push confirmed before t) holds trivially single-primary but breaks with
+  lagging read replicas — which silently breaks the gen-mismatch replay floor
+  (local loss of own confirmed writes) AND pending-push resolution in push()
+  ("provably didn't land" needs boundary reads reflecting all own commits).
+  Enforcement path: session token — client pins the commit position
+  (replication_index) of its last confirmed push; replicas serve pulls and
+  boundary reads only at-or-after it. Fallback: trim nothing on gen mismatch
+  (correct, but re-opens O(n²) CDC/WAL growth). Push floor, translation and
+  no-duplicate properties do NOT depend on freshness — only on boundary
+  atomicity and confirmed⇒durable.
