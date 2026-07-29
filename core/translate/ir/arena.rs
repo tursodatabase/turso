@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use turso_parser::ast;
+
 use crate::ValueBlob;
 
 /// Handle to a node in an [`ExprArena`]. This is what translation returns
@@ -25,6 +27,24 @@ impl ValId {
 /// a single lowering region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SlotId(u32);
+
+/// Handle to an *opaque leaf*: an AST expression the IR cannot decompose
+/// yet (today: column and rowid reads), whose lowering is delegated back
+/// to the eager `translate_expr` path via
+/// [`super::Lowerer::with_opaque_emitter`]. This is the value-level
+/// escape hatch that lets mixed trees (`x + 1`) route through the IR
+/// while cursor/index resolution stays in one place.
+///
+/// Opaque leaves are effectful reads: like [`SlotId`] reads they are
+/// coherent only within a lowering region, and they are never constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OpaqueId(u32);
+
+impl OpaqueId {
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnaryOp {
@@ -77,6 +97,10 @@ pub enum Node {
     /// same slot within a region are the same value by the region purity
     /// rule), but never constant and never hoistable.
     Slot(SlotId),
+    /// Opaque leaf lowered by delegating to the eager translation path.
+    /// Structurally equal leaf expressions dedup to the same node, so
+    /// repeated reads of the same column share one register per region.
+    Opaque(OpaqueId),
 }
 
 /// Interning arena for expression nodes.
@@ -89,6 +113,8 @@ pub struct ExprArena {
     nodes: Vec<Node>,
     interned: HashMap<Node, ValId>,
     next_slot: u32,
+    /// AST expressions backing [`Node::Opaque`] leaves.
+    opaques: Vec<ast::Expr>,
 }
 
 impl ExprArena {
@@ -153,6 +179,28 @@ impl ExprArena {
         self.intern(Node::Slot(slot))
     }
 
+    /// An opaque leaf backed by `expr`, lowered by delegation to the
+    /// eager path. Structurally equal expressions share a node (linear
+    /// scan — opaque leaves per expression are few).
+    pub fn opaque(&mut self, expr: &ast::Expr) -> ValId {
+        let id = match self.opaques.iter().position(|e| e == expr) {
+            Some(index) => OpaqueId(u32::try_from(index).expect("opaque table bounded by nodes")),
+            None => {
+                let id = OpaqueId(
+                    u32::try_from(self.opaques.len())
+                        .expect("expression arena exceeded u32::MAX opaque leaves"),
+                );
+                self.opaques.push(expr.clone());
+                id
+            }
+        };
+        self.intern(Node::Opaque(id))
+    }
+
+    pub fn opaque_expr(&self, id: OpaqueId) -> &ast::Expr {
+        &self.opaques[id.index()]
+    }
+
     /// Whether the value is compile-time constant, i.e. its transitive
     /// inputs contain no slot reads (and, as node kinds grow, no column
     /// reads or non-deterministic functions). Constant values are eligible
@@ -166,7 +214,7 @@ impl ExprArena {
                 | Node::ConstReal(_)
                 | Node::ConstText(_)
                 | Node::ConstBlob(_) => {}
-                Node::Slot(_) => return false,
+                Node::Slot(_) | Node::Opaque(_) => return false,
                 Node::Unary(_, operand) => stack.push(*operand),
                 Node::Binary(_, lhs, rhs) => {
                     stack.push(*lhs);

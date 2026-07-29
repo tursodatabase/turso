@@ -207,10 +207,30 @@ lift — goes last.
       arenas are shared across a statement. Validated: core unit tests,
       conformance corpus, EXPLAIN shows IR-lowered constants hoisting
       correctly out of scan loops.
-- [ ] 1c. Add `Column` reads and function calls as nodes; port the
-      remaining pure value-position cases of `translate_expr`. Region
-      discipline enforced at call sites.
-- [ ] 1d. Comparisons with affinity + collation payloads
+- [x] 1c. Column and rowid reads join the IR as **opaque leaves**
+      (`Node::Opaque`): the arena stores the leaf AST expression and
+      lowering delegates it back to eager `translate_expr` via
+      `Lowerer::with_opaque_emitter`, so cursor/index/covering/virtual/
+      custom-type resolution stays in one place while the IR owns the
+      tree around it. Structurally equal leaves dedup (repeated column
+      reads share a register per region). `BuildCtx` carries
+      referenced_tables + resolver; the builder computes the collation
+      post-state statically (same merge rules as `binary_expr_shared`)
+      and the hook restores it after lowering. Maximal constant subtrees
+      of mixed trees are wrapped in constant spans during lowering so
+      hoisting still works (verified via EXPLAIN). Safety gates — the IR
+      path refuses: expression→register cache enabled (GROUP BY-style
+      contexts where re-reading columns is wrong), expression indexes in
+      play, custom-typed columns (operator overloads), array operands of
+      `||` (ArrayConcat), SELF_TABLE placeholders. Function calls did NOT
+      make this slice — they need contiguous argument blocks, moved to 1d.
+- [ ] 1d. Function calls as nodes. Needs the contiguous-register-group
+      concept: `Insn::Function` takes its args in adjacent registers, so
+      lowering a FnCall must allocate a block and `lower_into` each arg
+      slot (mirroring the eager shape). Start with pure scalar functions
+      on the generic `Function` path; leave specialized emission
+      (datetime folds, JSON fast paths, aggregates) to the eager path.
+- [ ] 1e. Comparisons with affinity + collation payloads
       (`CmpInsFlags`, `comparison_affinity`), value-position only
       (`Insn::Eq/Ne/Lt/…` value mode / `Bool` results).
 

@@ -435,24 +435,44 @@ pub fn translate_expr(
                 return Ok(target_register);
             }
 
-            // Declarative IR path: trees the IR can fully represent (today
-            // the literal-only arithmetic/bitwise/concat subset) are built
-            // as value nodes and lowered in one pass. Anything else falls
-            // back to eager emission below.
-            {
+            // Declarative IR path: trees the IR can fully represent
+            // (arithmetic/bitwise/concat over literals and column/rowid
+            // reads) are built as value nodes and lowered in one pass.
+            // Anything else falls back to eager emission below.
+            //
+            // Gated off when the expression→register cache or expression
+            // indexes are active: the builder decomposes trees without
+            // consulting either, and re-reading columns in those contexts
+            // is incorrect (cursors may not be positioned on the source
+            // row, or the table cursor may not be open at all).
+            if !has_expression_indexes && !resolver.expr_to_reg_cache_enabled {
                 let mut arena = crate::translate::ir::ExprArena::new();
-                if let Some(val) = crate::translate::ir::try_build_value(&mut arena, expr)? {
-                    crate::translate::ir::Lowerer::new(&arena).lower_into(
-                        program,
-                        val,
-                        target_register,
-                    )?;
-                    // Mirror the eager path's collation post-state: with
-                    // literal-only operands the resolved collation context
-                    // is always cleared, except in the equivalent-operand
-                    // branch which leaves it untouched.
-                    if !exprs_are_equivalent(e1, e2) {
-                        program.set_collation(None);
+                let build_ctx = crate::translate::ir::BuildCtx {
+                    referenced_tables,
+                    resolver: Some(resolver),
+                };
+                if let Some(built) =
+                    crate::translate::ir::try_build_value(&mut arena, expr, &build_ctx)?
+                {
+                    let mut emit_leaf = |program: &mut ProgramBuilder,
+                                         leaf: &ast::Expr,
+                                         dest: usize| {
+                        translate_expr(program, referenced_tables, leaf, dest, resolver).map(|_| ())
+                    };
+                    crate::translate::ir::Lowerer::with_opaque_emitter(&arena, &mut emit_leaf)
+                        .lower_into(program, built.val, target_register)?;
+                    // Restore the collation post-state the eager path
+                    // would have left: the statically computed context
+                    // when there is one; otherwise cleared, except in the
+                    // equivalent-operand shape where the eager path
+                    // leaves the state untouched.
+                    match built.collation {
+                        Some(collation) => program.set_collation(Some(collation)),
+                        None => {
+                            if !exprs_are_equivalent(e1, e2) {
+                                program.set_collation(None);
+                            }
+                        }
                     }
                     if let Some(span) = constant_span {
                         program.constant_span_end(span);

@@ -1,10 +1,18 @@
 use std::collections::HashMap;
 
+use turso_parser::ast;
+
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::Insn;
 use crate::{LimboError, Result};
 
 use super::arena::{BinOp, ExprArena, Node, SlotId, UnaryOp, ValId};
+
+/// Callback that lowers an opaque leaf ([`Node::Opaque`]) by emitting the
+/// given AST expression into `dest`. In production this delegates to the
+/// eager `translate_expr`, which keeps cursor/index/collation resolution
+/// in one place while the IR owns the tree structure around it.
+pub type OpaqueEmitter<'e> = dyn FnMut(&mut ProgramBuilder, &ast::Expr, usize) -> Result<()> + 'e;
 
 /// Materializes values from an [`ExprArena`] into a [`ProgramBuilder`].
 ///
@@ -20,13 +28,17 @@ pub struct Lowerer<'a> {
     lowered: HashMap<ValId, usize>,
     /// Frontend-provided register bindings for mutable slots.
     slots: HashMap<SlotId, usize>,
+    /// Lowers [`Node::Opaque`] leaves; absent when the graph has none.
+    opaque_emitter: Option<&'a mut OpaqueEmitter<'a>>,
 }
 
 /// Work item for the explicit post-order walk. `Visit` schedules a node's
-/// operands; `Emit` runs once its operands are all lowered.
+/// operands; `Emit` runs once its operands are all lowered; `EndSpan`
+/// closes the constant span opened for a maximal constant subtree.
 enum Task {
     Visit(ValId),
     Emit(ValId),
+    EndSpan(usize),
 }
 
 impl<'a> Lowerer<'a> {
@@ -35,6 +47,18 @@ impl<'a> Lowerer<'a> {
             arena,
             lowered: HashMap::new(),
             slots: HashMap::new(),
+            opaque_emitter: None,
+        }
+    }
+
+    /// A lowerer that can materialize [`Node::Opaque`] leaves through the
+    /// given callback.
+    pub fn with_opaque_emitter(arena: &'a ExprArena, emitter: &'a mut OpaqueEmitter<'a>) -> Self {
+        Self {
+            arena,
+            lowered: HashMap::new(),
+            slots: HashMap::new(),
+            opaque_emitter: Some(emitter),
         }
     }
 
@@ -55,22 +79,43 @@ impl<'a> Lowerer<'a> {
                     if self.lowered.contains_key(&id) {
                         continue;
                     }
+                    // A maximal constant subtree in a mixed tree emits
+                    // inside its own constant span so it stays eligible
+                    // for hoisting into the program prologue, matching
+                    // what nested eager translation does for constant
+                    // operands. If a span is already open (e.g. the whole
+                    // expression is constant), the parent span covers us.
+                    let span = if !program.constant_span_is_open() && self.arena.is_constant(id) {
+                        Some(program.constant_span_start())
+                    } else {
+                        None
+                    };
                     match self.arena.node(id) {
                         Node::ConstNull
                         | Node::ConstInt(_)
                         | Node::ConstReal(_)
                         | Node::ConstText(_)
                         | Node::ConstBlob(_)
-                        | Node::Slot(_) => {
+                        | Node::Slot(_)
+                        | Node::Opaque(_) => {
                             self.emit_node(program, id, None)?;
+                            if let Some(span) = span {
+                                program.constant_span_end(span);
+                            }
                         }
                         Node::Unary(_, operand) => {
                             let operand = *operand;
+                            if let Some(span) = span {
+                                stack.push(Task::EndSpan(span));
+                            }
                             stack.push(Task::Emit(id));
                             stack.push(Task::Visit(operand));
                         }
                         Node::Binary(_, lhs, rhs) => {
                             let (lhs, rhs) = (*lhs, *rhs);
+                            if let Some(span) = span {
+                                stack.push(Task::EndSpan(span));
+                            }
                             stack.push(Task::Emit(id));
                             // Popped in reverse: lhs is visited (and thus
                             // emitted) before rhs, keeping lowering order
@@ -85,6 +130,9 @@ impl<'a> Lowerer<'a> {
                         continue;
                     }
                     self.emit_node(program, id, None)?;
+                }
+                Task::EndSpan(span) => {
+                    program.constant_span_end(span);
                 }
             }
         }
@@ -126,7 +174,8 @@ impl<'a> Lowerer<'a> {
             | Node::ConstReal(_)
             | Node::ConstText(_)
             | Node::ConstBlob(_)
-            | Node::Slot(_) => {}
+            | Node::Slot(_)
+            | Node::Opaque(_) => {}
             Node::Unary(_, operand) => {
                 let operand = *operand;
                 let _ = self.lower(program, operand)?;
@@ -151,6 +200,18 @@ impl<'a> Lowerer<'a> {
         dest: Option<usize>,
     ) -> Result<()> {
         let reg = match self.arena.node(id) {
+            Node::Opaque(opaque) => {
+                let arena = self.arena;
+                let expr = arena.opaque_expr(*opaque);
+                let emitter = self.opaque_emitter.as_mut().ok_or_else(|| {
+                    LimboError::InternalError(
+                        "IR lowering: opaque leaf without an opaque emitter".to_string(),
+                    )
+                })?;
+                let dest = dest.unwrap_or_else(|| program.alloc_register());
+                emitter(program, expr, dest)?;
+                dest
+            }
             Node::Slot(slot) => {
                 let slot_reg = *self.slots.get(slot).ok_or_else(|| {
                     LimboError::InternalError(format!(
@@ -216,7 +277,7 @@ impl<'a> Lowerer<'a> {
                             BinOp::Concat => Insn::Concat { lhs, rhs, dest },
                         }
                     }
-                    Node::Slot(_) => unreachable!("handled above"),
+                    Node::Slot(_) | Node::Opaque(_) => unreachable!("handled above"),
                 };
                 program.emit_insn(insn);
                 dest
