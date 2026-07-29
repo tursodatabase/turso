@@ -10,6 +10,14 @@
 //! for reading and writing pages to the database file, either local or
 //! remote. The `Wal` struct is responsible for managing the write-ahead log
 //! for the database, also either local or remote.
+// Differential-testing harnesses (b-tree conformance) need to name
+// `BTreeCursor` and call `integrity_check` from an external crate. The
+// module is `pub(crate)` by default; the `aristo-instr` feature widens it
+// to `pub` so the conformance crate can reach those (already-`pub`) items.
+// No behavior change without the feature.
+#[cfg(feature = "aristo-instr")]
+pub mod btree;
+#[cfg(not(feature = "aristo-instr"))]
 pub(crate) mod btree;
 pub(crate) mod buffer_pool;
 pub(crate) mod checksum;
