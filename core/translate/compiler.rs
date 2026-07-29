@@ -105,6 +105,26 @@ pub(crate) trait Compile: Sized {
             compilers: PhantomData,
         }
     }
+
+    /// Fold the rows of an already-open symbolic cursor into one SSA value.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn fold_cursor<BodyFn, Body>(
+        self,
+        cursor: CursorId,
+        body: BodyFn,
+    ) -> CursorFold<Self, BodyFn, Body>
+    where
+        Self: Compile<Output = ValueId>,
+        BodyFn: FnOnce(ValueId) -> Body,
+        Body: Compile<Output = ValueId>,
+    {
+        CursorFold {
+            initial: self,
+            cursor,
+            body,
+            compiler: PhantomData,
+        }
+    }
 }
 
 type BoxedCompilerFn<Output> = Box<dyn FnOnce(&mut IrBuilder) -> Result<Output>>;
@@ -275,6 +295,50 @@ where
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct CursorFold<Initial, BodyFn, Body> {
+    initial: Initial,
+    cursor: CursorId,
+    body: BodyFn,
+    compiler: PhantomData<fn() -> Body>,
+}
+
+impl<Initial, BodyFn, Body> Compile for CursorFold<Initial, BodyFn, Body>
+where
+    Initial: Compile<Output = ValueId>,
+    BodyFn: FnOnce(ValueId) -> Body,
+    Body: Compile<Output = ValueId>,
+{
+    type Output = ValueId;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let initial = self.initial.compile(builder)?;
+        let row = builder.create_block()?;
+        let exit = builder.create_block()?;
+        let state = builder.add_block_parameter(row)?;
+        let result = builder.add_block_parameter(exit)?;
+
+        builder.terminate(Terminator::CursorRewind {
+            cursor: self.cursor,
+            if_non_empty: row,
+            if_empty: exit,
+            arguments: smallvec![initial],
+        })?;
+
+        builder.switch_to(row)?;
+        let next = (self.body)(state).compile(builder)?;
+        builder.terminate(Terminator::CursorNext {
+            cursor: self.cursor,
+            if_next: row,
+            if_done: exit,
+            arguments: smallvec![next],
+        })?;
+
+        builder.switch_to(exit)?;
+        Ok(result)
+    }
+}
+
 /// The symbolic result of one SSA operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ValueId(u32);
@@ -299,6 +363,21 @@ impl InputId {
     }
 }
 
+/// A symbolic cursor bound to an already-allocated VDBE cursor during lowering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CursorId(u32);
+
+impl CursorId {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn new(index: u32) -> Self {
+        Self(index)
+    }
+
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BlockId(u32);
 
@@ -313,15 +392,23 @@ enum ScalarOp {
     Input(InputId),
     Constant(Value),
     Add { lhs: ValueId, rhs: ValueId },
+    Column { cursor: CursorId, column: usize },
 }
 
 impl ScalarOp {
     fn operands(&self) -> impl Iterator<Item = ValueId> + '_ {
         let operands = match self {
-            Self::Input(_) | Self::Constant(_) => [None, None],
+            Self::Input(_) | Self::Constant(_) | Self::Column { .. } => [None, None],
             Self::Add { lhs, rhs } => [Some(*lhs), Some(*rhs)],
         };
         operands.into_iter().flatten()
+    }
+
+    fn cursor(&self) -> Option<CursorId> {
+        match self {
+            Self::Column { cursor, .. } => Some(*cursor),
+            Self::Input(_) | Self::Constant(_) | Self::Add { .. } => None,
+        }
     }
 }
 
@@ -342,27 +429,71 @@ enum Terminator {
         if_true: BlockId,
         if_false: BlockId,
     },
+    CursorRewind {
+        cursor: CursorId,
+        if_non_empty: BlockId,
+        if_empty: BlockId,
+        arguments: SmallVec<[ValueId; 2]>,
+    },
+    CursorNext {
+        cursor: CursorId,
+        if_next: BlockId,
+        if_done: BlockId,
+        arguments: SmallVec<[ValueId; 2]>,
+    },
     Return(ValueId),
 }
 
 impl Terminator {
-    fn successors(&self) -> impl Iterator<Item = BlockId> {
-        let successors = match self {
-            Self::Jump { target, .. } => [Some(*target), None],
+    fn successors(&self) -> impl Iterator<Item = BlockId> + '_ {
+        self.edges().map(|(target, _)| target)
+    }
+
+    fn edges(&self) -> impl Iterator<Item = (BlockId, &[ValueId])> {
+        let edges = match self {
+            Self::Jump { target, arguments } => [Some((*target, arguments.as_slice())), None],
             Self::Branch {
                 if_true, if_false, ..
-            } => [Some(*if_true), Some(*if_false)],
+            } => [Some((*if_true, &[][..])), Some((*if_false, &[][..]))],
+            Self::CursorRewind {
+                if_non_empty,
+                if_empty,
+                arguments,
+                ..
+            } => [
+                Some((*if_non_empty, arguments.as_slice())),
+                Some((*if_empty, arguments.as_slice())),
+            ],
+            Self::CursorNext {
+                if_next,
+                if_done,
+                arguments,
+                ..
+            } => [
+                Some((*if_next, arguments.as_slice())),
+                Some((*if_done, arguments.as_slice())),
+            ],
             Self::Return(_) => [None, None],
         };
-        successors.into_iter().flatten()
+        edges.into_iter().flatten()
     }
 
     fn operands(&self) -> impl Iterator<Item = ValueId> + '_ {
         let (first, rest) = match self {
             Self::Jump { arguments, .. } => (None, arguments.as_slice()),
             Self::Branch { condition, .. } | Self::Return(condition) => (Some(*condition), &[][..]),
+            Self::CursorRewind { arguments, .. } | Self::CursorNext { arguments, .. } => {
+                (None, arguments.as_slice())
+            }
         };
         first.into_iter().chain(rest.iter().copied())
+    }
+
+    fn cursor(&self) -> Option<CursorId> {
+        match self {
+            Self::CursorRewind { cursor, .. } | Self::CursorNext { cursor, .. } => Some(*cursor),
+            Self::Jump { .. } | Self::Branch { .. } | Self::Return(_) => None,
+        }
     }
 }
 
@@ -387,6 +518,7 @@ pub(crate) struct IrBuilder {
     current: BlockId,
     next_value: u32,
     input_count: u32,
+    cursor_count: u32,
 }
 
 impl IrBuilder {
@@ -401,7 +533,17 @@ impl IrBuilder {
             current: BlockId(0),
             next_value: 0,
             input_count: 0,
+            cursor_count: 0,
         }
+    }
+
+    fn record_cursor(&mut self, cursor: CursorId) -> Result<()> {
+        self.cursor_count = self
+            .cursor_count
+            .max(cursor.0.checked_add(1).ok_or_else(|| {
+                LimboError::InternalError("compiler IR cursor identifier overflow".to_owned())
+            })?);
+        Ok(())
     }
 
     fn allocate_value(&mut self) -> Result<ValueId> {
@@ -417,6 +559,9 @@ impl IrBuilder {
             self.input_count = self.input_count.max(input.0.checked_add(1).ok_or_else(|| {
                 LimboError::InternalError("compiler IR input identifier overflow".to_owned())
             })?);
+        }
+        if let Some(cursor) = op.cursor() {
+            self.record_cursor(cursor)?;
         }
         let result = self.allocate_value()?;
         self.blocks[self.current.index()]
@@ -477,6 +622,9 @@ impl IrBuilder {
     }
 
     fn terminate(&mut self, terminator: Terminator) -> Result<()> {
+        if let Some(cursor) = terminator.cursor() {
+            self.record_cursor(cursor)?;
+        }
         let block = &mut self.blocks[self.current.index()];
         if block.terminator.replace(terminator).is_some() {
             return Err(LimboError::InternalError(format!(
@@ -511,6 +659,7 @@ impl IrBuilder {
             blocks,
             value_count: self.next_value,
             input_count: self.input_count,
+            cursor_count: self.cursor_count,
         };
         program.verify()?;
         Ok(program)
@@ -529,6 +678,7 @@ pub(crate) struct IrProgram {
     blocks: SmallVec<[BasicBlock; 4]>,
     value_count: u32,
     input_count: u32,
+    cursor_count: u32,
 }
 
 impl IrProgram {
@@ -542,6 +692,7 @@ impl IrProgram {
         let block_count = self.blocks.len();
         let mut definitions = vec![None; self.value_count as usize];
         let mut inputs = vec![false; self.input_count as usize];
+        let mut cursors = vec![false; self.cursor_count as usize];
         let mut predecessors = vec![Vec::new(); block_count];
         let mut return_count = 0;
 
@@ -571,6 +722,14 @@ impl IrProgram {
                     };
                     *used = true;
                 }
+                if let Some(cursor) = instruction.op.cursor() {
+                    let Some(used) = cursors.get_mut(cursor.index()) else {
+                        return Err(LimboError::InternalError(format!(
+                            "compiler IR references out-of-range cursor {cursor:?}"
+                        )));
+                    };
+                    *used = true;
+                }
                 Self::record_definition(
                     &mut definitions,
                     instruction.result,
@@ -580,39 +739,33 @@ impl IrProgram {
                     },
                 )?;
             }
-            for successor in block.terminator.successors() {
+            for (successor, arguments) in block.terminator.edges() {
                 let Some(target) = self.blocks.get(successor.index()) else {
                     return Err(LimboError::InternalError(format!(
                         "compiler IR block {:?} targets unknown block {successor:?}",
                         block.id
                     )));
                 };
+                let parameter_count = target.parameters.len();
+                if arguments.len() != parameter_count {
+                    return Err(LimboError::InternalError(format!(
+                        "compiler IR edge {:?} -> {successor:?} supplies {} arguments for {parameter_count} parameters",
+                        block.id,
+                        arguments.len()
+                    )));
+                }
                 predecessors[target.id.index()].push(block.id);
             }
-            match &block.terminator {
-                Terminator::Jump { target, arguments } => {
-                    let parameter_count = self.blocks[target.index()].parameters.len();
-                    if arguments.len() != parameter_count {
-                        return Err(LimboError::InternalError(format!(
-                            "compiler IR edge {:?} -> {target:?} supplies {} arguments for {parameter_count} parameters",
-                            block.id,
-                            arguments.len()
-                        )));
-                    }
-                }
-                Terminator::Branch {
-                    if_true, if_false, ..
-                } => {
-                    for target in [if_true, if_false] {
-                        if !self.blocks[target.index()].parameters.is_empty() {
-                            return Err(LimboError::InternalError(format!(
-                                "compiler IR branch edge {:?} -> {target:?} cannot pass block arguments",
-                                block.id
-                            )));
-                        }
-                    }
-                }
-                Terminator::Return(_) => return_count += 1,
+            if let Some(cursor) = block.terminator.cursor() {
+                let Some(used) = cursors.get_mut(cursor.index()) else {
+                    return Err(LimboError::InternalError(format!(
+                        "compiler IR references out-of-range cursor {cursor:?}"
+                    )));
+                };
+                *used = true;
+            }
+            if matches!(block.terminator, Terminator::Return(_)) {
+                return_count += 1;
             }
         }
 
@@ -624,6 +777,11 @@ impl IrProgram {
         if let Some(missing) = inputs.iter().position(|used| !used) {
             return Err(LimboError::InternalError(format!(
                 "compiler IR input @{missing} is not referenced"
+            )));
+        }
+        if let Some(missing) = cursors.iter().position(|used| !used) {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR cursor ${missing} is not referenced"
             )));
         }
         if return_count != 1 {
@@ -760,13 +918,36 @@ impl IrProgram {
             .expect("verified compiler IR has exactly one return")
     }
 
+    fn emit_edge_copies(
+        &self,
+        program: &mut ProgramBuilder,
+        registers: &[usize],
+        target: BlockId,
+        arguments: &[ValueId],
+    ) {
+        for (argument, parameter) in arguments
+            .iter()
+            .zip(&self.blocks[target.index()].parameters)
+        {
+            let source = registers[argument.index()];
+            let destination = registers[parameter.index()];
+            if source != destination {
+                program.emit_insn(Insn::Copy {
+                    src_reg: source,
+                    dst_reg: destination,
+                    extra_amount: 0,
+                });
+            }
+        }
+    }
+
     /// Assign physical registers and labels, then append equivalent VDBE instructions.
     pub(crate) fn lower_into(
         self,
         program: &mut ProgramBuilder,
         target_register: usize,
     ) -> Result<()> {
-        self.lower_into_with_inputs(program, target_register, &[])
+        self.lower_into_with_resources(program, target_register, &[], &[])
     }
 
     /// Bind symbolic inputs to existing registers and lower the region.
@@ -776,12 +957,39 @@ impl IrProgram {
         target_register: usize,
         input_registers: &[usize],
     ) -> Result<()> {
+        self.lower_into_with_resources(program, target_register, input_registers, &[])
+    }
+
+    /// Bind symbolic values and cursors, then lower the region.
+    pub(crate) fn lower_into_with_resources(
+        self,
+        program: &mut ProgramBuilder,
+        target_register: usize,
+        input_registers: &[usize],
+        cursor_ids: &[usize],
+    ) -> Result<()> {
         self.verify()?;
         if input_registers.len() != self.input_count as usize {
             return Err(LimboError::InternalError(format!(
                 "compiler IR expects {} inputs, received {}",
                 self.input_count,
                 input_registers.len()
+            )));
+        }
+        if cursor_ids.len() != self.cursor_count as usize {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR expects {} cursors, received {}",
+                self.cursor_count,
+                cursor_ids.len()
+            )));
+        }
+        if let Some(cursor) = cursor_ids
+            .iter()
+            .copied()
+            .find(|cursor| *cursor >= program.cursor_ref.len())
+        {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR physical cursor {cursor} is not allocated"
             )));
         }
         let output = self.output();
@@ -873,24 +1081,17 @@ impl IrProgram {
                         rhs: registers[rhs.index()],
                         dest: destination,
                     }),
+                    ScalarOp::Column { cursor, column } => program.emit_insn(Insn::Column {
+                        cursor_id: cursor_ids[cursor.index()],
+                        column: *column,
+                        dest: destination,
+                        default: None,
+                    }),
                 }
             }
             match &block.terminator {
                 Terminator::Jump { target, arguments } => {
-                    for (argument, parameter) in arguments
-                        .iter()
-                        .zip(&self.blocks[target.index()].parameters)
-                    {
-                        let source = registers[argument.index()];
-                        let destination = registers[parameter.index()];
-                        if source != destination {
-                            program.emit_insn(Insn::Copy {
-                                src_reg: source,
-                                dst_reg: destination,
-                                extra_amount: 0,
-                            });
-                        }
-                    }
+                    self.emit_edge_copies(program, &registers, *target, arguments);
                     program.emit_insn(Insn::Goto {
                         target_pc: labels[target.index()],
                     });
@@ -907,6 +1108,40 @@ impl IrProgram {
                     });
                     program.emit_insn(Insn::Goto {
                         target_pc: labels[if_true.index()],
+                    });
+                }
+                Terminator::CursorRewind {
+                    cursor,
+                    if_non_empty,
+                    if_empty,
+                    arguments,
+                } => {
+                    for target in [if_non_empty, if_empty] {
+                        self.emit_edge_copies(program, &registers, *target, arguments);
+                    }
+                    program.emit_insn(Insn::Rewind {
+                        cursor_id: cursor_ids[cursor.index()],
+                        pc_if_empty: labels[if_empty.index()],
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: labels[if_non_empty.index()],
+                    });
+                }
+                Terminator::CursorNext {
+                    cursor,
+                    if_next,
+                    if_done,
+                    arguments,
+                } => {
+                    for target in [if_next, if_done] {
+                        self.emit_edge_copies(program, &registers, *target, arguments);
+                    }
+                    program.emit_insn(Insn::Next {
+                        cursor_id: cursor_ids[cursor.index()],
+                        pc_if_next: labels[if_next.index()],
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: labels[if_done.index()],
                     });
                 }
                 Terminator::Return(_) => {
@@ -948,6 +1183,9 @@ impl fmt::Display for IrProgram {
                     ScalarOp::Add { lhs, rhs } => {
                         writeln!(f, "add %{}, %{}", lhs.0, rhs.0)?;
                     }
+                    ScalarOp::Column { cursor, column } => {
+                        writeln!(f, "column ${}[{column}]", cursor.0)?;
+                    }
                 }
             }
             write!(f, "  ")?;
@@ -971,11 +1209,47 @@ impl fmt::Display for IrProgram {
                     "branch %{}, block{}, block{}",
                     condition.0, if_true.0, if_false.0
                 )?,
+                Terminator::CursorRewind {
+                    cursor,
+                    if_non_empty,
+                    if_empty,
+                    arguments,
+                } => {
+                    write!(f, "rewind ${}, block{}(", cursor.0, if_non_empty.0)?;
+                    Self::fmt_arguments(f, arguments)?;
+                    write!(f, "), block{}(", if_empty.0)?;
+                    Self::fmt_arguments(f, arguments)?;
+                    writeln!(f, ")")?;
+                }
+                Terminator::CursorNext {
+                    cursor,
+                    if_next,
+                    if_done,
+                    arguments,
+                } => {
+                    write!(f, "next ${}, block{}(", cursor.0, if_next.0)?;
+                    Self::fmt_arguments(f, arguments)?;
+                    write!(f, "), block{}(", if_done.0)?;
+                    Self::fmt_arguments(f, arguments)?;
+                    writeln!(f, ")")?;
+                }
                 Terminator::Return(value) => writeln!(f, "return %{}", value.0)?,
             }
             if block_index + 1 != self.blocks.len() {
                 writeln!(f)?;
             }
+        }
+        Ok(())
+    }
+}
+
+impl IrProgram {
+    fn fmt_arguments(f: &mut fmt::Formatter<'_>, arguments: &[ValueId]) -> fmt::Result {
+        for (index, argument) in arguments.iter().enumerate() {
+            if index != 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "%{}", argument.0)?;
         }
         Ok(())
     }
@@ -1030,6 +1304,28 @@ pub(crate) struct Add {
     rhs: ValueId,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Column {
+    cursor: CursorId,
+    column: usize,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const fn column(cursor: CursorId, column: usize) -> Column {
+    Column { cursor, column }
+}
+
+impl Compile for Column {
+    type Output = ValueId;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        builder.push(ScalarOp::Column {
+            cursor: self.cursor,
+            column: self.column,
+        })
+    }
+}
+
 pub(crate) fn add(lhs: ValueId, rhs: ValueId) -> Add {
     Add { lhs, rhs }
 }
@@ -1057,8 +1353,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
-    use crate::{io::MemoryIO, sync::Arc, Database, SqliteDialect, Statement};
+    use crate::vdbe::builder::{CursorType, ProgramBuilderOpts, QueryMode};
+    use crate::{io::MemoryIO, schema::BTreeTable, sync::Arc, Database, SqliteDialect, Statement};
 
     #[test]
     fn combinators_build_symbolic_ssa_before_lowering() {
@@ -1195,6 +1491,113 @@ mod tests {
     }
 
     #[test]
+    fn cursor_fold_builds_effectful_control_flow_with_ssa_state() {
+        let cursor = CursorId::new(0);
+        let compiler = constant(Value::from_i64(0)).fold_cursor(cursor, |sum| {
+            column(cursor, 2).and_then(move |value| add(sum, value))
+        });
+
+        let ir = compile_scalar(compiler).unwrap();
+
+        assert_eq!(
+            ir.to_string(),
+            concat!(
+                "block0:\n",
+                "  %0 = constant Numeric(Integer(0))\n",
+                "  rewind $0, block1(%0), block2(%0)\n",
+                "\n",
+                "block1(%1):\n",
+                "  %3 = column $0[2]\n",
+                "  %4 = add %1, %3\n",
+                "  next $0, block1(%4), block2(%4)\n",
+                "\n",
+                "block2(%2):\n",
+                "  return %2\n",
+            )
+        );
+    }
+
+    #[test]
+    fn cursor_fold_binds_the_physical_cursor_only_during_lowering() {
+        let cursor = CursorId::new(0);
+        let compiler = constant(Value::from_i64(0)).fold_cursor(cursor, |sum| {
+            column(cursor, 2).and_then(move |value| add(sum, value))
+        });
+        let ir = compile_scalar(compiler).unwrap();
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 3, 0));
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE t(a, b, c)", 2).unwrap());
+        program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        let bound_cursor = program.alloc_cursor_id(CursorType::BTreeTable(table));
+
+        ir.lower_into_with_resources(&mut program, 7, &[], &[bound_cursor])
+            .unwrap();
+        program.resolve_labels().unwrap();
+
+        assert!(program.insns.iter().all(|(insn, _)| match insn {
+            Insn::Rewind {
+                cursor_id,
+                pc_if_empty,
+            } => *cursor_id == bound_cursor && pc_if_empty.is_offset(),
+            Insn::Column { cursor_id, .. } => *cursor_id == bound_cursor,
+            Insn::Next {
+                cursor_id,
+                pc_if_next,
+            } => *cursor_id == bound_cursor && pc_if_next.is_offset(),
+            Insn::Goto { target_pc } => target_pc.is_offset(),
+            _ => true,
+        }));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Rewind { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Column { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Next { .. })));
+    }
+
+    #[test]
+    fn cursor_fold_rejects_missing_cursor_bindings() {
+        let cursor = CursorId::new(0);
+        let ir = compile_scalar(
+            constant(Value::from_i64(0))
+                .fold_cursor(cursor, |state| column(cursor, 0).map(move |_| state)),
+        )
+        .unwrap();
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 1, 0));
+
+        let error = ir.lower_into(&mut program, 1).unwrap_err();
+
+        assert!(error.to_string().contains("expects 1 cursors, received 0"));
+    }
+
+    #[test]
+    fn cursor_fold_rejects_an_unallocated_physical_cursor() {
+        let cursor = CursorId::new(0);
+        let ir = compile_scalar(
+            constant(Value::from_i64(0))
+                .fold_cursor(cursor, |state| column(cursor, 0).map(move |_| state)),
+        )
+        .unwrap();
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 1, 0));
+
+        let error = ir
+            .lower_into_with_resources(&mut program, 1, &[], &[0])
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("physical cursor 0 is not allocated"));
+    }
+
+    #[test]
     fn nested_branches_lower_when_the_return_block_is_not_last() {
         let compiler = constant(Value::from_i64(1)).branch(
             constant(Value::from_i64(0))
@@ -1323,6 +1726,7 @@ mod tests {
             ],
             value_count: 2,
             input_count: 0,
+            cursor_count: 0,
         };
 
         let error = ir.verify().unwrap_err();
@@ -1347,6 +1751,38 @@ mod tests {
         assert!(error
             .to_string()
             .contains("supplies 0 arguments for 1 parameters"));
+    }
+
+    #[test]
+    fn verifier_rejects_wrong_cursor_edge_argument_count() {
+        let mut builder = IrBuilder::new();
+        let initial = builder.push(ScalarOp::Constant(Value::Null)).unwrap();
+        let row = builder.create_block().unwrap();
+        let exit = builder.create_block().unwrap();
+        builder.add_block_parameter(row).unwrap();
+        builder
+            .terminate(Terminator::CursorRewind {
+                cursor: CursorId::new(0),
+                if_non_empty: row,
+                if_empty: exit,
+                arguments: smallvec![initial],
+            })
+            .unwrap();
+        builder.switch_to(row).unwrap();
+        builder
+            .terminate(Terminator::Jump {
+                target: exit,
+                arguments: SmallVec::new(),
+            })
+            .unwrap();
+        builder.switch_to(exit).unwrap();
+        let value = builder.push(ScalarOp::Constant(Value::Null)).unwrap();
+
+        let error = builder.finish(value).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("edge BlockId(0) -> BlockId(2) supplies 1 arguments for 0 parameters"));
     }
 
     #[test]
@@ -1396,6 +1832,7 @@ mod tests {
             ],
             value_count: 3,
             input_count: 0,
+            cursor_count: 0,
         };
 
         let error = ir.verify().unwrap_err();

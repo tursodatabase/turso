@@ -16,8 +16,8 @@ representation.
 - A compiler has one typed output.
 - Combining compilers preserves the execution order of their effects.
 - Symbolic values have exactly one definition.
-- An operation may only use values defined before it in the same straight-line
-  region. Control-flow regions will extend this rule with block dominance.
+- Every value must dominate its use; loop-carried and merged values enter blocks
+  through explicit block parameters.
 - Intermediate representations contain no physical VDBE locations.
 - Invalid intermediate representations are rejected before VDBE emission.
 - VDBE lowering is deterministic.
@@ -42,16 +42,25 @@ representation.
    until each path has equivalent coverage.
 
 The current IR supports straight-line scalar operations, conditional diamonds,
-and explicit loops with block parameters. This establishes the combinator
-contract, SSA joins and loop-carried values, and the separation between
-symbolic values and VDBE resources without prematurely choosing the
-representation of effectful database resources.
+explicit loops with block parameters, and a first effectful cursor fold. This
+establishes the combinator contract, SSA joins and loop-carried values, and the
+separation between symbolic values and VDBE resources.
 
 `loop_while` builds a preheader, header, body, and exit. Its initial value and
 each backedge value flow into the same header parameter, so the loop state has
 one SSA definition even though it changes at runtime. The Rust closures used to
 describe the condition and body run once while building IR; repetition exists
 only in the resulting control-flow graph and lowered VDBE program.
+
+`fold_cursor` describes an iterator-like fold over an already-open symbolic
+cursor. It emits a cursor `Rewind` terminator, a row block whose parameter is the
+accumulator, a cursor `Next` backedge, and an exit parameter containing either
+the initial value for an empty cursor or the final accumulated value. Column
+reads remain ordered instructions inside the row block. The IR stores a
+symbolic cursor identifier; lowering receives the corresponding physical VDBE
+cursor and only then emits `Rewind`, `Column`, and `Next` instructions. Cursor
+allocation and opening remain at the legacy boundary until cursor resource
+declarations are added to the IR.
 
 Supported expression fragments are assembled recursively. Boxing erases the
 concrete Rust type of heterogeneous combinator trees while preserving deferred
