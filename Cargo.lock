@@ -7365,6 +7365,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shuttle",
+ "simdutf8",
  "simsimd",
  "smallvec",
  "sorted-vec",
