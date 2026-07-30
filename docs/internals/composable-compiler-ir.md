@@ -247,9 +247,28 @@ boundary (the whole tree is constant, so the span opened by
       across blocks must be dominance-safe (entry-or-current-block rule)
       — the verifier caught the sibling-branch reuse on the partial-index
       corpus before it became corrupt bytecode.
-- [ ] 2b. CASE/COALESCE/IFNULL in value position as `branch`/`branch3`
-      compositions (block parameters carrying the result); IS/IS NOT and
-      IS NULL/NOT NULL terminals in condition position.
+- [x] 2b-1. CASE (both forms) in value position: per-arm then/next
+      blocks chaining into one join whose block parameter carries the
+      result — the first production use of block parameters for values.
+      Base form emits the eager `Ne base,when -> next` shape
+      (`jump_if_null`, NO affinity conversion — `CmpData.affinity`
+      became `Option<Affinity>` because flags-without-affinity is not
+      `Some(Blob)`); searched form emits `IfNot when -> next`. The join
+      is created after the arm blocks so emission order matches the
+      eager layout (each WHEN falls into its THEN, ELSE falls into the
+      join). Collation payloads per base comparison come from the
+      running compile-time state folded in eager emission order (base,
+      when/then per pair, else). Improvement over eager: arms use fresh
+      registers, so the RegisterReuse constant-hoisting deopt does not
+      apply — constant THEN values hoist (whole constant CASEs hoist
+      wholesale, span machinery handles the internal control flow). The
+      integration hook is shared (`try_compiler_value_expr`) and now
+      covers both the Binary and Case arms of `translate_expr`.
+- [ ] 2b-2. COALESCE/IFNULL in value position — needs a null-test
+      branch terminator (`IsNull`/`NotNull` jumps; truthiness `Branch`
+      cannot express "0 is a keeper"). Same terminator unlocks
+      IS NULL / NOT NULL terminals in condition position and the
+      IS/IS NOT null-equality comparisons.
 - [ ] 2c. Constant hoisting as an IR transform (move constant-only
       instructions to the entry block) so IR islands stop depending on
       the constant-span machinery; then start deleting

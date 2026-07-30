@@ -246,7 +246,7 @@ pub(crate) fn compile_value_expr<'a>(
                     Some(Built {
                         compiler: lhs.compiler.then(rhs.compiler).map_with(
                             move |builder, (lhs, rhs)| {
-                                Ok(builder.compare(op, affinity, collation, lhs, rhs))
+                                Ok(builder.compare(op, Some(affinity), collation, lhs, rhs))
                             },
                         ),
                         effect: CollationEffect::Sets(None),
@@ -318,6 +318,124 @@ pub(crate) fn compile_value_expr<'a>(
                     Ok(builder.call(func_ctx, constant, values))
                 }),
                 effect,
+            })
+        }
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            // Both CASE forms compile to a chain of per-arm blocks
+            // joining in one block whose parameter carries the result —
+            // the block-parameter replacement for the eager path's
+            // shared target register (which forces its RegisterReuse
+            // constant-hoisting deopt; IR arms use fresh registers, so
+            // constant THEN values hoist safely).
+            let base = match base {
+                Some(base_expr) => {
+                    let Some(built) = compile_value_expr(base_expr.as_ref(), ctx)? else {
+                        return Ok(None);
+                    };
+                    Some(built)
+                }
+                None => None,
+            };
+            // Collation is compile-time state threaded through eager
+            // emission order (base, then when/then per pair, then else)
+            // with no resets: the running state at each base-form
+            // comparison is that comparison's collation payload.
+            let mut running = match &base {
+                Some(built) => built.effect,
+                None => CollationEffect::Untouched,
+            };
+            let mut pairs = Vec::with_capacity(when_then_pairs.len());
+            for (when_expr, then_expr) in when_then_pairs {
+                let Some(when) = compile_value_expr(when_expr.as_ref(), ctx)? else {
+                    return Ok(None);
+                };
+                if let CollationEffect::Sets(collation) = when.effect {
+                    running = CollationEffect::Sets(collation);
+                }
+                let payload = running.contribution().map(|(collation, _)| collation);
+                let Some(then) = compile_value_expr(then_expr.as_ref(), ctx)? else {
+                    return Ok(None);
+                };
+                if let CollationEffect::Sets(collation) = then.effect {
+                    running = CollationEffect::Sets(collation);
+                }
+                pairs.push((when.compiler, then.compiler, payload));
+            }
+            let else_compiler = match else_expr {
+                Some(else_expr) => {
+                    let Some(built) = compile_value_expr(else_expr.as_ref(), ctx)? else {
+                        return Ok(None);
+                    };
+                    if let CollationEffect::Sets(collation) = built.effect {
+                        running = CollationEffect::Sets(collation);
+                    }
+                    Some(built.compiler)
+                }
+                None => None,
+            };
+            let base_compiler = base.map(|built| built.compiler);
+            Some(Built {
+                compiler: Compiler::build_with(move |builder| {
+                    let base_value = match base_compiler {
+                        Some(compiler) => Some(compiler.run(builder)?),
+                        None => None,
+                    };
+                    // Precreate the arm blocks and the join last, so
+                    // emission order matches the eager layout: each WHEN
+                    // falls into its THEN, the final ELSE falls into the
+                    // join.
+                    let arm_blocks: Vec<(super::ir::BlockId, super::ir::BlockId)> = pairs
+                        .iter()
+                        .map(|_| (builder.create_block(), builder.create_block()))
+                        .collect();
+                    let join = builder.create_block();
+                    let result = builder.add_block_param(join);
+                    for ((when, then, payload), &(then_block, next_block)) in
+                        pairs.into_iter().zip(&arm_blocks)
+                    {
+                        let when_value = when.run(builder)?;
+                        match base_value {
+                            // Base form: `Ne base, when -> next` with
+                            // jump_if_null and no affinity conversion —
+                            // a NULL comparison is an untrue WHEN.
+                            Some(base_value) => builder.cmp_branch(
+                                CmpOp::Eq,
+                                None,
+                                payload,
+                                base_value,
+                                when_value,
+                                JumpTarget::new(then_block, Vec::new()),
+                                JumpTarget::new(next_block, Vec::new()),
+                                JumpTarget::new(next_block, Vec::new()),
+                            ),
+                            // Searched form: `IfNot when -> next`, NULL
+                            // untrue.
+                            None => builder.branch(
+                                when_value,
+                                JumpTarget::new(then_block, Vec::new()),
+                                JumpTarget::new(next_block, Vec::new()),
+                                JumpTarget::new(next_block, Vec::new()),
+                            ),
+                        }
+                        builder.switch_to(then_block);
+                        let then_value = then.run(builder)?;
+                        builder.jump(join, vec![then_value]);
+                        builder.switch_to(next_block);
+                    }
+                    // ELSE (or NULL) in the final fallthrough block.
+                    let else_value = match else_compiler {
+                        Some(compiler) => compiler.run(builder)?,
+                        None => builder.null(),
+                    };
+                    builder.jump(join, vec![else_value]);
+                    builder.switch_to(join);
+                    Ok(result)
+                }),
+                effect: running,
             })
         }
         ast::Expr::Column {
@@ -510,7 +628,7 @@ pub(crate) fn compile_condition_expr<'a>(
                     let (lhs, rhs) = operands.run(builder)?;
                     builder.cmp_branch(
                         op,
-                        affinity,
+                        Some(affinity),
                         collation,
                         lhs,
                         rhs,

@@ -912,7 +912,7 @@ mod tests {
             let rhs = builder.external(2);
             builder.cmp_branch(
                 CmpOp::Lt,
-                Affinity::Numeric,
+                Some(Affinity::Numeric),
                 None,
                 lhs,
                 rhs,
@@ -934,6 +934,56 @@ mod tests {
         let [Insn::Ge { lhs: 1, rhs: 2, .. }] = insns[..] else {
             panic!("expected a single negated comparison, got {insns:?}");
         };
+    }
+
+    #[test]
+    fn searched_case_joins_arms_through_a_block_parameter() {
+        // CASE WHEN 1 THEN 'a' ELSE 'b' END: constants intern in the
+        // entry, IfNot picks the arm, each arm copies its result into
+        // the join parameter (bound to dest), the else arm falls into
+        // the join.
+        let insns = pipeline("CASE WHEN 1 THEN 'a' ELSE 'b' END").unwrap();
+        let [Insn::Integer { value: 1, .. }, Insn::String8 { dest: a, .. }, Insn::String8 { dest: b, .. }, Insn::IfNot {
+            jump_if_null: true, ..
+        }, Insn::Copy {
+            src_reg: then_src,
+            dst_reg: then_dst,
+            ..
+        }, Insn::Goto { .. }, Insn::Copy {
+            src_reg: else_src,
+            dst_reg: else_dst,
+            ..
+        }] = insns[..]
+        else {
+            panic!("unexpected searched CASE shape: {insns:?}");
+        };
+        assert_eq!(then_src, a);
+        assert_eq!(else_src, b);
+        assert_eq!(then_dst, else_dst);
+    }
+
+    #[test]
+    fn base_case_compares_with_ne_and_no_boolean() {
+        // CASE 2 WHEN 1 THEN 10 ELSE 30 END: the eager shape — one Ne
+        // jump per WHEN (NULL untrue via jump_if_null), no materialized
+        // comparison result.
+        let insns = pipeline("CASE 2 WHEN 1 THEN 10 ELSE 30 END").unwrap();
+        assert!(
+            insns.iter().any(|insn| matches!(insn, Insn::Ne { .. })),
+            "{insns:?}"
+        );
+        assert!(
+            !insns
+                .iter()
+                .any(|insn| matches!(insn, Insn::ZeroOrNull { .. } | Insn::Eq { .. })),
+            "base CASE must branch on Ne, not materialize equality: {insns:?}"
+        );
+        // Missing ELSE means ELSE NULL.
+        let insns = pipeline("CASE WHEN 0 THEN 1 END").unwrap();
+        assert!(
+            insns.iter().any(|insn| matches!(insn, Insn::Null { .. })),
+            "{insns:?}"
+        );
     }
 
     #[test]

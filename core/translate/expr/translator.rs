@@ -89,6 +89,44 @@ pub fn resolve_expr(
     translate_expr(program, referenced_tables, expr, dest_reg, resolver)
 }
 
+/// Try the composable compiler pipeline for `expr` in value position:
+/// describe → build verified IR → emit, leaving the result in
+/// `target_register` and restoring the collation post-state the eager
+/// path would have left. Returns false (emitting nothing) when the
+/// expression is not yet representable or the context forbids
+/// decomposition (expression→register cache, expression indexes), in
+/// which case the caller stays on the eager path.
+fn try_compiler_value_expr(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+    has_expression_indexes: bool,
+) -> Result<bool> {
+    if has_expression_indexes || resolver.expr_to_reg_cache_enabled {
+        return Ok(false);
+    }
+    let build_ctx = crate::translate::compiler::BuildCtx {
+        referenced_tables,
+        resolver: Some(resolver),
+    };
+    let Some(built) = crate::translate::compiler::compile_value_expr(expr, &build_ctx)? else {
+        return Ok(false);
+    };
+    let mut emit_leaf = |program: &mut ProgramBuilder, leaf: &ast::Expr, dest: usize| {
+        translate_expr(program, referenced_tables, leaf, dest, resolver).map(|_| ())
+    };
+    crate::translate::compiler::emit_value(
+        program,
+        built.compiler,
+        target_register,
+        Some(&mut emit_leaf),
+    )?;
+    built.effect.apply(program);
+    Ok(true)
+}
+
 /// Translate an expression into bytecode.
 #[turso_macros::trace_stack]
 pub fn translate_expr(
@@ -435,46 +473,20 @@ pub fn translate_expr(
                 return Ok(target_register);
             }
 
-            // Composable compiler path: expressions the new pipeline can
-            // fully represent (arithmetic/bitwise/concat over literals
-            // and column/rowid reads) are described as compiler values,
-            // built into verified IR, and emitted in one pass. Anything
-            // else falls back to eager emission below.
-            //
-            // Gated off when the expression→register cache or expression
-            // indexes are active: the frontend decomposes trees without
-            // consulting either, and re-reading columns in those contexts
-            // is incorrect (cursors may not be positioned on the source
-            // row, or the table cursor may not be open at all).
-            if !has_expression_indexes && !resolver.expr_to_reg_cache_enabled {
-                let build_ctx = crate::translate::compiler::BuildCtx {
-                    referenced_tables,
-                    resolver: Some(resolver),
-                };
-                if let Some(built) =
-                    crate::translate::compiler::compile_value_expr(expr, &build_ctx)?
-                {
-                    let mut emit_leaf = |program: &mut ProgramBuilder,
-                                         leaf: &ast::Expr,
-                                         dest: usize| {
-                        translate_expr(program, referenced_tables, leaf, dest, resolver).map(|_| ())
-                    };
-                    crate::translate::compiler::emit_value(
-                        program,
-                        built.compiler,
-                        target_register,
-                        Some(&mut emit_leaf),
-                    )?;
-                    // Restore the collation post-state the eager path
-                    // would have left behind (computed statically by the
-                    // frontend, including the equivalent-operand shape
-                    // that leaves the ambient state untouched).
-                    built.effect.apply(program);
-                    if let Some(span) = constant_span {
-                        program.constant_span_end(span);
-                    }
-                    return Ok(target_register);
+            // Composable compiler path; falls back to eager emission
+            // below for anything the pipeline cannot represent yet.
+            if try_compiler_value_expr(
+                program,
+                referenced_tables,
+                expr,
+                target_register,
+                resolver,
+                has_expression_indexes,
+            )? {
+                if let Some(span) = constant_span {
+                    program.constant_span_end(span);
                 }
+                return Ok(target_register);
             }
 
             binary_expr_shared(
@@ -494,6 +506,22 @@ pub fn translate_expr(
             when_then_pairs,
             else_expr,
         } => {
+            // Composable compiler path; falls back to eager emission
+            // below for anything the pipeline cannot represent yet.
+            if try_compiler_value_expr(
+                program,
+                referenced_tables,
+                expr,
+                target_register,
+                resolver,
+                has_expression_indexes,
+            )? {
+                if let Some(span) = constant_span {
+                    program.constant_span_end(span);
+                }
+                return Ok(target_register);
+            }
+
             // There's two forms of CASE, one which checks a base expression for equality
             // against the WHEN values, and returns the corresponding THEN value if it matches:
             //   CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'many' END

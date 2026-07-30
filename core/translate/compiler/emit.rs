@@ -362,7 +362,10 @@ impl<'a> Emitter<'a> {
                     let rhs = self.reg_of(*rhs);
                     let dest = self.reg_of(value);
                     let data = self.func.cmp_data(*cmp);
-                    let flags = CmpInsFlags::default().with_affinity(data.affinity);
+                    let flags = match data.affinity {
+                        Some(affinity) => CmpInsFlags::default().with_affinity(affinity),
+                        None => CmpInsFlags::default(),
+                    };
                     let collation = data.collation;
                     let if_true_label = self.program.allocate_label();
                     let jump = match data.op {
@@ -552,7 +555,10 @@ impl<'a> Emitter<'a> {
                 let lhs = self.reg_of(*lhs);
                 let rhs = self.reg_of(*rhs);
                 let data = self.func.cmp_data(*cmp);
-                let base_flags = CmpInsFlags::default().with_affinity(data.affinity);
+                let base_flags = match data.affinity {
+                    Some(affinity) => CmpInsFlags::default().with_affinity(affinity),
+                    None => CmpInsFlags::default(),
+                };
                 let collation = data.collation;
                 let mut trampolines: Vec<(BranchOffset, JumpTarget)> = Vec::new();
                 // Pick the jump direction so the other side falls

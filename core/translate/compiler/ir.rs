@@ -154,11 +154,13 @@ impl CmpId {
 
 /// Payload of an [`Inst::Compare`]: affinity and collation are part of
 /// the operation, captured at description time — never read from ambient
-/// state during emission.
+/// state during emission. `affinity: None` emits default comparison
+/// flags with no affinity conversion at all (the eager CASE-base shape),
+/// which is not the same as `Some(Affinity::Blob)`.
 #[derive(Debug, Clone)]
 pub struct CmpData {
     pub op: CmpOp,
-    pub affinity: Affinity,
+    pub affinity: Option<Affinity>,
     pub collation: Option<CollationSeq>,
 }
 
@@ -523,7 +525,7 @@ impl FuncBuilder {
     pub fn compare(
         &mut self,
         op: CmpOp,
-        affinity: Affinity,
+        affinity: Option<Affinity>,
         collation: Option<CollationSeq>,
         lhs: ValueId,
         rhs: ValueId,
@@ -562,7 +564,7 @@ impl FuncBuilder {
     pub fn cmp_branch(
         &mut self,
         op: CmpOp,
-        affinity: Affinity,
+        affinity: Option<Affinity>,
         collation: Option<CollationSeq>,
         lhs: ValueId,
         rhs: ValueId,
