@@ -7022,17 +7022,19 @@ fn op_window_value(
             payload[0].clone()
         }
         WindowFunc::LastValue => {
-            // last_value's slot is overwritten by the next AggStep anyway,
-            // so we can take ownership here and save a clone per peer-group
-            // flush (notable for Text / Blob args).
-            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            // xValue must not consume the accumulator: under a frame whose
+            // end trails the partition end, the same accumulated value is
+            // read once per emitted row, and a sliding frame reads it
+            // between AggStep calls. Mirrors SQLite's last_valueValueFunc
+            // (window.c:524-529), which copies without clearing.
+            let Register::Aggregate(AggContext::Builtin(payload)) = &state.registers[acc_reg]
             else {
                 return Err(LimboError::InternalError(format!(
                     "last_value accumulator in unexpected register state: {:?}",
                     state.registers[acc_reg]
                 )));
             };
-            std::mem::replace(&mut payload[0], Value::Null)
+            payload[0].clone()
         }
         // percent_rank() — mirrors SQLite's percent_rankValueFunc
         // (window.c:352). The value is (rows in earlier peer groups) /
