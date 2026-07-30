@@ -45,8 +45,18 @@ After simplifying control flow, a backwards liveness pass removes recursively
 unused pure value instructions. Constants, symbolic inputs, parameters,
 arithmetic, and logical operations are removable; integer coercions and column
 reads remain ordered roots because they can expose datatype, storage, or
-corruption behavior. Effect instructions and terminator operands are always
-live.
+corruption behavior. Effect instructions and terminator control operands are
+always live. Edge arguments instead become live through the destination block
+parameters that consume them.
+
+Block-parameter liveness therefore follows every incoming edge. When a join
+position is unused, optimization removes that parameter and the corresponding
+argument from every predecessor before recursively removing newly dead value
+producers. Cursor rewind and advance terminators share one argument vector
+between their row and exit targets, so the optimizer couples matching positions
+in those target signatures: a position survives on both targets if either one
+uses it. Removing dead join state before lowering avoids allocating its
+registers and emitting its edge copies while preserving valid SSA arity.
 
 Optimization runs before registers, cursors, labels, or instruction offsets are
 assigned. Surviving value and resource identifiers remain stable arena indices,

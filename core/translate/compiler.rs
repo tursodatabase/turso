@@ -939,6 +939,15 @@ impl Terminator {
         first.into_iter().chain(second).chain(rest.iter().copied())
     }
 
+    fn control_operands(&self) -> impl Iterator<Item = ValueId> {
+        let operands = match self {
+            Self::Branch { condition, .. } | Self::Return(condition) => [Some(*condition), None],
+            Self::Compare { lhs, rhs, .. } => [Some(*lhs), Some(*rhs)],
+            Self::Jump { .. } | Self::CursorRewind { .. } | Self::CursorNext { .. } => [None, None],
+        };
+        operands.into_iter().flatten()
+    }
+
     fn cursor(&self) -> Option<CursorId> {
         match self {
             Self::CursorRewind { cursor, .. } | Self::CursorNext { cursor, .. } => Some(*cursor),
@@ -994,6 +1003,57 @@ impl Terminator {
                 remap_target(if_done)
             }
             Self::Return(_) => Ok(()),
+        }
+    }
+
+    fn prune_block_arguments(&mut self, parameter_live: &[Vec<bool>]) -> bool {
+        fn retain_live_arguments(arguments: &mut SmallVec<[ValueId; 2]>, live: &[bool]) -> bool {
+            assert_eq!(
+                arguments.len(),
+                live.len(),
+                "verified compiler IR edge must match its target parameters"
+            );
+            let previous_len = arguments.len();
+            let mut index = 0;
+            arguments.retain(|_| {
+                let retain = live[index];
+                index += 1;
+                retain
+            });
+            arguments.len() != previous_len
+        }
+
+        match self {
+            Self::Jump { target, arguments } => {
+                retain_live_arguments(arguments, &parameter_live[target.index()])
+            }
+            Self::CursorRewind {
+                if_non_empty,
+                if_empty,
+                arguments,
+                ..
+            } => {
+                assert_eq!(
+                    parameter_live[if_non_empty.index()],
+                    parameter_live[if_empty.index()],
+                    "shared cursor edge targets must retain the same parameter positions"
+                );
+                retain_live_arguments(arguments, &parameter_live[if_non_empty.index()])
+            }
+            Self::CursorNext {
+                if_next,
+                if_done,
+                arguments,
+                ..
+            } => {
+                assert_eq!(
+                    parameter_live[if_next.index()],
+                    parameter_live[if_done.index()],
+                    "shared cursor edge targets must retain the same parameter positions"
+                );
+                retain_live_arguments(arguments, &parameter_live[if_next.index()])
+            }
+            Self::Branch { .. } | Self::Compare { .. } | Self::Return(_) => false,
         }
     }
 }
@@ -1573,13 +1633,14 @@ impl IrProgram {
         Ok(())
     }
 
-    /// Remove unused value instructions that cannot affect SQL-visible behavior.
+    /// Remove unused value instructions and SSA join positions that cannot
+    /// affect SQL-visible behavior.
     fn eliminate_dead_values(&mut self) -> bool {
         let mut dependencies = vec![SmallVec::<[ValueId; 2]>::new(); self.value_count as usize];
         let mut roots = Vec::new();
 
         for block in &self.blocks {
-            roots.extend(block.terminator.operands());
+            roots.extend(block.terminator.control_operands());
             for instruction in &block.instructions {
                 match instruction {
                     Instruction::Value { result, op } => {
@@ -1589,6 +1650,35 @@ impl IrProgram {
                         }
                     }
                     Instruction::Effect(_) => roots.extend(instruction.operands()),
+                }
+            }
+            for (target, arguments) in block.terminator.edges() {
+                for (parameter, argument) in
+                    self.blocks[target.index()].parameters.iter().zip(arguments)
+                {
+                    dependencies[parameter.index()].push(*argument);
+                }
+            }
+
+            let shared_targets = match &block.terminator {
+                Terminator::CursorRewind {
+                    if_non_empty,
+                    if_empty,
+                    ..
+                } => Some((*if_non_empty, *if_empty)),
+                Terminator::CursorNext {
+                    if_next, if_done, ..
+                } => Some((*if_next, *if_done)),
+                _ => None,
+            };
+            if let Some((first, second)) = shared_targets {
+                for (first, second) in self.blocks[first.index()]
+                    .parameters
+                    .iter()
+                    .zip(&self.blocks[second.index()].parameters)
+                {
+                    dependencies[first.index()].push(*second);
+                    dependencies[second.index()].push(*first);
                 }
             }
         }
@@ -1610,8 +1700,27 @@ impl IrProgram {
             }
         }
 
+        let parameter_live = self
+            .blocks
+            .iter()
+            .map(|block| {
+                block
+                    .parameters
+                    .iter()
+                    .map(|parameter| live[parameter.index()])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
         let mut changed = false;
         for block in &mut self.blocks {
+            changed |= block.terminator.prune_block_arguments(&parameter_live);
+        }
+        for block in &mut self.blocks {
+            let previous_parameter_len = block.parameters.len();
+            block.parameters.retain(|parameter| live[parameter.index()]);
+            changed |= block.parameters.len() != previous_parameter_len;
+
             let previous_len = block.instructions.len();
             block.instructions.retain(|instruction| match instruction {
                 Instruction::Value { result, .. } => live[result.index()],
@@ -3640,6 +3749,144 @@ mod tests {
                 "block0:\n",
                 "  %3 = constant Numeric(Integer(7))\n",
                 "  return %3\n",
+            )
+        );
+    }
+
+    #[test]
+    fn optimizer_removes_unused_join_parameters_and_edge_arguments() {
+        let true_values = constant(Value::from_i64(10))
+            .then(constant(Value::from_i64(20)))
+            .map(|(first, second)| LoopState {
+                values: smallvec![first, second],
+            });
+        let false_values = constant(Value::from_i64(30))
+            .then(constant(Value::from_i64(40)))
+            .map(|(first, second)| LoopState {
+                values: smallvec![first, second],
+            });
+        let compiler = parameter(Variable::indexed(1.try_into().unwrap()))
+            .branch(true_values, false_values)
+            .map(|state| state.values[0]);
+
+        let ir = compile_scalar(compiler).unwrap().optimize().unwrap();
+
+        assert_eq!(
+            ir.to_string(),
+            concat!(
+                "block0:\n",
+                "  %0 = parameter ?1\n",
+                "  branch %0, block1, block2\n",
+                "\n",
+                "block1:\n",
+                "  %1 = constant Numeric(Integer(10))\n",
+                "  jump block3(%1)\n",
+                "\n",
+                "block2:\n",
+                "  %5 = constant Numeric(Integer(30))\n",
+                "  jump block3(%5)\n",
+                "\n",
+                "block3(%3):\n",
+                "  return %3\n",
+            )
+        );
+    }
+
+    #[test]
+    fn dead_join_positions_do_not_emit_edge_copies() {
+        let true_values = constant(Value::from_i64(10))
+            .then(constant(Value::from_i64(20)))
+            .map(|(first, second)| LoopState {
+                values: smallvec![first, second],
+            });
+        let false_values = constant(Value::from_i64(30))
+            .then(constant(Value::from_i64(40)))
+            .map(|(first, second)| LoopState {
+                values: smallvec![first, second],
+            });
+        let compiler = parameter(Variable::indexed(1.try_into().unwrap()))
+            .branch(true_values, false_values)
+            .map(|state| state.values[0]);
+        let ir = compile_scalar(compiler).unwrap();
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 16, 4));
+        let target = program.alloc_register();
+
+        ir.lower_into(&mut program, target).unwrap();
+
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::Copy { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn optimizer_prunes_shared_cursor_edge_state_by_position() {
+        let mut builder = IrBuilder::new();
+        let cursor = builder.external_cursor(CursorInputId::new(0)).unwrap();
+        let first = builder
+            .push(ScalarOp::Constant(Value::from_i64(10)))
+            .unwrap();
+        let second = builder
+            .push(ScalarOp::Constant(Value::from_i64(20)))
+            .unwrap();
+        let third = builder
+            .push(ScalarOp::Constant(Value::from_i64(30)))
+            .unwrap();
+        let row = builder.create_block().unwrap();
+        let exit = builder.create_block().unwrap();
+        let row_first = builder.add_block_parameter(row).unwrap();
+        let row_second = builder.add_block_parameter(row).unwrap();
+        let row_third = builder.add_block_parameter(row).unwrap();
+        builder.add_block_parameter(exit).unwrap();
+        let exit_second = builder.add_block_parameter(exit).unwrap();
+        builder.add_block_parameter(exit).unwrap();
+        builder
+            .terminate(Terminator::CursorRewind {
+                cursor,
+                if_non_empty: row,
+                if_empty: exit,
+                arguments: smallvec![first, second, third],
+            })
+            .unwrap();
+        builder.switch_to(row).unwrap();
+        builder
+            .push_effect(EffectOp::ResultRow {
+                pack: ValuePack(smallvec![row_first]),
+            })
+            .unwrap();
+        builder
+            .terminate(Terminator::CursorNext {
+                cursor,
+                if_next: row,
+                if_done: exit,
+                arguments: smallvec![row_first, row_second, row_third],
+            })
+            .unwrap();
+        builder.switch_to(exit).unwrap();
+
+        let ir = builder.finish(exit_second).unwrap().optimize().unwrap();
+
+        assert_eq!(
+            ir.to_string(),
+            concat!(
+                "cursor $0 = input &0\n",
+                "\n",
+                "block0:\n",
+                "  %0 = constant Numeric(Integer(10))\n",
+                "  %1 = constant Numeric(Integer(20))\n",
+                "  rewind $0, block1(%0, %1), block2(%0, %1)\n",
+                "\n",
+                "block1(%3, %4):\n",
+                "  result_row [%3]\n",
+                "  next $0, block1(%3, %4), block2(%3, %4)\n",
+                "\n",
+                "block2(%6, %7):\n",
+                "  return %7\n",
             )
         );
     }
