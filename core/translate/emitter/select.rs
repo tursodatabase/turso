@@ -7,9 +7,9 @@ use crate::{
         aggregation::emit_ungrouped_aggregation,
         collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         compiler::{
-            compile_effect, cursor_values, insert_index_pack, literal_values, pack_values,
-            result_row_pack, scan_index, scan_table, seek_in_values, seek_index, seek_rowid,
-            seek_table_range, select_pack, BoxedCompile, Compile, CursorInputId,
+            compile_effect, cursor_input, cursor_values, insert_index_pack, literal_values,
+            pack_values, result_row_pack, scan_index, scan_table, seek_in_values, seek_index,
+            seek_rowid, seek_table_range, select_pack, BoxedCompile, Compile, CursorInputId,
             DeferredIndexBound, DeferredIndexRange, DeferredTableBound, DeferredTableRange,
             IrProgram, Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId, ValuePack,
         },
@@ -177,7 +177,9 @@ impl DeclarativePackSink {
                 input,
                 index_name,
                 affinity,
-            } => insert_index_pack(input, pack, index_name, affinity).boxed(),
+            } => cursor_input(input)
+                .and_then(move |cursor| insert_index_pack(cursor, pack, index_name, affinity))
+                .boxed(),
         }
     }
 }

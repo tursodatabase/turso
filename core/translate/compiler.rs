@@ -1131,6 +1131,10 @@ enum EffectOp {
         db: usize,
         schema_cookie: u32,
     },
+    #[cfg_attr(not(test), allow(dead_code))]
+    OpenEphemeralIndex {
+        cursor: CursorId,
+    },
     DeferredSeek {
         index: CursorId,
         table: CursorId,
@@ -1237,6 +1241,7 @@ impl Instruction {
             Self::Value { op, .. } => (Some(op.operands()), &[][..]),
             Self::Effect(
                 EffectOp::OpenRead { .. }
+                | EffectOp::OpenEphemeralIndex { .. }
                 | EffectOp::DeferredSeek { .. }
                 | EffectOp::OpenSorter { .. }
                 | EffectOp::SorterData { .. }
@@ -1258,6 +1263,7 @@ impl Instruction {
             Self::Effect(EffectOp::IndexInsert { cursor, .. }) => smallvec![*cursor],
             Self::Effect(
                 EffectOp::OpenRead { .. }
+                | EffectOp::OpenEphemeralIndex { .. }
                 | EffectOp::ResultRow { .. }
                 | EffectOp::OpenSorter { .. }
                 | EffectOp::SorterInsert { .. }
@@ -1270,7 +1276,9 @@ impl Instruction {
 
     fn cursor_definition(&self) -> Option<CursorId> {
         match self {
-            Self::Effect(EffectOp::OpenRead { cursor, .. }) => Some(*cursor),
+            Self::Effect(
+                EffectOp::OpenRead { cursor, .. } | EffectOp::OpenEphemeralIndex { cursor },
+            ) => Some(*cursor),
             Self::Value { .. }
             | Self::Effect(
                 EffectOp::DeferredSeek { .. }
@@ -1292,6 +1300,7 @@ impl Instruction {
             ) => Some(*sorter),
             Self::Effect(
                 EffectOp::OpenRead { .. }
+                | EffectOp::OpenEphemeralIndex { .. }
                 | EffectOp::DeferredSeek { .. }
                 | EffectOp::ResultRow { .. }
                 | EffectOp::IndexInsert { .. }
@@ -1307,6 +1316,7 @@ impl Instruction {
             Self::Value { .. }
             | Self::Effect(
                 EffectOp::OpenRead { .. }
+                | EffectOp::OpenEphemeralIndex { .. }
                 | EffectOp::DeferredSeek { .. }
                 | EffectOp::ResultRow { .. }
                 | EffectOp::IndexInsert { .. }
@@ -1323,6 +1333,7 @@ impl Instruction {
             Self::Value { .. }
             | Self::Effect(
                 EffectOp::OpenRead { .. }
+                | EffectOp::OpenEphemeralIndex { .. }
                 | EffectOp::DeferredSeek { .. }
                 | EffectOp::ResultRow { .. }
                 | EffectOp::IndexInsert { .. }
@@ -2092,7 +2103,9 @@ impl IrBuilder {
 
     fn push_effect(&mut self, op: EffectOp) -> Result<()> {
         let cursors: SmallVec<[CursorId; 2]> = match &op {
-            EffectOp::OpenRead { cursor, .. } => smallvec![*cursor],
+            EffectOp::OpenRead { cursor, .. } | EffectOp::OpenEphemeralIndex { cursor } => {
+                smallvec![*cursor]
+            }
             EffectOp::DeferredSeek { index, table } => smallvec![*index, *table],
             EffectOp::IndexInsert { cursor, .. } => smallvec![*cursor],
             EffectOp::ResultRow { .. }
@@ -2109,6 +2122,7 @@ impl IrBuilder {
             | EffectOp::SorterInsert { sorter, .. }
             | EffectOp::SorterData { sorter } => Some(*sorter),
             EffectOp::OpenRead { .. }
+            | EffectOp::OpenEphemeralIndex { .. }
             | EffectOp::DeferredSeek { .. }
             | EffectOp::ResultRow { .. }
             | EffectOp::IndexInsert { .. }
@@ -2623,6 +2637,7 @@ impl IrProgram {
                     Instruction::Value { .. }
                     | Instruction::Effect(
                         EffectOp::OpenRead { .. }
+                        | EffectOp::OpenEphemeralIndex { .. }
                         | EffectOp::DeferredSeek { .. }
                         | EffectOp::ResultRow { .. }
                         | EffectOp::IndexInsert { .. }
@@ -3869,6 +3884,12 @@ impl IrProgram {
                             db: *db,
                         });
                     }
+                    Instruction::Effect(EffectOp::OpenEphemeralIndex { cursor }) => {
+                        program.emit_insn(Insn::OpenEphemeral {
+                            cursor_id: Self::cursor_for(&physical_cursors, *cursor),
+                            is_table: false,
+                        });
+                    }
                     Instruction::Effect(EffectOp::DeferredSeek { index, table }) => {
                         program.emit_insn(Insn::DeferredSeek {
                             index_cursor_id: Self::cursor_for(&physical_cursors, *index),
@@ -4638,6 +4659,9 @@ impl fmt::Display for IrProgram {
                         "  open_read ${} root {root_page} db {db} schema {schema_cookie}",
                         cursor.0
                     )?,
+                    Instruction::Effect(EffectOp::OpenEphemeralIndex { cursor }) => {
+                        writeln!(f, "  open_ephemeral_index ${}", cursor.0)?;
+                    }
                     Instruction::Effect(EffectOp::DeferredSeek { index, table }) => {
                         writeln!(f, "  deferred_seek ${} -> ${}", index.0, table.0)?;
                     }
@@ -4931,6 +4955,11 @@ pub(crate) struct OpenReadCursor {
     schema_cookie: u32,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct OpenEphemeralIndex {
+    index: Arc<Index>,
+}
+
 /// The base symbolic stream of rows backed by an opened cursor.
 #[derive(Clone)]
 pub(crate) struct CursorRows {
@@ -4946,6 +4975,16 @@ enum CursorRowSource {
     Rowid(ValueId),
     TableRange(TableRangeSource),
     IndexRange(IndexRangeSource),
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const fn scan_cursor(cursor: CursorId, direction: ScanDirection) -> CursorRows {
+    CursorRows {
+        cursor,
+        row_cursor: cursor,
+        deferred_seek: None,
+        source: CursorRowSource::Scan(direction),
+    }
 }
 
 impl CursorRowSource {
@@ -6621,6 +6660,11 @@ pub(crate) fn open_read_table(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn open_ephemeral_index(index: Arc<Index>) -> OpenEphemeralIndex {
+    OpenEphemeralIndex { index }
+}
+
 fn open_read_index(index: Arc<Index>, db: usize, schema_cookie: u32) -> OpenReadCursor {
     let root_page = index.root_page;
     OpenReadCursor {
@@ -6642,6 +6686,17 @@ impl Compile for OpenReadCursor {
             db: self.db,
             schema_cookie: self.schema_cookie,
         })?;
+        Ok(cursor)
+    }
+}
+
+impl Compile for OpenEphemeralIndex {
+    type Output = CursorId;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let cursor =
+            builder.allocate_cursor(CursorResource::Owned(CursorType::BTreeIndex(self.index)))?;
+        builder.push_effect(EffectOp::OpenEphemeralIndex { cursor })?;
         Ok(cursor)
     }
 }
@@ -6786,7 +6841,7 @@ pub(crate) struct ResultRow {
 }
 
 pub(crate) struct InsertIndex {
-    input: CursorInputId,
+    cursor: CursorId,
     pack: ValuePack,
     index_name: String,
     affinity: Option<String>,
@@ -6816,13 +6871,13 @@ pub(crate) fn result_row_pack(pack: ValuePack) -> ResultRow {
 }
 
 pub(crate) fn insert_index_pack(
-    input: CursorInputId,
+    cursor: CursorId,
     pack: ValuePack,
     index_name: String,
     affinity: Option<String>,
 ) -> InsertIndex {
     InsertIndex {
-        input,
+        cursor,
         pack,
         index_name,
         affinity,
@@ -6899,9 +6954,8 @@ impl Compile for InsertIndex {
                 "compiler IR index insert must contain at least one value".to_owned(),
             ));
         }
-        let cursor = builder.external_cursor(self.input)?;
         builder.push_effect(EffectOp::IndexInsert {
-            cursor,
+            cursor: self.cursor,
             pack: self.pack,
             index_name: self.index_name,
             affinity: self.affinity,
@@ -7463,14 +7517,10 @@ mod tests {
 
     #[test]
     fn index_insert_binds_an_external_cursor_without_opening_it() {
-        let compiler =
-            pack_values(smallvec![constant(Value::from_i64(7)).boxed()]).and_then(|pack| {
-                insert_index_pack(
-                    CursorInputId::new(0),
-                    pack,
-                    "in_keys".to_owned(),
-                    Some("D".to_owned()),
-                )
+        let compiler = cursor_input(CursorInputId::new(0))
+            .then(pack_values(smallvec![constant(Value::from_i64(7)).boxed()]))
+            .and_then(|(cursor, pack)| {
+                insert_index_pack(cursor, pack, "in_keys".to_owned(), Some("D".to_owned()))
             });
         let ir = compile_effect(compiler).unwrap();
         let rendered = ir.to_string();
@@ -8981,6 +9031,78 @@ mod tests {
             .position(|(insn, _)| matches!(insn, Insn::Rewind { cursor_id: 0, .. }))
             .unwrap();
         assert!(open < rewind);
+    }
+
+    #[test]
+    fn owned_ephemeral_index_can_be_written_then_scanned_in_one_region() {
+        let index = Arc::new(Index {
+            name: "owned_ephemeral".to_owned(),
+            table_name: String::new(),
+            root_page: 0,
+            columns: vec![IndexColumn::new("key", 0)],
+            unique: false,
+            ephemeral: true,
+            has_rowid: false,
+            where_clause: None,
+            index_method: None,
+            on_conflict: None,
+        });
+        let compiler = open_ephemeral_index(index).and_then(|cursor| {
+            pack_values(smallvec![constant(Value::from_i64(7)).boxed()])
+                .and_then(move |pack| {
+                    insert_index_pack(
+                        cursor,
+                        pack,
+                        "owned_ephemeral".to_owned(),
+                        Some("D".to_owned()),
+                    )
+                })
+                .and_then(move |()| {
+                    scan_cursor(cursor, ScanDirection::Forward).for_each(|row| {
+                        pack_values(smallvec![row.column(0).boxed()]).and_then(result_row_pack)
+                    })
+                })
+        });
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+
+        assert!(rendered.contains("cursor $0 = btree_index \"owned_ephemeral\" root 0"));
+        assert!(rendered.contains("open_ephemeral_index $0"));
+        assert!(rendered.contains("index_insert $0 [%0]"));
+        assert!(rendered.contains("cursor_start Forward $0"));
+
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 2, 0));
+        let target = program.alloc_register();
+        let lowered = ir.lower_into(&mut program, target).unwrap();
+        assert_eq!(lowered.single_result_row_pack().unwrap().1, 1);
+        program.resolve_labels().unwrap();
+
+        assert_eq!(program.cursor_ref.len(), 1);
+        assert!(matches!(
+            &program.cursor_ref[0].1,
+            CursorType::BTreeIndex(index) if index.ephemeral
+        ));
+        let open = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| {
+                matches!(instruction, Insn::OpenEphemeral { cursor_id: 0, .. })
+            })
+            .unwrap();
+        let insert = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| {
+                matches!(instruction, Insn::IdxInsert { cursor_id: 0, .. })
+            })
+            .unwrap();
+        let rewind = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::Rewind { cursor_id: 0, .. }))
+            .unwrap();
+        assert!(open < insert && insert < rewind);
     }
 
     #[test]
