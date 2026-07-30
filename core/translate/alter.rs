@@ -1903,14 +1903,14 @@ pub fn translate_alter_table(
                 }
             }
 
-            let rewritten_table = if rewrites_physical_layout {
-                let mut table = btree.clone();
-                table.columns_mut()[column_index] =
-                    replacement_column.expect("replacement_column must exist for ALTER COLUMN");
-                table.prepare_generated_columns()?;
-                Some(table)
-            } else {
-                None
+            let altered_table = match replacement_column {
+                Some(replacement_column) => {
+                    let mut table = btree.clone();
+                    table.columns_mut()[column_index] = replacement_column;
+                    table.prepare_generated_columns()?;
+                    Some(table)
+                }
+                None => None,
             };
 
             // If renaming, rewrite trigger SQL for all triggers that reference this column
@@ -2201,54 +2201,56 @@ pub fn translate_alter_table(
                 });
             }
 
-            if let Some(rewritten_table) = rewritten_table {
+            if let Some(altered_table) = altered_table {
                 emit_add_virtual_column_validation(
                     program,
-                    &rewritten_table,
-                    &rewritten_table.columns()[column_index],
+                    &altered_table,
+                    &altered_table.columns()[column_index],
                     &definition.constraints,
                     resolver,
                     connection,
                     database_id,
                 )?;
 
-                let original_columns = original_btree.columns();
-                let source_column_by_schema_idx: Vec<Option<usize>> = rewritten_table
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, column)| {
-                        if column.is_virtual_generated() {
-                            // Virtual columns don't occupy a slot in the rewritten record.
-                            None
-                        } else if original_columns
-                            .get(idx)
-                            .is_some_and(|c| c.is_virtual_generated())
-                        {
-                            // Newly-stored slot (the original column was virtual): no
-                            // source value exists on the old row image — leave NULL.
-                            None
-                        } else {
-                            // The cursor is opened on the original btree, so the logical
-                            // index passed here is mapped to the original physical slot
-                            // by `emit_column_or_rowid` via the original's logical-to-
-                            // physical map. Schema order is preserved by ALTER COLUMN,
-                            // so the rewritten schema_idx also identifies the same
-                            // logical column in the original.
-                            Some(idx)
-                        }
-                    })
-                    .collect();
-                let layout = rewritten_table.column_layout()?;
-                emit_rewrite_table_rows(
-                    program,
-                    original_btree.clone(),
-                    &rewritten_table,
-                    &source_column_by_schema_idx,
-                    &layout,
-                    connection,
-                    database_id,
-                );
+                if rewrites_physical_layout {
+                    let original_columns = original_btree.columns();
+                    let source_column_by_schema_idx: Vec<Option<usize>> = altered_table
+                        .columns()
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, column)| {
+                            if column.is_virtual_generated() {
+                                // Virtual columns don't occupy a slot in the rewritten record.
+                                None
+                            } else if original_columns
+                                .get(idx)
+                                .is_some_and(|c| c.is_virtual_generated())
+                            {
+                                // Newly-stored slot (the original column was virtual): no
+                                // source value exists on the old row image — leave NULL.
+                                None
+                            } else {
+                                // The cursor is opened on the original btree, so the logical
+                                // index passed here is mapped to the original physical slot
+                                // by `emit_column_or_rowid` via the original's logical-to-
+                                // physical map. Schema order is preserved by ALTER COLUMN,
+                                // so the rewritten schema_idx also identifies the same
+                                // logical column in the original.
+                                Some(idx)
+                            }
+                        })
+                        .collect();
+                    let layout = altered_table.column_layout()?;
+                    emit_rewrite_table_rows(
+                        program,
+                        original_btree.clone(),
+                        &altered_table,
+                        &source_column_by_schema_idx,
+                        &layout,
+                        connection,
+                        database_id,
+                    );
+                }
             }
 
             if clears_autoincrement_sequence {

@@ -754,3 +754,75 @@ test fail-alter-column-collides-with-other-column {
 }
 expect error {
 }
+
+# Adding NOT NULL must check existing rows and fail if any are NULL,
+# even when the type does not change and no row rewrite runs.
+test fail-alter-column-add-notnull-with-existing-nulls {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    INSERT INTO t (a) VALUES (1);
+    ALTER TABLE t ALTER COLUMN b TO b TEXT NOT NULL;
+}
+expect error {
+}
+
+# Same, through the row-rewrite path (affinity also changes).
+test fail-alter-column-add-notnull-with-existing-nulls-rewrite {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    INSERT INTO t (a) VALUES (1);
+    ALTER TABLE t ALTER COLUMN b TO b INTEGER NOT NULL;
+}
+expect error {
+}
+
+test alter-column-add-notnull-without-nulls {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    INSERT INTO t VALUES (1, 'x');
+    ALTER TABLE t ALTER COLUMN b TO b TEXT NOT NULL;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE TABLE t (a INTEGER, b TEXT NOT NULL)
+    ok
+}
+
+# The added NOT NULL is enforced on later writes.
+test fail-insert-null-after-alter-column-add-notnull {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    INSERT INTO t VALUES (1, 'x');
+    ALTER TABLE t ALTER COLUMN b TO b TEXT NOT NULL;
+    INSERT INTO t (a) VALUES (2);
+}
+expect error {
+}
+
+test alter-column-drop-notnull {
+    CREATE TABLE t (a INTEGER, b TEXT NOT NULL);
+    INSERT INTO t VALUES (1, 'x');
+    ALTER TABLE t ALTER COLUMN b TO b TEXT;
+    INSERT INTO t (a) VALUES (2);
+    SELECT a, b IS NULL FROM t ORDER BY a;
+}
+expect {
+    1|0
+    2|1
+}
+
+# Adding a CHECK must validate existing rows, like the rewrite path does.
+test fail-alter-column-add-check-violated-by-existing-rows {
+    CREATE TABLE t (x INTEGER);
+    INSERT INTO t VALUES (-5);
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER CHECK (x > 0);
+}
+expect error {
+}
+
+test alter-column-add-check-existing-rows-pass {
+    CREATE TABLE t (x INTEGER);
+    INSERT INTO t VALUES (5);
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER CHECK (x > 0);
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t (x INTEGER CHECK (x > 0))
+}
