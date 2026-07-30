@@ -6613,6 +6613,26 @@ pub mod test {
     }
 
     #[test]
+    fn page_codec_missing_wal_frame_reports_short_read() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
+        let target_page = Arc::new(crate::Page::new(43));
+
+        let completion = wal.read_frame(1, target_page, buffer_pool).unwrap();
+        let error = wait_for_completion_error(&io, completion);
+
+        assert!(matches!(
+            error,
+            CompletionError::ShortReadWalFrame {
+                expected: 512,
+                actual: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn page_codec_round_trips_vectored_wal_spill_frames() {
         let page_size = 512;
         let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);

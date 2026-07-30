@@ -177,11 +177,7 @@ impl DatabaseStorage for DatabaseFile {
                             }
                         };
                         if bytes_read == 0 {
-                            original_c.error(CompletionError::ShortRead {
-                                page_idx,
-                                expected: buf.len(),
-                                actual: 0,
-                            });
+                            original_c.complete(bytes_read);
                             return original_c.get_error();
                         }
                         turso_assert_greater_than!(
@@ -190,8 +186,13 @@ impl DatabaseStorage for DatabaseFile {
                             "database: expected positive bytes for page codec page",
                             { "page_idx": page_idx }
                         );
-                        if bytes_read as usize != buf.len() {
-                            original_c.complete(bytes_read);
+                        let expected = original_c.as_read().buf().len();
+                        if bytes_read as usize != expected {
+                            original_c.error(CompletionError::ShortRead {
+                                page_idx,
+                                expected,
+                                actual: bytes_read as usize,
+                            });
                             return original_c.get_error();
                         }
                         let original_buf = original_c.as_read().buf();
@@ -550,7 +551,7 @@ mod page_codec_tests {
     }
 
     #[test]
-    fn page_codec_zero_byte_read_reports_short_read() {
+    fn page_codec_zero_byte_read_reaches_original_completion() {
         let db_file = DatabaseFile {
             file: Arc::new(MockFile {
                 read_result: Ok(0),
@@ -560,28 +561,61 @@ mod page_codec_tests {
         let mut io_ctx = IOContext::default();
         io_ctx.set_page_codec(Arc::new(XorPageCodec(0xa5)));
         let page_idx = 9usize;
-        let original = Completion::new_read(Arc::new(Buffer::new_temporary(4096)), |_| None);
+        let bytes_seen = Arc::new(AtomicUsize::new(usize::MAX));
+        let bytes_seen_callback = bytes_seen.clone();
+        let original = Completion::new_read(Arc::new(Buffer::new_temporary(4096)), move |result| {
+            let (_, bytes_read) = result.expect("zero-byte read should reach the callback");
+            bytes_seen_callback.store(bytes_read as usize, Ordering::Relaxed);
+            None
+        });
 
         let wrapped = db_file
             .read_page(page_idx, &io_ctx, original.clone())
             .unwrap();
-        let err = MemoryIO::new()
-            .wait_for_completion(wrapped)
-            .expect_err("a zero-byte transformed page read must fail");
+        MemoryIO::new().wait_for_completion(wrapped).unwrap();
+
+        assert!(original.succeeded());
+        assert_eq!(bytes_seen.load(Ordering::Relaxed), 0);
+        assert!(
+            original
+                .as_read()
+                .buf()
+                .as_slice()
+                .iter()
+                .all(|byte| *byte == 0),
+            "an absent page must not be decoded"
+        );
+    }
+
+    #[test]
+    fn page_codec_partial_database_read_fails_before_decode() {
+        let db_file = DatabaseFile {
+            file: Arc::new(MockFile {
+                read_result: Ok(128),
+                writes_submitted: Arc::new(AtomicUsize::new(0)),
+            }),
+        };
+        let mut io_ctx = IOContext::default();
+        io_ctx.set_page_codec(Arc::new(XorPageCodec(0xa5)));
+        let original = Completion::new_read(Arc::new(Buffer::new_temporary(512)), |_| None);
+
+        let wrapped = db_file.read_page(1, &io_ctx, original.clone()).unwrap();
+        let err = MemoryIO::new().wait_for_completion(wrapped).unwrap_err();
+
         assert!(matches!(
             err,
             LimboError::CompletionError(CompletionError::ShortRead {
-                page_idx: 9,
-                expected: 4096,
-                actual: 0,
+                page_idx: 1,
+                expected: 512,
+                actual: 128,
             })
         ));
         assert!(matches!(
             original.get_error(),
             Some(CompletionError::ShortRead {
-                page_idx: 9,
-                expected: 4096,
-                actual: 0,
+                page_idx: 1,
+                expected: 512,
+                actual: 128,
             })
         ));
     }

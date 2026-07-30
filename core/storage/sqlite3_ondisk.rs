@@ -1981,6 +1981,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
         PageTransform::Codec(ctx) => {
             let page_codec = ctx.clone();
             let original_complete = complete;
+            // TODO(v): support in-place codec decoding to avoid this extra page buffer.
             let decoded_buf = Arc::new(buffer_pool.get_page());
             let codec_context = PageCodecContext::from_page_idx(page_idx, PageLocation::Wal)?;
 
@@ -1989,6 +1990,9 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
                     let Ok((encoded_buf, bytes_read)) = res else {
                         return original_complete(res);
                     };
+                    if bytes_read == 0 {
+                        return original_complete(Ok((encoded_buf, bytes_read)));
+                    }
                     turso_assert_greater_than!(
                         bytes_read,
                         0,
