@@ -230,3 +230,43 @@ expect error {
     1st ORDER BY term out of range - should be between 1 and 2
 }
 
+# Only integer literals that fit a 32-bit int are column positions
+# (SQLite's sqlite3ExprIsInteger); larger ones are constant expressions.
+test order-by-integer-beyond-i32-is-constant {
+    CREATE TABLE t16(a);
+    INSERT INTO t16 VALUES(1),(2);
+    SELECT a FROM t16 ORDER BY 6641019685895816357, a DESC;
+}
+expect {
+    2
+    1
+}
+
+test order-by-i32-max-is-positional {
+    CREATE TABLE t17(a);
+    INSERT INTO t17 VALUES(1);
+    SELECT a FROM t17 ORDER BY 2147483647;
+}
+expect error {
+    1st ORDER BY term out of range - should be between 1 and 1
+}
+
+test order-by-negative-integer-beyond-i32-is-constant {
+    CREATE TABLE t18(a);
+    INSERT INTO t18 VALUES(1),(2);
+    SELECT a FROM t18 ORDER BY -6641019685895816357, a DESC;
+}
+expect {
+    2
+    1
+}
+
+test group-by-integer-beyond-i32-is-constant {
+    CREATE TABLE t19(a);
+    INSERT INTO t19 VALUES(1);
+    SELECT a FROM t19 GROUP BY 6641019685895816357;
+}
+expect {
+    1
+}
+

@@ -1197,7 +1197,7 @@ fn replace_column_number_with_copy_of_column_expr(
         }
         ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
             if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner.as_ref() {
-                if num.parse::<usize>().is_ok() {
+                if num.parse::<i32>().is_ok() {
                     crate::bail_parse_error!(
                         "1st {} term out of range - should be between 1 and {}",
                         clause_name,
@@ -1210,17 +1210,19 @@ fn replace_column_number_with_copy_of_column_expr(
         _ => None,
     };
     if let Some(num) = num_str {
-        // Only treat as column reference if it parses as a positive integer.
-        // Float literals like "0.5" or "1.0" are valid constant expressions, not column references.
-        if let Ok(column_number) = num.parse::<usize>() {
-            if column_number == 0 || column_number > columns.len() {
+        // Only treat as column reference if it parses as an integer that fits
+        // a 32-bit int, mirroring SQLite's sqlite3ExprIsInteger. Float
+        // literals like "0.5" and integers past the 32-bit range are valid
+        // constant expressions, not column references.
+        if let Ok(column_number) = num.parse::<i32>() {
+            if column_number <= 0 || column_number as usize > columns.len() {
                 crate::bail_parse_error!(
                     "1st {} term out of range - should be between 1 and {}",
                     clause_name,
                     columns.len()
                 );
             }
-            let ResultSetColumn { expr, .. } = &columns[column_number - 1];
+            let ResultSetColumn { expr, .. } = &columns[column_number as usize - 1];
             *order_by_or_group_by_expr = expr.clone();
         }
         // Otherwise, leave the expression as-is (constant expression, case 3 per SQLite docs)
@@ -1246,17 +1248,19 @@ fn resolve_compound_order_by_expr(
             let (col_idx, _) = resolve_compound_order_by_expr(inner, all_plans, term_number)?;
             Ok((col_idx, Some(CollationSeq::new(collation_name.as_str())?)))
         }
-        // Case 1: Numeric column reference (e.g., ORDER BY 1)
+        // Case 1: Numeric column reference (e.g., ORDER BY 1). As in SQLite's
+        // sqlite3ExprIsInteger, only literals that fit a 32-bit int count as
+        // column positions.
         ast::Expr::Literal(ast::Literal::Numeric(num)) => {
-            if let Ok(column_number) = num.parse::<usize>() {
-                if column_number == 0 || column_number > num_result_columns {
+            if let Ok(column_number) = num.parse::<i32>() {
+                if column_number <= 0 || column_number as usize > num_result_columns {
                     crate::bail_parse_error!(
                         "{} ORDER BY term out of range - should be between 1 and {}",
                         column_number,
                         num_result_columns
                     );
                 }
-                Ok((column_number - 1, None))
+                Ok((column_number as usize - 1, None))
             } else {
                 crate::bail_parse_error!(
                     "{} ORDER BY term does not match any column in the result set",
