@@ -60,9 +60,13 @@ It composes `scan_table`, row-stream operators, scalar projection, and
 `result_row`, then builds and verifies the complete IR before touching
 `ProgramBuilder`.
 
-The row stream can wrap its consumer with chainable `filter` operators. A filter
-compiles its predicate in the row block and emits an SSA branch around the
-downstream consumer; false and NULL rows proceed directly to cursor advance.
+The row stream has an associated symbolic item type and composes chainable
+`filter` and `map` operators before a terminal `for_each`. A filter compiles its
+predicate in the row block and emits an SSA branch around the downstream
+consumer; false and NULL rows proceed directly to cursor advance. A map runs a
+deferred compiler and changes the item type, so SELECT projection is expressed
+as `filter(...).map(...).for_each(result_row)` rather than being embedded in the
+terminal consumer.
 The production path preserves predicate and projection source order. Comparison
 affinity and collation are resolved by the SQL frontend before IR construction.
 The resulting terminator has separate true, false, and NULL successors; a

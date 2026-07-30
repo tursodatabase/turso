@@ -157,15 +157,13 @@ fn try_emit_declarative_table_scan(
     let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
     let compiler = scan_table(table, database_id, schema_cookie).and_then(move |rows| {
         if predicates.is_empty() {
-            rows.for_each(move |row| {
-                compile_symbolic_exprs(row, &projections).and_then(result_row_pack)
-            })
-            .boxed()
+            rows.map(move |row| compile_symbolic_exprs(row, &projections))
+                .for_each(result_row_pack)
+                .boxed()
         } else {
             rows.filter(move |row| compile_symbolic_conjunction(row, &predicates))
-                .for_each(move |row| {
-                    compile_symbolic_exprs(row, &projections).and_then(result_row_pack)
-                })
+                .map(move |row| compile_symbolic_exprs(row, &projections))
+                .for_each(result_row_pack)
                 .boxed()
         }
     });

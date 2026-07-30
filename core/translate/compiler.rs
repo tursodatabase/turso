@@ -1940,17 +1940,32 @@ pub(crate) struct CursorRows {
 /// Stream operators compose compiler descriptions. They do not inspect rows or
 /// advance cursors while the Rust expression is being constructed.
 pub(crate) trait RowStream: Sized {
+    type Item;
+
     fn for_each<BodyFn, Body>(self, body: BodyFn) -> impl Compile<Output = ()>
     where
-        BodyFn: FnOnce(Row) -> Body,
+        BodyFn: FnOnce(Self::Item) -> Body,
         Body: Compile<Output = ()>;
+
+    fn map<MapperFn, Mapper>(self, mapper: MapperFn) -> MapRows<Self, MapperFn, Mapper>
+    where
+        MapperFn: FnOnce(Self::Item) -> Mapper,
+        Mapper: Compile,
+    {
+        MapRows {
+            source: self,
+            mapper,
+            compiler: PhantomData,
+        }
+    }
 
     fn filter<PredicateFn, Predicate>(
         self,
         predicate: PredicateFn,
     ) -> FilterRows<Self, PredicateFn, Predicate>
     where
-        PredicateFn: FnOnce(Row) -> Predicate,
+        Self::Item: Clone,
+        PredicateFn: FnOnce(Self::Item) -> Predicate,
         Predicate: Compile<Output = ValueId>,
     {
         FilterRows {
@@ -1962,9 +1977,11 @@ pub(crate) trait RowStream: Sized {
 }
 
 impl RowStream for CursorRows {
+    type Item = Row;
+
     fn for_each<BodyFn, Body>(self, body: BodyFn) -> impl Compile<Output = ()>
     where
-        BodyFn: FnOnce(Row) -> Body,
+        BodyFn: FnOnce(Self::Item) -> Body,
         Body: Compile<Output = ()>,
     {
         ForEachRow {
@@ -1972,6 +1989,31 @@ impl RowStream for CursorRows {
             body,
             compiler: PhantomData,
         }
+    }
+}
+
+/// A row stream whose items are produced by a deferred compiler.
+pub(crate) struct MapRows<Source, MapperFn, Mapper> {
+    source: Source,
+    mapper: MapperFn,
+    compiler: PhantomData<fn() -> Mapper>,
+}
+
+impl<Source, MapperFn, Mapper> RowStream for MapRows<Source, MapperFn, Mapper>
+where
+    Source: RowStream,
+    MapperFn: FnOnce(Source::Item) -> Mapper,
+    Mapper: Compile,
+{
+    type Item = Mapper::Output;
+
+    fn for_each<BodyFn, Body>(self, body: BodyFn) -> impl Compile<Output = ()>
+    where
+        BodyFn: FnOnce(Self::Item) -> Body,
+        Body: Compile<Output = ()>,
+    {
+        let Self { source, mapper, .. } = self;
+        source.for_each(move |item| mapper(item).and_then(body))
     }
 }
 
@@ -1985,19 +2027,22 @@ pub(crate) struct FilterRows<Source, PredicateFn, Predicate> {
 impl<Source, PredicateFn, Predicate> RowStream for FilterRows<Source, PredicateFn, Predicate>
 where
     Source: RowStream,
-    PredicateFn: FnOnce(Row) -> Predicate,
+    Source::Item: Clone,
+    PredicateFn: FnOnce(Source::Item) -> Predicate,
     Predicate: Compile<Output = ValueId>,
 {
+    type Item = Source::Item;
+
     fn for_each<BodyFn, Body>(self, body: BodyFn) -> impl Compile<Output = ()>
     where
-        BodyFn: FnOnce(Row) -> Body,
+        BodyFn: FnOnce(Self::Item) -> Body,
         Body: Compile<Output = ()>,
     {
         let Self {
             source, predicate, ..
         } = self;
-        source.for_each(move |row| {
-            predicate(row).and_then(move |condition| when(condition, body(row)))
+        source.for_each(move |item| {
+            predicate(item.clone()).and_then(move |condition| when(condition, body(item)))
         })
     }
 }
@@ -2560,14 +2605,13 @@ mod tests {
     }
 
     #[test]
-    fn row_stream_filters_wrap_the_consumer_in_source_order() {
+    fn row_stream_filters_and_maps_compose_in_source_order() {
         let table = Arc::new(BTreeTable::from_sql("CREATE TABLE filtered(a,b,c)", 2).unwrap());
         let compiler = scan_table(table, 0, 0).and_then(|rows| {
             rows.filter(|row| row.column(0))
                 .filter(|row| row.column(1))
-                .for_each(|row| {
-                    pack_values(smallvec![row.column(2).boxed()]).and_then(result_row_pack)
-                })
+                .map(|row| row.column(2))
+                .for_each(|value| result_row([value]))
         });
 
         let ir = compile_effect(compiler).unwrap();
