@@ -401,6 +401,28 @@ expect {
     1|20|200|221
 }
 
+test cross-join-three-stage-dependent-seeks {
+    CREATE TABLE chain_a(id INTEGER PRIMARY KEY, key TEXT);
+    CREATE TABLE chain_b(id INTEGER PRIMARY KEY, key TEXT, c_id INTEGER);
+    CREATE INDEX chain_b_key ON chain_b(key);
+    CREATE TABLE chain_c(id INTEGER PRIMARY KEY, payload TEXT);
+    INSERT INTO chain_a VALUES (1, 'a'), (2, 'b'), (3, 'x');
+    INSERT INTO chain_b VALUES
+        (1, 'a', 2), (2, 'a', 1), (3, 'b', 3), (4, 'z', 1);
+    INSERT INTO chain_c VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    SELECT a.id, b.id, c.payload
+    FROM chain_a AS a
+    CROSS JOIN chain_b AS b INDEXED BY chain_b_key
+    CROSS JOIN chain_c AS c
+    WHERE b.key = a.key AND c.id = b.c_id
+    ORDER BY a.id, b.id;
+}
+expect {
+    1|1|two
+    1|2|one
+    2|3|three
+}
+
 test cross-join-subquery-right {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);

@@ -115,12 +115,6 @@ impl SymbolicRows {
         }
     }
 
-    pub(crate) fn pair(first: Row, second: Row) -> Self {
-        Self {
-            rows: smallvec::smallvec![first, second],
-        }
-    }
-
     pub(crate) fn with_row(mut self, row: Row) -> Self {
         self.rows.push(row);
         self

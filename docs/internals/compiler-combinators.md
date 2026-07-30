@@ -108,9 +108,10 @@ moves. This makes register coalescing and reuse independent of edge-copy order.
 The current IR supports straight-line scalar operations, conditional diamonds,
 explicit loops with block parameters, and effectful cursor folds and row
 production. A production SELECT path uses these pieces for B-tree scans,
-arbitrary-width inner joins whose members are full table scans, and dependent
-searches in a two-table inner join. Its frontend first resolves an owned scalar
-description, then compiles that description against each symbolic row set.
+arbitrary-width inner joins whose members can be table or index scans, point
+searches, range searches, or `IN` searches. Its frontend first resolves owned
+access and scalar descriptions, then compiles them against each symbolic row
+set.
 Columns, literals, numeric and bitwise arithmetic, three-valued `AND` and `OR`,
 both forms of `CASE`, parentheses, collation wrappers, and ordinary comparisons
 can be nested and shared by both result expressions and predicates.
@@ -126,21 +127,17 @@ deferred compiler and changes the item type, so SELECT projection is expressed
 as `filter(...).map(...).for_each(result_row)` rather than being embedded in the
 terminal consumer.
 `flat_map` gives nested row production the same shape as Rust's iterator
-adapter. The first production join composes two ordinary B-tree scan sources,
-opens both resources before entering the outer loop, and maps each outer row to
-a fresh traversal of the inner stream. Each yielded item contains ordered
-symbolic row slots. SQL table identities are resolved to those slots before IR
-construction, so join predicates and projections can reference either row
-without leaking SQL identifiers into the compiler IR. Filtering, sorting,
-distinctness, slicing, and destinations then consume the joined stream through
-the same operators as a single-table scan.
-For a planner-sized list of full table scans, every table resource is opened in
-source order and the frontend folds the remaining scans over the first stream.
-Each fold appends one symbolic row slot through another `flat_map`, producing an
-N-way nested-loop CFG without selecting cursor numbers or emitting bytecode.
-The concrete Rust adapter type is erased after every fold, while the item type
-remains `SymbolicRows`; this is what lets the same composition handle three or
-more sources without hard-coding tuple arities.
+adapter. Join compilation opens every resource before entering the outer loop,
+then folds the planner-sized member list over the first stream. Each member is
+an owned table-or-index access description; inside its `flat_map`, it compiles
+keys and bounds against the symbolic rows produced to its left, positions its
+opened resource, and appends one symbolic row slot. This produces an N-way
+nested-loop CFG without selecting cursor numbers, emitting bytecode, or
+hard-coding tuple arities. SQL table identities are resolved to ordered
+`SymbolicRows` slots before IR construction. The concrete Rust adapter type is
+erased after every fold while that symbolic item type remains intact, so
+filtering, sorting, distinctness, slicing, and destinations consume every join
+shape through the same operators as a single-table scan.
 Table resource acquisition is separate from stream positioning. `open_table`
 produces a non-cloneable symbolic `OpenedTable`; consuming that handle with
 `scan`, `seek_rowid`, or `seek_range` produces the row stream. A dependent join
@@ -236,8 +233,7 @@ and composes each ordered arm from `then`, `and_then`, comparison, and `branch`;
 NULL comparison results follow the false arm, as required by SQLite.
 The path also falls back when SQL semantics still live in the eager frontend:
 other expression forms, outer and semi/anti joins, unsupported index-range
-shapes, joins wider than two tables when a member needs indexed or dependent
-positioning, joins spanning attached databases, aggregates, most subquery forms,
+shapes, joins spanning attached databases, aggregates, most subquery forms,
 generated values, arrays, and custom-type decoding.
 `EXPLAIN QUERY PLAN` also remains on the eager path until the IR models
 explain-tree effects.
@@ -296,6 +292,10 @@ unwinding their cursor bindings. At the top level, the resulting producers are
 ordinary ordered stages in one IR graph and need no `Once` guard at all. If an
 unsupported ancestor leaves the region behind a nested eager boundary, the
 guarded initializer preserves the standalone subquery's re-entry semantics.
+Join access resolution collects every uncorrelated `IN` cursor requirement
+across the member list, then orders those cursor inputs together with scalar
+subquery inputs by the planner's subquery order. This keeps dependency discovery
+independent of join arity and leaves physical cursor assignment to lowering.
 
 Row production is an effect over a symbolic `ValuePack`, not an eagerly chosen
 register range. Each pack member remains an ordinary SSA value and must dominate
