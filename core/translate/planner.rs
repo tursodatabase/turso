@@ -2013,17 +2013,12 @@ pub fn fold_join_constraints(
 ) -> Result<()> {
     for (join_idx, join) in from.joins.iter().enumerate() {
         // The first table is from.select (index 0 in joined_tables),
-        // joins start at index 1.
-        let table_idx = join_idx + 1;
-        // For right_join_swapped, the binder swapped table positions so
-        // index 0 is the originally-right table (no join_info) and index 1
-        // is the originally-left table (with LeftOuter join_info).
-        // The ON/USING constraint should be tagged with the outer table's id.
-        let actual_table_idx = if table_references.right_join_swapped() && table_idx == 1 {
-            0
-        } else {
-            table_idx
-        };
+        // joins start at index 1. This holds under right_join_swapped too:
+        // the binder swapped the tables so index 0 is the originally-right
+        // table and index 1 is the originally-left one, which carries the
+        // LeftOuter join_info — i.e. the outer table the ON/USING constraint
+        // must be tagged with is still at index 1.
+        let actual_table_idx = join_idx + 1;
 
         let outer = table_references.joined_tables()[actual_table_idx]
             .join_info
