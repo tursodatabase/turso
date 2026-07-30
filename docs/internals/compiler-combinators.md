@@ -46,13 +46,19 @@ The current IR supports straight-line scalar operations, conditional diamonds,
 explicit loops with block parameters, and effectful cursor folds and row
 production. A first production SELECT path uses these pieces for an unfiltered,
 forward scan of one B-tree table whose result expressions are direct columns.
-It composes `open_read`, `fold_cursor`, column projection, and `result_row`, then
-builds and verifies the complete IR before touching `ProgramBuilder`.
+It composes `scan_table`, row-stream operators, column projection, and
+`result_row`, then builds and verifies the complete IR before touching
+`ProgramBuilder`.
 
-That path deliberately falls back when SQL semantics still live in the eager
-frontend: expressions, predicates, ordering, limits, joins, aggregates,
-subqueries, generated values, arrays, and custom-type decoding. `EXPLAIN QUERY
-PLAN` also remains on the eager path until the IR models explain-tree effects.
+The row stream can wrap its consumer with chainable `filter` operators. A filter
+compiles its predicate in the row block and emits an SSA branch around the
+downstream consumer; false and NULL rows proceed directly to cursor advance.
+The production path currently admits direct-column truthiness predicates and
+preserves their source order. It falls back when SQL semantics still live in the
+eager frontend: general expressions and comparisons, ordering, limits, joins,
+aggregates, subqueries, generated values, arrays, and custom-type decoding.
+`EXPLAIN QUERY PLAN` also remains on the eager path until the IR models
+explain-tree effects.
 Ordinary column lowering does reuse the VDBE backend's logical-column helper, so
 rowid aliases, logical-to-physical column mapping, and ALTER-added defaults keep
 their established behavior. This narrow bridge establishes that a complete

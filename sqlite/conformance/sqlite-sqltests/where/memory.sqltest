@@ -1,5 +1,21 @@
 @database :memory:
 
+@cross-check-integrity
+test where-direct-column-truthiness {
+    CREATE TABLE direct_truth(flag, keep, value);
+    INSERT INTO direct_truth VALUES
+        (0, 1, 'zero'),
+        (1, 1, 'one'),
+        (NULL, 1, 'null'),
+        (2, 0, 'two-filtered'),
+        (-1, 3, 'negative');
+    SELECT value FROM direct_truth WHERE flag AND keep;
+}
+expect {
+    one
+    negative
+}
+
 # in WHERE clauses, column aliases do not take precedence when resolving identifiers to columns.
 @cross-check-integrity
 test where_alias_precedence {
@@ -29,4 +45,3 @@ test where_alias_precedence_3 {
 expect {
     1|101
 }
-

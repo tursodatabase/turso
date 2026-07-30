@@ -320,6 +320,45 @@ pub(crate) struct ForEachRow<BodyFn, Body> {
     compiler: PhantomData<fn() -> Body>,
 }
 
+/// Executes an effectful compiler only when an SSA condition is truthy.
+pub(crate) struct When<Body> {
+    condition: ValueId,
+    body: Body,
+}
+
+pub(crate) const fn when<Body>(condition: ValueId, body: Body) -> When<Body>
+where
+    Body: Compile<Output = ()>,
+{
+    When { condition, body }
+}
+
+impl<Body> Compile for When<Body>
+where
+    Body: Compile<Output = ()>,
+{
+    type Output = ();
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let body = builder.create_block()?;
+        let continuation = builder.create_block()?;
+        builder.terminate(Terminator::Branch {
+            condition: self.condition,
+            if_true: body,
+            if_false: continuation,
+        })?;
+
+        builder.switch_to(body)?;
+        self.body.compile(builder)?;
+        builder.terminate(Terminator::Jump {
+            target: continuation,
+            arguments: SmallVec::new(),
+        })?;
+
+        builder.switch_to(continuation)
+    }
+}
+
 impl<BodyFn, Body> Compile for ForEachRow<BodyFn, Body>
 where
     BodyFn: FnOnce(Row) -> Body,
@@ -1661,14 +1700,40 @@ pub(crate) struct OpenReadTable {
     schema_cookie: u32,
 }
 
-/// A symbolic stream of rows backed by an opened cursor.
+/// The base symbolic stream of rows backed by an opened cursor.
 #[derive(Clone, Copy)]
-pub(crate) struct RowStream {
+pub(crate) struct CursorRows {
     cursor: CursorId,
 }
 
-impl RowStream {
-    pub(crate) fn for_each<BodyFn, Body>(self, body: BodyFn) -> ForEachRow<BodyFn, Body>
+/// A compile-time row-program algebra analogous to [`Iterator`].
+///
+/// Stream operators compose compiler descriptions. They do not inspect rows or
+/// advance cursors while the Rust expression is being constructed.
+pub(crate) trait RowStream: Sized {
+    fn for_each<BodyFn, Body>(self, body: BodyFn) -> impl Compile<Output = ()>
+    where
+        BodyFn: FnOnce(Row) -> Body,
+        Body: Compile<Output = ()>;
+
+    fn filter<PredicateFn, Predicate>(
+        self,
+        predicate: PredicateFn,
+    ) -> FilterRows<Self, PredicateFn, Predicate>
+    where
+        PredicateFn: FnOnce(Row) -> Predicate,
+        Predicate: Compile<Output = ValueId>,
+    {
+        FilterRows {
+            source: self,
+            predicate,
+            compiler: PhantomData,
+        }
+    }
+}
+
+impl RowStream for CursorRows {
+    fn for_each<BodyFn, Body>(self, body: BodyFn) -> impl Compile<Output = ()>
     where
         BodyFn: FnOnce(Row) -> Body,
         Body: Compile<Output = ()>,
@@ -1681,6 +1746,33 @@ impl RowStream {
     }
 }
 
+/// A row stream that admits only rows whose predicate is truthy.
+pub(crate) struct FilterRows<Source, PredicateFn, Predicate> {
+    source: Source,
+    predicate: PredicateFn,
+    compiler: PhantomData<fn() -> Predicate>,
+}
+
+impl<Source, PredicateFn, Predicate> RowStream for FilterRows<Source, PredicateFn, Predicate>
+where
+    Source: RowStream,
+    PredicateFn: FnOnce(Row) -> Predicate,
+    Predicate: Compile<Output = ValueId>,
+{
+    fn for_each<BodyFn, Body>(self, body: BodyFn) -> impl Compile<Output = ()>
+    where
+        BodyFn: FnOnce(Row) -> Body,
+        Body: Compile<Output = ()>,
+    {
+        let Self {
+            source, predicate, ..
+        } = self;
+        source.for_each(move |row| {
+            predicate(row).and_then(move |condition| when(condition, body(row)))
+        })
+    }
+}
+
 /// One row yielded by a [`RowStream`].
 #[derive(Clone, Copy)]
 pub(crate) struct Row {
@@ -1688,6 +1780,10 @@ pub(crate) struct Row {
 }
 
 impl Row {
+    pub(crate) const fn column(self, column_index: usize) -> Column {
+        column(self.cursor, column_index)
+    }
+
     pub(crate) fn project(self, columns: SmallVec<[usize; 4]>) -> ProjectColumns {
         project_columns(self.cursor, columns)
     }
@@ -1701,10 +1797,10 @@ pub(crate) fn scan_table(table: Arc<BTreeTable>, db: usize, schema_cookie: u32) 
 }
 
 impl Compile for ScanTable {
-    type Output = RowStream;
+    type Output = CursorRows;
 
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
-        self.0.compile(builder).map(|cursor| RowStream { cursor })
+        self.0.compile(builder).map(|cursor| CursorRows { cursor })
     }
 }
 
@@ -1973,6 +2069,52 @@ mod tests {
                 "block2:\n",
                 "  %1 = constant Null\n",
                 "  return %1\n",
+            )
+        );
+    }
+
+    #[test]
+    fn row_stream_filters_wrap_the_consumer_in_source_order() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE filtered(a,b,c)", 2).unwrap());
+        let compiler = scan_table(table, 0, 0).and_then(|rows| {
+            rows.filter(|row| row.column(0))
+                .filter(|row| row.column(1))
+                .for_each(|row| row.project(smallvec![2]).and_then(result_row_pack))
+        });
+
+        let ir = compile_effect(compiler).unwrap();
+
+        assert_eq!(
+            ir.to_string(),
+            concat!(
+                "cursor $0 = btree_table \"filtered\" root 2\n",
+                "\n",
+                "block0:\n",
+                "  open_read $0 root 2 db 0 schema 0\n",
+                "  rewind $0, block1(), block2()\n",
+                "\n",
+                "block1:\n",
+                "  %0 = column $0[0]\n",
+                "  branch %0, block3, block4\n",
+                "\n",
+                "block2:\n",
+                "  %3 = constant Null\n",
+                "  return %3\n",
+                "\n",
+                "block3:\n",
+                "  %1 = column $0[1]\n",
+                "  branch %1, block5, block6\n",
+                "\n",
+                "block4:\n",
+                "  next $0, block1(), block2()\n",
+                "\n",
+                "block5:\n",
+                "  %2 = column $0[2]\n",
+                "  result_row [%2]\n",
+                "  jump block6()\n",
+                "\n",
+                "block6:\n",
+                "  jump block4()\n",
             )
         );
     }

@@ -5,7 +5,10 @@ use crate::{
     sync::Arc,
     translate::{
         aggregation::emit_ungrouped_aggregation,
-        compiler::{compile_effect, result_row_pack, scan_table, Compile},
+        compiler::{
+            compile_effect, constant, result_row_pack, scan_table, BoxedCompile, Compile, Row,
+            RowStream, ValueId,
+        },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
             MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
@@ -26,13 +29,14 @@ use crate::{
         window::{emit_window_flush, EmitWindow},
         ProgramBuilder, Resolver,
     },
+    types::Value,
     vdbe::{builder::QueryMode, insn::Insn},
     HashMap, HashSet, LimboError, Result,
 };
 use smallvec::SmallVec;
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
-use turso_parser::ast::Expr;
+use turso_parser::ast::{Expr, TableInternalId};
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_select(
@@ -70,7 +74,6 @@ fn try_emit_declarative_table_scan(
     if matches!(program.get_query_mode(), QueryMode::ExplainQueryPlan)
         || !matches!(plan.query_destination, QueryDestination::ResultRows)
         || !matches!(plan.distinctness, Distinctness::NonDistinct)
-        || !plan.where_clause.is_empty()
         || plan.group_by.is_some()
         || !plan.order_by.is_empty()
         || !plan.aggregates.is_empty()
@@ -114,41 +117,59 @@ fn try_emit_declarative_table_scan(
 
     let mut columns = SmallVec::<[usize; 4]>::with_capacity(plan.result_columns.len());
     for result_column in &plan.result_columns {
-        let Expr::Column {
-            table: table_id,
-            column,
-            ..
-        } = &result_column.expr
+        let Some(column) = direct_scan_column(
+            resolver,
+            joined.database_id,
+            joined.internal_id,
+            table,
+            &result_column.expr,
+        )?
         else {
             return Ok(None);
         };
-        if *table_id != joined.internal_id {
+        columns.push(column);
+    }
+
+    let mut predicate_columns = SmallVec::<[usize; 2]>::new();
+    for predicate in &plan.where_clause {
+        if predicate.consumed {
+            continue;
+        }
+        if predicate.from_outer_join.is_some()
+            || !predicate.should_eval_at_loop(
+                0,
+                &plan.join_order,
+                &plan.non_from_clause_subqueries,
+                Some(&plan.table_references),
+            )
+        {
             return Ok(None);
         }
-        let column_definition = table.columns().get(*column).ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "SELECT plan references column {column} outside table {}",
-                table.name
-            ))
-        })?;
-        let requires_frontend_decoding = column_definition.is_virtual_generated()
-            || column_definition.is_array()
-            || resolver.with_schema(joined.database_id, |schema| {
-                schema
-                    .get_type_def_unchecked(&column_definition.ty_str)
-                    .is_some()
-            });
-        if requires_frontend_decoding {
+        let Some(column) = direct_scan_column(
+            resolver,
+            joined.database_id,
+            joined.internal_id,
+            table,
+            &predicate.expr,
+        )?
+        else {
             return Ok(None);
-        }
-        columns.push(*column);
+        };
+        predicate_columns.push(column);
     }
 
     let table = table.clone();
     let database_id = joined.database_id;
     let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
     let compiler = scan_table(table, database_id, schema_cookie).and_then(move |rows| {
-        rows.for_each(move |row| row.project(columns).and_then(result_row_pack))
+        let emit = move |row: Row| row.project(columns).and_then(result_row_pack);
+        if predicate_columns.is_empty() {
+            rows.for_each(emit).boxed()
+        } else {
+            rows.filter(move |row| truthy_columns(row, &predicate_columns))
+                .for_each(emit)
+                .boxed()
+        }
     });
     let ir = compile_effect(compiler)?;
     let target_register = program.alloc_register();
@@ -161,6 +182,49 @@ fn try_emit_declarative_table_scan(
         )));
     }
     Ok(Some(result_cols_start))
+}
+
+fn direct_scan_column(
+    resolver: &Resolver,
+    database_id: usize,
+    table_id: TableInternalId,
+    table: &BTreeTable,
+    expr: &Expr,
+) -> Result<Option<usize>> {
+    let Expr::Column {
+        table: expr_table,
+        column,
+        ..
+    } = expr
+    else {
+        return Ok(None);
+    };
+    if *expr_table != table_id {
+        return Ok(None);
+    }
+    let column_definition = table.columns().get(*column).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "SELECT plan references column {column} outside table {}",
+            table.name
+        ))
+    })?;
+    let requires_frontend_decoding = column_definition.is_virtual_generated()
+        || column_definition.is_array()
+        || resolver.with_schema(database_id, |schema| {
+            schema
+                .get_type_def_unchecked(&column_definition.ty_str)
+                .is_some()
+        });
+    Ok((!requires_frontend_decoding).then_some(*column))
+}
+
+fn truthy_columns(row: Row, columns: &[usize]) -> BoxedCompile<ValueId> {
+    let Some((&column, remaining)) = columns.split_first() else {
+        return constant(Value::from_i64(1)).boxed();
+    };
+    row.column(column)
+        .branch(truthy_columns(row, remaining), constant(Value::from_i64(0)))
+        .boxed()
 }
 
 fn emit_program_for_select_with_inputs(
@@ -1167,6 +1231,34 @@ mod tests {
         assert!(
             !query_plan_rows.is_empty(),
             "EXPLAIN QUERY PLAN must retain the eager emitter's explain tree"
+        );
+
+        connection
+            .execute("CREATE TABLE filtered(flag INTEGER, name TEXT)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO filtered VALUES (0, 'zero'), (1, 'one'), (NULL, 'null'), (2, 'two')",
+            )
+            .unwrap();
+        let mut filtered_statement = connection
+            .prepare("SELECT name FROM filtered WHERE flag")
+            .unwrap();
+        let filtered_instructions = &filtered_statement.get_program().insns;
+        let filtered_result_row = filtered_instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. }))
+            .expect("filtered stream must produce its projected row");
+        assert!(matches!(
+            filtered_instructions[filtered_result_row - 1].0,
+            Insn::Copy { .. }
+        ));
+        assert_eq!(
+            filtered_statement.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::Text("one".into())],
+                vec![Value::Text("two".into())],
+            ]
         );
     }
 }
