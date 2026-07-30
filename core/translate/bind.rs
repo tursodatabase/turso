@@ -65,137 +65,46 @@ pub trait BindTable {
     fn column_is_hidden(&self, idx: usize) -> bool;
 }
 
-/// Id generator for fixed-scope expression binding: such binding never
-/// creates tables (no FROM clause, no subquery rewriting), so allocating an
-/// id is a bug.
-struct NoNewIds;
-
-impl IdGenerator for NoNewIds {
-    fn next_table_id(&mut self) -> ast::TableInternalId {
-        unreachable!("fixed-scope expression binding does not create tables")
-    }
-    fn next_cte_id(&mut self) -> usize {
-        unreachable!("fixed-scope expression binding does not create CTEs")
-    }
-}
-
-/// Bind the identifier leaves of a standalone expression against the tables
-/// of `table_references` (or against nothing when `None`). This is for
-/// expressions outside a query context — index/CHECK/DEFAULT expressions,
-/// recursive-body LIMIT, integrity checks, emission-time rebinds — where the
-/// tables are already resolved and no subquery or BETWEEN rewriting must
-/// happen. Column/rowid usage is marked directly on `table_references`.
-///
-/// With `allow_unbound`, unresolved identifiers are left as-is (UPSERT's
-/// EXCLUDED references bind later) instead of erroring.
-pub fn bind_fixed_scope_expr(
+/// Validate the identifier leaves of an expression that binds against no
+/// tables at all — single-row INSERT VALUES, UPSERT `DO UPDATE` (which
+/// resolves against the row image and EXCLUDED at emission), and
+/// recursive-CTE body LIMIT. Identifiers are an error (no
+/// double-quoted-string fallback — DQS never applied to scopeless
+/// expressions) unless `allow_unbound` leaves them for later resolution.
+fn bind_scopeless_expr(
     expr: &mut ast::Expr,
-    mut table_references: Option<&mut TableReferences>,
     resolver: &Resolver,
     allow_unbound: bool,
 ) -> Result<()> {
-    // Without tables there is nothing to resolve against: identifiers are an
-    // error (no double-quoted-string fallback — DQS never applied to
-    // scopeless expressions) unless the caller allows unbound identifiers.
-    let Some(refs) = table_references.as_deref_mut() else {
-        walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
-            match expr {
-                ast::Expr::Id(id) => {
-                    if !allow_unbound {
-                        crate::bail_parse_error!("no such column: {}", id.as_str());
-                    }
+    walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
+        match expr {
+            ast::Expr::Id(id) => {
+                if !allow_unbound {
+                    crate::bail_parse_error!("no such column: {}", id.as_str());
                 }
-                ast::Expr::Qualified(tbl, id) => {
-                    if !allow_unbound {
-                        crate::bail_parse_error!(
-                            "no such column: {}.{}",
-                            tbl.as_str(),
-                            id.as_str()
-                        );
-                    }
-                }
-                ast::Expr::DoublyQualified(db, tbl, id) => {
-                    if !allow_unbound {
-                        crate::bail_parse_error!(
-                            "no such column: {}.{}.{}",
-                            db.as_str(),
-                            tbl.as_str(),
-                            id.as_str()
-                        );
-                    }
-                }
-                ast::Expr::FunctionCall { name, args, .. } => {
-                    super::expr::validate_custom_type_function_call(name.as_str(), args, resolver)?;
-                }
-                _ => {}
             }
-            Ok(WalkControl::Continue)
-        })?;
-        return Ok(());
-    };
-
-    let mut id_gen = NoNewIds;
-    let mut ctx = BindContext::new(resolver, &mut id_gen);
-    ctx.allow_unbound = allow_unbound;
-    let scope = BindScope {
-        tables: refs
-            .joined_tables()
-            .iter()
-            .map(|jt| {
-                let table = Arc::new(jt.table.clone());
-                ScopeTable {
-                    identifier: jt.identifier.clone(),
-                    internal_id: jt.internal_id,
-                    source: ScopeTableSource::Table(table.clone()),
-                    table,
-                    join_info: jt.join_info.clone(),
-                    database_id: jt.database_id,
-                    indexed: None,
+            ast::Expr::Qualified(tbl, id) => {
+                if !allow_unbound {
+                    crate::bail_parse_error!("no such column: {}.{}", tbl.as_str(), id.as_str());
                 }
-            })
-            .collect(),
-        right_join_swapped: false,
-    };
-    // Real (non-definition-only) outer references stay resolvable, with the
-    // nearest scope depth winning — e.g. the UPDATE write phase reads index
-    // expressions against an ephemeral scratch table joined with the target
-    // table as an outer reference.
-    {
-        let mut depths: Vec<usize> = refs
-            .outer_query_refs()
-            .iter()
-            .filter(|r| !r.cte_definition_only)
-            .map(|r| r.scope_depth)
-            .collect();
-        depths.sort_unstable();
-        depths.dedup();
-        for depth in depths.into_iter().rev() {
-            let frame = BindScope {
-                tables: refs
-                    .outer_query_refs()
-                    .iter()
-                    .filter(|r| !r.cte_definition_only && r.scope_depth == depth)
-                    .map(|r| {
-                        let table = Arc::new(r.table.clone());
-                        ScopeTable {
-                            identifier: r.identifier.clone(),
-                            internal_id: r.internal_id,
-                            source: ScopeTableSource::Table(table.clone()),
-                            table,
-                            join_info: None,
-                            database_id: 0,
-                            indexed: None,
-                        }
-                    })
-                    .collect(),
-                right_join_swapped: false,
-            };
-            #[expect(clippy::arc_with_non_send_sync)]
-            ctx.append_outer_query_scope(Arc::new(frame), Arc::new(Vec::new()));
+            }
+            ast::Expr::DoublyQualified(db, tbl, id) => {
+                if !allow_unbound {
+                    crate::bail_parse_error!(
+                        "no such column: {}.{}.{}",
+                        db.as_str(),
+                        tbl.as_str(),
+                        id.as_str()
+                    );
+                }
+            }
+            ast::Expr::FunctionCall { name, args, .. } => {
+                super::expr::validate_custom_type_function_call(name.as_str(), args, resolver)?;
+            }
+            _ => {}
         }
-    }
-    ctx.bind_expr_leaves(expr, &scope)?;
-    ctx.tracking.flush(refs);
+        Ok(WalkControl::Continue)
+    })?;
     Ok(())
 }
 
@@ -893,7 +802,7 @@ pub fn bind_insert_stmt(
                                     }
                                     _ => {}
                                 }
-                                bind_fixed_scope_expr(expr, None, resolver, false)?;
+                                bind_scopeless_expr(expr, resolver, false)?;
                             }
                             values = values_expr.pop().unwrap_or_else(Vec::new);
                         }
@@ -923,10 +832,10 @@ pub fn bind_insert_stmt(
         } = &mut upsert_opt.do_clause
         {
             for set in sets.iter_mut() {
-                bind_fixed_scope_expr(&mut set.expr, None, resolver, true)?;
+                bind_scopeless_expr(&mut set.expr, resolver, true)?;
             }
             if let Some(ref mut where_expr) = where_clause {
-                bind_fixed_scope_expr(where_expr, None, resolver, true)?;
+                bind_scopeless_expr(where_expr, resolver, true)?;
             }
         }
         let next = upsert_opt.next.take();
@@ -2484,9 +2393,9 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 let resolver = self.resolver;
                 let entry = self.ctes.get_mut(&cte_name).unwrap();
                 if let Some(limit) = entry.select.limit.as_mut() {
-                    bind_fixed_scope_expr(&mut limit.expr, None, resolver, false)?;
+                    bind_scopeless_expr(&mut limit.expr, resolver, false)?;
                     if let Some(offset) = limit.offset.as_mut() {
-                        bind_fixed_scope_expr(offset, None, resolver, false)?;
+                        bind_scopeless_expr(offset, resolver, false)?;
                     }
                 }
                 recursive_bindings.push((
@@ -3704,35 +3613,6 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             order_by: vec![],
             within_group: vec![],
         };
-    }
-
-    /// Bind only the identifier leaves of an expression against a fixed
-    /// scope (see [bind_fixed_scope_expr]): Id / Qualified / DoublyQualified
-    /// resolution, star-expanding functions, and custom-type call
-    /// validation. Subquery bodies and BETWEEN are left untouched.
-    fn bind_expr_leaves(&mut self, expr: &mut ast::Expr, scope: &BindScope) -> Result<()> {
-        walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
-            match expr {
-                ast::Expr::Id(_)
-                | ast::Expr::Qualified(_, _)
-                | ast::Expr::DoublyQualified(_, _, _) => {
-                    self.bind_identifier(expr, scope)?;
-                }
-                ast::Expr::FunctionCall { name, args, .. } => {
-                    super::expr::validate_custom_type_function_call(
-                        name.as_str(),
-                        args,
-                        self.resolver,
-                    )?;
-                }
-                ast::Expr::FunctionCallStar { .. } => {
-                    self.expand_star_function(expr, scope);
-                }
-                _ => {}
-            }
-            Ok(WalkControl::Continue)
-        })?;
-        Ok(())
     }
 
     fn bind_from(&mut self, from: &mut ast::FromClause) -> Result<BindScope> {
