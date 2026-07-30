@@ -39,6 +39,7 @@ impl<'a, T: 'a> Compiler<'a, T> {
     }
 
     /// A compiler that does no work and yields `value`.
+    #[allow(dead_code)] // exercised by unit tests; awaiting integration slices
     pub fn pure(value: T) -> Self {
         Self::build_with(move |_| Ok(value))
     }
@@ -49,6 +50,7 @@ impl<'a, T: 'a> Compiler<'a, T> {
     }
 
     /// Transform the result without touching the IR.
+    #[allow(dead_code)] // exercised by unit tests; awaiting integration slices
     pub fn map<U: 'a>(self, f: impl FnOnce(T) -> U + 'a) -> Compiler<'a, U> {
         Compiler::build_with(move |builder| Ok(f(self.run(builder)?)))
     }
@@ -77,6 +79,7 @@ impl<'a, T: 'a> Compiler<'a, T> {
     /// Monadic sequencing: the next compiler is chosen from this one's
     /// result. This is what makes recursive compiler construction work —
     /// the continuation can itself assemble arbitrary sub-compilers.
+    #[allow(dead_code)] // exercised by unit tests; awaiting integration slices
     pub fn and_then<U: 'a>(self, f: impl FnOnce(T) -> Compiler<'a, U> + 'a) -> Compiler<'a, U> {
         Compiler::build_with(move |builder| {
             let value = self.run(builder)?;
@@ -91,6 +94,7 @@ impl<'a> Compiler<'a, ValueId> {
     /// arm produces a value; control joins in a fresh block whose single
     /// block parameter carries the chosen result — no register is shared
     /// by convention between the arms.
+    #[allow(dead_code)] // exercised by unit tests; awaiting integration slices
     pub fn branch3(
         self,
         when_true: Compiler<'a, ValueId>,
@@ -130,6 +134,7 @@ impl<'a> Compiler<'a, ValueId> {
     /// value-position behavior, e.g. CASE with no matching WHEN). The
     /// false arm's *computation* is shared: the NULL edge jumps to the
     /// same block, it is not duplicated.
+    #[allow(dead_code)] // exercised by unit tests; awaiting integration slices
     pub fn branch(
         self,
         when_true: Compiler<'a, ValueId>,
@@ -267,6 +272,7 @@ impl<'a> Predicate<'a> {
 /// latch). The builder is left positioned in the loop's continuation
 /// block. Loop-carried values (block parameters on the body) come with
 /// the aggregate work; today's bodies are effect-only.
+#[allow(dead_code)] // exercised by unit tests; awaiting integration slices
 pub fn scan_loop<'a>(
     cursor: super::ir::CursorId,
     body: impl FnOnce(&mut FuncBuilder) -> Result<()> + 'a,
@@ -296,6 +302,7 @@ pub fn scan_loop<'a>(
 
 /// A value imported from a physical register owned by surrounding eager
 /// code. See [`super::ir::Inst::External`].
+#[allow(dead_code)] // exercised by unit tests; awaiting integration slices
 pub fn external(reg: usize) -> Compiler<'static, ValueId> {
     Compiler::build_with(move |builder| Ok(builder.external(reg)))
 }

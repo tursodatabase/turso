@@ -439,12 +439,48 @@ boundary (the whole tree is constant, so the span opened by
 - Read this file, then `core/translate/compiler/mod.rs` (module docs are
   load-bearing), then the checklist above. The IR is only as integrated
   as the checklist says — do not assume more.
-- The `#[allow(dead_code)]` on `combine`/`ir` in `compiler/mod.rs` exists
-  because the authoring surface (branches, block params, externals) is
-  test-only until Phase 2; drop the allows as integration catches up.
+- The module-blanket `#[allow(dead_code)]`s are gone; the remaining
+  test-only authoring surface (`pure`/`map`/`and_then`, `branch`/
+  `branch3`, `scan_loop`, externals, the forward scan shorthands)
+  carries targeted per-item allows so new dead code gets flagged.
 - When adding instructions: keep `Inst` `Eq + Hash` only if the new kind
   is safe to intern (effectful instructions must NOT be interned — gate
   `intern_in_entry` on purity when they arrive), keep emission iterative,
   capture affinity/collation in payloads rather than ambient state.
 - Never break `cargo clippy --workspace --all-features --all-targets --
   --deny=warnings` or `cargo fmt`.
+
+## Invariants learned from the first full CI run (PR #8118)
+
+- **Calls are never constant-hoisted.** Emission must not include
+  `Inst::Call` in constant spans even when every argument is constant:
+  span contents hoist into the program prologue and run
+  unconditionally, and calls can throw (`LIKE` with a malformed
+  ESCAPE, `abs(i64::MIN)`), so a call guarded by a CASE arm or
+  short-circuit must run exactly where control flow places it. The
+  eager path draws the same line — it marks leaf constants hoistable,
+  never `Insn::Function`. Pinned by the stmt_journal integration tests
+  (issue 6877) and a span-level unit test.
+- **`EmitRow` steers into the caller's result pack.** `emit_query`
+  pre-allocates the result-column registers before the scan hook runs;
+  emission must write those (`row_dest` binding on
+  `emit_condition_function`), not a fresh pack, or every composed-path
+  query shifts register numbering relative to eager (and the
+  pre-allocated registers go dead).
+- **Bytecode snapshots must be (re)recorded in release mode**
+  (`CI=1 make -C sqlite/conformance run-rust
+  ARGS='--snapshot-mode=always'`): hash-join snapshots embed
+  `DEFAULT_MEM_BUDGET`, which is deliberately 32KB under
+  `debug_assertions` but 64MB in the release builds CI runs. A local
+  debug run of the snapshot corpus will always mismatch the hash-join
+  snapshots — that is expected, not a regression. Intentional emission
+  shape changes require regenerating the snapshots in the same commit.
+- **Local runs skip snapshots** (`--snapshot-filter __never__`), so any
+  iteration that changes emitted shapes must run the snapshot corpus
+  before pushing.
+- The differential simulator found a pre-existing (not this branch)
+  wrong-results bug: the eager auto-index build over `REAL AS (col)
+  VIRTUAL` generated columns reads key columns from the ephemeral
+  cursor being built instead of evaluating the generator expression
+  (repro in PR #8118 comments, seed 15613764616140386778). Verified by
+  disabling all three compiler hooks and reproducing identically.

@@ -164,6 +164,7 @@ impl CmpOp {
 pub struct CmpId(u32);
 
 impl CmpId {
+    #[allow(dead_code)] // dense-id API symmetry with the other handles
     pub fn index(self) -> usize {
         self.0 as usize
     }
@@ -567,10 +568,6 @@ impl FuncBuilder {
         }
     }
 
-    pub fn current_block(&self) -> BlockId {
-        self.current
-    }
-
     /// Create a new, empty block. Does not change the current block.
     pub fn create_block(&mut self) -> BlockId {
         let id = BlockId(u32::try_from(self.blocks.len()).expect("block count fits in u32"));
@@ -619,6 +616,7 @@ impl FuncBuilder {
 
     /// Import a value that already lives in physical register `reg`
     /// outside this function. See [`Inst::External`].
+    #[allow(dead_code)] // exercised by unit tests; awaiting integration slices
     pub fn external(&mut self, reg: usize) -> ValueId {
         self.intern_in_entry(Inst::External { reg })
     }
@@ -737,12 +735,14 @@ impl FuncBuilder {
     }
 
     /// Forward [`Self::scan_start`]: rewind a declared cursor.
+    #[allow(dead_code)] // exercised by unit tests; awaiting integration slices
     pub fn rewind(&mut self, cursor: CursorId, if_empty: JumpTarget, if_rows: JumpTarget) {
         self.scan_start(cursor, ScanDirection::Forward, if_empty, if_rows);
     }
 
     /// Forward [`Self::scan_advance`]: step a declared cursor to its
     /// next row.
+    #[allow(dead_code)] // exercised by unit tests; awaiting integration slices
     pub fn next_row(&mut self, cursor: CursorId, if_more: JumpTarget, if_done: JumpTarget) {
         self.scan_advance(cursor, ScanDirection::Forward, if_more, if_done);
     }
@@ -840,6 +840,7 @@ impl FuncBuilder {
     }
 
     /// Terminate the current block by leaving the island for `exit`.
+    #[allow(dead_code)] // exercised by unit tests; awaiting integration slices
     pub fn exit(&mut self, exit: ExitId) {
         self.terminate(Terminator::Exit(exit));
     }

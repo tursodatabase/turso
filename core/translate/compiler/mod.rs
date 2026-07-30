@@ -26,11 +26,9 @@
 // callers by design: branches, block parameters, and external inputs are
 // exercised by unit tests until the translation slices that need them
 // land. Drop these allows as integration catches up.
-#[allow(dead_code)]
 pub(crate) mod combine;
 pub(crate) mod emit;
 pub(crate) mod expr;
-#[allow(dead_code)]
 pub(crate) mod ir;
 pub(crate) mod verify;
 
