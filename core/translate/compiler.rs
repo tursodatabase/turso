@@ -5414,35 +5414,117 @@ pub(crate) fn literal_values(
     values: SmallVec<[BoxedCompile<ValueId>; 4]>,
     affinity: Affinity,
     collation: Option<CollationSeq>,
-) -> DeferredLiteralValues {
-    DeferredLiteralValues {
+) -> DeferredInValues {
+    DeferredInValues::Literal(DeferredLiteralValues {
         values,
         affinity,
         collation,
+    })
+}
+
+pub(crate) fn cursor_values(
+    input: CursorInputId,
+    collation: Option<CollationSeq>,
+) -> DeferredInValues {
+    DeferredInValues::Cursor { input, collation }
+}
+
+pub(crate) enum DeferredInValues {
+    Literal(DeferredLiteralValues),
+    Cursor {
+        input: CursorInputId,
+        collation: Option<CollationSeq>,
+    },
+}
+
+impl DeferredInValues {
+    const fn collation(&self) -> Option<CollationSeq> {
+        match self {
+            Self::Literal(values) => values.collation,
+            Self::Cursor { collation, .. } => *collation,
+        }
     }
 }
 
-impl Compile for DeferredLiteralValues {
-    type Output = ReadySorterRows;
+pub(crate) enum InValueRows {
+    Literal(ReadySorterRows),
+    Cursor(CursorRows),
+}
+
+impl Compile for DeferredInValues {
+    type Output = InValueRows;
 
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
-        let sorter = builder.allocate_sorter_with_affinities(
-            smallvec![SortKey::new(SortOrder::Asc, self.collation, None, None,)],
-            1,
-            Some(smallvec![self.affinity]),
-        )?;
-        builder.push_effect(EffectOp::OpenSorter { sorter })?;
-        for value in self.values {
-            let value = value.compile(builder)?;
-            builder.push_effect(EffectOp::SorterInsert {
-                sorter,
-                pack: ValuePack(smallvec![value]),
-            })?;
+        match self {
+            Self::Literal(values) => {
+                let sorter = builder.allocate_sorter_with_affinities(
+                    smallvec![SortKey::new(SortOrder::Asc, values.collation, None, None,)],
+                    1,
+                    Some(smallvec![values.affinity]),
+                )?;
+                builder.push_effect(EffectOp::OpenSorter { sorter })?;
+                for value in values.values {
+                    let value = value.compile(builder)?;
+                    builder.push_effect(EffectOp::SorterInsert {
+                        sorter,
+                        pack: ValuePack(smallvec![value]),
+                    })?;
+                }
+                Ok(InValueRows::Literal(ReadySorterRows {
+                    sorter,
+                    record_width: 1,
+                }))
+            }
+            Self::Cursor { input, .. } => {
+                let cursor = builder.external_cursor(input)?;
+                Ok(InValueRows::Cursor(CursorRows {
+                    cursor,
+                    row_cursor: cursor,
+                    deferred_seek: None,
+                    source: CursorRowSource::Scan(ScanDirection::Forward),
+                }))
+            }
         }
-        Ok(ReadySorterRows {
-            sorter,
-            record_width: 1,
-        })
+    }
+}
+
+impl RowStream for InValueRows {
+    type Item = ValueId;
+
+    fn for_each_boxed(self, body: BoxedRowConsumer<Self::Item>) -> BoxedCompile<()> {
+        match self {
+            Self::Literal(rows) => {
+                rows.for_each_boxed(Box::new(move |row| row.column(0).and_then(body).boxed()))
+            }
+            Self::Cursor(rows) => {
+                rows.for_each_boxed(Box::new(move |row| row.column(0).and_then(body).boxed()))
+            }
+        }
+    }
+
+    fn try_fold_boxed(
+        self,
+        initial: BoxedCompile<LoopState>,
+        body: BoxedRowFolder<Self::Item>,
+    ) -> BoxedCompile<LoopState> {
+        match self {
+            Self::Literal(rows) => rows.try_fold_boxed(
+                initial,
+                Box::new(move |row, state| {
+                    row.column(0)
+                        .and_then(move |value| body(value, state))
+                        .boxed()
+                }),
+            ),
+            Self::Cursor(rows) => rows.try_fold_boxed(
+                initial,
+                Box::new(move |row, state| {
+                    row.column(0)
+                        .and_then(move |value| body(value, state))
+                        .boxed()
+                }),
+            ),
+        }
     }
 }
 
@@ -6037,7 +6119,7 @@ pub(crate) struct ScanBtree {
 
 pub(crate) struct InSeekBtree {
     source: ScanBtreeSource,
-    values: DeferredLiteralValues,
+    values: DeferredInValues,
     target: InSeekTarget,
     collation: CollationSeq,
 }
@@ -6049,7 +6131,7 @@ enum InSeekTarget {
 }
 
 pub(crate) struct InSeekRows {
-    values: ReadySorterRows,
+    values: InValueRows,
     target: CursorRows,
     kind: InSeekTarget,
     collation: CollationSeq,
@@ -6087,13 +6169,10 @@ impl InSeekRows {
         let target = self.target;
         let kind = self.kind;
         self.values
-            .distinct_by(smallvec![self.collation], |row| {
-                pack_values(smallvec![row.column(0).boxed()])
+            .distinct_by(smallvec![self.collation], |value| {
+                pack_values(smallvec![pure(value).boxed()])
             })
-            .flat_map(move |row| {
-                row.column(0)
-                    .map(move |key| Self::target_for_key(target, kind, key))
-            })
+            .flat_map(move |key| pure(Self::target_for_key(target, kind, key)))
     }
 }
 
@@ -6346,9 +6425,9 @@ pub(crate) fn seek_in_values(
     covering: bool,
     db: usize,
     schema_cookie: u32,
-    values: DeferredLiteralValues,
+    values: DeferredInValues,
 ) -> InSeekBtree {
-    let collation = values.collation;
+    let collation = values.collation();
     let (source, target) = match index {
         Some(index) => (
             index_source(table, index, covering, db, schema_cookie),
@@ -7231,6 +7310,47 @@ mod tests {
             .insns
             .iter()
             .any(|(instruction, _)| matches!(instruction, Insn::HashDistinct { .. })));
+    }
+
+    #[test]
+    fn in_values_can_scan_an_external_cursor_without_reopening_it() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE pointed(a,b)", 2).unwrap());
+        let values = cursor_values(CursorInputId::new(0), None);
+        let compiler = seek_in_values(table.clone(), None, false, 0, 0, values).and_then(|rows| {
+            rows.for_each(|row| {
+                pack_values(smallvec![row.rowid().boxed()]).and_then(result_row_pack)
+            })
+        });
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+
+        assert!(rendered.contains("cursor $1 = input &0"));
+        assert!(rendered.contains("cursor_start Forward $1"));
+        assert!(rendered.contains("cursor_seek_rowid $0"));
+        assert!(!rendered.contains("open_read $1"));
+        assert!(!rendered.contains("open_sorter"));
+
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 2, 0));
+        let bound_cursor =
+            program.alloc_cursor_id(CursorType::BTreeIndex(test_index(&table, "in_values", 3)));
+        let target = program.alloc_register();
+        ir.lower_into_with_resources(&mut program, target, &[], &[bound_cursor])
+            .unwrap();
+        program.resolve_labels().unwrap();
+
+        assert!(program.insns.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::Rewind { cursor_id, .. } if *cursor_id == bound_cursor
+        )));
+        assert!(program.insns.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::SeekRowid { cursor_id, .. } if *cursor_id != bound_cursor
+        )));
+        assert!(program
+            .insns
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::SorterOpen { .. })));
     }
 
     #[test]

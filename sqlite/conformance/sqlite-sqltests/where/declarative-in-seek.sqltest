@@ -9,6 +9,12 @@ test declarative-in-seeks-preserve-sql-semantics {
         WHERE id IN (5, '1', 1, NULL, 3)
         ORDER BY id LIMIT 2 OFFSET 1;
 
+    CREATE TABLE in_subquery_keys(id);
+    INSERT INTO in_subquery_keys VALUES (5), (1), (1), (NULL), (3);
+    SELECT id, payload FROM in_rows
+        WHERE id IN (SELECT id FROM in_subquery_keys)
+        ORDER BY id LIMIT 2 OFFSET 1;
+
     CREATE TABLE in_indexed(id INTEGER PRIMARY KEY, key NUMERIC, payload TEXT);
     CREATE INDEX in_indexed_key ON in_indexed(key);
     INSERT INTO in_indexed VALUES
@@ -23,6 +29,8 @@ test declarative-in-seeks-preserve-sql-semantics {
         ORDER BY id;
 }
 expect {
+    3|three
+    5|five
     3|three
     5|five
     1|one-a

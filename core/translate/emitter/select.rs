@@ -7,11 +7,11 @@ use crate::{
         aggregation::emit_ungrouped_aggregation,
         collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         compiler::{
-            compile_effect, literal_values, pack_values, result_row_pack, scan_index, scan_table,
-            seek_in_values, seek_index, seek_rowid, seek_table_range, select_pack, BoxedCompile,
-            Compile, DeferredIndexBound, DeferredIndexRange, DeferredTableBound,
-            DeferredTableRange, IrProgram, Row, RowStream, ScanDirection, SortKey, SortedRow,
-            ValueId,
+            compile_effect, cursor_values, literal_values, pack_values, result_row_pack,
+            scan_index, scan_table, seek_in_values, seek_index, seek_rowid, seek_table_range,
+            select_pack, BoxedCompile, Compile, CursorInputId, DeferredIndexBound,
+            DeferredIndexRange, DeferredTableBound, DeferredTableRange, IrProgram, Row, RowStream,
+            ScanDirection, SortKey, SortedRow, ValueId,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -28,7 +28,8 @@ use crate::{
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, InSeekSource, IndexMethodQuery,
             IterationDirection, JoinOrderMember, Operation, QueryDestination, Scan, Search,
-            SeekDef, SeekKey, SeekKeyComponent, SelectPlan, SimpleAggregate,
+            SeekDef, SeekKey, SeekKeyComponent, SelectPlan, SimpleAggregate, SubqueryEvalPhase,
+            SubqueryState,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -44,7 +45,7 @@ use crate::{
 use smallvec::SmallVec;
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
-use turso_parser::ast::{Expr, SortOrder};
+use turso_parser::ast::{Expr, SortOrder, SubqueryType};
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_select(
@@ -61,7 +62,7 @@ pub fn emit_program_for_select_with_resolver(
     mut plan: SelectPlan,
 ) -> Result<()> {
     let declarative_result_cols_start = program.with_scoped_result_cols_start(|program| {
-        try_emit_declarative_table_scan(program, &resolver, &plan)
+        try_emit_declarative_table_scan(program, &resolver, &mut plan)
     })?;
     if let Some(result_cols_start) = declarative_result_cols_start {
         program.result_columns = plan.result_columns;
@@ -137,8 +138,18 @@ enum DeclarativeBtreeAccess<'a> {
     },
     InValues {
         index: Option<&'a Arc<Index>>,
+        source: DeclarativeInSource<'a>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum DeclarativeInSource<'a> {
+    Literal {
         values: &'a [Expr],
         affinity: Affinity,
+    },
+    Subquery {
+        cursor_id: CursorID,
     },
 }
 
@@ -165,7 +176,7 @@ impl<'a> DeclarativeBtreeAccess<'a> {
 fn try_emit_declarative_table_scan(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    plan: &SelectPlan,
+    plan: &mut SelectPlan,
 ) -> Result<Option<usize>> {
     if matches!(program.get_query_mode(), QueryMode::ExplainQueryPlan)
         || !matches!(plan.query_destination, QueryDestination::ResultRows)
@@ -174,7 +185,6 @@ fn try_emit_declarative_table_scan(
         || plan.contains_constant_false_condition
         || !plan.values.is_empty()
         || plan.window.is_some()
-        || !plan.non_from_clause_subqueries.is_empty()
         || plan.simple_aggregate.is_some()
         || !plan.phantom_params.is_empty()
         || !plan.table_references.outer_query_refs().is_empty()
@@ -233,10 +243,52 @@ fn try_emit_declarative_table_scan(
             source: InSeekSource::LiteralList { values, affinity },
         }) => DeclarativeBtreeAccess::InValues {
             index: index.as_ref(),
-            values,
-            affinity: *affinity,
+            source: DeclarativeInSource::Literal {
+                values,
+                affinity: *affinity,
+            },
+        },
+        Operation::Search(Search::InSeek {
+            index,
+            source: InSeekSource::Subquery { cursor_id },
+        }) => DeclarativeBtreeAccess::InValues {
+            index: index.as_ref(),
+            source: DeclarativeInSource::Subquery {
+                cursor_id: *cursor_id,
+            },
         },
         _ => return Ok(None),
+    };
+    let external_in_cursor = match access {
+        DeclarativeBtreeAccess::InValues {
+            source: DeclarativeInSource::Subquery { cursor_id },
+            ..
+        } => {
+            let [subquery] = plan.non_from_clause_subqueries.as_slice() else {
+                return Ok(None);
+            };
+            if subquery.correlated
+                || subquery.eval_phase != SubqueryEvalPhase::BeforeLoop
+                || !matches!(
+                    &subquery.state,
+                    SubqueryState::Unevaluated { plan: Some(_) }
+                )
+                || !matches!(
+                    &subquery.query_type,
+                    SubqueryType::In {
+                        cursor_id: subquery_cursor,
+                        ..
+                    } if *subquery_cursor == cursor_id
+                )
+                || subquery.get_eval_at(&plan.join_order, Some(&plan.table_references))?
+                    != EvalAt::BeforeLoop
+            {
+                return Ok(None);
+            }
+            Some((cursor_id, subquery.internal_id))
+        }
+        _ if !plan.non_from_clause_subqueries.is_empty() => return Ok(None),
+        _ => None,
     };
     let direction = access.direction();
     let index = access.index();
@@ -279,7 +331,10 @@ fn try_emit_declarative_table_scan(
         &plan.table_references,
     );
     let in_values = match access {
-        DeclarativeBtreeAccess::InValues { values, .. } => {
+        DeclarativeBtreeAccess::InValues {
+            source: DeclarativeInSource::Literal { values, affinity },
+            ..
+        } => {
             let mut compiled = SmallVec::with_capacity(values.len());
             for value in values {
                 let Some(resolved) = expr_resolver.resolve(value)? else {
@@ -290,8 +345,23 @@ fn try_emit_declarative_table_scan(
                 };
                 compiled.push(value);
             }
-            Some(compiled)
+            Some(literal_values(
+                compiled,
+                affinity,
+                index
+                    .and_then(|index| index.columns.first())
+                    .and_then(|column| column.collation),
+            ))
         }
+        DeclarativeBtreeAccess::InValues {
+            source: DeclarativeInSource::Subquery { .. },
+            ..
+        } => Some(cursor_values(
+            CursorInputId::new(0),
+            index
+                .and_then(|index| index.columns.first())
+                .and_then(|column| column.collation),
+        )),
         _ => None,
     };
     let rowid_eq = match access {
@@ -525,21 +595,13 @@ fn try_emit_declarative_table_scan(
             schema_cookie,
             index_range.expect("index range access must compile a range"),
         )),
-        DeclarativeBtreeAccess::InValues {
-            index, affinity, ..
-        } => body.compile(seek_in_values(
+        DeclarativeBtreeAccess::InValues { index, .. } => body.compile(seek_in_values(
             table,
             index.cloned(),
             covering_index.is_some(),
             database_id,
             schema_cookie,
-            literal_values(
-                in_values.expect("IN-list access must compile its values"),
-                affinity,
-                index
-                    .and_then(|index| index.columns.first())
-                    .and_then(|column| column.collation),
-            ),
+            in_values.expect("IN access must compile its value source"),
         )),
         DeclarativeBtreeAccess::Scan {
             index: Some(index), ..
@@ -556,7 +618,20 @@ fn try_emit_declarative_table_scan(
         }
     }?;
     let target_register = program.alloc_register();
-    let lowered = ir.lower_into(program, target_register)?;
+    let lowered = if let Some((cursor_id, subquery_id)) = external_in_cursor {
+        emit_non_from_clause_subqueries_for_eval_at(
+            program,
+            resolver,
+            &mut plan.non_from_clause_subqueries,
+            &plan.join_order,
+            Some(&plan.table_references),
+            EvalAt::BeforeLoop,
+            |subquery| subquery.internal_id == subquery_id,
+        )?;
+        ir.lower_into_with_resources(program, target_register, &[], &[cursor_id])?
+    } else {
+        ir.lower_into(program, target_register)?
+    };
     let (result_cols_start, result_column_count) = lowered.single_result_row_pack()?;
     if result_column_count != plan.result_columns.len() {
         return Err(LimboError::InternalError(format!(
@@ -1868,6 +1943,94 @@ mod tests {
             vec![
                 vec![Value::from_i64(3), Value::from_text("three")],
                 vec![Value::from_i64(5), Value::from_text("five")],
+            ]
+        );
+    }
+
+    #[test]
+    fn uncorrelated_in_subquery_binds_its_materialized_cursor_to_the_nested_stream() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute("CREATE TABLE subquery_rows(id INTEGER PRIMARY KEY, payload TEXT)")
+            .unwrap();
+        connection
+            .execute("CREATE TABLE subquery_keys(id)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO subquery_rows VALUES \
+                 (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four'), (5, 'five')",
+            )
+            .unwrap();
+        connection
+            .execute("INSERT INTO subquery_keys VALUES (5), (1), (1), (NULL), (3)")
+            .unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT id, payload FROM subquery_rows \
+                 WHERE id IN (SELECT id FROM subquery_keys) LIMIT 2 OFFSET 1",
+            )
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::SeekRowid { .. }))
+                .count(),
+            1
+        );
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::OpenEphemeral { .. })));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::HashDistinct { .. })));
+        assert!(instructions
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::SorterOpen { .. })));
+        let result_row = instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 2, .. }))
+            .expect("declarative subquery IN stream must produce its projected row pack");
+        assert!(instructions[result_row - 2..result_row]
+            .iter()
+            .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })));
+
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(3), Value::from_text("three")],
+                vec![Value::from_i64(5), Value::from_text("five")],
+            ]
+        );
+
+        let mut correlated = connection
+            .prepare(
+                "SELECT outer_row.id FROM subquery_rows AS outer_row \
+                 WHERE outer_row.id IN (\
+                     SELECT key_row.id FROM subquery_keys AS key_row \
+                     WHERE key_row.id <= outer_row.id\
+                 ) ORDER BY outer_row.id",
+            )
+            .unwrap();
+        let correlated_instructions = &correlated.get_program().insns;
+        let result_row = correlated_instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. }))
+            .expect("correlated eager fallback must produce its projected row");
+        assert!(!matches!(
+            correlated_instructions[result_row - 1].0,
+            Insn::Copy { .. }
+        ));
+        assert_eq!(
+            correlated.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(1)],
+                vec![Value::from_i64(3)],
+                vec![Value::from_i64(5)],
             ]
         );
     }
