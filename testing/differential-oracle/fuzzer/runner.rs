@@ -85,6 +85,8 @@ impl Default for SimConfig {
 pub struct SimStats {
     /// Number of statements executed.
     pub statements_executed: usize,
+    /// Number of statements skipped because EXPLAIN failed in at least one engine.
+    pub statements_skipped: usize,
     /// Number of oracle warnings (e.g., LIMIT without ORDER BY mismatches).
     pub warnings: usize,
     /// Number of oracle failures.
@@ -134,6 +136,10 @@ impl SimStats {
         table.add_row(vec![
             Cell::new("Statements Executed").fg(Color::Blue),
             Cell::new(self.statements_executed).fg(Color::Blue),
+        ]);
+        table.add_row(vec![
+            Cell::new("Statements Skipped").fg(Color::Yellow),
+            Cell::new(self.statements_skipped).fg(Color::Yellow),
         ]);
 
         // Warnings - yellow if any
@@ -413,6 +419,13 @@ impl Fuzzer {
                 OracleResult::Pass => {
                     stats.statements_executed += 1;
                     executed_sql.push(stmt.sql.clone());
+                }
+                OracleResult::Skipped(reason) => {
+                    stats.statements_skipped += 1;
+                    push_warning_comments(executed_sql, i, &reason);
+                    executed_sql.push(format!("-- SKIPPED: {}", stmt.sql));
+                    tracing::debug!("Skipped generated statement {i}: {reason}");
+                    continue;
                 }
                 OracleResult::Warning(reason) => {
                     stats.statements_executed += 1;
