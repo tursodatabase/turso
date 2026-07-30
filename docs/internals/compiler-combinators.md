@@ -145,6 +145,12 @@ its table or index resource. A source list may therefore cross attached
 databases without choosing cursor numbers or opening any resource during SQL
 planning; lowering registers the read transaction for each database when it
 emits that source's open effect.
+Root and dependent sources have distinct description types. Root access accepts
+only statically compiled keys, ranges, and `IN` producers and can create a row
+stream without an input row. A dependent source instead stores expressions
+resolved against rows to its left, and its positioning operation requires a
+`SymbolicRows` value. The source fold therefore cannot accidentally compile a
+dependent key without its dominating outer row or pass outer rows to the root.
 Table resource acquisition is separate from stream positioning. `open_table`
 produces a non-cloneable symbolic `OpenedTable`; consuming that handle with
 `scan`, `seek_rowid`, or `seek_range` produces the row stream. A dependent join
