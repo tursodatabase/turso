@@ -5997,6 +5997,14 @@ type BoxedDistinctKey<Item> = Box<dyn FnOnce(Item) -> BoxedCompile<ValuePack>>;
 pub(crate) trait RowStream: Sized + 'static {
     type Item: 'static;
 
+    /// Erase the concrete adapter stack while preserving its symbolic item
+    /// type and deferred execution semantics.
+    fn erase(self) -> ErasedRows<Self::Item> {
+        ErasedRows {
+            source: Box::new(self),
+        }
+    }
+
     fn for_each<BodyFn, Body>(self, body: BodyFn) -> BoxedCompile<()>
     where
         BodyFn: FnOnce(Self::Item) -> Body + 'static,
@@ -6177,6 +6185,59 @@ pub(crate) trait RowStream: Sized + 'static {
             collations,
             key: Box::new(move |item| key(item).boxed()),
         }
+    }
+}
+
+trait ErasedRowStream<Item>: 'static {
+    fn for_each_erased(self: Box<Self>, body: BoxedRowConsumer<Item>) -> BoxedCompile<()>;
+
+    fn try_fold_erased(
+        self: Box<Self>,
+        initial: BoxedCompile<LoopState>,
+        body: BoxedRowFolder<Item>,
+    ) -> BoxedCompile<LoopState>;
+}
+
+impl<Item, Source> ErasedRowStream<Item> for Source
+where
+    Item: 'static,
+    Source: RowStream<Item = Item>,
+{
+    fn for_each_erased(self: Box<Self>, body: BoxedRowConsumer<Item>) -> BoxedCompile<()> {
+        RowStream::for_each_boxed(*self, body)
+    }
+
+    fn try_fold_erased(
+        self: Box<Self>,
+        initial: BoxedCompile<LoopState>,
+        body: BoxedRowFolder<Item>,
+    ) -> BoxedCompile<LoopState> {
+        RowStream::try_fold_boxed(*self, initial, body)
+    }
+}
+
+/// A row stream with its concrete adapter stack erased.
+///
+/// This is the stream equivalent of [`BoxedCompile`]: SQL frontends can fold a
+/// planner-sized list of sources into one nested stream without exposing or
+/// eagerly executing the resulting concrete `flat_map` type.
+pub(crate) struct ErasedRows<Item> {
+    source: Box<dyn ErasedRowStream<Item>>,
+}
+
+impl<Item: 'static> RowStream for ErasedRows<Item> {
+    type Item = Item;
+
+    fn for_each_boxed(self, body: BoxedRowConsumer<Self::Item>) -> BoxedCompile<()> {
+        self.source.for_each_erased(body)
+    }
+
+    fn try_fold_boxed(
+        self,
+        initial: BoxedCompile<LoopState>,
+        body: BoxedRowFolder<Self::Item>,
+    ) -> BoxedCompile<LoopState> {
+        self.source.try_fold_erased(initial, body)
     }
 }
 
@@ -9510,6 +9571,25 @@ mod tests {
                 "  jump block4()\n",
             )
         );
+    }
+
+    #[test]
+    fn erased_row_stream_preserves_deferred_adapters() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE erased(a,b)", 2).unwrap());
+        let compiler = scan_table(table, 0, 0, ScanDirection::Forward).and_then(|rows| {
+            rows.map(|row| row.column(0))
+                .erase()
+                .filter(pure)
+                .map(pure)
+                .for_each(|value| result_row([value]))
+        });
+
+        let rendered = compile_effect(compiler).unwrap().to_string();
+
+        assert!(rendered.contains("cursor_start Forward $0"));
+        assert!(rendered.contains("%0 = column $0[0]"));
+        assert!(rendered.contains("branch %0"));
+        assert!(rendered.contains("result_row [%0]"));
     }
 
     #[test]

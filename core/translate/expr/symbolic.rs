@@ -121,6 +121,11 @@ impl SymbolicRows {
         }
     }
 
+    pub(crate) fn with_row(mut self, row: Row) -> Self {
+        self.rows.push(row);
+        self
+    }
+
     fn get(&self, position: usize) -> Option<Row> {
         self.rows.get(position).copied()
     }

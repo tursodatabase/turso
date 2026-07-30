@@ -107,12 +107,13 @@ moves. This makes register coalescing and reuse independent of edge-copy order.
 
 The current IR supports straight-line scalar operations, conditional diamonds,
 explicit loops with block parameters, and effectful cursor folds and row
-production. A production SELECT path uses these pieces for B-tree scans and a
-first two-table inner nested-loop join. Its frontend first resolves an owned
-scalar description, then compiles that description against each symbolic row
-set. Columns, literals, numeric and bitwise arithmetic, three-valued `AND` and
-`OR`, both forms of `CASE`, parentheses, collation wrappers, and ordinary
-comparisons can be nested and shared by both result expressions and predicates.
+production. A production SELECT path uses these pieces for B-tree scans,
+arbitrary-width inner joins whose members are full table scans, and dependent
+searches in a two-table inner join. Its frontend first resolves an owned scalar
+description, then compiles that description against each symbolic row set.
+Columns, literals, numeric and bitwise arithmetic, three-valued `AND` and `OR`,
+both forms of `CASE`, parentheses, collation wrappers, and ordinary comparisons
+can be nested and shared by both result expressions and predicates.
 It composes `scan_table`, row-stream operators, scalar projection, and
 `result_row`, then builds and verifies the complete IR before touching
 `ProgramBuilder`.
@@ -133,6 +134,13 @@ construction, so join predicates and projections can reference either row
 without leaking SQL identifiers into the compiler IR. Filtering, sorting,
 distinctness, slicing, and destinations then consume the joined stream through
 the same operators as a single-table scan.
+For a planner-sized list of full table scans, every table resource is opened in
+source order and the frontend folds the remaining scans over the first stream.
+Each fold appends one symbolic row slot through another `flat_map`, producing an
+N-way nested-loop CFG without selecting cursor numbers or emitting bytecode.
+The concrete Rust adapter type is erased after every fold, while the item type
+remains `SymbolicRows`; this is what lets the same composition handle three or
+more sources without hard-coding tuple arities.
 Table resource acquisition is separate from stream positioning. `open_table`
 produces a non-cloneable symbolic `OpenedTable`; consuming that handle with
 `scan`, `seek_rowid`, or `seek_range` produces the row stream. A dependent join
@@ -199,11 +207,13 @@ use `first_or(NULL)`, which represents SQLite's empty-result and first-row
 semantics without assigning a result register or emitting a subroutine.
 
 The authoring surface remains generically typed, but stream consumption erases
-the concrete compiler and row-callback types at every adapter boundary. This is
-the practical escape hatch used by parser-combinator libraries for large
-recursive descriptions: it bounds Rust monomorphization and generated symbol
-size without assigning registers, emitting VDBE instructions, or losing the
-typed item and result contracts visible to compiler authors.
+the concrete compiler and row-callback types at every adapter boundary.
+`ErasedRows<T>` additionally erases a complete adapter stack while retaining
+its symbolic item type, enabling dynamic folds over planner-sized source lists.
+These are the practical escape hatches used by parser-combinator libraries for
+large recursive descriptions: they bound Rust monomorphization and generated
+symbol size without assigning registers, emitting VDBE instructions, or losing
+the typed item and result contracts visible to compiler authors.
 The production path preserves predicate and projection source order. Comparison
 affinity, collation, and NULL policy are resolved by the SQL frontend before IR
 construction. Ordinary comparison terminators have separate true, false, and
@@ -226,8 +236,9 @@ and composes each ordered arm from `then`, `and_then`, comparison, and `branch`;
 NULL comparison results follow the false arm, as required by SQLite.
 The path also falls back when SQL semantics still live in the eager frontend:
 other expression forms, outer and semi/anti joins, unsupported index-range
-shapes, joins wider than two tables or spanning attached databases, aggregates,
-most subquery forms, generated values, arrays, and custom-type decoding.
+shapes, joins wider than two tables when a member needs indexed or dependent
+positioning, joins spanning attached databases, aggregates, most subquery forms,
+generated values, arrays, and custom-type decoding.
 `EXPLAIN QUERY PLAN` also remains on the eager path until the IR models
 explain-tree effects.
 Ordinary column lowering does reuse the VDBE backend's logical-column helper, so

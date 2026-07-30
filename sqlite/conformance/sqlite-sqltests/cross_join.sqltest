@@ -386,6 +386,21 @@ expect {
     12
 }
 
+test cross-join-three-tables-filtered-expression {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (10), (20);
+    INSERT INTO t3 VALUES (100), (200);
+    SELECT t1.a, t2.b, t3.c, t1.a + t2.b + t3.c
+    FROM t1 CROSS JOIN t2 CROSS JOIN t3
+    WHERE t1.a + t2.b + t3.c = 221;
+}
+expect {
+    1|20|200|221
+}
+
 test cross-join-subquery-right {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);

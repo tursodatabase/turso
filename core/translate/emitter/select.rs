@@ -14,8 +14,8 @@ use crate::{
             seek_table_range, select_pack, BoxedCompile, Compile, CompileRegion, CursorId,
             CursorInputId, DeferredInValues, DeferredIndexBound, DeferredIndexRange,
             DeferredTableBound, DeferredTableRange, InputProducer, InputRequirement,
-            InputRequirements, InputSlot, PhysicalInputBinding, Row, RowStream, ScanDirection,
-            SortKey, SortedRow, ValueId, ValuePack,
+            InputRequirements, InputSlot, OpenedTable, PhysicalInputBinding, Row, RowStream,
+            ScanDirection, SortKey, SortedRow, ValueId, ValuePack,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -1071,6 +1071,16 @@ fn try_compile_declarative_table_scan(
         _ => return Ok(None),
     };
 
+    if plan.join_order.len() > 2 {
+        return try_compile_declarative_multi_scan_join(
+            resolver,
+            plan,
+            destination,
+            destination_index,
+            inputs,
+        );
+    }
+
     if plan.join_order.len() == 2 {
         return try_compile_declarative_inner_join(
             resolver,
@@ -1372,6 +1382,163 @@ fn try_compile_declarative_table_scan(
             inputs,
         ),
     };
+    Ok(Some(DeclarativeSelectProgram {
+        compiler,
+        destination_index,
+        result_column_count: plan.result_columns.len(),
+    }))
+}
+
+fn nested_table_scans(
+    mut tables: SmallVec<[OpenedTable; 4]>,
+    mut directions: SmallVec<[ScanDirection; 4]>,
+) -> impl RowStream<Item = SymbolicRows> {
+    assert_eq!(tables.len(), directions.len());
+    assert!(!tables.is_empty());
+
+    let first_table = tables.remove(0);
+    let first_direction = directions.remove(0);
+    let mut rows = first_table
+        .scan(first_direction)
+        .map(|row| pure(SymbolicRows::single(row)))
+        .erase();
+    for (table, direction) in tables.into_iter().zip(directions) {
+        rows = rows
+            .flat_map(move |outer_rows| {
+                pure(
+                    table
+                        .scan(direction)
+                        .map(move |row| pure(outer_rows.with_row(row)))
+                        .erase(),
+                )
+            })
+            .erase();
+    }
+    rows
+}
+
+fn try_compile_declarative_multi_scan_join(
+    resolver: &Resolver,
+    plan: &SelectPlan,
+    destination: DeclarativeSelectDestination,
+    destination_index: Option<Arc<Index>>,
+    mut inputs: InputRequirements<DeclarativeInputSource>,
+) -> Result<Option<DeclarativeSelectProgram>> {
+    if plan.join_order.len() < 3 {
+        return Ok(None);
+    }
+    let joined_tables = plan.table_references.joined_tables();
+    if joined_tables.len() != plan.join_order.len()
+        || joined_tables.iter().any(|joined| {
+            joined
+                .join_info
+                .as_ref()
+                .is_some_and(|info| info.join_type != JoinType::Inner)
+        })
+    {
+        return Ok(None);
+    }
+
+    let Some(first_member) = plan.join_order.first() else {
+        return Ok(None);
+    };
+    let Some(first_joined) = joined_tables.get(first_member.original_idx) else {
+        return Ok(None);
+    };
+    let database_id = first_joined.database_id;
+
+    let mut seen = SmallVec::<[usize; 4]>::new();
+    let mut tables = SmallVec::<[Arc<BTreeTable>; 4]>::new();
+    let mut directions = SmallVec::<[ScanDirection; 4]>::new();
+    for member in &plan.join_order {
+        let Some(joined) = joined_tables.get(member.original_idx) else {
+            return Ok(None);
+        };
+        if member.table_id != joined.internal_id
+            || member.is_outer
+            || seen.contains(&member.original_idx)
+        {
+            return Ok(None);
+        }
+        seen.push(member.original_idx);
+        if joined.database_id != database_id {
+            return Ok(None);
+        }
+        let Table::BTree(table) = &joined.table else {
+            return Ok(None);
+        };
+        let Operation::Scan(Scan::BTreeTable {
+            iter_dir,
+            index: None,
+        }) = &joined.op
+        else {
+            return Ok(None);
+        };
+        tables.push(table.clone());
+        directions.push(match iter_dir {
+            IterationDirection::Forwards => ScanDirection::Forward,
+            IterationDirection::Backwards => ScanDirection::Reverse,
+        });
+    }
+
+    let Table::BTree(first_table) = &first_joined.table else {
+        unreachable!("validated multi-table join contains only B-tree tables");
+    };
+    let mut expr_resolver = RowExprResolver::new(
+        resolver,
+        first_joined.database_id,
+        first_joined.internal_id,
+        first_table,
+        RowLayout::Table,
+        &plan.table_references,
+    );
+    for member in &plan.join_order[1..] {
+        let joined = &joined_tables[member.original_idx];
+        let Table::BTree(table) = &joined.table else {
+            unreachable!("validated multi-table join contains only B-tree tables");
+        };
+        expr_resolver.add_source(
+            joined.database_id,
+            joined.internal_id,
+            table,
+            RowLayout::Table,
+        );
+    }
+    let Some(body) = resolve_declarative_select_body(
+        plan,
+        resolver,
+        &mut expr_resolver,
+        database_id,
+        plan.join_order.len() - 1,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(dependencies) = validate_and_order_declarative_dependencies(
+        plan,
+        None,
+        expr_resolver.into_scalar_inputs(),
+    )?
+    else {
+        return Ok(None);
+    };
+    for dependency in dependencies {
+        inputs.declare(dependency)?;
+    }
+
+    let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
+    let mut opened = pure(SmallVec::<[OpenedTable; 4]>::new()).boxed();
+    for table in tables {
+        opened = opened
+            .then(open_table(table, database_id, schema_cookie))
+            .map(|(mut opened, table)| {
+                opened.push(table);
+                opened
+            })
+            .boxed();
+    }
+    let rows = opened.map(move |tables| nested_table_scans(tables, directions));
+    let compiler = body.into_symbolic_compiler(rows, destination, inputs);
     Ok(Some(DeclarativeSelectProgram {
         compiler,
         destination_index,
@@ -5311,6 +5478,70 @@ mod tests {
                 vec![Value::from_i64(2), Value::from_i64(24), Value::from_i64(4),],
                 vec![Value::from_i64(1), Value::from_i64(13), Value::from_i64(3),],
             ]
+        );
+    }
+
+    #[test]
+    fn three_table_inner_join_composes_nested_symbolic_streams() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute("CREATE TABLE join_a(value INTEGER)")
+            .unwrap();
+        connection
+            .execute("CREATE TABLE join_b(value INTEGER)")
+            .unwrap();
+        connection
+            .execute("CREATE TABLE join_c(value INTEGER)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO join_a VALUES (1), (2)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO join_b VALUES (10), (20)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO join_c VALUES (100), (200)")
+            .unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT a.value, b.value, c.value, a.value + b.value + c.value \
+                   FROM join_a AS a \
+                  CROSS JOIN join_b AS b \
+                  CROSS JOIN join_c AS c \
+                  WHERE a.value + b.value + c.value = 221",
+            )
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::Rewind { .. }))
+                .count(),
+            3,
+            "the composed stream must rewind every table cursor"
+        );
+        let result_row = instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 4, .. }))
+            .expect("declarative join must produce one four-value result pack");
+        assert!(
+            instructions[result_row - 4..result_row]
+                .iter()
+                .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })),
+            "all joined projections must remain symbolic until result-pack lowering: {instructions:#?}"
+        );
+
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![vec![
+                Value::from_i64(1),
+                Value::from_i64(20),
+                Value::from_i64(200),
+                Value::from_i64(221),
+            ]]
         );
     }
 
