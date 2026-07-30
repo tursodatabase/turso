@@ -209,6 +209,40 @@ where
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct BindCursorInput<Compiler> {
+    input: CursorInputId,
+    cursor: CursorId,
+    compiler: Compiler,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn bind_cursor_input<Compiler>(
+    input: CursorInputId,
+    cursor: CursorId,
+    compiler: Compiler,
+) -> BindCursorInput<Compiler> {
+    BindCursorInput {
+        input,
+        cursor,
+        compiler,
+    }
+}
+
+impl<Compiler> Compile for BindCursorInput<Compiler>
+where
+    Compiler: Compile,
+{
+    type Output = Compiler::Output;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let previous = builder.bind_cursor_input(self.input, self.cursor)?;
+        let result = self.compiler.compile(builder);
+        builder.restore_cursor_input(self.input, previous);
+        result
+    }
+}
+
 pub(crate) struct Branch<Condition, IfTrue, IfFalse> {
     condition: Condition,
     if_true: IfTrue,
@@ -1939,6 +1973,7 @@ pub(crate) struct IrBuilder {
     next_value: u32,
     input_count: u32,
     cursor_input_count: u32,
+    cursor_input_bindings: SmallVec<[Option<CursorId>; 2]>,
     cursor_resources: SmallVec<[CursorResource; 2]>,
     sorter_resources: SmallVec<[SorterResource; 1]>,
     distinct_set_resources: SmallVec<[DistinctSetResource; 1]>,
@@ -1958,6 +1993,7 @@ impl IrBuilder {
             next_value: 0,
             input_count: 0,
             cursor_input_count: 0,
+            cursor_input_bindings: SmallVec::new(),
             cursor_resources: SmallVec::new(),
             sorter_resources: SmallVec::new(),
             distinct_set_resources: SmallVec::new(),
@@ -1974,12 +2010,38 @@ impl IrBuilder {
     }
 
     fn external_cursor(&mut self, input: CursorInputId) -> Result<CursorId> {
+        if let Some(cursor) = self
+            .cursor_input_bindings
+            .get(input.index())
+            .copied()
+            .flatten()
+        {
+            return Ok(cursor);
+        }
         self.cursor_input_count = self
             .cursor_input_count
             .max(input.0.checked_add(1).ok_or_else(|| {
                 LimboError::InternalError("compiler IR cursor input identifier overflow".to_owned())
             })?);
         self.allocate_cursor(CursorResource::External(input))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn bind_cursor_input(
+        &mut self,
+        input: CursorInputId,
+        cursor: CursorId,
+    ) -> Result<Option<CursorId>> {
+        self.ensure_cursor_declared(cursor)?;
+        if self.cursor_input_bindings.len() <= input.index() {
+            self.cursor_input_bindings.resize(input.index() + 1, None);
+        }
+        Ok(self.cursor_input_bindings[input.index()].replace(cursor))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn restore_cursor_input(&mut self, input: CursorInputId, previous: Option<CursorId>) {
+        self.cursor_input_bindings[input.index()] = previous;
     }
 
     fn ensure_cursor_declared(&self, cursor: CursorId) -> Result<()> {
@@ -9103,6 +9165,58 @@ mod tests {
             .position(|(instruction, _)| matches!(instruction, Insn::Rewind { cursor_id: 0, .. }))
             .unwrap();
         assert!(open < insert && insert < rewind);
+    }
+
+    #[test]
+    fn cursor_input_binding_composes_descriptions_over_one_owned_cursor() {
+        let index = Arc::new(Index {
+            name: "bound_ephemeral".to_owned(),
+            table_name: String::new(),
+            root_page: 0,
+            columns: vec![IndexColumn::new("key", 0)],
+            unique: false,
+            ephemeral: true,
+            has_rowid: false,
+            where_clause: None,
+            index_method: None,
+            on_conflict: None,
+        });
+        let input = CursorInputId::new(0);
+        let compiler = open_ephemeral_index(index).and_then(move |cursor| {
+            let producer = cursor_input(input)
+                .then(pack_values(smallvec![constant(Value::from_i64(7)).boxed()]))
+                .and_then(|(destination, pack)| {
+                    insert_index_pack(
+                        destination,
+                        pack,
+                        "bound_ephemeral".to_owned(),
+                        Some("D".to_owned()),
+                    )
+                });
+            let consumer = producer
+                .and_then(move |()| cursor_input(input))
+                .and_then(|source| {
+                    scan_cursor(source, ScanDirection::Forward).for_each(|row| {
+                        pack_values(smallvec![row.column(0).boxed()]).and_then(result_row_pack)
+                    })
+                });
+            bind_cursor_input(input, cursor, consumer)
+        });
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+
+        assert!(rendered.contains("cursor $0 = btree_index \"bound_ephemeral\" root 0"));
+        assert!(!rendered.contains("external_cursor"));
+        assert!(rendered.contains("open_ephemeral_index $0"));
+        assert!(rendered.contains("index_insert $0 [%0]"));
+        assert!(rendered.contains("cursor_start Forward $0"));
+
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 2, 0));
+        let target = program.alloc_register();
+        let lowered = ir.lower_into(&mut program, target).unwrap();
+        assert_eq!(lowered.single_result_row_pack().unwrap().1, 1);
+        assert_eq!(program.cursor_ref.len(), 1);
     }
 
     #[test]
