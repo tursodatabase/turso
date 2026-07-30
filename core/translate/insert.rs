@@ -29,7 +29,7 @@ use crate::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
             TableReferences,
         },
-        planner::{plan_ctes_as_outer_refs, ROWID_STRS},
+        planner::ROWID_STRS,
         select::translate_select,
         stmt_journal::{any_index_or_ipk_has_replace, set_insert_stmt_journal_flags},
         subquery::{
@@ -343,14 +343,41 @@ pub fn translate_insert(
         vec![],
     );
 
-    // Plan CTEs and add them as outer query references for RETURNING subquery resolution
-    plan_ctes_as_outer_refs(
-        with_for_returning,
-        resolver,
-        program,
-        &mut table_references,
-        connection,
-    )?;
+    // Bind the RETURNING clause: resolve names against the target table and
+    // any WITH-clause CTEs (for subqueries inside RETURNING).
+    let mut bound_returning_subqueries = {
+        let mut with_for_returning = with_for_returning;
+        let target_id = table_references.joined_tables()[0].internal_id;
+        let mut binder = super::bind::BindContext::new(resolver, program);
+        let (cte_definitions, subquery_bindings) = binder.bind_insert_returning(
+            &tbl_name.name,
+            target_id,
+            &mut returning,
+            &mut with_for_returning,
+            database_id,
+        )?;
+
+        // Plan the CTEs and expose them as definition-only outer refs so
+        // RETURNING subqueries can reference them.
+        let planned_ctes =
+            super::planner::plan_bound_ctes(cte_definitions, resolver, program, connection)?;
+        for (name, jt) in &planned_ctes {
+            table_references.add_outer_query_reference(super::plan::OuterQueryReference {
+                identifier: name.clone(),
+                internal_id: jt.internal_id,
+                table: jt.table.clone(),
+                using_dedup_hidden_cols: super::plan::ColumnMask::default(),
+                col_used_mask: ColumnUsedMask::default(),
+                cte_select: None,
+                cte_explicit_columns: vec![],
+                cte_id: None,
+                cte_definition_only: true,
+                rowid_referenced: false,
+                scope_depth: 0,
+            });
+        }
+        subquery_bindings
+    };
 
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)
@@ -362,12 +389,12 @@ pub fn translate_insert(
         &mut returning,
         resolver,
         connection,
-        &mut rustc_hash::FxHashMap::default(),
+        &mut bound_returning_subqueries,
     )?;
 
     // Process RETURNING clause using shared module
     let mut result_columns =
-        process_returning_clause(&mut returning, &mut table_references, resolver, false)?;
+        process_returning_clause(&mut returning, &mut table_references, resolver, true)?;
     let has_fks = fk_enabled
         && (resolver.with_schema(database_id, |s| s.has_child_fks(table_name.as_str()))
             || resolver.with_schema(database_id, |s| {
