@@ -68,6 +68,23 @@ input arity are interface metadata rather than runtime value instructions. A
 parameter occurring only in removed code therefore still creates its bind slot,
 while its VDBE `Variable` instruction is not emitted.
 
+Register allocation computes backwards liveness over the optimized control-flow
+graph and colors an SSA interference graph. Values whose lifetimes do not
+overlap can share one physical register, including values in mutually exclusive
+branch arms and preheader values whose storage is dead before a loop-body
+temporary is defined. Block parameters are simultaneous definitions at block
+entry. The paired parameter packs targeted by cursor rewind and advance also
+remain distinct because the current VDBE lowering materializes both packs before
+choosing the successor. External input registers and the caller-provided result
+register stay fixed; comparison scratch registers and contiguous result-row
+packs are allocated separately from the SSA color pool.
+
+Block arguments are parallel assignments, not an ordered series of copies.
+Lowering emits every acyclic move only after its destination is no longer needed
+as a source. A cyclic transfer, such as swapping two loop-carried values, saves
+one source in a reusable temporary register before completing the remaining
+moves. This makes register coalescing and reuse independent of edge-copy order.
+
 ## Migration plan
 
 1. Introduce the deferred compiler interface and a straight-line scalar IR.

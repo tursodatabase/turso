@@ -6,6 +6,7 @@
 
 use std::{fmt, marker::PhantomData};
 
+use rustc_hash::FxHashSet as HashSet;
 use smallvec::{smallvec, SmallVec};
 use turso_parser::ast::Variable;
 
@@ -523,7 +524,7 @@ where
 }
 
 /// The symbolic result of one SSA operation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct ValueId(u32);
 
 impl ValueId {
@@ -1837,6 +1838,202 @@ impl IrProgram {
         defined
     }
 
+    /// Compute the values live after each block terminator. Block parameters
+    /// are definitions at the successor entry; their incoming edge arguments
+    /// are uses in the predecessor block.
+    fn live_out_values(&self) -> Vec<HashSet<ValueId>> {
+        let mut block_uses = Vec::with_capacity(self.blocks.len());
+        let mut block_definitions = Vec::with_capacity(self.blocks.len());
+        for block in &self.blocks {
+            let mut uses = HashSet::default();
+            let mut definitions = HashSet::default();
+            definitions.extend(block.parameters.iter().copied());
+            for instruction in &block.instructions {
+                for operand in instruction.operands() {
+                    if !definitions.contains(&operand) {
+                        uses.insert(operand);
+                    }
+                }
+                if let Instruction::Value { result, .. } = instruction {
+                    definitions.insert(*result);
+                }
+            }
+            for operand in block.terminator.operands() {
+                if !definitions.contains(&operand) {
+                    uses.insert(operand);
+                }
+            }
+            block_uses.push(uses);
+            block_definitions.push(definitions);
+        }
+
+        let mut live_in = vec![HashSet::default(); self.blocks.len()];
+        let mut live_out = vec![HashSet::default(); self.blocks.len()];
+        loop {
+            let mut changed = false;
+            for block_index in (0..self.blocks.len()).rev() {
+                let mut next_out = HashSet::default();
+                for successor in self.blocks[block_index].terminator.successors() {
+                    next_out.extend(live_in[successor.index()].iter().copied());
+                }
+                let mut next_in = block_uses[block_index].clone();
+                next_in.extend(
+                    next_out
+                        .iter()
+                        .filter(|value| !block_definitions[block_index].contains(value))
+                        .copied(),
+                );
+                if next_out != live_out[block_index] {
+                    live_out[block_index] = next_out;
+                    changed = true;
+                }
+                if next_in != live_in[block_index] {
+                    live_in[block_index] = next_in;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return live_out;
+            }
+        }
+    }
+
+    fn add_interference(interference: &mut [HashSet<ValueId>], first: ValueId, second: ValueId) {
+        if first == second {
+            return;
+        }
+        interference[first.index()].insert(second);
+        interference[second.index()].insert(first);
+    }
+
+    /// Build a conservative SSA interference graph. Results also interfere
+    /// with their operands so lowering never relies on a VDBE instruction
+    /// accepting an aliased input and destination register.
+    fn value_interference(&self) -> Vec<HashSet<ValueId>> {
+        let live_out = self.live_out_values();
+        let mut interference = vec![HashSet::default(); self.value_count as usize];
+
+        for block in &self.blocks {
+            let mut live = live_out[block.id.index()].clone();
+            live.extend(block.terminator.operands());
+            for instruction in block.instructions.iter().rev() {
+                match instruction {
+                    Instruction::Value { result, op } => {
+                        let operands = op.operands().collect::<SmallVec<[_; 2]>>();
+                        for other in live.iter().chain(operands.iter()) {
+                            Self::add_interference(&mut interference, *result, *other);
+                        }
+                        live.remove(result);
+                        live.extend(operands);
+                    }
+                    Instruction::Effect(_) => live.extend(instruction.operands()),
+                }
+            }
+
+            // Every parameter receives a value at the block entry, including
+            // signature positions retained for shared cursor edges. Keep all
+            // destinations distinct and away from values live through entry.
+            for (index, parameter) in block.parameters.iter().enumerate() {
+                for other in &block.parameters[index + 1..] {
+                    Self::add_interference(&mut interference, *parameter, *other);
+                }
+                for other in &live {
+                    Self::add_interference(&mut interference, *parameter, *other);
+                }
+            }
+
+            // Cursor terminators materialize both successor argument lists
+            // before branching. Those two parameter packs therefore coexist
+            // physically even though only one successor executes.
+            let shared_targets = match &block.terminator {
+                Terminator::CursorRewind {
+                    if_non_empty,
+                    if_empty,
+                    ..
+                } => Some((*if_non_empty, *if_empty)),
+                Terminator::CursorNext {
+                    if_next, if_done, ..
+                } => Some((*if_next, *if_done)),
+                _ => None,
+            };
+            if let Some((first, second)) = shared_targets {
+                for first in &self.blocks[first.index()].parameters {
+                    for second in &self.blocks[second.index()].parameters {
+                        Self::add_interference(&mut interference, *first, *second);
+                    }
+                }
+            }
+        }
+        interference
+    }
+
+    fn allocate_value_registers(
+        &self,
+        program: &mut ProgramBuilder,
+        target_register: usize,
+        input_registers: &[usize],
+    ) -> SmallVec<[Option<usize>; 8]> {
+        let output = self.output();
+        let defined_values = self.defined_values();
+        let mut input_values = vec![None; self.value_count as usize];
+        for block in &self.blocks {
+            for instruction in &block.instructions {
+                if let Instruction::Value {
+                    result,
+                    op: ScalarOp::Input(input),
+                } = instruction
+                {
+                    input_values[result.index()] = Some(*input);
+                }
+            }
+        }
+
+        let interference = self.value_interference();
+        let mut colors = vec![None; self.value_count as usize];
+        let mut color_count = 0;
+        for value in 0..self.value_count {
+            let value = ValueId(value);
+            if !defined_values[value.index()]
+                || value == output
+                || input_values[value.index()].is_some()
+            {
+                continue;
+            }
+            let mut unavailable = vec![false; color_count];
+            for neighbor in &interference[value.index()] {
+                if let Some(color) = colors[neighbor.index()] {
+                    unavailable[color] = true;
+                }
+            }
+            let color = unavailable
+                .iter()
+                .position(|unavailable| !unavailable)
+                .unwrap_or_else(|| {
+                    color_count += 1;
+                    color_count - 1
+                });
+            colors[value.index()] = Some(color);
+        }
+        let physical_colors = (0..color_count)
+            .map(|_| program.alloc_register())
+            .collect::<SmallVec<[_; 8]>>();
+
+        (0..self.value_count)
+            .map(|value| {
+                let value = ValueId(value);
+                if !defined_values[value.index()] {
+                    None
+                } else if value == output {
+                    Some(target_register)
+                } else if let Some(input) = input_values[value.index()] {
+                    Some(input_registers[input.index()])
+                } else {
+                    Some(physical_colors[colors[value.index()].expect("allocatable SSA value")])
+                }
+            })
+            .collect()
+    }
+
     fn required_cursors(&self) -> Vec<bool> {
         let mut required = vec![false; self.cursor_resources.len()];
         for block in &self.blocks {
@@ -1863,12 +2060,12 @@ impl IrProgram {
         cursors[cursor.index()].expect("verified live cursor has a physical cursor")
     }
 
-    fn emit_edge_copies(
+    fn collect_edge_copies(
         &self,
-        program: &mut ProgramBuilder,
         registers: &[Option<usize>],
         target: BlockId,
         arguments: &[ValueId],
+        copies: &mut SmallVec<[(usize, usize); 8]>,
     ) {
         for (argument, parameter) in arguments
             .iter()
@@ -1876,14 +2073,71 @@ impl IrProgram {
         {
             let source = Self::register_for(registers, *argument);
             let destination = Self::register_for(registers, *parameter);
-            if source != destination {
+            if source == destination {
+                continue;
+            }
+            if let Some((existing_source, _)) = copies
+                .iter()
+                .find(|(_, existing_destination)| *existing_destination == destination)
+            {
+                assert_eq!(
+                    *existing_source, source,
+                    "one physical edge destination cannot receive different SSA values"
+                );
+            } else {
+                copies.push((source, destination));
+            }
+        }
+    }
+
+    fn emit_parallel_copies(
+        program: &mut ProgramBuilder,
+        mut copies: SmallVec<[(usize, usize); 8]>,
+        temporary: &mut Option<usize>,
+    ) {
+        while !copies.is_empty() {
+            if let Some(index) = copies
+                .iter()
+                .position(|(_, destination)| copies.iter().all(|(source, _)| source != destination))
+            {
+                let (source, destination) = copies.remove(index);
                 program.emit_insn(Insn::Copy {
                     src_reg: source,
                     dst_reg: destination,
                     extra_amount: 0,
                 });
+                continue;
+            }
+
+            // Every remaining destination is still needed as a source, so the
+            // moves contain a cycle. Preserve one source and rewrite all of
+            // its pending uses to break that cycle.
+            let source = copies[0].0;
+            let temporary = *temporary.get_or_insert_with(|| program.alloc_register());
+            program.emit_insn(Insn::Copy {
+                src_reg: source,
+                dst_reg: temporary,
+                extra_amount: 0,
+            });
+            for (pending_source, _) in &mut copies {
+                if *pending_source == source {
+                    *pending_source = temporary;
+                }
             }
         }
+    }
+
+    fn emit_edge_copies(
+        &self,
+        program: &mut ProgramBuilder,
+        registers: &[Option<usize>],
+        target: BlockId,
+        arguments: &[ValueId],
+        temporary: &mut Option<usize>,
+    ) {
+        let mut copies = SmallVec::new();
+        self.collect_edge_copies(registers, target, arguments, &mut copies);
+        Self::emit_parallel_copies(program, copies, temporary);
     }
 
     /// Assign physical registers and labels, then append equivalent VDBE instructions.
@@ -1955,33 +2209,7 @@ impl IrProgram {
                 },
             )
             .collect::<SmallVec<[Option<usize>; 2]>>();
-        let output = self.output();
-        let defined_values = self.defined_values();
-        let mut input_values = vec![None; self.value_count as usize];
-        for block in &self.blocks {
-            for instruction in &block.instructions {
-                if let Instruction::Value {
-                    result,
-                    op: ScalarOp::Input(input),
-                } = instruction
-                {
-                    input_values[result.index()] = Some(*input);
-                }
-            }
-        }
-        let registers = (0..self.value_count)
-            .map(|value| {
-                if !defined_values[value as usize] {
-                    None
-                } else if ValueId(value) == output {
-                    Some(target_register)
-                } else if let Some(input) = input_values[value as usize] {
-                    Some(input_registers[input.index()])
-                } else {
-                    Some(program.alloc_register())
-                }
-            })
-            .collect::<SmallVec<[Option<usize>; 8]>>();
+        let registers = self.allocate_value_registers(program, target_register, input_registers);
         let labels = self
             .blocks
             .iter()
@@ -2005,6 +2233,7 @@ impl IrProgram {
         let continuation =
             (return_block + 1 != self.blocks.len()).then(|| program.allocate_label());
         let mut result_row_packs = SmallVec::new();
+        let mut edge_copy_temporary = None;
 
         for block in &self.blocks {
             if targeted[block.id.index()] {
@@ -2140,7 +2369,13 @@ impl IrProgram {
             }
             match &block.terminator {
                 Terminator::Jump { target, arguments } => {
-                    self.emit_edge_copies(program, &registers, *target, arguments);
+                    self.emit_edge_copies(
+                        program,
+                        &registers,
+                        *target,
+                        arguments,
+                        &mut edge_copy_temporary,
+                    );
                     program.emit_insn(Insn::Goto {
                         target_pc: labels[target.index()],
                     });
@@ -2249,9 +2484,11 @@ impl IrProgram {
                     if_empty,
                     arguments,
                 } => {
+                    let mut copies = SmallVec::new();
                     for target in [if_non_empty, if_empty] {
-                        self.emit_edge_copies(program, &registers, *target, arguments);
+                        self.collect_edge_copies(&registers, *target, arguments, &mut copies);
                     }
+                    Self::emit_parallel_copies(program, copies, &mut edge_copy_temporary);
                     program.emit_insn(Insn::Rewind {
                         cursor_id: Self::cursor_for(&physical_cursors, *cursor),
                         pc_if_empty: labels[if_empty.index()],
@@ -2266,9 +2503,11 @@ impl IrProgram {
                     if_done,
                     arguments,
                 } => {
+                    let mut copies = SmallVec::new();
                     for target in [if_next, if_done] {
-                        self.emit_edge_copies(program, &registers, *target, arguments);
+                        self.collect_edge_copies(&registers, *target, arguments, &mut copies);
                     }
+                    Self::emit_parallel_copies(program, copies, &mut edge_copy_temporary);
                     program.emit_insn(Insn::Next {
                         cursor_id: Self::cursor_for(&physical_cursors, *cursor),
                         pc_if_next: labels[if_next.index()],
@@ -3914,6 +4153,89 @@ mod tests {
     }
 
     #[test]
+    fn straight_line_lifetimes_reuse_non_overlapping_registers() {
+        let compiler = constant(Value::from_i64(7))
+            .and_then(must_be_int)
+            .and_then(must_be_int)
+            .and_then(must_be_int);
+        let ir = compile_scalar(compiler).unwrap();
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 4, 0));
+        let target = program.alloc_register();
+
+        ir.lower_into(&mut program, target).unwrap();
+
+        assert_eq!(program.peek_next_register(), target + 3);
+        assert!(matches!(
+            program.insns.as_slice(),
+            [
+                (Insn::Integer { dest: first, .. }, _),
+                (Insn::Copy { dst_reg: second, .. }, _),
+                (Insn::MustBeInt { reg: second_check, .. }, _),
+                (Insn::Copy { dst_reg: third, .. }, _),
+                (Insn::MustBeInt { reg: third_check, .. }, _),
+                (Insn::Copy { dst_reg: result, .. }, _),
+                (Insn::MustBeInt { reg: result_check, .. }, _),
+            ] if *first == *third
+                && *second == *second_check
+                && *third == *third_check
+                && *result == target
+                && *result_check == target
+        ));
+    }
+
+    #[test]
+    fn mutually_exclusive_branch_values_share_a_register() {
+        let compiler = parameter(Variable::indexed(1.try_into().unwrap()))
+            .branch(constant(Value::from_i64(10)), constant(Value::from_i64(20)));
+        let ir = compile_scalar(compiler).unwrap();
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 4, 0));
+        let target = program.alloc_register();
+
+        ir.lower_into(&mut program, target).unwrap();
+
+        assert_eq!(program.peek_next_register(), target + 2);
+        let destinations = program
+            .insns
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::Variable { dest, .. } | Insn::Integer { dest, .. } => Some(*dest),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(destinations.len(), 3);
+        assert!(destinations
+            .iter()
+            .all(|destination| { *destination == destinations[0] && *destination != target }));
+    }
+
+    #[test]
+    fn loop_temporaries_reuse_preheader_storage() {
+        let compiler = constant(Value::from_i64(3)).loop_while(pure, |state| {
+            constant(Value::from_i64(-1)).and_then(move |step| add(state, step))
+        });
+        let ir = compile_scalar(compiler).unwrap();
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 4, 0));
+        let target = program.alloc_register();
+
+        ir.lower_into(&mut program, target).unwrap();
+
+        assert_eq!(program.peek_next_register(), target + 3);
+        let constant_destinations = program
+            .insns
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::Integer { dest, .. } => Some(*dest),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(constant_destinations.len(), 2);
+        assert_eq!(constant_destinations[0], constant_destinations[1]);
+    }
+
+    #[test]
     fn dead_value_elimination_preserves_integer_coercion_errors() {
         let compiler = constant(Value::Text("not an integer".into()))
             .and_then(must_be_int)
@@ -4151,6 +4473,77 @@ mod tests {
         let rows = statement.run_collect_rows().unwrap();
 
         assert_eq!(rows, vec![vec![Value::from_i64(0)]]);
+    }
+
+    #[test]
+    fn parallel_edge_copies_preserve_loop_carried_swaps() {
+        let mut ir = IrBuilder::new();
+        let first = ir.push(ScalarOp::Constant(Value::from_i64(1))).unwrap();
+        let second = ir.push(ScalarOp::Constant(Value::from_i64(2))).unwrap();
+        let remaining = ir.push(ScalarOp::Constant(Value::from_i64(1))).unwrap();
+        let header = ir.create_block().unwrap();
+        let body = ir.create_block().unwrap();
+        let exit = ir.create_block().unwrap();
+        let carried_first = ir.add_block_parameter(header).unwrap();
+        let carried_second = ir.add_block_parameter(header).unwrap();
+        let carried_remaining = ir.add_block_parameter(header).unwrap();
+        ir.terminate(Terminator::Jump {
+            target: header,
+            arguments: smallvec![first, second, remaining],
+        })
+        .unwrap();
+
+        ir.switch_to(header).unwrap();
+        ir.terminate(Terminator::Branch {
+            condition: carried_remaining,
+            if_true: body,
+            if_false: exit,
+        })
+        .unwrap();
+
+        ir.switch_to(body).unwrap();
+        let decrement = ir.push(ScalarOp::Constant(Value::from_i64(-1))).unwrap();
+        let next_remaining = ir
+            .push(ScalarOp::Add {
+                lhs: carried_remaining,
+                rhs: decrement,
+            })
+            .unwrap();
+        ir.terminate(Terminator::Jump {
+            target: header,
+            arguments: smallvec![carried_second, carried_first, next_remaining],
+        })
+        .unwrap();
+
+        ir.switch_to(exit).unwrap();
+        ir.push_effect(EffectOp::ResultRow {
+            pack: ValuePack(smallvec![carried_first, carried_second]),
+        })
+        .unwrap();
+        let ir = ir.finish(carried_first).unwrap();
+
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        let mut builder =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 10, 0));
+        let result = builder.alloc_register();
+        ir.lower_into(&mut builder, result).unwrap();
+        builder.emit_insn(Insn::Halt {
+            err_code: 0,
+            description: String::new(),
+            on_error: None,
+            description_reg: None,
+        });
+        let program = builder
+            .build(connection.clone(), false, "parallel edge copy test")
+            .unwrap();
+        let mut statement = Statement::new(program, connection.get_pager(), QueryMode::Normal, 0);
+
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(2), Value::from_i64(1)]]
+        );
     }
 
     #[test]
