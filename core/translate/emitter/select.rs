@@ -1,15 +1,16 @@
 use crate::{
     alloc::{TursoFromIterator, TursoIteratorExt},
     emit_explain,
-    schema::{BTreeCharacteristics, BTreeTable, Table},
+    schema::{BTreeCharacteristics, BTreeTable, Index, Table},
     sync::Arc,
     translate::{
         aggregation::emit_ungrouped_aggregation,
         collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         compiler::{
             compile_effect, pack_values, result_row_pack, scan_index, scan_table, seek_index,
-            seek_rowid, select_pack, BoxedCompile, Compile, DeferredIndexBound, DeferredIndexRange,
-            Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId,
+            seek_rowid, seek_table_range, select_pack, BoxedCompile, Compile, DeferredIndexBound,
+            DeferredIndexRange, DeferredTableBound, DeferredTableRange, Row, RowStream,
+            ScanDirection, SortKey, SortedRow, ValueId,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -25,8 +26,8 @@ use crate::{
         order_by::{custom_type_comparator, EmitOrderBy},
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, IterationDirection,
-            JoinOrderMember, Operation, QueryDestination, Scan, Search, SeekKey, SeekKeyComponent,
-            SelectPlan, SimpleAggregate,
+            JoinOrderMember, Operation, QueryDestination, Scan, Search, SeekDef, SeekKey,
+            SeekKeyComponent, SelectPlan, SimpleAggregate,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -36,7 +37,7 @@ use crate::{
         ProgramBuilder, Resolver,
     },
     types::SeekOp,
-    vdbe::{builder::QueryMode, insn::Insn},
+    vdbe::{affinity::Affinity, builder::QueryMode, insn::Insn},
     HashMap, HashSet, LimboError, Result,
 };
 use smallvec::SmallVec;
@@ -96,6 +97,64 @@ fn compile_deferred_index_bound(
     }))
 }
 
+fn compile_deferred_table_bound(
+    key: &SeekKey,
+    expr_resolver: &RowExprResolver<'_, '_>,
+) -> Result<Option<DeferredTableBound>> {
+    Ok(Some(match &key.last_component {
+        SeekKeyComponent::None => DeferredTableBound::unbounded(key.op),
+        // A rowid range has no SQL NULL sentinel. If the planner ever
+        // constructs one, retain the eager path until its meaning is explicit.
+        SeekKeyComponent::Null => return Ok(None),
+        SeekKeyComponent::Expr(expression) => {
+            let Some(resolved) = expr_resolver.resolve(expression)? else {
+                return Ok(None);
+            };
+            let Some(value) = compile_symbolic_static_expr(&resolved) else {
+                return Ok(None);
+            };
+            DeferredTableBound::expression(value, key.op)
+        }
+    }))
+}
+
+#[derive(Clone, Copy)]
+enum DeclarativeBtreeAccess<'a> {
+    Scan {
+        direction: ScanDirection,
+        index: Option<&'a Arc<Index>>,
+    },
+    RowidEq(&'a Expr),
+    TableRange {
+        direction: ScanDirection,
+        seek_def: &'a SeekDef,
+    },
+    IndexRange {
+        direction: ScanDirection,
+        index: &'a Arc<Index>,
+        seek_def: &'a SeekDef,
+    },
+}
+
+impl<'a> DeclarativeBtreeAccess<'a> {
+    const fn direction(self) -> ScanDirection {
+        match self {
+            Self::Scan { direction, .. }
+            | Self::TableRange { direction, .. }
+            | Self::IndexRange { direction, .. } => direction,
+            Self::RowidEq(_) => ScanDirection::Forward,
+        }
+    }
+
+    const fn index(self) -> Option<&'a Arc<Index>> {
+        match self {
+            Self::Scan { index, .. } => index,
+            Self::IndexRange { index, .. } => Some(index),
+            Self::RowidEq(_) | Self::TableRange { .. } => None,
+        }
+    }
+}
+
 fn try_emit_declarative_table_scan(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -130,40 +189,49 @@ fn try_emit_declarative_table_scan(
     {
         return Ok(None);
     }
-    let (direction, index, rowid_eq, index_seek) = match &joined.op {
-        Operation::Scan(Scan::BTreeTable { iter_dir, index }) => (
-            match iter_dir {
+    let access = match &joined.op {
+        Operation::Scan(Scan::BTreeTable { iter_dir, index }) => DeclarativeBtreeAccess::Scan {
+            direction: match iter_dir {
                 IterationDirection::Forwards => ScanDirection::Forward,
                 IterationDirection::Backwards => ScanDirection::Reverse,
             },
-            index.as_ref(),
-            None,
-            None,
-        ),
+            index: index.as_ref(),
+        },
         Operation::Search(Search::RowidEq { cmp_expr }) => {
-            (ScanDirection::Forward, None, Some(cmp_expr), None)
+            DeclarativeBtreeAccess::RowidEq(cmp_expr)
         }
+        Operation::Search(Search::Seek {
+            index: None,
+            seek_def,
+        }) => DeclarativeBtreeAccess::TableRange {
+            direction: match seek_def.iter_dir {
+                IterationDirection::Forwards => ScanDirection::Forward,
+                IterationDirection::Backwards => ScanDirection::Reverse,
+            },
+            seek_def,
+        },
         Operation::Search(Search::Seek {
             index: Some(index),
             seek_def,
-        }) => (
-            match seek_def.iter_dir {
+        }) => DeclarativeBtreeAccess::IndexRange {
+            direction: match seek_def.iter_dir {
                 IterationDirection::Forwards => ScanDirection::Forward,
                 IterationDirection::Backwards => ScanDirection::Reverse,
             },
-            Some(index),
-            None,
-            Some(seek_def),
-        ),
+            index,
+            seek_def,
+        },
         _ => return Ok(None),
     };
+    let direction = access.direction();
+    let index = access.index();
     let Table::BTree(table) = &joined.table else {
         return Ok(None);
     };
     if index.is_some_and(|index| index.ephemeral || index.index_method.is_some()) {
         return Ok(None);
     }
-    if index_seek.is_some()
+    if matches!(access, DeclarativeBtreeAccess::IndexRange { .. })
         && index.is_some_and(|index| {
             resolver.with_schema(joined.database_id, |schema| {
                 index.columns.iter().any(|index_column| {
@@ -193,9 +261,8 @@ fn try_emit_declarative_table_scan(
         row_layout,
         &plan.table_references,
     );
-    let rowid_eq = match rowid_eq {
-        None => None,
-        Some(rowid_eq) => {
+    let rowid_eq = match access {
+        DeclarativeBtreeAccess::RowidEq(rowid_eq) => {
             let Some(rowid_eq) = expr_resolver.resolve(rowid_eq)? else {
                 return Ok(None);
             };
@@ -204,14 +271,39 @@ fn try_emit_declarative_table_scan(
             };
             Some(rowid_eq)
         }
+        _ => None,
     };
-    let index_range = match index_seek {
-        None => None,
-        Some(seek_def)
-            if seek_def
-                .prefix
+    let table_range = match access {
+        DeclarativeBtreeAccess::TableRange {
+            direction,
+            seek_def,
+        } if seek_def.prefix.is_empty() => {
+            let Some(start) = compile_deferred_table_bound(&seek_def.start, &expr_resolver)? else {
+                return Ok(None);
+            };
+            let Some(end) = compile_deferred_table_bound(&seek_def.end, &expr_resolver)? else {
+                return Ok(None);
+            };
+            let affinity = table
+                .columns()
                 .iter()
-                .all(|constraint| constraint.eq.is_some()) =>
+                .find(|column| column.is_rowid_alias())
+                .map(|column| column.affinity())
+                .unwrap_or(Affinity::Numeric);
+            Some(DeferredTableRange::new(start, end, direction, affinity))
+        }
+        DeclarativeBtreeAccess::TableRange { .. } => return Ok(None),
+        _ => None,
+    };
+    let index_range = match access {
+        DeclarativeBtreeAccess::IndexRange {
+            direction,
+            index,
+            seek_def,
+        } if seek_def
+            .prefix
+            .iter()
+            .all(|constraint| constraint.eq.is_some()) =>
         {
             let mut values = SmallVec::with_capacity(seek_def.prefix.len());
             let mut affinities = SmallVec::with_capacity(seek_def.prefix.len());
@@ -243,7 +335,7 @@ fn try_emit_declarative_table_scan(
             // An unconstrained physical edge can include NULL keys that SQL
             // range predicates must skip. Make that boundary explicit before
             // handing the range to the SQL-agnostic compiler IR.
-            let first_index_order = index.expect("index seek has an index").columns[0].order;
+            let first_index_order = index.columns[0].order;
             if seek_def.prefix.is_empty()
                 && matches!(seek_def.start.last_component, SeekKeyComponent::None)
             {
@@ -274,7 +366,8 @@ fn try_emit_declarative_table_scan(
                 values, affinities, start, end, direction,
             ))
         }
-        Some(_) => return Ok(None),
+        DeclarativeBtreeAccess::IndexRange { .. } => return Ok(None),
+        _ => None,
     };
     let mut sort_keys = SmallVec::<[SortKey; 4]>::with_capacity(plan.order_by.len());
     let mut sort_expressions =
@@ -369,17 +462,30 @@ fn try_emit_declarative_table_scan(
     let database_id = joined.database_id;
     let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
     let result_column_count = projections.len();
-    let scan = match (rowid_eq, index_range, index) {
-        (Some(rowid), None, None) => seek_rowid(table, database_id, schema_cookie, rowid),
-        (None, Some(range), Some(index)) => seek_index(
+    let scan = match access {
+        DeclarativeBtreeAccess::RowidEq(_) => seek_rowid(
+            table,
+            database_id,
+            schema_cookie,
+            rowid_eq.expect("rowid equality access must compile a key"),
+        ),
+        DeclarativeBtreeAccess::TableRange { .. } => seek_table_range(
+            table,
+            database_id,
+            schema_cookie,
+            table_range.expect("table range access must compile a range"),
+        ),
+        DeclarativeBtreeAccess::IndexRange { index, .. } => seek_index(
             table,
             index.clone(),
             covering_index.is_some(),
             database_id,
             schema_cookie,
-            range,
+            index_range.expect("index range access must compile a range"),
         ),
-        (None, None, Some(index)) => scan_index(
+        DeclarativeBtreeAccess::Scan {
+            index: Some(index), ..
+        } => scan_index(
             table,
             index.clone(),
             covering_index.is_some(),
@@ -387,8 +493,9 @@ fn try_emit_declarative_table_scan(
             schema_cookie,
             direction,
         ),
-        (None, None, None) => scan_table(table, database_id, schema_cookie, direction),
-        _ => unreachable!("planner access methods have one declarative B-tree source"),
+        DeclarativeBtreeAccess::Scan { index: None, .. } => {
+            scan_table(table, database_id, schema_cookie, direction)
+        }
     };
     let compiler = scan.and_then(move |rows| {
         if predicates.is_empty() {
@@ -2019,6 +2126,172 @@ mod tests {
         assert_eq!(
             eager_fallback.run_collect_rows().unwrap(),
             vec![vec![Value::from_i64(5)], vec![Value::from_i64(6)]]
+        );
+    }
+
+    #[test]
+    fn rowid_ranges_use_declarative_table_endpoints() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute("CREATE TABLE rowid_ranged(id INTEGER PRIMARY KEY, payload TEXT)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO rowid_ranged VALUES \
+                 (1, 'one'), (2, 'two'), (3, 'three'), \
+                 (4, 'four'), (5, 'five'), (6, 'six')",
+            )
+            .unwrap();
+
+        let mut forward = connection
+            .prepare(
+                "SELECT id, payload FROM rowid_ranged \
+                 WHERE id > ?1 AND id <= ?2 ORDER BY id LIMIT 2 OFFSET 1",
+            )
+            .unwrap();
+        let instructions = &forward.get_program().insns;
+        assert!(instructions.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::SeekGT {
+                is_index: false,
+                num_regs: 1,
+                ..
+            }
+        )));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Gt { .. })));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Next { .. })));
+        let result_row = instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 2, .. }))
+            .expect("bounded rowid stream must produce its projected row pack");
+        assert!(instructions[result_row - 2..result_row]
+            .iter()
+            .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })));
+
+        forward
+            .bind_at(1.try_into().unwrap(), Value::from_text("1"))
+            .unwrap();
+        forward
+            .bind_at(2.try_into().unwrap(), Value::from_text("5"))
+            .unwrap();
+        assert_eq!(
+            forward.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(3), Value::from_text("three")],
+                vec![Value::from_i64(4), Value::from_text("four")],
+            ]
+        );
+        forward.reset().unwrap();
+        forward.bind_at(1.try_into().unwrap(), Value::Null).unwrap();
+        forward
+            .bind_at(2.try_into().unwrap(), Value::from_i64(5))
+            .unwrap();
+        assert!(forward.run_collect_rows().unwrap().is_empty());
+
+        let mut reverse = connection
+            .prepare(
+                "SELECT id FROM rowid_ranged \
+                 WHERE id >= 2 AND id < 6 ORDER BY id DESC",
+            )
+            .unwrap();
+        let reverse_instructions = &reverse.get_program().insns;
+        assert!(reverse_instructions.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::SeekLT {
+                is_index: false,
+                num_regs: 1,
+                ..
+            }
+        )));
+        assert!(reverse_instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Lt { .. })));
+        assert!(reverse_instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Prev { .. })));
+        assert_eq!(
+            reverse.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(5)],
+                vec![Value::from_i64(4)],
+                vec![Value::from_i64(3)],
+                vec![Value::from_i64(2)],
+            ]
+        );
+
+        let mut no_start = connection
+            .prepare("SELECT id FROM rowid_ranged WHERE id < 4 ORDER BY id")
+            .unwrap();
+        assert!(no_start
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Rewind { .. })));
+        assert!(no_start
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Ge { .. })));
+        assert_eq!(
+            no_start.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(1)],
+                vec![Value::from_i64(2)],
+                vec![Value::from_i64(3)],
+            ]
+        );
+
+        let mut no_end = connection
+            .prepare("SELECT id FROM rowid_ranged WHERE id > 3 ORDER BY id")
+            .unwrap();
+        assert!(no_end
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(
+                instruction,
+                Insn::SeekGT {
+                    is_index: false,
+                    ..
+                }
+            )));
+        assert_eq!(
+            no_end.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(4)],
+                vec![Value::from_i64(5)],
+                vec![Value::from_i64(6)],
+            ]
+        );
+
+        let mut eager_fallback = connection
+            .prepare("SELECT id FROM rowid_ranged WHERE id > abs(?1)")
+            .unwrap();
+        let fallback_instructions = &eager_fallback.get_program().insns;
+        let result_row = fallback_instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. }))
+            .expect("eager fallback must produce its projected row");
+        assert!(!matches!(
+            fallback_instructions[result_row - 1].0,
+            Insn::Copy { .. }
+        ));
+        eager_fallback
+            .bind_at(1.try_into().unwrap(), Value::from_i64(-3))
+            .unwrap();
+        assert_eq!(
+            eager_fallback.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(4)],
+                vec![Value::from_i64(5)],
+                vec![Value::from_i64(6)],
+            ]
         );
     }
 

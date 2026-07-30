@@ -399,12 +399,11 @@ where
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
         let row = builder.create_block()?;
         let exit = builder.create_block()?;
-        let check = match &self.source {
-            CursorRowSource::IndexRange(range) if range.end.is_some() => {
-                Some(builder.create_block()?)
-            }
-            _ => None,
-        };
+        let check = self
+            .source
+            .has_end_bound()
+            .then(|| builder.create_block())
+            .transpose()?;
 
         match self.source.clone() {
             CursorRowSource::Scan(direction) => builder.terminate(Terminator::CursorStart {
@@ -421,6 +420,23 @@ where
                 if_not_found: exit,
                 arguments: SmallVec::new(),
             })?,
+            CursorRowSource::TableRange(range) => match range.start {
+                Some(start) => builder.terminate(Terminator::TableSeek {
+                    cursor: self.cursor,
+                    rowid: start.rowid,
+                    op: start.op,
+                    if_found: check.unwrap_or(row),
+                    if_empty: exit,
+                    arguments: SmallVec::new(),
+                })?,
+                None => builder.terminate(Terminator::CursorStart {
+                    cursor: self.cursor,
+                    direction: range.direction,
+                    if_non_empty: check.unwrap_or(row),
+                    if_empty: exit,
+                    arguments: SmallVec::new(),
+                })?,
+            },
             CursorRowSource::IndexRange(range) => match range.start {
                 Some(start) => builder.terminate(Terminator::IndexSeek {
                     cursor: self.cursor,
@@ -438,6 +454,21 @@ where
                     arguments: SmallVec::new(),
                 })?,
             },
+        }
+
+        if let CursorRowSource::TableRange(range) = self.source.clone() {
+            if let Some(end) = range.end {
+                builder.switch_to(check.expect("bounded table range must have a check block"))?;
+                builder.terminate(Terminator::TableBound {
+                    cursor: self.cursor,
+                    rowid: end.rowid,
+                    op: end.op,
+                    affinity: range.affinity,
+                    if_before_end: row,
+                    if_at_end: exit,
+                    arguments: SmallVec::new(),
+                })?;
+            }
         }
 
         if let CursorRowSource::IndexRange(range) = self.source.clone() {
@@ -477,6 +508,13 @@ where
                 target: exit,
                 arguments: SmallVec::new(),
             })?,
+            CursorRowSource::TableRange(range) => builder.terminate(Terminator::CursorAdvance {
+                cursor: self.cursor,
+                direction: range.direction,
+                if_next: check.unwrap_or(row),
+                if_done: exit,
+                arguments: SmallVec::new(),
+            })?,
             CursorRowSource::IndexRange(range) => builder.terminate(Terminator::CursorAdvance {
                 cursor: self.cursor,
                 direction: range.direction,
@@ -504,12 +542,11 @@ where
         let advance = builder.create_block()?;
         let stop = builder.create_block()?;
         let exit = builder.create_block()?;
-        let check = match &self.source {
-            CursorRowSource::IndexRange(range) if range.end.is_some() => {
-                Some(builder.create_block()?)
-            }
-            _ => None,
-        };
+        let check = self
+            .source
+            .has_end_bound()
+            .then(|| builder.create_block())
+            .transpose()?;
         let mut row_state = SmallVec::with_capacity(initial.len());
         let mut result_state = SmallVec::with_capacity(initial.len());
         let mut check_state = SmallVec::with_capacity(initial.len());
@@ -536,6 +573,23 @@ where
                 if_not_found: exit,
                 arguments: initial.values,
             })?,
+            CursorRowSource::TableRange(range) => match range.start {
+                Some(start) => builder.terminate(Terminator::TableSeek {
+                    cursor: self.cursor,
+                    rowid: start.rowid,
+                    op: start.op,
+                    if_found: check.unwrap_or(row),
+                    if_empty: exit,
+                    arguments: initial.values,
+                })?,
+                None => builder.terminate(Terminator::CursorStart {
+                    cursor: self.cursor,
+                    direction: range.direction,
+                    if_non_empty: check.unwrap_or(row),
+                    if_empty: exit,
+                    arguments: initial.values,
+                })?,
+            },
             CursorRowSource::IndexRange(range) => match range.start {
                 Some(start) => builder.terminate(Terminator::IndexSeek {
                     cursor: self.cursor,
@@ -553,6 +607,21 @@ where
                     arguments: initial.values,
                 })?,
             },
+        }
+
+        if let CursorRowSource::TableRange(range) = self.source.clone() {
+            if let Some(end) = range.end {
+                builder.switch_to(check.expect("bounded table range must have a check block"))?;
+                builder.terminate(Terminator::TableBound {
+                    cursor: self.cursor,
+                    rowid: end.rowid,
+                    op: end.op,
+                    affinity: range.affinity,
+                    if_before_end: row,
+                    if_at_end: exit,
+                    arguments: check_state.clone(),
+                })?;
+            }
         }
 
         if let CursorRowSource::IndexRange(range) = self.source.clone() {
@@ -607,6 +676,13 @@ where
             })?,
             CursorRowSource::Rowid(_) => builder.terminate(Terminator::Jump {
                 target: exit,
+                arguments: step.state.values.clone(),
+            })?,
+            CursorRowSource::TableRange(range) => builder.terminate(Terminator::CursorAdvance {
+                cursor: self.cursor,
+                direction: range.direction,
+                if_next: check.unwrap_or(row),
+                if_done: exit,
                 arguments: step.state.values.clone(),
             })?,
             CursorRowSource::IndexRange(range) => builder.terminate(Terminator::CursorAdvance {
@@ -1266,6 +1342,23 @@ enum Terminator {
         if_not_found: BlockId,
         arguments: SmallVec<[ValueId; 2]>,
     },
+    TableSeek {
+        cursor: CursorId,
+        rowid: ValueId,
+        op: SeekOp,
+        if_found: BlockId,
+        if_empty: BlockId,
+        arguments: SmallVec<[ValueId; 2]>,
+    },
+    TableBound {
+        cursor: CursorId,
+        rowid: ValueId,
+        op: SeekOp,
+        affinity: Affinity,
+        if_before_end: BlockId,
+        if_at_end: BlockId,
+        arguments: SmallVec<[ValueId; 2]>,
+    },
     IndexSeek {
         cursor: CursorId,
         key: IndexKey,
@@ -1351,6 +1444,26 @@ impl Terminator {
                 Some((*if_not_found, arguments.as_slice())),
                 None,
             ],
+            Self::TableSeek {
+                if_found,
+                if_empty,
+                arguments,
+                ..
+            } => [
+                Some((*if_found, arguments.as_slice())),
+                Some((*if_empty, arguments.as_slice())),
+                None,
+            ],
+            Self::TableBound {
+                if_before_end,
+                if_at_end,
+                arguments,
+                ..
+            } => [
+                Some((*if_before_end, arguments.as_slice())),
+                Some((*if_at_end, arguments.as_slice())),
+                None,
+            ],
             Self::IndexSeek {
                 if_found,
                 if_empty,
@@ -1422,6 +1535,12 @@ impl Terminator {
             | Self::SorterNext { arguments, .. } => arguments.iter().copied().collect(),
             Self::CursorSeekRowid {
                 rowid, arguments, ..
+            }
+            | Self::TableSeek {
+                rowid, arguments, ..
+            }
+            | Self::TableBound {
+                rowid, arguments, ..
             } => std::iter::once(*rowid)
                 .chain(arguments.iter().copied())
                 .collect(),
@@ -1440,7 +1559,9 @@ impl Terminator {
         let operands = match self {
             Self::Branch { condition, .. } | Self::Return(condition) => smallvec![*condition],
             Self::Compare { lhs, rhs, .. } => smallvec![*lhs, *rhs],
-            Self::CursorSeekRowid { rowid, .. } => smallvec![*rowid],
+            Self::CursorSeekRowid { rowid, .. }
+            | Self::TableSeek { rowid, .. }
+            | Self::TableBound { rowid, .. } => smallvec![*rowid],
             Self::IndexSeek { key, .. } | Self::IndexBound { key, .. } => {
                 key.values().iter().copied().collect()
             }
@@ -1458,6 +1579,8 @@ impl Terminator {
         match self {
             Self::CursorStart { cursor, .. }
             | Self::CursorSeekRowid { cursor, .. }
+            | Self::TableSeek { cursor, .. }
+            | Self::TableBound { cursor, .. }
             | Self::IndexSeek { cursor, .. }
             | Self::IndexBound { cursor, .. }
             | Self::CursorAdvance { cursor, .. } => Some(*cursor),
@@ -1476,6 +1599,8 @@ impl Terminator {
             | Self::Compare { .. }
             | Self::CursorStart { .. }
             | Self::CursorSeekRowid { .. }
+            | Self::TableSeek { .. }
+            | Self::TableBound { .. }
             | Self::IndexSeek { .. }
             | Self::IndexBound { .. }
             | Self::CursorAdvance { .. }
@@ -1492,6 +1617,8 @@ impl Terminator {
             | Self::Compare { .. }
             | Self::CursorStart { .. }
             | Self::CursorSeekRowid { .. }
+            | Self::TableSeek { .. }
+            | Self::TableBound { .. }
             | Self::IndexSeek { .. }
             | Self::IndexBound { .. }
             | Self::CursorAdvance { .. }
@@ -1547,6 +1674,20 @@ impl Terminator {
             } => {
                 remap_target(if_found)?;
                 remap_target(if_not_found)
+            }
+            Self::TableSeek {
+                if_found, if_empty, ..
+            } => {
+                remap_target(if_found)?;
+                remap_target(if_empty)
+            }
+            Self::TableBound {
+                if_before_end,
+                if_at_end,
+                ..
+            } => {
+                remap_target(if_before_end)?;
+                remap_target(if_at_end)
             }
             Self::IndexSeek {
                 if_found, if_empty, ..
@@ -1640,6 +1781,32 @@ impl Terminator {
                     "shared cursor edge targets must retain the same parameter positions"
                 );
                 retain_live_arguments(arguments, &parameter_live[if_found.index()])
+            }
+            Self::TableSeek {
+                if_found,
+                if_empty,
+                arguments,
+                ..
+            } => {
+                assert_eq!(
+                    parameter_live[if_found.index()],
+                    parameter_live[if_empty.index()],
+                    "shared table-seek edge targets must retain the same parameter positions"
+                );
+                retain_live_arguments(arguments, &parameter_live[if_found.index()])
+            }
+            Self::TableBound {
+                if_before_end,
+                if_at_end,
+                arguments,
+                ..
+            } => {
+                assert_eq!(
+                    parameter_live[if_before_end.index()],
+                    parameter_live[if_at_end.index()],
+                    "shared table-bound edge targets must retain the same parameter positions"
+                );
+                retain_live_arguments(arguments, &parameter_live[if_before_end.index()])
             }
             Self::IndexSeek {
                 if_found,
@@ -2236,6 +2403,17 @@ impl IrProgram {
                         "compiler IR index seek requires a B-tree index cursor, found {cursor:?}"
                     )));
                 }
+                if matches!(
+                    block.terminator,
+                    Terminator::CursorSeekRowid { .. }
+                        | Terminator::TableSeek { .. }
+                        | Terminator::TableBound { .. }
+                ) && matches!(resource, CursorResource::Owned(cursor) if !matches!(cursor, CursorType::BTreeTable(_)))
+                {
+                    return Err(LimboError::InternalError(format!(
+                        "compiler IR rowid control requires a B-tree table cursor, found {cursor:?}"
+                    )));
+                }
             }
             if let Some(sorter) = block.terminator.sorter() {
                 if sorter.index() >= self.sorter_resources.len() {
@@ -2415,6 +2593,8 @@ impl IrProgram {
                 | Terminator::Compare { .. }
                 | Terminator::CursorStart { .. }
                 | Terminator::CursorSeekRowid { .. }
+                | Terminator::TableSeek { .. }
+                | Terminator::TableBound { .. }
                 | Terminator::IndexSeek { .. }
                 | Terminator::IndexBound { .. }
                 | Terminator::CursorAdvance { .. }
@@ -2712,6 +2892,14 @@ impl IrProgram {
                     if_not_found,
                     ..
                 } => Some((*if_found, *if_not_found)),
+                Terminator::TableSeek {
+                    if_found, if_empty, ..
+                } => Some((*if_found, *if_empty)),
+                Terminator::TableBound {
+                    if_before_end,
+                    if_at_end,
+                    ..
+                } => Some((*if_before_end, *if_at_end)),
                 Terminator::IndexSeek {
                     if_found, if_empty, ..
                 } => Some((*if_found, *if_empty)),
@@ -3086,6 +3274,14 @@ impl IrProgram {
                     if_not_found,
                     ..
                 } => Some((*if_found, *if_not_found)),
+                Terminator::TableSeek {
+                    if_found, if_empty, ..
+                } => Some((*if_found, *if_empty)),
+                Terminator::TableBound {
+                    if_before_end,
+                    if_at_end,
+                    ..
+                } => Some((*if_before_end, *if_at_end)),
                 Terminator::IndexSeek {
                     if_found, if_empty, ..
                 } => Some((*if_found, *if_empty)),
@@ -3867,6 +4063,137 @@ impl IrProgram {
                         target_pc: labels[if_found.index()],
                     });
                 }
+                Terminator::TableSeek {
+                    cursor,
+                    rowid,
+                    op,
+                    if_found,
+                    if_empty,
+                    arguments,
+                } => {
+                    let mut copies = SmallVec::new();
+                    for target in [if_found, if_empty] {
+                        self.collect_edge_copies(&registers, *target, arguments, &mut copies);
+                    }
+                    Self::emit_parallel_copies(program, copies, &mut edge_copy_temporary);
+                    // A seek may apply numeric affinity to its key. Keep the
+                    // register backing the immutable SSA value unchanged.
+                    let start_reg = program.alloc_register();
+                    program.emit_insn(Insn::Copy {
+                        src_reg: Self::register_for(&registers, *rowid),
+                        dst_reg: start_reg,
+                        extra_amount: 0,
+                    });
+                    program.emit_insn(Insn::IsNull {
+                        reg: start_reg,
+                        target_pc: labels[if_empty.index()],
+                    });
+                    let cursor_id = Self::cursor_for(&physical_cursors, *cursor);
+                    program.emit_insn(match op {
+                        SeekOp::GE { eq_only } => Insn::SeekGE {
+                            is_index: false,
+                            cursor_id,
+                            start_reg,
+                            num_regs: 1,
+                            target_pc: labels[if_empty.index()],
+                            eq_only: *eq_only,
+                        },
+                        SeekOp::GT => Insn::SeekGT {
+                            is_index: false,
+                            cursor_id,
+                            start_reg,
+                            num_regs: 1,
+                            target_pc: labels[if_empty.index()],
+                        },
+                        SeekOp::LE { eq_only } => Insn::SeekLE {
+                            is_index: false,
+                            cursor_id,
+                            start_reg,
+                            num_regs: 1,
+                            target_pc: labels[if_empty.index()],
+                            eq_only: *eq_only,
+                        },
+                        SeekOp::LT => Insn::SeekLT {
+                            is_index: false,
+                            cursor_id,
+                            start_reg,
+                            num_regs: 1,
+                            target_pc: labels[if_empty.index()],
+                        },
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: labels[if_found.index()],
+                    });
+                }
+                Terminator::TableBound {
+                    cursor,
+                    rowid,
+                    op,
+                    affinity,
+                    if_before_end,
+                    if_at_end,
+                    arguments,
+                } => {
+                    let mut copies = SmallVec::new();
+                    for target in [if_before_end, if_at_end] {
+                        self.collect_edge_copies(&registers, *target, arguments, &mut copies);
+                    }
+                    Self::emit_parallel_copies(program, copies, &mut edge_copy_temporary);
+                    // VDBE comparisons may coerce both operands. Materialize
+                    // fresh registers so lowering preserves SSA immutability.
+                    let bound = program.alloc_register();
+                    program.emit_insn(Insn::Copy {
+                        src_reg: Self::register_for(&registers, *rowid),
+                        dst_reg: bound,
+                        extra_amount: 0,
+                    });
+                    program.emit_insn(Insn::IsNull {
+                        reg: bound,
+                        target_pc: labels[if_at_end.index()],
+                    });
+                    let current = program.alloc_register();
+                    program.emit_insn(Insn::RowId {
+                        cursor_id: Self::cursor_for(&physical_cursors, *cursor),
+                        dest: current,
+                    });
+                    let flags = CmpInsFlags::default()
+                        .jump_if_null()
+                        .with_affinity(*affinity);
+                    let target_pc = labels[if_at_end.index()];
+                    program.emit_insn(match op {
+                        SeekOp::GE { .. } => Insn::Ge {
+                            lhs: current,
+                            rhs: bound,
+                            target_pc,
+                            flags,
+                            collation: None,
+                        },
+                        SeekOp::GT => Insn::Gt {
+                            lhs: current,
+                            rhs: bound,
+                            target_pc,
+                            flags,
+                            collation: None,
+                        },
+                        SeekOp::LE { .. } => Insn::Le {
+                            lhs: current,
+                            rhs: bound,
+                            target_pc,
+                            flags,
+                            collation: None,
+                        },
+                        SeekOp::LT => Insn::Lt {
+                            lhs: current,
+                            rhs: bound,
+                            target_pc,
+                            flags,
+                            collation: None,
+                        },
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: labels[if_before_end.index()],
+                    });
+                }
                 Terminator::IndexSeek {
                     cursor,
                     key,
@@ -4314,6 +4641,43 @@ impl fmt::Display for IrProgram {
                     Self::fmt_arguments(f, arguments)?;
                     writeln!(f, ")")?;
                 }
+                Terminator::TableSeek {
+                    cursor,
+                    rowid,
+                    op,
+                    if_found,
+                    if_empty,
+                    arguments,
+                } => {
+                    write!(
+                        f,
+                        "table_seek {op:?} ${}, %{}, block{}(",
+                        cursor.0, rowid.0, if_found.0
+                    )?;
+                    Self::fmt_arguments(f, arguments)?;
+                    write!(f, "), block{}(", if_empty.0)?;
+                    Self::fmt_arguments(f, arguments)?;
+                    writeln!(f, ")")?;
+                }
+                Terminator::TableBound {
+                    cursor,
+                    rowid,
+                    op,
+                    affinity,
+                    if_before_end,
+                    if_at_end,
+                    arguments,
+                } => {
+                    write!(
+                        f,
+                        "table_bound {op:?} affinity {affinity:?} ${}, %{}, block{}(",
+                        cursor.0, rowid.0, if_before_end.0
+                    )?;
+                    Self::fmt_arguments(f, arguments)?;
+                    write!(f, "), block{}(", if_at_end.0)?;
+                    Self::fmt_arguments(f, arguments)?;
+                    writeln!(f, ")")?;
+                }
                 Terminator::IndexSeek {
                     cursor,
                     key,
@@ -4480,7 +4844,32 @@ pub(crate) struct CursorRows {
 enum CursorRowSource {
     Scan(ScanDirection),
     Rowid(ValueId),
+    TableRange(TableRangeSource),
     IndexRange(IndexRangeSource),
+}
+
+impl CursorRowSource {
+    fn has_end_bound(&self) -> bool {
+        match self {
+            Self::TableRange(range) => range.end.is_some(),
+            Self::IndexRange(range) => range.end.is_some(),
+            Self::Scan(_) | Self::Rowid(_) => false,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TableRangeSource {
+    start: Option<TableBoundSpec>,
+    end: Option<TableBoundSpec>,
+    direction: ScanDirection,
+    affinity: Affinity,
+}
+
+#[derive(Clone, Copy)]
+struct TableBoundSpec {
+    rowid: ValueId,
+    op: SeekOp,
 }
 
 #[derive(Clone)]
@@ -5378,7 +5767,68 @@ pub(crate) struct ScanBtree {
 enum ScanBtreeStart {
     Full(ScanDirection),
     Rowid(BoxedCompile<ValueId>),
+    TableRange(DeferredTableRange),
     IndexRange(DeferredIndexRange),
+}
+
+pub(crate) struct DeferredTableBound {
+    rowid: Option<BoxedCompile<ValueId>>,
+    op: SeekOp,
+}
+
+impl DeferredTableBound {
+    pub(crate) const fn unbounded(op: SeekOp) -> Self {
+        Self { rowid: None, op }
+    }
+
+    pub(crate) const fn expression(rowid: BoxedCompile<ValueId>, op: SeekOp) -> Self {
+        Self {
+            rowid: Some(rowid),
+            op,
+        }
+    }
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Option<TableBoundSpec>> {
+        let Some(rowid) = self.rowid else {
+            return Ok(None);
+        };
+        Ok(Some(TableBoundSpec {
+            rowid: rowid.compile(builder)?,
+            op: self.op,
+        }))
+    }
+}
+
+pub(crate) struct DeferredTableRange {
+    start: DeferredTableBound,
+    end: DeferredTableBound,
+    direction: ScanDirection,
+    affinity: Affinity,
+}
+
+impl DeferredTableRange {
+    pub(crate) const fn new(
+        start: DeferredTableBound,
+        end: DeferredTableBound,
+        direction: ScanDirection,
+        affinity: Affinity,
+    ) -> Self {
+        Self {
+            start,
+            end,
+            direction,
+            affinity,
+        }
+    }
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<TableRangeSource> {
+        Ok(TableRangeSource {
+            start: self.start.compile(builder)?,
+            end: self.end.compile(builder)?,
+            direction: self.direction,
+            affinity: self.affinity,
+        })
+    }
 }
 
 pub(crate) struct DeferredIndexBound {
@@ -5529,6 +5979,18 @@ pub(crate) fn seek_rowid(
     }
 }
 
+pub(crate) fn seek_table_range(
+    table: Arc<BTreeTable>,
+    db: usize,
+    schema_cookie: u32,
+    range: DeferredTableRange,
+) -> ScanBtree {
+    ScanBtree {
+        source: ScanBtreeSource::Table(open_read_table(table, db, schema_cookie)),
+        start: ScanBtreeStart::TableRange(range),
+    }
+}
+
 pub(crate) fn scan_index(
     table: Arc<BTreeTable>,
     index: Arc<Index>,
@@ -5598,6 +6060,9 @@ impl Compile for ScanBtree {
         let source = match self.start {
             ScanBtreeStart::Full(direction) => CursorRowSource::Scan(direction),
             ScanBtreeStart::Rowid(rowid) => CursorRowSource::Rowid(rowid.compile(builder)?),
+            ScanBtreeStart::TableRange(range) => {
+                CursorRowSource::TableRange(range.compile(builder)?)
+            }
             ScanBtreeStart::IndexRange(range) => {
                 CursorRowSource::IndexRange(range.compile(builder)?)
             }
@@ -6322,6 +6787,79 @@ mod tests {
             instruction,
             Insn::Rewind { .. } | Insn::Last { .. } | Insn::Next { .. } | Insn::Prev { .. }
         )));
+    }
+
+    #[test]
+    fn table_range_builds_symbolic_seek_bound_and_advance_control_flow() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE ranged(a)", 2).unwrap());
+        let range = DeferredTableRange::new(
+            DeferredTableBound::expression(constant(Value::from_i64(2)).boxed(), SeekOp::GT),
+            DeferredTableBound::expression(constant(Value::from_i64(5)).boxed(), SeekOp::GT),
+            ScanDirection::Forward,
+            Affinity::Numeric,
+        );
+        let compiler = seek_table_range(table, 0, 0, range).and_then(|rows| {
+            rows.for_each(|row| {
+                pack_values(smallvec![row.rowid().boxed(), row.column(0).boxed()])
+                    .and_then(result_row_pack)
+            })
+        });
+
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+        assert!(rendered.contains("table_seek GT $0, %0"));
+        assert!(rendered.contains("table_bound GT affinity Numeric $0, %1"));
+        assert!(rendered.contains("cursor_advance Forward $0"));
+        assert!(!rendered.contains("cursor_start"));
+
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 2, 0));
+        let target = program.alloc_register();
+        ir.lower_into(&mut program, target).unwrap();
+        program.resolve_labels().unwrap();
+
+        assert!(program.insns.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::SeekGT {
+                is_index: false,
+                num_regs: 1,
+                ..
+            }
+        )));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::RowId { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Gt { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Next { .. })));
+    }
+
+    #[test]
+    fn verifier_rejects_table_range_control_on_an_index_cursor() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE ranged(a,b)", 2).unwrap());
+        let index = test_index(&table, "ranged_b", 3);
+        let range = DeferredTableRange::new(
+            DeferredTableBound::expression(constant(Value::from_i64(2)).boxed(), SeekOp::GT),
+            DeferredTableBound::unbounded(SeekOp::GT),
+            ScanDirection::Forward,
+            Affinity::Numeric,
+        );
+        let compiler = seek_table_range(table, 0, 0, range)
+            .and_then(|rows| rows.for_each(|_| constant(Value::Null).map(|_| ())));
+        let mut ir = compile_effect(compiler).unwrap();
+        ir.cursor_resources[0] = CursorResource::Owned(CursorType::BTreeIndex(index));
+
+        let error = ir.verify().unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("rowid control requires a B-tree table cursor"));
     }
 
     #[test]

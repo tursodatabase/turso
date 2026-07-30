@@ -1,0 +1,30 @@
+@database :memory:
+
+test declarative-rowid-ranges-preserve-sql-semantics {
+    CREATE TABLE ranged(id INTEGER PRIMARY KEY, payload TEXT);
+    INSERT INTO ranged VALUES
+        (1, 'one'), (2, 'two'), (3, 'three'),
+        (4, 'four'), (5, 'five'), (6, 'six');
+
+    SELECT id, payload FROM ranged
+        WHERE id > '1' AND id <= '5'
+        ORDER BY id LIMIT 2 OFFSET 1;
+    SELECT id FROM ranged WHERE id >= 2 AND id < 6 ORDER BY id DESC;
+    SELECT id FROM ranged WHERE id < 4 ORDER BY id;
+    SELECT id FROM ranged WHERE id > 3 ORDER BY id;
+    SELECT id FROM ranged WHERE id > NULL;
+}
+expect {
+    3|three
+    4|four
+    5
+    4
+    3
+    2
+    1
+    2
+    3
+    4
+    5
+    6
+}
