@@ -7,7 +7,6 @@ use crate::translate::plan::{
     DeletePlan, DmlSafety, DmlSafetyReason, IterationDirection, JoinOrderMember, Operation, Plan,
     QueryDestination, ResultSetColumn, Scan, SelectPlan,
 };
-use crate::translate::planner::{parse_limit, parse_where, plan_ctes_as_outer_refs};
 use crate::translate::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
     plan_subqueries_from_where_clause,
@@ -19,7 +18,7 @@ use crate::Result;
 use smallvec::SmallVec;
 use turso_parser::ast::{Expr, Limit, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
 
-use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
+use super::plan::{ColumnUsedMask, WhereTerm};
 
 // validate the delete statment, returning the underlying table if validation passes
 fn validate_delete(
