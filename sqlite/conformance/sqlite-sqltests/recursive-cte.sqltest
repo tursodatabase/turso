@@ -1749,3 +1749,82 @@ expect {
     2
     3
 }
+
+test recursive-cte-nested-with-shadows-outer-name {
+    WITH RECURSIVE t21(a, b) AS (
+        WITH t21(x) AS (VALUES (1))
+        SELECT x, x FROM t21 ORDER BY 1 LIMIT 5
+    )
+    SELECT * FROM t21 AS tA, t21 AS tB;
+}
+expect {
+    1|1|1|1
+}
+
+test recursive-cte-unused-nested-cte-self-ref-is-not-a-recursive-ref {
+    WITH RECURSIVE c(x) AS (
+        WITH t(y) AS (SELECT x FROM c)
+        SELECT 1
+        UNION ALL
+        SELECT x + 1 FROM c WHERE x < 3
+    )
+    SELECT * FROM c;
+}
+expect {
+    1
+    2
+    3
+}
+
+test recursive-cte-unused-nested-cte-self-ref-keeps-cte-non-recursive {
+    WITH RECURSIVE c AS (
+        WITH t AS (SELECT * FROM c)
+        SELECT 1
+    )
+    SELECT * FROM c;
+}
+expect {
+    1
+}
+
+test recursive-cte-used-nested-cte-self-ref-rejected {
+    WITH RECURSIVE c(x, m) AS (
+        WITH t AS (SELECT max(x) AS m FROM c)
+        SELECT 1, 0
+        UNION ALL
+        SELECT x + 1, (SELECT m FROM t) FROM c WHERE x < 4
+    )
+    SELECT * FROM c;
+}
+expect error {
+    multiple recursive references: c
+}
+
+test recursive-cte-visited-set-via-nested-cte-rejected {
+    CREATE TABLE visited_edge(a, b);
+    INSERT INTO visited_edge VALUES(1, 2), (2, 3), (3, 2);
+    WITH RECURSIVE reach(n) AS (
+        WITH seen AS (SELECT n FROM reach)
+        SELECT 1
+        UNION ALL
+        SELECT e.b FROM reach r JOIN visited_edge e ON e.a = r.n
+        WHERE e.b NOT IN (SELECT n FROM seen)
+    )
+    SELECT count(*) FROM reach;
+}
+expect error {
+    multiple recursive references: reach
+}
+
+test recursive-cte-window-clause-self-ref-rejected {
+    WITH RECURSIVE w(x) AS (
+        SELECT 1
+        UNION ALL
+        SELECT x + 1 FROM w WHERE x < 3
+        WINDOW win AS (PARTITION BY (SELECT max(x) FROM w))
+    )
+    SELECT * FROM w;
+}
+expect error {
+    multiple recursive references: w
+}

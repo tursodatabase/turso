@@ -78,7 +78,9 @@ fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<V
 
         let mut referenced_table_names = Vec::new();
         collect_from_clause_table_refs(&cte.select, &mut referenced_table_names);
-        let references_itself = referenced_table_names.contains(&name);
+        let references_itself = RecursiveRefCounter { cte_name: &name }
+            .count_select(&cte.select, &mut RecursiveRefScope::new())
+            > 0;
         referenced_table_names_by_cte.push(referenced_table_names);
         definitions.push(CteDefinition {
             cte_id: program.alloc_cte_id(),
@@ -136,47 +138,241 @@ fn collect_from_one_select(one: &ast::OneSelect, out: &mut Vec<String>) {
     }
 }
 
-fn count_cte_self_references(one: &ast::OneSelect, cte_name: &str) -> (usize, usize) {
-    fn count_in_from_table(table: &ast::SelectTable, cte_name: &str) -> usize {
-        match table {
-            ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
-                usize::from(
-                    name.db_name.is_none() && normalize_ident(name.name.as_str()) == cte_name,
-                )
+/// Counts references to a recursive CTE's own name the way SQLite's name
+/// resolution does:
+/// - a nested `WITH` that redefines the name shadows it for that subtree, and
+/// - references inside a nested CTE body only count when that CTE is itself
+///   referenced (an unused nested CTE that mentions the recursive table does
+///   not make the query recursive), weighted by how many references its body
+///   contains.
+struct RecursiveRefCounter<'a> {
+    cte_name: &'a str,
+}
+
+/// Names visible at the current point, innermost last. Each entry carries the
+/// number of recursive references that using the name implies: 0 for a name
+/// that shadows the recursive table, and the body's own reference count for
+/// any other nested CTE.
+type RecursiveRefScope = Vec<(String, usize)>;
+
+impl RecursiveRefCounter<'_> {
+    /// The number of recursive references implied by referring to `name`.
+    fn name_weight(&self, name: &str, scope: &RecursiveRefScope) -> usize {
+        for (scope_name, weight) in scope.iter().rev() {
+            if scope_name == name {
+                return *weight;
             }
-            ast::SelectTable::Select(_, _) => 0,
+        }
+        usize::from(name == self.cte_name)
+    }
+
+    /// Brings the CTEs of a nested `WITH` into scope with their reference
+    /// weights. The caller is responsible for truncating `scope` afterwards.
+    fn push_nested_ctes(&self, with: Option<&With>, scope: &mut RecursiveRefScope) {
+        let Some(with) = with else {
+            return;
+        };
+        for cte in &with.ctes {
+            let name = normalize_ident(cte.tbl_name.as_str());
+            // The CTE's own name is visible inside its body, where it refers
+            // to the nested CTE itself rather than the recursive table.
+            scope.push((name, 0));
+            let weight = self.count_select(&cte.select, scope);
+            scope.last_mut().expect("scope entry pushed above").1 = weight;
+        }
+    }
+
+    fn count_select(&self, select: &Select, scope: &mut RecursiveRefScope) -> usize {
+        let scope_base = scope.len();
+        self.push_nested_ctes(select.with.as_ref(), scope);
+        let mut count = self.count_one_select(&select.body.select, scope);
+        for compound in &select.body.compounds {
+            count += self.count_one_select(&compound.select, scope);
+        }
+        for sorted in &select.order_by {
+            count += self.count_expr(&sorted.expr, scope);
+        }
+        if let Some(limit) = &select.limit {
+            count += self.count_expr(&limit.expr, scope);
+            if let Some(offset) = &limit.offset {
+                count += self.count_expr(offset, scope);
+            }
+        }
+        scope.truncate(scope_base);
+        count
+    }
+
+    fn count_one_select(&self, one: &ast::OneSelect, scope: &mut RecursiveRefScope) -> usize {
+        match one {
+            ast::OneSelect::Select {
+                columns,
+                from,
+                where_clause,
+                group_by,
+                window_clause,
+                ..
+            } => {
+                let mut count = 0;
+                if let Some(from) = from {
+                    count += self.count_from_table(&from.select, scope);
+                    for join in &from.joins {
+                        count += self.count_from_table(&join.table, scope);
+                        if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
+                            count += self.count_expr(expr, scope);
+                        }
+                    }
+                }
+                for column in columns {
+                    if let ast::ResultColumn::Expr(expr, _) = column {
+                        count += self.count_expr(expr, scope);
+                    }
+                }
+                if let Some(expr) = where_clause {
+                    count += self.count_expr(expr, scope);
+                }
+                if let Some(group_by) = group_by {
+                    for expr in &group_by.exprs {
+                        count += self.count_expr(expr, scope);
+                    }
+                    if let Some(having) = &group_by.having {
+                        count += self.count_expr(having, scope);
+                    }
+                }
+                for window_def in window_clause {
+                    count += self.count_window(&window_def.window, scope);
+                }
+                count
+            }
+            ast::OneSelect::Values(rows) => rows
+                .iter()
+                .flatten()
+                .map(|expr| self.count_expr(expr, scope))
+                .sum(),
+        }
+    }
+
+    fn count_from_table(&self, table: &ast::SelectTable, scope: &mut RecursiveRefScope) -> usize {
+        match table {
+            ast::SelectTable::Table(name, _, _) => {
+                if name.db_name.is_none() {
+                    self.name_weight(&normalize_ident(name.name.as_str()), scope)
+                } else {
+                    0
+                }
+            }
+            ast::SelectTable::TableCall(name, args, _) => {
+                let mut count = if name.db_name.is_none() {
+                    self.name_weight(&normalize_ident(name.name.as_str()), scope)
+                } else {
+                    0
+                };
+                for arg in args {
+                    count += self.count_expr(arg, scope);
+                }
+                count
+            }
+            ast::SelectTable::Select(subselect, _) => self.count_select(subselect, scope),
             ast::SelectTable::Sub(from, _) => {
-                count_in_from_table(&from.select, cte_name)
-                    + from
-                        .joins
-                        .iter()
-                        .map(|join| count_in_from_table(&join.table, cte_name))
-                        .sum::<usize>()
+                let mut count = self.count_from_table(&from.select, scope);
+                for join in &from.joins {
+                    count += self.count_from_table(&join.table, scope);
+                    if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
+                        count += self.count_expr(expr, scope);
+                    }
+                }
+                count
             }
         }
     }
 
-    let top_level_from_count = if let ast::OneSelect::Select {
-        from: Some(from), ..
-    } = one
-    {
-        count_in_from_table(&from.select, cte_name)
-            + from
-                .joins
-                .iter()
-                .map(|join| count_in_from_table(&join.table, cte_name))
-                .sum::<usize>()
-    } else {
-        0
-    };
-    let mut referenced_table_names = Vec::new();
-    collect_from_one_select(one, &mut referenced_table_names);
-    collect_subquery_table_refs_in_one_select(one, &mut referenced_table_names);
-    let total_count = referenced_table_names
-        .iter()
-        .filter(|name| name.as_str() == cte_name)
-        .count();
-    (top_level_from_count, total_count)
+    fn count_window(&self, window: &ast::Window, scope: &mut RecursiveRefScope) -> usize {
+        let mut count = 0;
+        for expr in &window.partition_by {
+            count += self.count_expr(expr, scope);
+        }
+        for sorted in &window.order_by {
+            count += self.count_expr(&sorted.expr, scope);
+        }
+        if let Some(frame_clause) = &window.frame_clause {
+            for bound in std::iter::once(&frame_clause.start).chain(frame_clause.end.as_ref()) {
+                if let ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) = bound {
+                    count += self.count_expr(expr, scope);
+                }
+            }
+        }
+        count
+    }
+
+    fn count_expr(&self, expr: &Expr, scope: &mut RecursiveRefScope) -> usize {
+        let mut count = 0;
+        let _ = walk_expr(expr, &mut |node: &Expr| -> Result<WalkControl> {
+            match node {
+                Expr::Exists(select) | Expr::Subquery(select) => {
+                    count += self.count_select(select, scope);
+                    Ok(WalkControl::SkipChildren)
+                }
+                Expr::InSelect { rhs, .. } => {
+                    count += self.count_select(rhs, scope);
+                    // The walker does not descend into the subquery, only the
+                    // left-hand side expression.
+                    Ok(WalkControl::Continue)
+                }
+                _ => Ok(WalkControl::Continue),
+            }
+        });
+        count
+    }
+
+    /// Returns `(top_level_from_count, total_count)` for one arm of a
+    /// recursive CTE body: direct references to the recursive table in the
+    /// arm's FROM clause, and all references reachable from the arm.
+    fn count_arm(&self, one: &ast::OneSelect, scope: &mut RecursiveRefScope) -> (usize, usize) {
+        fn count_direct_in_from_table(
+            counter: &RecursiveRefCounter,
+            table: &ast::SelectTable,
+            scope: &RecursiveRefScope,
+        ) -> usize {
+            match table {
+                ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
+                    if name.db_name.is_some() {
+                        return 0;
+                    }
+                    let name = normalize_ident(name.name.as_str());
+                    // A direct reference only counts when nothing shadows the
+                    // recursive table's name.
+                    usize::from(
+                        name == counter.cte_name
+                            && !scope.iter().any(|(scope_name, _)| *scope_name == name),
+                    )
+                }
+                ast::SelectTable::Select(_, _) => 0,
+                ast::SelectTable::Sub(from, _) => {
+                    count_direct_in_from_table(counter, &from.select, scope)
+                        + from
+                            .joins
+                            .iter()
+                            .map(|join| count_direct_in_from_table(counter, &join.table, scope))
+                            .sum::<usize>()
+                }
+            }
+        }
+
+        let top_level_from_count = if let ast::OneSelect::Select {
+            from: Some(from), ..
+        } = one
+        {
+            count_direct_in_from_table(self, &from.select, scope)
+                + from
+                    .joins
+                    .iter()
+                    .map(|join| count_direct_in_from_table(self, &join.table, scope))
+                    .sum::<usize>()
+        } else {
+            0
+        };
+        let total_count = self.count_one_select(one, scope);
+        (top_level_from_count, total_count)
+    }
 }
 
 fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<String>) {
@@ -985,6 +1181,14 @@ fn prepare_recursive_cte_plan(
 ) -> Result<Plan> {
     let select = &cte_definition.select;
     let mut first_recursive_query_index = None;
+    let ref_counter = RecursiveRefCounter {
+        cte_name: &cte_definition.name,
+    };
+    // Nested CTEs defined at the body level are visible in every arm; bring
+    // them into scope so shadowing and use-through-nested-CTE references are
+    // counted the way name resolution will see them.
+    let mut ref_scope = RecursiveRefScope::new();
+    ref_counter.push_nested_ctes(select.with.as_ref(), &mut ref_scope);
     for (query_index, query) in std::iter::once(&select.body.select)
         .chain(
             select
@@ -995,8 +1199,7 @@ fn prepare_recursive_cte_plan(
         )
         .enumerate()
     {
-        let (top_level_from_count, total_count) =
-            count_cte_self_references(query, &cte_definition.name);
+        let (top_level_from_count, total_count) = ref_counter.count_arm(query, &mut ref_scope);
         if first_recursive_query_index.is_none() && total_count == 0 {
             continue;
         }
@@ -1823,9 +2026,19 @@ pub fn parse_from(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let mut cte_definitions = Vec::new();
+    let mut shadowed_outer_ctes = Vec::new();
 
     if let Some(with) = with {
         cte_definitions = collect_cte_definitions(with, program)?;
+
+        // This WITH clause's definitions shadow same-named CTEs from outer
+        // scopes that are still being planned, so references to those names
+        // here are not circular.
+        let shadowing_names = cte_definitions
+            .iter()
+            .map(|definition| definition.name.clone())
+            .collect::<Vec<_>>();
+        shadowed_outer_ctes = program.mask_shadowed_ctes_being_defined(&shadowing_names);
 
         if preplan_ctes_for_non_from_subqueries {
             // Make these CTE names available to subqueries outside the FROM clause.
@@ -1890,6 +2103,7 @@ pub fn parse_from(
         }
     }
 
+    program.unmask_shadowed_ctes_being_defined(shadowed_outer_ctes);
     Ok(())
 }
 
