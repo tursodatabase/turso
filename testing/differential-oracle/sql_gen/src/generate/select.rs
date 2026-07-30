@@ -698,6 +698,9 @@ const AGGREGATE_WINDOW_FUNCS: &[(&str, WindowFnArity)] = &[
     ("total", WindowFnArity::OneArg),
     ("count", WindowFnArity::OneArg),
     ("avg", WindowFnArity::OneArg),
+    ("group_concat", WindowFnArity::Concat),
+    ("string_agg", WindowFnArity::Concat),
+    ("json_group_array", WindowFnArity::OneArg),
 ];
 
 #[derive(Clone, Copy)]
@@ -707,6 +710,7 @@ enum WindowFnArity {
     Ntile,
     NthValue,
     LagLead,
+    Concat,
 }
 
 /// Generate a `func(...) OVER (...)` projection within the configured
@@ -763,6 +767,7 @@ fn generate_window_function(
             }
             a
         }
+        WindowFnArity::Concat => vec![arg_col, pick_scoped_column_ref(ctx)?],
     };
 
     // Build the OVER clause: 0-2 PARTITION BY exprs, 0-2 ORDER BY
@@ -842,13 +847,19 @@ fn generate_window_frame(ctx: &mut Context, frame_policy: WindowFramePolicy) -> 
                 2 => generate_offset_frame(ctx, WindowFrameMode::Range),
                 _ => unreachable!("range is limited to three frame modes"),
             };
-            frame.exclude = Some(match ctx.gen_range(4) {
-                0 => WindowFrameExclude::NoOthers,
-                1 => WindowFrameExclude::CurrentRow,
-                2 => WindowFrameExclude::Group,
-                3 => WindowFrameExclude::Ties,
-                _ => unreachable!("range is limited to four exclusion variants"),
-            });
+            // Retain unexcluded frames so the latest policy continues to
+            // exercise xInverse in addition to the full-scan EXCLUDE path.
+            frame.exclude = if ctx.gen_bool() {
+                None
+            } else {
+                Some(match ctx.gen_range(4) {
+                    0 => WindowFrameExclude::NoOthers,
+                    1 => WindowFrameExclude::CurrentRow,
+                    2 => WindowFrameExclude::Group,
+                    3 => WindowFrameExclude::Ties,
+                    _ => unreachable!("range is limited to four exclusion variants"),
+                })
+            };
             frame
         }
     }
@@ -1728,10 +1739,18 @@ mod tests {
             let sql = select.to_string();
             if sql.contains(" ROWS BETWEEN ") {
                 assert!(
-                    ["sum(", "total(", "count(", "avg("]
-                        .iter()
-                        .any(|name| sql.contains(name)),
-                    "explicit frames must be attached to invertible aggregates: {sql}"
+                    [
+                        "sum(",
+                        "total(",
+                        "count(",
+                        "avg(",
+                        "group_concat(",
+                        "string_agg(",
+                        "json_group_array(",
+                    ]
+                    .iter()
+                    .any(|name| sql.contains(name)),
+                    "explicit frames must be attached to supported sliding aggregates: {sql}"
                 );
                 generated_rows_frame = true;
                 break;
@@ -1791,10 +1810,18 @@ mod tests {
             });
             if has_explicit_frame {
                 assert!(
-                    ["sum(", "total(", "count(", "avg("]
-                        .iter()
-                        .any(|name| sql.contains(name)),
-                    "explicit frames must be attached to invertible aggregates: {sql}"
+                    [
+                        "sum(",
+                        "total(",
+                        "count(",
+                        "avg(",
+                        "group_concat(",
+                        "string_agg(",
+                        "json_group_array(",
+                    ]
+                    .iter()
+                    .any(|name| sql.contains(name)),
+                    "explicit frames must be attached to supported sliding aggregates: {sql}"
                 );
             }
             if saw_rows && saw_groups && saw_range {
@@ -1847,10 +1874,18 @@ mod tests {
                     "RANGE offsets require exactly one ORDER BY expression: {sql}"
                 );
                 assert!(
-                    ["sum(", "total(", "count(", "avg("]
-                        .iter()
-                        .any(|name| sql.contains(name)),
-                    "explicit frames must be attached to invertible aggregates: {sql}"
+                    [
+                        "sum(",
+                        "total(",
+                        "count(",
+                        "avg(",
+                        "group_concat(",
+                        "string_agg(",
+                        "json_group_array(",
+                    ]
+                    .iter()
+                    .any(|name| sql.contains(name)),
+                    "explicit frames must be attached to supported sliding aggregates: {sql}"
                 );
                 return;
             }
@@ -1887,6 +1922,7 @@ mod tests {
         let mut saw_group = false;
         let mut saw_ties = false;
         let mut saw_offset_range = false;
+        let mut saw_unexcluded_removable_prefix = false;
 
         for seed in 0..2000 {
             let mut ctx = Context::new_with_seed(seed);
@@ -1907,8 +1943,20 @@ mod tests {
                 );
                 saw_offset_range = true;
             }
+            saw_unexcluded_removable_prefix |= sql.contains(" BETWEEN ")
+                && !sql.contains("BETWEEN UNBOUNDED PRECEDING")
+                && !sql.contains(" EXCLUDE ")
+                && ["group_concat(", "string_agg(", "json_group_array("]
+                    .iter()
+                    .any(|name| sql.contains(name));
 
-            if saw_no_others && saw_current_row && saw_group && saw_ties && saw_offset_range {
+            if saw_no_others
+                && saw_current_row
+                && saw_group
+                && saw_ties
+                && saw_offset_range
+                && saw_unexcluded_removable_prefix
+            {
                 return;
             }
         }
@@ -1916,7 +1964,8 @@ mod tests {
         panic!(
             "EXCLUDE policy coverage incomplete: no_others={saw_no_others}, \
              current_row={saw_current_row}, group={saw_group}, ties={saw_ties}, \
-             offset_range={saw_offset_range}"
+             offset_range={saw_offset_range}, \
+             unexcluded_removable_prefix={saw_unexcluded_removable_prefix}"
         );
     }
 

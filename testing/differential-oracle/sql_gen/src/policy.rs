@@ -1079,7 +1079,8 @@ pub enum WindowFramePolicy {
     GroupsAndOffsetFreeRange,
     /// Also generate numeric-offset `RANGE` frames.
     RangeOffsets,
-    /// Also generate every explicit frame-exclusion variant.
+    /// Also generate every explicit frame-exclusion variant while retaining
+    /// unexcluded frames for xInverse coverage.
     Exclude,
 }
 

@@ -151,7 +151,8 @@ use crate::{
     json::json_from_raw_bytes_agg, json::json_insert, json::json_object, json::json_patch,
     json::json_quote, json::json_remove, json::json_replace, json::json_set, json::json_type,
     json::jsonb, json::jsonb_array, json::jsonb_extract, json::jsonb_insert, json::jsonb_object,
-    json::jsonb_patch, json::jsonb_remove, json::jsonb_replace, json::jsonb_set, json::Conv,
+    json::jsonb_patch, json::jsonb_remove, json::jsonb_replace, json::jsonb_set,
+    json::raw_jsonb_element_len, json::Conv,
 };
 
 use super::{Program, ProgramState, Register};
@@ -6170,7 +6171,9 @@ fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
 ///   // same but starts at 0.0
 /// - Avg: [Float(0.0), Float(0.0), Integer(0)]  // sum, r_err, count - uses KBN like SUM
 /// - Min/Max: [Null]
-/// - GroupConcat/StringAgg: [Null] (becomes Text on first non-null value)
+/// - GroupConcat/StringAgg:
+///   [Null|Text, Integer(count), Integer(first separator length),
+///   Blob(varying inter-string separator lengths)]
 /// - JsonGroupObject/JsonbGroupObject: [Blob([])]
 /// - JsonGroupArray/JsonbGroupArray: [Blob([])]
 fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> Result<()> {
@@ -6195,8 +6198,14 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
         }
         AggFunc::Min | AggFunc::Max => payload.push(Value::Null),
         AggFunc::GroupConcat | AggFunc::StringAgg => {
-            // Use Null as sentinel to distinguish "no values yet" from "accumulated empty string"
+            // Use Null as sentinel to distinguish "no values yet" from an
+            // accumulated empty string. SQLite normally remembers one
+            // separator length and only materializes the per-separator queue
+            // if the length changes.
             payload.push(Value::Null);
+            payload.push(Value::from_i64(0));
+            payload.push(Value::from_i64(0));
+            payload.push(Value::Blob(crate::alloc::vec![]));
         }
         AggFunc::External(_) => {
             mark_unlikely();
@@ -6255,7 +6264,9 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
 ///   - `approx`: 1 if result is approximate (float arithmetic used)
 ///   - `ovrfl`: 1 if integer overflow occurred (Total promotes to float, Sum errors)
 /// - **Min/Max**: `[current_extreme: Value]` - tracks min/max seen so far
-/// - **GroupConcat/StringAgg**: `[accumulated: Null|Text]` - Null until first value, then Text
+/// - **GroupConcat/StringAgg**:
+///   `[accumulated: Null|Text, count: Integer, first_separator_len: Integer,
+///     separator_lengths: Blob]`
 /// - **JsonGroup***: `[raw_jsonb: Blob]` - accumulated raw JSONB bytes
 /// - **ArrayAgg/Mode/PercentileCont/PercentileDisc**: buffer every input value by growing the
 ///   payload `Vec` (one push per row); the leading slots hold a running count and, for the
@@ -6453,18 +6464,76 @@ fn update_agg_payload(
             if matches!(arg, Value::Null) {
                 return Ok(());
             }
-            let acc = &mut payload[0];
-            if matches!(acc, Value::Null) {
+            let [acc, count_slot, first_separator_len_slot, separator_lengths_slot, ..] =
+                payload.as_mut_slice()
+            else {
+                unreachable!("GroupConcat payload is initialized with four slots");
+            };
+            let Value::Numeric(Numeric::Integer(count)) = count_slot else {
+                unreachable!("GroupConcat count slot is Integer");
+            };
+            let Value::Numeric(Numeric::Integer(first_separator_len)) = first_separator_len_slot
+            else {
+                unreachable!("GroupConcat first separator length is Integer");
+            };
+            let Value::Blob(separator_lengths) = separator_lengths_slot else {
+                unreachable!("GroupConcat separator queue is Blob");
+            };
+            let first_term = matches!(acc, Value::Null);
+            if first_term {
                 // Start an empty Text accumulator; append below without an
                 // intermediate String for Text inputs.
                 *acc = Value::build_text(String::new());
+            }
+
+            let delimiter = match maybe_arg2 {
+                Some(delimiter) => delimiter,
+                None => &Value::build_text(","),
+            };
+            if first_term {
+                let mut rendered = Value::build_text(String::new());
+                rendered.exec_group_concat(delimiter)?;
+                let Value::Text(rendered) = rendered else {
+                    unreachable!("GroupConcat rendering target is Text");
+                };
+                *first_separator_len = i64::try_from(rendered.as_str().len())
+                    .map_err(|_| LimboError::IntegerOverflow)?;
             } else {
-                match maybe_arg2 {
-                    Some(delimiter) => acc.exec_group_concat(delimiter)?,
-                    None => acc.exec_group_concat(&Value::build_text(","))?,
+                let before_separator = match acc {
+                    Value::Text(text) => text.as_str().len(),
+                    _ => unreachable!("GroupConcat accumulator is Text after initialization"),
+                };
+                acc.exec_group_concat(delimiter)?;
+                let after_separator = match acc {
+                    Value::Text(text) => text.as_str().len(),
+                    _ => unreachable!("GroupConcat accumulator is Text after its first value"),
+                };
+                let separator_len = after_separator
+                    .checked_sub(before_separator)
+                    .expect("appending a separator cannot shrink GroupConcat");
+                let separator_len =
+                    i64::try_from(separator_len).map_err(|_| LimboError::IntegerOverflow)?;
+                if separator_len != *first_separator_len || !separator_lengths.is_empty() {
+                    let count = usize::try_from(*count).map_err(|_| LimboError::IntegerOverflow)?;
+                    if separator_lengths.is_empty() {
+                        let prior_separator_count = count.saturating_sub(1);
+                        separator_lengths.try_reserve(
+                            count
+                                .checked_mul(std::mem::size_of::<i64>())
+                                .ok_or(LimboError::IntegerOverflow)?,
+                        )?;
+                        let bytes = first_separator_len.to_be_bytes();
+                        for _ in 0..prior_separator_count {
+                            separator_lengths.extend_from_slice(&bytes);
+                        }
+                    } else {
+                        separator_lengths.try_reserve(std::mem::size_of::<i64>())?;
+                    }
+                    separator_lengths.extend_from_slice(&separator_len.to_be_bytes());
                 }
             }
             acc.exec_group_concat(arg)?;
+            *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
         }
         AggFunc::External(_) => {
             mark_unlikely();
@@ -7358,12 +7427,9 @@ pub fn op_agg_inverse(
     }
     let func = func.expect_agg();
 
-    // sum / count / avg / total run their xInverse to undo a prior
-    // xStep when a row leaves the frame from the left. SQLite's
-    // matching implementations live at `func.c:1859-1986`. min / max /
-    // group_concat aren't invertible — SQLite falls back to a full
-    // frame rescan there (`window.c::windowFullScan`); we don't
-    // implement that fallback, so those error out.
+    // Run xInverse to undo a prior xStep when a row leaves the frame
+    // from the left. min/max are handled separately using SQLite's
+    // sorted-index strategy.
     let arg = state.registers[*col].get_value().clone();
     let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
         return Err(LimboError::InternalError(format!(
@@ -7525,18 +7591,89 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             *r_err_val = Value::from_f64(sum_state.r_err);
             *count -= 1;
         }
+        AggFunc::GroupConcat | AggFunc::StringAgg => {
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
+            let [acc, count_slot, first_separator_len_slot, separator_lengths_slot, ..] = payload
+            else {
+                unreachable!("GroupConcat payload is initialized with four slots");
+            };
+            let Value::Numeric(Numeric::Integer(count)) = count_slot else {
+                unreachable!("GroupConcat count slot is Integer");
+            };
+            let Value::Numeric(Numeric::Integer(first_separator_len)) = first_separator_len_slot
+            else {
+                unreachable!("GroupConcat first separator length is Integer");
+            };
+            let Value::Blob(separator_lengths) = separator_lengths_slot else {
+                unreachable!("GroupConcat separator queue is Blob");
+            };
+            debug_assert!(*count > 0, "GroupConcat xInverse without matching xStep");
+            let old_count = usize::try_from(*count)
+                .map_err(|_| LimboError::InternalError("negative GroupConcat count".into()))?;
+            let expected_separator_bytes = old_count
+                .saturating_sub(1)
+                .checked_mul(std::mem::size_of::<i64>())
+                .ok_or(LimboError::IntegerOverflow)?;
+            if !separator_lengths.is_empty() && separator_lengths.len() != expected_separator_bytes
+            {
+                return Err(LimboError::InternalError(format!(
+                    "GroupConcat separator queue has {} bytes for {old_count} values",
+                    separator_lengths.len()
+                )));
+            }
+
+            let mut rendered = Value::build_text(String::new());
+            rendered.exec_group_concat(&arg)?;
+            let Value::Text(rendered) = rendered else {
+                unreachable!("GroupConcat rendering target is Text");
+            };
+            let value_len = rendered.as_str().len();
+
+            *count -= 1;
+            let separator_len = if !separator_lengths.is_empty() && *count > 0 {
+                let bytes: [u8; std::mem::size_of::<i64>()] = separator_lengths
+                    [..std::mem::size_of::<i64>()]
+                    .try_into()
+                    .expect("separator queue length checked above");
+                separator_lengths.drain(..std::mem::size_of::<i64>());
+                usize::try_from(i64::from_be_bytes(bytes))
+                    .map_err(|_| LimboError::IntegerOverflow)?
+            } else if separator_lengths.is_empty() {
+                usize::try_from(*first_separator_len).map_err(|_| {
+                    LimboError::InternalError("negative GroupConcat separator length".into())
+                })?
+            } else {
+                0
+            };
+            let remove_len = value_len
+                .checked_add(separator_len)
+                .ok_or(LimboError::IntegerOverflow)?;
+            let Value::Text(text) = acc else {
+                unreachable!("GroupConcat accumulator is Text after a non-NULL xStep");
+            };
+            let accumulated_len = text.as_str().len();
+            if remove_len < accumulated_len && !text.as_str().is_char_boundary(remove_len) {
+                return Err(LimboError::InternalError(format!(
+                    "GroupConcat xInverse removes {remove_len} bytes from {accumulated_len}"
+                )));
+            }
+            if remove_len >= accumulated_len {
+                *acc = Value::Null;
+                separator_lengths.clear();
+            } else {
+                text.value.to_mut().drain(..remove_len);
+            }
+        }
         AggFunc::Min
         | AggFunc::Max
-        | AggFunc::GroupConcat
-        | AggFunc::StringAgg
         | AggFunc::ArrayAgg
         | AggFunc::Mode
         | AggFunc::PercentileCont
         | AggFunc::PercentileDisc => {
-            // Aggregates without an xInverse. SQLite falls back to a
-            // full-frame rescan (`window.c::windowFullScan`); we reject
-            // such frames at parse time in `aggregate_supports_xinverse`,
-            // so reaching this arm is a planner regression.
+            // Aggregates without an xInverse are rejected for moving-start
+            // frames, so reaching this arm is a planner regression.
             unreachable!("planner should reject moving-start frame over non-invertible {func}");
         }
         AggFunc::External(_) => {
@@ -7547,7 +7684,28 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
         | AggFunc::JsonbGroupObject
         | AggFunc::JsonGroupArray
         | AggFunc::JsonbGroupArray => {
-            unreachable!("planner rejects moving-start frames over JSON group aggregates");
+            let Value::Blob(data) = &mut payload[0] else {
+                unreachable!("JSON group accumulator payload is Blob");
+            };
+            let expected_container =
+                if matches!(func, AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject) {
+                    12
+                } else {
+                    11
+                };
+            if data.first().map(|header| header & 0x0f) != Some(expected_container) {
+                return Err(LimboError::InternalError(
+                    "JSON group xInverse found an invalid accumulator header".into(),
+                ));
+            }
+            let element_count = if expected_container == 12 { 2 } else { 1 };
+            let mut end = 1usize;
+            for _ in 0..element_count {
+                end = end
+                    .checked_add(raw_jsonb_element_len(data, end)?)
+                    .ok_or(LimboError::IntegerOverflow)?;
+            }
+            data.drain(1..end);
         }
     }
     Ok(())

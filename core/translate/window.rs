@@ -2398,10 +2398,8 @@ fn emit_window_op(
 
     // RETURN_ROW finalizes accumulators before emitting (SQLite's
     // windowAggFinal at window.c:2284).
-    if matches!(op, WindowOp::ReturnRow) {
-        if window.frame.exclude.is_none() {
-            emit_window_agg_final(program, window, &registers, false);
-        }
+    if matches!(op, WindowOp::ReturnRow) && window.frame.exclude.is_none() {
+        emit_window_agg_final(program, window, &registers, false);
     }
 
     let label_continue = program.allocate_label();
