@@ -1809,7 +1809,10 @@ mod tests {
         assert!(stmt.is_ok());
 
         let sql = stmt.unwrap().to_string();
-        assert!(sql.starts_with("CREATE TRIGGER"));
+        assert!(
+            sql.starts_with("CREATE TRIGGER") || sql.starts_with("CREATE TEMP TRIGGER"),
+            "{sql}"
+        );
         assert!(sql.contains("ON users"));
         assert!(sql.contains("BEGIN"));
         assert!(sql.contains("END"));

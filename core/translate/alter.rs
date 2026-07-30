@@ -1550,7 +1550,7 @@ pub fn translate_alter_table(
             let new_name = new_name.as_str();
             let normalized_old_name = normalize_ident(table_name);
             let normalized_new_name = normalize_ident(new_name);
-            let mut temp_triggers_to_rewrite: Vec<(String, String)> = Vec::new();
+            let mut temp_triggers_to_rewrite: Vec<(String, String, bool)> = Vec::new();
 
             if resolver.with_schema(database_id, |s| {
                 s.get_table(new_name).is_some()
@@ -1578,6 +1578,14 @@ pub fn translate_alter_table(
                     )));
                 }
                 if trigger_entry.database_id == crate::TEMP_DB_ID {
+                    let temp_trigger_targets_renamed_table =
+                        normalize_ident(&trigger_entry.trigger.table_name) == normalized_old_name
+                            && match trigger_entry.trigger.target_database_id {
+                                Some(target_db) => target_db == database_id,
+                                None => resolver.with_schema(crate::TEMP_DB_ID, |schema| {
+                                    schema.get_table(&normalized_old_name).is_none()
+                                }),
+                            };
                     // Pass the renamed database's NAME so the rewrite
                     // only touches triggers whose `tbl_name.db_name`
                     // actually points at the db we are renaming in
@@ -1594,8 +1602,11 @@ pub fn translate_alter_table(
                         &renamed_db_name,
                     )?;
                     if new_sql != trigger_entry.trigger.sql {
-                        temp_triggers_to_rewrite
-                            .push((trigger_entry.trigger.name.clone(), new_sql));
+                        temp_triggers_to_rewrite.push((
+                            trigger_entry.trigger.name.clone(),
+                            new_sql,
+                            temp_trigger_targets_renamed_table,
+                        ));
                     }
                 }
             }
@@ -1712,14 +1723,20 @@ pub fn translate_alter_table(
                 );
             }
 
-            for (trigger_name, new_sql) in temp_triggers_to_rewrite {
+            for (trigger_name, new_sql, renames_target) in temp_triggers_to_rewrite {
                 let escaped_sql = escape_sql_string_literal(&new_sql);
                 let escaped_trigger_name = escape_sql_string_literal(&trigger_name);
                 let qualified_schema_table = schema_table_name_for_db(resolver, crate::TEMP_DB_ID);
+                let tbl_name_update = if renames_target {
+                    let escaped_new_name = escape_sql_string_literal(new_name);
+                    format!(", tbl_name = '{escaped_new_name}'")
+                } else {
+                    String::new()
+                };
                 let update_stmt = format!(
                     r#"
                         UPDATE {qualified_schema_table}
-                        SET sql = '{escaped_sql}'
+                        SET sql = '{escaped_sql}'{tbl_name_update}
                         WHERE name = '{escaped_trigger_name}' COLLATE NOCASE AND type = 'trigger'
                     "#,
                 );

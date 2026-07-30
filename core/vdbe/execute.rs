@@ -15909,6 +15909,41 @@ pub fn op_rename_table(
 
     if *db != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
         conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| -> crate::Result<()> {
+            // A TEMP trigger may run on a table in another database. Triggers
+            // are found by the name of that table. When the table is renamed,
+            // move its TEMP triggers to the new name. Changing only the stored
+            // SQL would leave them under the old name, so they would no longer
+            // run.
+            let temp_shadows_old_name = schema.tables.contains_key(&normalized_from);
+            if let Some(triggers) = schema.triggers.remove(&normalized_from) {
+                let mut triggers_to_keep = std::collections::VecDeque::new();
+                let mut triggers_to_rename = std::collections::VecDeque::new();
+                for mut trigger_arc in triggers {
+                    let targets_renamed_database = match trigger_arc.target_database_id {
+                        Some(target_db) => target_db == *db,
+                        None => !temp_shadows_old_name,
+                    };
+                    if targets_renamed_database {
+                        let trigger = Arc::make_mut(&mut trigger_arc);
+                        normalized_to.clone_into(&mut trigger.table_name);
+                        rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+                        triggers_to_rename.push_back(trigger_arc);
+                    } else {
+                        triggers_to_keep.push_back(trigger_arc);
+                    }
+                }
+                if !triggers_to_keep.is_empty() {
+                    schema
+                        .triggers
+                        .insert(normalized_from.to_owned(), triggers_to_keep);
+                }
+                schema
+                    .triggers
+                    .entry(normalized_to.to_owned())
+                    .or_default()
+                    .extend(triggers_to_rename);
+            }
+
             for triggers in schema.triggers.values_mut() {
                 for trigger_arc in triggers.iter_mut() {
                     if !sql_might_reference_identifier(&trigger_arc.sql, &normalized_from) {
