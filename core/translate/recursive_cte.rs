@@ -37,17 +37,15 @@ pub(crate) fn emit_recursive_cte(
     });
 
     let mut queue_index_columns = crate::alloc::try_vec![]?;
-    let mut queue_sort_keys = Vec::new();
+    let mut queue_sort_keys = crate::alloc::try_vec![]?;
     if let Some(queue_order) = &recursive_cte.queue_order {
         for (result_column_index, order, nulls, explicit_collation) in queue_order {
             let default_nulls = match order {
                 SortOrder::Asc => NullsOrder::First,
                 SortOrder::Desc => NullsOrder::Last,
             };
-            let nulls_last_override = nulls
-                .filter(|nulls| *nulls != default_nulls)
-                .map(|nulls| matches!(nulls, NullsOrder::Last));
-            if nulls_last_override.is_some() {
+            let nulls_override = nulls.filter(|nulls| *nulls != default_nulls);
+            if nulls_override.is_some() {
                 queue_index_columns.try_push(IndexColumn {
                     name: format!("null-rank-{}", queue_sort_keys.len()),
                     order: SortOrder::Asc,
@@ -71,7 +69,7 @@ pub(crate) fn emit_recursive_cte(
             })?;
             queue_sort_keys.push(RecursiveCteQueueKey {
                 result_column_index: *result_column_index,
-                nulls_last_override,
+                nulls_override,
             });
         }
     }

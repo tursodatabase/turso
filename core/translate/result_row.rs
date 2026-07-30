@@ -354,13 +354,14 @@ pub fn emit_columns_to_destination(
 
             let sort_key_column_count = sort_keys
                 .iter()
-                .map(|key| 1 + usize::from(key.nulls_last_override.is_some()))
+                .map(|key| 1 + usize::from(key.nulls_override.is_some()))
                 .sum::<usize>();
             let queue_row_start_reg =
                 program.alloc_registers(sort_key_column_count + 1 + num_columns);
             let mut queue_key_reg = queue_row_start_reg;
             for key in sort_keys {
-                if let Some(nulls_last) = key.nulls_last_override {
+                if let Some(nulls) = key.nulls_override {
+                    let nulls_last = matches!(nulls, ast::NullsOrder::Last);
                     let null_rank_ready = program.allocate_label();
                     program.emit_insn(Insn::Integer {
                         value: i64::from(nulls_last),

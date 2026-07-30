@@ -622,9 +622,9 @@ pub enum QueryDestination {
 /// One result column used to order the recursive CTE work queue.
 pub struct RecursiveCteQueueKey {
     pub result_column_index: usize,
-    /// `Some(true)` for NULLS LAST, `Some(false)` for NULLS FIRST, and `None`
-    /// when the index sort order already puts NULLs in the requested position.
-    pub nulls_last_override: Option<bool>,
+    /// `None` when the index sort order already puts NULLs in the requested
+    /// position.
+    pub nulls_override: Option<ast::NullsOrder>,
 }
 
 impl QueryDestination {
