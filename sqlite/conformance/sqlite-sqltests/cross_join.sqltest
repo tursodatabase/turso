@@ -444,6 +444,25 @@ expect {
     3|1|three
 }
 
+test cross-join-attached-database-dependent-rowid {
+    ATTACH ':memory:' AS cross_aux;
+    CREATE TABLE attached_root(id INTEGER PRIMARY KEY, child_id INTEGER);
+    CREATE TABLE cross_aux.attached_child(
+        id INTEGER PRIMARY KEY,
+        payload TEXT
+    );
+    INSERT INTO attached_root VALUES (1, 2), (2, 1);
+    INSERT INTO cross_aux.attached_child VALUES (1, 'one'), (2, 'two');
+    SELECT r.id, c.id, c.payload
+    FROM attached_root AS r
+    CROSS JOIN cross_aux.attached_child AS c
+    WHERE c.id = r.child_id;
+}
+expect {
+    1|2|two
+    2|1|one
+}
+
 test cross-join-subquery-right {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);

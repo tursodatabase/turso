@@ -140,6 +140,11 @@ or hard-coding tuple arities. SQL table identities are resolved to ordered
 erased after every fold while that symbolic item type remains intact, so
 filtering, sorting, distinctness, slicing, and destinations consume every
 source shape through one path.
+Each source description owns its database identity and schema cookie alongside
+its table or index resource. A source list may therefore cross attached
+databases without choosing cursor numbers or opening any resource during SQL
+planning; lowering registers the read transaction for each database when it
+emits that source's open effect.
 Table resource acquisition is separate from stream positioning. `open_table`
 produces a non-cloneable symbolic `OpenedTable`; consuming that handle with
 `scan`, `seek_rowid`, or `seek_range` produces the row stream. A dependent join
@@ -232,8 +237,8 @@ and composes each ordered arm from `then`, `and_then`, comparison, and `branch`;
 NULL comparison results follow the false arm, as required by SQLite.
 The path also falls back when SQL semantics still live in the eager frontend:
 other expression forms, outer and semi/anti joins, unsupported index-range
-shapes, joins spanning attached databases, aggregates, most subquery forms,
-generated values, arrays, and custom-type decoding.
+shapes, aggregates, most subquery forms, generated values, arrays, and
+custom-type decoding.
 `EXPLAIN QUERY PLAN` also remains on the eager path until the IR models
 explain-tree effects.
 Ordinary column lowering does reuse the VDBE backend's logical-column helper, so

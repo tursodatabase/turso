@@ -1081,10 +1081,14 @@ impl ResolvedJoinInValues {
 
 enum ResolvedJoinMember {
     Table {
+        database_id: usize,
+        schema_cookie: u32,
         table: Arc<BTreeTable>,
         access: ResolvedTableJoinAccess,
     },
     Index {
+        database_id: usize,
+        schema_cookie: u32,
         table: Arc<BTreeTable>,
         index: Arc<Index>,
         covering: bool,
@@ -1104,12 +1108,19 @@ enum OpenedJoinMember {
 }
 
 impl ResolvedJoinMember {
-    fn open(self, database_id: usize, schema_cookie: u32) -> BoxedCompile<OpenedJoinMember> {
+    fn open(self) -> BoxedCompile<OpenedJoinMember> {
         match self {
-            Self::Table { table, access } => open_table(table, database_id, schema_cookie)
+            Self::Table {
+                database_id,
+                schema_cookie,
+                table,
+                access,
+            } => open_table(table, database_id, schema_cookie)
                 .map(move |table| OpenedJoinMember::Table { table, access })
                 .boxed(),
             Self::Index {
+                database_id,
+                schema_cookie,
                 table,
                 index,
                 covering,
@@ -1283,11 +1294,11 @@ fn try_compile_declarative_source_pipeline(
     }
     let first_covering = first_index.is_some() && first_joined.utilizes_covering_index();
 
-    let database_id = first_joined.database_id;
+    let root_database_id = first_joined.database_id;
     let mut seen = SmallVec::<[usize; 4]>::new();
     let mut expr_resolver = RowExprResolver::new(
         resolver,
-        database_id,
+        root_database_id,
         first_joined.internal_id,
         outer_table,
         first_index
@@ -1306,7 +1317,6 @@ fn try_compile_declarative_source_pipeline(
         if member.table_id != joined.internal_id
             || member.is_outer
             || seen.contains(&member.original_idx)
-            || joined.database_id != database_id
         {
             return Ok(None);
         }
@@ -1319,10 +1329,12 @@ fn try_compile_declarative_source_pipeline(
             return Ok(None);
         };
         if planned_index.is_some_and(|index| {
-            !declarative_join_index_is_supported(resolver, database_id, table, index)
+            !declarative_join_index_is_supported(resolver, joined.database_id, table, index)
         }) {
             return Ok(None);
         }
+        let database_id = joined.database_id;
+        let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
         let covering = planned_index.is_some() && joined.utilizes_covering_index();
         let collation = planned_index
             .and_then(|index| index.columns.first())
@@ -1337,12 +1349,16 @@ fn try_compile_declarative_source_pipeline(
                 };
                 match index {
                     Some(index) => ResolvedJoinMember::Index {
+                        database_id,
+                        schema_cookie,
                         table: table.clone(),
                         index: index.clone(),
                         covering,
                         access: ResolvedIndexJoinAccess::Scan(direction),
                     },
                     None => ResolvedJoinMember::Table {
+                        database_id,
+                        schema_cookie,
                         table: table.clone(),
                         access: ResolvedTableJoinAccess::Scan(direction),
                     },
@@ -1361,6 +1377,8 @@ fn try_compile_declarative_source_pipeline(
                     ResolvedJoinValue::Dependent(rowid)
                 };
                 ResolvedJoinMember::Table {
+                    database_id,
+                    schema_cookie,
                     table: table.clone(),
                     access: ResolvedTableJoinAccess::Rowid(rowid),
                 }
@@ -1387,6 +1405,8 @@ fn try_compile_declarative_source_pipeline(
                     ResolvedJoinTableRange::Dependent(range)
                 };
                 ResolvedJoinMember::Table {
+                    database_id,
+                    schema_cookie,
                     table: table.clone(),
                     access: ResolvedTableJoinAccess::Range(range),
                 }
@@ -1413,6 +1433,8 @@ fn try_compile_declarative_source_pipeline(
                     ResolvedJoinIndexRange::Dependent(range)
                 };
                 ResolvedJoinMember::Index {
+                    database_id,
+                    schema_cookie,
                     table: table.clone(),
                     index: index.clone(),
                     covering,
@@ -1464,12 +1486,16 @@ fn try_compile_declarative_source_pipeline(
                 };
                 match index {
                     Some(index) => ResolvedJoinMember::Index {
+                        database_id,
+                        schema_cookie,
                         table: table.clone(),
                         index: index.clone(),
                         covering,
                         access: ResolvedIndexJoinAccess::InValues(values),
                     },
                     None => ResolvedJoinMember::Table {
+                        database_id,
+                        schema_cookie,
                         table: table.clone(),
                         access: ResolvedTableJoinAccess::InValues(values),
                     },
@@ -1495,7 +1521,7 @@ fn try_compile_declarative_source_pipeline(
         plan,
         resolver,
         &mut expr_resolver,
-        database_id,
+        root_database_id,
         plan.join_order.len() - 1,
     )?
     else {
@@ -1513,11 +1539,10 @@ fn try_compile_declarative_source_pipeline(
         inputs.declare(dependency)?;
     }
 
-    let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
     let mut opened = pure(SmallVec::<[OpenedJoinMember; 4]>::new()).boxed();
     for member in resolved_members {
         opened = opened
-            .then(member.open(database_id, schema_cookie))
+            .then(member.open())
             .map(|(mut members, member)| {
                 members.push(member);
                 members
@@ -5323,6 +5348,82 @@ mod tests {
                     Value::from_i64(3),
                     Value::from_i64(1),
                     Value::from_text("three")
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn attached_database_join_uses_one_declarative_source_pipeline() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open(
+            io,
+            ":memory:",
+            crate::OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(crate::DatabaseOpts::new().with_attach(true)),
+        )
+        .unwrap();
+        let connection = database.connect().unwrap();
+        connection.execute("ATTACH ':memory:aux' AS aux").unwrap();
+        connection
+            .execute("CREATE TABLE roots(id INTEGER PRIMARY KEY, child_id INTEGER)")
+            .unwrap();
+        connection
+            .execute("CREATE TABLE aux.children(id INTEGER PRIMARY KEY, payload TEXT)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO roots VALUES (1, 2), (2, 1)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO aux.children VALUES (1, 'one'), (2, 'two')")
+            .unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT r.id, c.id, c.payload \
+                   FROM roots AS r CROSS JOIN aux.children AS c \
+                  WHERE c.id = r.child_id",
+            )
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+        let open_databases = instructions
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::OpenRead { db, .. } => Some(*db),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(open_databases, vec![0, 2]);
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::SeekRowid { .. }))
+                .count(),
+            1
+        );
+        let result_row = instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 3, .. }))
+            .expect("attached database join must produce one symbolic result pack");
+        assert!(
+            instructions[result_row - 3..result_row]
+                .iter()
+                .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })),
+            "attached database projections must remain symbolic until pack lowering"
+        );
+
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![
+                vec![
+                    Value::from_i64(1),
+                    Value::from_i64(2),
+                    Value::from_text("two")
+                ],
+                vec![
+                    Value::from_i64(2),
+                    Value::from_i64(1),
+                    Value::from_text("one")
                 ],
             ]
         );
