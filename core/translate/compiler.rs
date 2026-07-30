@@ -399,9 +399,12 @@ where
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
         let row = builder.create_block()?;
         let exit = builder.create_block()?;
-        let check = matches!(&self.source, CursorRowSource::IndexRange(_))
-            .then(|| builder.create_block())
-            .transpose()?;
+        let check = match &self.source {
+            CursorRowSource::IndexRange(range) if range.end.is_some() => {
+                Some(builder.create_block()?)
+            }
+            _ => None,
+        };
 
         match self.source.clone() {
             CursorRowSource::Scan(direction) => builder.terminate(Terminator::CursorStart {
@@ -418,26 +421,37 @@ where
                 if_not_found: exit,
                 arguments: SmallVec::new(),
             })?,
-            CursorRowSource::IndexRange(range) => builder.terminate(Terminator::IndexSeek {
-                cursor: self.cursor,
-                key: range.start.key,
-                op: range.start.op,
-                if_found: check.expect("index range must have a bound-check block"),
-                if_empty: exit,
-                arguments: SmallVec::new(),
-            })?,
+            CursorRowSource::IndexRange(range) => match range.start {
+                Some(start) => builder.terminate(Terminator::IndexSeek {
+                    cursor: self.cursor,
+                    key: start.key,
+                    op: start.op,
+                    if_found: check.unwrap_or(row),
+                    if_empty: exit,
+                    arguments: SmallVec::new(),
+                })?,
+                None => builder.terminate(Terminator::CursorStart {
+                    cursor: self.cursor,
+                    direction: range.direction,
+                    if_non_empty: check.unwrap_or(row),
+                    if_empty: exit,
+                    arguments: SmallVec::new(),
+                })?,
+            },
         }
 
         if let CursorRowSource::IndexRange(range) = self.source.clone() {
-            builder.switch_to(check.expect("index range must have a bound-check block"))?;
-            builder.terminate(Terminator::IndexBound {
-                cursor: self.cursor,
-                key: range.end.key,
-                op: range.end.op,
-                if_before_end: row,
-                if_at_end: exit,
-                arguments: SmallVec::new(),
-            })?;
+            if let Some(end) = range.end {
+                builder.switch_to(check.expect("bounded index range must have a check block"))?;
+                builder.terminate(Terminator::IndexBound {
+                    cursor: self.cursor,
+                    key: end.key,
+                    op: end.op,
+                    if_before_end: row,
+                    if_at_end: exit,
+                    arguments: SmallVec::new(),
+                })?;
+            }
         }
 
         builder.switch_to(row)?;
@@ -466,7 +480,7 @@ where
             CursorRowSource::IndexRange(range) => builder.terminate(Terminator::CursorAdvance {
                 cursor: self.cursor,
                 direction: range.direction,
-                if_next: check.expect("index range must have a bound-check block"),
+                if_next: check.unwrap_or(row),
                 if_done: exit,
                 arguments: SmallVec::new(),
             })?,
@@ -490,9 +504,12 @@ where
         let advance = builder.create_block()?;
         let stop = builder.create_block()?;
         let exit = builder.create_block()?;
-        let check = matches!(&self.source, CursorRowSource::IndexRange(_))
-            .then(|| builder.create_block())
-            .transpose()?;
+        let check = match &self.source {
+            CursorRowSource::IndexRange(range) if range.end.is_some() => {
+                Some(builder.create_block()?)
+            }
+            _ => None,
+        };
         let mut row_state = SmallVec::with_capacity(initial.len());
         let mut result_state = SmallVec::with_capacity(initial.len());
         let mut check_state = SmallVec::with_capacity(initial.len());
@@ -519,26 +536,37 @@ where
                 if_not_found: exit,
                 arguments: initial.values,
             })?,
-            CursorRowSource::IndexRange(range) => builder.terminate(Terminator::IndexSeek {
-                cursor: self.cursor,
-                key: range.start.key,
-                op: range.start.op,
-                if_found: check.expect("index range must have a bound-check block"),
-                if_empty: exit,
-                arguments: initial.values,
-            })?,
+            CursorRowSource::IndexRange(range) => match range.start {
+                Some(start) => builder.terminate(Terminator::IndexSeek {
+                    cursor: self.cursor,
+                    key: start.key,
+                    op: start.op,
+                    if_found: check.unwrap_or(row),
+                    if_empty: exit,
+                    arguments: initial.values,
+                })?,
+                None => builder.terminate(Terminator::CursorStart {
+                    cursor: self.cursor,
+                    direction: range.direction,
+                    if_non_empty: check.unwrap_or(row),
+                    if_empty: exit,
+                    arguments: initial.values,
+                })?,
+            },
         }
 
         if let CursorRowSource::IndexRange(range) = self.source.clone() {
-            builder.switch_to(check.expect("index range must have a bound-check block"))?;
-            builder.terminate(Terminator::IndexBound {
-                cursor: self.cursor,
-                key: range.end.key,
-                op: range.end.op,
-                if_before_end: row,
-                if_at_end: exit,
-                arguments: check_state,
-            })?;
+            if let Some(end) = range.end {
+                builder.switch_to(check.expect("bounded index range must have a check block"))?;
+                builder.terminate(Terminator::IndexBound {
+                    cursor: self.cursor,
+                    key: end.key,
+                    op: end.op,
+                    if_before_end: row,
+                    if_at_end: exit,
+                    arguments: check_state,
+                })?;
+            }
         }
 
         builder.switch_to(row)?;
@@ -584,7 +612,7 @@ where
             CursorRowSource::IndexRange(range) => builder.terminate(Terminator::CursorAdvance {
                 cursor: self.cursor,
                 direction: range.direction,
-                if_next: check.expect("index range must have a bound-check block"),
+                if_next: check.unwrap_or(row),
                 if_done: exit,
                 arguments: step.state.values.clone(),
             })?,
@@ -792,20 +820,38 @@ impl ValuePack {
 struct IndexKey {
     pack: ValuePack,
     affinities: SmallVec<[Affinity; 4]>,
+    null_policies: SmallVec<[IndexNullPolicy; 4]>,
+}
+
+/// Whether a NULL endpoint value makes the range empty or participates in the
+/// B-tree comparison as a planner-injected sentinel.
+#[derive(Clone, Copy, Debug)]
+enum IndexNullPolicy {
+    AbortRange,
+    Compare,
 }
 
 impl IndexKey {
-    fn new(values: SmallVec<[ValueId; 4]>, affinities: SmallVec<[Affinity; 4]>) -> Result<Self> {
-        if values.is_empty() || values.len() != affinities.len() {
+    fn new(
+        values: SmallVec<[ValueId; 4]>,
+        affinities: SmallVec<[Affinity; 4]>,
+        null_policies: SmallVec<[IndexNullPolicy; 4]>,
+    ) -> Result<Self> {
+        if values.is_empty()
+            || values.len() != affinities.len()
+            || values.len() != null_policies.len()
+        {
             return Err(LimboError::InternalError(format!(
-                "compiler IR index key has {} values and {} affinities",
+                "compiler IR index key has {} values, {} affinities, and {} NULL policies",
                 values.len(),
-                affinities.len()
+                affinities.len(),
+                null_policies.len()
             )));
         }
         Ok(Self {
             pack: ValuePack(values),
             affinities,
+            null_policies,
         })
     }
 
@@ -3293,7 +3339,8 @@ impl IrProgram {
         if_null: crate::vdbe::BranchOffset,
     ) -> usize {
         let start = program.alloc_registers(key.values().len());
-        for (index, value) in key.values().iter().enumerate() {
+        for (index, (value, null_policy)) in key.values().iter().zip(&key.null_policies).enumerate()
+        {
             let source = Self::register_for(registers, *value);
             let destination = start + index;
             if source != destination {
@@ -3303,10 +3350,12 @@ impl IrProgram {
                     extra_amount: 0,
                 });
             }
-            program.emit_insn(Insn::IsNull {
-                reg: destination,
-                target_pc: if_null,
-            });
+            if matches!(null_policy, IndexNullPolicy::AbortRange) {
+                program.emit_insn(Insn::IsNull {
+                    reg: destination,
+                    target_pc: if_null,
+                });
+            }
         }
         let affinities = key
             .affinities
@@ -4369,6 +4418,13 @@ impl IrProgram {
             }
             write!(f, "{affinity:?}")?;
         }
+        write!(f, "] null [")?;
+        for (index, policy) in key.null_policies.iter().enumerate() {
+            if index != 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{policy:?}")?;
+        }
         write!(f, "]")
     }
 
@@ -4429,8 +4485,8 @@ enum CursorRowSource {
 
 #[derive(Clone)]
 struct IndexRangeSource {
-    start: IndexBoundSpec,
-    end: IndexBoundSpec,
+    start: Option<IndexBoundSpec>,
+    end: Option<IndexBoundSpec>,
     direction: ScanDirection,
 }
 
@@ -5326,61 +5382,121 @@ enum ScanBtreeStart {
 }
 
 pub(crate) struct DeferredIndexBound {
-    values: SmallVec<[BoxedCompile<ValueId>; 4]>,
-    affinities: SmallVec<[Affinity; 4]>,
+    suffix: DeferredIndexSuffix,
     op: SeekOp,
 }
 
 impl DeferredIndexBound {
-    pub(crate) fn new(
-        values: SmallVec<[BoxedCompile<ValueId>; 4]>,
-        affinities: SmallVec<[Affinity; 4]>,
-        op: SeekOp,
-    ) -> Self {
+    pub(crate) const fn prefix(op: SeekOp) -> Self {
         Self {
-            values,
-            affinities,
+            suffix: DeferredIndexSuffix::None,
             op,
         }
     }
 
-    fn compile(self, builder: &mut IrBuilder) -> Result<IndexBoundSpec> {
-        let mut values = SmallVec::with_capacity(self.values.len());
-        for value in self.values {
-            values.push(value.compile(builder)?);
+    pub(crate) const fn null(op: SeekOp) -> Self {
+        Self {
+            suffix: DeferredIndexSuffix::Null,
+            op,
         }
-        Ok(IndexBoundSpec {
-            key: IndexKey::new(values, self.affinities)?,
+    }
+
+    pub(crate) const fn expression(
+        value: BoxedCompile<ValueId>,
+        affinity: Affinity,
+        op: SeekOp,
+    ) -> Self {
+        Self {
+            suffix: DeferredIndexSuffix::Expression { value, affinity },
+            op,
+        }
+    }
+
+    fn compile(
+        self,
+        builder: &mut IrBuilder,
+        prefix_values: &[ValueId],
+        prefix_affinities: &[Affinity],
+    ) -> Result<Option<IndexBoundSpec>> {
+        let mut values = SmallVec::from_slice(prefix_values);
+        let mut affinities = SmallVec::from_slice(prefix_affinities);
+        let mut null_policies = smallvec![IndexNullPolicy::AbortRange; values.len()];
+        match self.suffix {
+            DeferredIndexSuffix::None => {}
+            DeferredIndexSuffix::Null => {
+                values.push(builder.push(ScalarOp::Constant(Value::Null))?);
+                affinities.push(Affinity::Blob);
+                null_policies.push(IndexNullPolicy::Compare);
+            }
+            DeferredIndexSuffix::Expression { value, affinity } => {
+                values.push(value.compile(builder)?);
+                affinities.push(affinity);
+                null_policies.push(IndexNullPolicy::AbortRange);
+            }
+        }
+        if values.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(IndexBoundSpec {
+            key: IndexKey::new(values, affinities, null_policies)?,
             op: self.op,
-        })
+        }))
     }
 }
 
+/// Optional component after the equality prefix of one range endpoint.
+enum DeferredIndexSuffix {
+    None,
+    Null,
+    Expression {
+        value: BoxedCompile<ValueId>,
+        affinity: Affinity,
+    },
+}
+
 pub(crate) struct DeferredIndexRange {
+    prefix_values: SmallVec<[BoxedCompile<ValueId>; 4]>,
+    prefix_affinities: SmallVec<[Affinity; 4]>,
     start: DeferredIndexBound,
-    end_op: SeekOp,
+    end: DeferredIndexBound,
     direction: ScanDirection,
 }
 
 impl DeferredIndexRange {
-    pub(crate) const fn with_shared_key(
+    pub(crate) const fn new(
+        prefix_values: SmallVec<[BoxedCompile<ValueId>; 4]>,
+        prefix_affinities: SmallVec<[Affinity; 4]>,
         start: DeferredIndexBound,
-        end_op: SeekOp,
+        end: DeferredIndexBound,
         direction: ScanDirection,
     ) -> Self {
         Self {
+            prefix_values,
+            prefix_affinities,
             start,
-            end_op,
+            end,
             direction,
         }
     }
 
     fn compile(self, builder: &mut IrBuilder) -> Result<IndexRangeSource> {
-        let start = self.start.compile(builder)?;
-        let end = IndexBoundSpec {
-            key: start.key.clone(),
-            op: self.end_op,
-        };
+        if self.prefix_values.len() != self.prefix_affinities.len() {
+            return Err(LimboError::InternalError(format!(
+                "compiler index range has {} prefix values and {} affinities",
+                self.prefix_values.len(),
+                self.prefix_affinities.len()
+            )));
+        }
+        let mut prefix_values = SmallVec::<[ValueId; 4]>::with_capacity(self.prefix_values.len());
+        for value in self.prefix_values {
+            prefix_values.push(value.compile(builder)?);
+        }
+        let start = self
+            .start
+            .compile(builder, &prefix_values, &self.prefix_affinities)?;
+        let end = self
+            .end
+            .compile(builder, &prefix_values, &self.prefix_affinities)?;
         Ok(IndexRangeSource {
             start,
             end,
@@ -6243,13 +6359,11 @@ mod tests {
     fn exact_index_range_builds_seek_bound_and_advance_control_flow() {
         let table = Arc::new(BTreeTable::from_sql("CREATE TABLE indexed(a,b)", 2).unwrap());
         let index = test_index(&table, "indexed_b", 3);
-        let range = DeferredIndexRange::with_shared_key(
-            DeferredIndexBound::new(
-                smallvec![constant(Value::from_i64(7)).boxed()],
-                smallvec![Affinity::Numeric],
-                SeekOp::GE { eq_only: true },
-            ),
-            SeekOp::GT,
+        let range = DeferredIndexRange::new(
+            smallvec![constant(Value::from_i64(7)).boxed()],
+            smallvec![Affinity::Numeric],
+            DeferredIndexBound::prefix(SeekOp::GE { eq_only: true }),
+            DeferredIndexBound::prefix(SeekOp::GT),
             ScanDirection::Forward,
         );
         let compiler = seek_index(table, index, false, 0, 0, range).and_then(|rows| {
@@ -6296,16 +6410,95 @@ mod tests {
     }
 
     #[test]
+    fn index_range_distinguishes_null_sentinels_from_null_expression_bounds() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE indexed(a,b)", 2).unwrap());
+        let index = test_index(&table, "indexed_b", 3);
+        let range = DeferredIndexRange::new(
+            SmallVec::new(),
+            SmallVec::new(),
+            DeferredIndexBound::null(SeekOp::GT),
+            DeferredIndexBound::expression(
+                constant(Value::from_i64(9)).boxed(),
+                Affinity::Numeric,
+                SeekOp::GE { eq_only: false },
+            ),
+            ScanDirection::Forward,
+        );
+        let compiler = seek_index(table, index, false, 0, 0, range).and_then(|rows| {
+            rows.for_each(|row| {
+                pack_values(smallvec![row.column(0).boxed()]).and_then(result_row_pack)
+            })
+        });
+
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+        assert!(rendered.contains("%0 = constant Null"));
+        assert!(rendered.contains("index_seek GT $1 [%0] affinity [Blob] null [Compare]"));
+        assert!(rendered.contains("index_bound GE { eq_only: false } $1 [%1]"));
+
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 2, 0));
+        let target = program.alloc_register();
+        ir.lower_into(&mut program, target).unwrap();
+        program.resolve_labels().unwrap();
+
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::IsNull { .. }))
+                .count(),
+            1,
+            "only the expression endpoint should abort the range when it is NULL"
+        );
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::SeekGT { num_regs: 1, .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::IdxGE { num_regs: 1, .. })));
+    }
+
+    #[test]
+    fn index_range_can_advance_without_a_termination_bound() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE indexed(a,b)", 2).unwrap());
+        let index = test_index(&table, "indexed_b", 3);
+        let range = DeferredIndexRange::new(
+            SmallVec::new(),
+            SmallVec::new(),
+            DeferredIndexBound::expression(
+                constant(Value::from_i64(1)).boxed(),
+                Affinity::Numeric,
+                SeekOp::GT,
+            ),
+            DeferredIndexBound::prefix(SeekOp::GT),
+            ScanDirection::Forward,
+        );
+        let compiler = seek_index(table, index, true, 0, 0, range).and_then(|rows| {
+            rows.for_each(|row| {
+                pack_values(smallvec![row.column(0).boxed()]).and_then(result_row_pack)
+            })
+        });
+
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+
+        assert!(rendered.contains("index_seek GT $0"));
+        assert!(!rendered.contains("index_bound"));
+        assert!(rendered.contains("cursor_advance Forward $0, block1(), block2()"));
+    }
+
+    #[test]
     fn verifier_rejects_index_control_on_a_table_cursor() {
         let table = Arc::new(BTreeTable::from_sql("CREATE TABLE indexed(a,b)", 2).unwrap());
         let index = test_index(&table, "indexed_b", 3);
-        let range = DeferredIndexRange::with_shared_key(
-            DeferredIndexBound::new(
-                smallvec![constant(Value::from_i64(7)).boxed()],
-                smallvec![Affinity::Numeric],
-                SeekOp::GE { eq_only: true },
-            ),
-            SeekOp::GT,
+        let range = DeferredIndexRange::new(
+            smallvec![constant(Value::from_i64(7)).boxed()],
+            smallvec![Affinity::Numeric],
+            DeferredIndexBound::prefix(SeekOp::GE { eq_only: true }),
+            DeferredIndexBound::prefix(SeekOp::GT),
             ScanDirection::Forward,
         );
         let compiler = seek_index(table.clone(), index, false, 0, 0, range)

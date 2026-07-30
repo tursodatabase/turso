@@ -25,7 +25,7 @@ use crate::{
         order_by::{custom_type_comparator, EmitOrderBy},
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, IterationDirection,
-            JoinOrderMember, Operation, QueryDestination, Scan, Search, SeekKeyComponent,
+            JoinOrderMember, Operation, QueryDestination, Scan, Search, SeekKey, SeekKeyComponent,
             SelectPlan, SimpleAggregate,
         },
         planner::table_mask_from_expr,
@@ -35,13 +35,14 @@ use crate::{
         window::{emit_window_flush, EmitWindow},
         ProgramBuilder, Resolver,
     },
+    types::SeekOp,
     vdbe::{builder::QueryMode, insn::Insn},
     HashMap, HashSet, LimboError, Result,
 };
 use smallvec::SmallVec;
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
-use turso_parser::ast::Expr;
+use turso_parser::ast::{Expr, SortOrder};
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_select(
@@ -69,6 +70,30 @@ pub fn emit_program_for_select_with_resolver(
 
     let materialized_build_inputs = emit_materialized_build_inputs(program, &resolver, &mut plan)?;
     emit_program_for_select_with_inputs(program, &resolver, plan, materialized_build_inputs)
+}
+
+fn compile_deferred_index_bound(
+    key: &SeekKey,
+    expr_resolver: &RowExprResolver<'_, '_>,
+) -> Result<Option<DeferredIndexBound>> {
+    Ok(Some(match &key.last_component {
+        SeekKeyComponent::None => DeferredIndexBound::prefix(key.op),
+        SeekKeyComponent::Null => DeferredIndexBound::null(key.op),
+        SeekKeyComponent::Expr(expression) => {
+            let Some(resolved) = expr_resolver.resolve(expression)? else {
+                return Ok(None);
+            };
+            let Some(value) = compile_symbolic_static_expr(&resolved) else {
+                return Ok(None);
+            };
+            let affinity = if key.affinity.expr_needs_no_affinity_change(expression) {
+                crate::vdbe::affinity::Affinity::Blob
+            } else {
+                key.affinity
+            };
+            DeferredIndexBound::expression(value, affinity, key.op)
+        }
+    }))
 }
 
 fn try_emit_declarative_table_scan(
@@ -183,13 +208,10 @@ fn try_emit_declarative_table_scan(
     let index_range = match index_seek {
         None => None,
         Some(seek_def)
-            if !seek_def.prefix.is_empty()
-                && seek_def
-                    .prefix
-                    .iter()
-                    .all(|constraint| constraint.eq.is_some())
-                && matches!(seek_def.start.last_component, SeekKeyComponent::None)
-                && matches!(seek_def.end.last_component, SeekKeyComponent::None) =>
+            if seek_def
+                .prefix
+                .iter()
+                .all(|constraint| constraint.eq.is_some()) =>
         {
             let mut values = SmallVec::with_capacity(seek_def.prefix.len());
             let mut affinities = SmallVec::with_capacity(seek_def.prefix.len());
@@ -211,10 +233,45 @@ fn try_emit_declarative_table_scan(
                     *affinity
                 });
             }
-            Some(DeferredIndexRange::with_shared_key(
-                DeferredIndexBound::new(values, affinities, seek_def.start.op),
-                seek_def.end.op,
-                direction,
+            let Some(mut start) = compile_deferred_index_bound(&seek_def.start, &expr_resolver)?
+            else {
+                return Ok(None);
+            };
+            let Some(mut end) = compile_deferred_index_bound(&seek_def.end, &expr_resolver)? else {
+                return Ok(None);
+            };
+            // An unconstrained physical edge can include NULL keys that SQL
+            // range predicates must skip. Make that boundary explicit before
+            // handing the range to the SQL-agnostic compiler IR.
+            let first_index_order = index.expect("index seek has an index").columns[0].order;
+            if seek_def.prefix.is_empty()
+                && matches!(seek_def.start.last_component, SeekKeyComponent::None)
+            {
+                start = match (seek_def.iter_dir, first_index_order) {
+                    (IterationDirection::Forwards, SortOrder::Asc) => {
+                        DeferredIndexBound::null(SeekOp::GT)
+                    }
+                    (IterationDirection::Backwards, SortOrder::Desc) => {
+                        DeferredIndexBound::null(SeekOp::LT)
+                    }
+                    _ => start,
+                };
+            }
+            if seek_def.prefix.is_empty()
+                && matches!(seek_def.end.last_component, SeekKeyComponent::None)
+            {
+                end = match (seek_def.iter_dir, first_index_order) {
+                    (IterationDirection::Forwards, SortOrder::Desc) => {
+                        DeferredIndexBound::null(SeekOp::GE { eq_only: false })
+                    }
+                    (IterationDirection::Backwards, SortOrder::Asc) => {
+                        DeferredIndexBound::null(SeekOp::LE { eq_only: false })
+                    }
+                    _ => end,
+                };
+            }
+            Some(DeferredIndexRange::new(
+                values, affinities, start, end, direction,
             ))
         }
         Some(_) => return Ok(None),
@@ -1690,6 +1747,278 @@ mod tests {
                 vec![Value::from_i64(5), Value::from_text("five")],
                 vec![Value::from_i64(2), Value::from_text("two")],
             ]
+        );
+    }
+
+    #[test]
+    fn bounded_index_searches_use_declarative_range_endpoints() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE ranged(\
+                    id INTEGER PRIMARY KEY, category TEXT, rank NUMERIC, payload TEXT\
+                )",
+            )
+            .unwrap();
+        connection
+            .execute("CREATE INDEX ranged_category_rank ON ranged(category, rank)")
+            .unwrap();
+        connection
+            .execute("CREATE INDEX ranged_category_rank_desc ON ranged(category, rank DESC)")
+            .unwrap();
+        connection
+            .execute("CREATE INDEX ranged_rank ON ranged(rank)")
+            .unwrap();
+        connection
+            .execute("CREATE INDEX ranged_rank_desc ON ranged(rank DESC)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO ranged VALUES \
+                 (1, 'group', NULL, 'null'), \
+                 (2, 'group', 1, 'one'), \
+                 (3, 'group', 2, 'two-a'), \
+                 (4, 'group', 2, 'two-b'), \
+                 (5, 'group', 3, 'three'), \
+                 (6, 'group', 4, 'four'), \
+                 (7, 'other', 2, 'other')",
+            )
+            .unwrap();
+
+        let mut two_sided = connection
+            .prepare(
+                "SELECT id FROM ranged INDEXED BY ranged_category_rank \
+                 WHERE category = ?1 AND rank > ?2 AND rank <= ?3 ORDER BY id",
+            )
+            .unwrap();
+        let instructions = &two_sided.get_program().insns;
+        assert!(instructions.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::SeekGT {
+                is_index: true,
+                num_regs: 2,
+                ..
+            }
+        )));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::IdxGT { num_regs: 2, .. })));
+        let result_row = instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. }))
+            .expect("bounded index stream must produce its projected row");
+        assert!(matches!(&instructions[result_row - 1].0, Insn::Copy { .. }));
+        two_sided
+            .bind_at(1.try_into().unwrap(), Value::from_text("group"))
+            .unwrap();
+        two_sided
+            .bind_at(2.try_into().unwrap(), Value::from_text("1"))
+            .unwrap();
+        two_sided
+            .bind_at(3.try_into().unwrap(), Value::from_text("3"))
+            .unwrap();
+        assert_eq!(
+            two_sided.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(3)],
+                vec![Value::from_i64(4)],
+                vec![Value::from_i64(5)],
+            ]
+        );
+
+        two_sided.reset().unwrap();
+        two_sided
+            .bind_at(1.try_into().unwrap(), Value::from_text("group"))
+            .unwrap();
+        two_sided
+            .bind_at(2.try_into().unwrap(), Value::Null)
+            .unwrap();
+        two_sided
+            .bind_at(3.try_into().unwrap(), Value::from_i64(3))
+            .unwrap();
+        assert!(two_sided.run_collect_rows().unwrap().is_empty());
+
+        let mut prefix_upper = connection
+            .prepare(
+                "SELECT id FROM ranged INDEXED BY ranged_category_rank \
+                 WHERE category = 'group' AND rank <= 2 ORDER BY id",
+            )
+            .unwrap();
+        assert!(prefix_upper
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(
+                instruction,
+                Insn::SeekGT {
+                    is_index: true,
+                    num_regs: 2,
+                    ..
+                }
+            )));
+        assert_eq!(
+            prefix_upper.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(2)],
+                vec![Value::from_i64(3)],
+                vec![Value::from_i64(4)],
+            ]
+        );
+
+        let mut descending_upper = connection
+            .prepare(
+                "SELECT id FROM ranged INDEXED BY ranged_category_rank_desc \
+                 WHERE category = 'group' AND rank <= 2 ORDER BY id",
+            )
+            .unwrap();
+        assert!(descending_upper
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::IdxGE { num_regs: 2, .. })));
+        assert_eq!(
+            descending_upper.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(2)],
+                vec![Value::from_i64(3)],
+                vec![Value::from_i64(4)],
+            ]
+        );
+
+        let mut no_end = connection
+            .prepare(
+                "SELECT id FROM ranged INDEXED BY ranged_rank \
+                 WHERE rank > 2 ORDER BY rank, id",
+            )
+            .unwrap();
+        assert!(no_end
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::SeekGT { num_regs: 1, .. })));
+        assert!(no_end.get_program().insns.iter().all(|(instruction, _)| {
+            !matches!(
+                instruction,
+                Insn::IdxGE { .. } | Insn::IdxGT { .. } | Insn::IdxLE { .. } | Insn::IdxLT { .. }
+            )
+        }));
+        assert_eq!(
+            no_end.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(5)], vec![Value::from_i64(6)]]
+        );
+
+        let mut no_end_limited = connection
+            .prepare(
+                "SELECT id FROM ranged INDEXED BY ranged_rank \
+                 WHERE rank > 1 ORDER BY rank, id LIMIT 2 OFFSET 1",
+            )
+            .unwrap();
+        assert_eq!(
+            no_end_limited.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(4)], vec![Value::from_i64(7)]]
+        );
+
+        let mut no_start_seek = connection
+            .prepare(
+                "SELECT id FROM ranged INDEXED BY ranged_rank_desc \
+                 WHERE rank > 2 ORDER BY rank DESC, id LIMIT 1",
+            )
+            .unwrap();
+        assert!(no_start_seek
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Rewind { .. })));
+        assert!(no_start_seek
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::IdxGE { num_regs: 1, .. })));
+        assert_eq!(
+            no_start_seek.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(6)]]
+        );
+
+        let mut no_start = connection
+            .prepare(
+                "SELECT id FROM ranged INDEXED BY ranged_rank \
+                 WHERE rank < 3 ORDER BY id",
+            )
+            .unwrap();
+        assert!(no_start
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::SeekGT { num_regs: 1, .. })));
+        assert!(no_start
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::IdxGE { num_regs: 1, .. })));
+        assert_eq!(
+            no_start.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(2)],
+                vec![Value::from_i64(3)],
+                vec![Value::from_i64(4)],
+                vec![Value::from_i64(7)],
+            ]
+        );
+
+        let mut reverse = connection
+            .prepare(
+                "SELECT id FROM ranged INDEXED BY ranged_category_rank \
+                 WHERE category = 'group' AND rank >= 2 AND rank < 4 \
+                 ORDER BY rank DESC, id DESC",
+            )
+            .unwrap();
+        let reverse_instructions = &reverse.get_program().insns;
+        assert!(reverse_instructions.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::SeekLT {
+                is_index: true,
+                num_regs: 2,
+                ..
+            }
+        )));
+        assert!(reverse_instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::IdxLT { num_regs: 2, .. })));
+        assert!(reverse_instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Prev { .. })));
+        assert_eq!(
+            reverse.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(5)],
+                vec![Value::from_i64(4)],
+                vec![Value::from_i64(3)],
+            ]
+        );
+
+        let mut eager_fallback = connection
+            .prepare(
+                "SELECT id FROM ranged INDEXED BY ranged_rank \
+                 WHERE rank > abs(?1)",
+            )
+            .unwrap();
+        let fallback_instructions = &eager_fallback.get_program().insns;
+        let result_row = fallback_instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. }))
+            .expect("eager fallback must produce its projected row");
+        assert!(!matches!(
+            &fallback_instructions[result_row - 1].0,
+            Insn::Copy { .. }
+        ));
+        eager_fallback
+            .bind_at(1.try_into().unwrap(), Value::from_i64(-2))
+            .unwrap();
+        assert_eq!(
+            eager_fallback.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(5)], vec![Value::from_i64(6)]]
         );
     }
 
