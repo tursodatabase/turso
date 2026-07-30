@@ -5327,6 +5327,24 @@ pub(crate) trait RowStream: Sized + 'static {
         .boxed()
     }
 
+    /// Return the first symbolic scalar yielded by the stream, or `initial`
+    /// when the stream is empty.
+    fn first_or<Initial>(self, initial: Initial) -> BoxedCompile<ValueId>
+    where
+        Self: RowStream<Item = ValueId>,
+        Initial: Compile<Output = ValueId> + 'static,
+    {
+        self.try_fold(initial.map(LoopState::single), |item, mut state| {
+            state.replace_single(item);
+            constant(Value::from_i64(0)).map(move |should_continue| LoopStep {
+                state,
+                should_continue,
+            })
+        })
+        .map(LoopState::into_single)
+        .boxed()
+    }
+
     fn map<MapperFn, Mapper>(self, mapper: MapperFn) -> MapRows<Self, MapperFn, Mapper>
     where
         MapperFn: FnOnce(Self::Item) -> Mapper + 'static,
@@ -7652,6 +7670,43 @@ mod tests {
                 "\n",
                 "block1(%1):\n",
                 "  %3 = constant Numeric(Integer(1))\n",
+                "  %4 = constant Numeric(Integer(0))\n",
+                "  branch %4, block2, block3\n",
+                "\n",
+                "block2:\n",
+                "  cursor_advance Forward $0, block1(%3), block4(%3)\n",
+                "\n",
+                "block3:\n",
+                "  jump block4(%3)\n",
+                "\n",
+                "block4(%2):\n",
+                "  return %2\n",
+            )
+        );
+    }
+
+    #[test]
+    fn row_stream_first_or_joins_the_first_scalar_with_the_empty_default() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE streamed(a)", 2).unwrap());
+        let compiler = scan_table(table, 0, 0, ScanDirection::Forward).and_then(|rows| {
+            rows.map(|row| row.column(0))
+                .first_or(constant(Value::Null))
+        });
+
+        let ir = compile_scalar(compiler).unwrap();
+
+        assert_eq!(
+            ir.to_string(),
+            concat!(
+                "cursor $0 = btree_table \"streamed\" root 2\n",
+                "\n",
+                "block0:\n",
+                "  open_read $0 root 2 db 0 schema 0\n",
+                "  %0 = constant Null\n",
+                "  cursor_start Forward $0, block1(%0), block4(%0)\n",
+                "\n",
+                "block1(%1):\n",
+                "  %3 = column $0[0]\n",
                 "  %4 = constant Numeric(Integer(0))\n",
                 "  branch %4, block2, block3\n",
                 "\n",

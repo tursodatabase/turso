@@ -145,7 +145,11 @@ unsupported counts retain the eager emitter.
 false value from the empty edge, replaces it with true on the first row, and
 returns a false continuation so both paths join as one SSA boolean without
 advancing past that row. This is the compiler-level operation used for
-declarative `EXISTS`.
+declarative `EXISTS`. `first_or` generalizes that terminal to a stream of SSA
+values: it carries a caller-provided empty-stream value, replaces it with the
+first produced value, and joins the two paths as one result. Scalar subqueries
+use `first_or(NULL)`, which represents SQLite's empty-result and first-row
+semantics without assigning a result register or emitting a subroutine.
 
 The authoring surface remains generically typed, but stream consumption erases
 the concrete compiler and row-callback types at every adapter boundary. This is
@@ -245,10 +249,13 @@ are discarded before that subtree is treated as one external value.
 An input slot can also be scoped to another compiler output before IR is built.
 In that case every use resolves directly to the producer's `ValueId`, no
 external input remains at lowering, and ordinary dominance verification covers
-the composed value. The first production use compiles a simple uncorrelated
-`EXISTS` child to `has_rows`, binds that boolean into the outer predicate,
-and lowers both scans as one graph. Correlated, aggregate, distinct, and other
-unsupported `EXISTS` shapes retain the eager subquery emitter.
+the composed value. Simple uncorrelated `EXISTS` children compile to `has_rows`;
+simple uncorrelated single-column scalar children compile to `first_or(NULL)`.
+Their values can be bound into supported outer expression trees, and both scans
+then lower as one graph. Scalar `LIMIT` and `OFFSET` compose through the same
+stream operators before the first-row terminal. Correlated, aggregate,
+distinct, ordered, multi-column, and other unsupported subquery shapes retain
+the eager subquery emitter.
 
 Conditional branches only admit branch bodies that are fully represented in
 the IR. An unsupported branch body sends the whole conditional back to the

@@ -7,7 +7,7 @@ use crate::{
         aggregation::emit_ungrouped_aggregation,
         collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         compiler::{
-            bind_cursor_input, bind_input, compile_effect, cursor_input, cursor_values,
+            bind_cursor_input, bind_input, compile_effect, constant, cursor_input, cursor_values,
             declare_ephemeral_index, initialize_cursor_once, insert_index_pack, literal_values,
             open_declared_ephemeral_index, open_ephemeral_index, pack_values, result_row_pack,
             scan_index, scan_table, seek_in_values, seek_index, seek_rowid, seek_table_range,
@@ -21,8 +21,8 @@ use crate::{
             OperationMode, ResultSetColumn, TableMask, TranslateCtx,
         },
         expr::{
-            compile_symbolic_conjunction, compile_symbolic_exprs, compile_symbolic_static_expr,
-            ResolvedScalarExpr, RowExprResolver, RowLayout,
+            compile_symbolic_conjunction, compile_symbolic_expr, compile_symbolic_exprs,
+            compile_symbolic_static_expr, ResolvedScalarExpr, RowExprResolver, RowLayout,
         },
         group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
@@ -40,7 +40,7 @@ use crate::{
         window::{emit_window_flush, EmitWindow},
         ProgramBuilder, Resolver,
     },
-    types::SeekOp,
+    types::{SeekOp, Value},
     vdbe::{affinity::Affinity, builder::QueryMode, insn::Insn},
     HashMap, HashSet, LimboError, Result,
 };
@@ -167,7 +167,7 @@ struct DeclarativeSelectProgram {
     destination_cursor: Option<DeclarativeCursorBinding>,
     destination_index: Option<Arc<Index>>,
     external_in_cursor: Option<DeclarativeInCursor>,
-    external_exists: Option<DeclarativeExistsInput>,
+    external_scalar: Option<DeclarativeScalarInput>,
     result_column_count: usize,
 }
 
@@ -189,14 +189,22 @@ struct DeclarativeInCursor {
 }
 
 #[derive(Clone, Copy)]
-struct DeclarativeExistsInput {
+struct DeclarativeScalarInput {
     input: InputId,
     subquery_id: TableInternalId,
+    kind: DeclarativeScalarKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeclarativeScalarKind {
+    Exists,
+    RowValue,
 }
 
 enum DeclarativeSelectDestination {
     ResultRows,
     Exists,
+    RowValue,
     EphemeralIndex {
         input: CursorInputId,
         index_name: String,
@@ -282,16 +290,16 @@ fn try_emit_declarative_table_scan(
         program.is_nested(),
     )?;
     compilation =
-        compose_declarative_exists_subquery(program.get_query_mode(), resolver, plan, compilation)?;
+        compose_declarative_scalar_subquery(program.get_query_mode(), resolver, plan, compilation)?;
     let DeclarativeSelectProgram {
         compiler,
         destination_cursor,
         destination_index: _,
         external_in_cursor,
-        external_exists,
+        external_scalar,
         result_column_count,
     } = compilation;
-    if external_exists.is_some() {
+    if external_scalar.is_some() {
         return Ok(None);
     }
     let DeclarativeSelectCompiler::Effect(compiler) = compiler else {
@@ -409,8 +417,8 @@ fn compose_declarative_in_subquery(
             inner,
             initialize_once,
         )?;
-        let inner = compose_declarative_exists_subquery(query_mode, resolver, select_plan, inner)?;
-        if inner.external_in_cursor.is_some() || inner.external_exists.is_some() {
+        let inner = compose_declarative_scalar_subquery(query_mode, resolver, select_plan, inner)?;
+        if inner.external_in_cursor.is_some() || inner.external_scalar.is_some() {
             return Ok(outer);
         }
         (
@@ -459,7 +467,7 @@ fn compose_declarative_in_subquery(
         destination_cursor: outer.destination_cursor,
         destination_index: outer.destination_index,
         external_in_cursor: None,
-        external_exists: outer.external_exists,
+        external_scalar: outer.external_scalar,
         result_column_count: outer.result_column_count,
     })
 }
@@ -493,13 +501,13 @@ fn compose_declarative_in_compiler<Output: 'static>(
     }
 }
 
-fn compose_declarative_exists_subquery(
+fn compose_declarative_scalar_subquery(
     query_mode: QueryMode,
     resolver: &Resolver,
     plan: &mut SelectPlan,
     outer: DeclarativeSelectProgram,
 ) -> Result<DeclarativeSelectProgram> {
-    let Some(external) = outer.external_exists else {
+    let Some(external) = outer.external_scalar else {
         return Ok(outer);
     };
     let Some(subquery_index) = plan
@@ -508,7 +516,7 @@ fn compose_declarative_exists_subquery(
         .position(|subquery| subquery.internal_id == external.subquery_id)
     else {
         return Err(LimboError::InternalError(format!(
-            "declarative EXISTS references missing subquery {:?}",
+            "declarative scalar input references missing subquery {:?}",
             external.subquery_id
         )));
     };
@@ -519,7 +527,7 @@ fn compose_declarative_exists_subquery(
         } = &mut subquery.state
         else {
             return Err(LimboError::InternalError(format!(
-                "declarative EXISTS subquery {:?} has no unevaluated plan",
+                "declarative scalar subquery {:?} has no unevaluated plan",
                 external.subquery_id
             )));
         };
@@ -532,8 +540,8 @@ fn compose_declarative_exists_subquery(
         };
         let inner =
             compose_declarative_in_subquery(query_mode, resolver, select_plan, inner, false)?;
-        let inner = compose_declarative_exists_subquery(query_mode, resolver, select_plan, inner)?;
-        if inner.external_in_cursor.is_some() || inner.external_exists.is_some() {
+        let inner = compose_declarative_scalar_subquery(query_mode, resolver, select_plan, inner)?;
+        if inner.external_in_cursor.is_some() || inner.external_scalar.is_some() {
             return Ok(outer);
         }
         (inner, select_plan.table_references.clone())
@@ -545,12 +553,12 @@ fn compose_declarative_exists_subquery(
     let compiler = match outer.compiler {
         DeclarativeSelectCompiler::Effect(consumer) => DeclarativeSelectCompiler::Effect(
             producer
-                .and_then(move |exists| bind_input(external.input, exists, consumer))
+                .and_then(move |value| bind_input(external.input, value, consumer))
                 .boxed(),
         ),
         DeclarativeSelectCompiler::Scalar(consumer) => DeclarativeSelectCompiler::Scalar(
             producer
-                .and_then(move |exists| bind_input(external.input, exists, consumer))
+                .and_then(move |value| bind_input(external.input, value, consumer))
                 .boxed(),
         ),
     };
@@ -565,7 +573,7 @@ fn compose_declarative_exists_subquery(
         destination_cursor: outer.destination_cursor,
         destination_index: outer.destination_index,
         external_in_cursor: outer.external_in_cursor,
-        external_exists: None,
+        external_scalar: None,
         result_column_count: outer.result_column_count,
     })
 }
@@ -596,6 +604,13 @@ fn try_compile_declarative_table_scan(
             if matches!(plan.distinctness, Distinctness::NonDistinct) =>
         {
             (DeclarativeSelectDestination::Exists, None, None)
+        }
+        QueryDestination::RowValueSubqueryResult { num_regs: 1, .. }
+            if plan.result_columns.len() == 1
+                && plan.order_by.is_empty()
+                && matches!(plan.distinctness, Distinctness::NonDistinct) =>
+        {
+            (DeclarativeSelectDestination::RowValue, None, None)
         }
         // The first producer migration covers the identity-shaped index used by
         // scalar IN subqueries. Wider/reordered keys and generated rowids retain
@@ -693,41 +708,51 @@ fn try_compile_declarative_table_scan(
         },
         _ => return Ok(None),
     };
-    let external_exists = if plan.non_from_clause_subqueries.is_empty() {
+    let external_scalar = if plan.non_from_clause_subqueries.is_empty() {
         None
     } else {
         let [subquery] = plan.non_from_clause_subqueries.as_slice() else {
             return Ok(None);
         };
-        if !matches!(subquery.query_type, SubqueryType::Exists { .. }) {
+        if matches!(subquery.query_type, SubqueryType::In { .. }) {
             None
         } else {
-            let Some(predicate) = plan
-                .where_clause
-                .iter()
-                .filter(|predicate| !predicate.consumed)
-                .find(|predicate| {
-                    direct_exists_subquery(&predicate.expr) == Some(subquery.internal_id)
-                })
-            else {
-                return Ok(None);
+            let kind = match subquery.query_type {
+                SubqueryType::Exists { .. } => {
+                    let Some(predicate) = plan
+                        .where_clause
+                        .iter()
+                        .filter(|predicate| !predicate.consumed)
+                        .find(|predicate| {
+                            direct_exists_subquery(&predicate.expr) == Some(subquery.internal_id)
+                        })
+                    else {
+                        return Ok(None);
+                    };
+                    if predicate.from_outer_join.is_some() {
+                        return Ok(None);
+                    }
+                    DeclarativeScalarKind::Exists
+                }
+                SubqueryType::RowValue { num_regs: 1, .. } => DeclarativeScalarKind::RowValue,
+                SubqueryType::RowValue { .. } => return Ok(None),
+                SubqueryType::In { .. } => unreachable!(),
             };
-            if predicate.from_outer_join.is_some()
-                || subquery.correlated
+            if subquery.correlated
                 || subquery.eval_phase != SubqueryEvalPhase::BeforeLoop
                 || !matches!(
                     &subquery.state,
                     SubqueryState::Unevaluated { plan: Some(_) }
                 )
-                || !matches!(subquery.query_type, SubqueryType::Exists { .. })
                 || subquery.get_eval_at(&plan.join_order, Some(&plan.table_references))?
                     != EvalAt::BeforeLoop
             {
                 return Ok(None);
             }
-            Some(DeclarativeExistsInput {
+            Some(DeclarativeScalarInput {
                 input: InputId::new(0),
                 subquery_id: subquery.internal_id,
+                kind,
             })
         }
     };
@@ -766,7 +791,7 @@ fn try_compile_declarative_table_scan(
                 subquery_id: subquery.internal_id,
             })
         }
-        _ if !plan.non_from_clause_subqueries.is_empty() && external_exists.is_none() => {
+        _ if !plan.non_from_clause_subqueries.is_empty() && external_scalar.is_none() => {
             return Ok(None);
         }
         _ => None,
@@ -802,6 +827,10 @@ fn try_compile_declarative_table_scan(
     let row_layout = covering_index
         .map(RowLayout::CoveringIndex)
         .unwrap_or(RowLayout::Table);
+    let scalar_subquery_inputs: SmallVec<[(TableInternalId, InputId); 1]> = external_scalar
+        .filter(|external| external.kind == DeclarativeScalarKind::RowValue)
+        .map(|external| smallvec![(external.subquery_id, external.input)])
+        .unwrap_or_default();
 
     let expr_resolver = RowExprResolver::new(
         resolver,
@@ -810,7 +839,8 @@ fn try_compile_declarative_table_scan(
         table,
         row_layout,
         &plan.table_references,
-    );
+    )
+    .with_subquery_inputs(&scalar_subquery_inputs);
     let in_values = match access {
         DeclarativeBtreeAccess::InValues {
             source: DeclarativeInSource::Literal { values, affinity },
@@ -1029,8 +1059,10 @@ fn try_compile_declarative_table_scan(
         if predicate.consumed {
             continue;
         }
-        if let Some(external) = external_exists {
-            if direct_exists_subquery(&predicate.expr) == Some(external.subquery_id) {
+        if let Some(external) = external_scalar {
+            if external.kind == DeclarativeScalarKind::Exists
+                && direct_exists_subquery(&predicate.expr) == Some(external.subquery_id)
+            {
                 predicates.push(ResolvedScalarExpr::Input(external.input));
                 continue;
             }
@@ -1128,7 +1160,7 @@ fn try_compile_declarative_table_scan(
         destination_cursor,
         destination_index,
         external_in_cursor,
-        external_exists,
+        external_scalar,
         result_column_count: plan.result_columns.len(),
     }))
 }
@@ -1169,6 +1201,9 @@ impl DeclarativeSelectBody {
             ),
             DeclarativeSelectDestination::Exists => {
                 DeclarativeSelectCompiler::Scalar(self.exists(scan))
+            }
+            DeclarativeSelectDestination::RowValue => {
+                DeclarativeSelectCompiler::Scalar(self.row_value(scan))
             }
             DeclarativeSelectDestination::EphemeralIndex {
                 input,
@@ -1211,6 +1246,36 @@ impl DeclarativeSelectBody {
             } else {
                 compile_declarative_exists(
                     rows.filter(move |row| compile_symbolic_conjunction(row, &predicates)),
+                    limit,
+                    offset,
+                )
+            }
+        })
+        .boxed()
+    }
+
+    fn row_value<Scan, Rows>(self, scan: Scan) -> BoxedCompile<ValueId>
+    where
+        Scan: Compile<Output = Rows> + 'static,
+        Rows: RowStream<Item = Row> + 'static,
+    {
+        let Self {
+            predicates,
+            mut projections,
+            slice: DeclarativeSlice { limit, offset },
+            ..
+        } = self;
+        assert_eq!(projections.len(), 1);
+        let projection = projections
+            .pop()
+            .expect("scalar subquery must have one projection");
+        scan.and_then(move |rows| {
+            if predicates.is_empty() {
+                compile_declarative_row_value(rows, projection, limit, offset)
+            } else {
+                compile_declarative_row_value(
+                    rows.filter(move |row| compile_symbolic_conjunction(row, &predicates)),
+                    projection,
                     limit,
                     offset,
                 )
@@ -1274,6 +1339,35 @@ where
         (Some(limit), None) => rows.take(limit).has_rows(),
         (None, Some(offset)) => rows.skip(offset).has_rows(),
         (None, None) => rows.has_rows(),
+    }
+}
+
+fn compile_declarative_row_value<Stream>(
+    rows: Stream,
+    projection: ResolvedScalarExpr,
+    limit: Option<BoxedCompile<ValueId>>,
+    offset: Option<BoxedCompile<ValueId>>,
+) -> BoxedCompile<ValueId>
+where
+    Stream: RowStream<Item = Row> + 'static,
+{
+    match (limit, offset) {
+        (Some(limit), Some(offset)) => rows
+            .skip(offset)
+            .map(move |row| compile_symbolic_expr(row, &projection))
+            .take(limit)
+            .first_or(constant(Value::Null)),
+        (Some(limit), None) => rows
+            .map(move |row| compile_symbolic_expr(row, &projection))
+            .take(limit)
+            .first_or(constant(Value::Null)),
+        (None, Some(offset)) => rows
+            .skip(offset)
+            .map(move |row| compile_symbolic_expr(row, &projection))
+            .first_or(constant(Value::Null)),
+        (None, None) => rows
+            .map(move |row| compile_symbolic_expr(row, &projection))
+            .first_or(constant(Value::Null)),
     }
 }
 
@@ -2900,6 +2994,96 @@ mod tests {
             .iter()
             .any(|(instruction, _)| matches!(instruction, Insn::BeginSubrtn { .. })));
         assert!(distinct_fallback.run_collect_rows().unwrap().is_empty());
+    }
+
+    #[test]
+    fn uncorrelated_scalar_subquery_composes_into_symbolic_expressions() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute("CREATE TABLE scalar_outer(id INTEGER, value INTEGER)")
+            .unwrap();
+        connection
+            .execute("CREATE TABLE scalar_inner(value INTEGER)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO scalar_outer VALUES (1, 2), (2, 3)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO scalar_inner VALUES (40), (99)")
+            .unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT id, value + (SELECT value FROM scalar_inner) \
+                 FROM scalar_outer",
+            )
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+        assert!(instructions.iter().all(|(instruction, _)| !matches!(
+            instruction,
+            Insn::BeginSubrtn { .. } | Insn::Return { .. } | Insn::Once { .. }
+        )));
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(1), Value::from_i64(42)],
+                vec![Value::from_i64(2), Value::from_i64(43)],
+            ]
+        );
+
+        connection.execute("DELETE FROM scalar_inner").unwrap();
+        statement.reset().unwrap();
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(1), Value::Null],
+                vec![Value::from_i64(2), Value::Null],
+            ],
+            "an empty scalar stream must join through its NULL default"
+        );
+
+        connection
+            .execute("INSERT INTO scalar_inner VALUES (40), (99)")
+            .unwrap();
+        let mut offset = connection
+            .prepare(
+                "SELECT id, (SELECT value FROM scalar_inner LIMIT 1 OFFSET 1) \
+                 FROM scalar_outer",
+            )
+            .unwrap();
+        assert!(offset
+            .get_program()
+            .insns
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::BeginSubrtn { .. })));
+        assert_eq!(
+            offset.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(1), Value::from_i64(99)],
+                vec![Value::from_i64(2), Value::from_i64(99)],
+            ]
+        );
+
+        let mut ordered_fallback = connection
+            .prepare(
+                "SELECT id, (SELECT value FROM scalar_inner ORDER BY value DESC) \
+                 FROM scalar_outer",
+            )
+            .unwrap();
+        assert!(ordered_fallback
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::BeginSubrtn { .. })));
+        assert_eq!(
+            ordered_fallback.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(1), Value::from_i64(99)],
+                vec![Value::from_i64(2), Value::from_i64(99)],
+            ]
+        );
     }
 
     #[test]

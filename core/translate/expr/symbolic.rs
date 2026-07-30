@@ -1,5 +1,5 @@
 use smallvec::SmallVec;
-use turso_parser::ast::{Expr, Literal, Operator, TableInternalId, Variable};
+use turso_parser::ast::{Expr, Literal, Operator, SubqueryType, TableInternalId, Variable};
 
 use crate::{
     schema::{BTreeTable, Index},
@@ -63,6 +63,7 @@ pub(crate) struct RowExprResolver<'a, 'schema> {
     table: &'a BTreeTable,
     layout: RowLayout<'a>,
     referenced_tables: &'a TableReferences,
+    subquery_inputs: &'a [(TableInternalId, InputId)],
 }
 
 impl<'a, 'schema> RowExprResolver<'a, 'schema> {
@@ -81,7 +82,16 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
             table,
             layout,
             referenced_tables,
+            subquery_inputs: &[],
         }
+    }
+
+    pub(crate) const fn with_subquery_inputs(
+        mut self,
+        subquery_inputs: &'a [(TableInternalId, InputId)],
+    ) -> Self {
+        self.subquery_inputs = subquery_inputs;
+        self
     }
 
     /// Returns `None` when any part of the expression still requires the eager
@@ -102,6 +112,14 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
             Expr::RowId { table, .. } => self.resolve_rowid(*table),
             Expr::Variable(variable) => Ok(Some(ResolvedScalarExpr::Parameter(variable.clone()))),
             Expr::Literal(literal) => self.resolve_literal(literal),
+            Expr::SubqueryResult {
+                subquery_id,
+                lhs: None,
+                not_in: false,
+                query_type: SubqueryType::RowValue { num_regs: 1, .. },
+            } => Ok(self.subquery_inputs.iter().find_map(|(candidate, input)| {
+                (*candidate == *subquery_id).then_some(ResolvedScalarExpr::Input(*input))
+            })),
             Expr::Binary(lhs, operator, rhs) => self.resolve_binary(lhs, *operator, rhs),
             Expr::Case {
                 base,

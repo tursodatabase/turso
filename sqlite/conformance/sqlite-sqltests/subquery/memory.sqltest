@@ -221,6 +221,37 @@ expect {
 }
 
 # SCALAR SUBQUERIES
+# A scalar subquery returns its first row, or NULL when it has no rows.
+@cross-check-integrity
+test subquery-scalar-first-row-and-empty-default {
+    create table outer_values(id, value);
+    create table scalar_values(value);
+    insert into outer_values values (1, 2), (2, 3);
+    insert into scalar_values values (40), (99);
+    select id, value + (select value from scalar_values) from outer_values;
+    delete from scalar_values;
+    select id, (select value from scalar_values) from outer_values;
+}
+expect {
+    1|42
+    2|43
+    1|
+    2|
+}
+
+# LIMIT and OFFSET are applied before the scalar subquery chooses its first row.
+@cross-check-integrity
+test subquery-scalar-limit-offset-first-row {
+    create table scalar_values(value);
+    insert into scalar_values values (40), (99), (123);
+    select (select value from scalar_values limit 1 offset 1);
+    select (select value from scalar_values limit 0 offset 1);
+}
+expect {
+    99
+
+}
+
 # Get products with price higher than average price
 @cross-check-integrity
 test subquery-scalar-comparison {
