@@ -3428,6 +3428,40 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         })
     }
 
+    // ── Trigger WHEN binding ────────────────────────────────────────────
+
+    /// Bind the subquery expressions (EXISTS / scalar subquery / IN SELECT)
+    /// inside a trigger WHEN clause, replacing them with
+    /// [ast::Expr::SubqueryResult] nodes and returning the bound subqueries.
+    ///
+    /// The caller has already rewritten NEW/OLD references to registers, so
+    /// the subquery bodies contain only ordinary table/column references.
+    /// Non-subquery leaves at the top level (registers, literals, and the
+    /// double-quoted-string quirk) are intentionally left untouched — they
+    /// keep their translate-time behavior.
+    pub fn bind_trigger_when_subqueries(
+        &mut self,
+        expr: &mut ast::Expr,
+    ) -> Result<HashMap<ast::TableInternalId, BoundSubquery>> {
+        self.with_query(|ctx| {
+            let scope = BindScope::empty();
+            ctx.with_phase(BindPhase::NoAliases, |ctx| {
+                walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+                    match e {
+                        ast::Expr::Exists(_)
+                        | ast::Expr::Subquery(_)
+                        | ast::Expr::InSelect { .. } => {
+                            ctx.bind_expr(e, &scope)?;
+                            Ok(WalkControl::SkipChildren)
+                        }
+                        _ => Ok(WalkControl::Continue),
+                    }
+                })
+            })?;
+            Ok(std::mem::take(&mut ctx.subquery_bindings))
+        })
+    }
+
     // ── INSERT binding ──────────────────────────────────────────────────
 
     /// Bind an INSERT statement's RETURNING clause (with its WITH-clause CTEs

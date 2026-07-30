@@ -560,8 +560,13 @@ pub fn plan_subqueries_from_trigger_when_clause(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let mut bound_subqueries: HashMap<ast::TableInternalId, crate::translate::bind::BoundSubquery> =
-        HashMap::default();
+    // Bind the WHEN clause's subqueries up front (NEW/OLD references were
+    // already rewritten to registers by the trigger machinery), then plan
+    // them through the bound path like every other subquery.
+    let mut bound_subqueries = {
+        let mut binder = crate::translate::bind::BindContext::new(resolver, program);
+        binder.bind_trigger_when_subqueries(expr)?
+    };
     let mut table_references = TableReferences::new(vec![], vec![]);
     plan_subqueries_with_outer_query_access(
         program,
