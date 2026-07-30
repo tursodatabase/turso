@@ -309,7 +309,7 @@ pub fn translate_inner(
                     "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
                 );
             }
-            let binding = delete::bind_delete_stmt(
+            let binding = bind::bind_delete_stmt(
                 &tbl_name,
                 indexed,
                 &mut where_clause,
@@ -428,7 +428,8 @@ pub fn translate_inner(
                     "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
                 );
             }
-            let binding = update::bind_update_stmt(&mut update, resolver, program, connection, false)?;
+            let binding =
+                bind::bind_update_stmt(&mut update, resolver, program, connection, false)?;
             translate_update(update, binding, resolver, program, connection)?
         }
         ast::Stmt::Vacuum { name, into } => {

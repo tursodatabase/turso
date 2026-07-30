@@ -8,7 +8,7 @@ use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
 use crate::{
     bail_parse_error,
-    schema::{Schema, Table},
+    schema::Table,
     util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     CaptureDataChangesExt, Connection,
@@ -57,7 +57,7 @@ addr  opcode         p1    p2    p3    p4             p5  comment
 */
 pub fn translate_update(
     body: ast::Update,
-    binding: UpdateBinding,
+    bound: super::bind::BoundUpdate,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
@@ -69,7 +69,7 @@ pub fn translate_update(
         connection,
         false,
         None,
-        Some(binding),
+        Some(bound),
     )?;
     let Plan::Update(ref update_plan) = plan else {
         unreachable!("prepare_and_optimize_update_plan must return Plan::Update");
@@ -167,66 +167,6 @@ pub fn translate_update_for_schema_change(
     Ok(())
 }
 
-/// Output of the statement-level bind phase for UPDATE, produced by
-/// [bind_update_stmt] before planning starts.
-pub struct UpdateBinding {
-    pub bound: super::bind::BoundUpdate,
-    pub database_id: usize,
-    pub table: Arc<Table>,
-    pub or_conflict: Option<ast::ResolveType>,
-}
-
-/// Bind an UPDATE statement up front: validate the target table and resolve
-/// all names in FROM/SET/WHERE/RETURNING. Planning consumes the result
-/// without re-resolving anything.
-pub fn bind_update_stmt(
-    body: &mut ast::Update,
-    resolver: &Resolver,
-    program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
-    is_internal_schema_change: bool,
-) -> crate::Result<UpdateBinding> {
-    let database_id = resolver.resolve_existing_table_database_id_qualified(&body.tbl_name)?;
-    let schema = resolver.schema();
-    let target_name = &body.tbl_name.name;
-    let table = match resolver.with_schema(database_id, |s| s.get_table(target_name.as_str())) {
-        Some(table) => table,
-        None => bail_parse_error!("Parse error: no such table: {}", target_name),
-    };
-    if program.trigger.is_some() && table.virtual_table().is_some() {
-        bail_parse_error!(
-            "unsafe use of virtual table \"{}\"",
-            body.tbl_name.name.as_str()
-        );
-    }
-    if table.btree().is_some_and(|bt| !bt.has_rowid) {
-        bail_parse_error!("UPDATE of WITHOUT ROWID tables is not supported");
-    }
-    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie)?;
-    validate_update(
-        schema,
-        body,
-        target_name.as_str(),
-        is_internal_schema_change,
-        connection,
-    )?;
-
-    // Extract the OR conflict clause before borrowing body mutably
-    let or_conflict = body.or_conflict.take();
-
-    // Bind phase: resolve all names in FROM/SET/WHERE/RETURNING up front.
-    let mut binder = super::bind::BindContext::new(resolver, program);
-    let bound = binder.bind_update(body, database_id)?;
-
-    Ok(UpdateBinding {
-        bound,
-        database_id,
-        table,
-        or_conflict,
-    })
-}
-
 fn prepare_and_optimize_update_plan(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -234,7 +174,7 @@ fn prepare_and_optimize_update_plan(
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
     ddl_query_for_cdc_update: Option<&str>,
-    binding: Option<UpdateBinding>,
+    binding: Option<super::bind::BoundUpdate>,
 ) -> crate::Result<Plan> {
     let (mut update_plan, mut bound_subqueries) = prepare_update_plan(
         program,
@@ -272,65 +212,22 @@ fn prepare_and_optimize_update_plan(
     Ok(plan)
 }
 
-fn validate_update(
-    schema: &Schema,
-    body: &ast::Update,
-    table_name: &str,
-    is_internal_schema_change: bool,
-    conn: &Arc<Connection>,
-) -> crate::Result<()> {
-    // Check if this is a system table that should be protected from direct writes
-    if !is_internal_schema_change
-        && !conn.is_nested_stmt()
-        && !conn.is_mvcc_bootstrap_connection()
-        && !crate::schema::allow_user_dml(table_name)
-    {
-        crate::bail_parse_error!("table {} may not be modified", table_name);
-    }
-    if !body.order_by.is_empty() {
-        bail_parse_error!("ORDER BY is not supported in UPDATE");
-    }
-    // Check if this is a materialized view
-    if schema.is_materialized_view(table_name) {
-        bail_parse_error!("cannot modify materialized view {}", table_name);
-    }
-
-    // Check if this table has any incompatible dependent views
-    schema.with_incompatible_dependent_views(table_name, |views| {
-    if !views.is_empty() {
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
-        crate::bail_parse_error!(
-            "Cannot UPDATE table '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
-             These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
-             Please DROP and recreate the view(s) before modifying this table.",
-            views.iter().map(|view| view.as_str()).collect::<Vec<_>>().join(", "),
-        );
-    }
-    Ok(())
-    })
-}
-
 fn prepare_update_plan(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     mut body: ast::Update,
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
-    binding: Option<UpdateBinding>,
+    binding: Option<super::bind::BoundUpdate>,
 ) -> crate::Result<(
     UpdatePlan,
     rustc_hash::FxHashMap<turso_parser::ast::TableInternalId, super::bind::BoundSubquery>,
 )> {
-    // The statement path binds up front (bind_stmt); internal callers
+    // The statement path binds up front (translate_inner); internal callers
     // (schema-change updates) bind here.
-    let UpdateBinding {
-        mut bound,
-        database_id,
-        table,
-        or_conflict,
-    } = match binding {
-        Some(binding) => binding,
-        None => bind_update_stmt(
+    let mut bound = match binding {
+        Some(bound) => bound,
+        None => super::bind::bind_update_stmt(
             &mut body,
             resolver,
             program,
@@ -338,6 +235,12 @@ fn prepare_update_plan(
             is_internal_schema_change,
         )?,
     };
+    let database_id = bound.database_id;
+    let table = bound.table.clone();
+    let or_conflict = bound.or_conflict.take();
+
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie)?;
 
     let table_name = table.get_name().to_string();
     let table_name = table_name.as_str();
