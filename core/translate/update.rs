@@ -464,12 +464,7 @@ fn prepare_update_plan(
             &mut bound_subqueries,
         )?;
 
-        process_returning_clause(
-            &mut body.returning,
-            &mut returning_table_references,
-            resolver,
-            true,
-        )?
+        process_returning_clause(&mut body.returning, &mut returning_table_references)?
     } else {
         vec![]
     };

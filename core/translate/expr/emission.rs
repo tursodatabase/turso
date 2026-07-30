@@ -136,8 +136,6 @@ pub fn emit_function_call(
 pub fn process_returning_clause(
     returning: &mut [ast::ResultColumn],
     table_references: &mut TableReferences,
-    resolver: &Resolver<'_>,
-    is_bound: bool,
 ) -> Result<Vec<ResultSetColumn>> {
     let mut result_columns = Vec::with_capacity(returning.len());
 
@@ -146,11 +144,7 @@ pub fn process_returning_clause(
     for rc in returning.iter_mut() {
         match rc {
             ast::ResultColumn::Expr(expr, alias) => {
-                // In bound mode the binder already resolved RETURNING exprs.
-                if !is_bound {
-                    bind_and_rewrite_expr(expr, Some(table_references), resolver, false)?;
-                }
-
+                // The binder already resolved RETURNING exprs.
                 let vec_size = expr_vector_size(expr)?;
                 if vec_size != 1 {
                     crate::bail_parse_error!(

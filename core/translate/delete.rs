@@ -278,8 +278,7 @@ pub fn prepare_delete_plan(
         &mut bound_subqueries,
     )?;
 
-    let result_columns =
-        process_returning_clause(&mut returning, &mut table_references, resolver, true)?;
+    let result_columns = process_returning_clause(&mut returning, &mut table_references)?;
 
     // LIMIT/OFFSET identifiers were already resolved by the binder.
     let (resolved_limit, resolved_offset) =

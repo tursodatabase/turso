@@ -382,8 +382,7 @@ pub fn translate_insert(
     )?;
 
     // Process RETURNING clause using shared module
-    let mut result_columns =
-        process_returning_clause(&mut returning, &mut table_references, resolver, true)?;
+    let mut result_columns = process_returning_clause(&mut returning, &mut table_references)?;
     let has_fks = fk_enabled
         && (resolver.with_schema(database_id, |s| s.has_child_fks(table_name.as_str()))
             || resolver.with_schema(database_id, |s| {
