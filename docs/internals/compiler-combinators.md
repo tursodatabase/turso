@@ -151,6 +151,16 @@ outer symbolic row inside `flat_map`. All physical cursors still open before
 the outer loop; only index positioning and deferred table lookup repeat for
 each outer row. `scan_index` and `seek_index` are convenience compositions over
 this resource API.
+IN-driven positioning uses the same resource boundary instead of a combined
+open-and-seek compiler. `DeferredInValues` compiles independently into an
+`InValueRows` stream that retains its comparison collation. Pairing that stream
+with an `OpenedTable` or `OpenedIndex` through `seek_each` produces the nested
+row stream: distinct RHS keys are consumed one at a time and reposition the
+already-open target. The SQL frontend expresses this directly with `then` and
+`map`, so target acquisition, RHS production, deduplication, and B-tree
+positioning remain separate compiler stages. Literal and external-cursor RHS
+producers share the same transition, and neither path can reopen the target
+inside the key loop.
 Short-circuiting consumers use an SSA `try_fold` protocol: each accepted item
 returns a state pack and a symbolic continuation value. A false continuation
 branches directly to the loop exit, while a true continuation reaches the

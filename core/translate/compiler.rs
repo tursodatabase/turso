@@ -5818,6 +5818,15 @@ impl OpenedTable {
     pub(crate) const fn seek_range(self, range: DeferredTableRange) -> SeekOpenedTable {
         SeekOpenedTable { table: self, range }
     }
+
+    /// Repositions this table once for every key produced by `values`.
+    pub(crate) fn seek_each(self, values: InValueRows) -> InSeekRows {
+        InSeekRows {
+            values,
+            target: self.rows(CursorRowSource::Scan(ScanDirection::Forward)),
+            kind: InSeekTarget::Rowid,
+        }
+    }
 }
 
 pub(crate) struct SeekOpenedTable {
@@ -5828,7 +5837,7 @@ pub(crate) struct SeekOpenedTable {
 /// Compiler operation that opens an index, and its table cursor when required,
 /// without choosing how the index will be positioned.
 pub(crate) struct OpenIndex {
-    source: ScanBtreeSource,
+    source: IndexSource,
 }
 
 /// An opened symbolic index resource that can be consumed into one positioned
@@ -5855,6 +5864,15 @@ impl OpenedIndex {
 
     pub(crate) const fn seek(self, range: DeferredIndexRange) -> SeekOpenedIndex {
         SeekOpenedIndex { index: self, range }
+    }
+
+    /// Repositions this index once for every key produced by `values`.
+    pub(crate) fn seek_each(self, values: InValueRows) -> InSeekRows {
+        InSeekRows {
+            values,
+            target: self.rows(CursorRowSource::Scan(ScanDirection::Forward)),
+            kind: InSeekTarget::Index,
+        }
     }
 }
 
@@ -6508,16 +6526,12 @@ pub(crate) enum DeferredInValues {
     },
 }
 
-impl DeferredInValues {
-    const fn collation(&self) -> Option<CollationSeq> {
-        match self {
-            Self::Literal(values) => values.collation,
-            Self::Cursor { collation, .. } => *collation,
-        }
-    }
+pub(crate) struct InValueRows {
+    source: InValueSourceRows,
+    collation: CollationSeq,
 }
 
-pub(crate) enum InValueRows {
+enum InValueSourceRows {
     Literal(ReadySorterRows),
     Cursor(CursorRows),
 }
@@ -6528,6 +6542,7 @@ impl Compile for DeferredInValues {
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
         match self {
             Self::Literal(values) => {
+                let collation = values.collation.unwrap_or(CollationSeq::Binary);
                 let sorter = builder.allocate_sorter_with_affinities(
                     smallvec![SortKey::new(SortOrder::Asc, values.collation, None, None,)],
                     1,
@@ -6541,19 +6556,25 @@ impl Compile for DeferredInValues {
                         pack: ValuePack(smallvec![value]),
                     })?;
                 }
-                Ok(InValueRows::Literal(ReadySorterRows {
-                    sorter,
-                    record_width: 1,
-                }))
+                Ok(InValueRows {
+                    source: InValueSourceRows::Literal(ReadySorterRows {
+                        sorter,
+                        record_width: 1,
+                    }),
+                    collation,
+                })
             }
-            Self::Cursor { input, .. } => {
+            Self::Cursor { input, collation } => {
                 let cursor = builder.external_cursor(input)?;
-                Ok(InValueRows::Cursor(CursorRows {
-                    cursor,
-                    row_cursor: cursor,
-                    deferred_seek: None,
-                    source: CursorRowSource::Scan(ScanDirection::Forward),
-                }))
+                Ok(InValueRows {
+                    source: InValueSourceRows::Cursor(CursorRows {
+                        cursor,
+                        row_cursor: cursor,
+                        deferred_seek: None,
+                        source: CursorRowSource::Scan(ScanDirection::Forward),
+                    }),
+                    collation: collation.unwrap_or(CollationSeq::Binary),
+                })
             }
         }
     }
@@ -6563,11 +6584,11 @@ impl RowStream for InValueRows {
     type Item = ValueId;
 
     fn for_each_boxed(self, body: BoxedRowConsumer<Self::Item>) -> BoxedCompile<()> {
-        match self {
-            Self::Literal(rows) => {
+        match self.source {
+            InValueSourceRows::Literal(rows) => {
                 rows.for_each_boxed(Box::new(move |row| row.column(0).and_then(body).boxed()))
             }
-            Self::Cursor(rows) => {
+            InValueSourceRows::Cursor(rows) => {
                 rows.for_each_boxed(Box::new(move |row| row.column(0).and_then(body).boxed()))
             }
         }
@@ -6578,8 +6599,8 @@ impl RowStream for InValueRows {
         initial: BoxedCompile<LoopState>,
         body: BoxedRowFolder<Self::Item>,
     ) -> BoxedCompile<LoopState> {
-        match self {
-            Self::Literal(rows) => rows.try_fold_boxed(
+        match self.source {
+            InValueSourceRows::Literal(rows) => rows.try_fold_boxed(
                 initial,
                 Box::new(move |row, state| {
                     row.column(0)
@@ -6587,7 +6608,7 @@ impl RowStream for InValueRows {
                         .boxed()
                 }),
             ),
-            Self::Cursor(rows) => rows.try_fold_boxed(
+            InValueSourceRows::Cursor(rows) => rows.try_fold_boxed(
                 initial,
                 Box::new(move |row, state| {
                     row.column(0)
@@ -7142,8 +7163,7 @@ impl Row {
     }
 }
 
-enum ScanBtreeSource {
-    Table(OpenReadCursor),
+enum IndexSource {
     CoveringIndex(OpenReadCursor),
     IndexLookup {
         table: OpenReadCursor,
@@ -7151,19 +7171,9 @@ enum ScanBtreeSource {
     },
 }
 
-struct OpenedBtree {
-    cursor: CursorId,
-    row_cursor: CursorId,
-    deferred_seek: Option<DeferredSeekCursors>,
-}
-
-impl ScanBtreeSource {
-    fn open(self, builder: &mut IrBuilder) -> Result<OpenedBtree> {
+impl IndexSource {
+    fn open(self, builder: &mut IrBuilder) -> Result<OpenedIndex> {
         let (cursor, row_cursor, deferred_seek) = match self {
-            Self::Table(table) => {
-                let cursor = table.compile(builder)?;
-                (cursor, cursor, None)
-            }
             Self::CoveringIndex(index) => {
                 let cursor = index.compile(builder)?;
                 (cursor, cursor, None)
@@ -7174,19 +7184,12 @@ impl ScanBtreeSource {
                 (index, table, Some(DeferredSeekCursors { index, table }))
             }
         };
-        Ok(OpenedBtree {
+        Ok(OpenedIndex {
             cursor,
             row_cursor,
             deferred_seek,
         })
     }
-}
-
-pub(crate) struct InSeekBtree {
-    source: ScanBtreeSource,
-    values: DeferredInValues,
-    target: InSeekTarget,
-    collation: CollationSeq,
 }
 
 #[derive(Clone, Copy)]
@@ -7199,7 +7202,6 @@ pub(crate) struct InSeekRows {
     values: InValueRows,
     target: CursorRows,
     kind: InSeekTarget,
-    collation: CollationSeq,
 }
 
 impl InSeekRows {
@@ -7233,8 +7235,9 @@ impl InSeekRows {
     fn stream(self) -> impl RowStream<Item = Row> {
         let target = self.target;
         let kind = self.kind;
+        let collation = self.values.collation;
         self.values
-            .distinct_by(smallvec![self.collation], |value| {
+            .distinct_by(smallvec![collation], |value| {
                 pack_values(smallvec![pure(value).boxed()])
             })
             .flat_map(move |key| pure(Self::target_for_key(target, kind, key)))
@@ -7470,33 +7473,6 @@ pub(crate) fn seek_table_range(
     open_table(table, db, schema_cookie).and_then(move |table| table.seek_range(range))
 }
 
-pub(crate) fn seek_in_values(
-    table: Arc<BTreeTable>,
-    index: Option<Arc<Index>>,
-    covering: bool,
-    db: usize,
-    schema_cookie: u32,
-    values: DeferredInValues,
-) -> InSeekBtree {
-    let collation = values.collation();
-    let (source, target) = match index {
-        Some(index) => (
-            index_source(table, index, covering, db, schema_cookie),
-            InSeekTarget::Index,
-        ),
-        None => (
-            ScanBtreeSource::Table(open_read_table(table, db, schema_cookie)),
-            InSeekTarget::Rowid,
-        ),
-    };
-    InSeekBtree {
-        source,
-        values,
-        target,
-        collation: collation.unwrap_or(CollationSeq::Binary),
-    }
-}
-
 pub(crate) fn scan_index(
     table: Arc<BTreeTable>,
     index: Arc<Index>,
@@ -7537,36 +7513,15 @@ fn index_source(
     covering: bool,
     db: usize,
     schema_cookie: u32,
-) -> ScanBtreeSource {
+) -> IndexSource {
     let index = open_read_index(index, db, schema_cookie);
     if covering {
-        ScanBtreeSource::CoveringIndex(index)
+        IndexSource::CoveringIndex(index)
     } else {
-        ScanBtreeSource::IndexLookup {
+        IndexSource::IndexLookup {
             table: open_read_table(table, db, schema_cookie),
             index,
         }
-    }
-}
-
-impl Compile for InSeekBtree {
-    type Output = InSeekRows;
-
-    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
-        let opened = self.source.open(builder)?;
-        let values = self.values.compile(builder)?;
-        Ok(InSeekRows {
-            values,
-            target: CursorRows {
-                cursor: opened.cursor,
-                row_cursor: opened.row_cursor,
-                deferred_seek: opened.deferred_seek,
-                // Replaced with the current RHS key by `InSeekRows`.
-                source: CursorRowSource::Scan(ScanDirection::Forward),
-            },
-            kind: self.target,
-            collation: self.collation,
-        })
     }
 }
 
@@ -7653,12 +7608,7 @@ impl Compile for OpenIndex {
     type Output = OpenedIndex;
 
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
-        let opened = self.source.open(builder)?;
-        Ok(OpenedIndex {
-            cursor: opened.cursor,
-            row_cursor: opened.row_cursor,
-            deferred_seek: opened.deferred_seek,
-        })
+        self.source.open(builder)
     }
 }
 
@@ -8785,11 +8735,14 @@ mod tests {
             Affinity::Integer,
             None,
         );
-        let compiler = seek_in_values(table, None, false, 0, 0, values).and_then(|rows| {
-            rows.take(constant(Value::from_i64(2))).for_each(|row| {
-                pack_values(smallvec![row.rowid().boxed()]).and_then(result_row_pack)
-            })
-        });
+        let compiler = open_table(table, 0, 0)
+            .then(values)
+            .map(|(table, values)| table.seek_each(values))
+            .and_then(|rows| {
+                rows.take(constant(Value::from_i64(2))).for_each(|row| {
+                    pack_values(smallvec![row.rowid().boxed()]).and_then(result_row_pack)
+                })
+            });
 
         let ir = compile_effect(compiler).unwrap();
         let rendered = ir.to_string();
@@ -8801,6 +8754,12 @@ mod tests {
         assert!(rendered.contains("distinct_check &0 ["));
         assert!(rendered.contains("cursor_seek_rowid $0,"));
         assert!(rendered.contains("sorter_next #0"));
+        assert!(
+            rendered.find("open_read $0").expect("table must be opened")
+                < rendered
+                    .find("open_sorter #0")
+                    .expect("RHS values must be produced")
+        );
 
         let mut program =
             ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 2, 0));
@@ -8837,11 +8796,14 @@ mod tests {
     fn in_values_can_scan_an_external_cursor_without_reopening_it() {
         let table = Arc::new(BTreeTable::from_sql("CREATE TABLE pointed(a,b)", 2).unwrap());
         let values = cursor_values(CursorInputId::new(0), None);
-        let compiler = seek_in_values(table.clone(), None, false, 0, 0, values).and_then(|rows| {
-            rows.for_each(|row| {
-                pack_values(smallvec![row.rowid().boxed()]).and_then(result_row_pack)
-            })
-        });
+        let compiler = open_table(table.clone(), 0, 0)
+            .then(values)
+            .map(|(table, values)| table.seek_each(values))
+            .and_then(|rows| {
+                rows.for_each(|row| {
+                    pack_values(smallvec![row.rowid().boxed()]).and_then(result_row_pack)
+                })
+            });
         let ir = compile_effect(compiler).unwrap();
         let rendered = ir.to_string();
 

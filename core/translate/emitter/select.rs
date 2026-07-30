@@ -10,9 +10,9 @@ use crate::{
             bind_cursor_input, constant, cursor_input, cursor_values, declare_ephemeral_index,
             initialize_cursor_once, insert_index_pack, literal_values,
             open_declared_ephemeral_index, open_ephemeral_index, open_index, open_table,
-            pack_values, pure, result_row_pack, scan_index, scan_table, seek_in_values, seek_index,
-            seek_rowid, seek_table_range, select_pack, BoxedCompile, Compile, CompileRegion,
-            CursorId, CursorInputId, DeferredIndexBound, DeferredIndexRange, DeferredTableBound,
+            pack_values, pure, result_row_pack, scan_index, scan_table, seek_index, seek_rowid,
+            seek_table_range, select_pack, BoxedCompile, Compile, CompileRegion, CursorId,
+            CursorInputId, DeferredIndexBound, DeferredIndexRange, DeferredTableBound,
             DeferredTableRange, InputProducer, InputRequirement, InputRequirements, InputSlot,
             PhysicalInputBinding, Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId,
             ValuePack,
@@ -1296,15 +1296,25 @@ fn try_compile_declarative_table_scan(
             destination,
             inputs,
         ),
-        DeclarativeBtreeAccess::InValues { index, .. } => body.into_compiler(
-            seek_in_values(
+        DeclarativeBtreeAccess::InValues {
+            index: Some(index), ..
+        } => body.into_compiler(
+            open_index(
                 table,
-                index.cloned(),
+                index.clone(),
                 covering_index.is_some(),
                 database_id,
                 schema_cookie,
-                in_values.expect("IN access must compile its value source"),
-            ),
+            )
+            .then(in_values.expect("IN access must compile its value source"))
+            .map(|(index, values)| index.seek_each(values)),
+            destination,
+            inputs,
+        ),
+        DeclarativeBtreeAccess::InValues { index: None, .. } => body.into_compiler(
+            open_table(table, database_id, schema_cookie)
+                .then(in_values.expect("IN access must compile its value source"))
+                .map(|(table, values)| table.seek_each(values)),
             destination,
             inputs,
         ),
