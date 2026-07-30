@@ -309,6 +309,51 @@ pub(crate) struct CursorFold<Initial, BodyFn, Body> {
     compiler: PhantomData<fn() -> Body>,
 }
 
+/// Applies one deferred compiler to every row visited by a symbolic cursor.
+///
+/// Unlike [`CursorFold`], row production has no loop-carried value. The row and
+/// exit blocks therefore have no SSA parameters and each cursor edge carries no
+/// arguments.
+pub(crate) struct ForEachRow<BodyFn, Body> {
+    cursor: CursorId,
+    body: BodyFn,
+    compiler: PhantomData<fn() -> Body>,
+}
+
+impl<BodyFn, Body> Compile for ForEachRow<BodyFn, Body>
+where
+    BodyFn: FnOnce(Row) -> Body,
+    Body: Compile<Output = ()>,
+{
+    type Output = ();
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let row = builder.create_block()?;
+        let exit = builder.create_block()?;
+
+        builder.terminate(Terminator::CursorRewind {
+            cursor: self.cursor,
+            if_non_empty: row,
+            if_empty: exit,
+            arguments: SmallVec::new(),
+        })?;
+
+        builder.switch_to(row)?;
+        (self.body)(Row {
+            cursor: self.cursor,
+        })
+        .compile(builder)?;
+        builder.terminate(Terminator::CursorNext {
+            cursor: self.cursor,
+            if_next: row,
+            if_done: exit,
+            arguments: SmallVec::new(),
+        })?;
+
+        builder.switch_to(exit)
+    }
+}
+
 impl<Initial, BodyFn, Body> Compile for CursorFold<Initial, BodyFn, Body>
 where
     Initial: Compile<Output = ValueId>,
@@ -362,10 +407,6 @@ pub(crate) struct ValuePack(SmallVec<[ValueId; 4]>);
 impl ValuePack {
     fn values(&self) -> &[ValueId] {
         &self.0
-    }
-
-    pub(crate) fn first(&self) -> ValueId {
-        *self.0.first().expect("compiler value pack is non-empty")
     }
 }
 
@@ -1620,6 +1661,53 @@ pub(crate) struct OpenReadTable {
     schema_cookie: u32,
 }
 
+/// A symbolic stream of rows backed by an opened cursor.
+#[derive(Clone, Copy)]
+pub(crate) struct RowStream {
+    cursor: CursorId,
+}
+
+impl RowStream {
+    pub(crate) fn for_each<BodyFn, Body>(self, body: BodyFn) -> ForEachRow<BodyFn, Body>
+    where
+        BodyFn: FnOnce(Row) -> Body,
+        Body: Compile<Output = ()>,
+    {
+        ForEachRow {
+            cursor: self.cursor,
+            body,
+            compiler: PhantomData,
+        }
+    }
+}
+
+/// One row yielded by a [`RowStream`].
+#[derive(Clone, Copy)]
+pub(crate) struct Row {
+    cursor: CursorId,
+}
+
+impl Row {
+    pub(crate) fn project(self, columns: SmallVec<[usize; 4]>) -> ProjectColumns {
+        project_columns(self.cursor, columns)
+    }
+}
+
+/// Opens a table when compiled and returns its symbolic row stream.
+pub(crate) struct ScanTable(OpenReadTable);
+
+pub(crate) fn scan_table(table: Arc<BTreeTable>, db: usize, schema_cookie: u32) -> ScanTable {
+    ScanTable(open_read_table(table, db, schema_cookie))
+}
+
+impl Compile for ScanTable {
+    type Output = RowStream;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        self.0.compile(builder).map(|cursor| RowStream { cursor })
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn open_read_table(
     table: Arc<BTreeTable>,
@@ -1802,6 +1890,17 @@ where
     builder.finish(output)
 }
 
+/// Builds and verifies an IR program whose observable result is its effects.
+pub(crate) fn compile_effect<Compiler>(compiler: Compiler) -> Result<IrProgram>
+where
+    Compiler: Compile<Output = ()>,
+{
+    let mut builder = IrBuilder::new();
+    compiler.compile(&mut builder)?;
+    let completion = builder.push(ScalarOp::Constant(Value::Null))?;
+    builder.finish(completion)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1843,6 +1942,36 @@ mod tests {
                 "  %0 = constant Numeric(Integer(1))\n",
                 "  %1 = constant Numeric(Integer(2))\n",
                 "  result_row [%0, %1]\n",
+                "  return %1\n",
+            )
+        );
+    }
+
+    #[test]
+    fn row_stream_for_each_builds_a_cursor_loop_without_loop_state() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE streamed(a)", 2).unwrap());
+        let compiler = scan_table(table, 0, 0).and_then(|rows| {
+            rows.for_each(|row| row.project(smallvec![0]).and_then(result_row_pack))
+        });
+
+        let ir = compile_effect(compiler).unwrap();
+
+        assert_eq!(
+            ir.to_string(),
+            concat!(
+                "cursor $0 = btree_table \"streamed\" root 2\n",
+                "\n",
+                "block0:\n",
+                "  open_read $0 root 2 db 0 schema 0\n",
+                "  rewind $0, block1(), block2()\n",
+                "\n",
+                "block1:\n",
+                "  %0 = column $0[0]\n",
+                "  result_row [%0]\n",
+                "  next $0, block1(), block2()\n",
+                "\n",
+                "block2:\n",
+                "  %1 = constant Null\n",
                 "  return %1\n",
             )
         );

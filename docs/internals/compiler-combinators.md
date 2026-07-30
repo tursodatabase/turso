@@ -68,8 +68,13 @@ only in the resulting control-flow graph and lowered VDBE program.
 `fold_cursor` describes an iterator-like fold over an already-open symbolic
 cursor. It emits a cursor `Rewind` terminator, a row block whose parameter is the
 accumulator, a cursor `Next` backedge, and an exit parameter containing either
-the initial value for an empty cursor or the final accumulated value. Column
-reads remain ordered instructions inside the row block. The IR stores a
+the initial value for an empty cursor or the final accumulated value. `RowStream`
+provides the producer/consumer form used by SELECT compilation: `scan_table`
+returns a symbolic stream and `for_each` adds a row block without exposing a
+dummy loop-carried value to the SQL frontend. Both operations build CFG edges;
+neither iterates while the compiler description is constructed.
+
+Column reads remain ordered instructions inside the row block. The IR stores a
 symbolic cursor identifier. External cursors are declared as input resources and
 receive their physical binding at lowering. IR-owned table cursors instead carry
 their `CursorType` as resource metadata; lowering allocates the physical cursor,

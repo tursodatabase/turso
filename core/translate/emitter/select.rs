@@ -5,9 +5,7 @@ use crate::{
     sync::Arc,
     translate::{
         aggregation::emit_ungrouped_aggregation,
-        compiler::{
-            compile_scalar, constant, open_read_table, project_columns, result_row_pack, Compile,
-        },
+        compiler::{compile_effect, result_row_pack, scan_table, Compile},
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
             MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
@@ -28,7 +26,6 @@ use crate::{
         window::{emit_window_flush, EmitWindow},
         ProgramBuilder, Resolver,
     },
-    types::Value,
     vdbe::{builder::QueryMode, insn::Insn},
     HashMap, HashSet, LimboError, Result,
 };
@@ -150,15 +147,10 @@ fn try_emit_declarative_table_scan(
     let table = table.clone();
     let database_id = joined.database_id;
     let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
-    let compiler = open_read_table(table, database_id, schema_cookie).and_then(move |cursor| {
-        constant(Value::Null).fold_cursor(cursor, move |_state| {
-            project_columns(cursor, columns).and_then(|pack| {
-                let next_state = pack.first();
-                result_row_pack(pack).map(move |()| next_state)
-            })
-        })
+    let compiler = scan_table(table, database_id, schema_cookie).and_then(move |rows| {
+        rows.for_each(move |row| row.project(columns).and_then(result_row_pack))
     });
-    let ir = compile_scalar(compiler)?;
+    let ir = compile_effect(compiler)?;
     let target_register = program.alloc_register();
     let lowered = ir.lower_into(program, target_register)?;
     let (result_cols_start, result_column_count) = lowered.single_result_row_pack()?;
@@ -1122,7 +1114,7 @@ fn build_materialized_build_input_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{io::MemoryIO, Database, SqliteDialect};
+    use crate::{io::MemoryIO, types::Value, Database, SqliteDialect};
 
     #[test]
     fn simple_table_scan_crosses_the_declarative_compiler_boundary() {
@@ -1132,6 +1124,12 @@ mod tests {
         connection
             .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)")
             .unwrap();
+        assert!(connection
+            .prepare("SELECT id, name FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .is_empty());
         connection
             .execute("INSERT INTO t VALUES (1, 'one')")
             .unwrap();
