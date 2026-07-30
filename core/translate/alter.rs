@@ -759,9 +759,6 @@ fn emit_add_column_check_validation(
         return Ok(());
     }
 
-    let table_name = &btree.name;
-    let col_name_lower = normalize_ident(new_column_name);
-
     // Open the table to check if it has rows.
     let check_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
     program.emit_insn(Insn::OpenRead {
@@ -778,27 +775,11 @@ fn emit_add_column_check_validation(
 
     // Table has rows -- evaluate each CHECK constraint with the default value substituted.
     for (constraint_name, check_expr) in &all_checks {
-        let mut substituted = *check_expr.clone();
-
-        // Replace references to the new column with the default value expression.
-        let _ = walk_expr_mut(
-            &mut substituted,
-            &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-                match e {
-                    ast::Expr::Id(name) if normalize_ident(name.as_str()) == col_name_lower => {
-                        *e = default_expr.clone();
-                        Ok(WalkControl::SkipChildren)
-                    }
-                    ast::Expr::Qualified(tbl, col)
-                        if normalize_ident(tbl.as_str()) == normalize_ident(table_name)
-                            && normalize_ident(col.as_str()) == col_name_lower =>
-                    {
-                        *e = default_expr.clone();
-                        Ok(WalkControl::SkipChildren)
-                    }
-                    _ => Ok(WalkControl::Continue),
-                }
-            },
+        let substituted = crate::translate::bind::bind_check_column_default(
+            check_expr,
+            &btree.name,
+            new_column_name,
+            &default_expr,
         );
 
         let result_reg = program.alloc_register();

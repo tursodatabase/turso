@@ -180,6 +180,33 @@ pub fn rename_schema_expr_identifiers(expr: &mut ast::Expr, from: &str, to: &str
     });
 }
 
+/// Substitute one table column in a CHECK expression with its ADD COLUMN default.
+pub fn bind_check_column_default(
+    expr: &ast::Expr,
+    table_name: &str,
+    column_name: &str,
+    default_expr: &ast::Expr,
+) -> ast::Expr {
+    let normalized_table = normalize_ident(table_name);
+    let normalized_column = normalize_ident(column_name);
+    let mut bound = expr.clone();
+    let _ = walk_expr_mut(&mut bound, &mut |expr| match expr {
+        ast::Expr::Id(name) if normalize_ident(name.as_str()) == normalized_column => {
+            *expr = default_expr.clone();
+            Ok(WalkControl::SkipChildren)
+        }
+        ast::Expr::Qualified(table, column)
+            if normalize_ident(table.as_str()) == normalized_table
+                && normalize_ident(column.as_str()) == normalized_column =>
+        {
+            *expr = default_expr.clone();
+            Ok(WalkControl::SkipChildren)
+        }
+        _ => Ok(WalkControl::Continue),
+    });
+    bound
+}
+
 /// Point SELF_TABLE references in a stored schema expression at a concrete
 /// table reference. This does not reject unresolved identifiers because ALTER
 /// validation may deliberately bind them through an expression register cache.
