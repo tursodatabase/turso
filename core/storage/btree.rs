@@ -7369,6 +7369,10 @@ impl CursorTrait for BTreeCursor {
         loop {
             match self.seek_to_last_state {
                 SeekToLastState::Start => {
+                    // A write through another cursor may save this cursor's old
+                    // position. We need the current largest rowid, not that old
+                    // position. Otherwise rowid() restores the old position.
+                    self.clear_saved_seek();
                     let has_record = return_if_io!(self.move_to_rightmost());
                     self.invalidate_record();
                     self.set_has_record(has_record);

@@ -2221,3 +2221,26 @@ test insert-two-partial-unique-indexes-expr-key-no-hang {
 expect {
     1|B|
 }
+
+# A BEFORE trigger updates this table while a multi-row INSERT is choosing an
+# automatic rowid. The new rowid must be one greater than the largest rowid in
+# the table, not based on a cursor position saved before the trigger ran.
+@cross-check-integrity
+test insert-auto-rowid-after-before-trigger-updates-same-table {
+    CREATE TABLE rowid_trigger_target (id INTEGER PRIMARY KEY, value TEXT);
+    INSERT INTO rowid_trigger_target VALUES (591505, 'prior');
+    CREATE TRIGGER rowid_trigger BEFORE INSERT ON rowid_trigger_target BEGIN
+        UPDATE rowid_trigger_target SET value = 'updated';
+    END;
+    INSERT INTO rowid_trigger_target VALUES
+        (-915518, 'first'),
+        (-513681, 'second'),
+        (NULL, 'generated');
+    SELECT id, value FROM rowid_trigger_target ORDER BY id;
+}
+expect {
+    -915518|updated
+    -513681|updated
+    591505|updated
+    591506|generated
+}
