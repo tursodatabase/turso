@@ -309,9 +309,21 @@ boundary (the whole tree is constant, so the span opened by
       Affinity from the probe (`exprINAffinity`); per-element collation
       payloads from the running fold. Empty lists never reach
       translation (parser desugars to 0/1); row-valued probes fall back
-      via operand compilation. Value-position IN and LIKE/GLOB remain
-      eager. `Slot` remains future work for genuine cross-iteration
-      mutation (aggregate accumulators, coroutine cells).
+      via operand compilation. `Slot` remains future work for genuine
+      cross-iteration mutation (aggregate accumulators, coroutine cells).
+- [x] 2b-3d. Value-position IN and LIKE/GLOB. Value IN reuses the
+      condition chain (`InChain`, shared helper) with the three
+      continuations binding 1/0/NULL into a join block parameter; NOT IN
+      swaps the constants — no `Not` instruction, NULL bypasses
+      inversion, matching the eager tmp-register wrapper. LIKE/GLOB are
+      calls with pack order [pattern, haystack, escape] but
+      haystack-first evaluation (the IR separates slot order from run
+      order naturally); a literal pattern sets `Insn::Function`'s
+      constant mask (`CallData.constant_mask`) so the runtime caches the
+      compiled pattern; NOT LIKE appends `Insn::Not`. MATCH/REGEXP
+      rewrites stay eager. Phase 2 expression coverage is now
+      essentially complete; the notable eager-only remainders are
+      subquery results, custom types, and the specialized function arms.
 - [ ] 2c. Constant hoisting as an IR transform (move constant-only
       instructions to the entry block) so IR islands stop depending on
       the constant-span machinery; then start deleting

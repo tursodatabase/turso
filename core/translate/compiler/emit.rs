@@ -474,7 +474,7 @@ impl<'a> Emitter<'a> {
                     }
                     let dest = self.reg_of(value);
                     self.program.emit_insn(Insn::Function {
-                        constant_mask: 0,
+                        constant_mask: self.func.call_data(*call).constant_mask,
                         start_reg: pack,
                         dest,
                         func: self.func.call_data(*call).func.clone(),

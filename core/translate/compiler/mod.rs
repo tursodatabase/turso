@@ -313,8 +313,34 @@ mod tests {
         assert!(pipeline("CURRENT_TIMESTAMP").is_none());
         // Named-type casts need a resolver to rule out custom types.
         assert!(pipeline("CAST(1 AS TEXT)").is_none());
-        // IN lists need mutable null-flag accumulation (slots).
-        assert!(pipeline("1 IN (1, 2)").is_none());
+        // Row-valued probes and subqueries still fall back.
+        assert!(pipeline("(1, 2) IN ((1, 2))").is_none());
+    }
+
+    #[test]
+    fn value_position_in_joins_one_zero_null() {
+        // 3 IN (1, 2): the condition chain joins 1/0/NULL through a
+        // block parameter; NOT IN swaps the constants with no Not insn.
+        let insns = pipeline("3 IN (1, 2)").unwrap();
+        assert!(
+            insns.iter().any(|insn| matches!(insn, Insn::Null { .. })),
+            "NULL arm exists: {insns:?}"
+        );
+        assert!(
+            insns
+                .iter()
+                .filter(|insn| matches!(insn, Insn::Eq { .. }))
+                .count()
+                >= 1,
+            "{insns:?}"
+        );
+        assert!(
+            !pipeline("3 NOT IN (1, 2)")
+                .unwrap()
+                .iter()
+                .any(|insn| matches!(insn, Insn::Not { .. })),
+            "NOT IN swaps join constants instead of emitting Not"
+        );
     }
 
     #[test]
@@ -805,7 +831,7 @@ mod tests {
         // into the pack slot — no Copy, exactly the eager shape.
         let mut builder = FuncBuilder::new();
         let five = builder.int(5);
-        let call = builder.call(abs_ctx(), true, vec![five]);
+        let call = builder.call(abs_ctx(), true, 0, vec![five]);
         builder.ret(call);
         let func = builder.finish();
 
@@ -840,7 +866,7 @@ mod tests {
             func: crate::function::Func::Scalar(crate::function::ScalarFunc::Instr),
             arg_count: 2,
         };
-        let call = builder.call(ctx, true, vec![seven, seven]);
+        let call = builder.call(ctx, true, 0, vec![seven, seven]);
         builder.ret(call);
         let func = builder.finish();
 
@@ -871,8 +897,8 @@ mod tests {
         // into the outer call's pack slot — no intermediate Copy.
         let mut builder = FuncBuilder::new();
         let x = builder.int(3);
-        let inner = builder.call(abs_ctx(), true, vec![x]);
-        let outer = builder.call(abs_ctx(), true, vec![inner]);
+        let inner = builder.call(abs_ctx(), true, 0, vec![x]);
+        let outer = builder.call(abs_ctx(), true, 0, vec![inner]);
         builder.ret(outer);
         let func = builder.finish();
 
@@ -900,7 +926,7 @@ mod tests {
         // inside a constant span even when its argument is constant.
         let mut builder = FuncBuilder::new();
         let n = builder.int(8);
-        let call = builder.call(abs_ctx(), false, vec![n]);
+        let call = builder.call(abs_ctx(), false, 0, vec![n]);
         builder.ret(call);
         let func = builder.finish();
 

@@ -27,7 +27,7 @@ use crate::util::{exprs_are_equivalent, parse_numeric_literal};
 use crate::{Numeric, Result, Value, ValueBlob};
 
 use super::combine::{self, Compiler, Predicate};
-use super::ir::{BinOp, CmpOp, JumpTarget, UnaryOp, ValueId};
+use super::ir::{BinOp, BlockId, CmpOp, FuncBuilder, JumpTarget, UnaryOp, ValueId};
 
 /// Static context the frontend needs to admit effectful leaves. Column
 /// and rowid reads are only representable when the table reference
@@ -397,7 +397,7 @@ pub(crate) fn compile_value_expr<'a>(
                     for arg in arg_compilers {
                         values.push(arg.run(builder)?);
                     }
-                    Ok(builder.call(func_ctx, constant, values))
+                    Ok(builder.call(func_ctx, constant, 0, values))
                 }),
                 effect,
             })
@@ -677,6 +677,122 @@ pub(crate) fn compile_value_expr<'a>(
                 effect: CollationEffect::Sets(None),
             })
         }
+        // Value-position IN: the same chain as condition position, with
+        // the three continuations binding 1/0/NULL into a join block
+        // parameter. NOT IN just swaps which constant each side binds —
+        // no Not instruction, and NULL bypasses the inversion exactly as
+        // in the eager wrapper.
+        ast::Expr::InList { lhs, not, rhs } => {
+            let Some((chain, effect)) = compile_in_chain(lhs, rhs, ctx)? else {
+                return Ok(None);
+            };
+            let negated = *not;
+            Some(Built {
+                compiler: Compiler::build_with(move |builder| {
+                    let match_b = builder.create_block();
+                    let miss_b = builder.create_block();
+                    let null_b = builder.create_block();
+                    let join = builder.create_block();
+                    let result = builder.add_block_param(join);
+                    chain.build(builder, match_b, miss_b, null_b)?;
+                    let (match_value, miss_value) = if negated { (0, 1) } else { (1, 0) };
+                    builder.switch_to(match_b);
+                    let matched = builder.int(match_value);
+                    builder.jump(join, vec![matched]);
+                    builder.switch_to(miss_b);
+                    let missed = builder.int(miss_value);
+                    builder.jump(join, vec![missed]);
+                    builder.switch_to(null_b);
+                    let unknown = builder.null();
+                    builder.jump(join, vec![unknown]);
+                    builder.switch_to(join);
+                    Ok(result)
+                }),
+                effect,
+            })
+        }
+        // LIKE/GLOB are function calls with a twist: the pack order is
+        // [pattern, haystack, escape] while evaluation order is haystack
+        // first — the IR separates the two naturally. A literal pattern
+        // sets Insn::Function's constant mask so the runtime caches the
+        // compiled pattern. MATCH/REGEXP rewrites stay eager.
+        ast::Expr::Like {
+            lhs,
+            not,
+            op,
+            rhs,
+            escape,
+        } => {
+            let scalar = match op {
+                ast::LikeOperator::Like => ScalarFunc::Like,
+                ast::LikeOperator::Glob => ScalarFunc::Glob,
+                _ => return Ok(None),
+            };
+            let Some(resolver) = ctx.resolver else {
+                return Ok(None);
+            };
+            let Some(haystack) = compile_value_expr(lhs.as_ref(), ctx)? else {
+                return Ok(None);
+            };
+            let Some(pattern) = compile_value_expr(rhs.as_ref(), ctx)? else {
+                return Ok(None);
+            };
+            let escape_built = match escape {
+                Some(escape) => {
+                    let Some(built) = compile_value_expr(escape.as_ref(), ctx)? else {
+                        return Ok(None);
+                    };
+                    Some(built)
+                }
+                None => None,
+            };
+            // Eager evaluation order: haystack, pattern, escape — fold
+            // their effects in that order.
+            let mut effect = CollationEffect::Untouched;
+            for built_effect in [
+                Some(haystack.effect),
+                Some(pattern.effect),
+                escape_built.as_ref().map(|built| built.effect),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let CollationEffect::Sets(collation) = built_effect {
+                    effect = CollationEffect::Sets(collation);
+                }
+            }
+            let constant_mask = if matches!(rhs.as_ref(), ast::Expr::Literal(_)) {
+                1
+            } else {
+                0
+            };
+            let constant = expr.is_constant(resolver);
+            let arg_count = if escape_built.is_some() { 3 } else { 2 };
+            let negated = *not;
+            let (haystack_c, pattern_c) = (haystack.compiler, pattern.compiler);
+            let escape_c = escape_built.map(|built| built.compiler);
+            Some(Built {
+                compiler: Compiler::build_with(move |builder| {
+                    let haystack = haystack_c.run(builder)?;
+                    let pattern = pattern_c.run(builder)?;
+                    let mut args = vec![pattern, haystack];
+                    if let Some(escape_c) = escape_c {
+                        args.push(escape_c.run(builder)?);
+                    }
+                    let func_ctx = FuncCtx {
+                        func: Func::Scalar(scalar),
+                        arg_count,
+                    };
+                    let like = builder.call(func_ctx, constant, constant_mask, args);
+                    Ok(if negated {
+                        builder.unary(UnaryOp::Not, like)
+                    } else {
+                        like
+                    })
+                }),
+                effect,
+            })
+        }
         ast::Expr::Cast {
             expr: operand,
             type_name,
@@ -882,39 +998,10 @@ pub(crate) fn compile_condition_expr<'a>(
         // the linearly-dominating chain blocks — the eager path's
         // check_null register accumulation, without the mutable cell.
         ast::Expr::InList { lhs, not, rhs } => {
-            // Empty lists and row-valued probes stay eager (the operand
-            // compilation refuses vectors/subqueries anyway).
-            if rhs.is_empty() {
-                return Ok(None);
-            }
-            let Some(lhs_built) = compile_value_expr(lhs.as_ref(), ctx)? else {
+            let Some((chain, effect)) = compile_in_chain(lhs, rhs, ctx)? else {
                 return Ok(None);
             };
-            // The IN comparison affinity comes from the probe (SQLite's
-            // exprINAffinity); for parenthesized vectors, its first
-            // element — but vectors already fell back above.
-            let affinity = crate::translate::expr::get_expr_affinity(
-                lhs.as_ref(),
-                ctx.referenced_tables,
-                ctx.resolver,
-            );
-            // Collation state threads through eager emission order (lhs,
-            // then each element) with no resets; each Eq's payload is
-            // the running state after its element.
-            let mut running = lhs_built.effect;
-            let mut elements = Vec::with_capacity(rhs.len());
-            for element in rhs {
-                let Some(built) = compile_value_expr(element.as_ref(), ctx)? else {
-                    return Ok(None);
-                };
-                if let CollationEffect::Sets(collation) = built.effect {
-                    running = CollationEffect::Sets(collation);
-                }
-                let payload = running.contribution().map(|(collation, _)| collation);
-                elements.push((built.compiler, payload, element.can_be_null()));
-            }
             let negated = *not;
-            let lhs_compiler = lhs_built.compiler;
             Some(CondBuilt {
                 predicate: Predicate::build_with(move |builder, targets| {
                     // NOT IN swaps the match/no-match continuations; the
@@ -925,85 +1012,9 @@ pub(crate) fn compile_condition_expr<'a>(
                     } else {
                         (targets.if_true, targets.if_false)
                     };
-                    let null_t = targets.if_null;
-                    // NULL is only tracked when it goes somewhere other
-                    // than the miss continuation, mirroring the eager
-                    // `jump_target_when_false != jump_target_when_null`
-                    // gate (blocks dedupe by label, so this is the same
-                    // comparison).
-                    let null_distinct = null_t != miss_t;
-                    let probe = lhs_compiler.run(builder)?;
-                    let mut null_check = if null_distinct {
-                        Some(builder.binary(BinOp::BitAnd, probe, probe))
-                    } else {
-                        None
-                    };
-                    let count = elements.len();
-                    for (index, (element, payload, can_be_null)) in elements.into_iter().enumerate()
-                    {
-                        let last = index + 1 == count;
-                        let value = element.run(builder)?;
-                        if let Some(check) = null_check {
-                            if can_be_null {
-                                null_check = Some(builder.binary(BinOp::BitAnd, check, value));
-                            }
-                        }
-                        if !last || null_distinct {
-                            let next = builder.create_block();
-                            if probe == value {
-                                // The probe IS this element (shared SSA
-                                // value): it matches iff non-NULL.
-                                builder.null_branch(
-                                    probe,
-                                    JumpTarget::new(next, Vec::new()),
-                                    JumpTarget::new(match_t, Vec::new()),
-                                );
-                            } else {
-                                builder.cmp_branch(
-                                    CmpOp::Eq,
-                                    Some(affinity),
-                                    payload,
-                                    probe,
-                                    value,
-                                    JumpTarget::new(match_t, Vec::new()),
-                                    JumpTarget::new(next, Vec::new()),
-                                    JumpTarget::new(next, Vec::new()),
-                                );
-                            }
-                            builder.switch_to(next);
-                        } else if probe == value {
-                            builder.null_branch(
-                                probe,
-                                JumpTarget::new(miss_t, Vec::new()),
-                                JumpTarget::new(match_t, Vec::new()),
-                            );
-                        } else {
-                            // Last element with NULL joining the miss
-                            // side: one comparison decides.
-                            builder.cmp_branch(
-                                CmpOp::Eq,
-                                Some(affinity),
-                                payload,
-                                probe,
-                                value,
-                                JumpTarget::new(match_t, Vec::new()),
-                                JumpTarget::new(miss_t, Vec::new()),
-                                JumpTarget::new(miss_t, Vec::new()),
-                            );
-                        }
-                    }
-                    if let Some(check) = null_check {
-                        // No element matched: NULL result if the probe or
-                        // any nullable element was NULL, otherwise a miss.
-                        builder.null_branch(
-                            check,
-                            JumpTarget::new(null_t, Vec::new()),
-                            JumpTarget::new(miss_t, Vec::new()),
-                        );
-                    }
-                    Ok(())
+                    chain.build(builder, match_t, miss_t, targets.if_null)
                 }),
-                effect: running,
+                effect,
             })
         }
         // Any value-representable expression is a truthiness terminal in
@@ -1015,6 +1026,144 @@ pub(crate) fn compile_condition_expr<'a>(
             effect: built.effect,
         }),
     })
+}
+
+/// A described scalar IN-list: the probe, the elements with their
+/// collation payloads and nullability, and the probe-derived comparison
+/// affinity (SQLite's exprINAffinity).
+struct InChain<'a> {
+    probe: Compiler<'a, ValueId>,
+    elements: Vec<(Compiler<'a, ValueId>, Option<CollationSeq>, bool)>,
+    affinity: crate::vdbe::affinity::Affinity,
+}
+
+impl<'a> InChain<'a> {
+    /// Build the test chain: each element compares against the shared
+    /// probe, jumping to `match_t` on equality and falling into the next
+    /// element's block. NULL is tracked (BitAnd accumulation threaded as
+    /// plain SSA values through the linearly-dominating chain) only when
+    /// the NULL continuation differs from the miss side, mirroring the
+    /// eager `jump_target_when_false != jump_target_when_null` gate.
+    /// Every path out of the chain ends in a terminator.
+    fn build(
+        self,
+        builder: &mut FuncBuilder,
+        match_t: BlockId,
+        miss_t: BlockId,
+        null_t: BlockId,
+    ) -> Result<()> {
+        let null_distinct = null_t != miss_t;
+        let probe = self.probe.run(builder)?;
+        let mut null_check = if null_distinct {
+            Some(builder.binary(BinOp::BitAnd, probe, probe))
+        } else {
+            None
+        };
+        let count = self.elements.len();
+        for (index, (element, payload, can_be_null)) in self.elements.into_iter().enumerate() {
+            let last = index + 1 == count;
+            let value = element.run(builder)?;
+            if let Some(check) = null_check {
+                if can_be_null {
+                    null_check = Some(builder.binary(BinOp::BitAnd, check, value));
+                }
+            }
+            if !last || null_distinct {
+                let next = builder.create_block();
+                if probe == value {
+                    // The probe IS this element (shared SSA value): it
+                    // matches iff non-NULL.
+                    builder.null_branch(
+                        probe,
+                        JumpTarget::new(next, Vec::new()),
+                        JumpTarget::new(match_t, Vec::new()),
+                    );
+                } else {
+                    builder.cmp_branch(
+                        CmpOp::Eq,
+                        Some(self.affinity),
+                        payload,
+                        probe,
+                        value,
+                        JumpTarget::new(match_t, Vec::new()),
+                        JumpTarget::new(next, Vec::new()),
+                        JumpTarget::new(next, Vec::new()),
+                    );
+                }
+                builder.switch_to(next);
+            } else if probe == value {
+                builder.null_branch(
+                    probe,
+                    JumpTarget::new(miss_t, Vec::new()),
+                    JumpTarget::new(match_t, Vec::new()),
+                );
+            } else {
+                // Last element with NULL joining the miss side: one
+                // comparison decides.
+                builder.cmp_branch(
+                    CmpOp::Eq,
+                    Some(self.affinity),
+                    payload,
+                    probe,
+                    value,
+                    JumpTarget::new(match_t, Vec::new()),
+                    JumpTarget::new(miss_t, Vec::new()),
+                    JumpTarget::new(miss_t, Vec::new()),
+                );
+            }
+        }
+        if let Some(check) = null_check {
+            // No element matched: NULL result if the probe or any
+            // nullable element was NULL, otherwise a miss.
+            builder.null_branch(
+                check,
+                JumpTarget::new(null_t, Vec::new()),
+                JumpTarget::new(miss_t, Vec::new()),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Describe a scalar IN-list's parts, shared by the condition and value
+/// forms. Empty lists never reach translation (the parser desugars them
+/// to 0/1); row-valued probes fall back through operand compilation.
+fn compile_in_chain<'a>(
+    lhs: &'a ast::Expr,
+    rhs: &'a [Box<ast::Expr>],
+    ctx: &BuildCtx<'_>,
+) -> Result<Option<(InChain<'a>, CollationEffect)>> {
+    if rhs.is_empty() {
+        return Ok(None);
+    }
+    let Some(lhs_built) = compile_value_expr(lhs, ctx)? else {
+        return Ok(None);
+    };
+    let affinity =
+        crate::translate::expr::get_expr_affinity(lhs, ctx.referenced_tables, ctx.resolver);
+    // Collation state threads through eager emission order (probe, then
+    // each element) with no resets; each Eq's payload is the running
+    // state after its element.
+    let mut running = lhs_built.effect;
+    let mut elements = Vec::with_capacity(rhs.len());
+    for element in rhs {
+        let Some(built) = compile_value_expr(element.as_ref(), ctx)? else {
+            return Ok(None);
+        };
+        if let CollationEffect::Sets(collation) = built.effect {
+            running = CollationEffect::Sets(collation);
+        }
+        let payload = running.contribution().map(|(collation, _)| collation);
+        elements.push((built.compiler, payload, element.can_be_null()));
+    }
+    Ok(Some((
+        InChain {
+            probe: lhs_built.compiler,
+            elements,
+            affinity,
+        },
+        running,
+    )))
 }
 
 /// An `IS [NOT] NULL` condition terminal: a nullness branch to the
