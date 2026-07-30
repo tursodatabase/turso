@@ -15137,6 +15137,12 @@ pub fn op_drop_column(
         });
 
         btree.shift_generated_column_indices_after_drop(*column_index)?;
+        // Shift SELF_TABLE positional references in surviving CHECK
+        // constraints (constraints referencing the dropped column itself were
+        // rejected during translation).
+        for check in &mut btree.check_constraints {
+            crate::schema::shift_self_table_positions_after_drop(&mut check.expr, *column_index)?;
+        }
         Ok(())
     })??;
 
@@ -15171,18 +15177,13 @@ pub fn op_drop_column(
                         index_column.pos_in_table -= 1;
                     }
                     if let Some(ref mut expr) = index_column.expr {
-                        crate::translate::expr::walk_expr_mut(expr, &mut |e| {
-                            if let ast::Expr::Column {
-                                table, column: c, ..
-                            } = e
-                            {
-                                if table.is_self_table() && *c > *column_index {
-                                    *c -= 1;
-                                }
-                            }
-                            Ok(crate::translate::expr::WalkControl::Continue)
-                        })?;
+                        crate::schema::shift_self_table_positions_after_drop(expr, *column_index)?;
                     }
+                }
+                // Partial-index WHERE clauses also store SELF_TABLE
+                // positional references.
+                if let Some(ref mut wc) = index.where_clause {
+                    crate::schema::shift_self_table_positions_after_drop(wc, *column_index)?;
                 }
             }
         }

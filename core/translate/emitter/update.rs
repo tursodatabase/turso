@@ -17,7 +17,7 @@ use crate::{
     translate::{
         display::format_eqp_detail,
         emitter::{
-            check_expr_references_columns, delete::emit_fk_child_decrement_on_delete,
+            check_expr_references_updated_columns, delete::emit_fk_child_decrement_on_delete,
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_cdc_patch_record, emit_check_constraints, emit_index_column_value_new_image,
             emit_index_column_value_old_image, emit_make_record, emit_program_for_select,
@@ -1714,7 +1714,14 @@ fn emit_update_insns<'a>(
             let relevant_checks: Vec<CheckConstraint> = btree_table
                 .check_constraints
                 .iter()
-                .filter(|cc| check_expr_references_columns(&cc.expr, &updated_col_names))
+                .filter(|cc| {
+                    check_expr_references_updated_columns(
+                        &cc.expr,
+                        |idx| affected_columns.get(idx),
+                        &updated_col_names,
+                        updates_rowid,
+                    )
+                })
                 .cloned()
                 .collect();
 

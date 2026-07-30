@@ -1,4 +1,3 @@
-use crate::translate::bind::bind_fixed_scope_expr;
 use crate::translate::expr::emit_table_column;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::SelfTableContext;
@@ -137,16 +136,17 @@ fn emit_row_missing_from_index_error(
 fn bind_expr_for_table(
     expr: &ast::Expr,
     table_references: &mut TableReferences,
-    resolver: &Resolver,
 ) -> crate::Result<ast::Expr> {
     let mut out = expr.clone();
-    // Index key expressions, partial-index WHERE clauses, and generated
-    // columns are stored pre-resolved to SELF_TABLE form. CHECK constraints
-    // still carry raw identifiers, resolved by the fixed-scope binder below.
+    // Index key expressions, partial-index WHERE clauses, CHECK constraints,
+    // and generated columns are stored pre-resolved to SELF_TABLE form.
+    // Leftover identifiers mean lenient schema-load resolution failed.
+    if let Some(name) = crate::schema::first_unresolved_identifier(&out) {
+        crate::bail_parse_error!("no such column: {}", name);
+    }
     if let Some(jt) = table_references.joined_tables().first() {
         crate::schema::bind_self_table_expr(&mut out, jt.internal_id);
     }
-    bind_fixed_scope_expr(&mut out, Some(table_references), resolver, false)?;
     Ok(out)
 }
 
@@ -304,7 +304,7 @@ fn translate_integrity_check_impl(
 
                 let mut where_expr = None;
                 if let Some(pred) = index.where_clause.as_deref() {
-                    where_expr = Some(bind_expr_for_table(pred, &mut table_references, resolver)?);
+                    where_expr = Some(bind_expr_for_table(pred, &mut table_references)?);
                 }
 
                 let mut columns = Vec::with_capacity(index.columns.len());
@@ -318,7 +318,7 @@ fn translate_integrity_check_impl(
                             None
                         };
                         columns.push(BoundIndexColumn::Expr(
-                            Box::new(bind_expr_for_table(expr, &mut table_references, resolver)?),
+                            Box::new(bind_expr_for_table(expr, &mut table_references)?),
                             affinity,
                         ));
                         unique_nullable.push(true);
@@ -341,11 +341,7 @@ fn translate_integrity_check_impl(
 
         let mut bound_checks = Vec::with_capacity(btree_table.check_constraints.len());
         for check in &btree_table.check_constraints {
-            bound_checks.push(bind_expr_for_table(
-                &check.expr,
-                &mut table_references,
-                resolver,
-            )?);
+            bound_checks.push(bind_expr_for_table(&check.expr, &mut table_references)?);
         }
 
         let not_null_columns: Vec<(BoundIndexColumn, String)> = btree_table
@@ -357,8 +353,7 @@ fn translate_integrity_check_impl(
                 let name = col.name.clone().unwrap_or_else(|| format!("column{idx}"));
                 match col.generated_type() {
                     GeneratedType::Virtual { expr, .. } => {
-                        let bound =
-                            bind_expr_for_table(expr, &mut table_references, resolver).ok()?;
+                        let bound = bind_expr_for_table(expr, &mut table_references).ok()?;
                         Some((
                             BoundIndexColumn::Expr(Box::new(bound), Some(col.affinity())),
                             name,

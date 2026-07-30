@@ -3142,8 +3142,13 @@ impl CheckConstraint {
     }
 
     /// Returns the SQL representation of this CHECK constraint (e.g. `CHECK(x > 0)`).
-    pub fn sql(&self) -> String {
-        format!("CHECK({})", self.expr)
+    /// `columns` renders `SELF_TABLE` positional references back to the current
+    /// column names.
+    pub fn sql(&self, columns: &[Column]) -> String {
+        match render_gencol_expr_sql_with_new_names(&self.expr, columns) {
+            Ok(rendered) => format!("CHECK({rendered})"),
+            Err(_) => format!("CHECK({})", self.expr),
+        }
     }
 }
 
@@ -3630,7 +3635,7 @@ impl BTreeTable {
                         sql.push_str(&Name::exact(name.clone()).as_ident());
                         sql.push(' ');
                     }
-                    sql.push_str(&check_constraint.sql());
+                    sql.push_str(&check_constraint.sql(&self.columns));
                 }
             }
         }
@@ -3704,7 +3709,7 @@ impl BTreeTable {
                 sql.push_str(&Name::exact(name.clone()).as_ident());
                 sql.push(' ');
             }
-            sql.push_str(&check_constraint.sql());
+            sql.push_str(&check_constraint.sql(&self.columns));
         }
 
         // Add table-level UNIQUE constraints
@@ -3828,6 +3833,14 @@ impl BTreeTable {
                 }
             }
         }
+        // CHECK constraint expressions are resolved to the same SELF_TABLE
+        // positional form. Lenient: unknown names stay as identifiers and
+        // surface when the constraint is evaluated.
+        let mut checks = std::mem::replace(&mut self.check_constraints, TursoAllocExt::new());
+        for check in &mut checks {
+            resolve_index_expr_columns(&mut check.expr, self);
+        }
+        self.check_constraints = checks;
         self.column_graph()?;
         Ok(())
     }
@@ -4207,17 +4220,45 @@ pub fn bind_self_table_expr(expr: &mut Expr, internal_id: TableInternalId) {
     });
 }
 
+/// Decrement `SELF_TABLE` column positions greater than the dropped
+/// column's position in a stored schema expression (index key,
+/// partial-index WHERE, CHECK constraint).
+pub fn shift_self_table_positions_after_drop(expr: &mut Expr, dropped_index: usize) -> Result<()> {
+    walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
+        if let Expr::Column { table, column, .. } = e {
+            if table.is_self_table() && *column > dropped_index {
+                *column -= 1;
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
 /// True if the expression still contains unresolved identifier leaves
 /// (names that lenient schema-load resolution could not map to a column).
 pub fn expr_has_unresolved_identifiers(expr: &Expr) -> bool {
-    let mut found = false;
+    first_unresolved_identifier(expr).is_some()
+}
+
+/// Returns the first unresolved identifier leaf in the expression, if any
+/// (a name that lenient schema-load resolution could not map to a column).
+pub fn first_unresolved_identifier(expr: &Expr) -> Option<String> {
+    let mut found = None;
     let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
-        if matches!(
-            e,
-            Expr::Id(_) | Expr::Name(_) | Expr::Qualified(..) | Expr::DoublyQualified(..)
-        ) {
-            found = true;
+        if found.is_some() {
             return Ok(WalkControl::SkipChildren);
+        }
+        match e {
+            Expr::Id(name) | Expr::Name(name) => {
+                found = Some(name.as_str().to_string());
+                return Ok(WalkControl::SkipChildren);
+            }
+            Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
+                found = Some(format!("{}.{}", ns.as_str(), col.as_str()));
+                return Ok(WalkControl::SkipChildren);
+            }
+            _ => {}
         }
         Ok(WalkControl::Continue)
     });
@@ -4232,14 +4273,19 @@ pub fn expr_has_unresolved_identifiers(expr: &Expr) -> bool {
 pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) -> Result<String> {
     let mut clone = expr.clone();
     walk_expr_mut(&mut clone, &mut |e| -> Result<WalkControl> {
-        if let Expr::Column { table, column, .. } = e {
-            if table.is_self_table() {
+        match e {
+            Expr::Column { table, column, .. } if table.is_self_table() => {
                 if let Some(col) = columns.get(*column) {
                     if let Some(name) = col.name.as_ref() {
                         *e = Expr::Id(Name::exact(name.clone()));
                     }
                 }
             }
+            // Expr::RowId renders as empty SQL, so restore the keyword.
+            Expr::RowId { table, .. } if table.is_self_table() => {
+                *e = Expr::Id(Name::exact(ROWID_STRS[0].to_string()));
+            }
+            _ => {}
         }
         Ok(WalkControl::Continue)
     })?;
