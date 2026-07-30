@@ -11,7 +11,7 @@ use turso_parser::ast::{self, JoinConstraint, SortOrder, SortedColumn, TableInte
 
 use super::emitter::Resolver;
 use super::expr::{unwrap_parens, walk_expr, walk_expr_mut, WalkControl};
-use super::plan::{JoinInfo, TableReferences};
+use super::plan::{BitSet, JoinInfo, TableReferences};
 use super::planner::parse_row_id;
 use crate::schema::{
     is_deterministic_schema_function_call, BTreeTable, Column, GeneratedType, Index, IndexColumn,
@@ -236,6 +236,50 @@ pub fn bind_generated_column_expr(expr: &mut ast::Expr, columns: &[Column]) -> R
             Ok(WalkControl::Continue)
         }
         _ => Ok(WalkControl::Continue),
+    })?;
+    Ok(())
+}
+
+/// Resolve a generated expression's column dependencies to table positions.
+pub fn bind_generated_column_dependencies(
+    expr: &ast::Expr,
+    columns: &[Column],
+    dependencies: &mut BitSet,
+) -> Result<()> {
+    walk_expr(expr, &mut |expr| {
+        match expr {
+            ast::Expr::Column { table, column, .. } if table.is_self_table() => {
+                dependencies.set(*column)?;
+            }
+            ast::Expr::Id(name) | ast::Expr::Name(name) => {
+                if let Some(column) = columns.iter().position(|column| {
+                    column
+                        .name
+                        .as_ref()
+                        .is_some_and(|column_name| column_name.eq_ignore_ascii_case(name.as_str()))
+                }) {
+                    dependencies.set(column)?;
+                }
+            }
+            ast::Expr::Qualified(_, name) | ast::Expr::DoublyQualified(_, _, name) => {
+                if let Some(column) = columns.iter().position(|column| {
+                    column
+                        .name
+                        .as_ref()
+                        .is_some_and(|column_name| column_name.eq_ignore_ascii_case(name.as_str()))
+                }) {
+                    dependencies.set(column)?;
+                }
+            }
+            ast::Expr::Subquery(_)
+            | ast::Expr::Exists(_)
+            | ast::Expr::InTable { .. }
+            | ast::Expr::SubqueryResult { .. } => {
+                unreachable!("generated columns cannot contain subqueries")
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
     })?;
     Ok(())
 }

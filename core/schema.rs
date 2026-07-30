@@ -3181,7 +3181,7 @@ impl GeneratedColGraph {
                 continue;
             };
             let mut direct = BitSet::default();
-            collect_column_dependencies_of_gencol(expr, columns, &mut direct);
+            crate::translate::bind::bind_generated_column_dependencies(expr, columns, &mut direct)?;
             if direct.get(j) {
                 bail_parse_error!(
                     "generated column \"{}\" cannot reference itself",
@@ -4035,43 +4035,6 @@ pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> H
     });
 
     refs
-}
-
-fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &mut BitSet) {
-    let _ = walk_expr(expr, &mut |e| {
-        match e {
-            Expr::Column { table, column, .. } if table.is_self_table() => {
-                out.set(*column)?;
-            }
-            Expr::Id(name) | Expr::Name(name) => {
-                if let Some(idx) = find_column_index_by_name(columns, name.as_str()) {
-                    out.set(idx)?;
-                }
-            }
-            Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-                if let Some(idx) = find_column_index_by_name(columns, col.as_str()) {
-                    out.set(idx)?;
-                }
-            }
-            Expr::Subquery(_)
-            | Expr::Exists(_)
-            | Expr::InTable { .. }
-            | Expr::SubqueryResult { .. } => {
-                unreachable!("generated columns cannot contain subqueries")
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    });
-}
-
-fn find_column_index_by_name(columns: &[Column], col_name: &str) -> Option<usize> {
-    columns.iter().enumerate().find_map(|(i, col)| {
-        col.name
-            .as_ref()
-            .filter(|name| name.eq_ignore_ascii_case(col_name))
-            .map(|_| i)
-    })
 }
 
 pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
