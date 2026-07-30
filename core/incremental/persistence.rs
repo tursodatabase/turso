@@ -63,6 +63,9 @@ impl ReadRecord {
     }
 }
 
+/// Each arm issues exactly one cursor op and advances only after it returns `Done`:
+/// `IOResult::IO` means "call me again", so advancing first abandons an in-flight
+/// balance. Seeks therefore get their own arm.
 #[derive(Debug, Default)]
 pub enum WriteRow {
     #[default]
@@ -70,11 +73,16 @@ pub enum WriteRow {
     Delete {
         rowid: i64,
     },
+    DeleteTable,
     DeleteIndex,
     ComputeNewRowId {
         final_weight: isize,
     },
     InsertNew {
+        rowid: i64,
+        final_weight: isize,
+    },
+    InsertNewRow {
         rowid: i64,
         final_weight: isize,
     },
@@ -184,19 +192,18 @@ impl WriteRow {
                     }
                 }
                 WriteRow::Delete { rowid } => {
-                    // Seek to the row and delete it
                     return_if_io!(cursors
                         .table_cursor
                         .seek(SeekKey::TableRowId(*rowid), SeekOp::GE { eq_only: true }));
-
-                    // Transition to DeleteIndex to also delete the index entry
-                    *self = WriteRow::DeleteIndex;
+                    *self = WriteRow::DeleteTable;
+                }
+                WriteRow::DeleteTable => {
                     return_if_io!(cursors.table_cursor.delete());
+                    *self = WriteRow::DeleteIndex;
                 }
                 WriteRow::DeleteIndex => {
-                    // Mark as Done before delete to avoid retry on I/O
-                    *self = WriteRow::Done;
                     return_if_io!(cursors.index_cursor.delete());
+                    *self = WriteRow::Done;
                 }
                 WriteRow::ComputeNewRowId { final_weight } => {
                     // Find the last rowid to compute the next one
@@ -224,15 +231,20 @@ impl WriteRow {
                     rowid,
                     final_weight,
                 } => {
+                    return_if_io!(cursors
+                        .table_cursor
+                        .seek(SeekKey::TableRowId(*rowid), SeekOp::GE { eq_only: false }));
+                    *self = WriteRow::InsertNewRow {
+                        rowid: *rowid,
+                        final_weight: *final_weight,
+                    };
+                }
+                WriteRow::InsertNewRow {
+                    rowid,
+                    final_weight,
+                } => {
                     let rowid_val = *rowid;
                     let final_weight_val = *final_weight;
-
-                    // Seek to where we want to insert
-                    // The insert will position the cursor correctly
-                    return_if_io!(cursors.table_cursor.seek(
-                        SeekKey::TableRowId(rowid_val),
-                        SeekOp::GE { eq_only: false }
-                    ));
 
                     // Build the complete record with weight
                     // Use the function parameter record_values directly
@@ -244,9 +256,8 @@ impl WriteRow {
                         ImmutableRecord::from_values(&complete_record, complete_record.len())?;
                     let btree_key = BTreeKey::new_table_rowid(rowid_val, Some(&immutable_record));
 
-                    // Transition to InsertIndex state after table insertion
-                    *self = WriteRow::InsertIndex { rowid: rowid_val };
                     return_if_io!(cursors.table_cursor.insert(&btree_key));
+                    *self = WriteRow::InsertIndex { rowid: rowid_val };
                 }
                 WriteRow::InsertIndex { rowid } => {
                     // For has_rowid indexes, we need to append the rowid to the index key
@@ -259,9 +270,8 @@ impl WriteRow {
                         ImmutableRecord::from_values(&index_values, index_values.len())?;
                     let index_btree_key = BTreeKey::new_index_key(index_record.as_record_ref());
 
-                    // Mark as Done before index insert to avoid retry on I/O
-                    *self = WriteRow::Done;
                     return_if_io!(cursors.index_cursor.insert(&index_btree_key));
+                    *self = WriteRow::Done;
                 }
                 WriteRow::UpdateExisting {
                     rowid,
@@ -276,10 +286,9 @@ impl WriteRow {
                         ImmutableRecord::from_values(&complete_record, complete_record.len())?;
                     let btree_key = BTreeKey::new_table_rowid(*rowid, Some(&immutable_record));
 
-                    // Mark as Done before insert to avoid retry on I/O
-                    *self = WriteRow::Done;
                     // BTree insert with existing key will replace the old value
                     return_if_io!(cursors.table_cursor.insert(&btree_key));
+                    *self = WriteRow::Done;
                 }
                 WriteRow::Done => {
                     return Ok(IOResult::Done(()));

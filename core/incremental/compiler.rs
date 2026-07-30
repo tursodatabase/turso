@@ -32,12 +32,19 @@ use std::fmt::{self, Display, Formatter};
 const OPERATOR_COLUMNS: usize = 5;
 
 /// State machine for writing rows to simple materialized views (table-only, no index)
+///
+/// Each arm issues exactly one cursor op and advances only after it returns `Done`:
+/// `IOResult::IO` means "call me again", so advancing first abandons an in-flight
+/// balance. The seek therefore gets its own arm.
 #[derive(Debug, Default)]
 pub enum WriteRowView {
     #[default]
     GetRecord,
     Delete,
     Insert {
+        final_weight: isize,
+    },
+    InsertRow {
         final_weight: isize,
     },
     Done,
@@ -106,13 +113,16 @@ impl WriteRowView {
                     }
                 }
                 WriteRowView::Delete => {
-                    // Mark as Done before delete to avoid retry on I/O
-                    *self = WriteRowView::Done;
                     return_if_io!(cursor.delete());
+                    *self = WriteRowView::Done;
                 }
                 WriteRowView::Insert { final_weight } => {
                     return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
-
+                    *self = WriteRowView::InsertRow {
+                        final_weight: *final_weight,
+                    };
+                }
+                WriteRowView::InsertRow { final_weight } => {
                     // Extract the row ID from the key
                     let key_i64 = match key {
                         SeekKey::TableRowId(id) => id,
@@ -131,9 +141,8 @@ impl WriteRowView {
                         ImmutableRecord::from_values(&record_values, record_values.len())?;
                     let btree_key = BTreeKey::new_table_rowid(key_i64, Some(&immutable_record));
 
-                    // Mark as Done before insert to avoid retry on I/O
-                    *self = WriteRowView::Done;
                     return_if_io!(cursor.insert(&btree_key));
+                    *self = WriteRowView::Done;
                 }
                 WriteRowView::Done => {
                     return Ok(IOResult::Done(()));
