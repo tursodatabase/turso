@@ -33,6 +33,9 @@ pub mod explain;
 pub mod hash_table;
 pub mod insn;
 pub mod metrics;
+pub mod peephole;
+#[cfg(test)]
+mod peephole_tests;
 pub mod rowset;
 pub mod sorter;
 #[cfg(test)]

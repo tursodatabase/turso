@@ -28,8 +28,7 @@ fn vdbe_trace_on_traces_literal_select() {
         "7",
         "\
 VDBE Trace:
-0     Init               0     2     0                    0   Start at 2
-2     Goto               0     1     0                    0
+0     Init               0     1     0                    0   Start at 1
 1     Halt               0     0     0                    0
 VDBE Trace:
 0     Init               0     3     0                    0   Start at 3
@@ -48,8 +47,7 @@ fn vdbe_trace_on_traces_computed_expression() {
         "7",
         "\
 VDBE Trace:
-0     Init               0     2     0                    0   Start at 2
-2     Goto               0     1     0                    0
+0     Init               0     1     0                    0   Start at 1
 1     Halt               0     0     0                    0
 VDBE Trace:
 0     Init               0     3     0                    0   Start at 3

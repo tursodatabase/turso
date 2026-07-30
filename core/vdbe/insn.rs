@@ -102,6 +102,13 @@ impl CmpInsFlags {
         self.has(CmpInsFlags::JUMP_IF_NULL)
     }
 
+    /// Copy of these flags with the JUMP_IF_NULL bit flipped. Used when the
+    /// peephole pass inverts a comparison: the inverse must make the opposite
+    /// jump decision when an operand is NULL.
+    pub fn with_jump_if_null_flipped(&self) -> Self {
+        Self(self.0 ^ CmpInsFlags::JUMP_IF_NULL)
+    }
+
     pub fn has_nulleq(&self) -> bool {
         self.has(CmpInsFlags::NULL_EQ)
     }

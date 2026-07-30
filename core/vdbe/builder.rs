@@ -40,7 +40,7 @@ impl TableRefIdCounter {
 }
 
 use super::{
-    affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, PrepareContext,
+    affinity::Affinity, peephole, BranchOffset, CursorID, Insn, InsnReference, PrepareContext,
     PreparedProgram, Program,
 };
 use crate::translate::plan::BitSet;
@@ -1802,6 +1802,13 @@ impl ProgramBuilder {
         sql: &str,
     ) -> crate::Result<PreparedProgram> {
         self.resolve_labels()?;
+
+        // EXPLAIN QUERY PLAN programs are made of Insn::Explain rows that
+        // carry raw instruction indices, which deleting instructions would
+        // invalidate; they are also never executed for performance.
+        if !matches!(self.query_mode, QueryMode::ExplainQueryPlan) && peephole::enabled() {
+            peephole::optimize_program(&mut self.insns, &mut self.comments);
+        }
 
         self.parameters.list.dedup();
 
