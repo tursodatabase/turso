@@ -452,6 +452,13 @@ pub(crate) enum ComparisonOp {
     GreaterEqual,
 }
 
+/// A SQL three-valued logical operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LogicalOp {
+    And,
+    Or,
+}
+
 /// SQLite comparison metadata resolved before symbolic IR construction.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ResolvedComparison {
@@ -558,8 +565,19 @@ impl BlockId {
 enum ScalarOp {
     Input(InputId),
     Constant(Value),
-    Add { lhs: ValueId, rhs: ValueId },
-    Column { cursor: CursorId, column: usize },
+    Add {
+        lhs: ValueId,
+        rhs: ValueId,
+    },
+    Logical {
+        op: LogicalOp,
+        lhs: ValueId,
+        rhs: ValueId,
+    },
+    Column {
+        cursor: CursorId,
+        column: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -579,7 +597,7 @@ impl ScalarOp {
     fn operands(&self) -> impl Iterator<Item = ValueId> + '_ {
         let operands = match self {
             Self::Input(_) | Self::Constant(_) | Self::Column { .. } => [None, None],
-            Self::Add { lhs, rhs } => [Some(*lhs), Some(*rhs)],
+            Self::Add { lhs, rhs } | Self::Logical { lhs, rhs, .. } => [Some(*lhs), Some(*rhs)],
         };
         operands.into_iter().flatten()
     }
@@ -587,7 +605,7 @@ impl ScalarOp {
     fn cursor(&self) -> Option<CursorId> {
         match self {
             Self::Column { cursor, .. } => Some(*cursor),
-            Self::Input(_) | Self::Constant(_) | Self::Add { .. } => None,
+            Self::Input(_) | Self::Constant(_) | Self::Add { .. } | Self::Logical { .. } => None,
         }
     }
 }
@@ -1485,6 +1503,22 @@ impl IrProgram {
                                 rhs: registers[rhs.index()],
                                 dest: destination,
                             }),
+                            ScalarOp::Logical { op, lhs, rhs } => {
+                                let lhs = registers[lhs.index()];
+                                let rhs = registers[rhs.index()];
+                                program.emit_insn(match op {
+                                    LogicalOp::And => Insn::And {
+                                        lhs,
+                                        rhs,
+                                        dest: destination,
+                                    },
+                                    LogicalOp::Or => Insn::Or {
+                                        lhs,
+                                        rhs,
+                                        dest: destination,
+                                    },
+                                });
+                            }
                             ScalarOp::Column { cursor, column } => {
                                 program.emit_column_or_rowid(
                                     physical_cursors[cursor.index()],
@@ -1725,6 +1759,18 @@ impl fmt::Display for IrProgram {
                             ScalarOp::Constant(value) => writeln!(f, "constant {value:?}")?,
                             ScalarOp::Add { lhs, rhs } => {
                                 writeln!(f, "add %{}, %{}", lhs.0, rhs.0)?;
+                            }
+                            ScalarOp::Logical { op, lhs, rhs } => {
+                                writeln!(
+                                    f,
+                                    "{} %{}, %{}",
+                                    match op {
+                                        LogicalOp::And => "and",
+                                        LogicalOp::Or => "or",
+                                    },
+                                    lhs.0,
+                                    rhs.0
+                                )?;
                             }
                             ScalarOp::Column { cursor, column } => {
                                 writeln!(f, "column ${}[{column}]", cursor.0)?;
@@ -2036,6 +2082,12 @@ pub(crate) struct Add {
     rhs: ValueId,
 }
 
+pub(crate) struct Logical {
+    op: LogicalOp,
+    lhs: ValueId,
+    rhs: ValueId,
+}
+
 pub(crate) struct Compare {
     lhs: ValueId,
     rhs: ValueId,
@@ -2179,6 +2231,22 @@ impl Compile for Add {
     }
 }
 
+pub(crate) const fn logical(op: LogicalOp, lhs: ValueId, rhs: ValueId) -> Logical {
+    Logical { op, lhs, rhs }
+}
+
+impl Compile for Logical {
+    type Output = ValueId;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        builder.push(ScalarOp::Logical {
+            op: self.op,
+            lhs: self.lhs,
+            rhs: self.rhs,
+        })
+    }
+}
+
 pub(crate) fn compile_scalar<Compiler>(compiler: Compiler) -> Result<IrProgram>
 where
     Compiler: Compile<Output = ValueId>,
@@ -2220,6 +2288,26 @@ mod tests {
                 "  %0 = constant Numeric(Integer(40))\n",
                 "  %1 = constant Numeric(Integer(2))\n",
                 "  %2 = add %0, %1\n",
+                "  return %2\n",
+            )
+        );
+    }
+
+    #[test]
+    fn logical_operators_remain_symbolic_until_lowering() {
+        let compiler = constant(Value::Null)
+            .then(constant(Value::from_i64(1)))
+            .and_then(|(lhs, rhs)| logical(LogicalOp::Or, lhs, rhs));
+
+        let ir = compile_scalar(compiler).unwrap();
+
+        assert_eq!(
+            ir.to_string(),
+            concat!(
+                "block0:\n",
+                "  %0 = constant Null\n",
+                "  %1 = constant Numeric(Integer(1))\n",
+                "  %2 = or %0, %1\n",
                 "  return %2\n",
             )
         );

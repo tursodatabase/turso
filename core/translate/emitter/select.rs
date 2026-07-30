@@ -1301,5 +1301,44 @@ mod tests {
         assert!(connection
             .prepare("SELECT a COLLATE missing_collation FROM expressions")
             .is_err());
+
+        let mut control_flow_statement = connection
+            .prepare(
+                "SELECT CASE \
+                            WHEN a > b THEN 'gt' \
+                            WHEN a = b THEN 'eq' \
+                            ELSE 'other' \
+                        END, \
+                        (a > b) OR (name = 'BETA'), \
+                        (a > b) AND (name = 'BETA') \
+                   FROM expressions \
+                  WHERE CASE WHEN name = 'BETA' THEN a + b >= 4 ELSE 0 END",
+            )
+            .unwrap();
+        let control_flow_instructions = &control_flow_statement.get_program().insns;
+        assert!(control_flow_instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Or { .. })));
+        assert!(control_flow_instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::And { .. })));
+        let control_flow_result_row = control_flow_instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 3, .. }))
+            .expect("searched CASE projections must join into one symbolic result pack");
+        assert!(
+            control_flow_instructions[control_flow_result_row - 3..control_flow_result_row]
+                .iter()
+                .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })),
+            "CASE merge values must remain symbolic until result-pack lowering"
+        );
+        assert_eq!(
+            control_flow_statement.run_collect_rows().unwrap(),
+            vec![vec![
+                Value::Text("eq".into()),
+                Value::from_i64(1),
+                Value::from_i64(0),
+            ]]
+        );
     }
 }

@@ -47,8 +47,9 @@ explicit loops with block parameters, and effectful cursor folds and row
 production. A production SELECT path uses these pieces for a forward scan of
 one B-tree table. Its frontend first resolves an owned scalar description, then
 compiles that description against each symbolic row. Columns, literals,
-addition, parentheses, collation wrappers, and ordinary comparisons can be
-nested and shared by both result expressions and predicates.
+addition, three-valued `AND` and `OR`, searched `CASE`, parentheses, collation
+wrappers, and ordinary comparisons can be nested and shared by both result
+expressions and predicates.
 It composes `scan_table`, row-stream operators, scalar projection, and
 `result_row`, then builds and verifies the complete IR before touching
 `ProgramBuilder`.
@@ -62,9 +63,12 @@ The resulting terminator has separate true, false, and NULL successors; a
 comparison used as a value joins `1`, `0`, or `NULL` through a block parameter.
 An ordered compiler combinator collects independently composed scalar values
 into a symbolic `ValuePack`; contiguous result registers are still chosen only
-during lowering. The path falls back when SQL semantics still live in the eager
-frontend: general expressions, `IS` comparisons, ordering, limits, joins,
-aggregates, subqueries, generated values, arrays, and custom-type decoding.
+during lowering. Searched `CASE` builds nested SSA diamonds, so only the chosen
+result arm executes and every arm joins as one value. Base-expression `CASE`
+still falls back until its per-`WHEN` affinity and collation rules are resolved.
+The path also falls back when SQL semantics still live in the eager frontend:
+other expression forms, `IS` comparisons, ordering, limits, joins, aggregates,
+subqueries, generated values, arrays, and custom-type decoding.
 `EXPLAIN QUERY PLAN` also remains on the eager path until the IR models
 explain-tree effects.
 Ordinary column lowering does reuse the VDBE backend's logical-column helper, so

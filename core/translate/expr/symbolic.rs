@@ -6,8 +6,8 @@ use crate::{
     translate::{
         alter::literal_default_value,
         compiler::{
-            add, compare, constant, pack_values, resolved_comparison, BoxedCompile, ComparisonOp,
-            Compile, PackValues, ResolvedComparison, Row, ValueId,
+            add, compare, constant, logical, pack_values, resolved_comparison, BoxedCompile,
+            ComparisonOp, Compile, LogicalOp, PackValues, ResolvedComparison, Row, ValueId,
         },
         emitter::Resolver,
         plan::TableReferences,
@@ -27,10 +27,19 @@ pub(crate) enum ResolvedScalarExpr {
     Column(usize),
     Constant(Value),
     Add(Box<Self>, Box<Self>),
+    Logical {
+        op: LogicalOp,
+        lhs: Box<Self>,
+        rhs: Box<Self>,
+    },
     Compare {
         lhs: Box<Self>,
         rhs: Box<Self>,
         comparison: ResolvedComparison,
+    },
+    Case {
+        when_then_pairs: Vec<(Self, Self)>,
+        else_expr: Box<Self>,
     },
 }
 
@@ -72,6 +81,11 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
             Expr::Column { table, column, .. } => self.resolve_column(*table, *column),
             Expr::Literal(literal) => self.resolve_literal(literal),
             Expr::Binary(lhs, operator, rhs) => self.resolve_binary(lhs, *operator, rhs),
+            Expr::Case {
+                base,
+                when_then_pairs,
+                else_expr,
+            } => self.resolve_case(base.as_deref(), when_then_pairs, else_expr.as_deref()),
             _ => Ok(None),
         }
     }
@@ -122,7 +136,9 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
         rhs: &Expr,
     ) -> Result<Option<ResolvedScalarExpr>> {
         let comparison_op = comparison_op(operator);
-        if operator != Operator::Add && comparison_op.is_none() {
+        if !matches!(operator, Operator::Add | Operator::And | Operator::Or)
+            && comparison_op.is_none()
+        {
             return Ok(None);
         }
         let Some(lhs_resolved) = self.resolve(lhs)? else {
@@ -132,11 +148,23 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
             return Ok(None);
         };
 
-        if operator == Operator::Add {
-            return Ok(Some(ResolvedScalarExpr::Add(
-                Box::new(lhs_resolved),
-                Box::new(rhs_resolved),
-            )));
+        if matches!(operator, Operator::Add | Operator::And | Operator::Or) {
+            let expression = match operator {
+                Operator::Add => {
+                    ResolvedScalarExpr::Add(Box::new(lhs_resolved), Box::new(rhs_resolved))
+                }
+                Operator::And | Operator::Or => ResolvedScalarExpr::Logical {
+                    op: match operator {
+                        Operator::And => LogicalOp::And,
+                        Operator::Or => LogicalOp::Or,
+                        _ => unreachable!(),
+                    },
+                    lhs: Box::new(lhs_resolved),
+                    rhs: Box::new(rhs_resolved),
+                },
+                _ => unreachable!(),
+            };
+            return Ok(Some(expression));
         }
 
         let op = comparison_op.expect("comparison operator checked above");
@@ -148,6 +176,40 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
             lhs: Box::new(lhs_resolved),
             rhs: Box::new(rhs_resolved),
             comparison: resolved_comparison(op, affinity, collation),
+        }))
+    }
+
+    fn resolve_case(
+        &self,
+        base: Option<&Expr>,
+        when_then_pairs: &[(Box<Expr>, Box<Expr>)],
+        else_expr: Option<&Expr>,
+    ) -> Result<Option<ResolvedScalarExpr>> {
+        if base.is_some() {
+            return Ok(None);
+        }
+        let mut resolved_pairs = Vec::with_capacity(when_then_pairs.len());
+        for (when_expr, then_expr) in when_then_pairs {
+            let Some(when_expr) = self.resolve(when_expr)? else {
+                return Ok(None);
+            };
+            let Some(then_expr) = self.resolve(then_expr)? else {
+                return Ok(None);
+            };
+            resolved_pairs.push((when_expr, then_expr));
+        }
+        let else_expr = match else_expr {
+            Some(else_expr) => {
+                let Some(else_expr) = self.resolve(else_expr)? else {
+                    return Ok(None);
+                };
+                else_expr
+            }
+            None => ResolvedScalarExpr::Constant(Value::Null),
+        };
+        Ok(Some(ResolvedScalarExpr::Case {
+            when_then_pairs: resolved_pairs,
+            else_expr: Box::new(else_expr),
         }))
     }
 }
@@ -183,6 +245,13 @@ pub(crate) fn compile_expr(row: Row, expr: &ResolvedScalarExpr) -> BoxedCompile<
             .then(compile_expr(row, rhs))
             .and_then(|(lhs, rhs)| add(lhs, rhs))
             .boxed(),
+        ResolvedScalarExpr::Logical { op, lhs, rhs } => compile_expr(row, lhs)
+            .then(compile_expr(row, rhs))
+            .and_then({
+                let op = *op;
+                move |(lhs, rhs)| logical(op, lhs, rhs)
+            })
+            .boxed(),
         ResolvedScalarExpr::Compare {
             lhs,
             rhs,
@@ -194,7 +263,27 @@ pub(crate) fn compile_expr(row: Row, expr: &ResolvedScalarExpr) -> BoxedCompile<
                 move |(lhs, rhs)| compare(lhs, rhs, comparison)
             })
             .boxed(),
+        ResolvedScalarExpr::Case {
+            when_then_pairs,
+            else_expr,
+        } => compile_case(row, when_then_pairs, else_expr),
     }
+}
+
+fn compile_case(
+    row: Row,
+    when_then_pairs: &[(ResolvedScalarExpr, ResolvedScalarExpr)],
+    else_expr: &ResolvedScalarExpr,
+) -> BoxedCompile<ValueId> {
+    let Some(((when_expr, then_expr), remaining)) = when_then_pairs.split_first() else {
+        return compile_expr(row, else_expr);
+    };
+    compile_expr(row, when_expr)
+        .branch(
+            compile_expr(row, then_expr),
+            compile_case(row, remaining, else_expr),
+        )
+        .boxed()
 }
 
 /// Compiles expressions in source order into one symbolic register pack.

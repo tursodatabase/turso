@@ -1963,3 +1963,26 @@ test symbolic-scalar-table-scan {
 expect {
     3|tag|0|4|beta
 }
+
+@cross-check-integrity
+test symbolic-scalar-control-flow {
+    CREATE TABLE expressions(a NUMERIC, b NUMERIC, name TEXT COLLATE NOCASE);
+    INSERT INTO expressions VALUES
+        (1, 2, 'alpha'), (2, 2, 'beta'), (NULL, 4, 'BETA'), (5, -1, NULL);
+    SELECT CASE
+               WHEN a > b THEN 'gt'
+               WHEN a = b THEN 'eq'
+               ELSE 'other'
+           END,
+           (a > b) OR (name = 'BETA'),
+           (a > b) AND (name = 'BETA')
+      FROM expressions
+     WHERE CASE WHEN name = 'BETA' THEN a + b >= 4 ELSE 0 END;
+    CREATE TABLE truth(dummy);
+    INSERT INTO truth VALUES (1);
+    SELECT 0 AND NULL, 1 AND NULL, 1 OR NULL, 0 OR NULL FROM truth;
+}
+expect {
+    eq|1|0
+    0||1|
+}
