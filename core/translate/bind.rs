@@ -142,6 +142,26 @@ pub fn shift_index_after_drop(index: &mut Index, dropped_column: usize) -> Resul
     Ok(())
 }
 
+/// Render a bound schema expression using the table's current column names.
+pub fn render_schema_expr(expr: &ast::Expr, columns: &[Column]) -> Result<String> {
+    let mut unbound = expr.clone();
+    walk_expr_mut(&mut unbound, &mut |expr| {
+        match expr {
+            ast::Expr::Column { table, column, .. } if table.is_self_table() => {
+                if let Some(name) = columns.get(*column).and_then(|column| column.name.as_ref()) {
+                    *expr = ast::Expr::Id(ast::Name::exact(name.clone()));
+                }
+            }
+            ast::Expr::RowId { table, .. } if table.is_self_table() => {
+                *expr = ast::Expr::Id(ast::Name::exact(super::planner::ROWID_STRS[0].to_string()));
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(unbound.to_string())
+}
+
 /// Point SELF_TABLE references in a stored schema expression at a concrete
 /// table reference. This does not reject unresolved identifiers because ALTER
 /// validation may deliberately bind them through an expression register cache.

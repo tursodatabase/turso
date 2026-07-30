@@ -8,7 +8,7 @@ use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
-use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
+use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::index::{reject_explicit_nulls, resolve_index_method_parameters};
 use crate::translate::planner::ROWID_STRS;
 use crate::types::{IOResult, ImmutableRecord};
@@ -3128,7 +3128,7 @@ impl CheckConstraint {
     /// `columns` renders `SELF_TABLE` positional references back to the current
     /// column names.
     pub fn sql(&self, columns: &[Column]) -> String {
-        match render_gencol_expr_sql_with_new_names(&self.expr, columns) {
+        match crate::translate::bind::render_schema_expr(&self.expr, columns) {
             Ok(rendered) => format!("CHECK({rendered})"),
             Err(_) => format!("CHECK({})", self.expr),
         }
@@ -4072,33 +4072,6 @@ fn find_column_index_by_name(columns: &[Column], col_name: &str) -> Option<usize
             .filter(|name| name.eq_ignore_ascii_case(col_name))
             .map(|_| i)
     })
-}
-
-/// Re-render the SQL text of a generated-column expression using current column names. The input
-/// AST may have been previously resolved into `Expr::Column { table: SELF_TABLE, column: idx, .. }`
-/// nodes; we replace each such self-table reference with a fresh `Expr::Id(<col-name>)` before
-/// stringifying so the result round-trips through the parser, even if a referenced column was
-/// renamed since the original `original_sql` was captured.
-pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) -> Result<String> {
-    let mut clone = expr.clone();
-    walk_expr_mut(&mut clone, &mut |e| -> Result<WalkControl> {
-        match e {
-            Expr::Column { table, column, .. } if table.is_self_table() => {
-                if let Some(col) = columns.get(*column) {
-                    if let Some(name) = col.name.as_ref() {
-                        *e = Expr::Id(Name::exact(name.clone()));
-                    }
-                }
-            }
-            // Expr::RowId renders as empty SQL, so restore the keyword.
-            Expr::RowId { table, .. } if table.is_self_table() => {
-                *e = Expr::Id(Name::exact(ROWID_STRS[0].to_string()));
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(clone.to_string())
 }
 
 pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Expr>]) -> bool {

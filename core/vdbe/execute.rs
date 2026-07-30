@@ -9,10 +9,7 @@ use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::{BootstrapState, CheckpointStateMachine, TxID};
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
-use crate::schema::{
-    render_gencol_expr_sql_with_new_names, Schema, Table, SCHEMA_TABLE_NAME,
-    SQLITE_SEQUENCE_TABLE_NAME,
-};
+use crate::schema::{Schema, Table, SCHEMA_TABLE_NAME, SQLITE_SEQUENCE_TABLE_NAME};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
@@ -15372,10 +15369,8 @@ pub fn op_alter_column(
                     if let Some(expr) = &mut ic.expr {
                         rename_identifiers(expr.as_mut(), &old_column_name, &new_name);
                         if ic.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL {
-                            ic.name = crate::schema::render_gencol_expr_sql_with_new_names(
-                                expr,
-                                &renamed_columns,
-                            )?;
+                            ic.name =
+                                crate::translate::bind::render_schema_expr(expr, &renamed_columns)?;
                         } else if ic.name.eq_ignore_ascii_case(&existing_column_name) {
                             ic.name.clone_from(&new_name);
                         }
@@ -15407,7 +15402,7 @@ pub fn op_alter_column(
                 let cols_view = btree.columns();
                 if let Some(new_sql) = cols_view[i]
                     .generated_expr()
-                    .map(|expr| render_gencol_expr_sql_with_new_names(expr, cols_view))
+                    .map(|expr| crate::translate::bind::render_schema_expr(expr, cols_view))
                     .transpose()?
                 {
                     btree.columns_mut()[i].set_generated_original_sql(new_sql)

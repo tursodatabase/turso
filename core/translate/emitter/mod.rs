@@ -2142,11 +2142,8 @@ fn emit_check_constraint_bytecode(
             None => referenced_tables
                 .and_then(|tables| tables.joined_tables().first())
                 .and_then(|jt| {
-                    crate::schema::render_gencol_expr_sql_with_new_names(
-                        &check_constraint.expr,
-                        jt.columns(),
-                    )
-                    .ok()
+                    crate::translate::bind::render_schema_expr(&check_constraint.expr, jt.columns())
+                        .ok()
                 })
                 .unwrap_or_else(|| format!("{}", check_constraint.expr)),
         };
