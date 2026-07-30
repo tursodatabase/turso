@@ -963,22 +963,45 @@ expect {
     2
 }
 
-@skip-if sqlite "only newer SQLite rejects an outer-join ON clause reading past the recursive table (3.53 errors, 3.43 and 3.50 accept)"
-test recursive-cte-left-join-rejects-on-clause-reading-left-table {
-    CREATE TABLE edge_for_invalid_recursive_right(parent INTEGER, child INTEGER);
-    INSERT INTO edge_for_invalid_recursive_right VALUES(1, 2);
+# SQLite 3.53 rejects an outer-join ON clause reading tables left of the
+# recursive table ("ON clause references tables to its right") because the
+# recursive table is scanned outermost; 3.43-3.50 accept and evaluate it, and
+# the rejection was reported upstream as a regression. We accept.
+@skip-if sqlite "SQLite 3.53 rejects this form due to an upstream regression; 3.43-3.50 accept"
+test recursive-cte-left-join-on-clause-reading-left-table {
+    CREATE TABLE edge_for_recursive_right(parent INTEGER, child INTEGER);
+    INSERT INTO edge_for_recursive_right VALUES(1, 2);
     WITH RECURSIVE path(node) AS (
         VALUES(1)
         UNION ALL
-        SELECT edge_for_invalid_recursive_right.child
-          FROM edge_for_invalid_recursive_right LEFT JOIN path
-            ON edge_for_invalid_recursive_right.parent = path.node
+        SELECT edge_for_recursive_right.child
+          FROM edge_for_recursive_right LEFT JOIN path
+            ON edge_for_recursive_right.parent = path.node
         LIMIT 2
     )
     SELECT node FROM path;
 }
-expect error {
-    ON clause references tables to its right
+expect {
+    1
+    2
+}
+
+@skip-if sqlite "SQLite 3.53 rejects this form due to an upstream regression; 3.43-3.50 accept"
+test recursive-cte-left-join-on-clause-reading-only-left-table {
+    CREATE TABLE lj_const_on(a);
+    INSERT INTO lj_const_on VALUES(5),(6);
+    WITH RECURSIVE c(x) AS (
+        SELECT 1
+        UNION ALL
+        SELECT c.x + 1 FROM lj_const_on LEFT JOIN c ON lj_const_on.a = 5
+        WHERE c.x < 3
+    )
+    SELECT * FROM c;
+}
+expect {
+    1
+    2
+    3
 }
 
 # SQLite supports FULL JOIN with the recursive table on the left, but our
@@ -1003,8 +1026,10 @@ expect error {
     FULL OUTER JOIN with a recursive reference is not yet supported
 }
 
-@skip-if sqlite "only newer SQLite rejects an outer-join ON clause reading past the recursive table (3.53 errors, 3.43 and 3.50 accept)"
-test recursive-cte-full-join-rejects-on-clause-reading-left-table {
+# Like recursive-on-left FULL JOIN above, this needs a hash join with the
+# recursive input as a build side, which is not supported yet.
+@skip-if sqlite "supported in sqlite"
+test recursive-cte-full-join-recursive-on-right-not-supported {
     CREATE TABLE edge_for_invalid_recursive_full(parent INTEGER, child INTEGER);
     INSERT INTO edge_for_invalid_recursive_full VALUES(1, 2);
     WITH RECURSIVE path(node) AS (
@@ -1018,11 +1043,11 @@ test recursive-cte-full-join-rejects-on-clause-reading-left-table {
     SELECT node FROM path;
 }
 expect error {
-    ON clause references tables to its right
+    FULL OUTER JOIN with a recursive reference is not yet supported
 }
 
-@skip-if sqlite "only newer SQLite rejects an outer-join ON clause reading past the recursive table (3.53 errors, 3.43 and 3.50 accept)"
-test recursive-cte-left-join-rejects-on-clause-subquery-reading-left-table {
+@skip-if sqlite "SQLite 3.53 rejects this form due to an upstream regression; 3.43-3.50 accept"
+test recursive-cte-left-join-on-clause-subquery-reading-left-table {
     CREATE TABLE edge_for_recursive_on_subquery(parent INTEGER, child INTEGER);
     INSERT INTO edge_for_recursive_on_subquery VALUES(1, 2);
     WITH RECURSIVE path(node) AS (
@@ -1035,8 +1060,9 @@ test recursive-cte-left-join-rejects-on-clause-subquery-reading-left-table {
     )
     SELECT node FROM path;
 }
-expect error {
-    ON clause references tables to its right
+expect {
+    1
+    2
 }
 
 test recursive-cte-cross-join-current-row-inner {

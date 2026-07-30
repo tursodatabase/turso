@@ -7,7 +7,7 @@ use super::{
     plan::{
         Aggregate, ColumnMask, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
         JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
-        Plan, QueryDestination, ResultSetColumn, Scan, SelectPlan, TableReferences, WhereTerm,
+        Plan, QueryDestination, ResultSetColumn, Scan, TableReferences, WhereTerm,
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
 };
@@ -1329,7 +1329,6 @@ fn prepare_recursive_cte_plan(
         );
     }
     reject_aggregates_and_windows_in_recursive_query(&recursive_query)?;
-    reject_outer_join_on_clause_reading_past_recursive_input(&recursive_query, input_table_id)?;
 
     let queue_order = super::select::resolve_recursive_cte_queue_order(
         &select.order_by,
@@ -1386,67 +1385,6 @@ fn reject_aggregates_and_windows_in_recursive_query(query: &Plan) -> Result<()> 
             return Err(crate::LimboError::InternalError(
                 "recursive CTE query is not a SELECT".to_string(),
             ));
-        }
-    }
-    Ok(())
-}
-
-/// SQLite scans the recursive input as the outermost loop of the recursive
-/// step, so when the input is the right operand of a LEFT or FULL join, any
-/// ON term that also reads another table in the FROM clause would depend on
-/// loops that have not started yet. SQLite rejects this with "ON clause
-/// references tables to its right" (whereexpr.c), and we mirror that.
-///
-/// A recursive input written on the left of a RIGHT JOIN ends up as the
-/// rightmost outer-joined table after the planner's swap; SQLite accepts that
-/// form, so swapped joins are skipped.
-fn reject_outer_join_on_clause_reading_past_recursive_input(
-    query: &Plan,
-    input_table_id: TableInternalId,
-) -> Result<()> {
-    let selects: Vec<&SelectPlan> = match query {
-        Plan::Select(select) => vec![select],
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => left
-            .iter()
-            .map(|(select, _)| select)
-            .chain(std::iter::once(right_most.as_ref()))
-            .collect(),
-        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {
-            return Err(crate::LimboError::InternalError(
-                "recursive CTE query is not a SELECT".to_string(),
-            ));
-        }
-    };
-    for select in selects {
-        if select.table_references.right_join_swapped() {
-            continue;
-        }
-        for term in &select.where_clause {
-            if term.from_outer_join != Some(input_table_id) {
-                continue;
-            }
-            let Some(input_table_idx) = select
-                .table_references
-                .joined_tables()
-                .iter()
-                .position(|table| table.internal_id == input_table_id)
-            else {
-                return Err(crate::LimboError::InternalError(
-                    "outer-join ON term references a table that is not in the FROM clause"
-                        .to_string(),
-                ));
-            };
-            let mut mask = table_mask_from_expr(
-                &term.expr,
-                &select.table_references,
-                &select.non_from_clause_subqueries,
-            )?;
-            mask.clear(input_table_idx);
-            if !mask.is_empty() {
-                crate::bail_parse_error!("ON clause references tables to its right");
-            }
         }
     }
     Ok(())
