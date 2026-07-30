@@ -137,20 +137,7 @@ pub fn translate(
                 &mut program,
             )?;
         }
-        mut stmt => {
-            // Bind the whole statement once, up front. The per-statement
-            // translate functions consume the bound output instead of
-            // binding at their own call sites.
-            let bound_stmt = bind::bind_stmt(&mut stmt, &resolver, &mut program, &connection)?;
-            translate_inner(
-                stmt,
-                bound_stmt,
-                &mut resolver,
-                &mut program,
-                &connection,
-                input,
-            )?
-        }
+        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
     };
 
     program.epilogue(schema);
@@ -161,10 +148,13 @@ pub fn translate(
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
 // statements, we would have to return a program builder instead
 /// Translate SQL statement into bytecode program.
+///
+/// SELECT, DELETE, and UPDATE bind (resolve every table, column, and alias
+/// reference) at the top of their match arms, then hand the bound output to
+/// their translate functions — no binding happens during planning.
 #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
 pub fn translate_inner(
     stmt: ast::Stmt,
-    bound_stmt: Option<bind::BoundStmt>,
     resolver: &mut Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
@@ -303,14 +293,32 @@ pub fn translate_inner(
             translate_create_virtual_table(vtab, resolver, program, connection)?
         }
         ast::Stmt::Delete {
-            where_clause,
+            tbl_name,
+            indexed,
+            mut where_clause,
             limit,
-            returning,
-            ..
+            mut returning,
+            order_by,
+            mut with,
         } => {
-            let Some(bind::BoundStmt::Delete(binding)) = bound_stmt else {
-                unreachable!("bind_stmt binds every DELETE");
-            };
+            if !order_by.is_empty() {
+                bail_parse_error!("ORDER BY clause is not supported in DELETE");
+            }
+            if where_clause.is_none() && connection.get_dml_require_where() {
+                bail_parse_error!(
+                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
+            }
+            let binding = delete::bind_delete_stmt(
+                &tbl_name,
+                indexed,
+                &mut where_clause,
+                &mut returning,
+                &mut with,
+                resolver,
+                program,
+                connection,
+            )?;
             translate_delete(
                 binding,
                 resolver,
@@ -403,10 +411,8 @@ pub fn translate_inner(
             savepoint_name,
         } => translate_rollback(program, tx_name, savepoint_name)?,
         ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
-        ast::Stmt::Select(select) => {
-            let Some(bind::BoundStmt::Select(bound)) = bound_stmt else {
-                unreachable!("bind_stmt binds every SELECT");
-            };
+        ast::Stmt::Select(mut select) => {
+            let bound = select::bind_select_stmt(&mut select, resolver, program)?;
             translate_select(
                 select,
                 bound,
@@ -416,10 +422,13 @@ pub fn translate_inner(
                 connection,
             )?;
         }
-        ast::Stmt::Update(update) => {
-            let Some(bind::BoundStmt::Update(binding)) = bound_stmt else {
-                unreachable!("bind_stmt binds every UPDATE");
-            };
+        ast::Stmt::Update(mut update) => {
+            if update.where_clause.is_none() && connection.get_dml_require_where() {
+                bail_parse_error!(
+                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
+            }
+            let binding = update::bind_update_stmt(&mut update, resolver, program, connection, false)?;
             translate_update(update, binding, resolver, program, connection)?
         }
         ast::Stmt::Vacuum { name, into } => {
