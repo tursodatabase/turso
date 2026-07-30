@@ -6451,8 +6451,8 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     // ── Trigger WHEN binding ────────────────────────────────────────────
 
     /// Bind NEW/OLD references and subqueries in a trigger WHEN clause.
-    /// Non-subquery identifiers at the top level are intentionally left for
-    /// expression translation so the double-quoted-string quirk is preserved.
+    /// Top-level identifiers are either resolved here or rejected. DQS string
+    /// fallback is also completed here so emission never binds raw SQL names.
     pub fn bind_trigger_when(
         &mut self,
         expr: &mut ast::Expr,
@@ -6509,7 +6509,12 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                             {
                                 crate::bail_parse_error!("no such column: {}", identifier);
                             }
-                            Ok(WalkControl::Continue)
+                            if name.quoted_with('"') && ctx.resolver.dqs_dml.is_enabled() {
+                                *e = ast::Expr::Literal(ast::Literal::String(name.as_literal()));
+                                Ok(WalkControl::Continue)
+                            } else {
+                                crate::bail_parse_error!("no such column: {}", identifier);
+                            }
                         }
                         _ => Ok(WalkControl::Continue),
                     }

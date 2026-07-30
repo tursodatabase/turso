@@ -649,7 +649,7 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::DoublyQualified(_, _, _) => {
-            crate::bail_parse_error!("DoublyQualified should have been rewritten in optimizer")
+            crate::bail_parse_error!("unbound qualified column reached expression translation")
         }
         ast::Expr::Exists(_) => {
             crate::bail_parse_error!("EXISTS is not supported in this position")
@@ -2202,7 +2202,8 @@ pub fn translate_expr(
             }
         }
         ast::Expr::Id(id) => {
-            // Check for custom type expression overrides (e.g. `value` placeholder)
+            // Custom type expressions use synthetic parameter identifiers whose
+            // register binding only exists while their bytecode is emitted.
             if let Some(&reg) = program.id_register_overrides.get(id.as_str()) {
                 program.emit_insn(Insn::Copy {
                     src_reg: reg,
@@ -2211,15 +2212,7 @@ pub fn translate_expr(
                 });
                 return Ok(target_register);
             }
-            if !resolver.dqs_dml.is_enabled() {
-                crate::bail_parse_error!("no such column: {}", id.as_str());
-            }
-            // DQS enabled: treat double-quoted identifiers as string literals (SQLite compatibility)
-            program.emit_insn(Insn::String8 {
-                value: id.as_str().to_string(),
-                dest: target_register,
-            });
-            Ok(target_register)
+            crate::bail_parse_error!("unbound identifier reached expression translation: {}", id)
         }
         ast::Expr::Column {
             database: _,
@@ -2868,7 +2861,7 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::Qualified(_, _) => {
-            unreachable!("Qualified should be resolved to a Column before translation")
+            crate::bail_parse_error!("unbound qualified column reached expression translation")
         }
         ast::Expr::FieldAccess {
             base,
