@@ -898,7 +898,6 @@ fn resolve_effective_frame(
             end: FrameBoundary::CurrentRow,
         });
     };
-    reject_unsupported_frame(&frame)?;
     // Aggregates we haven't ported an xInverse for. SQLite supports
     // sliding frames over these via per-function strategies (sorted
     // index for min/max, separator-length tracking for group_concat,
@@ -906,17 +905,22 @@ fn resolve_effective_frame(
     // wired up alongside the xInverse implementations themselves.
     // first_value / nth_value don't need xInverse — they're WINDOWFUNCNOOP
     // (window.c:591) and read positionally from csr_app at output time, so
-    // any frame shape works as long as csr_start's frame-start rowid is
-    // tracked.
+    // any frame shape works as long as the frame-index counters are
+    // tracked. last_value's inverse is the frame-row count decrement
+    // (window.c:505-522).
     let supports_sliding = matches!(
         func,
         AccumulatorFunc::Agg(
             AggFunc::Sum | AggFunc::Total | AggFunc::Count | AggFunc::Count0 | AggFunc::Avg,
-        ) | AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue)
+        ) | AccumulatorFunc::Window(
+            WindowFunc::FirstValue | WindowFunc::NthValue | WindowFunc::LastValue
+        )
     );
-    let moving_start = matches!(
+    // Anything but an UNBOUNDED PRECEDING start makes the frame shrink
+    // from the left, firing xInverse.
+    let moving_start = !matches!(
         frame.start,
-        crate::translate::plan::FrameBoundary::Preceding(_)
+        crate::translate::plan::FrameBoundary::UnboundedPreceding
     );
     if moving_start && !supports_sliding {
         crate::bail_parse_error!(
@@ -926,30 +930,6 @@ fn resolve_effective_frame(
         );
     }
     Ok(frame)
-}
-
-/// Reject frame shapes the emit code doesn't handle. The accepted set
-/// is the default `RANGE UNBOUNDED PRECEDING AND CURRENT ROW` and
-/// `ROWS BETWEEN [UNBOUNDED PRECEDING | N PRECEDING] AND CURRENT ROW`.
-fn reject_unsupported_frame(frame: &crate::translate::plan::Frame) -> Result<()> {
-    use crate::translate::plan::FrameBoundary;
-    use turso_parser::ast::FrameMode;
-    let default_ok = frame.mode == FrameMode::Range
-        && matches!(frame.start, FrameBoundary::UnboundedPreceding)
-        && matches!(frame.end, FrameBoundary::CurrentRow);
-    let rows_ok = frame.mode == FrameMode::Rows
-        && matches!(
-            frame.start,
-            FrameBoundary::UnboundedPreceding | FrameBoundary::Preceding(_)
-        )
-        && matches!(frame.end, FrameBoundary::CurrentRow);
-    if default_ok || rows_ok {
-        return Ok(());
-    }
-    crate::bail_parse_error!(
-        "unsupported frame: only ROWS BETWEEN [UNBOUNDED PRECEDING | N PRECEDING] \
-         AND CURRENT ROW is supported"
-    );
 }
 
 /// Resolve the `Window` a function call should be attached to, given the
