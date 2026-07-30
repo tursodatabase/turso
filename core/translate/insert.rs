@@ -362,11 +362,12 @@ pub fn translate_insert(
         &mut returning,
         resolver,
         connection,
+        &mut rustc_hash::FxHashMap::default(),
     )?;
 
     // Process RETURNING clause using shared module
     let mut result_columns =
-        process_returning_clause(&mut returning, &mut table_references, resolver)?;
+        process_returning_clause(&mut returning, &mut table_references, resolver, false)?;
     let has_fks = fk_enabled
         && (resolver.with_schema(database_id, |s| s.has_child_fks(table_name.as_str()))
             || resolver.with_schema(database_id, |s| {

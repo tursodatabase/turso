@@ -419,9 +419,8 @@ pub fn plan_subqueries_from_where_clause(
     where_clause: &mut [WhereTerm],
     resolver: &Resolver,
     connection: &Arc<Connection>,
+    bound_subqueries: &mut HashMap<ast::TableInternalId, crate::translate::bind::BoundSubquery>,
 ) -> Result<()> {
-    let mut bound_subqueries: HashMap<ast::TableInternalId, crate::translate::bind::BoundSubquery> =
-        HashMap::default();
     plan_subqueries_with_outer_query_access(
         program,
         non_from_clause_subqueries,
@@ -434,7 +433,7 @@ pub fn plan_subqueries_from_where_clause(
         SubqueryPosition::Where.allow_correlated(),
         &mut Vec::new(),
         &[],
-        &mut bound_subqueries,
+        bound_subqueries,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
@@ -516,9 +515,8 @@ pub fn plan_subqueries_from_returning(
     returning: &mut [ast::ResultColumn],
     resolver: &Resolver,
     connection: &Arc<Connection>,
+    bound_subqueries: &mut HashMap<ast::TableInternalId, crate::translate::bind::BoundSubquery>,
 ) -> Result<()> {
-    let mut bound_subqueries: HashMap<ast::TableInternalId, crate::translate::bind::BoundSubquery> =
-        HashMap::default();
     // Extract mutable references to expressions from ResultColumn::Expr variants
     let exprs = returning.iter_mut().filter_map(|rc| match rc {
         ast::ResultColumn::Expr(expr, _) => Some(expr.as_mut()),
@@ -537,7 +535,7 @@ pub fn plan_subqueries_from_returning(
         SubqueryPosition::ResultColumn.allow_correlated(),
         &mut Vec::new(),
         &[],
-        &mut bound_subqueries,
+        bound_subqueries,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;

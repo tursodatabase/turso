@@ -187,6 +187,7 @@ fn prepare_and_optimize_update_plan(
         &mut update_plan.where_clause,
         resolver,
         connection,
+        &mut rustc_hash::FxHashMap::default(),
     )?;
     mark_shared_cte_materialization_requirements(
         &mut read_scope_tables,
@@ -345,6 +346,7 @@ fn prepare_update_plan(
         &mut where_clause,
         resolver,
         connection,
+        &mut rustc_hash::FxHashMap::default(),
     )?;
 
     let mut read_scope_tables = TableReferences::new(vec![target_table], vec![]);
@@ -394,12 +396,14 @@ fn prepare_update_plan(
             &mut body.returning,
             resolver,
             connection,
+            &mut rustc_hash::FxHashMap::default(),
         )?;
 
         process_returning_clause(
             &mut body.returning,
             &mut returning_table_references,
             resolver,
+            false,
         )?
     } else {
         vec![]

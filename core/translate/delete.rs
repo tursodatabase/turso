@@ -94,7 +94,7 @@ pub fn translate_delete(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
-    let mut delete_plan = prepare_delete_plan(
+    let (mut delete_plan, mut bound_subqueries) = prepare_delete_plan(
         program,
         resolver,
         tbl_name,
@@ -117,7 +117,7 @@ pub fn translate_delete(
                 rowset_plan,
                 resolver,
                 connection,
-                &mut rustc_hash::FxHashMap::default(),
+                &mut bound_subqueries,
             )?;
         } else {
             // Normal path: subqueries are in the DELETE plan's WHERE
@@ -128,6 +128,7 @@ pub fn translate_delete(
                 &mut delete_plan_inner.where_clause,
                 resolver,
                 connection,
+                &mut bound_subqueries,
             )?;
         }
     }
@@ -189,55 +190,68 @@ pub fn prepare_delete_plan(
     resolver: &Resolver,
     qualified_name: &QualifiedName,
     table: Arc<Table>,
-    where_clause: Option<Box<Expr>>,
+    mut where_clause: Option<Box<Expr>>,
     limit: Option<Limit>,
     mut returning: Vec<ResultColumn>,
     indexed: Option<turso_parser::ast::Indexed>,
-    with: Option<With>,
+    mut with: Option<With>,
     connection: &Arc<crate::Connection>,
     database_id: usize,
-) -> Result<Plan> {
+) -> Result<(
+    Plan,
+    rustc_hash::FxHashMap<turso_parser::ast::TableInternalId, super::bind::BoundSubquery>,
+)> {
     let schema = resolver.schema();
 
     let btree_table_for_triggers = table.btree();
-    let table = if let Some(table) = table.virtual_table() {
-        Table::Virtual(table)
-    } else if let Some(table) = table.btree() {
-        Table::BTree(table)
-    } else {
-        crate::bail_parse_error!("Table is neither a virtual table nor a btree table");
-    };
     let indexes = schema.get_indices(table.get_name()).cloned().collect();
-    let joined_tables = vec![JoinedTable {
-        op: Operation::default_scan_for(&table),
-        table,
-        identifier: qualified_name.identifier(),
-        internal_id: program.table_reference_counter.next(),
-        join_info: None,
-        col_used_mask: ColumnUsedMask::default(),
-        column_use_counts: Vec::new(),
-        expression_index_usages: Vec::new(),
-        database_id,
+
+    // Bind phase: resolve all names in WHERE and RETURNING up front.
+    let mut binder = super::bind::BindContext::new(resolver, program);
+    let mut bound = binder.bind_delete(
+        qualified_name,
         indexed,
-    }];
-    let mut table_references = TableReferences::new(joined_tables, vec![]);
-
-    // Plan CTEs and add them as outer query references for subquery resolution
-    plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
-
-    let mut where_predicates = vec![];
-
-    // Parse the WHERE clause
-    parse_where(
-        where_clause.as_deref(),
-        &mut table_references,
-        None,
-        &mut where_predicates,
-        resolver,
+        &mut where_clause,
+        &mut returning,
+        &mut with,
+        database_id,
     )?;
 
+    let cte_definitions = std::mem::take(&mut bound.cte_definitions);
+    let bound_subqueries = std::mem::take(&mut bound.subquery_bindings);
+
+    // Plan CTEs using pre-bound data from the binder, then convert the bound
+    // scope into TableReferences.
+    let mut planned_ctes =
+        super::planner::plan_bound_ctes(cte_definitions, resolver, program, connection)?;
+    let mut table_references = bound.into_table_references(&mut planned_ctes)?;
+
+    // Add planned CTEs as definition-only outer query refs so subqueries in
+    // WHERE/RETURNING can reference them.
+    for (name, jt) in &planned_ctes {
+        table_references.add_outer_query_reference(super::plan::OuterQueryReference {
+            identifier: name.clone(),
+            internal_id: jt.internal_id,
+            table: jt.table.clone(),
+            using_dedup_hidden_cols: super::plan::ColumnMask::default(),
+            col_used_mask: ColumnUsedMask::default(),
+            cte_select: None,
+            cte_explicit_columns: vec![],
+            cte_id: None,
+            cte_definition_only: true,
+            rowid_referenced: false,
+            scope_depth: 0,
+        });
+    }
+
+    let mut where_predicates = vec![];
+    super::planner::parse_where_bound(where_clause.as_deref(), &mut where_predicates)?;
+
     // Plan subqueries in RETURNING expressions before processing
-    // (so SubqueryResult nodes are cloned into result_columns)
+    // (so SubqueryResult nodes are cloned into result_columns).
+    // The bound map is passed separately to the caller for WHERE planning,
+    // so use a reborrow here.
+    let mut bound_subqueries = bound_subqueries;
     let mut non_from_clause_subqueries = vec![];
     plan_subqueries_from_returning(
         program,
@@ -246,13 +260,15 @@ pub fn prepare_delete_plan(
         &mut returning,
         resolver,
         connection,
+        &mut bound_subqueries,
     )?;
 
-    let result_columns = process_returning_clause(&mut returning, &mut table_references, resolver)?;
+    let result_columns =
+        process_returning_clause(&mut returning, &mut table_references, resolver, true)?;
 
-    // Parse the LIMIT/OFFSET clause
+    // LIMIT/OFFSET identifiers were already resolved by the binder.
     let (resolved_limit, resolved_offset) =
-        limit.map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
+        limit.map_or((None, None), |l| (Some(l.expr), l.offset));
 
     // Check if there are DELETE triggers. If so, we need to materialize the write set into a RowSet first.
     // This is done in SQLite for all DELETE triggers on the affected table even if the trigger would not have an impact
@@ -300,7 +316,7 @@ pub fn prepare_delete_plan(
         ensure_delete_uses_rowset(program, &mut delete_plan);
     }
 
-    Ok(Plan::Delete(Box::new(delete_plan)))
+    Ok((Plan::Delete(Box::new(delete_plan)), bound_subqueries))
 }
 
 /// Returns true if any FK referencing `table_name` (transitively, following CASCADE chains)
@@ -364,9 +380,14 @@ fn where_clause_has_subquery(predicates: &[WhereTerm]) -> bool {
     for pred in predicates {
         let mut found = false;
         let _ = walk_expr(&pred.expr, &mut |e| {
+            // Raw subquery nodes (legacy path) or pre-bound SubqueryResult
+            // nodes produced by the binding phase.
             if matches!(
                 e,
-                Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_)
+                Expr::Subquery(_)
+                    | Expr::InSelect { .. }
+                    | Expr::Exists(_)
+                    | Expr::SubqueryResult { .. }
             ) {
                 found = true;
             }

@@ -2874,6 +2874,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             let scope = ctx.build_table_scope(
                 &update.tbl_name.name,
                 update.tbl_name.alias.as_ref(),
+                update.indexed.clone(),
                 database_id,
             )?;
 
@@ -2932,39 +2933,21 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
     /// Build a single-table scope for DML statements (UPDATE, DELETE).
     /// `database_id` specifies which attached database to search (0 = main).
+    ///
+    /// DML targets are always schema tables — a WITH-clause CTE never shadows
+    /// the target (matching SQLite, where `WITH t AS (...) DELETE FROM t`
+    /// modifies the real table t).
     fn build_table_scope(
         &mut self,
         table_name: &ast::Name,
         alias: Option<&ast::Name>,
+        indexed: Option<ast::Indexed>,
         database_id: usize,
     ) -> Result<BindScope> {
         let normalized = normalize_ident(table_name.as_str());
         let identifier = alias
             .map(|a| normalize_ident(a.as_str()))
             .unwrap_or_else(|| normalized.clone());
-
-        // Check CTEs first
-        if let Some(cte) = self.ctes.get(&normalized) {
-            validate_cte_explicit_columns(&normalized, cte)?;
-            let cte_table = Arc::new(CteTable {
-                columns: cte.resolved_columns.clone(),
-            });
-            return Ok(BindScope {
-                tables: vec![ScopeTable {
-                    identifier,
-                    internal_id: self.id_gen.next_table_id(),
-                    source: ScopeTableSource::Cte {
-                        name: normalized,
-                        cte_id: cte.cte_id,
-                    },
-                    table: cte_table,
-                    join_info: None,
-                    database_id: 0,
-                    indexed: None,
-                }],
-                right_join_swapped: false,
-            });
-        }
 
         // Schema lookup (uses the specified database for attached DB support)
         let schema_table = self
@@ -2980,7 +2963,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 table: schema_table,
                 join_info: None,
                 database_id,
-                indexed: None,
+                indexed,
             }],
             right_join_swapped: false,
         })
@@ -3138,7 +3121,8 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     /// Bind a DELETE statement, resolving all name references in-place.
     pub fn bind_delete(
         &mut self,
-        tbl_name: &ast::Name,
+        tbl_name: &ast::QualifiedName,
+        indexed: Option<ast::Indexed>,
         where_clause: &mut Option<Box<ast::Expr>>,
         returning: &mut Vec<ast::ResultColumn>,
         with: &mut Option<ast::With>,
@@ -3151,7 +3135,12 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             }
 
             // 2. Build scope with target table
-            let scope = ctx.build_table_scope(tbl_name, None, database_id)?;
+            let scope = ctx.build_table_scope(
+                &tbl_name.name,
+                tbl_name.alias.as_ref(),
+                indexed,
+                database_id,
+            )?;
 
             // 3. Bind WHERE clause
             if let Some(where_expr) = where_clause.as_mut() {
@@ -3211,7 +3200,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             }
 
             // 2. Build scope with target table (for RETURNING)
-            let scope = ctx.build_table_scope(tbl_name, None, database_id)?;
+            let scope = ctx.build_table_scope(tbl_name, None, None, database_id)?;
 
             // 3. Bind VALUES / detect multi-row path
             let (values, inserting_multiple_rows) = ctx.bind_insert_values(body, &scope)?;
