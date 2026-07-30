@@ -5,7 +5,7 @@ use crate::{
     sync::Arc,
     translate::{
         aggregation::emit_ungrouped_aggregation,
-        collate::get_collseq_from_expr_with_symbols,
+        collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         compiler::{
             compile_effect, pack_values, result_row_pack, scan_table, BoxedCompile, Compile, Row,
             RowStream, SortKey, SortedRow, ValueId,
@@ -77,7 +77,7 @@ fn try_emit_declarative_table_scan(
 ) -> Result<Option<usize>> {
     if matches!(program.get_query_mode(), QueryMode::ExplainQueryPlan)
         || !matches!(plan.query_destination, QueryDestination::ResultRows)
-        || !matches!(plan.distinctness, Distinctness::NonDistinct)
+        || (matches!(plan.distinctness, Distinctness::Distinct { .. }) && !plan.order_by.is_empty())
         || plan.group_by.is_some()
         || !plan.aggregates.is_empty()
         || plan.contains_constant_false_condition
@@ -173,6 +173,23 @@ fn try_emit_declarative_table_scan(
         };
         projections.push(expression);
     }
+    let distinct_collations = if matches!(plan.distinctness, Distinctness::Distinct { .. }) {
+        Some(
+            plan.result_columns
+                .iter()
+                .map(|column| {
+                    get_collseq_from_expr_with_symbols(
+                        &column.expr,
+                        &plan.table_references,
+                        Some(resolver.symbol_table),
+                    )
+                    .map(|collation| collation.unwrap_or(CollationSeq::Binary))
+                })
+                .collect::<Result<SmallVec<[CollationSeq; 4]>>>()?,
+        )
+    } else {
+        None
+    };
 
     let mut predicates = SmallVec::<[ResolvedScalarExpr; 2]>::new();
     for predicate in &plan.where_clause {
@@ -207,8 +224,8 @@ fn try_emit_declarative_table_scan(
                 sort_expressions,
                 sort_keys,
                 result_column_count,
-                limit,
-                offset,
+                distinct_collations,
+                DeclarativeSlice { limit, offset },
             )
         } else {
             compile_declarative_rows(
@@ -217,8 +234,8 @@ fn try_emit_declarative_table_scan(
                 sort_expressions,
                 sort_keys,
                 result_column_count,
-                limit,
-                offset,
+                distinct_collations,
+                DeclarativeSlice { limit, offset },
             )
         }
     });
@@ -235,19 +252,28 @@ fn try_emit_declarative_table_scan(
     Ok(Some(result_cols_start))
 }
 
+struct DeclarativeSlice {
+    limit: Option<BoxedCompile<ValueId>>,
+    offset: Option<BoxedCompile<ValueId>>,
+}
+
 fn compile_declarative_rows<Stream>(
     rows: Stream,
     projections: SmallVec<[ResolvedScalarExpr; 4]>,
     mut sort_expressions: SmallVec<[ResolvedScalarExpr; 4]>,
     sort_keys: SmallVec<[SortKey; 4]>,
     result_column_count: usize,
-    limit: Option<BoxedCompile<ValueId>>,
-    offset: Option<BoxedCompile<ValueId>>,
+    distinct_collations: Option<SmallVec<[CollationSeq; 4]>>,
+    slice: DeclarativeSlice,
 ) -> BoxedCompile<()>
 where
     Stream: RowStream<Item = Row> + 'static,
 {
-    if sort_keys.is_empty() {
+    let DeclarativeSlice { limit, offset } = slice;
+    if let Some(collations) = distinct_collations {
+        debug_assert!(sort_keys.is_empty());
+        compile_declarative_distinct_projection(rows, projections, collations, limit, offset)
+    } else if sort_keys.is_empty() {
         compile_declarative_projection(rows, projections, limit, offset)
     } else {
         sort_expressions.extend(projections);
@@ -259,6 +285,31 @@ where
             limit,
             offset,
         )
+    }
+}
+
+fn compile_declarative_distinct_projection<Stream>(
+    rows: Stream,
+    projections: SmallVec<[ResolvedScalarExpr; 4]>,
+    collations: SmallVec<[CollationSeq; 4]>,
+    limit: Option<BoxedCompile<ValueId>>,
+    offset: Option<BoxedCompile<ValueId>>,
+) -> BoxedCompile<()>
+where
+    Stream: RowStream<Item = Row> + 'static,
+{
+    let rows = rows
+        .map(move |row| compile_symbolic_exprs(row, &projections))
+        .distinct(collations);
+    match (limit, offset) {
+        (Some(limit), Some(offset)) => rows
+            .skip(offset)
+            .take(limit)
+            .for_each(result_row_pack)
+            .boxed(),
+        (Some(limit), None) => rows.take(limit).for_each(result_row_pack).boxed(),
+        (None, Some(offset)) => rows.skip(offset).for_each(result_row_pack).boxed(),
+        (None, None) => rows.for_each(result_row_pack).boxed(),
     }
 }
 

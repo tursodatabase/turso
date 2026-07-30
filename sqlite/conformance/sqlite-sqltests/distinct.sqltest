@@ -124,6 +124,23 @@ expect {
     3
 }
 
+# Exercise the streaming declarative DISTINCT path: projection and collation
+# determine the key, then OFFSET/LIMIT count only admitted unique rows.
+@cross-check-integrity
+test distinct-stream-limit-offset {
+    CREATE TABLE distinct_stream (key TEXT COLLATE NOCASE, payload);
+    INSERT INTO distinct_stream VALUES
+        ('A', 1), ('a', 1), ('b', 2), ('b', 2), ('c', 3), ('d', 4);
+    SELECT DISTINCT key, payload
+    FROM distinct_stream
+    WHERE payload >= 1
+    LIMIT 2 OFFSET 1;
+}
+expect {
+    b|2
+    c|3
+}
+
 # Regression: OFFSET must be applied after DISTINCT deduplication.
 # This query projects all input rows to the same value (0), so DISTINCT yields
 # exactly one row. OFFSET 2 should therefore skip that one row and return empty.

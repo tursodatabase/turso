@@ -19,7 +19,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u16, CmpInsFlags, Insn, SortComparatorType},
+        insn::{to_u16, CmpInsFlags, HashDistinctData, Insn, SortComparatorType},
         PageIdx,
     },
     LimboError, Result,
@@ -658,7 +658,7 @@ pub(crate) const fn resolved_comparison(
 }
 
 /// An ordered set of SSA values that must occupy consecutive VDBE registers.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ValuePack(SmallVec<[ValueId; 4]>);
 
 impl ValuePack {
@@ -766,6 +766,16 @@ impl SorterId {
     }
 }
 
+/// A symbolic set used to admit only the first occurrence of a value pack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DistinctSetId(u32);
+
+impl DistinctSetId {
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 #[derive(Debug)]
 enum CursorResource {
     External(CursorInputId),
@@ -776,6 +786,11 @@ enum CursorResource {
 struct SorterResource {
     keys: SmallVec<[SortKey; 4]>,
     record_width: usize,
+}
+
+#[derive(Debug)]
+struct DistinctSetResource {
+    collations: SmallVec<[CollationSeq; 4]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -834,6 +849,9 @@ enum EffectOp {
     },
     SorterData {
         sorter: SorterId,
+    },
+    OpenDistinctSet {
+        set: DistinctSetId,
     },
 }
 
@@ -906,7 +924,8 @@ impl Instruction {
             Self::Effect(
                 EffectOp::OpenRead { .. }
                 | EffectOp::OpenSorter { .. }
-                | EffectOp::SorterData { .. },
+                | EffectOp::SorterData { .. }
+                | EffectOp::OpenDistinctSet { .. },
             ) => (None, &[][..]),
             Self::Effect(EffectOp::ResultRow { pack } | EffectOp::SorterInsert { pack, .. }) => {
                 (None, pack.values())
@@ -923,7 +942,8 @@ impl Instruction {
                 | EffectOp::ResultRow { .. }
                 | EffectOp::OpenSorter { .. }
                 | EffectOp::SorterInsert { .. }
-                | EffectOp::SorterData { .. },
+                | EffectOp::SorterData { .. }
+                | EffectOp::OpenDistinctSet { .. },
             ) => None,
         }
     }
@@ -936,7 +956,8 @@ impl Instruction {
                 EffectOp::ResultRow { .. }
                 | EffectOp::OpenSorter { .. }
                 | EffectOp::SorterInsert { .. }
-                | EffectOp::SorterData { .. },
+                | EffectOp::SorterData { .. }
+                | EffectOp::OpenDistinctSet { .. },
             ) => None,
         }
     }
@@ -950,7 +971,8 @@ impl Instruction {
             Self::Effect(
                 EffectOp::OpenRead { .. }
                 | EffectOp::ResultRow { .. }
-                | EffectOp::OpenSorter { .. },
+                | EffectOp::OpenSorter { .. }
+                | EffectOp::OpenDistinctSet { .. },
             ) => None,
         }
     }
@@ -962,6 +984,21 @@ impl Instruction {
             | Self::Effect(
                 EffectOp::OpenRead { .. }
                 | EffectOp::ResultRow { .. }
+                | EffectOp::SorterInsert { .. }
+                | EffectOp::SorterData { .. }
+                | EffectOp::OpenDistinctSet { .. },
+            ) => None,
+        }
+    }
+
+    fn distinct_set_definition(&self) -> Option<DistinctSetId> {
+        match self {
+            Self::Effect(EffectOp::OpenDistinctSet { set }) => Some(*set),
+            Self::Value { .. }
+            | Self::Effect(
+                EffectOp::OpenRead { .. }
+                | EffectOp::ResultRow { .. }
+                | EffectOp::OpenSorter { .. }
                 | EffectOp::SorterInsert { .. }
                 | EffectOp::SorterData { .. },
             ) => None,
@@ -1011,6 +1048,12 @@ enum Terminator {
         if_next: BlockId,
         if_done: BlockId,
         arguments: SmallVec<[ValueId; 2]>,
+    },
+    DistinctCheck {
+        set: DistinctSetId,
+        pack: ValuePack,
+        if_unique: BlockId,
+        if_duplicate: BlockId,
     },
     Return(ValueId),
 }
@@ -1072,6 +1115,15 @@ impl Terminator {
                 Some((*if_empty, arguments.as_slice())),
                 None,
             ],
+            Self::DistinctCheck {
+                if_unique,
+                if_duplicate,
+                ..
+            } => [
+                Some((*if_unique, &[][..])),
+                Some((*if_duplicate, &[][..])),
+                None,
+            ],
             Self::Return(_) => [None, None, None],
         };
         edges.into_iter().flatten()
@@ -1088,21 +1140,23 @@ impl Terminator {
             | Self::CursorNext { arguments, .. }
             | Self::SorterSort { arguments, .. }
             | Self::SorterNext { arguments, .. } => (None, None, arguments.as_slice()),
+            Self::DistinctCheck { pack, .. } => (None, None, pack.values()),
         };
         first.into_iter().chain(second).chain(rest.iter().copied())
     }
 
-    fn control_operands(&self) -> impl Iterator<Item = ValueId> {
+    fn control_operands(&self) -> smallvec::IntoIter<[ValueId; 4]> {
         let operands = match self {
-            Self::Branch { condition, .. } | Self::Return(condition) => [Some(*condition), None],
-            Self::Compare { lhs, rhs, .. } => [Some(*lhs), Some(*rhs)],
+            Self::Branch { condition, .. } | Self::Return(condition) => smallvec![*condition],
+            Self::Compare { lhs, rhs, .. } => smallvec![*lhs, *rhs],
+            Self::DistinctCheck { pack, .. } => pack.values().iter().copied().collect(),
             Self::Jump { .. }
             | Self::CursorRewind { .. }
             | Self::CursorNext { .. }
             | Self::SorterSort { .. }
-            | Self::SorterNext { .. } => [None, None],
+            | Self::SorterNext { .. } => SmallVec::new(),
         };
-        operands.into_iter().flatten()
+        operands.into_iter()
     }
 
     fn cursor(&self) -> Option<CursorId> {
@@ -1111,7 +1165,7 @@ impl Terminator {
             Self::Jump { .. } | Self::Branch { .. } | Self::Compare { .. } | Self::Return(_) => {
                 None
             }
-            Self::SorterSort { .. } | Self::SorterNext { .. } => None,
+            Self::SorterSort { .. } | Self::SorterNext { .. } | Self::DistinctCheck { .. } => None,
         }
     }
 
@@ -1123,6 +1177,21 @@ impl Terminator {
             | Self::Compare { .. }
             | Self::CursorRewind { .. }
             | Self::CursorNext { .. }
+            | Self::DistinctCheck { .. }
+            | Self::Return(_) => None,
+        }
+    }
+
+    fn distinct_set(&self) -> Option<DistinctSetId> {
+        match self {
+            Self::DistinctCheck { set, .. } => Some(*set),
+            Self::Jump { .. }
+            | Self::Branch { .. }
+            | Self::Compare { .. }
+            | Self::CursorRewind { .. }
+            | Self::CursorNext { .. }
+            | Self::SorterSort { .. }
+            | Self::SorterNext { .. }
             | Self::Return(_) => None,
         }
     }
@@ -1185,6 +1254,14 @@ impl Terminator {
             } => {
                 remap_target(if_next)?;
                 remap_target(if_done)
+            }
+            Self::DistinctCheck {
+                if_unique,
+                if_duplicate,
+                ..
+            } => {
+                remap_target(if_unique)?;
+                remap_target(if_duplicate)
             }
             Self::Return(_) => Ok(()),
         }
@@ -1263,7 +1340,10 @@ impl Terminator {
                 );
                 retain_live_arguments(arguments, &parameter_live[if_next.index()])
             }
-            Self::Branch { .. } | Self::Compare { .. } | Self::Return(_) => false,
+            Self::Branch { .. }
+            | Self::Compare { .. }
+            | Self::DistinctCheck { .. }
+            | Self::Return(_) => false,
         }
     }
 }
@@ -1292,6 +1372,7 @@ pub(crate) struct IrBuilder {
     cursor_input_count: u32,
     cursor_resources: SmallVec<[CursorResource; 2]>,
     sorter_resources: SmallVec<[SorterResource; 1]>,
+    distinct_set_resources: SmallVec<[DistinctSetResource; 1]>,
     parameter_declarations: SmallVec<[Variable; 2]>,
 }
 
@@ -1310,6 +1391,7 @@ impl IrBuilder {
             cursor_input_count: 0,
             cursor_resources: SmallVec::new(),
             sorter_resources: SmallVec::new(),
+            distinct_set_resources: SmallVec::new(),
             parameter_declarations: SmallVec::new(),
         }
     }
@@ -1373,6 +1455,32 @@ impl IrBuilder {
         Ok(())
     }
 
+    fn allocate_distinct_set(
+        &mut self,
+        collations: SmallVec<[CollationSeq; 4]>,
+    ) -> Result<DistinctSetId> {
+        if collations.is_empty() {
+            return Err(LimboError::InternalError(
+                "compiler IR distinct set must have at least one key".to_owned(),
+            ));
+        }
+        let id = u32::try_from(self.distinct_set_resources.len()).map_err(|_| {
+            LimboError::InternalError("compiler IR distinct-set identifier overflow".to_owned())
+        })?;
+        self.distinct_set_resources
+            .push(DistinctSetResource { collations });
+        Ok(DistinctSetId(id))
+    }
+
+    fn ensure_distinct_set_declared(&self, set: DistinctSetId) -> Result<()> {
+        if set.index() >= self.distinct_set_resources.len() {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR references undeclared distinct set {set:?}"
+            )));
+        }
+        Ok(())
+    }
+
     fn allocate_value(&mut self) -> Result<ValueId> {
         let value = ValueId(self.next_value);
         self.next_value = self.next_value.checked_add(1).ok_or_else(|| {
@@ -1409,7 +1517,8 @@ impl IrBuilder {
             EffectOp::ResultRow { .. }
             | EffectOp::OpenSorter { .. }
             | EffectOp::SorterInsert { .. }
-            | EffectOp::SorterData { .. } => None,
+            | EffectOp::SorterData { .. }
+            | EffectOp::OpenDistinctSet { .. } => None,
         };
         if let Some(cursor) = cursor {
             self.ensure_cursor_declared(cursor)?;
@@ -1418,10 +1527,15 @@ impl IrBuilder {
             EffectOp::OpenSorter { sorter }
             | EffectOp::SorterInsert { sorter, .. }
             | EffectOp::SorterData { sorter } => Some(*sorter),
-            EffectOp::OpenRead { .. } | EffectOp::ResultRow { .. } => None,
+            EffectOp::OpenRead { .. }
+            | EffectOp::ResultRow { .. }
+            | EffectOp::OpenDistinctSet { .. } => None,
         };
         if let Some(sorter) = sorter {
             self.ensure_sorter_declared(sorter)?;
+        }
+        if let EffectOp::OpenDistinctSet { set } = &op {
+            self.ensure_distinct_set_declared(*set)?;
         }
         self.blocks[self.current.index()]
             .instructions
@@ -1487,6 +1601,9 @@ impl IrBuilder {
         if let Some(sorter) = terminator.sorter() {
             self.ensure_sorter_declared(sorter)?;
         }
+        if let Some(set) = terminator.distinct_set() {
+            self.ensure_distinct_set_declared(set)?;
+        }
         let block = &mut self.blocks[self.current.index()];
         if block.terminator.replace(terminator).is_some() {
             return Err(LimboError::InternalError(format!(
@@ -1524,6 +1641,7 @@ impl IrBuilder {
             cursor_input_count: self.cursor_input_count,
             cursor_resources: self.cursor_resources,
             sorter_resources: self.sorter_resources,
+            distinct_set_resources: self.distinct_set_resources,
             parameter_declarations: self.parameter_declarations,
         };
         program.verify()?;
@@ -1559,6 +1677,7 @@ pub(crate) struct IrProgram {
     cursor_input_count: u32,
     cursor_resources: SmallVec<[CursorResource; 2]>,
     sorter_resources: SmallVec<[SorterResource; 1]>,
+    distinct_set_resources: SmallVec<[DistinctSetResource; 1]>,
     parameter_declarations: SmallVec<[Variable; 2]>,
 }
 
@@ -1574,6 +1693,7 @@ impl IrProgram {
         let mut definitions = vec![None; self.value_count as usize];
         let mut cursor_definitions = vec![None; self.cursor_resources.len()];
         let mut sorter_definitions = vec![None; self.sorter_resources.len()];
+        let mut distinct_set_definitions = vec![None; self.distinct_set_resources.len()];
         let mut predecessors = vec![Vec::new(); block_count];
         let mut return_count = 0;
 
@@ -1629,6 +1749,13 @@ impl IrProgram {
                             sorter,
                             resource.record_width,
                             pack.values().len()
+                        )));
+                    }
+                }
+                if let Instruction::Effect(EffectOp::OpenDistinctSet { set }) = instruction {
+                    if set.index() >= self.distinct_set_resources.len() {
+                        return Err(LimboError::InternalError(format!(
+                            "compiler IR defines out-of-range distinct set {set:?}"
                         )));
                     }
                 }
@@ -1698,6 +1825,16 @@ impl IrProgram {
                         },
                     )?;
                 }
+                if let Some(set) = instruction.distinct_set_definition() {
+                    Self::record_distinct_set_definition(
+                        &mut distinct_set_definitions,
+                        set,
+                        Definition {
+                            block: block.id,
+                            instruction: Some(instruction_index),
+                        },
+                    )?;
+                }
             }
             for (successor, arguments) in block.terminator.edges() {
                 let Some(target) = self.blocks.get(successor.index()) else {
@@ -1727,6 +1864,24 @@ impl IrProgram {
                 if sorter.index() >= self.sorter_resources.len() {
                     return Err(LimboError::InternalError(format!(
                         "compiler IR references out-of-range sorter {sorter:?}"
+                    )));
+                }
+            }
+            if let Some(set) = block.terminator.distinct_set() {
+                let Some(resource) = self.distinct_set_resources.get(set.index()) else {
+                    return Err(LimboError::InternalError(format!(
+                        "compiler IR references out-of-range distinct set {set:?}"
+                    )));
+                };
+                let Terminator::DistinctCheck { pack, .. } = &block.terminator else {
+                    unreachable!("only distinct-check terminators use distinct sets");
+                };
+                if pack.values().len() != resource.collations.len() {
+                    return Err(LimboError::InternalError(format!(
+                        "compiler IR distinct set {:?} expects key width {}, received {}",
+                        set,
+                        resource.collations.len(),
+                        pack.values().len()
                     )));
                 }
             }
@@ -1807,6 +1962,15 @@ impl IrProgram {
                     block.instructions.len(),
                 )?;
             }
+            if let Some(set) = block.terminator.distinct_set() {
+                Self::verify_distinct_set_use(
+                    &distinct_set_definitions,
+                    &dominators,
+                    set,
+                    block.id,
+                    block.instructions.len(),
+                )?;
+            }
         }
         Ok(())
     }
@@ -1852,8 +2016,11 @@ impl IrProgram {
                         Self::require_sorter_phase(&phases, *sorter, SorterPhase::Reading, "read")?;
                     }
                     Instruction::Value { .. }
-                    | Instruction::Effect(EffectOp::OpenRead { .. } | EffectOp::ResultRow { .. }) =>
-                        {}
+                    | Instruction::Effect(
+                        EffectOp::OpenRead { .. }
+                        | EffectOp::ResultRow { .. }
+                        | EffectOp::OpenDistinctSet { .. },
+                    ) => {}
                 }
             }
 
@@ -1870,6 +2037,7 @@ impl IrProgram {
                 | Terminator::Compare { .. }
                 | Terminator::CursorRewind { .. }
                 | Terminator::CursorNext { .. }
+                | Terminator::DistinctCheck { .. }
                 | Terminator::Return(_) => {}
             }
 
@@ -1974,6 +2142,24 @@ impl IrProgram {
         if slot.replace(definition).is_some() {
             return Err(LimboError::InternalError(format!(
                 "compiler IR sorter {sorter:?} has multiple definitions"
+            )));
+        }
+        Ok(())
+    }
+
+    fn record_distinct_set_definition(
+        definitions: &mut [Option<Definition>],
+        set: DistinctSetId,
+        definition: Definition,
+    ) -> Result<()> {
+        let Some(slot) = definitions.get_mut(set.index()) else {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR defines out-of-range distinct set {set:?}"
+            )));
+        };
+        if slot.replace(definition).is_some() {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR distinct set {set:?} has multiple definitions"
             )));
         }
         Ok(())
@@ -2321,6 +2507,33 @@ impl IrProgram {
         Ok(())
     }
 
+    fn verify_distinct_set_use(
+        definitions: &[Option<Definition>],
+        dominators: &[Vec<bool>],
+        set: DistinctSetId,
+        use_block: BlockId,
+        use_instruction: usize,
+    ) -> Result<()> {
+        let Some(Some(definition)) = definitions.get(set.index()) else {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR uses unopened distinct set {set:?}"
+            )));
+        };
+        let valid = if definition.block == use_block {
+            definition
+                .instruction
+                .is_none_or(|definition| definition < use_instruction)
+        } else {
+            dominators[use_block.index()][definition.block.index()]
+        };
+        if !valid {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR distinct set {set:?} is not open on every path to {use_block:?}"
+            )));
+        }
+        Ok(())
+    }
+
     fn output(&self) -> ValueId {
         self.blocks
             .iter()
@@ -2586,6 +2799,21 @@ impl IrProgram {
         required
     }
 
+    fn required_distinct_sets(&self) -> Vec<bool> {
+        let mut required = vec![false; self.distinct_set_resources.len()];
+        for block in &self.blocks {
+            for instruction in &block.instructions {
+                if let Some(set) = instruction.distinct_set_definition() {
+                    required[set.index()] = true;
+                }
+            }
+            if let Some(set) = block.terminator.distinct_set() {
+                required[set.index()] = true;
+            }
+        }
+        required
+    }
+
     fn register_for(registers: &[Option<usize>], value: ValueId) -> usize {
         registers[value.index()].expect("verified live SSA value has a physical register")
     }
@@ -2596,6 +2824,10 @@ impl IrProgram {
 
     fn sorter_for(sorters: &[Option<PhysicalSorter>], sorter: SorterId) -> PhysicalSorter {
         sorters[sorter.index()].expect("verified live sorter has physical resources")
+    }
+
+    fn distinct_set_for(sets: &[Option<usize>], set: DistinctSetId) -> usize {
+        sets[set.index()].expect("verified live distinct set has a physical hash table")
     }
 
     fn collect_edge_copies(
@@ -2762,6 +2994,13 @@ impl IrProgram {
                 })
             })
             .collect::<SmallVec<[Option<PhysicalSorter>; 1]>>();
+        let required_distinct_sets = self.required_distinct_sets();
+        let physical_distinct_sets = self
+            .distinct_set_resources
+            .iter()
+            .enumerate()
+            .map(|(index, _)| required_distinct_sets[index].then(|| program.alloc_hash_table_id()))
+            .collect::<SmallVec<[Option<usize>; 1]>>();
         let registers = self.allocate_value_registers(program, target_register, input_registers);
         let labels = self
             .blocks
@@ -2980,6 +3219,11 @@ impl IrProgram {
                             pseudo_cursor: physical.pseudo_cursor,
                         });
                     }
+                    Instruction::Effect(EffectOp::OpenDistinctSet { set }) => {
+                        program.emit_insn(Insn::HashClear {
+                            hash_table_id: Self::distinct_set_for(&physical_distinct_sets, *set),
+                        });
+                    }
                 }
             }
             match &block.terminator {
@@ -3169,6 +3413,38 @@ impl IrProgram {
                         target_pc: labels[if_done.index()],
                     });
                 }
+                Terminator::DistinctCheck {
+                    set,
+                    pack,
+                    if_unique,
+                    if_duplicate,
+                } => {
+                    let start = program.alloc_registers(pack.values().len());
+                    for (index, value) in pack.values().iter().enumerate() {
+                        let source = Self::register_for(&registers, *value);
+                        let destination = start + index;
+                        if source != destination {
+                            program.emit_insn(Insn::Copy {
+                                src_reg: source,
+                                dst_reg: destination,
+                                extra_amount: 0,
+                            });
+                        }
+                    }
+                    let resource = &self.distinct_set_resources[set.index()];
+                    program.emit_insn(Insn::HashDistinct {
+                        data: Box::new(HashDistinctData {
+                            hash_table_id: Self::distinct_set_for(&physical_distinct_sets, *set),
+                            key_start_reg: start,
+                            num_keys: pack.values().len(),
+                            collations: resource.collations.iter().copied().collect(),
+                            target_pc: labels[if_duplicate.index()],
+                        }),
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: labels[if_unique.index()],
+                    });
+                }
                 Terminator::Return(_) => {
                     if let Some(continuation) = continuation {
                         program.emit_insn(Insn::Goto {
@@ -3221,7 +3497,24 @@ impl fmt::Display for IrProgram {
             }
             writeln!(f, "]")?;
         }
-        if !self.cursor_resources.is_empty() || !self.sorter_resources.is_empty() {
+        for (index, resource) in self.distinct_set_resources.iter().enumerate() {
+            write!(
+                f,
+                "distinct_set &{index} width {} [",
+                resource.collations.len()
+            )?;
+            for (collation_index, collation) in resource.collations.iter().enumerate() {
+                if collation_index != 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{collation:?}")?;
+            }
+            writeln!(f, "]")?;
+        }
+        if !self.cursor_resources.is_empty()
+            || !self.sorter_resources.is_empty()
+            || !self.distinct_set_resources.is_empty()
+        {
             writeln!(f)?;
         }
         for (block_index, block) in self.blocks.iter().enumerate() {
@@ -3302,6 +3595,9 @@ impl fmt::Display for IrProgram {
                     }
                     Instruction::Effect(EffectOp::SorterData { sorter }) => {
                         writeln!(f, "  sorter_data #{}", sorter.0)?;
+                    }
+                    Instruction::Effect(EffectOp::OpenDistinctSet { set }) => {
+                        writeln!(f, "  open_distinct_set &{}", set.0)?;
                     }
                 }
             }
@@ -3392,6 +3688,16 @@ impl fmt::Display for IrProgram {
                     write!(f, "), block{}(", if_done.0)?;
                     Self::fmt_arguments(f, arguments)?;
                     writeln!(f, ")")?;
+                }
+                Terminator::DistinctCheck {
+                    set,
+                    pack,
+                    if_unique,
+                    if_duplicate,
+                } => {
+                    write!(f, "distinct_check &{} [", set.0)?;
+                    Self::fmt_arguments(f, pack.values())?;
+                    writeln!(f, "], block{}, block{}", if_unique.0, if_duplicate.0)?;
                 }
                 Terminator::Return(value) => writeln!(f, "return %{}", value.0)?,
             }
@@ -3550,6 +3856,17 @@ pub(crate) trait RowStream: Sized + 'static {
             source: self,
             keys,
             record_width,
+        }
+    }
+
+    /// Yield only the first value pack for each collation-aware key.
+    fn distinct(self, collations: SmallVec<[CollationSeq; 4]>) -> DistinctRows<Self>
+    where
+        Self: RowStream<Item = ValuePack>,
+    {
+        DistinctRows {
+            source: self,
+            collations,
         }
     }
 }
@@ -3798,6 +4115,146 @@ where
             source: self.source,
             keys: self.keys,
             record_width: self.record_width,
+            initial,
+            body,
+        }
+        .boxed()
+    }
+}
+
+/// A streaming row stage that remembers and filters previously yielded packs.
+pub(crate) struct DistinctRows<Source> {
+    source: Source,
+    collations: SmallVec<[CollationSeq; 4]>,
+}
+
+struct CheckDistinct {
+    set: DistinctSetId,
+    pack: ValuePack,
+}
+
+impl Compile for CheckDistinct {
+    type Output = ValueId;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let unique = builder.create_block()?;
+        let duplicate = builder.create_block()?;
+        let merge = builder.create_block()?;
+        let result = builder.add_block_parameter(merge)?;
+        builder.terminate(Terminator::DistinctCheck {
+            set: self.set,
+            pack: self.pack,
+            if_unique: unique,
+            if_duplicate: duplicate,
+        })?;
+
+        builder.switch_to(unique)?;
+        let is_unique = builder.push(ScalarOp::Constant(Value::from_i64(1)))?;
+        builder.terminate(Terminator::Jump {
+            target: merge,
+            arguments: smallvec![is_unique],
+        })?;
+
+        builder.switch_to(duplicate)?;
+        let is_duplicate = builder.push(ScalarOp::Constant(Value::from_i64(0)))?;
+        builder.terminate(Terminator::Jump {
+            target: merge,
+            arguments: smallvec![is_duplicate],
+        })?;
+
+        builder.switch_to(merge)?;
+        Ok(result)
+    }
+}
+
+struct ForEachDistinct<Source> {
+    source: Source,
+    collations: SmallVec<[CollationSeq; 4]>,
+    body: BoxedRowConsumer<ValuePack>,
+}
+
+impl<Source> Compile for ForEachDistinct<Source>
+where
+    Source: RowStream<Item = ValuePack>,
+{
+    type Output = ();
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let set = builder.allocate_distinct_set(self.collations)?;
+        builder.push_effect(EffectOp::OpenDistinctSet { set })?;
+        let body = self.body;
+        self.source
+            .for_each_boxed(Box::new(move |pack| {
+                CheckDistinct {
+                    set,
+                    pack: pack.clone(),
+                }
+                .and_then(move |is_unique| when(is_unique, body(pack)))
+                .boxed()
+            }))
+            .compile(builder)
+    }
+}
+
+struct TryFoldDistinct<Source> {
+    source: Source,
+    collations: SmallVec<[CollationSeq; 4]>,
+    initial: BoxedCompile<LoopState>,
+    body: BoxedRowFolder<ValuePack>,
+}
+
+impl<Source> Compile for TryFoldDistinct<Source>
+where
+    Source: RowStream<Item = ValuePack>,
+{
+    type Output = LoopState;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let initial = self.initial.compile(builder)?;
+        let set = builder.allocate_distinct_set(self.collations)?;
+        builder.push_effect(EffectOp::OpenDistinctSet { set })?;
+        let body = self.body;
+        self.source
+            .try_fold_boxed(
+                pure(initial).boxed(),
+                Box::new(move |pack, state| {
+                    CheckDistinct {
+                        set,
+                        pack: pack.clone(),
+                    }
+                    .and_then(move |is_unique| {
+                        pure(is_unique).branch(body(pack, state.clone()), continue_loop(state))
+                    })
+                    .boxed()
+                }),
+            )
+            .compile(builder)
+    }
+}
+
+impl<Source> RowStream for DistinctRows<Source>
+where
+    Source: RowStream<Item = ValuePack>,
+{
+    type Item = ValuePack;
+
+    fn for_each_boxed(self, body: BoxedRowConsumer<Self::Item>) -> BoxedCompile<()> {
+        ForEachDistinct {
+            source: self.source,
+            collations: self.collations,
+            body,
+        }
+        .boxed()
+    }
+
+    fn try_fold_boxed(
+        self,
+        initial: BoxedCompile<LoopState>,
+        body: BoxedRowFolder<Self::Item>,
+    ) -> BoxedCompile<LoopState> {
+        TryFoldDistinct {
+            source: self.source,
+            collations: self.collations,
             initial,
             body,
         }
@@ -4716,6 +5173,79 @@ mod tests {
                 "  return %3\n",
             )
         );
+    }
+
+    #[test]
+    fn row_stream_distinct_checks_projected_packs_before_yielding() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE deduplicated(a,b)", 2).unwrap());
+        let compiler = scan_table(table, 0, 0).and_then(|rows| {
+            rows.map(|row| pack_values(smallvec![row.column(0).boxed(), row.column(1).boxed()]))
+                .distinct(smallvec![CollationSeq::NoCase, CollationSeq::Binary])
+                .for_each(result_row_pack)
+        });
+
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+
+        assert!(rendered.starts_with(concat!(
+            "cursor $0 = btree_table \"deduplicated\" root 2\n",
+            "distinct_set &0 width 2 [NoCase, Binary]\n",
+        )));
+        let open = rendered
+            .find("open_distinct_set &0")
+            .expect("the distinct set must be reset before scanning");
+        let rewind = rendered
+            .find("rewind $0")
+            .expect("the source cursor must be entered");
+        let check = rendered
+            .find("distinct_check &0 [%0, %1]")
+            .expect("the projected pack must be checked as one key");
+        let result = rendered
+            .find("result_row [%0, %1]")
+            .expect("only admitted packs reach the consumer");
+
+        assert!(open < rewind && rewind < check && check < result);
+    }
+
+    #[test]
+    fn verifier_rejects_distinct_keys_with_the_wrong_width() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE deduplicated(a)", 2).unwrap());
+        let compiler = scan_table(table, 0, 0).and_then(|rows| {
+            rows.map(|row| pack_values(smallvec![row.column(0).boxed()]))
+                .distinct(smallvec![CollationSeq::Binary])
+                .for_each(result_row_pack)
+        });
+        let mut ir = compile_effect(compiler).unwrap();
+        ir.distinct_set_resources[0]
+            .collations
+            .push(CollationSeq::NoCase);
+
+        let error = ir.verify().unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("expects key width 2, received 1"));
+    }
+
+    #[test]
+    fn verifier_rejects_distinct_checks_without_a_dominating_open() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE deduplicated(a)", 2).unwrap());
+        let compiler = scan_table(table, 0, 0).and_then(|rows| {
+            rows.map(|row| pack_values(smallvec![row.column(0).boxed()]))
+                .distinct(smallvec![CollationSeq::Binary])
+                .for_each(result_row_pack)
+        });
+        let mut ir = compile_effect(compiler).unwrap();
+        ir.blocks[0].instructions.retain(|instruction| {
+            !matches!(
+                instruction,
+                Instruction::Effect(EffectOp::OpenDistinctSet { .. })
+            )
+        });
+
+        let error = ir.verify().unwrap_err();
+
+        assert!(error.to_string().contains("uses unopened distinct set"));
     }
 
     #[test]
@@ -5880,6 +6410,7 @@ mod tests {
             cursor_input_count: 0,
             cursor_resources: SmallVec::new(),
             sorter_resources: SmallVec::new(),
+            distinct_set_resources: SmallVec::new(),
             parameter_declarations: SmallVec::new(),
         };
 
@@ -5904,6 +6435,7 @@ mod tests {
             cursor_input_count: 0,
             cursor_resources: SmallVec::new(),
             sorter_resources: SmallVec::new(),
+            distinct_set_resources: SmallVec::new(),
             parameter_declarations: SmallVec::new(),
         };
 
@@ -5966,6 +6498,7 @@ mod tests {
             cursor_input_count: 0,
             cursor_resources: SmallVec::new(),
             sorter_resources: SmallVec::new(),
+            distinct_set_resources: SmallVec::new(),
             parameter_declarations: SmallVec::new(),
         };
 
@@ -6077,6 +6610,7 @@ mod tests {
             cursor_input_count: 0,
             cursor_resources: SmallVec::new(),
             sorter_resources: SmallVec::new(),
+            distinct_set_resources: SmallVec::new(),
             parameter_declarations: SmallVec::new(),
         };
 
@@ -6299,6 +6833,36 @@ mod tests {
                 vec![Value::from_text("see"), Value::from_i64(5)],
                 vec![Value::from_text("bee"), Value::from_i64(4)],
                 vec![Value::from_text("lower"), Value::from_i64(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn distinct_table_scan_runs_symbolic_stream_pipeline_through_vdbe() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute("CREATE TABLE deduplicated(key COLLATE NOCASE, payload)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO deduplicated VALUES \
+                 ('A', 1), ('a', 1), ('b', 2), (NULL, 3), (NULL, 3), ('c', 4)",
+            )
+            .unwrap();
+
+        let rows = connection
+            .prepare("SELECT DISTINCT key, payload FROM deduplicated LIMIT 2 OFFSET 1")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::from_text("b"), Value::from_i64(2)],
+                vec![Value::Null, Value::from_i64(3)],
             ]
         );
     }
