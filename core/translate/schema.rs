@@ -35,93 +35,6 @@ use turso_ext::VTabKind;
 use turso_parser::ast;
 use turso_parser::ast::ColumnDefinition;
 
-/// Validate a CHECK constraint expression at CREATE TABLE / ALTER TABLE ADD COLUMN time.
-/// Rejects non-existent columns, non-existent functions, aggregates, window functions,
-/// bind parameters, and subqueries.
-pub(crate) fn validate_check_expr(
-    expr: &ast::Expr,
-    table_name: &str,
-    column_names: &[&str],
-    resolver: &Resolver,
-) -> Result<()> {
-    let normalized_table = normalize_ident(table_name);
-    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-        match e {
-            ast::Expr::Id(name) | ast::Expr::Name(name) => {
-                let n = normalize_ident(name.as_str());
-                if !column_names.iter().any(|c| normalize_ident(c) == n)
-                    && !ROWID_STRS.iter().any(|r| r.eq_ignore_ascii_case(&n))
-                {
-                    bail_parse_error!("no such column: {}", name.as_str());
-                }
-            }
-            ast::Expr::Qualified(tbl, col) => {
-                if normalize_ident(tbl.as_str()) != normalized_table {
-                    bail_parse_error!("no such column: {}.{}", tbl.as_str(), col.as_str());
-                }
-                let cn = normalize_ident(col.as_str());
-                if !column_names.iter().any(|c| normalize_ident(c) == cn)
-                    && !ROWID_STRS.iter().any(|r| r.eq_ignore_ascii_case(&cn))
-                {
-                    bail_parse_error!("no such column: {}", col.as_str());
-                }
-            }
-            ast::Expr::DoublyQualified(db, tbl, col) => {
-                bail_parse_error!(
-                    "no such column: {}.{}.{}",
-                    db.as_str(),
-                    tbl.as_str(),
-                    col.as_str()
-                );
-            }
-            ast::Expr::FunctionCall {
-                name,
-                args,
-                filter_over,
-                ..
-            } => {
-                if filter_over.over_clause.is_some() {
-                    bail_parse_error!("misuse of window function {}()", name.as_str());
-                }
-                if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
-                    if matches!(func, Func::Agg(..)) {
-                        bail_parse_error!("misuse of aggregate function {}()", name.as_str());
-                    }
-                    if matches!(func, Func::Window(..)) {
-                        bail_parse_error!("misuse of window function {}()", name.as_str());
-                    }
-                } else {
-                    bail_parse_error!("no such function: {}", name.as_str());
-                }
-            }
-            ast::Expr::FunctionCallStar { name, filter_over } => {
-                if filter_over.over_clause.is_some() {
-                    bail_parse_error!("misuse of window function {}()", name.as_str());
-                }
-                if let Some(func) = resolver.resolve_function(name.as_str(), 0)? {
-                    if matches!(func, Func::Agg(..)) {
-                        bail_parse_error!("misuse of aggregate function {}()", name.as_str());
-                    }
-                    if matches!(func, Func::Window(..)) {
-                        bail_parse_error!("misuse of window function {}()", name.as_str());
-                    }
-                } else {
-                    bail_parse_error!("no such function: {}", name.as_str());
-                }
-            }
-            ast::Expr::Variable(_) => {
-                bail_parse_error!("parameters prohibited in CHECK constraints");
-            }
-            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
-                bail_parse_error!("subqueries prohibited in CHECK constraints");
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(())
-}
-
 fn validate_default_expr(expr: &ast::Expr, col: &ColumnDefinition) -> Result<()> {
     walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         match e {
@@ -739,7 +652,12 @@ fn validate(
             for constraint in &col_i.constraints {
                 match &constraint.constraint {
                     ast::ColumnConstraint::Check(expr) => {
-                        validate_check_expr(expr, table_name, &column_names, resolver)?;
+                        crate::translate::bind::bind_check_constraint(
+                            expr,
+                            table_name,
+                            &column_names,
+                            resolver,
+                        )?;
                     }
                     ast::ColumnConstraint::Generated { .. }
                         if !conn.experimental_generated_columns_enabled() =>
@@ -776,7 +694,12 @@ fn validate(
         }
         for constraint in constraints {
             if let ast::TableConstraint::Check(ref expr) = constraint.constraint {
-                validate_check_expr(expr, table_name, &column_names, resolver)?;
+                crate::translate::bind::bind_check_constraint(
+                    expr,
+                    table_name,
+                    &column_names,
+                    resolver,
+                )?;
             }
         }
 

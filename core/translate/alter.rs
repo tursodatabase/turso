@@ -6,10 +6,7 @@ use turso_parser::{
     parser::Parser,
 };
 
-use super::{
-    schema::{validate_check_expr, SQLITE_TABLEID},
-    update::translate_update_for_schema_change,
-};
+use super::{schema::SQLITE_TABLEID, update::translate_update_for_schema_change};
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
@@ -1365,7 +1362,12 @@ pub fn translate_alter_table(
                             .iter()
                             .filter_map(|c| c.name.as_deref())
                             .collect();
-                        validate_check_expr(expr, &btree.name, &column_names, resolver)?;
+                        crate::translate::bind::bind_check_constraint(
+                            expr,
+                            &btree.name,
+                            &column_names,
+                            resolver,
+                        )?;
                         btree.check_constraints.push(CheckConstraint::new(
                             constraint.name.as_ref(),
                             expr,

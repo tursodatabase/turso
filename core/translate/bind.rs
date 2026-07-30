@@ -208,6 +208,101 @@ pub fn bind_index_columns(
     Ok(bound)
 }
 
+/// Bind and validate a CHECK constraint against its table columns.
+pub(crate) fn bind_check_constraint(
+    expr: &ast::Expr,
+    table_name: &str,
+    column_names: &[&str],
+    resolver: &Resolver,
+) -> Result<()> {
+    let normalized_table = normalize_ident(table_name);
+    walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        match expr {
+            ast::Expr::Id(name) | ast::Expr::Name(name) => {
+                let normalized_name = normalize_ident(name.as_str());
+                if !column_names
+                    .iter()
+                    .any(|column| normalize_ident(column) == normalized_name)
+                    && !super::planner::ROWID_STRS
+                        .iter()
+                        .any(|rowid| rowid.eq_ignore_ascii_case(&normalized_name))
+                {
+                    crate::bail_parse_error!("no such column: {}", name.as_str());
+                }
+            }
+            ast::Expr::Qualified(table, column) => {
+                if normalize_ident(table.as_str()) != normalized_table {
+                    crate::bail_parse_error!(
+                        "no such column: {}.{}",
+                        table.as_str(),
+                        column.as_str()
+                    );
+                }
+                let column_name = normalize_ident(column.as_str());
+                if !column_names
+                    .iter()
+                    .any(|column| normalize_ident(column) == column_name)
+                    && !super::planner::ROWID_STRS
+                        .iter()
+                        .any(|rowid| rowid.eq_ignore_ascii_case(&column_name))
+                {
+                    crate::bail_parse_error!("no such column: {}", column.as_str());
+                }
+            }
+            ast::Expr::DoublyQualified(database, table, column) => {
+                crate::bail_parse_error!(
+                    "no such column: {}.{}.{}",
+                    database.as_str(),
+                    table.as_str(),
+                    column.as_str()
+                );
+            }
+            ast::Expr::FunctionCall {
+                name,
+                args,
+                filter_over,
+                ..
+            } => {
+                if filter_over.over_clause.is_some() {
+                    crate::bail_parse_error!("misuse of window function {}()", name.as_str());
+                }
+                let Some(function) = resolver.resolve_function(name.as_str(), args.len())? else {
+                    crate::bail_parse_error!("no such function: {}", name.as_str());
+                };
+                if matches!(function, Func::Agg(..)) {
+                    crate::bail_parse_error!("misuse of aggregate function {}()", name.as_str());
+                }
+                if matches!(function, Func::Window(..)) {
+                    crate::bail_parse_error!("misuse of window function {}()", name.as_str());
+                }
+            }
+            ast::Expr::FunctionCallStar { name, filter_over } => {
+                if filter_over.over_clause.is_some() {
+                    crate::bail_parse_error!("misuse of window function {}()", name.as_str());
+                }
+                let Some(function) = resolver.resolve_function(name.as_str(), 0)? else {
+                    crate::bail_parse_error!("no such function: {}", name.as_str());
+                };
+                if matches!(function, Func::Agg(..)) {
+                    crate::bail_parse_error!("misuse of aggregate function {}()", name.as_str());
+                }
+                if matches!(function, Func::Window(..)) {
+                    crate::bail_parse_error!("misuse of window function {}()", name.as_str());
+                }
+            }
+            ast::Expr::Variable(_) => {
+                crate::bail_parse_error!("parameters prohibited in CHECK constraints");
+            }
+            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
+                crate::bail_parse_error!("subqueries prohibited in CHECK constraints");
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
 fn extract_index_collation<'a>(
     expr: &'a ast::Expr,
     resolver: Option<&Resolver>,
