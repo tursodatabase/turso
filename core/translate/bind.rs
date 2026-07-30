@@ -191,6 +191,78 @@ fn first_unbound_identifier(expr: &ast::Expr) -> Option<String> {
     found
 }
 
+pub struct LogicalScopeColumn<'a> {
+    pub name: &'a str,
+    pub database: Option<&'a str>,
+    pub table: Option<&'a str>,
+    pub table_alias: Option<&'a str>,
+}
+
+pub struct BoundLogicalColumn {
+    pub name: String,
+    pub table: Option<String>,
+}
+
+/// Bind a raw logical-planner column expression against its input schema.
+pub fn bind_logical_column<'a>(
+    expr: &ast::Expr,
+    columns: impl IntoIterator<Item = LogicalScopeColumn<'a>>,
+) -> Result<Option<BoundLogicalColumn>> {
+    let (database, table, column) = match expr {
+        ast::Expr::Id(column) | ast::Expr::Name(column) => (None, None, column.as_str()),
+        ast::Expr::Qualified(table, column) => (None, Some(table.as_str()), column.as_str()),
+        ast::Expr::DoublyQualified(database, table, column) => (
+            Some(database.as_str()),
+            Some(table.as_str()),
+            column.as_str(),
+        ),
+        _ => return Ok(None),
+    };
+
+    let mut matches = columns
+        .into_iter()
+        .filter(|candidate| candidate.name.eq_ignore_ascii_case(column))
+        .filter(|candidate| {
+            let table_matches = table.is_none_or(|table| {
+                candidate
+                    .table_alias
+                    .is_some_and(|alias| alias.eq_ignore_ascii_case(table))
+                    || candidate
+                        .table
+                        .is_some_and(|name| name.eq_ignore_ascii_case(table))
+            });
+            let database_matches = database.is_none_or(|database| {
+                candidate
+                    .database
+                    .is_some_and(|name| name.eq_ignore_ascii_case(database))
+            });
+            table_matches && database_matches
+        });
+    let Some(bound) = matches.next() else {
+        let name = match (database, table) {
+            (Some(database), Some(table)) => format!("{database}.{table}.{column}"),
+            (None, Some(table)) => format!("{table}.{column}"),
+            _ => column.to_string(),
+        };
+        crate::bail_parse_error!("no such column: {}", name);
+    };
+    if matches.next().is_some() {
+        crate::bail_parse_error!("ambiguous column name: {}", column);
+    }
+
+    let table = if let (Some(database), Some(table)) = (bound.database, bound.table) {
+        Some(format!("{database}.{table}"))
+    } else if let Some(alias) = bound.table_alias {
+        Some(alias.to_string())
+    } else {
+        bound.table.map(str::to_string)
+    };
+    Ok(Some(BoundLogicalColumn {
+        name: bound.name.to_string(),
+        table,
+    }))
+}
+
 fn bind_table_index_expressions(
     resolver: &Resolver,
     database_id: usize,
