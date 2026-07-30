@@ -368,3 +368,46 @@ fn test_alter_column_collation_change_rebuilds_index() {
         conn.close().unwrap();
     }
 }
+
+/// A second connection to the same database must see the new column
+/// definition after an ALTER COLUMN commits: the schema cookie bump makes it
+/// re-parse the schema, so the new default and check constraints apply to its
+/// writes too.
+#[test]
+fn test_alter_column_visible_to_other_connection() {
+    let path = TempDir::new()
+        .unwrap()
+        .keep()
+        .join("alter_col_other_conn.db");
+
+    let db = TempDatabase::new_with_existent(&path);
+    let conn1 = db.connect_limbo();
+    let conn2 = db.connect_limbo();
+
+    conn1
+        .execute("CREATE TABLE t (a INTEGER, b TEXT)")
+        .unwrap();
+    conn2.execute("INSERT INTO t (a) VALUES (1)").unwrap();
+
+    conn1
+        .execute("ALTER TABLE t ALTER COLUMN b TO b TEXT DEFAULT 'd' CHECK (b != 'bad')")
+        .unwrap();
+
+    conn2.execute("DELETE FROM t").unwrap();
+    conn2.execute("INSERT INTO t (a) VALUES (2)").unwrap();
+    let rows: Vec<(i64, String)> = conn2.exec_rows("SELECT a, b FROM t");
+    assert_eq!(
+        rows,
+        vec![(2, "d".into())],
+        "second connection must apply the new default"
+    );
+
+    let err = conn2.execute("INSERT INTO t (a, b) VALUES (3, 'bad')");
+    assert!(
+        err.is_err(),
+        "second connection must enforce the new CHECK constraint"
+    );
+
+    conn1.close().unwrap();
+    conn2.close().unwrap();
+}

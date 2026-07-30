@@ -1372,3 +1372,79 @@ test fail-alter-column-keeps-table-level-fk {
 }
 expect error {
 }
+
+# WITHOUT ROWID: the PRIMARY KEY is the table itself; altering a PK
+# column would strip or reorder it. Must be rejected.
+test fail-alter-column-without-rowid-pk-member {
+    CREATE TABLE w (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+    ALTER TABLE w ALTER COLUMN k TO k INTEGER;
+}
+expect error {
+}
+
+# WITHOUT ROWID: the row rewrite machinery is rowid-based, so a type
+# change that must rewrite rows is rejected instead of leaving the
+# schema claiming a type the rows do not have.
+test fail-alter-column-without-rowid-type-change {
+    CREATE TABLE w (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+    INSERT INTO w VALUES ('a', '1');
+    ALTER TABLE w ALTER COLUMN v TO v INTEGER;
+}
+expect error {
+}
+
+# WITHOUT ROWID: metadata-only changes still work.
+test alter-column-without-rowid-default-change {
+    CREATE TABLE w (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+    ALTER TABLE w ALTER COLUMN v TO v TEXT DEFAULT 'd';
+    INSERT INTO w (k) VALUES ('a');
+    SELECT k, v FROM w;
+}
+expect {
+    a|d
+}
+
+# WITHOUT ROWID: the NOT NULL validation scan works.
+test fail-alter-column-without-rowid-notnull-with-nulls {
+    CREATE TABLE w (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+    INSERT INTO w (k) VALUES ('a');
+    ALTER TABLE w ALTER COLUMN v TO v TEXT NOT NULL;
+}
+expect error {
+}
+
+# ROLLBACK restores both the schema and the pre-ALTER row data.
+test alter-column-rollback-restores-schema-and-data {
+    CREATE TABLE t (x INT);
+    INSERT INTO t VALUES (1);
+    BEGIN;
+    ALTER TABLE t ALTER COLUMN x TO x TEXT;
+    ROLLBACK;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT x, typeof(x) FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE TABLE t (x INT)
+    1|integer
+    ok
+}
+
+test fail-alter-column-sqlite-schema-protected {
+    ALTER TABLE sqlite_schema ALTER COLUMN name TO name2 TEXT;
+}
+expect error {
+}
+
+# Empty table: pure metadata change, no rewrite needed.
+test alter-column-empty-table {
+    CREATE TABLE t (x TEXT);
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER DEFAULT 5;
+    INSERT INTO t VALUES ('9');
+    INSERT INTO t (rowid) VALUES (5);
+    SELECT x, typeof(x) FROM t ORDER BY rowid;
+}
+expect {
+    9|integer
+    5|integer
+}

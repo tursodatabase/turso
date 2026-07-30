@@ -1903,6 +1903,28 @@ pub fn translate_alter_table(
                     )
                 }
             };
+            if !rename && !btree.has_rowid {
+                let alters_pk_column = btree.columns()[column_index].primary_key()
+                    || btree
+                        .primary_key_columns
+                        .iter()
+                        .any(|(name, _)| normalize_ident(name) == normalize_ident(from));
+                if alters_pk_column {
+                    return Err(LimboError::ParseError(
+                        "cannot alter a PRIMARY KEY column of a WITHOUT ROWID table".to_string(),
+                    ));
+                }
+                // The row rewrite and index refill machinery is rowid-based.
+                // Reject instead of leaving the schema claiming a type or
+                // collation the stored rows do not have.
+                if rewrites_physical_layout || collation_changed {
+                    return Err(LimboError::ParseError(
+                        "ALTER COLUMN cannot change the type or collation of a WITHOUT ROWID table column"
+                            .to_string(),
+                    ));
+                }
+            }
+
             let clears_autoincrement_sequence = !rename
                 && btree.has_autoincrement
                 && btree.columns()[column_index].is_rowid_alias()
