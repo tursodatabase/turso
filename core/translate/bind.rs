@@ -2340,7 +2340,9 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     return Ok(());
                 }
 
-                if id.quoted_with('"') {
+                // SQLite DQS misfeature: double-quoted identifiers fall back
+                // to string literals only when DQS is enabled.
+                if id.quoted_with('"') && self.resolver.dqs_dml.is_enabled() {
                     *expr = ast::Expr::Literal(ast::Literal::String(id.as_literal()));
                 } else if self.allow_unbound {
                     // Leave as-is (e.g. EXCLUDED pseudo-table refs in UPSERT)

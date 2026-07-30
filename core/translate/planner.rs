@@ -2031,6 +2031,15 @@ pub fn fold_join_constraints(
             .is_some_and(|j| j.is_outer());
         let outer_table_id = table_references.joined_tables()[actual_table_idx].internal_id;
 
+        // NATURAL joins were rewritten to USING by the binder, but the
+        // operator still carries the flag. SQLite does not use HIDDEN columns
+        // for NATURAL joins, so natural-derived USING lookups must skip them
+        // on the left side (explicit USING may match hidden columns).
+        let natural = matches!(
+            &join.operator,
+            ast::JoinOperator::TypedJoin(Some(jt)) if jt.contains(JoinType::NATURAL)
+        );
+
         match &join.constraint {
             Some(ast::JoinConstraint::On(expr)) => {
                 let start_idx = out_where_clause.len();
@@ -2069,6 +2078,7 @@ pub fn fold_join_constraints(
                                 .columns()
                                 .iter()
                                 .enumerate()
+                                .filter(|(_, col)| !natural || !col.hidden())
                                 .find(|(_, col)| {
                                     col.name.as_deref().is_some_and(|name| {
                                         name.eq_ignore_ascii_case(&name_normalized)
