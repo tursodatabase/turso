@@ -3240,7 +3240,6 @@ mod tests {
         time::Duration,
     };
     use tempfile::NamedTempFile;
-    use turso_core::SqliteDialect;
 
     #[test]
     fn explicit_override_wins_over_persisted_protocol() {
