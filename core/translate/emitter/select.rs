@@ -9,9 +9,10 @@ use crate::{
         compiler::{
             compile_effect, cursor_input, cursor_values, insert_index_pack, literal_values,
             pack_values, result_row_pack, scan_index, scan_table, seek_in_values, seek_index,
-            seek_rowid, seek_table_range, select_pack, BoxedCompile, Compile, CursorInputId,
-            DeferredIndexBound, DeferredIndexRange, DeferredTableBound, DeferredTableRange,
-            IrProgram, Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId, ValuePack,
+            seek_rowid, seek_table_range, select_pack, BoxedCompile, Compile, CursorId,
+            CursorInputId, DeferredIndexBound, DeferredIndexRange, DeferredTableBound,
+            DeferredTableRange, Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId,
+            ValuePack,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -160,10 +161,18 @@ enum DeclarativeSelectOutcome {
     Consumed,
 }
 
+enum DeclarativeSelectDestination {
+    ResultRows,
+    EphemeralIndex {
+        index_name: String,
+        affinity: Option<String>,
+    },
+}
+
 enum DeclarativePackSink {
     ResultRows,
     EphemeralIndex {
-        input: CursorInputId,
+        cursor: CursorId,
         index_name: String,
         affinity: Option<String>,
     },
@@ -174,12 +183,10 @@ impl DeclarativePackSink {
         match self {
             Self::ResultRows => result_row_pack(pack).boxed(),
             Self::EphemeralIndex {
-                input,
+                cursor,
                 index_name,
                 affinity,
-            } => cursor_input(input)
-                .and_then(move |cursor| insert_index_pack(cursor, pack, index_name, affinity))
-                .boxed(),
+            } => insert_index_pack(cursor, pack, index_name, affinity).boxed(),
         }
     }
 }
@@ -223,8 +230,8 @@ fn try_emit_declarative_table_scan(
         return Ok(None);
     }
 
-    let (sink, destination_cursor) = match &plan.query_destination {
-        QueryDestination::ResultRows => (DeclarativePackSink::ResultRows, None),
+    let (destination, destination_cursor) = match &plan.query_destination {
+        QueryDestination::ResultRows => (DeclarativeSelectDestination::ResultRows, None),
         // The first producer migration covers the identity-shaped index used by
         // scalar IN subqueries. Wider/reordered keys and generated rowids retain
         // the eager destination code until those policies are explicit IR data.
@@ -240,8 +247,7 @@ fn try_emit_declarative_table_scan(
             && index.columns[0].pos_in_table == 0 =>
         {
             (
-                DeclarativePackSink::EphemeralIndex {
-                    input: CursorInputId::new(0),
+                DeclarativeSelectDestination::EphemeralIndex {
                     index_name: index.name.clone(),
                     affinity: affinity_str.as_ref().map(|value| (**value).clone()),
                 },
@@ -635,26 +641,26 @@ fn try_emit_declarative_table_scan(
         distinct_collations,
         slice: DeclarativeSlice { limit, offset },
     };
-    let ir = match access {
-        DeclarativeBtreeAccess::RowidEq(_) => body.compile(
+    let compiler = match access {
+        DeclarativeBtreeAccess::RowidEq(_) => body.into_compiler(
             seek_rowid(
                 table,
                 database_id,
                 schema_cookie,
                 rowid_eq.expect("rowid equality access must compile a key"),
             ),
-            sink,
+            destination,
         ),
-        DeclarativeBtreeAccess::TableRange { .. } => body.compile(
+        DeclarativeBtreeAccess::TableRange { .. } => body.into_compiler(
             seek_table_range(
                 table,
                 database_id,
                 schema_cookie,
                 table_range.expect("table range access must compile a range"),
             ),
-            sink,
+            destination,
         ),
-        DeclarativeBtreeAccess::IndexRange { index, .. } => body.compile(
+        DeclarativeBtreeAccess::IndexRange { index, .. } => body.into_compiler(
             seek_index(
                 table,
                 index.clone(),
@@ -663,9 +669,9 @@ fn try_emit_declarative_table_scan(
                 schema_cookie,
                 index_range.expect("index range access must compile a range"),
             ),
-            sink,
+            destination,
         ),
-        DeclarativeBtreeAccess::InValues { index, .. } => body.compile(
+        DeclarativeBtreeAccess::InValues { index, .. } => body.into_compiler(
             seek_in_values(
                 table,
                 index.cloned(),
@@ -674,11 +680,11 @@ fn try_emit_declarative_table_scan(
                 schema_cookie,
                 in_values.expect("IN access must compile its value source"),
             ),
-            sink,
+            destination,
         ),
         DeclarativeBtreeAccess::Scan {
             index: Some(index), ..
-        } => body.compile(
+        } => body.into_compiler(
             scan_index(
                 table,
                 index.clone(),
@@ -687,13 +693,14 @@ fn try_emit_declarative_table_scan(
                 schema_cookie,
                 direction,
             ),
-            sink,
+            destination,
         ),
-        DeclarativeBtreeAccess::Scan { index: None, .. } => body.compile(
+        DeclarativeBtreeAccess::Scan { index: None, .. } => body.into_compiler(
             scan_table(table, database_id, schema_cookie, direction),
-            sink,
+            destination,
         ),
-    }?;
+    };
+    let ir = compile_effect(compiler)?;
     let target_register = program.alloc_register();
     let lowered = if let Some((cursor_id, subquery_id)) = external_in_cursor {
         emit_non_from_clause_subqueries_for_eval_at(
@@ -749,9 +756,44 @@ struct DeclarativeSelectBody {
 }
 
 impl DeclarativeSelectBody {
-    fn compile<Scan, Rows>(self, scan: Scan, sink: DeclarativePackSink) -> Result<IrProgram>
+    fn into_compiler<Scan, Rows>(
+        self,
+        scan: Scan,
+        destination: DeclarativeSelectDestination,
+    ) -> BoxedCompile<()>
     where
-        Scan: Compile<Output = Rows>,
+        Scan: Compile<Output = Rows> + 'static,
+        Rows: RowStream<Item = Row> + 'static,
+    {
+        match destination {
+            DeclarativeSelectDestination::ResultRows => {
+                self.with_sink(scan, DeclarativePackSink::ResultRows)
+            }
+            DeclarativeSelectDestination::EphemeralIndex {
+                index_name,
+                affinity,
+            } => {
+                // The description owns only a symbolic input slot. Its physical
+                // destination cursor is not selected until lowering.
+                cursor_input(CursorInputId::new(0))
+                    .and_then(move |cursor| {
+                        self.with_sink(
+                            scan,
+                            DeclarativePackSink::EphemeralIndex {
+                                cursor,
+                                index_name,
+                                affinity,
+                            },
+                        )
+                    })
+                    .boxed()
+            }
+        }
+    }
+
+    fn with_sink<Scan, Rows>(self, scan: Scan, sink: DeclarativePackSink) -> BoxedCompile<()>
+    where
+        Scan: Compile<Output = Rows> + 'static,
         Rows: RowStream<Item = Row> + 'static,
     {
         let Self {
@@ -764,7 +806,7 @@ impl DeclarativeSelectBody {
             slice,
         } = self;
         let terminal = DeclarativeTerminal { slice, sink };
-        compile_effect(scan.and_then(move |rows| {
+        scan.and_then(move |rows| {
             if predicates.is_empty() {
                 compile_declarative_rows(
                     rows,
@@ -786,7 +828,8 @@ impl DeclarativeSelectBody {
                     terminal,
                 )
             }
-        }))
+        })
+        .boxed()
     }
 }
 
