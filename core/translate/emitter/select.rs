@@ -7,12 +7,12 @@ use crate::{
         aggregation::emit_ungrouped_aggregation,
         collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         compiler::{
-            bind_cursor_input, compile_effect, cursor_input, cursor_values,
+            bind_cursor_input, bind_input, compile_effect, cursor_input, cursor_values,
             declare_ephemeral_index, initialize_cursor_once, insert_index_pack, literal_values,
             open_declared_ephemeral_index, open_ephemeral_index, pack_values, result_row_pack,
             scan_index, scan_table, seek_in_values, seek_index, seek_rowid, seek_table_range,
             select_pack, BoxedCompile, Compile, CursorId, CursorInputId, DeferredIndexBound,
-            DeferredIndexRange, DeferredTableBound, DeferredTableRange, Row, RowStream,
+            DeferredIndexRange, DeferredTableBound, DeferredTableRange, InputId, Row, RowStream,
             ScanDirection, SortKey, SortedRow, ValueId, ValuePack,
         },
         emitter::{
@@ -163,11 +163,17 @@ enum DeclarativeSelectOutcome {
 }
 
 struct DeclarativeSelectProgram {
-    compiler: BoxedCompile<()>,
+    compiler: DeclarativeSelectCompiler,
     destination_cursor: Option<DeclarativeCursorBinding>,
     destination_index: Option<Arc<Index>>,
     external_in_cursor: Option<DeclarativeInCursor>,
+    external_exists: Option<DeclarativeExistsInput>,
     result_column_count: usize,
+}
+
+enum DeclarativeSelectCompiler {
+    Effect(BoxedCompile<()>),
+    Scalar(BoxedCompile<ValueId>),
 }
 
 #[derive(Clone, Copy)]
@@ -182,8 +188,15 @@ struct DeclarativeInCursor {
     subquery_id: TableInternalId,
 }
 
+#[derive(Clone, Copy)]
+struct DeclarativeExistsInput {
+    input: InputId,
+    subquery_id: TableInternalId,
+}
+
 enum DeclarativeSelectDestination {
     ResultRows,
+    Exists,
     EphemeralIndex {
         input: CursorInputId,
         index_name: String,
@@ -198,6 +211,24 @@ enum DeclarativePackSink {
         index_name: String,
         affinity: Option<String>,
     },
+}
+
+fn direct_exists_subquery(expr: &Expr) -> Option<TableInternalId> {
+    match expr {
+        Expr::Parenthesized(expressions) => {
+            let [expression] = expressions.as_slice() else {
+                return None;
+            };
+            direct_exists_subquery(expression)
+        }
+        Expr::SubqueryResult {
+            subquery_id,
+            lhs: None,
+            not_in: false,
+            query_type: SubqueryType::Exists { .. },
+        } => Some(*subquery_id),
+        _ => None,
+    }
 }
 
 impl DeclarativePackSink {
@@ -250,13 +281,24 @@ fn try_emit_declarative_table_scan(
         compilation,
         program.is_nested(),
     )?;
+    compilation =
+        compose_declarative_exists_subquery(program.get_query_mode(), resolver, plan, compilation)?;
     let DeclarativeSelectProgram {
         compiler,
         destination_cursor,
         destination_index: _,
         external_in_cursor,
+        external_exists,
         result_column_count,
     } = compilation;
+    if external_exists.is_some() {
+        return Ok(None);
+    }
+    let DeclarativeSelectCompiler::Effect(compiler) = compiler else {
+        return Err(LimboError::InternalError(
+            "top-level declarative SELECT produced a scalar compiler".to_owned(),
+        ));
+    };
     let ir = compile_effect(compiler)?;
     let target_register = program.alloc_register();
     if let Some(external) = external_in_cursor {
@@ -367,7 +409,8 @@ fn compose_declarative_in_subquery(
             inner,
             initialize_once,
         )?;
-        if inner.external_in_cursor.is_some() {
+        let inner = compose_declarative_exists_subquery(query_mode, resolver, select_plan, inner)?;
+        if inner.external_in_cursor.is_some() || inner.external_exists.is_some() {
             return Ok(outer);
         }
         (
@@ -380,26 +423,30 @@ fn compose_declarative_in_subquery(
 
     let outer_input = external.binding.input;
     let producer_input = inner_destination.input;
-    let producer = inner.compiler;
-    let consumer = outer.compiler;
-    let compiler = if initialize_once {
-        declare_ephemeral_index(index)
-            .and_then(move |unopened| {
-                initialize_cursor_once(open_declared_ephemeral_index(unopened).and_then(
-                    move |cursor| {
-                        bind_cursor_input(producer_input, cursor, producer).map(move |()| cursor)
-                    },
-                ))
-                .and_then(move |cursor| bind_cursor_input(outer_input, cursor, consumer))
-            })
-            .boxed()
-    } else {
-        open_ephemeral_index(index)
-            .and_then(move |cursor| {
-                bind_cursor_input(producer_input, cursor, producer)
-                    .and_then(move |()| bind_cursor_input(outer_input, cursor, consumer))
-            })
-            .boxed()
+    let DeclarativeSelectCompiler::Effect(producer) = inner.compiler else {
+        return Ok(outer);
+    };
+    let compiler = match outer.compiler {
+        DeclarativeSelectCompiler::Effect(consumer) => {
+            DeclarativeSelectCompiler::Effect(compose_declarative_in_compiler(
+                index,
+                producer_input,
+                outer_input,
+                producer,
+                consumer,
+                initialize_once,
+            ))
+        }
+        DeclarativeSelectCompiler::Scalar(consumer) => {
+            DeclarativeSelectCompiler::Scalar(compose_declarative_in_compiler(
+                index,
+                producer_input,
+                outer_input,
+                producer,
+                consumer,
+                initialize_once,
+            ))
+        }
     };
 
     let subquery = &mut plan.non_from_clause_subqueries[subquery_index];
@@ -412,6 +459,113 @@ fn compose_declarative_in_subquery(
         destination_cursor: outer.destination_cursor,
         destination_index: outer.destination_index,
         external_in_cursor: None,
+        external_exists: outer.external_exists,
+        result_column_count: outer.result_column_count,
+    })
+}
+
+fn compose_declarative_in_compiler<Output: 'static>(
+    index: Arc<Index>,
+    producer_input: CursorInputId,
+    consumer_input: CursorInputId,
+    producer: BoxedCompile<()>,
+    consumer: BoxedCompile<Output>,
+    initialize_once: bool,
+) -> BoxedCompile<Output> {
+    if initialize_once {
+        declare_ephemeral_index(index)
+            .and_then(move |unopened| {
+                initialize_cursor_once(open_declared_ephemeral_index(unopened).and_then(
+                    move |cursor| {
+                        bind_cursor_input(producer_input, cursor, producer).map(move |()| cursor)
+                    },
+                ))
+                .and_then(move |cursor| bind_cursor_input(consumer_input, cursor, consumer))
+            })
+            .boxed()
+    } else {
+        open_ephemeral_index(index)
+            .and_then(move |cursor| {
+                bind_cursor_input(producer_input, cursor, producer)
+                    .and_then(move |()| bind_cursor_input(consumer_input, cursor, consumer))
+            })
+            .boxed()
+    }
+}
+
+fn compose_declarative_exists_subquery(
+    query_mode: QueryMode,
+    resolver: &Resolver,
+    plan: &mut SelectPlan,
+    outer: DeclarativeSelectProgram,
+) -> Result<DeclarativeSelectProgram> {
+    let Some(external) = outer.external_exists else {
+        return Ok(outer);
+    };
+    let Some(subquery_index) = plan
+        .non_from_clause_subqueries
+        .iter()
+        .position(|subquery| subquery.internal_id == external.subquery_id)
+    else {
+        return Err(LimboError::InternalError(format!(
+            "declarative EXISTS references missing subquery {:?}",
+            external.subquery_id
+        )));
+    };
+    let (inner, inner_table_references) = {
+        let subquery = &mut plan.non_from_clause_subqueries[subquery_index];
+        let SubqueryState::Unevaluated {
+            plan: Some(subquery_plan),
+        } = &mut subquery.state
+        else {
+            return Err(LimboError::InternalError(format!(
+                "declarative EXISTS subquery {:?} has no unevaluated plan",
+                external.subquery_id
+            )));
+        };
+        let Plan::Select(select_plan) = subquery_plan.as_mut() else {
+            return Ok(outer);
+        };
+        let Some(inner) = try_compile_declarative_table_scan(query_mode, resolver, select_plan)?
+        else {
+            return Ok(outer);
+        };
+        let inner =
+            compose_declarative_in_subquery(query_mode, resolver, select_plan, inner, false)?;
+        let inner = compose_declarative_exists_subquery(query_mode, resolver, select_plan, inner)?;
+        if inner.external_in_cursor.is_some() || inner.external_exists.is_some() {
+            return Ok(outer);
+        }
+        (inner, select_plan.table_references.clone())
+    };
+
+    let DeclarativeSelectCompiler::Scalar(producer) = inner.compiler else {
+        return Ok(outer);
+    };
+    let compiler = match outer.compiler {
+        DeclarativeSelectCompiler::Effect(consumer) => DeclarativeSelectCompiler::Effect(
+            producer
+                .and_then(move |exists| bind_input(external.input, exists, consumer))
+                .boxed(),
+        ),
+        DeclarativeSelectCompiler::Scalar(consumer) => DeclarativeSelectCompiler::Scalar(
+            producer
+                .and_then(move |exists| bind_input(external.input, exists, consumer))
+                .boxed(),
+        ),
+    };
+
+    let subquery = &mut plan.non_from_clause_subqueries[subquery_index];
+    assert_eq!(subquery.internal_id, external.subquery_id);
+    drop(subquery.consume_plan(EvalAt::BeforeLoop));
+    plan.table_references.extend(inner_table_references);
+
+    Ok(DeclarativeSelectProgram {
+        compiler,
+        destination_cursor: outer.destination_cursor,
+        destination_index: outer.destination_index,
+        external_in_cursor: outer.external_in_cursor,
+        external_exists: None,
         result_column_count: outer.result_column_count,
     })
 }
@@ -438,6 +592,11 @@ fn try_compile_declarative_table_scan(
     let destination_input = CursorInputId::new(0);
     let (destination, destination_cursor, destination_index) = match &plan.query_destination {
         QueryDestination::ResultRows => (DeclarativeSelectDestination::ResultRows, None, None),
+        QueryDestination::ExistsSubqueryResult { .. }
+            if matches!(plan.distinctness, Distinctness::NonDistinct) =>
+        {
+            (DeclarativeSelectDestination::Exists, None, None)
+        }
         // The first producer migration covers the identity-shaped index used by
         // scalar IN subqueries. Wider/reordered keys and generated rowids retain
         // the eager destination code until those policies are explicit IR data.
@@ -534,6 +693,44 @@ fn try_compile_declarative_table_scan(
         },
         _ => return Ok(None),
     };
+    let external_exists = if plan.non_from_clause_subqueries.is_empty() {
+        None
+    } else {
+        let [subquery] = plan.non_from_clause_subqueries.as_slice() else {
+            return Ok(None);
+        };
+        if !matches!(subquery.query_type, SubqueryType::Exists { .. }) {
+            None
+        } else {
+            let Some(predicate) = plan
+                .where_clause
+                .iter()
+                .filter(|predicate| !predicate.consumed)
+                .find(|predicate| {
+                    direct_exists_subquery(&predicate.expr) == Some(subquery.internal_id)
+                })
+            else {
+                return Ok(None);
+            };
+            if predicate.from_outer_join.is_some()
+                || subquery.correlated
+                || subquery.eval_phase != SubqueryEvalPhase::BeforeLoop
+                || !matches!(
+                    &subquery.state,
+                    SubqueryState::Unevaluated { plan: Some(_) }
+                )
+                || !matches!(subquery.query_type, SubqueryType::Exists { .. })
+                || subquery.get_eval_at(&plan.join_order, Some(&plan.table_references))?
+                    != EvalAt::BeforeLoop
+            {
+                return Ok(None);
+            }
+            Some(DeclarativeExistsInput {
+                input: InputId::new(0),
+                subquery_id: subquery.internal_id,
+            })
+        }
+    };
     let external_input = CursorInputId::new(u32::from(destination_cursor.is_some()));
     let external_in_cursor = match access {
         DeclarativeBtreeAccess::InValues {
@@ -569,7 +766,9 @@ fn try_compile_declarative_table_scan(
                 subquery_id: subquery.internal_id,
             })
         }
-        _ if !plan.non_from_clause_subqueries.is_empty() => return Ok(None),
+        _ if !plan.non_from_clause_subqueries.is_empty() && external_exists.is_none() => {
+            return Ok(None);
+        }
         _ => None,
     };
     let direction = access.direction();
@@ -830,6 +1029,12 @@ fn try_compile_declarative_table_scan(
         if predicate.consumed {
             continue;
         }
+        if let Some(external) = external_exists {
+            if direct_exists_subquery(&predicate.expr) == Some(external.subquery_id) {
+                predicates.push(ResolvedScalarExpr::Input(external.input));
+                continue;
+            }
+        }
         if predicate.from_outer_join.is_some()
             || !predicate.should_eval_at_loop(
                 0,
@@ -923,6 +1128,7 @@ fn try_compile_declarative_table_scan(
         destination_cursor,
         destination_index,
         external_in_cursor,
+        external_exists,
         result_column_count: plan.result_columns.len(),
     }))
 }
@@ -952,14 +1158,17 @@ impl DeclarativeSelectBody {
         self,
         scan: Scan,
         destination: DeclarativeSelectDestination,
-    ) -> BoxedCompile<()>
+    ) -> DeclarativeSelectCompiler
     where
         Scan: Compile<Output = Rows> + 'static,
         Rows: RowStream<Item = Row> + 'static,
     {
         match destination {
-            DeclarativeSelectDestination::ResultRows => {
-                self.with_sink(scan, DeclarativePackSink::ResultRows)
+            DeclarativeSelectDestination::ResultRows => DeclarativeSelectCompiler::Effect(
+                self.with_sink(scan, DeclarativePackSink::ResultRows),
+            ),
+            DeclarativeSelectDestination::Exists => {
+                DeclarativeSelectCompiler::Scalar(self.exists(scan))
             }
             DeclarativeSelectDestination::EphemeralIndex {
                 input,
@@ -968,20 +1177,46 @@ impl DeclarativeSelectBody {
             } => {
                 // The description owns only a symbolic input slot. Its physical
                 // destination cursor is not selected until lowering.
-                cursor_input(input)
-                    .and_then(move |cursor| {
-                        self.with_sink(
-                            scan,
-                            DeclarativePackSink::EphemeralIndex {
-                                cursor,
-                                index_name,
-                                affinity,
-                            },
-                        )
-                    })
-                    .boxed()
+                DeclarativeSelectCompiler::Effect(
+                    cursor_input(input)
+                        .and_then(move |cursor| {
+                            self.with_sink(
+                                scan,
+                                DeclarativePackSink::EphemeralIndex {
+                                    cursor,
+                                    index_name,
+                                    affinity,
+                                },
+                            )
+                        })
+                        .boxed(),
+                )
             }
         }
+    }
+
+    fn exists<Scan, Rows>(self, scan: Scan) -> BoxedCompile<ValueId>
+    where
+        Scan: Compile<Output = Rows> + 'static,
+        Rows: RowStream<Item = Row> + 'static,
+    {
+        let Self {
+            predicates,
+            slice: DeclarativeSlice { limit, offset },
+            ..
+        } = self;
+        scan.and_then(move |rows| {
+            if predicates.is_empty() {
+                compile_declarative_exists(rows, limit, offset)
+            } else {
+                compile_declarative_exists(
+                    rows.filter(move |row| compile_symbolic_conjunction(row, &predicates)),
+                    limit,
+                    offset,
+                )
+            }
+        })
+        .boxed()
     }
 
     fn with_sink<Scan, Rows>(self, scan: Scan, sink: DeclarativePackSink) -> BoxedCompile<()>
@@ -1023,6 +1258,22 @@ impl DeclarativeSelectBody {
             }
         })
         .boxed()
+    }
+}
+
+fn compile_declarative_exists<Stream>(
+    rows: Stream,
+    limit: Option<BoxedCompile<ValueId>>,
+    offset: Option<BoxedCompile<ValueId>>,
+) -> BoxedCompile<ValueId>
+where
+    Stream: RowStream + 'static,
+{
+    match (limit, offset) {
+        (Some(limit), Some(offset)) => rows.skip(offset).take(limit).has_rows(),
+        (Some(limit), None) => rows.take(limit).has_rows(),
+        (None, Some(offset)) => rows.skip(offset).has_rows(),
+        (None, None) => rows.has_rows(),
     }
 }
 
@@ -2568,6 +2819,87 @@ mod tests {
                 vec![Value::from_i64(5)],
             ]
         );
+    }
+
+    #[test]
+    fn uncorrelated_exists_composes_a_symbolic_boolean_into_the_outer_scan() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute("CREATE TABLE exists_outer(value INTEGER)")
+            .unwrap();
+        connection
+            .execute("CREATE TABLE exists_inner(value INTEGER)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO exists_outer VALUES (1), (2), (3)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO exists_inner VALUES (10), (20)")
+            .unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT value FROM exists_outer \
+                 WHERE EXISTS (SELECT 1 FROM exists_inner)",
+            )
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+        assert!(instructions.iter().all(|(instruction, _)| !matches!(
+            instruction,
+            Insn::BeginSubrtn { .. } | Insn::Return { .. } | Insn::Once { .. }
+        )));
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(1)],
+                vec![Value::from_i64(2)],
+                vec![Value::from_i64(3)],
+            ]
+        );
+
+        connection.execute("DELETE FROM exists_inner").unwrap();
+        statement.reset().unwrap();
+        assert!(statement.run_collect_rows().unwrap().is_empty());
+
+        let mut aggregate_fallback = connection
+            .prepare(
+                "SELECT value FROM exists_outer \
+                 WHERE EXISTS (SELECT max(value) FROM exists_inner)",
+            )
+            .unwrap();
+        assert!(aggregate_fallback
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::BeginSubrtn { .. })));
+        assert_eq!(
+            aggregate_fallback.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(1)],
+                vec![Value::from_i64(2)],
+                vec![Value::from_i64(3)],
+            ],
+            "an aggregate EXISTS child must remain available to the eager fallback"
+        );
+
+        connection
+            .execute("INSERT INTO exists_inner VALUES (10), (10)")
+            .unwrap();
+        let mut distinct_fallback = connection
+            .prepare(
+                "SELECT value FROM exists_outer WHERE EXISTS (\
+                     SELECT DISTINCT value FROM exists_inner LIMIT -1 OFFSET 1\
+                 )",
+            )
+            .unwrap();
+        assert!(distinct_fallback
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::BeginSubrtn { .. })));
+        assert!(distinct_fallback.run_collect_rows().unwrap().is_empty());
     }
 
     #[test]

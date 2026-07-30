@@ -6,9 +6,9 @@ use crate::{
     translate::{
         alter::literal_default_value,
         compiler::{
-            add, compare, constant, logical, pack_values, parameter, resolved_comparison,
-            BoxedCompile, ComparisonOp, Compile, LogicalOp, PackValues, ResolvedComparison, Row,
-            ValueId,
+            add, compare, constant, input, logical, pack_values, parameter, resolved_comparison,
+            BoxedCompile, ComparisonOp, Compile, InputId, LogicalOp, PackValues,
+            ResolvedComparison, Row, ValueId,
         },
         emitter::Resolver,
         plan::TableReferences,
@@ -25,6 +25,7 @@ use super::{comparison_affinity, comparison_collation};
 /// SQL-specific resolution happens before this description is constructed.
 /// Compiling it later only needs the symbolic row that supplies its columns.
 pub(crate) enum ResolvedScalarExpr {
+    Input(InputId),
     Column(usize),
     RowId,
     IndexRowId,
@@ -305,6 +306,7 @@ pub(crate) fn compile_static_expr(expr: &ResolvedScalarExpr) -> Option<BoxedComp
 
 fn try_compile_expr(row: Option<Row>, expr: &ResolvedScalarExpr) -> Option<BoxedCompile<ValueId>> {
     match expr {
+        ResolvedScalarExpr::Input(input_id) => Some(input(*input_id).boxed()),
         ResolvedScalarExpr::Column(column) => Some(row?.column(*column).boxed()),
         ResolvedScalarExpr::RowId => Some(row?.rowid().boxed()),
         ResolvedScalarExpr::IndexRowId => Some(row?.index_rowid().boxed()),

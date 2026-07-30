@@ -215,6 +215,38 @@ pub(crate) struct BindCursorInput<Compiler> {
     compiler: Compiler,
 }
 
+pub(crate) struct BindInput<Compiler> {
+    input: InputId,
+    value: ValueId,
+    compiler: Compiler,
+}
+
+pub(crate) fn bind_input<Compiler>(
+    input: InputId,
+    value: ValueId,
+    compiler: Compiler,
+) -> BindInput<Compiler> {
+    BindInput {
+        input,
+        value,
+        compiler,
+    }
+}
+
+impl<Compiler> Compile for BindInput<Compiler>
+where
+    Compiler: Compile,
+{
+    type Output = Compiler::Output;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let previous = builder.bind_input(self.input, self.value);
+        let result = self.compiler.compile(builder);
+        builder.restore_input(self.input, previous);
+        result
+    }
+}
+
 pub(crate) fn bind_cursor_input<Compiler>(
     input: CursorInputId,
     cursor: CursorId,
@@ -877,6 +909,26 @@ impl LoopState {
 
     fn pop(&mut self) -> Option<ValueId> {
         self.values.pop()
+    }
+
+    fn single(value: ValueId) -> Self {
+        Self {
+            values: smallvec![value],
+        }
+    }
+
+    fn replace_single(&mut self, value: ValueId) {
+        assert_eq!(self.values.len(), 1);
+        self.values[0] = value;
+    }
+
+    fn into_single(mut self) -> ValueId {
+        let value = self
+            .values
+            .pop()
+            .expect("single-value loop state must contain one value");
+        assert!(self.values.is_empty());
+        value
     }
 }
 
@@ -2029,6 +2081,7 @@ pub(crate) struct IrBuilder {
     current: BlockId,
     next_value: u32,
     input_count: u32,
+    input_bindings: SmallVec<[Option<ValueId>; 2]>,
     cursor_input_count: u32,
     cursor_input_bindings: SmallVec<[Option<CursorId>; 2]>,
     cursor_resources: SmallVec<[CursorResource; 2]>,
@@ -2049,6 +2102,7 @@ impl IrBuilder {
             current: BlockId(0),
             next_value: 0,
             input_count: 0,
+            input_bindings: SmallVec::new(),
             cursor_input_count: 0,
             cursor_input_bindings: SmallVec::new(),
             cursor_resources: SmallVec::new(),
@@ -2064,6 +2118,24 @@ impl IrBuilder {
         })?;
         self.cursor_resources.push(resource);
         Ok(CursorId(id))
+    }
+
+    fn external_input(&mut self, input: InputId) -> Result<ValueId> {
+        if let Some(value) = self.input_bindings.get(input.index()).copied().flatten() {
+            return Ok(value);
+        }
+        self.push(ScalarOp::Input(input))
+    }
+
+    fn bind_input(&mut self, input: InputId, value: ValueId) -> Option<ValueId> {
+        if self.input_bindings.len() <= input.index() {
+            self.input_bindings.resize(input.index() + 1, None);
+        }
+        self.input_bindings[input.index()].replace(value)
+    }
+
+    fn restore_input(&mut self, input: InputId, previous: Option<ValueId>) {
+        self.input_bindings[input.index()] = previous;
     }
 
     fn external_cursor(&mut self, input: CursorInputId) -> Result<CursorId> {
@@ -5232,6 +5304,29 @@ pub(crate) trait RowStream: Sized + 'static {
         body: BoxedRowFolder<Self::Item>,
     ) -> BoxedCompile<LoopState>;
 
+    /// Return a symbolic SQL boolean indicating whether the stream yields a row.
+    ///
+    /// The terminal stops after the first row. Empty and non-empty paths join
+    /// through the loop state, so the result remains an SSA value until lowering.
+    fn has_rows(self) -> BoxedCompile<ValueId> {
+        self.try_fold(
+            constant(Value::from_i64(0)).map(LoopState::single),
+            |_item, mut state| {
+                constant(Value::from_i64(1))
+                    .then(constant(Value::from_i64(0)))
+                    .map(move |(is_non_empty, should_continue)| {
+                        state.replace_single(is_non_empty);
+                        LoopStep {
+                            state,
+                            should_continue,
+                        }
+                    })
+            },
+        )
+        .map(LoopState::into_single)
+        .boxed()
+    }
+
     fn map<MapperFn, Mapper>(self, mapper: MapperFn) -> MapRows<Self, MapperFn, Mapper>
     where
         MapperFn: FnOnce(Self::Item) -> Mapper + 'static,
@@ -6909,7 +7004,7 @@ impl Compile for Input {
     type Output = ValueId;
 
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
-        builder.push(ScalarOp::Input(self.0))
+        builder.external_input(self.0)
     }
 }
 
@@ -7533,6 +7628,41 @@ mod tests {
                 "block2:\n",
                 "  %1 = constant Null\n",
                 "  return %1\n",
+            )
+        );
+    }
+
+    #[test]
+    fn row_stream_non_empty_terminal_returns_an_ssa_boolean_and_stops() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE streamed(a)", 2).unwrap());
+        let compiler =
+            scan_table(table, 0, 0, ScanDirection::Forward).and_then(RowStream::has_rows);
+
+        let ir = compile_scalar(compiler).unwrap();
+
+        assert_eq!(
+            ir.to_string(),
+            concat!(
+                "cursor $0 = btree_table \"streamed\" root 2\n",
+                "\n",
+                "block0:\n",
+                "  open_read $0 root 2 db 0 schema 0\n",
+                "  %0 = constant Numeric(Integer(0))\n",
+                "  cursor_start Forward $0, block1(%0), block4(%0)\n",
+                "\n",
+                "block1(%1):\n",
+                "  %3 = constant Numeric(Integer(1))\n",
+                "  %4 = constant Numeric(Integer(0))\n",
+                "  branch %4, block2, block3\n",
+                "\n",
+                "block2:\n",
+                "  cursor_advance Forward $0, block1(%3), block4(%3)\n",
+                "\n",
+                "block3:\n",
+                "  jump block4(%3)\n",
+                "\n",
+                "block4(%2):\n",
+                "  return %2\n",
             )
         );
     }
@@ -9447,6 +9577,27 @@ mod tests {
         let lowered = ir.lower_into(&mut program, target).unwrap();
         assert_eq!(lowered.single_result_row_pack().unwrap().1, 1);
         assert_eq!(program.cursor_ref.len(), 1);
+    }
+
+    #[test]
+    fn scalar_input_binding_composes_descriptions_without_a_lowering_input() {
+        let input_id = InputId::new(0);
+        let compiler = constant(Value::from_i64(7)).and_then(move |value| {
+            bind_input(
+                input_id,
+                value,
+                input(input_id)
+                    .then(constant(Value::from_i64(1)))
+                    .and_then(|(lhs, rhs)| add(lhs, rhs)),
+            )
+        });
+
+        let ir = compile_scalar(compiler).unwrap();
+
+        assert!(!ir.to_string().contains("input @0"));
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 1, 0));
+        ir.lower_into(&mut program, 1).unwrap();
     }
 
     #[test]

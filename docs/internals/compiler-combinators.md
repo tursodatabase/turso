@@ -141,6 +141,11 @@ expression is evaluated. The production table-scan path uses these operators
 for row-independent `LIMIT` and `OFFSET` expressions supported by the scalar IR,
 including parameters and searched `CASE`; column-dependent and otherwise
 unsupported counts retain the eager emitter.
+`has_rows` is the scalar terminal built on the same protocol. It carries a
+false value from the empty edge, replaces it with true on the first row, and
+returns a false continuation so both paths join as one SSA boolean without
+advancing past that row. This is the compiler-level operation used for
+declarative `EXISTS`.
 
 The authoring surface remains generically typed, but stream consumption erases
 the concrete compiler and row-callback types at every adapter boundary. This is
@@ -158,8 +163,8 @@ during lowering. Searched `CASE` builds nested SSA diamonds, so only the chosen
 result arm executes and every arm joins as one value. Base-expression `CASE`
 still falls back until its per-`WHEN` affinity and collation rules are resolved.
 The path also falls back when SQL semantics still live in the eager frontend:
-other expression forms, `IS` comparisons, ordering, limits, joins, aggregates,
-subqueries, generated values, arrays, and custom-type decoding.
+other expression forms, `IS` comparisons, joins, aggregates, most subquery
+forms, generated values, arrays, and custom-type decoding.
 `EXPLAIN QUERY PLAN` also remains on the eager path until the IR models
 explain-tree effects.
 Ordinary column lowering does reuse the VDBE backend's logical-column helper, so
@@ -237,6 +242,13 @@ columns, parameters, and legacy subexpressions can participate in one deferred
 region while preserving their source evaluation order. Collection is
 transactional: if a subtree cannot be represented safely, speculative inputs
 are discarded before that subtree is treated as one external value.
+An input slot can also be scoped to another compiler output before IR is built.
+In that case every use resolves directly to the producer's `ValueId`, no
+external input remains at lowering, and ordinary dominance verification covers
+the composed value. The first production use compiles a simple uncorrelated
+`EXISTS` child to `has_rows`, binds that boolean into the outer predicate,
+and lowers both scans as one graph. Correlated, aggregate, distinct, and other
+unsupported `EXISTS` shapes retain the eager subquery emitter.
 
 Conditional branches only admit branch bodies that are fully represented in
 the IR. An unsupported branch body sends the whole conditional back to the
