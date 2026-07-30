@@ -2525,11 +2525,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
  "wasip2",
  "wasip3",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -7330,6 +7332,8 @@ dependencies = [
  "env_logger",
  "fallible-iterator 0.3.0",
  "fastbloom",
+ "getrandom 0.2.15",
+ "getrandom 0.3.2",
  "hex",
  "icu_collator",
  "icu_locale",
