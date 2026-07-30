@@ -42,6 +42,7 @@ impl BlockId {
         self.0 as usize
     }
 
+    #[allow(dead_code)] // dense-id API symmetry; used by past/future emission orders
     pub(super) fn from_index(index: usize) -> Self {
         BlockId(u32::try_from(index).expect("block count fits in u32"))
     }
@@ -306,6 +307,23 @@ pub enum Inst {
     /// not be used.
     EmitRow {
         values: Vec<ValueId>,
+    },
+    /// One per-row accumulation step for aggregate `index` of the plan
+    /// being compiled (`Insn::AggStep` plus argument evaluation).
+    /// Emission delegates to the caller-supplied aggregate emitter,
+    /// keeping all per-function knowledge (argument shapes, string_agg
+    /// separators) in the eager helper. An effect like [`Inst::EmitRow`]:
+    /// never constant, never interned, ordered by block position; the
+    /// instruction's own value is unit-like and must not be used.
+    AggStep {
+        index: usize,
+    },
+    /// Finalize aggregate `index` into its accumulator register
+    /// (`Insn::AggFinal`), delegated like [`Inst::AggStep`]. The
+    /// finalized result is read back as an external value bound to the
+    /// accumulator register.
+    AggFinal {
+        index: usize,
     },
 }
 
@@ -660,7 +678,6 @@ impl FuncBuilder {
 
     /// Import a value that already lives in physical register `reg`
     /// outside this function. See [`Inst::External`].
-    #[allow(dead_code)] // exercised by unit tests; awaiting integration slices
     pub fn external(&mut self, reg: usize) -> ValueId {
         self.intern_in_entry(Inst::External { reg })
     }
@@ -816,6 +833,14 @@ impl FuncBuilder {
     /// unit-like bookkeeping and must not be used.
     pub fn emit_row(&mut self, values: Vec<ValueId>) {
         let _ = self.push_inst(Inst::EmitRow { values });
+    }
+
+    pub fn agg_step(&mut self, index: usize) {
+        let _ = self.push_inst(Inst::AggStep { index });
+    }
+
+    pub fn agg_final(&mut self, index: usize) {
+        let _ = self.push_inst(Inst::AggFinal { index });
     }
 
     pub fn binary(&mut self, op: BinOp, lhs: ValueId, rhs: ValueId) -> ValueId {

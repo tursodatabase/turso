@@ -27,33 +27,31 @@ addr  opcode       p1  p2  p3  p4                                     p5  commen
    1  Null          0   2   0                                          0  r[2]=NULL
    2  OpenRead      0  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
    3  Rewind        0  19   0                                          0  Rewind table lineitem
-   4    Column      0  10   3                                          0  r[3]=lineitem.L_SHIPDATE
-   5    Lt          3   4  18  Binary                                  0  if r[3]<r[4] goto 18
-   6    Column      0  10   5                                          0  r[5]=lineitem.L_SHIPDATE
-   7    Ge          5   6  18  Binary                                  0  if r[5]>=r[6] goto 18
-   8    Column      0   6   7                                          0  r[7]=lineitem.L_DISCOUNT
-   9    Lt          7  10  18  Binary                                  0  if r[7]<r[10] goto 18
-  10    Column      0   6  11                                          0  r[11]=lineitem.L_DISCOUNT
-  11    Gt         11  14  18  Binary                                  0  if r[11]>r[14] goto 18
-  12    Column      0   4  15                                          0  r[15]=lineitem.L_QUANTITY
-  13    Ge         15  16  18  Binary                                  0  if r[15]>=r[16] goto 18
-  14    Column      0   5  18                                          0  r[18]=lineitem.L_EXTENDEDPRICE
-  15    Column      0   6  19                                          0  r[19]=lineitem.L_DISCOUNT
-  16    Multiply   18  19  17                                          0  r[17]=r[18]*r[19]
-  17    AggStep     0  17   2  sum                                     0  accum=r[2] step(r[17])
+   4    Column      0  10   8                                          0  r[8]=lineitem.L_SHIPDATE
+   5    Lt          8   3  18  Binary                                  0  if r[8]<r[3] goto 18
+   6    Column      0  10   9                                          0  r[9]=lineitem.L_SHIPDATE
+   7    Ge          9   4  18  Binary                                  0  if r[9]>=r[4] goto 18
+   8    Column      0   6  10                                          0  r[10]=lineitem.L_DISCOUNT
+   9    Lt         10  11  18  Binary                                  0  if r[10]<r[11] goto 18
+  10    Column      0   6  12                                          0  r[12]=lineitem.L_DISCOUNT
+  11    Gt         12  13  18  Binary                                  0  if r[12]>r[13] goto 18
+  12    Column      0   4  14                                          0  r[14]=lineitem.L_QUANTITY
+  13    Ge         14   7  18  Binary                                  0  if r[14]>=r[7] goto 18
+  14    Column      0   5  16                                          0  r[16]=lineitem.L_EXTENDEDPRICE
+  15    Column      0   6  17                                          0  r[17]=lineitem.L_DISCOUNT
+  16    Multiply   16  17  15                                          0  r[15]=r[16]*r[17]
+  17    AggStep     0  15   2  sum                                     0  accum=r[2] step(r[15])
   18  Next          0   4   0                                          0
   19  AggFinal      0   2   0  sum                                     0  accum=r[2]
   20  Copy          2   1   0                                          0  r[1]=r[2]
   21  ResultRow     1   1   0                                          0  output=r[1]
   22  Halt          0   0   0                                          0
   23  Transaction   0   1   8                                          0  iDb=0 tx_mode=Read
-  24  String8       0   4   0  1994-01-01                              0  r[4]='1994-01-01'
-  25  String8       0   6   0  1995-01-01                              0  r[6]='1995-01-01'
-  26  Real          0   8   0  0.08                                    0  r[8]=0.08
-  27  Real          0   9   0  0.01                                    0  r[9]=0.01
-  28  Subtract      8   9  10                                          0  r[10]=r[8]-r[9]
-  29  Real          0  12   0  0.08                                    0  r[12]=0.08
-  30  Real          0  13   0  0.01                                    0  r[13]=0.01
-  31  Add          12  13  14                                          0  r[14]=r[12]+r[13]
-  32  Integer      24  16   0                                          0  r[16]=24
-  33  Goto          0   1   0                                          0
+  24  String8       0   3   0  1994-01-01                              0  r[3]='1994-01-01'
+  25  String8       0   4   0  1995-01-01                              0  r[4]='1995-01-01'
+  26  Real          0   5   0  0.08                                    0  r[5]=0.08
+  27  Real          0   6   0  0.01                                    0  r[6]=0.01
+  28  Integer      24   7   0                                          0  r[7]=24
+  29  Subtract      5   6  11                                          0  r[11]=r[5]-r[6]
+  30  Add           5   6  13                                          0  r[13]=r[5]+r[6]
+  31  Goto          0   1   0                                          0

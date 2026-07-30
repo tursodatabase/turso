@@ -152,7 +152,9 @@ pub fn verify(func: &Function) -> Result<(), VerifyError> {
             match inst {
                 super::ir::Inst::Const(_)
                 | super::ir::Inst::External { .. }
-                | super::ir::Inst::Leaf(_) => {}
+                | super::ir::Inst::Leaf(_)
+                | super::ir::Inst::AggStep { .. }
+                | super::ir::Inst::AggFinal { .. } => {}
                 super::ir::Inst::Unary { operand, .. }
                 | super::ir::Inst::NullTest { operand, .. }
                 | super::ir::Inst::Cast { operand, .. }

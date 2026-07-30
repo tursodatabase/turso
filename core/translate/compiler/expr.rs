@@ -915,29 +915,11 @@ pub(crate) fn compile_condition_expr<'a>(
         ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
             compile_condition_expr(exprs[0].as_ref(), ctx)?
         }
-        ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
-            let Some(lhs) = compile_condition_expr(lhs.as_ref(), ctx)? else {
-                return Ok(None);
-            };
-            let Some(rhs) = compile_condition_expr(rhs.as_ref(), ctx)? else {
-                return Ok(None);
-            };
-            Some(CondBuilt {
-                predicate: lhs.predicate.and(rhs.predicate),
-                effect: rhs.effect,
-            })
+        ast::Expr::Binary(_, ast::Operator::And, _) => {
+            compile_condition_chain(expr, ast::Operator::And, ctx)?
         }
-        ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
-            let Some(lhs) = compile_condition_expr(lhs.as_ref(), ctx)? else {
-                return Ok(None);
-            };
-            let Some(rhs) = compile_condition_expr(rhs.as_ref(), ctx)? else {
-                return Ok(None);
-            };
-            Some(CondBuilt {
-                predicate: lhs.predicate.or(rhs.predicate),
-                effect: rhs.effect,
-            })
+        ast::Expr::Binary(_, ast::Operator::Or, _) => {
+            compile_condition_chain(expr, ast::Operator::Or, ctx)?
         }
         ast::Expr::Binary(lhs_expr, op, rhs_expr) if cmp_binop(op).is_some() => {
             let op = cmp_binop(op).expect("guarded by match arm");
@@ -1258,6 +1240,59 @@ const fn value_binop(op: &ast::Operator) -> Option<BinOp> {
 
 /// The six ordinary comparisons. IS/IS NOT (null-equality semantics) and
 /// LIKE/GLOB (function calls in disguise) stay on the eager path.
+/// Compile a left-deep AND/OR chain by flattening it and folding from
+/// the right, so each combinator's continuation block is created in
+/// evaluation order. A left fold would create the mid blocks in reverse
+/// (the outermost combinator runs first and creates its block before
+/// any inner one), scattering the terms through the layout with jump
+/// trampolines between them; the right fold reproduces eager's linear
+/// chain, where each term falls through to the next.
+fn compile_condition_chain<'a>(
+    expr: &'a ast::Expr,
+    op: ast::Operator,
+    ctx: &BuildCtx<'_>,
+) -> Result<Option<CondBuilt<'a>>> {
+    let mut terms = Vec::new();
+    flatten_chain(expr, op, &mut terms);
+    let mut built = Vec::with_capacity(terms.len());
+    for term in terms {
+        let Some(term) = compile_condition_expr(term, ctx)? else {
+            return Ok(None);
+        };
+        built.push(term);
+    }
+    // The eager path leaves the last-evaluated terminal's collation
+    // state behind.
+    let effect = built
+        .last()
+        .expect("a Binary chain has at least two terms")
+        .effect;
+    let predicate = built
+        .into_iter()
+        .rev()
+        .map(|term| term.predicate)
+        .reduce(|rest, term| match op {
+            ast::Operator::And => term.and(rest),
+            _ => term.or(rest),
+        })
+        .expect("a Binary chain has at least two terms");
+    Ok(Some(CondBuilt { predicate, effect }))
+}
+
+/// Collect the leaves of a same-operator Binary chain, left to right.
+/// Parenthesized subtrees are not unwrapped here: they compile as
+/// single terms (recursing through `compile_condition_expr`, which
+/// flattens any chain inside them in its own slot).
+fn flatten_chain<'a>(expr: &'a ast::Expr, op: ast::Operator, out: &mut Vec<&'a ast::Expr>) {
+    match expr {
+        ast::Expr::Binary(lhs, current, rhs) if *current == op => {
+            flatten_chain(lhs, op, out);
+            flatten_chain(rhs, op, out);
+        }
+        _ => out.push(expr),
+    }
+}
+
 const fn cmp_binop(op: &ast::Operator) -> Option<CmpOp> {
     Some(match op {
         ast::Operator::Equals => CmpOp::Eq,

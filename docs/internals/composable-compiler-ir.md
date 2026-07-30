@@ -435,7 +435,28 @@ boundary (the whole tree is constant, so the span opened by
       cleared by the optimizer) maps to `ScanDirection::Backward` and
       emits the eager-identical Last/.../Prev loop. Composes with
       WHERE/LIMIT/OFFSET.
-- [ ] 4b. Joins, aggregates, sorters, subqueries as stream operators;
+- [x] 4b-1. Ungrouped aggregates over simple scans: `Inst::AggStep`/
+      `Inst::AggFinal` are opaque effects delegated to the eager
+      aggregation helper through an `AggEmitter` callback, so all
+      per-function argument shapes stay in one place; accumulator
+      registers are externals (allocated and NULLed by `emit_query`
+      before the hook). Emission is two islands with the caller's
+      `after_main_loop_label` bound between them — before-loop terms
+      (constant-false WHERE) jump there and must still run
+      finalization, because aggregate queries emit one row over zero
+      rows. Gates: DISTINCT/FILTER/percentile aggregates, LIMIT/OFFSET,
+      mixed agg+non-agg columns, non-bare-aggregate result columns,
+      array-typed results (eager IsNull/ArrayDecode presentation).
+- [x] Emission layout pass: blocks lay out along fallthrough chains
+      (each terminator's non-jumping side placed next when it has one
+      forward predecessor), with joins deferred until all forward
+      predecessors are placed; back edges (tri-color DFS) neither
+      chain nor block. AND/OR chains are flattened and right-folded at
+      description time so their continuation blocks are created in
+      evaluation order. Together these reproduce eager's linear
+      condition chains (TPC-H q6/q19 dropped their jump trampolines,
+      -26 instructions across five re-recorded snapshots).
+- [ ] 4b-2. GROUP BY, joins, sorters, subqueries as stream operators;
       `emitter/` + `main_loop/` sequencing becomes tree lowering.
 - [ ] 4c. Shrink and remove the eager-emission fallback per construct.
 

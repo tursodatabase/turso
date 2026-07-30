@@ -43,6 +43,21 @@ fn debug_verify(func: &Function) -> Result<()> {
 /// it.
 pub type LeafEmitter<'e> = dyn FnMut(&mut ProgramBuilder, &ast::Expr, usize) -> Result<()> + 'e;
 
+/// Which half of an aggregate's lifecycle an [`AggEmitter`] call emits:
+/// the per-row accumulation step or the post-loop finalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggPhase {
+    Step,
+    Final,
+}
+
+/// Emits the eager bytecode for one aggregate of the plan being
+/// compiled: argument evaluation plus `Insn::AggStep`, or
+/// `Insn::AggFinal`. Supplied by the integration hook, which owns the
+/// plan and the accumulator registers; the IR only records *when* each
+/// aggregate steps and finalizes.
+pub type AggEmitter<'e> = dyn FnMut(&mut ProgramBuilder, AggPhase, usize) -> Result<()> + 'e;
+
 /// Emit `func` into `program`, leaving the function's result in `dest`.
 /// Functions containing [`Inst::Leaf`] must use
 /// [`emit_function_with_leaves`].
@@ -78,20 +93,22 @@ pub fn emit_function_bound(
     debug_verify(func)?;
     bind_cursors(func, cursors)?;
     // Explicit reborrow: `Option<&mut dyn ...>` is invariant, so shorten
-    // the emitter borrow to this call's lifetime by hand.
-    match leaf_emitter {
-        Some(leaf_emitter) => Emitter::new(
-            program,
-            func,
-            Some(dest),
-            &[],
-            cursors,
-            None,
-            Some(&mut *leaf_emitter),
-        )
-        .emit(),
-        None => Emitter::new(program, func, Some(dest), &[], cursors, None, None).emit(),
-    }
+    // the emitter borrows to this call's lifetime by hand.
+    let leaf_emitter: Option<&mut LeafEmitter<'_>> = match leaf_emitter {
+        Some(emitter) => Some(&mut *emitter),
+        None => None,
+    };
+    Emitter::new(
+        program,
+        func,
+        Some(dest),
+        &[],
+        cursors,
+        None,
+        leaf_emitter,
+        None,
+    )
+    .emit()
 }
 
 /// Emit a condition island: a function whose control flow leaves through
@@ -111,6 +128,7 @@ pub fn emit_condition_function(
     row_dest: Option<usize>,
     fallthrough_label: Option<BranchOffset>,
     leaf_emitter: Option<&mut LeafEmitter<'_>>,
+    agg_emitter: Option<&mut AggEmitter<'_>>,
 ) -> Result<()> {
     debug_verify(func)?;
     if exit_labels.len() != func.num_exits() {
@@ -121,29 +139,29 @@ pub fn emit_condition_function(
         )));
     }
     bind_cursors(func, cursors)?;
-    // Explicit reborrow: `Option<&mut dyn ...>` is invariant, so shorten
-    // the emitter borrow to this call's lifetime by hand.
-    match leaf_emitter {
-        Some(leaf_emitter) => {
-            let mut emitter = Emitter::new(
-                program,
-                func,
-                None,
-                exit_labels,
-                cursors,
-                row_dest,
-                Some(&mut *leaf_emitter),
-            );
-            emitter.fallthrough_label = fallthrough_label;
-            emitter.emit()
-        }
-        None => {
-            let mut emitter =
-                Emitter::new(program, func, None, exit_labels, cursors, row_dest, None);
-            emitter.fallthrough_label = fallthrough_label;
-            emitter.emit()
-        }
-    }
+    // Explicit reborrows: `Option<&mut dyn ...>` is invariant in the
+    // trait object's lifetime, and `&mut *` is the coercion site that
+    // shortens it to this call.
+    let leaf_emitter: Option<&mut LeafEmitter<'_>> = match leaf_emitter {
+        Some(emitter) => Some(&mut *emitter),
+        None => None,
+    };
+    let agg_emitter: Option<&mut AggEmitter<'_>> = match agg_emitter {
+        Some(emitter) => Some(&mut *emitter),
+        None => None,
+    };
+    let mut emitter = Emitter::new(
+        program,
+        func,
+        None,
+        exit_labels,
+        cursors,
+        row_dest,
+        leaf_emitter,
+        agg_emitter,
+    );
+    emitter.fallthrough_label = fallthrough_label;
+    emitter.emit()
 }
 
 /// Check that exactly one physical cursor id was supplied per declared
@@ -181,6 +199,9 @@ struct Emitter<'a> {
     exit_label: Option<BranchOffset>,
     /// Emits [`Inst::Leaf`] values; absent when the function has none.
     leaf_emitter: Option<&'a mut LeafEmitter<'a>>,
+    /// Emits [`Inst::AggStep`]/[`Inst::AggFinal`]; absent when the
+    /// function has neither.
+    agg_emitter: Option<&'a mut AggEmitter<'a>>,
     /// Whether each value is transitively constant. Runs of constant
     /// instructions emit inside constant spans so they stay eligible for
     /// hoisting into the program prologue, matching what nested eager
@@ -211,33 +232,127 @@ impl<'a> Emitter<'a> {
         cursors: &'a [usize],
         row_dest: Option<usize>,
         leaf_emitter: Option<&'a mut LeafEmitter<'a>>,
+        agg_emitter: Option<&'a mut AggEmitter<'a>>,
     ) -> Self {
-        // Emission order: creation order restricted to reachable blocks.
-        // Creation order keeps combinator-generated CFGs readable (arms
-        // appear where they were described) and is trivially
-        // deterministic. Bypassable exit blocks (empty, no params) are
-        // excluded: every reference to them jumps straight to the bound
-        // external label, so they would be dead code.
-        let mut reachable = vec![false; func.blocks.len()];
-        let mut stack = vec![BlockId::ENTRY];
-        reachable[BlockId::ENTRY.index()] = true;
-        while let Some(block) = stack.pop() {
-            if let Some(terminator) = &func.block(block).terminator {
-                for target in terminator.targets() {
-                    if !reachable[target.block.index()] {
-                        reachable[target.block.index()] = true;
-                        stack.push(target.block);
+        // Emission order: fallthrough-chained layout over the reachable
+        // blocks. From each block, the successor emission would fall
+        // into (the non-jumping side of its terminator) is placed
+        // immediately after it — but only when that successor has
+        // exactly one predecessor. Single-predecessor chains are what
+        // combinators build for AND/OR terms, so this reproduces
+        // eager's linear condition chains regardless of block creation
+        // order; multi-predecessor joins (CASE's join block, a loop
+        // latch) break the chain and are placed in discovery order,
+        // which keeps arms laid out where they were described. The
+        // walk is deterministic. Bypassable exit blocks (empty, no
+        // params) are excluded: every reference to them jumps straight
+        // to the bound external label, so they would be dead code.
+        // Tri-color DFS: reachability plus back-edge classification. An
+        // edge into a block still on the DFS stack (grey) is a back
+        // edge — a loop; such edges must not make layout wait for the
+        // latch before placing the loop body.
+        const WHITE: u8 = 0;
+        const GREY: u8 = 1;
+        const BLACK: u8 = 2;
+        let mut color = vec![WHITE; func.blocks.len()];
+        // Predecessors via forward (non-back) edges only.
+        let mut predecessors: Vec<Vec<BlockId>> = vec![Vec::new(); func.blocks.len()];
+        let mut dfs: Vec<(BlockId, usize)> = vec![(BlockId::ENTRY, 0)];
+        color[BlockId::ENTRY.index()] = GREY;
+        while let Some(&mut (block, ref mut next)) = dfs.last_mut() {
+            let targets = func
+                .block(block)
+                .terminator
+                .as_ref()
+                .map(|terminator| terminator.targets());
+            let target = targets
+                .as_ref()
+                .and_then(|targets| (*next < targets.len()).then(|| targets[*next].block));
+            match target {
+                Some(successor) => {
+                    *next += 1;
+                    match color[successor.index()] {
+                        GREY => {} // back edge: not a forward predecessor
+                        _ => {
+                            predecessors[successor.index()].push(block);
+                            if color[successor.index()] == WHITE {
+                                color[successor.index()] = GREY;
+                                dfs.push((successor, 0));
+                            }
+                        }
                     }
+                }
+                None => {
+                    color[block.index()] = BLACK;
+                    dfs.pop();
                 }
             }
         }
-        let order: Vec<BlockId> = reachable
-            .iter()
-            .enumerate()
-            .filter(|(_, &reachable)| reachable)
-            .map(|(index, _)| BlockId::from_index(index))
-            .filter(|&block| Self::bypass_exit(func, exit_labels, block).is_none())
-            .collect();
+        let mut order: Vec<BlockId> = Vec::with_capacity(func.blocks.len());
+        let mut placed = vec![false; func.blocks.len()];
+        // FIFO worklist of chain heads. A head whose predecessors are
+        // not all placed yet is deferred to the back of the queue, so
+        // join blocks land after every arm that reaches them and a
+        // loop's continuation lands after the latch; the stuck counter
+        // force-places a head when a cycle of backedges would otherwise
+        // defer forever.
+        let mut heads = std::collections::VecDeque::from([BlockId::ENTRY]);
+        let mut deferred = 0usize;
+        while let Some(head) = heads.pop_front() {
+            if placed[head.index()] {
+                deferred = 0;
+                continue;
+            }
+            if deferred <= heads.len()
+                && predecessors[head.index()]
+                    .iter()
+                    .any(|pred| !placed[pred.index()])
+                && head != BlockId::ENTRY
+            {
+                heads.push_back(head);
+                deferred += 1;
+                continue;
+            }
+            deferred = 0;
+            let mut current = head;
+            loop {
+                if placed[current.index()] {
+                    break;
+                }
+                placed[current.index()] = true;
+                if Self::bypass_exit(func, exit_labels, current).is_none() {
+                    order.push(current);
+                }
+                let terminator = func
+                    .block(current)
+                    .terminator
+                    .as_ref()
+                    .expect("reachable blocks are verified to have terminators");
+                let preferred = Self::fallthrough_successor(terminator);
+                // Queue the jumping-side successors as later chain
+                // heads, in target order.
+                let targets = terminator.targets();
+                for target in targets {
+                    if Some(target.block) != preferred && !placed[target.block.index()] {
+                        heads.push_back(target.block);
+                    }
+                }
+                match preferred {
+                    Some(next)
+                        if !placed[next.index()] && predecessors[next.index()].len() == 1 =>
+                    {
+                        current = next;
+                    }
+                    Some(next) => {
+                        if !placed[next.index()] {
+                            heads.push_back(next);
+                        }
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        }
 
         // Transitive constness per value. Operand values are always
         // created before their users, so one pass in id order suffices.
@@ -270,6 +385,8 @@ impl<'a> Emitter<'a> {
                 Some(Inst::External { .. })
                 | Some(Inst::Leaf(_))
                 | Some(Inst::EmitRow { .. })
+                | Some(Inst::AggStep { .. })
+                | Some(Inst::AggFinal { .. })
                 | None => false,
             };
         }
@@ -283,7 +400,11 @@ impl<'a> Emitter<'a> {
             let block = func.block(block_id);
             for (_, inst) in &block.insts {
                 match inst {
-                    Inst::Const(_) | Inst::External { .. } | Inst::Leaf(_) => {}
+                    Inst::Const(_)
+                    | Inst::External { .. }
+                    | Inst::Leaf(_)
+                    | Inst::AggStep { .. }
+                    | Inst::AggFinal { .. } => {}
                     Inst::Unary { operand, .. }
                     | Inst::NullTest { operand, .. }
                     | Inst::Cast { operand, .. }
@@ -381,6 +502,7 @@ impl<'a> Emitter<'a> {
             order,
             exit_label: None,
             leaf_emitter,
+            agg_emitter,
             is_const,
             call_packs,
             row_packs,
@@ -399,6 +521,27 @@ impl<'a> Emitter<'a> {
     /// The external label a jump to `block` should use instead, when
     /// `block` is an empty parameterless exit block. Bypassing avoids a
     /// chain of `Goto`s through trivial exit trampolines.
+    /// The successor emission prefers to place immediately after a
+    /// block: the side its terminator falls into when the layout
+    /// cooperates (comparisons jump on the negated condition, Rewind
+    /// jumps on empty, Next jumps back on more rows, the counter
+    /// terminators jump on their tested condition). `None` for
+    /// terminators with no successors.
+    fn fallthrough_successor(terminator: &Terminator) -> Option<BlockId> {
+        match terminator {
+            Terminator::Jump(target) => Some(target.block),
+            Terminator::Branch { if_true, .. } | Terminator::CmpBranch { if_true, .. } => {
+                Some(if_true.block)
+            }
+            Terminator::NullBranch { if_not_null, .. } => Some(if_not_null.block),
+            Terminator::ScanStart { if_rows, .. } => Some(if_rows.block),
+            Terminator::ScanAdvance { if_done, .. } => Some(if_done.block),
+            Terminator::DecrJumpZero { if_more, .. } => Some(if_more.block),
+            Terminator::IfPos { if_rest, .. } => Some(if_rest.block),
+            Terminator::Ret { .. } | Terminator::Exit(_) => None,
+        }
+    }
+
     fn bypass_exit(
         func: &Function,
         exit_labels: &[BranchOffset],
@@ -471,6 +614,19 @@ impl<'a> Emitter<'a> {
                         )
                     })?;
                     emitter(self.program, expr, dest)?;
+                }
+                Inst::AggStep { index } | Inst::AggFinal { index } => {
+                    let phase = match inst {
+                        Inst::AggStep { .. } => AggPhase::Step,
+                        _ => AggPhase::Final,
+                    };
+                    let emitter = self.agg_emitter.as_mut().ok_or_else(|| {
+                        LimboError::InternalError(
+                            "compiler IR: aggregate effect without an aggregate emitter"
+                                .to_string(),
+                        )
+                    })?;
+                    emitter(self.program, phase, *index)?;
                 }
                 Inst::Compare { cmp, lhs, rhs } => {
                     let lhs = self.reg_of(*lhs);

@@ -70,8 +70,7 @@ pub(crate) fn try_emit_scan_query(
     let limit_ctx = t_ctx.limit_ctx;
     let reg_offset = t_ctx.reg_offset;
 
-    if !plan.aggregates.is_empty()
-        || plan.group_by.is_some()
+    if plan.group_by.is_some()
         || !plan.order_by.is_empty()
         || plan.window.is_some()
         || !matches!(plan.distinctness, Distinctness::NonDistinct)
@@ -100,6 +99,59 @@ pub(crate) fn try_emit_scan_query(
         return Ok(false);
     }
 
+    // Ungrouped aggregation mode: the island becomes accumulate-per-row
+    // with a finalize block that emits the single result row (reached
+    // from both loop exhaustion and the empty-input edge — aggregate
+    // queries produce exactly one row even over zero rows). Per-row
+    // stepping and finalization are delegated to the eager aggregation
+    // helper through opaque effects, so every per-function argument
+    // shape stays in one place; the gates below pin the slice to what
+    // that delegation reproduces byte-for-byte: plain accumulators (no
+    // DISTINCT/FILTER/percentile pre-evaluation), every result column a
+    // bare reference to one aggregate, and no LIMIT/OFFSET (eager has
+    // dedicated skip logic for the single row).
+    let aggregate_mode = if plan.aggregates.is_empty() {
+        None
+    } else {
+        if plan.limit.is_some()
+            || plan.offset.is_some()
+            || t_ctx.reg_nonagg_emit_once_flag.is_some()
+        {
+            return Ok(false);
+        }
+        if plan.aggregates.iter().any(|agg| {
+            !matches!(
+                agg.distinctness,
+                crate::translate::plan::Distinctness::NonDistinct
+            ) || agg.filter_expr.is_some()
+                || agg.fraction_reg.is_some()
+        }) {
+            return Ok(false);
+        }
+        let mut column_accumulators = Vec::with_capacity(plan.result_columns.len());
+        for result_column in &plan.result_columns {
+            // Array-typed aggregate results (array_agg) need the eager
+            // IsNull/ArrayDecode presentation step after the copy;
+            // custom types stay on the eager path.
+            if crate::translate::expr::expr_is_array(
+                &result_column.expr,
+                Some(&plan.table_references),
+            ) {
+                return Ok(false);
+            }
+            let Some(index) = plan.aggregates.iter().position(|agg| {
+                crate::util::exprs_are_equivalent(&result_column.expr, &agg.original_expr)
+            }) else {
+                return Ok(false);
+            };
+            column_accumulators.push(index);
+        }
+        let Some(agg_start) = t_ctx.reg_agg_start else {
+            return Ok(false);
+        };
+        Some((column_accumulators, agg_start))
+    };
+
     // Describe every WHERE term and result column before emitting
     // anything. Collation effects fold in eager emission order:
     // conditions run in the loop body before the projection.
@@ -108,7 +160,7 @@ pub(crate) fn try_emit_scan_query(
         resolver: Some(resolver),
     };
     let mut effect = expr::CollationEffect::Untouched;
-    let mut filter: Option<combine::Predicate<'_>> = None;
+    let mut predicates: Vec<combine::Predicate<'_>> = Vec::new();
     for term in &plan.where_clause {
         if term.consumed {
             continue;
@@ -139,20 +191,26 @@ pub(crate) fn try_emit_scan_query(
         if let expr::CollationEffect::Sets(collation) = built.effect {
             effect = expr::CollationEffect::Sets(collation);
         }
-        filter = Some(match filter {
-            Some(previous) => previous.and(built.predicate),
-            None => built.predicate,
-        });
+        predicates.push(built.predicate);
     }
+    // Fold the terms from the right so each one's continuation block is
+    // created in evaluation order — the linear fallthrough chain the
+    // eager loop body emits (see compile_condition_chain).
+    let filter = predicates
+        .into_iter()
+        .rev()
+        .reduce(|rest, term| term.and(rest));
     let mut columns = Vec::with_capacity(plan.result_columns.len());
-    for result_column in &plan.result_columns {
-        let Some(built) = compile_value_expr(&result_column.expr, &build_ctx)? else {
-            return Ok(false);
-        };
-        if let expr::CollationEffect::Sets(collation) = built.effect {
-            effect = expr::CollationEffect::Sets(collation);
+    if aggregate_mode.is_none() {
+        for result_column in &plan.result_columns {
+            let Some(built) = compile_value_expr(&result_column.expr, &build_ctx)? else {
+                return Ok(false);
+            };
+            if let expr::CollationEffect::Sets(collation) = built.effect {
+                effect = expr::CollationEffect::Sets(collation);
+            }
+            columns.push(built.compiler);
         }
-        columns.push(built.compiler);
     }
 
     // Cursors were opened by InitLoop; a plain scan iterates the table
@@ -180,6 +238,141 @@ pub(crate) fn try_emit_scan_query(
         (Some(_), None) => return Ok(false),
         (None, _) => None,
     };
+
+    if let Some((column_accumulators, agg_start)) = aggregate_mode {
+        // Two islands with the caller's after_main_loop_label bound
+        // between them: the accumulation loop, then finalization. The
+        // label placement is load-bearing — InitLoop's before-loop
+        // terms (e.g. a constant-false WHERE) jump to it expecting the
+        // finalization to still run, because aggregate queries produce
+        // exactly one row even over zero rows. The loop island's empty
+        // edge and exhaustion edge leave through the same exit onto
+        // that label, mirroring eager's Rewind-to-AggFinal jump.
+        let loop_end = program.allocate_label();
+        let mut builder = ir::FuncBuilder::new();
+        let cursor = builder.declare_cursor();
+        let done_exit = builder.declare_exit();
+        let done = builder.exit_block(done_exit);
+        let body = builder.create_block();
+        let pass = filter.is_some().then(|| builder.create_block());
+        let latch = builder.create_block();
+        builder.scan_start(
+            cursor,
+            direction,
+            ir::JumpTarget::new(done, Vec::new()),
+            ir::JumpTarget::new(body, Vec::new()),
+        );
+        builder.switch_to(body);
+        if let Some(filter) = filter {
+            let pass = pass.expect("pass block exists whenever a filter does");
+            filter.run(
+                &mut builder,
+                combine::CondTargets {
+                    if_true: pass,
+                    if_false: latch,
+                    if_null: latch,
+                },
+            )?;
+            builder.switch_to(pass);
+        }
+        for index in 0..plan.aggregates.len() {
+            builder.agg_step(index);
+        }
+        builder.jump(latch, Vec::new());
+        builder.switch_to(latch);
+        builder.scan_advance(
+            cursor,
+            direction,
+            ir::JumpTarget::new(body, Vec::new()),
+            ir::JumpTarget::new(done, Vec::new()),
+        );
+        let loop_func = builder.finish();
+
+        let fallthrough = program.allocate_label();
+        let mut builder = ir::FuncBuilder::new();
+        let finalize_exit = builder.declare_exit();
+        let finalize_done = builder.exit_block(finalize_exit);
+        for index in 0..plan.aggregates.len() {
+            builder.agg_final(index);
+        }
+        let values = column_accumulators
+            .iter()
+            .map(|&index| builder.external(agg_start + index))
+            .collect();
+        builder.emit_row(values);
+        builder.jump(finalize_done, Vec::new());
+        let func = builder.finish();
+
+        let mut emit_leaf =
+            |program: &mut ProgramBuilder, leaf: &turso_parser::ast::Expr, dest: usize| {
+                crate::translate::expr::translate_expr(
+                    program,
+                    Some(&plan.table_references),
+                    leaf,
+                    dest,
+                    resolver,
+                )
+                .map(|_| ())
+            };
+        let mut emit_agg = |program: &mut ProgramBuilder,
+                            phase: emit::AggPhase,
+                            index: usize|
+         -> Result<()> {
+            let agg = &plan.aggregates[index];
+            let acc_reg = agg_start + index;
+            match phase {
+                emit::AggPhase::Step => crate::translate::aggregation::translate_aggregation_step(
+                    program,
+                    &plan.table_references,
+                    crate::translate::aggregation::AggArgumentSource::new_from_expression(
+                        &agg.func,
+                        &agg.args,
+                        &agg.distinctness,
+                    ),
+                    acc_reg,
+                    resolver,
+                    None,
+                )
+                .map(|_| ()),
+                emit::AggPhase::Final => {
+                    program.emit_insn(crate::vdbe::insn::Insn::AggFinal {
+                        register: acc_reg,
+                        func: crate::function::AccumulatorFunc::Agg(agg.func.clone()),
+                    });
+                    Ok(())
+                }
+            }
+        };
+        emit::emit_condition_function(
+            program,
+            &loop_func,
+            &[loop_end],
+            &[physical_cursor],
+            None,
+            Some(loop_end),
+            Some(&mut emit_leaf),
+            Some(&mut emit_agg),
+        )?;
+        program.preassign_label_to_next_insn(loop_end);
+        program.preassign_label_to_next_insn(
+            t_ctx
+                .label_main_loop_end
+                .expect("emit_query allocates the main-loop end label"),
+        );
+        emit::emit_condition_function(
+            program,
+            &func,
+            &[fallthrough],
+            &[],
+            t_ctx.reg_result_cols_start,
+            Some(fallthrough),
+            Some(&mut emit_leaf),
+            Some(&mut emit_agg),
+        )?;
+        program.preassign_label_to_next_insn(fallthrough);
+        effect.apply(program);
+        return Ok(true);
+    }
 
     // The scan_loop shape with optional filter and offset stages
     // spliced between the scan and the projection: rows failing (or
@@ -278,8 +471,14 @@ pub(crate) fn try_emit_scan_query(
         t_ctx.reg_result_cols_start,
         Some(fallthrough),
         Some(&mut emit_leaf),
+        None,
     )?;
     program.preassign_label_to_next_insn(fallthrough);
+    program.preassign_label_to_next_insn(
+        t_ctx
+            .label_main_loop_end
+            .expect("emit_query allocates the main-loop end label"),
+    );
     // The collation post-state the eager body would have left behind.
     effect.apply(program);
     Ok(true)
@@ -370,6 +569,7 @@ pub(crate) fn emit_condition(
         None,
         Some(fallthrough),
         leaf_emitter,
+        None,
     )?;
     program.preassign_label_to_next_insn(fallthrough);
     Ok(())
@@ -1605,6 +1805,7 @@ mod tests {
             None,
             Some(fallthrough),
             Some(&mut leaf_emitter),
+            None,
         )
         .unwrap();
         program.preassign_label_to_next_insn(fallthrough);
@@ -1623,6 +1824,91 @@ mod tests {
             panic!("unexpected scan shape: {insns:?}");
         };
         assert_eq!(leaf_dest, start_reg);
+    }
+
+    #[test]
+    fn aggregate_islands_delegate_steps_and_finals_in_block_order() {
+        // The ungrouped-aggregation shape try_emit_scan_query builds:
+        // accumulate per row in the body, finalize after the loop, and
+        // emit the one result row from accumulator externals. Both the
+        // empty-input edge and loop exhaustion land in the finalize
+        // block. The aggregate emitter is called Step-per-row-per-agg
+        // and Final-once-per-agg, in block order; this test's emitter
+        // records each call as a distinctive Integer marker.
+        let mut builder = FuncBuilder::new();
+        let cursor = builder.declare_cursor();
+        let done_exit = builder.declare_exit();
+        let done = builder.exit_block(done_exit);
+        let body = builder.create_block();
+        let latch = builder.create_block();
+        let finalize = builder.create_block();
+        builder.rewind(
+            cursor,
+            JumpTarget::new(finalize, Vec::new()),
+            JumpTarget::new(body, Vec::new()),
+        );
+        builder.switch_to(body);
+        builder.agg_step(0);
+        builder.agg_step(1);
+        builder.jump(latch, Vec::new());
+        builder.switch_to(latch);
+        builder.next_row(
+            cursor,
+            JumpTarget::new(body, Vec::new()),
+            JumpTarget::new(finalize, Vec::new()),
+        );
+        builder.switch_to(finalize);
+        builder.agg_final(0);
+        builder.agg_final(1);
+        let first_acc = builder.external(41);
+        let second_acc = builder.external(42);
+        builder.emit_row(vec![first_acc, second_acc]);
+        builder.jump(done, Vec::new());
+        let func = builder.finish();
+        verify(&func).unwrap();
+
+        let mut program = test_program();
+        let fallthrough = program.allocate_label();
+        let mut emit_agg =
+            |program: &mut ProgramBuilder, phase: emit::AggPhase, index: usize| -> Result<()> {
+                let marker = match phase {
+                    emit::AggPhase::Step => 100 + index as i64,
+                    emit::AggPhase::Final => 200 + index as i64,
+                };
+                program.emit_insn(Insn::Integer {
+                    value: marker,
+                    dest: 0,
+                });
+                Ok(())
+            };
+        emit::emit_condition_function(
+            &mut program,
+            &func,
+            &[fallthrough],
+            &[3],
+            None,
+            Some(fallthrough),
+            None,
+            Some(&mut emit_agg),
+        )
+        .unwrap();
+        program.preassign_label_to_next_insn(fallthrough);
+        program.resolve_labels().unwrap();
+        let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
+        // Steps in the loop body, finals after Next, externals copied
+        // into the row pack — and Rewind's empty edge jumps to the
+        // finalize block, not past the island.
+        let [Insn::Rewind {
+            cursor_id: 3,
+            pc_if_empty,
+        }, Insn::Integer { value: 100, .. }, Insn::Integer { value: 101, .. }, Insn::Next { cursor_id: 3, .. }, Insn::Integer { value: 200, .. }, Insn::Integer { value: 201, .. }, Insn::Copy { src_reg: 41, .. }, Insn::Copy { src_reg: 42, .. }, Insn::ResultRow { count: 2, .. }] =
+            insns[..]
+        else {
+            panic!("unexpected aggregate island shape: {insns:?}");
+        };
+        // The empty edge lands on the first finalize instruction (the
+        // 200 marker at offset 4).
+        assert_eq!(pc_if_empty.as_offset_int(), 4);
     }
 
     #[test]
@@ -1686,6 +1972,7 @@ mod tests {
             None,
             Some(fallthrough),
             Some(&mut leaf_emitter),
+            None,
         )
         .unwrap();
         program.preassign_label_to_next_insn(fallthrough);
@@ -1751,6 +2038,7 @@ mod tests {
             None,
             Some(fallthrough),
             Some(&mut leaf_emitter),
+            None,
         )
         .unwrap();
         program.preassign_label_to_next_insn(fallthrough);
@@ -1813,6 +2101,7 @@ mod tests {
             None,
             Some(fallthrough),
             Some(&mut leaf_emitter),
+            None,
         )
         .unwrap();
         program.preassign_label_to_next_insn(fallthrough);
@@ -1874,6 +2163,7 @@ mod tests {
             None,
             Some(fallthrough),
             Some(&mut leaf_emitter),
+            None,
         )
         .unwrap();
         program.preassign_label_to_next_insn(fallthrough);

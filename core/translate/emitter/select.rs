@@ -243,7 +243,10 @@ pub fn emit_query<'a>(
     // described pipeline (scan -> projection -> result rows) instead of
     // the eager OpenLoop/LoopBody/CloseLoop sequencing below.
     if crate::translate::compiler::try_emit_scan_query(program, plan, t_ctx)? {
-        program.preassign_label_to_next_insn(after_main_loop_label);
+        // The hook binds after_main_loop_label itself: for aggregate
+        // plans it must land on the finalization section (before-loop
+        // terms jump there and still expect one result row), not after
+        // the island.
         return Ok(t_ctx.reg_result_cols_start.unwrap());
     }
 
