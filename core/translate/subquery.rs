@@ -504,7 +504,7 @@ pub fn plan_subqueries_from_returning(
 
 /// Plan subqueries in a trigger WHEN clause expression.
 /// The WHEN clause has no FROM clause, so there are no outer query references.
-/// NEW/OLD references should already be rewritten to Expr::Register before calling this.
+/// The binder has already resolved NEW/OLD references and bound every subquery.
 #[turso_macros::trace_stack]
 pub fn plan_subqueries_from_trigger_when_clause(
     program: &mut ProgramBuilder,
@@ -512,14 +512,8 @@ pub fn plan_subqueries_from_trigger_when_clause(
     expr: &mut ast::Expr,
     resolver: &Resolver,
     connection: &Arc<Connection>,
+    bound_subqueries: &mut HashMap<ast::TableInternalId, crate::translate::bind::BoundSubquery>,
 ) -> Result<()> {
-    // Bind the WHEN clause's subqueries up front (NEW/OLD references were
-    // already rewritten to registers by the trigger machinery), then plan
-    // them through the bound path like every other subquery.
-    let mut bound_subqueries = {
-        let mut binder = crate::translate::bind::BindContext::new(resolver, program);
-        binder.bind_trigger_when_subqueries(expr)?
-    };
     let mut table_references = TableReferences::new(vec![], vec![]);
     plan_subqueries_with_outer_query_access(
         program,
@@ -531,7 +525,7 @@ pub fn plan_subqueries_from_trigger_when_clause(
         SubqueryPosition::Where,
         SubqueryOrigin::TriggerWhen,
         false,
-        &mut bound_subqueries,
+        bound_subqueries,
     )
 }
 

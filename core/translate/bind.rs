@@ -10,7 +10,7 @@ use super::emitter::Resolver;
 use super::expr::{walk_expr, walk_expr_mut, WalkControl};
 use super::plan::{JoinInfo, TableReferences};
 use super::planner::parse_row_id;
-use crate::schema::Table;
+use crate::schema::{BTreeTable, Table};
 use crate::util::normalize_ident;
 use crate::Result;
 
@@ -1593,6 +1593,15 @@ pub struct BindContext<'a, G: IdGenerator> {
     /// resolves to the recursive input table instead of raising a circular
     /// reference.
     recursive_self: Option<RecursiveSelfRef>,
+
+    /// NEW/OLD values visible while binding a trigger WHEN clause.
+    trigger_columns: Option<TriggerColumnBindings>,
+}
+
+struct TriggerColumnBindings {
+    table: Arc<BTreeTable>,
+    new_registers: Option<Vec<usize>>,
+    old_registers: Option<Vec<usize>>,
 }
 
 impl<'a, G: IdGenerator> BindContext<'a, G> {
@@ -1613,6 +1622,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             shared_subqueries: Vec::new(),
             derived_bindings: HashMap::default(),
             recursive_self: None,
+            trigger_columns: None,
         }
     }
 
@@ -3507,6 +3517,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     }
 
     fn bind_identifier(&mut self, expr: &mut ast::Expr, scope: &BindScope) -> Result<()> {
+        if self.bind_trigger_column(expr)? {
+            return Ok(());
+        }
+
         match expr {
             ast::Expr::Id(id) => {
                 let resolved = match self.phase() {
@@ -3780,6 +3794,58 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 Ok(WalkControl::Continue)
             });
         }
+    }
+
+    fn bind_trigger_column(&self, expr: &mut ast::Expr) -> Result<bool> {
+        let Some(bindings) = &self.trigger_columns else {
+            return Ok(false);
+        };
+        let (namespace, column) = match expr {
+            ast::Expr::Qualified(namespace, column)
+            | ast::Expr::DoublyQualified(_, namespace, column) => (
+                normalize_ident(namespace.as_str()),
+                normalize_ident(column.as_str()),
+            ),
+            _ => return Ok(false),
+        };
+
+        let registers = if namespace.eq_ignore_ascii_case("new") {
+            bindings.new_registers.as_deref().ok_or_else(|| {
+                crate::LimboError::ParseError(
+                    "NEW references are only valid in INSERT and UPDATE triggers".to_string(),
+                )
+            })?
+        } else if namespace.eq_ignore_ascii_case("old") {
+            bindings.old_registers.as_deref().ok_or_else(|| {
+                crate::LimboError::ParseError(
+                    "OLD references are only valid in UPDATE and DELETE triggers".to_string(),
+                )
+            })?
+        } else {
+            return Ok(false);
+        };
+
+        let register = if let Some((index, column_definition)) = bindings.table.get_column(&column)
+        {
+            if column_definition.is_rowid_alias() {
+                registers.last().copied()
+            } else {
+                registers.get(index).copied()
+            }
+        } else if super::planner::ROWID_STRS
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&column))
+        {
+            registers.last().copied()
+        } else {
+            None
+        };
+
+        let Some(register) = register else {
+            crate::bail_parse_error!("no such column in {}: {}", namespace.to_uppercase(), column);
+        };
+        *expr = ast::Expr::Register(register);
+        Ok(true)
     }
 
     /// Bind an expression, resolving column references against the given scope.
@@ -4610,20 +4676,24 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
     // ── Trigger WHEN binding ────────────────────────────────────────────
 
-    /// Bind the subquery expressions (EXISTS / scalar subquery / IN SELECT)
-    /// inside a trigger WHEN clause, replacing them with
-    /// [ast::Expr::SubqueryResult] nodes and returning the bound subqueries.
-    ///
-    /// The caller has already rewritten NEW/OLD references to registers, so
-    /// the subquery bodies contain only ordinary table/column references.
-    /// Non-subquery leaves at the top level (registers, literals, and the
-    /// double-quoted-string quirk) are intentionally left untouched — they
-    /// keep their translate-time behavior.
-    pub fn bind_trigger_when_subqueries(
+    /// Bind NEW/OLD references and subqueries in a trigger WHEN clause.
+    /// Non-subquery identifiers at the top level are intentionally left for
+    /// expression translation so the double-quoted-string quirk is preserved.
+    pub fn bind_trigger_when(
         &mut self,
         expr: &mut ast::Expr,
+        table: Arc<BTreeTable>,
+        new_registers: Option<&[usize]>,
+        old_registers: Option<&[usize]>,
     ) -> Result<HashMap<ast::TableInternalId, BoundSubquery>> {
-        self.with_query(|ctx| {
+        let saved_trigger_columns = self.trigger_columns.take();
+        self.trigger_columns = Some(TriggerColumnBindings {
+            table,
+            new_registers: new_registers.map(<[usize]>::to_vec),
+            old_registers: old_registers.map(<[usize]>::to_vec),
+        });
+
+        let result = self.with_query(|ctx| {
             let scope = BindScope::empty();
             ctx.with_phase(BindPhase::NoAliases, |ctx| {
                 walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
@@ -4634,12 +4704,48 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                             ctx.bind_expr(e, &scope)?;
                             Ok(WalkControl::SkipChildren)
                         }
+                        ast::Expr::Qualified(_, _) | ast::Expr::DoublyQualified(_, _, _) => {
+                            if !ctx.bind_trigger_column(e)? {
+                                let (namespace, column) = match e {
+                                    ast::Expr::Qualified(namespace, column)
+                                    | ast::Expr::DoublyQualified(_, namespace, column) => {
+                                        (namespace.as_str(), column.as_str())
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                crate::bail_parse_error!(
+                                    "no such column: {}.{}",
+                                    namespace,
+                                    column
+                                );
+                            }
+                            Ok(WalkControl::Continue)
+                        }
+                        ast::Expr::Id(name) => {
+                            let identifier = normalize_ident(name.as_str());
+                            let trigger_table = &ctx
+                                .trigger_columns
+                                .as_ref()
+                                .expect("trigger columns must be set")
+                                .table;
+                            if trigger_table.get_column(&identifier).is_some()
+                                || super::planner::ROWID_STRS
+                                    .iter()
+                                    .any(|name| name.eq_ignore_ascii_case(&identifier))
+                            {
+                                crate::bail_parse_error!("no such column: {}", identifier);
+                            }
+                            Ok(WalkControl::Continue)
+                        }
                         _ => Ok(WalkControl::Continue),
                     }
                 })
             })?;
             Ok(std::mem::take(&mut ctx.subquery_bindings))
-        })
+        });
+
+        self.trigger_columns = saved_trigger_columns;
+        result
     }
 
     // ── INSERT binding ──────────────────────────────────────────────────
