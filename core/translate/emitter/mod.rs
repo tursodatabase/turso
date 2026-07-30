@@ -153,9 +153,8 @@ pub struct Resolver<'a> {
     /// than redirecting column reads at codegen time.
     pub register_affinities: HashMap<usize, Affinity>,
     /// Maps register indices to declared column collations, the collation
-    /// counterpart of `register_affinities`: when column references are
-    /// rewritten to Expr::Register (UPSERT DO UPDATE WHERE/SET), comparisons
-    /// must still use the column's implicit collation per SQLite's rule 2.
+    /// counterpart of `register_affinities`, for paths that lower schema
+    /// expressions to Expr::Register before translation.
     pub register_collations: HashMap<usize, CollationSeq>,
     /// Affinity metadata for planned scalar subqueries keyed by their internal ID.
     /// This lets comparison affinity follow SQLite rules for expressions like

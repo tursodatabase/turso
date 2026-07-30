@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap as HashMap;
+use std::borrow::Cow;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -15,14 +15,13 @@ use crate::translate::fkeys::{
     ParentKeyNewProbeMode,
 };
 use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
-use crate::translate::plan::ColumnMask;
+use crate::translate::plan::{ColumnMask, OuterQueryReference};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
     fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
 };
 use crate::vdbe::insn::{to_u32, CmpInsFlags};
 use crate::{
-    bail_parse_error,
     error::SQLITE_CONSTRAINT_NOTNULL,
     schema::{Index, Schema, Table},
     translate::{
@@ -31,7 +30,7 @@ use crate::{
         },
         expr::{
             emit_returning_results, emit_table_column, translate_expr,
-            translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
+            translate_expr_no_constant_opt, NoConstantOptReason,
         },
         insert::Insertion,
         plan::{ResultSetColumn, TableReferences},
@@ -80,14 +79,13 @@ use crate::{CaptureDataChangesExt, Connection};
 // e.g. INSERT INTO x(a) ON CONFLICT  *(a COLLATE nocase)*
 #[derive(Debug, Clone)]
 pub struct ConflictTarget {
-    /// The normalized column name in question
-    col_name: String,
+    /// Bound column position in the target table.
+    column: usize,
     /// Possible collation name, normalized to lowercase
     collate: Option<String>,
 }
 
-// Extract `(column, optional_collate)` from an ON CONFLICT target Expr.
-// Accepts: Id, Qualified, DoublyQualified, Parenthesized, Collate
+// Extract `(column, optional_collate)` from a bound ON CONFLICT target.
 fn extract_conflict_target(e: &ast::Expr) -> Option<ConflictTarget> {
     match e {
         ast::Expr::Collate(inner, collation) => {
@@ -98,18 +96,10 @@ fn extract_conflict_target(e: &ast::Expr) -> Option<ConflictTarget> {
         }
         ast::Expr::Parenthesized(v) if v.len() == 1 => extract_conflict_target(&v[0]),
 
-        ast::Expr::Id(name) => Some(ConflictTarget {
-            col_name: normalize_ident(name.as_str()),
+        ast::Expr::Column { column, .. } => Some(ConflictTarget {
+            column: *column,
             collate: None,
         }),
-        // t.a or db.t.a: accept ident or quoted in the column position
-        ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
-            let cname = col.as_str();
-            Some(ConflictTarget {
-                col_name: normalize_ident(cname),
-                collate: None,
-            })
-        }
         _ => None,
     }
 }
@@ -151,15 +141,10 @@ pub fn upsert_matches_rowid_alias(upsert: &Upsert, table: &Table) -> bool {
         return false;
     }
     // Only treat as PK if the PK is the rowid alias (INTEGER PRIMARY KEY)
-    let pk = table.columns().iter().find(|c| c.is_rowid_alias());
-    if let Some(pkcol) = pk {
-        extract_conflict_target(&t.targets[0].expr).is_some_and(|tk| {
-            tk.col_name
-                .eq_ignore_ascii_case(pkcol.name.as_ref().unwrap_or(&String::new()))
-        })
-    } else {
-        false
-    }
+    let pk = table.columns().iter().position(|c| c.is_rowid_alias());
+    pk.is_some_and(|pk_column| {
+        extract_conflict_target(&t.targets[0].expr).is_some_and(|target| target.column == pk_column)
+    })
 }
 
 /// Returns array of chaned column indicies and whether rowid was changed.
@@ -258,73 +243,8 @@ fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) 
     });
 }
 
-fn bind_partial_index_where_expr(expr: &mut ast::Expr, table: &Table) {
-    let table_name = normalize_ident(table.get_name());
-
-    let _ = walk_expr_mut(
-        expr,
-        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-            match e {
-                ast::Expr::Id(name) => {
-                    if let Some((column, col)) =
-                        table.get_column_by_name(&normalize_ident(name.as_str()))
-                    {
-                        *e = ast::Expr::Column {
-                            database: None,
-                            table: ast::TableInternalId::SELF_TABLE,
-                            column,
-                            is_rowid_alias: col.is_rowid_alias(),
-                        };
-                    } else if ROWID_STRS
-                        .iter()
-                        .any(|rowid| rowid.eq_ignore_ascii_case(name.as_str()))
-                    {
-                        *e = ast::Expr::RowId {
-                            database: None,
-                            table: ast::TableInternalId::SELF_TABLE,
-                        };
-                    }
-                }
-                ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col)
-                    if normalize_ident(ns.as_str()).eq_ignore_ascii_case(&table_name) =>
-                {
-                    if let Some((column, table_col)) =
-                        table.get_column_by_name(&normalize_ident(col.as_str()))
-                    {
-                        *e = ast::Expr::Column {
-                            database: None,
-                            table: ast::TableInternalId::SELF_TABLE,
-                            column,
-                            is_rowid_alias: table_col.is_rowid_alias(),
-                        };
-                    } else if ROWID_STRS
-                        .iter()
-                        .any(|rowid| rowid.eq_ignore_ascii_case(col.as_str()))
-                    {
-                        *e = ast::Expr::RowId {
-                            database: None,
-                            table: ast::TableInternalId::SELF_TABLE,
-                        };
-                    }
-                }
-                _ => {}
-            }
-            Ok(WalkControl::Continue)
-        },
-    );
-}
-
-fn partial_index_where_clauses_match(
-    target_where: &ast::Expr,
-    index_where: &ast::Expr,
-    table: &Table,
-) -> bool {
-    let mut target_where = target_where.clone();
-    let mut index_where = index_where.clone();
-    // TODO: ideally we would have a binding step where we wouldn't need to do these ad-hoc bindings just to compare exprs
-    bind_partial_index_where_expr(&mut target_where, table);
-    bind_partial_index_where_expr(&mut index_where, table);
-    exprs_are_equivalent(&target_where, &index_where)
+fn partial_index_where_clauses_match(target_where: &ast::Expr, index_where: &ast::Expr) -> bool {
+    exprs_are_equivalent(target_where, index_where)
 }
 
 /// Match ON CONFLICT target to a UNIQUE index, *ignoring order* but requiring
@@ -339,7 +259,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
 
     let partial_index_predicate_matches = match (&index.where_clause, &target.where_clause) {
         (Some(index_where), Some(target_where)) => {
-            partial_index_where_clauses_match(target_where.as_ref(), index_where.as_ref(), table)
+            partial_index_where_clauses_match(target_where.as_ref(), index_where.as_ref())
         }
         (Some(_), None) => false,
         (None, _) => true,
@@ -359,15 +279,13 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
         let mut found = None;
 
         if let Some(conflict_target) = extract_conflict_target(&te.expr) {
-            // Simple column reference target: match by name and collation.
-            let tname = &conflict_target.col_name;
+            // Simple column reference target: match by position and collation.
             for (i, ic) in index.columns.iter().enumerate() {
                 if matched.get(i) || ic.expr.is_some() {
                     continue;
                 }
-                let iname = normalize_ident(&ic.name);
                 let icoll = effective_collation_for_index_col(ic, table);
-                if tname.eq_ignore_ascii_case(&iname)
+                if conflict_target.column == ic.pos_in_table
                     && match conflict_target.collate.as_ref() {
                         Some(c) => c.eq_ignore_ascii_case(&icoll),
                         None => true, // unspecified collation -> accept any
@@ -379,13 +297,9 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
             }
         } else {
             // Expression target (e.g. lower(val)): match against expression index
-            // columns using semantic equivalence. Index expressions are stored
-            // with column references pre-resolved to SELF_TABLE form, so bind
-            // the target expression the same way before comparing.
+            // columns using semantic equivalence. Both sides were bound to
+            // SELF_TABLE before planning.
             let (target_expr, target_collate) = extract_target_expr(&te.expr);
-            let mut target_expr = target_expr.clone();
-            bind_partial_index_where_expr(&mut target_expr, table);
-            let target_expr = &target_expr;
             for (i, ic) in index.columns.iter().enumerate() {
                 if matched.get(i) {
                     continue;
@@ -466,9 +380,8 @@ pub fn resolve_upsert_target(
 /// 1. Seek to the conflicting row by rowid and load the current row snapshot
 ///    into a contiguous set of registers.
 /// 2. Optionally duplicate CURRENT into BEFORE* (for index rebuild and CDC).
-/// 3. Copy CURRENT into NEW, then evaluate SET expressions into NEW,
-///    with all references to the target table columns rewritten to read from
-///    the CURRENT registers (per SQLite semantics).
+/// 3. Copy CURRENT into NEW, then evaluate SET expressions into NEW, mapping
+///    bound target-table columns to the CURRENT registers (per SQLite semantics).
 /// 4. Enforce NOT NULL constraints and (if STRICT) type checks on NEW.
 /// 5. Rebuild indexes (delete keys using BEFORE, insert keys using NEW).
 /// 6. Rewrite the table row payload at the same rowid with NEW.
@@ -486,6 +399,7 @@ pub fn emit_upsert(
     insertion: &Insertion,
     set_pairs: &mut [(usize, Box<ast::Expr>)],
     where_clause: &mut Option<Box<ast::Expr>>,
+    excluded_table_id: ast::TableInternalId,
     resolver: &mut Resolver,
     returning: &mut [ResultSetColumn],
     connection: &Arc<Connection>,
@@ -604,116 +518,174 @@ pub fn emit_upsert(
     // otherwise fall back to current_start (already decoded or non-custom-type).
     let expr_current_start = decoded_current_start.unwrap_or(current_start);
 
-    // rewrite_expr_to_registers turns column references into bare
-    // Expr::Register nodes, which lose the column's affinity and implicit
-    // collation. Comparisons in the WHERE/SET expressions must still apply
-    // them (`int_col < '2'` compares numerically, a NOCASE column compares
-    // case-insensitively), so record both per register for the conflicting
-    // row image and its rowid. The excluded (insertion) registers are
-    // already recorded by the enclosing INSERT translation, except for the
-    // decoded copies made for STRICT custom-type tables. Cleared wholesale
-    // at the end of the enclosing INSERT translation.
-    for (idx, col) in table.columns().iter().enumerate() {
-        if col.is_rowid_alias() {
-            // The rewrite maps rowid-alias references to conflict_rowid_reg;
-            // the image register for the alias column is never referenced.
-            continue;
-        }
-        let reg = layout.to_register(expr_current_start, idx);
-        resolver.register_affinities.insert(reg, col.affinity());
-        resolver.register_collations.insert(reg, col.collation());
-        if let Some(decoded_start) = excluded_decoded_start {
-            let excluded_reg = layout.to_register(decoded_start, idx);
-            resolver
-                .register_affinities
-                .insert(excluded_reg, col.affinity());
-            resolver
-                .register_collations
-                .insert(excluded_reg, col.collation());
-        }
-    }
-    resolver
-        .register_affinities
-        .insert(ctx.conflict_rowid_reg, Affinity::Integer);
+    let mut upsert_expr_tables = table_references.clone();
+    upsert_expr_tables.add_outer_query_reference(OuterQueryReference {
+        identifier: "excluded".to_string(),
+        internal_id: excluded_table_id,
+        table: table.clone(),
+        using_dedup_hidden_cols: ColumnMask::default(),
+        col_used_mask: Default::default(),
+        cte_definition_only: false,
+        rowid_referenced: true,
+        scope_depth: 0,
+    });
 
-    // WHERE on target row
-    if let Some(pred) = where_clause.as_mut() {
-        rewrite_expr_to_registers(
-            pred,
-            table,
-            expr_current_start,
-            ctx.conflict_rowid_reg,
-            Some(table.get_name()),
-            Some(insertion),
-            true,
-            excluded_decoded_start,
-            &layout,
-        )?;
-        let pr = program.alloc_register();
-        translate_expr(program, None, pred, pr, resolver)?;
-        program.emit_insn(Insn::IfNot {
-            reg: pr,
-            target_pc: ctx.loop_labels.row_done,
-            jump_if_null: true,
-        });
-    }
-
-    // Apply SET; capture rowid change if any
-    let mut new_rowid_reg: Option<usize> = None;
-    for (col_idx, expr) in set_pairs.iter_mut() {
-        rewrite_expr_to_registers(
-            expr,
-            table,
-            expr_current_start,
-            ctx.conflict_rowid_reg,
-            Some(table.get_name()),
-            Some(insertion),
-            true,
-            excluded_decoded_start,
-            &layout,
-        )?;
-        // Save/restore target_union_type so union_value() resolves tags
-        // against this column's union type. See ProgramBuilder::target_union_type.
-        let col = &table.columns()[*col_idx];
-        let union_td = resolver
-            .schema()
-            .get_type_def_unchecked(&col.ty_str)
-            .filter(|td| td.is_union())
-            .cloned();
-        let prev_union = program.target_union_type.take();
-        program.target_union_type = union_td;
-        let translate_result = translate_expr_no_constant_opt(
-            program,
-            None,
-            expr,
-            layout.to_register(new_start, *col_idx),
-            resolver,
-            NoConstantOptReason::RegisterReuse,
+    // Binding gave current-row and EXCLUDED references stable table IDs.
+    // Map those bound leaves to the row-image registers without changing the
+    // expression tree. This keeps column affinity and collation available
+    // through TableReferences during expression translation.
+    let initial_cache_size = resolver.expr_to_reg_cache.len();
+    let cache_was_enabled = resolver.expr_to_reg_cache_enabled;
+    resolver.enable_expr_to_reg_cache();
+    resolver.cache_expr_reg(
+        Cow::Owned(ast::Expr::RowId {
+            database: None,
+            table: table_ref_id,
+        }),
+        ctx.conflict_rowid_reg,
+        false,
+        None,
+    );
+    resolver.cache_expr_reg(
+        Cow::Owned(ast::Expr::RowId {
+            database: Some(ctx.database_id),
+            table: table_ref_id,
+        }),
+        ctx.conflict_rowid_reg,
+        false,
+        None,
+    );
+    resolver.cache_expr_reg(
+        Cow::Owned(ast::Expr::RowId {
+            database: None,
+            table: excluded_table_id,
+        }),
+        insertion.key_register(),
+        false,
+        None,
+    );
+    for (column_index, column) in table.columns().iter().enumerate() {
+        let current_register = if column.is_rowid_alias() {
+            ctx.conflict_rowid_reg
+        } else {
+            layout.to_register(expr_current_start, column_index)
+        };
+        let excluded_register = if column.is_rowid_alias() {
+            insertion.key_register()
+        } else if let Some(decoded_start) = excluded_decoded_start {
+            layout.to_register(decoded_start, column_index)
+        } else {
+            insertion
+                .get_col_mapping_by_name(column.name.as_deref().unwrap_or_default())
+                .ok_or_else(|| {
+                    crate::LimboError::PlanningError(format!(
+                        "missing EXCLUDED register for column {}",
+                        column.name.as_deref().unwrap_or("<unnamed>")
+                    ))
+                })?
+                .register
+        };
+        let collation = Some((column.collation(), false));
+        resolver.cache_expr_reg(
+            Cow::Owned(ast::Expr::Column {
+                database: None,
+                table: table_ref_id,
+                column: column_index,
+                is_rowid_alias: column.is_rowid_alias(),
+            }),
+            current_register,
+            false,
+            collation,
         );
-        program.target_union_type = prev_union;
-        translate_result?;
-        if col.notnull() && !col.is_rowid_alias() {
-            program.emit_insn(Insn::HaltIfNull {
-                target_reg: layout.to_register(new_start, *col_idx),
-                err_code: SQLITE_CONSTRAINT_NOTNULL,
-                description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
-            });
-        }
-        if col.is_rowid_alias() {
-            // Must be integer; remember the NEW rowid value
-            let r = program.alloc_register();
-            program.emit_insn(Insn::Copy {
-                src_reg: layout.to_register(new_start, *col_idx),
-                dst_reg: r,
-                extra_amount: 0,
-            });
-            program.emit_insn(Insn::MustBeInt {
-                reg: r,
-                target_pc: None,
-            });
-            new_rowid_reg = Some(r);
-        }
+        resolver.cache_expr_reg(
+            Cow::Owned(ast::Expr::Column {
+                database: Some(ctx.database_id),
+                table: table_ref_id,
+                column: column_index,
+                is_rowid_alias: column.is_rowid_alias(),
+            }),
+            current_register,
+            false,
+            collation,
+        );
+        resolver.cache_expr_reg(
+            Cow::Owned(ast::Expr::Column {
+                database: None,
+                table: excluded_table_id,
+                column: column_index,
+                is_rowid_alias: column.is_rowid_alias(),
+            }),
+            excluded_register,
+            false,
+            collation,
+        );
     }
+
+    let expression_result = (|| -> crate::Result<Option<usize>> {
+        if let Some(pred) = where_clause.as_mut() {
+            let predicate_register = program.alloc_register();
+            translate_expr(
+                program,
+                Some(&upsert_expr_tables),
+                pred,
+                predicate_register,
+                resolver,
+            )?;
+            program.emit_insn(Insn::IfNot {
+                reg: predicate_register,
+                target_pc: ctx.loop_labels.row_done,
+                jump_if_null: true,
+            });
+        }
+
+        let mut new_rowid_reg = None;
+        for (column_index, expr) in set_pairs.iter_mut() {
+            let column = &table.columns()[*column_index];
+            let union_type = resolver
+                .schema()
+                .get_type_def_unchecked(&column.ty_str)
+                .filter(|type_def| type_def.is_union())
+                .cloned();
+            let previous_union_type = program.target_union_type.take();
+            program.target_union_type = union_type;
+            let translate_result = translate_expr_no_constant_opt(
+                program,
+                Some(&upsert_expr_tables),
+                expr,
+                layout.to_register(new_start, *column_index),
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            );
+            program.target_union_type = previous_union_type;
+            translate_result?;
+            if column.notnull() && !column.is_rowid_alias() {
+                program.emit_insn(Insn::HaltIfNull {
+                    target_reg: layout.to_register(new_start, *column_index),
+                    err_code: SQLITE_CONSTRAINT_NOTNULL,
+                    description: String::from(table.get_name())
+                        + "."
+                        + column.name.as_ref().unwrap(),
+                });
+            }
+            if column.is_rowid_alias() {
+                let register = program.alloc_register();
+                program.emit_insn(Insn::Copy {
+                    src_reg: layout.to_register(new_start, *column_index),
+                    dst_reg: register,
+                    extra_amount: 0,
+                });
+                program.emit_insn(Insn::MustBeInt {
+                    reg: register,
+                    target_pc: None,
+                });
+                new_rowid_reg = Some(register);
+            }
+        }
+        Ok(new_rowid_reg)
+    })();
+    resolver.expr_to_reg_cache.truncate(initial_cache_size);
+    resolver.expr_to_reg_cache_enabled = cache_was_enabled;
+    let new_rowid_reg = expression_result?;
 
     // Recompute virtual columns for the new row after SET clauses have modified base columns.
     // This must happen before CHECK constraints, triggers, and index updates.
@@ -1528,52 +1500,6 @@ pub fn emit_upsert(
     Ok(())
 }
 
-/// Normalize the `SET` clause into `(column_index, Expr)` pairs using table layout.
-///
-/// Supports multi-target row-value SETs: `SET (a, b) = (expr1, expr2)`.
-/// Enforces same number of column names and RHS values.
-/// If the same column is assigned multiple times, the last assignment wins.
-pub fn collect_set_clauses_for_upsert(
-    table: &Table,
-    set_items: &mut [ast::Set],
-) -> crate::Result<Vec<(usize, Box<ast::Expr>)>> {
-    let lookup: HashMap<String, usize> = table
-        .columns()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, c)| c.name.as_ref().map(|n| (n.to_lowercase(), i)))
-        .collect();
-
-    let mut out: Vec<(usize, Box<ast::Expr>)> = vec![];
-
-    for set in set_items {
-        let values: Vec<Box<ast::Expr>> = match set.expr.as_ref() {
-            ast::Expr::Parenthesized(v) => v.clone(),
-            e => vec![e.clone().into()],
-        };
-        if set.col_names.len() != values.len() {
-            bail_parse_error!(
-                "{} columns assigned {} values",
-                set.col_names.len(),
-                values.len()
-            );
-        }
-        for (cn, e) in set.col_names.iter().zip(values.into_iter()) {
-            let Some(idx) = lookup.get(&normalize_ident(cn.as_str())) else {
-                bail_parse_error!("no such column: {}", cn);
-            };
-            // cannot upsert generated column
-            table.columns()[*idx].ensure_not_generated("UPDATE", cn.as_str())?;
-            if let Some(existing) = out.iter_mut().find(|(i, _)| *i == *idx) {
-                existing.1 = e;
-            } else {
-                out.push((*idx, e));
-            }
-        }
-    }
-    Ok(out)
-}
-
 fn eval_partial_pred_for_row_image(
     prg: &mut ProgramBuilder,
     table: &Table,
@@ -1653,97 +1579,4 @@ fn emit_upsert_expr_index_value(
         dest_reg,
     )?;
     Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn rewrite_expr_to_registers(
-    e: &mut ast::Expr,
-    table: &Table,
-    base_start: usize,
-    rowid_reg: usize,
-    table_name: Option<&str>,
-    insertion: Option<&Insertion>,
-    allow_excluded: bool,
-    excluded_decoded_start: Option<usize>,
-    layout: &ColumnLayout,
-) -> crate::Result<WalkControl> {
-    use ast::Expr;
-    let table_name_norm = table_name.map(normalize_ident);
-
-    // Map a column name to a register within the row image at `base_start`.
-    let col_reg_from_row_image = |name: &str| -> Option<usize> {
-        if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
-            return Some(rowid_reg);
-        }
-        let (idx, c) = table.get_column_by_name(name)?;
-        if c.is_rowid_alias() {
-            Some(rowid_reg)
-        } else {
-            Some(base_start + layout.to_reg_offset(idx))
-        }
-    };
-
-    walk_expr_mut(
-        e,
-        &mut |expr: &mut ast::Expr| -> crate::Result<WalkControl> {
-            match expr {
-                Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
-                    let ns = normalize_ident(ns.as_str());
-                    let c = normalize_ident(c.as_str());
-                    // Handle EXCLUDED.* if enabled
-                    if allow_excluded && ns.eq_ignore_ascii_case("excluded") {
-                        if let Some(ins) = insertion {
-                            if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&c)) {
-                                *expr = Expr::Register(ins.key_register());
-                            } else if let Some(cm) = ins.get_col_mapping_by_name(&c) {
-                                // Use decoded excluded registers when available
-                                // to prevent double-encoding of custom type values
-                                if let Some(decoded_start) = excluded_decoded_start {
-                                    let (col_idx, _) =
-                                        table.get_column_by_name(&c).expect("column exists");
-                                    *expr = Expr::Register(
-                                        decoded_start + layout.to_reg_offset(col_idx),
-                                    );
-                                } else {
-                                    *expr = Expr::Register(cm.register);
-                                }
-                            } else {
-                                bail_parse_error!("no such column in EXCLUDED: {}", c);
-                            }
-                        }
-                        // If insertion is None, leave EXCLUDED.* untouched.
-                        return Ok(WalkControl::Continue);
-                    }
-
-                    // Match the target table namespace if provided
-                    if let Some(ref tn) = table_name_norm {
-                        if ns.eq_ignore_ascii_case(tn) {
-                            if let Some(r) = col_reg_from_row_image(&c) {
-                                *expr = Expr::Register(r);
-                            } else {
-                                bail_parse_error!("no such column: {}.{}", ns, c);
-                            }
-                            return Ok(WalkControl::Continue);
-                        }
-                    }
-
-                    // In UPSERT DO UPDATE context (allow_excluded=true), a qualified
-                    // reference that doesn't match the target table or EXCLUDED is
-                    // invalid. Return a graceful error instead of leaving it
-                    // unresolved (which would panic later in translate_expr).
-                    if allow_excluded {
-                        bail_parse_error!("no such column: {}.{}", ns, c);
-                    }
-                }
-                // Unqualified id -> row image (CURRENT/NEW depending on caller)
-                Expr::Id(name) => {
-                    if let Some(r) = col_reg_from_row_image(&normalize_ident(name.as_str())) {
-                        *expr = Expr::Register(r);
-                    }
-                }
-                _ => {}
-            }
-            Ok(WalkControl::Continue)
-        },
-    )
 }

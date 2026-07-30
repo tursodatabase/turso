@@ -66,37 +66,24 @@ pub trait BindTable {
 }
 
 /// Validate the identifier leaves of an expression that binds against no
-/// tables at all — single-row INSERT VALUES, UPSERT `DO UPDATE` (which
-/// resolves against the row image and EXCLUDED at emission), and
-/// recursive-CTE body LIMIT. Identifiers are an error (no
-/// double-quoted-string fallback — DQS never applied to scopeless
-/// expressions) unless `allow_unbound` leaves them for later resolution.
-fn bind_scopeless_expr(
-    expr: &mut ast::Expr,
-    resolver: &Resolver,
-    allow_unbound: bool,
-) -> Result<()> {
+/// tables at all, such as single-row INSERT VALUES and a recursive CTE's
+/// body-level LIMIT. DQS does not apply to these expressions.
+fn bind_scopeless_expr(expr: &mut ast::Expr, resolver: &Resolver) -> Result<()> {
     walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
         match expr {
             ast::Expr::Id(id) => {
-                if !allow_unbound {
-                    crate::bail_parse_error!("no such column: {}", id.as_str());
-                }
+                crate::bail_parse_error!("no such column: {}", id.as_str());
             }
             ast::Expr::Qualified(tbl, id) => {
-                if !allow_unbound {
-                    crate::bail_parse_error!("no such column: {}.{}", tbl.as_str(), id.as_str());
-                }
+                crate::bail_parse_error!("no such column: {}.{}", tbl.as_str(), id.as_str());
             }
             ast::Expr::DoublyQualified(db, tbl, id) => {
-                if !allow_unbound {
-                    crate::bail_parse_error!(
-                        "no such column: {}.{}.{}",
-                        db.as_str(),
-                        tbl.as_str(),
-                        id.as_str()
-                    );
-                }
+                crate::bail_parse_error!(
+                    "no such column: {}.{}.{}",
+                    db.as_str(),
+                    tbl.as_str(),
+                    id.as_str()
+                );
             }
             ast::Expr::FunctionCall { name, args, .. } => {
                 super::expr::validate_custom_type_function_call(name.as_str(), args, resolver)?;
@@ -768,32 +755,222 @@ fn validate_delete(
     Ok(table)
 }
 
+pub enum BoundUpsertDo {
+    Nothing,
+    Update {
+        sets: Vec<(usize, Box<ast::Expr>)>,
+        where_clause: Option<Box<ast::Expr>>,
+    },
+}
+
+pub type BoundUpsertAction = (
+    super::upsert::ResolvedUpsertTarget,
+    crate::vdbe::BranchOffset,
+    BoundUpsertDo,
+);
+
 /// Output of the statement-level bind phase for INSERT.
 ///
-/// INSERT's body binding is intentionally partial: single-row VALUES bind
-/// scope-less (there is no FROM clause), UPSERT `DO UPDATE` expressions
-/// defer full resolution to emission (they resolve against the target row
-/// image and EXCLUDED registers), and multi-row/SELECT sources bind when
-/// the source SELECT is planned. Virtual table inserts consume the unbound
-/// body.
+/// Single-row VALUES bind scope-less because they have no FROM clause.
+/// UPSERT conflict targets bind against the schema table and `DO UPDATE`
+/// expressions bind against the target row plus the EXCLUDED pseudo-table.
+/// Multi-row/SELECT sources bind when the source SELECT is planned. Virtual
+/// table inserts consume the unbound body.
 pub struct BoundInsert {
     #[allow(clippy::vec_box)]
     pub values: Vec<Box<ast::Expr>>,
-    pub upsert_actions: Vec<(
-        super::upsert::ResolvedUpsertTarget,
-        crate::vdbe::BranchOffset,
-        Box<ast::Upsert>,
-    )>,
+    pub upsert_actions: Vec<BoundUpsertAction>,
     pub inserting_multiple_rows: bool,
     /// Database the target table lives in (0 = main).
     pub database_id: usize,
     /// The validated target table.
     pub table: Arc<Table>,
+    /// ID used by bound references to the current target row.
+    pub target_table_id: ast::TableInternalId,
+    /// ID used by bound references to the would-be inserted row.
+    pub excluded_table_id: ast::TableInternalId,
+}
+
+fn upsert_scope_table(
+    identifier: String,
+    internal_id: ast::TableInternalId,
+    database_id: usize,
+    table: &Arc<Table>,
+) -> ScopeTable {
+    ScopeTable {
+        identifier,
+        internal_id,
+        source: ScopeTableSource::Table(Arc::clone(table)),
+        table: Arc::clone(table) as Arc<dyn BindTable>,
+        join_info: None,
+        database_id,
+        indexed: None,
+        bound_index_method_patterns: Vec::new(),
+    }
+}
+
+fn bind_upsert_conflict_target<G: IdGenerator>(
+    binder: &mut BindContext<'_, G>,
+    upsert: &mut ast::Upsert,
+    database_id: usize,
+    table: &Arc<Table>,
+) -> Result<()> {
+    let Some(target) = upsert.index.as_mut() else {
+        return Ok(());
+    };
+    let scope = BindScope {
+        tables: vec![upsert_scope_table(
+            normalize_ident(table.get_name()),
+            ast::TableInternalId::SELF_TABLE,
+            database_id,
+            table,
+        )],
+        right_join_swapped: false,
+    };
+    binder.with_phase(BindPhase::NoAliases, |binder| {
+        for target in &mut target.targets {
+            binder.bind_expr(&mut target.expr, &scope)?;
+        }
+        if let Some(where_clause) = target.where_clause.as_mut() {
+            binder.bind_expr(where_clause, &scope)?;
+        }
+        Ok(())
+    })?;
+
+    // Schema expressions use SELF_TABLE without a database qualifier. Keep
+    // conflict targets in that same canonical form before comparing them.
+    walk_expr_mut_in_upsert_target(target, &mut |expr| {
+        match expr {
+            ast::Expr::Column {
+                database, table, ..
+            }
+            | ast::Expr::RowId { database, table }
+                if table.is_self_table() =>
+            {
+                *database = None;
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+fn walk_expr_mut_in_upsert_target(
+    target: &mut ast::UpsertIndex,
+    visitor: &mut impl FnMut(&mut ast::Expr) -> Result<WalkControl>,
+) -> Result<()> {
+    for column in &mut target.targets {
+        walk_expr_mut(&mut column.expr, visitor)?;
+    }
+    if let Some(where_clause) = target.where_clause.as_mut() {
+        walk_expr_mut(where_clause, visitor)?;
+    }
+    Ok(())
+}
+
+fn collect_upsert_set_clauses(
+    table: &Table,
+    set_items: Vec<ast::Set>,
+) -> Result<Vec<(usize, Box<ast::Expr>)>> {
+    let lookup: HashMap<String, usize> = table
+        .columns()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| {
+            column
+                .name
+                .as_ref()
+                .map(|name| (name.to_lowercase(), index))
+        })
+        .collect();
+    let mut result = Vec::new();
+
+    for set in set_items {
+        let values = match *set.expr {
+            ast::Expr::Parenthesized(values) => values,
+            expr => vec![Box::new(expr)],
+        };
+        if set.col_names.len() != values.len() {
+            crate::bail_parse_error!(
+                "{} columns assigned {} values",
+                set.col_names.len(),
+                values.len()
+            );
+        }
+        for (name, expr) in set.col_names.iter().zip(values) {
+            let Some(index) = lookup.get(&normalize_ident(name.as_str())).copied() else {
+                crate::bail_parse_error!("no such column: {}", name);
+            };
+            table.columns()[index].ensure_not_generated("UPDATE", name.as_str())?;
+            if let Some(existing) = result
+                .iter_mut()
+                .find(|(existing_index, _)| *existing_index == index)
+            {
+                existing.1 = expr;
+            } else {
+                result.push((index, expr));
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn bind_upsert_do<G: IdGenerator>(
+    binder: &mut BindContext<'_, G>,
+    do_clause: ast::UpsertDo,
+    target_identifier: String,
+    target_table_id: ast::TableInternalId,
+    excluded_table_id: ast::TableInternalId,
+    database_id: usize,
+    table: &Arc<Table>,
+) -> Result<BoundUpsertDo> {
+    let ast::UpsertDo::Set {
+        sets,
+        mut where_clause,
+    } = do_clause
+    else {
+        return Ok(BoundUpsertDo::Nothing);
+    };
+    let mut sets = collect_upsert_set_clauses(table, sets)?;
+    let target_scope = BindScope {
+        tables: vec![upsert_scope_table(
+            target_identifier,
+            target_table_id,
+            database_id,
+            table,
+        )],
+        right_join_swapped: false,
+    };
+    let excluded_scope = BindScope {
+        tables: vec![upsert_scope_table(
+            "excluded".to_string(),
+            excluded_table_id,
+            database_id,
+            table,
+        )],
+        right_join_swapped: false,
+    };
+    #[expect(clippy::arc_with_non_send_sync)]
+    binder.append_outer_query_scope(Arc::new(excluded_scope), Arc::new(Vec::new()));
+    let bind_result = binder.with_phase(BindPhase::NoAliases, |binder| {
+        for (_, expr) in &mut sets {
+            binder.bind_expr(expr, &target_scope)?;
+        }
+        if let Some(where_clause) = where_clause.as_mut() {
+            binder.bind_expr(where_clause, &target_scope)?;
+        }
+        Ok(())
+    });
+    binder.pop_outer_query_scope();
+    bind_result?;
+
+    Ok(BoundUpsertDo::Update { sets, where_clause })
 }
 
 /// Bind an INSERT statement up front: validate the target table, resolve
-/// defaults in VALUES rows, bind single-row VALUES scope-less, and resolve
-/// UPSERT conflict targets.
+/// defaults in VALUES rows, bind single-row VALUES scope-less, and bind every
+/// UPSERT conflict target and action.
 #[turso_macros::trace_stack]
 pub fn bind_insert_stmt(
     tbl_name: &ast::QualifiedName,
@@ -822,16 +999,17 @@ pub fn bind_insert_stmt(
             inserting_multiple_rows: false,
             database_id,
             table,
+            target_table_id: program.table_reference_counter.next(),
+            excluded_table_id: program.table_reference_counter.next(),
         });
     }
 
+    let target_table_id = program.table_reference_counter.next();
+    let excluded_table_id = program.table_reference_counter.next();
+
     let mut values: Vec<Box<ast::Expr>> = vec![];
     let mut upsert: Option<Box<ast::Upsert>> = None;
-    let mut upsert_actions: Vec<(
-        super::upsert::ResolvedUpsertTarget,
-        crate::vdbe::BranchOffset,
-        Box<ast::Upsert>,
-    )> = Vec::new();
+    let mut upsert_actions: Vec<BoundUpsertAction> = Vec::new();
     let mut inserting_multiple_rows = false;
     match body {
         ast::InsertBody::DefaultValues => {
@@ -905,7 +1083,7 @@ pub fn bind_insert_stmt(
                                     }
                                     _ => {}
                                 }
-                                bind_scopeless_expr(expr, resolver, false)?;
+                                bind_scopeless_expr(expr, resolver)?;
                             }
                             values = values_expr.pop().unwrap_or_else(Vec::new);
                         }
@@ -928,28 +1106,29 @@ pub fn bind_insert_stmt(
     } else {
         program.set_resolve_type(on_conflict);
     }
+    let target_identifier =
+        normalize_ident(tbl_name.alias.as_ref().unwrap_or(&tbl_name.name).as_str());
     while let Some(mut upsert_opt) = upsert.take() {
-        if let ast::UpsertDo::Set {
-            ref mut sets,
-            ref mut where_clause,
-        } = &mut upsert_opt.do_clause
-        {
-            for set in sets.iter_mut() {
-                bind_scopeless_expr(&mut set.expr, resolver, true)?;
-            }
-            if let Some(ref mut where_expr) = where_clause {
-                bind_scopeless_expr(where_expr, resolver, true)?;
-            }
-        }
         let next = upsert_opt.next.take();
-        upsert_actions.push((
-            // resolve the constrained target for UPSERT in the chain
-            resolver.with_schema(database_id, |s| {
-                super::upsert::resolve_upsert_target(s, &table, &upsert_opt)
-            })?,
-            program.allocate_label(),
-            upsert_opt,
-        ));
+        let action_label = program.allocate_label();
+        let mut binder = BindContext::new(resolver, program);
+        bind_upsert_conflict_target(&mut binder, &mut upsert_opt, database_id, &table)?;
+        let resolved_target = binder.resolver.with_schema(database_id, |schema| {
+            super::upsert::resolve_upsert_target(schema, &table, &upsert_opt)
+        })?;
+        let bound_do = bind_upsert_do(
+            &mut binder,
+            upsert_opt.do_clause,
+            target_identifier.clone(),
+            target_table_id,
+            excluded_table_id,
+            database_id,
+            &table,
+        )?;
+        if !binder.subquery_bindings.is_empty() {
+            crate::bail_parse_error!("Subquery is not supported in this position");
+        }
+        upsert_actions.push((resolved_target, action_label, bound_do));
         upsert = next;
     }
     Ok(BoundInsert {
@@ -958,6 +1137,8 @@ pub fn bind_insert_stmt(
         inserting_multiple_rows,
         database_id,
         table,
+        target_table_id,
+        excluded_table_id,
     })
 }
 
@@ -2574,9 +2755,9 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 let entry = self.ctes.get_mut(&cte_name).unwrap();
                 entry.select.order_by.clear();
                 if let Some(limit) = entry.select.limit.as_mut() {
-                    bind_scopeless_expr(&mut limit.expr, resolver, false)?;
+                    bind_scopeless_expr(&mut limit.expr, resolver)?;
                     if let Some(offset) = limit.offset.as_mut() {
-                        bind_scopeless_expr(offset, resolver, false)?;
+                        bind_scopeless_expr(offset, resolver)?;
                     }
                 }
                 recursive_bindings.push((

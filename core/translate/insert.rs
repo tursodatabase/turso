@@ -1,3 +1,4 @@
+use super::bind::{BoundUpsertAction, BoundUpsertDo};
 use crate::schema::ColumnLayout;
 use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
 use crate::turso_debug_assert;
@@ -39,7 +40,7 @@ use crate::{
         trigger_exec::{
             fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
         },
-        upsert::{collect_set_clauses_for_upsert, emit_upsert, ResolvedUpsertTarget},
+        upsert::{emit_upsert, ResolvedUpsertTarget},
     },
     util::normalize_ident,
     vdbe::{
@@ -55,7 +56,7 @@ use std::num::NonZeroUsize;
 use turso_macros::turso_assert;
 use turso_parser::ast::{
     self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
-    TriggerTime, Upsert, UpsertDo, With,
+    TriggerTime, With,
 };
 
 pub struct TempTableCtx {
@@ -232,6 +233,8 @@ pub fn translate_insert(
         inserting_multiple_rows,
         database_id,
         table,
+        target_table_id,
+        excluded_table_id,
     } = super::bind::bind_insert_stmt(
         &tbl_name,
         &columns,
@@ -280,7 +283,7 @@ pub fn translate_insert(
                     .expect("we shouldn't have got here without a BTree table"),
             ),
             identifier: normalize_ident(table_name.as_str()),
-            internal_id: program.table_reference_counter.next(),
+            internal_id: target_table_id,
             op: Operation::default_scan_for(&table),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
@@ -1131,6 +1134,7 @@ pub fn translate_insert(
             &ctx,
             &insertion,
             &table,
+            excluded_table_id,
             &mut result_columns,
             connection,
             &mut table_references,
@@ -1149,7 +1153,7 @@ pub fn translate_insert(
         let has_triggers = has_before_triggers || has_after_triggers;
         let has_upsert_do_update = upsert_actions
             .iter()
-            .any(|(_, _, upsert)| matches!(upsert.do_clause, UpsertDo::Set { .. }));
+            .any(|(_, _, action)| matches!(action, BoundUpsertDo::Update { .. }));
         set_insert_stmt_journal_flags(
             program,
             resolver,
@@ -1539,39 +1543,34 @@ fn emit_rowid_generation(
 fn resolve_upserts(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
-    upsert_actions: &mut [(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
+    upsert_actions: &mut [BoundUpsertAction],
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
     table: &Table,
+    excluded_table_id: ast::TableInternalId,
     result_columns: &mut [ResultSetColumn],
     connection: &Arc<crate::Connection>,
     table_references: &mut TableReferences,
 ) -> Result<()> {
-    for (_, label, upsert) in upsert_actions {
+    for (_, label, action) in upsert_actions {
         program.preassign_label_to_next_insn(*label);
 
-        if let UpsertDo::Set {
-            ref mut sets,
-            ref mut where_clause,
-        } = upsert.do_clause
-        {
-            // Normalize SET pairs once
-            let mut rewritten_sets = collect_set_clauses_for_upsert(table, sets)?;
-
+        if let BoundUpsertDo::Update { sets, where_clause } = action {
             emit_upsert(
                 program,
                 table,
                 ctx,
                 insertion,
-                &mut rewritten_sets,
+                sets,
                 where_clause,
+                excluded_table_id,
                 resolver,
                 result_columns,
                 connection,
                 table_references,
             )?;
         } else {
-            // UpsertDo::Nothing case
+            // DO NOTHING case
             program.emit_insn(Insn::Goto {
                 target_pc: ctx.loop_labels.row_done,
             });
@@ -2859,14 +2858,14 @@ fn emit_unique_index_check(
         });
         // Conflict detected, figure out if this UPSERT handles the conflict
         if let Some(position) = position.or(upsert_catch_all) {
-            match &preflight.upsert_actions[position].2.do_clause {
-                UpsertDo::Nothing => {
+            match &preflight.upsert_actions[position].2 {
+                BoundUpsertDo::Nothing => {
                     // Bail out without writing anything
                     program.emit_insn(Insn::Goto {
                         target_pc: ctx.loop_labels.row_done,
                     });
                 }
-                UpsertDo::Set { .. } => {
+                BoundUpsertDo::Update { .. } => {
                     // Route to DO UPDATE: capture conflicting rowid then jump
                     program.emit_insn(Insn::IdxRowId {
                         cursor_id: idx_cursor_id,
@@ -3349,7 +3348,7 @@ struct ConstraintsToCheck {
 /// Context for preflight constraint checks
 struct PreflightCtx<'a, 'b> {
     /// UPSERT action handlers (target, label, upsert clause)
-    upsert_actions: &'a [(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
+    upsert_actions: &'a [BoundUpsertAction],
     /// Whether ON CONFLICT REPLACE is active globally (without UPSERT).
     /// This is true when the statement has INSERT OR REPLACE (applies to all constraints).
     on_replace: bool,
@@ -3365,7 +3364,7 @@ struct PreflightCtx<'a, 'b> {
 #[allow(clippy::too_many_arguments)]
 fn build_constraints_to_check(
     table_name: &str,
-    upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
+    upsert_actions: &[BoundUpsertAction],
     has_rowid: bool,
     has_user_provided_rowid: bool,
     resolver: &Resolver,
