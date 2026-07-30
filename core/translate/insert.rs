@@ -18,7 +18,7 @@ use crate::{
             bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
             process_returning_clause, restore_returning_row_image_in_cache,
             seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            walk_expr, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
+            walk_expr, NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
@@ -2052,13 +2052,7 @@ fn bind_insert(
                                     }
                                     _ => {}
                                 }
-                                bind_and_rewrite_expr(
-                                    expr,
-                                    None,
-                                    None,
-                                    resolver,
-                                    BindingBehavior::ResultColumnsNotAllowed,
-                                )?;
+                                bind_and_rewrite_expr(expr, None, resolver, false)?;
                             }
                             values = values_expr.pop().unwrap_or_else(Vec::new);
                         }
@@ -2088,22 +2082,10 @@ fn bind_insert(
         } = &mut upsert_opt.do_clause
         {
             for set in sets.iter_mut() {
-                bind_and_rewrite_expr(
-                    &mut set.expr,
-                    None,
-                    None,
-                    resolver,
-                    BindingBehavior::AllowUnboundIdentifiers,
-                )?;
+                bind_and_rewrite_expr(&mut set.expr, None, resolver, true)?;
             }
             if let Some(ref mut where_expr) = where_clause {
-                bind_and_rewrite_expr(
-                    where_expr,
-                    None,
-                    None,
-                    resolver,
-                    BindingBehavior::AllowUnboundIdentifiers,
-                )?;
+                bind_and_rewrite_expr(where_expr, None, resolver, true)?;
             }
         }
         let next = upsert_opt.next.take();

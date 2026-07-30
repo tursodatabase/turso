@@ -558,20 +558,12 @@ fn plan_subqueries_with_outer_query_access<'a>(
             .joined_tables()
             .iter()
             .map(|t| {
-                // Extract cte_id from FromClauseSubquery if this is a CTE reference
-                let cte_id = match &t.table {
-                    Table::FromClauseSubquery(subq) => subq.cte_id(),
-                    _ => None,
-                };
                 let outer_ref = OuterQueryReference {
                     table: t.table.clone(),
                     identifier: t.identifier.clone(),
                     internal_id: t.internal_id,
                     using_dedup_hidden_cols: t.using_dedup_hidden_cols()?,
                     col_used_mask: ColumnUsedMask::default(),
-                    cte_select: None,
-                    cte_explicit_columns: Vec::new(),
-                    cte_id,
                     cte_definition_only: false,
                     rowid_referenced: false,
                     scope_depth: 0,
@@ -585,9 +577,6 @@ fn plan_subqueries_with_outer_query_access<'a>(
                     internal_id: t.internal_id,
                     using_dedup_hidden_cols: t.using_dedup_hidden_cols.try_clone()?,
                     col_used_mask: ColumnUsedMask::default(),
-                    cte_select: t.cte_select.clone(),
-                    cte_explicit_columns: t.cte_explicit_columns.clone(),
-                    cte_id: t.cte_id, // Preserve CTE ID from outer query refs
                     cte_definition_only: t.cte_definition_only,
                     rowid_referenced: false,
                     scope_depth: t.scope_depth + 1,

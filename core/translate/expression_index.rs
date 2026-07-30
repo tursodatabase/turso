@@ -1,7 +1,5 @@
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{
-    bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
-};
+use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{ColumnUsedMask, JoinedTable, TableReferences};
 use crate::translate::planner::ROWID_STRS;
 use crate::Result;
@@ -100,13 +98,7 @@ pub fn expression_index_column_usage(
         binding_table.identifier.clone_from(&btree_table.name);
     }
     let mut binding_tables = TableReferences::new(vec![binding_table], vec![]);
-    bind_and_rewrite_expr(
-        &mut bound_expr,
-        Some(&mut binding_tables),
-        None,
-        resolver,
-        BindingBehavior::ResultColumnsNotAllowed,
-    )?;
+    bind_and_rewrite_expr(&mut bound_expr, Some(&mut binding_tables), resolver, false)?;
 
     Ok(single_table_column_usage(&bound_expr)
         .map(|(_, columns_mask)| columns_mask)

@@ -148,13 +148,7 @@ pub fn process_returning_clause(
             ast::ResultColumn::Expr(expr, alias) => {
                 // In bound mode the binder already resolved RETURNING exprs.
                 if !is_bound {
-                    bind_and_rewrite_expr(
-                        expr,
-                        Some(table_references),
-                        None,
-                        resolver,
-                        BindingBehavior::TryResultColumnsFirst,
-                    )?;
+                    bind_and_rewrite_expr(expr, Some(table_references), resolver, false)?;
                 }
 
                 let vec_size = expr_vector_size(expr)?;

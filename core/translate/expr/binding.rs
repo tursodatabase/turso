@@ -1,18 +1,5 @@
 use super::*;
 
-/// The precedence of binding identifiers to columns.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BindingBehavior {
-    /// `TryResultColumnsFirst` means that result columns (e.g. SELECT x AS y, ...) take precedence over canonical columns (e.g. SELECT x, y AS z, ...). This is the default behavior.
-    TryResultColumnsFirst,
-    /// `TryCanonicalColumnsFirst` means that canonical columns take precedence over result columns. This is used for e.g. WHERE clauses.
-    TryCanonicalColumnsFirst,
-    /// `ResultColumnsNotAllowed` means that referring to result columns is not allowed. This is used e.g. for DML statements.
-    ResultColumnsNotAllowed,
-    /// `AllowUnboundIdentifiers` means that unbound identifiers are allowed. This is used for INSERT ... ON CONFLICT DO UPDATE SET ... where binding is handled later than this phase.
-    AllowUnboundIdentifiers,
-}
-
 /// The result of resolving the `<id>` half of a qualified `<tbl>.<id>`
 /// reference against a single candidate table whose identifier already
 /// matches `<tbl>`.
@@ -73,14 +60,15 @@ pub(super) fn resolve_qualified_on_ref(
 
 /// Rewrite ast::Expr in place, binding Column references/rewriting Expr::Id -> Expr::Column
 /// using the provided TableReferences, and replacing anonymous parameters with internal named
-/// ones
+/// ones. With `allow_unbound`, identifiers that cannot be resolved are left
+/// as-is (INSERT ... ON CONFLICT DO UPDATE SET, where EXCLUDED refs bind
+/// later) instead of erroring.
 #[turso_macros::trace_stack]
-pub fn bind_and_rewrite_expr<'a>(
+pub fn bind_and_rewrite_expr(
     top_level_expr: &mut ast::Expr,
-    mut referenced_tables: Option<&'a mut TableReferences>,
-    result_columns: Option<&'a [ResultSetColumn]>,
+    mut referenced_tables: Option<&mut TableReferences>,
     resolver: &Resolver<'_>,
-    binding_behavior: BindingBehavior,
+    allow_unbound: bool,
 ) -> Result<()> {
     walk_expr_mut(
         top_level_expr,
@@ -89,25 +77,13 @@ pub fn bind_and_rewrite_expr<'a>(
                 Expr::Id(id) => {
                     crate::stack::trace_stack!("bind_id");
                     let Some(referenced_tables) = &mut referenced_tables else {
-                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
+                        if allow_unbound {
                             return Ok(WalkControl::Continue);
                         }
                         crate::bail_parse_error!("no such column: {}", id.as_str());
                     };
                     let normalized_id = normalize_ident(id.as_str());
 
-                    if binding_behavior == BindingBehavior::TryResultColumnsFirst {
-                        if let Some(result_columns) = result_columns {
-                            for result_column in result_columns.iter() {
-                                if let Some(alias) = &result_column.alias {
-                                    if alias.eq_ignore_ascii_case(&normalized_id) {
-                                        *expr = result_column.expr.clone();
-                                        return Ok(WalkControl::Continue);
-                                    }
-                                }
-                            }
-                        }
-                    }
                     let mut match_result = None;
                     let joined_tables = referenced_tables.joined_tables();
 
@@ -225,19 +201,6 @@ pub fn bind_and_rewrite_expr<'a>(
                         return Ok(WalkControl::Continue);
                     }
 
-                    if binding_behavior == BindingBehavior::TryCanonicalColumnsFirst {
-                        if let Some(result_columns) = result_columns {
-                            for result_column in result_columns.iter() {
-                                if let Some(alias) = &result_column.alias {
-                                    if alias.eq_ignore_ascii_case(&normalized_id) {
-                                        *expr = result_column.expr.clone();
-                                        return Ok(WalkControl::Continue);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
                     // SQLite DQS misfeature: double-quoted identifiers fall back to string literals
                     // only when DQS is enabled for DML statements
                     if id.quoted_with('"') && resolver.dqs_dml.is_enabled() {
@@ -261,7 +224,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     // (bare rowid alias like `t.rowid` on a btree with rowids).
                     tracing::debug!("bind_and_rewrite_expr({:?}, {:?})", tbl, id);
                     let Some(referenced_tables) = &mut referenced_tables else {
-                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
+                        if allow_unbound {
                             return Ok(WalkControl::Continue);
                         }
                         crate::bail_parse_error!(
@@ -393,16 +356,9 @@ pub fn bind_and_rewrite_expr<'a>(
                         // as a definition-only outer ref. The CTE *name* is valid in
                         // principle; it's the column access through it that isn't,
                         // because the CTE hasn't been brought into this scope's FROM.
-                        // The `cte_id`/`cte_select` check restricts this to real CTE
-                        // definition refs so any other future use of `cte_definition_only`
-                        // still falls through to "no such table".
                         let is_definition_only_cte = referenced_tables
                             .find_outer_query_ref_by_identifier(&normalized_table_name)
-                            .is_some_and(|outer_ref| {
-                                outer_ref.cte_definition_only
-                                    && (outer_ref.cte_id.is_some()
-                                        || outer_ref.cte_select.is_some())
-                            });
+                            .is_some_and(|outer_ref| outer_ref.cte_definition_only);
                         if is_definition_only_cte {
                             crate::bail_parse_error!(
                                 "no such column: {}.{}",
@@ -484,7 +440,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     let db_name_clone = db_name.clone();
 
                     let Some(referenced_tables) = &mut referenced_tables else {
-                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
+                        if allow_unbound {
                             return Ok(WalkControl::Continue);
                         }
                         crate::bail_parse_error!(

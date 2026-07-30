@@ -9,7 +9,7 @@ use super::{
     },
     expr::{
         bind_and_rewrite_expr, emit_table_column, translate_expr, translate_expr_no_constant_opt,
-        walk_expr, BindingBehavior, ExprAffinityInfo, NoConstantOptReason, WalkControl,
+        walk_expr, ExprAffinityInfo, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
@@ -1951,13 +1951,7 @@ pub(crate) fn emit_index_column_value_old_image(
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
         let mut expr = expr.as_ref().clone();
-        bind_and_rewrite_expr(
-            &mut expr,
-            Some(table_references),
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
+        bind_and_rewrite_expr(&mut expr, Some(table_references), resolver, false)?;
 
         let self_table_context = SelfTableContext::ForSelect {
             table_ref_id: table_internal_id,
@@ -2117,9 +2111,8 @@ fn emit_check_constraint_bytecode(
             bind_and_rewrite_expr(
                 &mut rewritten_expr,
                 Some(&mut binding_tables),
-                None,
                 resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
+                false,
             )?;
         }
 

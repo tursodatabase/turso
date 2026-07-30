@@ -15,7 +15,7 @@ use crate::translate::{
     emitter::Resolver,
     expr::{
         expr_contains_nondeterministic_scalar_function, expr_vector_size, unwrap_parens,
-        BindingBehavior, WalkControl,
+        WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
 };
@@ -1590,9 +1590,9 @@ fn plan_one_bound_cte(
             .expect("CTE inner binding should be present"),
     };
 
-    // Block circular references during planning.
-    program.push_cte_being_defined(name.clone());
-    let plan_result = plan_bound_subquery(
+    // Circular references were rejected at bind time (ctes_being_bound in
+    // the binder), so planning a bound body cannot recurse into itself.
+    let cte_plan = plan_bound_subquery(
         bound_sq,
         resolver,
         program,
@@ -1600,9 +1600,7 @@ fn plan_one_bound_cte(
         outer_query_refs.to_vec(),
         planned,
         QueryDestination::placeholder_for_subquery(),
-    );
-    program.pop_cte_being_defined();
-    let cte_plan = plan_result?;
+    )?;
 
     let entry = &cte_definitions[cte_idx].1;
     let explicit_cols = if entry.explicit_columns.is_empty() {
@@ -2218,21 +2216,9 @@ pub fn parse_limit(
     mut limit: Limit,
     resolver: &Resolver,
 ) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
-    bind_and_rewrite_expr(
-        &mut limit.expr,
-        None,
-        None,
-        resolver,
-        BindingBehavior::TryResultColumnsFirst,
-    )?;
+    bind_and_rewrite_expr(&mut limit.expr, None, resolver, false)?;
     if let Some(ref mut off_expr) = limit.offset {
-        bind_and_rewrite_expr(
-            off_expr,
-            None,
-            None,
-            resolver,
-            BindingBehavior::TryResultColumnsFirst,
-        )?;
+        bind_and_rewrite_expr(off_expr, None, resolver, false)?;
     }
     Ok((Some(limit.expr), limit.offset))
 }

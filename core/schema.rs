@@ -9,9 +9,7 @@ use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{
-    bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
-};
+use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::index::{
     reject_explicit_nulls, resolve_index_method_parameters, resolve_sorted_columns,
 };
@@ -6018,14 +6016,7 @@ impl Index {
             return None;
         };
         let mut expr = where_clause.clone();
-        bind_and_rewrite_expr(
-            &mut expr,
-            table_refs,
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )
-        .ok()?;
+        bind_and_rewrite_expr(&mut expr, table_refs, resolver, false).ok()?;
         Some(*expr)
     }
 }

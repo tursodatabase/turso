@@ -1229,15 +1229,6 @@ pub struct OuterQueryReference {
     /// i.e., if the subquery depends on tables T and U,
     /// then both T and U need to be in scope for the subquery to be evaluated.
     pub col_used_mask: ColumnUsedMask,
-    /// Original CTE SELECT AST for re-planning. When a CTE is referenced
-    /// multiple times, each reference needs a fresh plan with unique
-    /// internal_ids to avoid cursor key collisions.
-    pub cte_select: Option<ast::Select>,
-    /// Explicit column names from WITH t(a, b) AS (...) syntax.
-    pub cte_explicit_columns: Vec<String>,
-    /// CTE ID if this is a CTE reference. Used to track CTE reference counts
-    /// for materialization decisions.
-    pub cte_id: Option<usize>,
     /// When true, this entry is only for CTE definition lookup in subquery
     /// FROM clauses, not for column resolution. This is set when the CTE
     /// has been consumed by a FROM clause (with or without an alias), so
@@ -1267,9 +1258,6 @@ impl OuterQueryReference {
             table,
             using_dedup_hidden_cols: ColumnMask::default(),
             col_used_mask: ColumnUsedMask::default(),
-            cte_select: None,
-            cte_explicit_columns: vec![],
-            cte_id: None,
             cte_definition_only: true,
             rowid_referenced: false,
             scope_depth: 0,
@@ -1504,21 +1492,6 @@ impl TableReferences {
         self.outer_query_refs
             .iter()
             .find(|t| t.identifier == identifier)
-    }
-
-    /// Marks the pre-planned [OuterQueryReference] with the given identifier as
-    /// "CTE definition only". This prevents it from being used for column
-    /// resolution while still allowing CTE definition lookup in subquery FROM
-    /// clauses. Called when a CTE is consumed by a FROM clause, since column
-    /// resolution is then handled by the joined_table entry instead.
-    pub fn mark_outer_query_ref_cte_definition_only(&mut self, identifier: &str) {
-        if let Some(outer_ref) = self
-            .outer_query_refs
-            .iter_mut()
-            .find(|t| t.identifier == identifier)
-        {
-            outer_ref.cte_definition_only = true;
-        }
     }
 
     /// Returns `(internal_id, &Table)` for the table with the given identifier.
