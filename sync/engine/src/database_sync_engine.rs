@@ -2557,9 +2557,36 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                         })?;
                                     }
                                 }
-                                (_, PullUpdatesV1Result::Pages { replace_base }, _) => {
+                                (
+                                    advertised_revision,
+                                    PullUpdatesV1Result::Pages { replace_base },
+                                    _,
+                                ) => {
+                                    // A second page snapshot means the remote still cannot serve a
+                                    // direct logical range from this revision: its logical log for
+                                    // that generation has no replayable prefix. Either the
+                                    // generation predates portable logical changes, or its first
+                                    // commits carry only internal recovery ops (`turso_sync_*`
+                                    // bookkeeping from a push whose user statements matched no
+                                    // row) and were written by a remote that predates marking such
+                                    // commits explicitly.
+                                    //
+                                    // Installing this snapshot here is not possible: the WAL
+                                    // sessions for the one we just applied are still open, and the
+                                    // apply path is a single linear pass. Retrying in place would
+                                    // also be pointless - the remote's answer only changes when its
+                                    // log state does. So fail cleanly and let the caller's next
+                                    // pull() re-enter apply from scratch: that retry succeeds once
+                                    // the remote rolls over to a new generation, without recreating
+                                    // the database.
                                     return Err(Error::DatabaseSyncEngineError(format!(
-                                        "replace-base follow-up logical pull unexpectedly returned a page stream: replace_base={replace_base}"
+                                        "remote cannot serve a logical MVCC range for {main_db_path} from revision {revision}: \
+                                         the replace-base follow-up pull returned another page snapshot \
+                                         (replace_base={replace_base}, advertised revision {advertised_revision:?}). \
+                                         The remote's logical log for that generation has no prefix this client can replay. \
+                                         This is safe to retry: pull again after the remote checkpoints to a new generation, \
+                                         or upgrade the remote to a build that marks internal-only commits explicitly.",
+                                        main_db_path = self.main_db_path,
                                     )));
                                 }
                             }
