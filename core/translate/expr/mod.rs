@@ -35,6 +35,7 @@ use crate::{LimboError, Numeric, Result, Value};
 
 #[macro_use]
 mod metadata;
+mod symbolic;
 
 mod affinity;
 mod arrays;
@@ -102,6 +103,10 @@ pub(crate) use emission::{
     seed_returning_row_image_in_cache,
 };
 pub use metadata::ConditionMetadata;
+pub(crate) use symbolic::{
+    compile_conjunction as compile_symbolic_conjunction, compile_exprs as compile_symbolic_exprs,
+    ResolvedScalarExpr, RowExprResolver,
+};
 pub use translator::{
     resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
 };

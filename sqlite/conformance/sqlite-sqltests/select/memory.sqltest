@@ -1950,3 +1950,16 @@ test where-variable-predicate {
 }
 expect {
 }
+
+@cross-check-integrity
+test symbolic-scalar-table-scan {
+    CREATE TABLE expressions(a NUMERIC, b NUMERIC, name TEXT COLLATE NOCASE);
+    INSERT INTO expressions VALUES
+        (1, 2, 'alpha'), (2, 2, 'beta'), (NULL, 4, 'BETA'), (5, -1, NULL);
+    SELECT a + 1, 'tag', a > b, a + b, name COLLATE NOCASE
+      FROM expressions
+     WHERE a + b >= 4 AND name = 'BETA';
+}
+expect {
+    3|tag|0|4|beta
+}

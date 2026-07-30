@@ -1944,10 +1944,6 @@ impl Row {
     pub(crate) const fn column(self, column_index: usize) -> Column {
         column(self.cursor, column_index)
     }
-
-    pub(crate) fn project(self, columns: SmallVec<[usize; 4]>) -> ProjectColumns {
-        project_columns(self.cursor, columns)
-    }
 }
 
 /// Opens a table when compiled and returns its symbolic row stream.
@@ -2102,9 +2098,9 @@ pub(crate) struct ResultRow {
     pack: ValuePack,
 }
 
-pub(crate) struct ProjectColumns {
-    cursor: CursorId,
-    columns: SmallVec<[usize; 4]>,
+/// Compiles an ordered set of independently composed values into one pack.
+pub(crate) struct PackValues {
+    values: SmallVec<[BoxedCompile<ValueId>; 4]>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2118,29 +2114,23 @@ pub(crate) fn result_row_pack(pack: ValuePack) -> ResultRow {
     ResultRow { pack }
 }
 
-pub(crate) fn project_columns(cursor: CursorId, columns: SmallVec<[usize; 4]>) -> ProjectColumns {
-    ProjectColumns { cursor, columns }
+pub(crate) fn pack_values(values: SmallVec<[BoxedCompile<ValueId>; 4]>) -> PackValues {
+    PackValues { values }
 }
 
-impl Compile for ProjectColumns {
+impl Compile for PackValues {
     type Output = ValuePack;
 
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
-        if self.columns.is_empty() {
+        if self.values.is_empty() {
             return Err(LimboError::InternalError(
-                "compiler IR projection must contain at least one column".to_owned(),
+                "compiler IR value pack must contain at least one value".to_owned(),
             ));
         }
-        let values = self
-            .columns
-            .into_iter()
-            .map(|column| {
-                builder.push(ScalarOp::Column {
-                    cursor: self.cursor,
-                    column,
-                })
-            })
-            .collect::<Result<SmallVec<_>>>()?;
+        let mut values = SmallVec::with_capacity(self.values.len());
+        for compiler in self.values {
+            values.push(compiler.compile(builder)?);
+        }
         Ok(ValuePack(values))
     }
 }
@@ -2337,10 +2327,38 @@ mod tests {
     }
 
     #[test]
+    fn composed_values_are_collected_into_one_symbolic_pack() {
+        let values = smallvec![
+            constant(Value::from_i64(40)).boxed(),
+            constant(Value::from_i64(1))
+                .then(constant(Value::from_i64(1)))
+                .and_then(|(lhs, rhs)| add(lhs, rhs))
+                .boxed(),
+        ];
+        let ir = compile_effect(pack_values(values).and_then(result_row_pack)).unwrap();
+
+        assert_eq!(
+            ir.to_string(),
+            concat!(
+                "block0:\n",
+                "  %0 = constant Numeric(Integer(40))\n",
+                "  %1 = constant Numeric(Integer(1))\n",
+                "  %2 = constant Numeric(Integer(1))\n",
+                "  %3 = add %1, %2\n",
+                "  result_row [%0, %3]\n",
+                "  %4 = constant Null\n",
+                "  return %4\n",
+            )
+        );
+    }
+
+    #[test]
     fn row_stream_for_each_builds_a_cursor_loop_without_loop_state() {
         let table = Arc::new(BTreeTable::from_sql("CREATE TABLE streamed(a)", 2).unwrap());
         let compiler = scan_table(table, 0, 0).and_then(|rows| {
-            rows.for_each(|row| row.project(smallvec![0]).and_then(result_row_pack))
+            rows.for_each(|row| {
+                pack_values(smallvec![row.column(0).boxed()]).and_then(result_row_pack)
+            })
         });
 
         let ir = compile_effect(compiler).unwrap();
@@ -2372,7 +2390,9 @@ mod tests {
         let compiler = scan_table(table, 0, 0).and_then(|rows| {
             rows.filter(|row| row.column(0))
                 .filter(|row| row.column(1))
-                .for_each(|row| row.project(smallvec![2]).and_then(result_row_pack))
+                .for_each(|row| {
+                    pack_values(smallvec![row.column(2).boxed()]).and_then(result_row_pack)
+                })
         });
 
         let ir = compile_effect(compiler).unwrap();

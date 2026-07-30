@@ -5,24 +5,23 @@ use crate::{
     sync::Arc,
     translate::{
         aggregation::emit_ungrouped_aggregation,
-        alter::literal_default_value,
-        compiler::{
-            compare, compile_effect, constant, resolved_comparison, result_row_pack, scan_table,
-            BoxedCompile, ComparisonOp, Compile, ResolvedComparison, Row, RowStream, ValueId,
-        },
+        compiler::{compile_effect, result_row_pack, scan_table, Compile, RowStream},
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
             MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
             OperationMode, ResultSetColumn, TableMask, TranslateCtx,
         },
-        expr::{comparison_affinity, comparison_collation},
+        expr::{
+            compile_symbolic_conjunction, compile_symbolic_exprs, ResolvedScalarExpr,
+            RowExprResolver,
+        },
         group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
         order_by::EmitOrderBy,
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, IterationDirection,
             JoinOrderMember, Operation, QueryDestination, Scan, Search, SeekKeyComponent,
-            SelectPlan, SimpleAggregate, TableReferences,
+            SelectPlan, SimpleAggregate,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -31,29 +30,13 @@ use crate::{
         window::{emit_window_flush, EmitWindow},
         ProgramBuilder, Resolver,
     },
-    types::Value,
     vdbe::{builder::QueryMode, insn::Insn},
     HashMap, HashSet, LimboError, Result,
 };
 use smallvec::SmallVec;
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
-use turso_parser::ast::{Expr, Literal, Operator, TableInternalId};
-
-#[derive(Clone)]
-enum DeclarativeOperand {
-    Column(usize),
-    Constant(Value),
-}
-
-enum DeclarativePredicate {
-    TruthyColumn(usize),
-    Comparison {
-        lhs: DeclarativeOperand,
-        rhs: DeclarativeOperand,
-        comparison: ResolvedComparison,
-    },
-}
+use turso_parser::ast::Expr;
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_select(
@@ -132,22 +115,23 @@ fn try_emit_declarative_table_scan(
         return Ok(None);
     };
 
-    let mut columns = SmallVec::<[usize; 4]>::with_capacity(plan.result_columns.len());
+    let expr_resolver = RowExprResolver::new(
+        resolver,
+        joined.database_id,
+        joined.internal_id,
+        table,
+        &plan.table_references,
+    );
+    let mut projections =
+        SmallVec::<[ResolvedScalarExpr; 4]>::with_capacity(plan.result_columns.len());
     for result_column in &plan.result_columns {
-        let Some(column) = direct_scan_column(
-            resolver,
-            joined.database_id,
-            joined.internal_id,
-            table,
-            &result_column.expr,
-        )?
-        else {
+        let Some(expression) = expr_resolver.resolve(&result_column.expr)? else {
             return Ok(None);
         };
-        columns.push(column);
+        projections.push(expression);
     }
 
-    let mut predicates = SmallVec::<[DeclarativePredicate; 2]>::new();
+    let mut predicates = SmallVec::<[ResolvedScalarExpr; 2]>::new();
     for predicate in &plan.where_clause {
         if predicate.consumed {
             continue;
@@ -162,15 +146,7 @@ fn try_emit_declarative_table_scan(
         {
             return Ok(None);
         }
-        let Some(predicate) = declarative_predicate(
-            resolver,
-            joined.database_id,
-            joined.internal_id,
-            table,
-            &predicate.expr,
-            &plan.table_references,
-        )?
-        else {
+        let Some(predicate) = expr_resolver.resolve(&predicate.expr)? else {
             return Ok(None);
         };
         predicates.push(predicate);
@@ -180,12 +156,16 @@ fn try_emit_declarative_table_scan(
     let database_id = joined.database_id;
     let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
     let compiler = scan_table(table, database_id, schema_cookie).and_then(move |rows| {
-        let emit = move |row: Row| row.project(columns).and_then(result_row_pack);
         if predicates.is_empty() {
-            rows.for_each(emit).boxed()
+            rows.for_each(move |row| {
+                compile_symbolic_exprs(row, &projections).and_then(result_row_pack)
+            })
+            .boxed()
         } else {
-            rows.filter(move |row| declarative_predicates(row, &predicates))
-                .for_each(emit)
+            rows.filter(move |row| compile_symbolic_conjunction(row, &predicates))
+                .for_each(move |row| {
+                    compile_symbolic_exprs(row, &projections).and_then(result_row_pack)
+                })
                 .boxed()
         }
     });
@@ -200,169 +180,6 @@ fn try_emit_declarative_table_scan(
         )));
     }
     Ok(Some(result_cols_start))
-}
-
-fn direct_scan_column(
-    resolver: &Resolver,
-    database_id: usize,
-    table_id: TableInternalId,
-    table: &BTreeTable,
-    expr: &Expr,
-) -> Result<Option<usize>> {
-    let Expr::Column {
-        table: expr_table,
-        column,
-        ..
-    } = expr
-    else {
-        return Ok(None);
-    };
-    if *expr_table != table_id {
-        return Ok(None);
-    }
-    let column_definition = table.columns().get(*column).ok_or_else(|| {
-        LimboError::InternalError(format!(
-            "SELECT plan references column {column} outside table {}",
-            table.name
-        ))
-    })?;
-    let requires_frontend_decoding = column_definition.is_virtual_generated()
-        || column_definition.is_array()
-        || resolver.with_schema(database_id, |schema| {
-            schema
-                .get_type_def_unchecked(&column_definition.ty_str)
-                .is_some()
-        });
-    Ok((!requires_frontend_decoding).then_some(*column))
-}
-
-fn declarative_predicate(
-    resolver: &Resolver,
-    database_id: usize,
-    table_id: TableInternalId,
-    table: &BTreeTable,
-    expr: &Expr,
-    referenced_tables: &TableReferences,
-) -> Result<Option<DeclarativePredicate>> {
-    if let Some(column) = direct_scan_column(resolver, database_id, table_id, table, expr)? {
-        return Ok(Some(DeclarativePredicate::TruthyColumn(column)));
-    }
-
-    let expr = unwrap_single_parentheses(expr);
-    let Expr::Binary(lhs, operator, rhs) = expr else {
-        return Ok(None);
-    };
-    let Some(op) = declarative_comparison_op(*operator) else {
-        return Ok(None);
-    };
-    let Some(lhs_operand) = declarative_operand(resolver, database_id, table_id, table, lhs)?
-    else {
-        return Ok(None);
-    };
-    let Some(rhs_operand) = declarative_operand(resolver, database_id, table_id, table, rhs)?
-    else {
-        return Ok(None);
-    };
-    let affinity = comparison_affinity(lhs, rhs, Some(referenced_tables), Some(resolver));
-    let collation = comparison_collation(lhs, rhs, Some(referenced_tables), Some(resolver))?;
-
-    Ok(Some(DeclarativePredicate::Comparison {
-        lhs: lhs_operand,
-        rhs: rhs_operand,
-        comparison: resolved_comparison(op, affinity, collation),
-    }))
-}
-
-fn unwrap_single_parentheses(mut expr: &Expr) -> &Expr {
-    while let Expr::Parenthesized(expressions) = expr {
-        let [inner] = expressions.as_slice() else {
-            break;
-        };
-        expr = inner;
-    }
-    expr
-}
-
-fn declarative_operand(
-    resolver: &Resolver,
-    database_id: usize,
-    table_id: TableInternalId,
-    table: &BTreeTable,
-    expr: &Expr,
-) -> Result<Option<DeclarativeOperand>> {
-    let expr = unwrap_single_parentheses(expr);
-    if let Expr::Collate(inner, _) = expr {
-        return declarative_operand(resolver, database_id, table_id, table, inner);
-    }
-    if let Some(column) = direct_scan_column(resolver, database_id, table_id, table, expr)? {
-        return Ok(Some(DeclarativeOperand::Column(column)));
-    }
-    let Expr::Literal(literal) = expr else {
-        return Ok(None);
-    };
-    if matches!(
-        literal,
-        Literal::Keyword(_)
-            | Literal::CurrentDate
-            | Literal::CurrentTime
-            | Literal::CurrentTimestamp
-    ) {
-        return Ok(None);
-    }
-    Ok(Some(DeclarativeOperand::Constant(literal_default_value(
-        literal,
-    )?)))
-}
-
-const fn declarative_comparison_op(operator: Operator) -> Option<ComparisonOp> {
-    match operator {
-        Operator::Equals => Some(ComparisonOp::Equal),
-        Operator::NotEquals => Some(ComparisonOp::NotEqual),
-        Operator::Less => Some(ComparisonOp::Less),
-        Operator::LessEquals => Some(ComparisonOp::LessEqual),
-        Operator::Greater => Some(ComparisonOp::Greater),
-        Operator::GreaterEquals => Some(ComparisonOp::GreaterEqual),
-        _ => None,
-    }
-}
-
-fn compile_declarative_operand(row: Row, operand: &DeclarativeOperand) -> BoxedCompile<ValueId> {
-    match operand {
-        DeclarativeOperand::Column(column) => row.column(*column).boxed(),
-        DeclarativeOperand::Constant(value) => constant(value.clone()).boxed(),
-    }
-}
-
-fn compile_declarative_predicate(
-    row: Row,
-    predicate: &DeclarativePredicate,
-) -> BoxedCompile<ValueId> {
-    match predicate {
-        DeclarativePredicate::TruthyColumn(column) => row.column(*column).boxed(),
-        DeclarativePredicate::Comparison {
-            lhs,
-            rhs,
-            comparison,
-        } => compile_declarative_operand(row, lhs)
-            .then(compile_declarative_operand(row, rhs))
-            .and_then({
-                let comparison = *comparison;
-                move |(lhs, rhs)| compare(lhs, rhs, comparison)
-            })
-            .boxed(),
-    }
-}
-
-fn declarative_predicates(row: Row, predicates: &[DeclarativePredicate]) -> BoxedCompile<ValueId> {
-    let Some((predicate, remaining)) = predicates.split_first() else {
-        return constant(Value::from_i64(1)).boxed();
-    };
-    compile_declarative_predicate(row, predicate)
-        .branch(
-            declarative_predicates(row, remaining),
-            constant(Value::from_i64(0)),
-        )
-        .boxed()
 }
 
 fn emit_program_for_select_with_inputs(
@@ -1436,5 +1253,53 @@ mod tests {
             compared_statement.run_collect_rows().unwrap(),
             vec![vec![Value::Text("beta".into())]]
         );
+
+        connection
+            .execute("CREATE TABLE expressions(a NUMERIC, b NUMERIC, name TEXT COLLATE NOCASE)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO expressions VALUES \
+                 (1, 2, 'alpha'), (2, 2, 'beta'), (NULL, 4, 'BETA'), (5, -1, NULL)",
+            )
+            .unwrap();
+        let mut expression_statement = connection
+            .prepare(
+                "SELECT a + 1, 'tag', a > b, a + b, name COLLATE NOCASE FROM expressions \
+                 WHERE a + b >= 4 AND name = 'BETA'",
+            )
+            .unwrap();
+        let expression_instructions = &expression_statement.get_program().insns;
+        assert!(
+            expression_instructions
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::Add { .. }))
+                .count()
+                >= 3,
+            "projection and predicate additions must both use symbolic scalar expressions"
+        );
+        let expression_result_row = expression_instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 5, .. }))
+            .expect("resolved scalar projections must produce one five-value pack");
+        assert!(
+            expression_instructions[expression_result_row - 5..expression_result_row]
+                .iter()
+                .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })),
+            "independent expression values must be packed only during lowering"
+        );
+        assert_eq!(
+            expression_statement.run_collect_rows().unwrap(),
+            vec![vec![
+                Value::from_i64(3),
+                Value::Text("tag".into()),
+                Value::from_i64(0),
+                Value::from_i64(4),
+                Value::Text("beta".into()),
+            ]]
+        );
+        assert!(connection
+            .prepare("SELECT a COLLATE missing_collation FROM expressions")
+            .is_err());
     }
 }
