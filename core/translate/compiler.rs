@@ -5015,6 +5015,22 @@ pub(crate) struct OpenEphemeralIndex {
     index: Arc<Index>,
 }
 
+pub(crate) struct DeclareEphemeralIndex {
+    index: Arc<Index>,
+}
+
+/// A symbolic ephemeral-index cursor that has storage identity but no runtime
+/// open effect yet. Keeping the raw cursor private prevents consumers from
+/// reading or writing the resource before initialization is described.
+#[derive(Clone, Copy)]
+pub(crate) struct UnopenedEphemeralIndex {
+    cursor: CursorId,
+}
+
+pub(crate) struct OpenDeclaredEphemeralIndex {
+    unopened: UnopenedEphemeralIndex,
+}
+
 /// The base symbolic stream of rows backed by an opened cursor.
 #[derive(Clone)]
 pub(crate) struct CursorRows {
@@ -6719,6 +6735,16 @@ pub(crate) fn open_ephemeral_index(index: Arc<Index>) -> OpenEphemeralIndex {
     OpenEphemeralIndex { index }
 }
 
+pub(crate) fn declare_ephemeral_index(index: Arc<Index>) -> DeclareEphemeralIndex {
+    DeclareEphemeralIndex { index }
+}
+
+pub(crate) const fn open_declared_ephemeral_index(
+    unopened: UnopenedEphemeralIndex,
+) -> OpenDeclaredEphemeralIndex {
+    OpenDeclaredEphemeralIndex { unopened }
+}
+
 fn open_read_index(index: Arc<Index>, db: usize, schema_cookie: u32) -> OpenReadCursor {
     let root_page = index.root_page;
     OpenReadCursor {
@@ -6748,8 +6774,26 @@ impl Compile for OpenEphemeralIndex {
     type Output = CursorId;
 
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let unopened = declare_ephemeral_index(self.index).compile(builder)?;
+        open_declared_ephemeral_index(unopened).compile(builder)
+    }
+}
+
+impl Compile for DeclareEphemeralIndex {
+    type Output = UnopenedEphemeralIndex;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
         let cursor =
             builder.allocate_cursor(CursorResource::Owned(CursorType::BTreeIndex(self.index)))?;
+        Ok(UnopenedEphemeralIndex { cursor })
+    }
+}
+
+impl Compile for OpenDeclaredEphemeralIndex {
+    type Output = CursorId;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let cursor = self.unopened.cursor;
         builder.push_effect(EffectOp::OpenEphemeralIndex { cursor })?;
         Ok(cursor)
     }
@@ -7136,6 +7180,21 @@ mod tests {
             unique: false,
             ephemeral: false,
             has_rowid: table.has_rowid,
+            where_clause: None,
+            index_method: None,
+            on_conflict: None,
+        })
+    }
+
+    fn test_ephemeral_index(name: &str) -> Arc<Index> {
+        Arc::new(Index {
+            name: name.to_owned(),
+            table_name: String::new(),
+            root_page: 0,
+            columns: vec![IndexColumn::new("key", 0)],
+            unique: false,
+            ephemeral: true,
+            has_rowid: false,
             where_clause: None,
             index_method: None,
             on_conflict: None,
@@ -9089,18 +9148,7 @@ mod tests {
 
     #[test]
     fn owned_ephemeral_index_can_be_written_then_scanned_in_one_region() {
-        let index = Arc::new(Index {
-            name: "owned_ephemeral".to_owned(),
-            table_name: String::new(),
-            root_page: 0,
-            columns: vec![IndexColumn::new("key", 0)],
-            unique: false,
-            ephemeral: true,
-            has_rowid: false,
-            where_clause: None,
-            index_method: None,
-            on_conflict: None,
-        });
+        let index = test_ephemeral_index("owned_ephemeral");
         let compiler = open_ephemeral_index(index).and_then(|cursor| {
             pack_values(smallvec![constant(Value::from_i64(7)).boxed()])
                 .and_then(move |pack| {
@@ -9160,19 +9208,58 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_index_declaration_is_separate_from_its_open_effect() {
+        let compiler = declare_ephemeral_index(test_ephemeral_index("declared_ephemeral"))
+            .and_then(|unopened| {
+                open_declared_ephemeral_index(unopened).and_then(|cursor| {
+                    pack_values(smallvec![constant(Value::from_i64(7)).boxed()])
+                        .and_then(move |pack| {
+                            insert_index_pack(
+                                cursor,
+                                pack,
+                                "declared_ephemeral".to_owned(),
+                                Some("D".to_owned()),
+                            )
+                        })
+                        .and_then(move |()| {
+                            scan_cursor(cursor, ScanDirection::Forward).for_each(|row| {
+                                pack_values(smallvec![row.column(0).boxed()])
+                                    .and_then(result_row_pack)
+                            })
+                        })
+                })
+            });
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+
+        assert!(rendered.contains("cursor $0 = btree_index \"declared_ephemeral\" root 0"));
+        assert!(rendered.contains("open_ephemeral_index $0"));
+        assert!(rendered.contains("index_insert $0 [%0]"));
+        assert!(rendered.contains("cursor_start Forward $0"));
+
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 2, 0));
+        let target = program.alloc_register();
+        let lowered = ir.lower_into(&mut program, target).unwrap();
+        assert_eq!(lowered.single_result_row_pack().unwrap().1, 1);
+        assert_eq!(program.cursor_ref.len(), 1);
+    }
+
+    #[test]
+    fn verifier_rejects_a_declared_but_unopened_cursor() {
+        let compiler = declare_ephemeral_index(test_ephemeral_index("unopened_ephemeral"))
+            .and_then(|unopened| {
+                scan_cursor(unopened.cursor, ScanDirection::Forward).for_each(|_| pure(()))
+            });
+
+        let error = compile_effect(compiler).unwrap_err();
+
+        assert!(error.to_string().contains("uses unopened cursor"));
+    }
+
+    #[test]
     fn cursor_input_binding_composes_descriptions_over_one_owned_cursor() {
-        let index = Arc::new(Index {
-            name: "bound_ephemeral".to_owned(),
-            table_name: String::new(),
-            root_page: 0,
-            columns: vec![IndexColumn::new("key", 0)],
-            unique: false,
-            ephemeral: true,
-            has_rowid: false,
-            where_clause: None,
-            index_method: None,
-            on_conflict: None,
-        });
+        let index = test_ephemeral_index("bound_ephemeral");
         let input = CursorInputId::new(0);
         let compiler = open_ephemeral_index(index).and_then(move |cursor| {
             let producer = cursor_input(input)

@@ -191,6 +191,14 @@ effect as the cursor's definition, rejecting a read, rewind, or advance unless
 the open dominates it on every control-flow path. Only after those checks does
 lowering emit `OpenRead`, `Rewind`, `Column`, and `Next` instructions.
 
+Ephemeral indexes separate symbolic resource declaration from runtime
+initialization. Declaration returns an unopened typed handle; the open compiler
+consumes that handle and returns the cursor accepted by stream and index
+operations. The existing combined open operation is built from those two
+primitives. This distinction lets structured control-flow regions own the open
+effect without selecting a physical cursor early, while the verifier continues
+to reject every path that uses a declared but unopened resource.
+
 Row production is an effect over a symbolic `ValuePack`, not an eagerly chosen
 register range. Each pack member remains an ordinary SSA value and must dominate
 the `result_row` effect. During lowering, the backend allocates one consecutive
