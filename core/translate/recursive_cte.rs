@@ -312,7 +312,7 @@ fn emit_recursive_cte_query(
             Ok(())
         }
         Plan::CompoundSelect { .. } => {
-            emit_program_for_compound_select(program, resolver, query.clone()).map(|_| ())
+            emit_program_for_compound_select(program, resolver, query).map(|_| ())
         }
         Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => Err(
             LimboError::InternalError("recursive CTE query is not a SELECT".to_string()),

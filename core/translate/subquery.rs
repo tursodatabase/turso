@@ -1699,12 +1699,10 @@ pub fn emit_from_clause_subquery(
                 emit_query(program, select_plan, &mut metadata)?
             }
             Plan::CompoundSelect { .. } => {
-                // Clone the plan to pass to emit_program_for_compound_select (it takes ownership)
-                let plan_clone = plan.clone();
                 let resolver = t_ctx.resolver.fork();
                 // emit_program_for_compound_select returns the result column start register
                 // for coroutine mode, which is needed by the outer query.
-                emit_program_for_compound_select(program, &resolver, plan_clone)?
+                emit_program_for_compound_select(program, &resolver, plan)?
                     .expect("compound CTE in coroutine mode must have result register")
             }
             Plan::RecursiveCte(recursive_cte) => {
@@ -1791,9 +1789,8 @@ fn emit_indexed_materialized_subquery(
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
-            let plan_clone = plan.clone();
             let resolver = t_ctx.resolver.fork();
-            emit_program_for_compound_select(program, &resolver, plan_clone)?;
+            emit_program_for_compound_select(program, &resolver, plan)?;
         }
         Plan::RecursiveCte(_) => {
             unreachable!("recursive CTEs require table-backed materialization for indexed access")
@@ -1889,10 +1886,8 @@ fn emit_materialized_subquery_table(
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
-            // Clone the plan to pass to emit_program_for_compound_select (it takes ownership)
-            let plan_clone = plan.clone();
             let resolver = t_ctx.resolver.fork();
-            emit_program_for_compound_select(program, &resolver, plan_clone)?;
+            emit_program_for_compound_select(program, &resolver, plan)?;
         }
         Plan::RecursiveCte(recursive_cte) => {
             super::recursive_cte::emit_recursive_cte(program, &t_ctx.resolver, recursive_cte)?;
@@ -1977,8 +1972,8 @@ pub fn emit_non_from_clause_subquery(
                         emit_program_for_select(program, resolver, *select_plan)
                     }
                 }
-                compound @ Plan::CompoundSelect { .. } => {
-                    emit_program_for_compound_select(program, resolver, compound)?;
+                mut compound @ Plan::CompoundSelect { .. } => {
+                    emit_program_for_compound_select(program, resolver, &mut compound)?;
                     Ok(())
                 }
                 _ => unreachable!("DML plans cannot be subqueries"),
