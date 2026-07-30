@@ -8,18 +8,18 @@ use std::{fmt, marker::PhantomData};
 
 use rustc_hash::FxHashSet as HashSet;
 use smallvec::{smallvec, SmallVec};
-use turso_parser::ast::Variable;
+use turso_parser::ast::{NullsOrder, SortOrder, Variable};
 
 use crate::{
     numeric::Numeric,
-    schema::BTreeTable,
+    schema::{BTreeTable, PseudoCursorType},
     sync::Arc,
     translate::collate::CollationSeq,
     types::Value,
     vdbe::{
         affinity::Affinity,
         builder::{CursorType, ProgramBuilder},
-        insn::{CmpInsFlags, Insn},
+        insn::{to_u16, CmpInsFlags, Insn, SortComparatorType},
         PageIdx,
     },
     LimboError, Result,
@@ -667,10 +667,42 @@ impl ValuePack {
     }
 }
 
+/// Fully resolved ordering semantics for one symbolic sorter key.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SortKey {
+    pub(crate) order: SortOrder,
+    pub(crate) collation: Option<CollationSeq>,
+    pub(crate) nulls: Option<NullsOrder>,
+    pub(crate) comparator: Option<SortComparatorType>,
+}
+
+impl SortKey {
+    pub(crate) const fn new(
+        order: SortOrder,
+        collation: Option<CollationSeq>,
+        nulls: Option<NullsOrder>,
+        comparator: Option<SortComparatorType>,
+    ) -> Self {
+        Self {
+            order,
+            collation,
+            nulls,
+            comparator,
+        }
+    }
+}
+
 /// Physical resources allocated while lowering one compiler IR region.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct LoweredRegion {
     result_row_packs: SmallVec<[(usize, usize); 1]>,
+}
+
+#[derive(Clone, Copy)]
+struct PhysicalSorter {
+    cursor: usize,
+    pseudo_cursor: usize,
+    data_register: usize,
 }
 
 impl LoweredRegion {
@@ -724,10 +756,26 @@ impl CursorId {
     }
 }
 
+/// A symbolic sorter resource, distinct from cursors that can be scanned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SorterId(u32);
+
+impl SorterId {
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 #[derive(Debug)]
 enum CursorResource {
     External(CursorInputId),
     Owned(CursorType),
+}
+
+#[derive(Debug)]
+struct SorterResource {
+    keys: SmallVec<[SortKey; 4]>,
+    record_width: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -760,6 +808,10 @@ enum ScalarOp {
         cursor: CursorId,
         column: usize,
     },
+    SorterColumn {
+        sorter: SorterId,
+        column: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -773,14 +825,26 @@ enum EffectOp {
     ResultRow {
         pack: ValuePack,
     },
+    OpenSorter {
+        sorter: SorterId,
+    },
+    SorterInsert {
+        sorter: SorterId,
+        pack: ValuePack,
+    },
+    SorterData {
+        sorter: SorterId,
+    },
 }
 
 impl ScalarOp {
     fn operands(&self) -> impl Iterator<Item = ValueId> + '_ {
         let operands = match self {
-            Self::Input(_) | Self::Parameter(_) | Self::Constant(_) | Self::Column { .. } => {
-                [None, None]
-            }
+            Self::Input(_)
+            | Self::Parameter(_)
+            | Self::Constant(_)
+            | Self::Column { .. }
+            | Self::SorterColumn { .. } => [None, None],
             Self::MustBeInt { value } => [Some(*value), None],
             Self::Add { lhs, rhs } | Self::Logical { lhs, rhs, .. } => [Some(*lhs), Some(*rhs)],
         };
@@ -795,7 +859,21 @@ impl ScalarOp {
             | Self::Constant(_)
             | Self::Add { .. }
             | Self::MustBeInt { .. }
-            | Self::Logical { .. } => None,
+            | Self::Logical { .. }
+            | Self::SorterColumn { .. } => None,
+        }
+    }
+
+    fn sorter(&self) -> Option<SorterId> {
+        match self {
+            Self::SorterColumn { sorter, .. } => Some(*sorter),
+            Self::Input(_)
+            | Self::Parameter(_)
+            | Self::Constant(_)
+            | Self::Add { .. }
+            | Self::MustBeInt { .. }
+            | Self::Logical { .. }
+            | Self::Column { .. } => None,
         }
     }
 
@@ -810,7 +888,7 @@ impl ScalarOp {
             // Integer coercion can raise a datatype error. Column reads remain
             // ordered until storage-read and corruption behavior is modeled as
             // an explicit effect in the IR.
-            Self::MustBeInt { .. } | Self::Column { .. } => false,
+            Self::MustBeInt { .. } | Self::Column { .. } | Self::SorterColumn { .. } => false,
         }
     }
 }
@@ -825,8 +903,14 @@ impl Instruction {
     fn operands(&self) -> impl Iterator<Item = ValueId> + '_ {
         let (scalar, values) = match self {
             Self::Value { op, .. } => (Some(op.operands()), &[][..]),
-            Self::Effect(EffectOp::OpenRead { .. }) => (None, &[][..]),
-            Self::Effect(EffectOp::ResultRow { pack }) => (None, pack.values()),
+            Self::Effect(
+                EffectOp::OpenRead { .. }
+                | EffectOp::OpenSorter { .. }
+                | EffectOp::SorterData { .. },
+            ) => (None, &[][..]),
+            Self::Effect(EffectOp::ResultRow { pack } | EffectOp::SorterInsert { pack, .. }) => {
+                (None, pack.values())
+            }
         };
         scalar.into_iter().flatten().chain(values.iter().copied())
     }
@@ -834,14 +918,53 @@ impl Instruction {
     fn cursor_use(&self) -> Option<CursorId> {
         match self {
             Self::Value { op, .. } => op.cursor(),
-            Self::Effect(EffectOp::OpenRead { .. } | EffectOp::ResultRow { .. }) => None,
+            Self::Effect(
+                EffectOp::OpenRead { .. }
+                | EffectOp::ResultRow { .. }
+                | EffectOp::OpenSorter { .. }
+                | EffectOp::SorterInsert { .. }
+                | EffectOp::SorterData { .. },
+            ) => None,
         }
     }
 
     fn cursor_definition(&self) -> Option<CursorId> {
         match self {
             Self::Effect(EffectOp::OpenRead { cursor, .. }) => Some(*cursor),
-            Self::Value { .. } | Self::Effect(EffectOp::ResultRow { .. }) => None,
+            Self::Value { .. }
+            | Self::Effect(
+                EffectOp::ResultRow { .. }
+                | EffectOp::OpenSorter { .. }
+                | EffectOp::SorterInsert { .. }
+                | EffectOp::SorterData { .. },
+            ) => None,
+        }
+    }
+
+    fn sorter_use(&self) -> Option<SorterId> {
+        match self {
+            Self::Value { op, .. } => op.sorter(),
+            Self::Effect(
+                EffectOp::SorterInsert { sorter, .. } | EffectOp::SorterData { sorter },
+            ) => Some(*sorter),
+            Self::Effect(
+                EffectOp::OpenRead { .. }
+                | EffectOp::ResultRow { .. }
+                | EffectOp::OpenSorter { .. },
+            ) => None,
+        }
+    }
+
+    fn sorter_definition(&self) -> Option<SorterId> {
+        match self {
+            Self::Effect(EffectOp::OpenSorter { sorter }) => Some(*sorter),
+            Self::Value { .. }
+            | Self::Effect(
+                EffectOp::OpenRead { .. }
+                | EffectOp::ResultRow { .. }
+                | EffectOp::SorterInsert { .. }
+                | EffectOp::SorterData { .. },
+            ) => None,
         }
     }
 }
@@ -873,6 +996,18 @@ enum Terminator {
     },
     CursorNext {
         cursor: CursorId,
+        if_next: BlockId,
+        if_done: BlockId,
+        arguments: SmallVec<[ValueId; 2]>,
+    },
+    SorterSort {
+        sorter: SorterId,
+        if_non_empty: BlockId,
+        if_empty: BlockId,
+        arguments: SmallVec<[ValueId; 2]>,
+    },
+    SorterNext {
+        sorter: SorterId,
         if_next: BlockId,
         if_done: BlockId,
         arguments: SmallVec<[ValueId; 2]>,
@@ -916,9 +1051,25 @@ impl Terminator {
                 if_done,
                 arguments,
                 ..
+            }
+            | Self::SorterNext {
+                if_next,
+                if_done,
+                arguments,
+                ..
             } => [
                 Some((*if_next, arguments.as_slice())),
                 Some((*if_done, arguments.as_slice())),
+                None,
+            ],
+            Self::SorterSort {
+                if_non_empty,
+                if_empty,
+                arguments,
+                ..
+            } => [
+                Some((*if_non_empty, arguments.as_slice())),
+                Some((*if_empty, arguments.as_slice())),
                 None,
             ],
             Self::Return(_) => [None, None, None],
@@ -933,9 +1084,10 @@ impl Terminator {
                 (Some(*condition), None, &[][..])
             }
             Self::Compare { lhs, rhs, .. } => (Some(*lhs), Some(*rhs), &[][..]),
-            Self::CursorRewind { arguments, .. } | Self::CursorNext { arguments, .. } => {
-                (None, None, arguments.as_slice())
-            }
+            Self::CursorRewind { arguments, .. }
+            | Self::CursorNext { arguments, .. }
+            | Self::SorterSort { arguments, .. }
+            | Self::SorterNext { arguments, .. } => (None, None, arguments.as_slice()),
         };
         first.into_iter().chain(second).chain(rest.iter().copied())
     }
@@ -944,7 +1096,11 @@ impl Terminator {
         let operands = match self {
             Self::Branch { condition, .. } | Self::Return(condition) => [Some(*condition), None],
             Self::Compare { lhs, rhs, .. } => [Some(*lhs), Some(*rhs)],
-            Self::Jump { .. } | Self::CursorRewind { .. } | Self::CursorNext { .. } => [None, None],
+            Self::Jump { .. }
+            | Self::CursorRewind { .. }
+            | Self::CursorNext { .. }
+            | Self::SorterSort { .. }
+            | Self::SorterNext { .. } => [None, None],
         };
         operands.into_iter().flatten()
     }
@@ -955,6 +1111,19 @@ impl Terminator {
             Self::Jump { .. } | Self::Branch { .. } | Self::Compare { .. } | Self::Return(_) => {
                 None
             }
+            Self::SorterSort { .. } | Self::SorterNext { .. } => None,
+        }
+    }
+
+    fn sorter(&self) -> Option<SorterId> {
+        match self {
+            Self::SorterSort { sorter, .. } | Self::SorterNext { sorter, .. } => Some(*sorter),
+            Self::Jump { .. }
+            | Self::Branch { .. }
+            | Self::Compare { .. }
+            | Self::CursorRewind { .. }
+            | Self::CursorNext { .. }
+            | Self::Return(_) => None,
         }
     }
 
@@ -998,6 +1167,20 @@ impl Terminator {
                 remap_target(if_empty)
             }
             Self::CursorNext {
+                if_next, if_done, ..
+            } => {
+                remap_target(if_next)?;
+                remap_target(if_done)
+            }
+            Self::SorterSort {
+                if_non_empty,
+                if_empty,
+                ..
+            } => {
+                remap_target(if_non_empty)?;
+                remap_target(if_empty)
+            }
+            Self::SorterNext {
                 if_next, if_done, ..
             } => {
                 remap_target(if_next)?;
@@ -1054,6 +1237,32 @@ impl Terminator {
                 );
                 retain_live_arguments(arguments, &parameter_live[if_next.index()])
             }
+            Self::SorterSort {
+                if_non_empty,
+                if_empty,
+                arguments,
+                ..
+            } => {
+                assert_eq!(
+                    parameter_live[if_non_empty.index()],
+                    parameter_live[if_empty.index()],
+                    "shared sorter edge targets must retain the same parameter positions"
+                );
+                retain_live_arguments(arguments, &parameter_live[if_non_empty.index()])
+            }
+            Self::SorterNext {
+                if_next,
+                if_done,
+                arguments,
+                ..
+            } => {
+                assert_eq!(
+                    parameter_live[if_next.index()],
+                    parameter_live[if_done.index()],
+                    "shared sorter edge targets must retain the same parameter positions"
+                );
+                retain_live_arguments(arguments, &parameter_live[if_next.index()])
+            }
             Self::Branch { .. } | Self::Compare { .. } | Self::Return(_) => false,
         }
     }
@@ -1082,6 +1291,7 @@ pub(crate) struct IrBuilder {
     input_count: u32,
     cursor_input_count: u32,
     cursor_resources: SmallVec<[CursorResource; 2]>,
+    sorter_resources: SmallVec<[SorterResource; 1]>,
     parameter_declarations: SmallVec<[Variable; 2]>,
 }
 
@@ -1099,6 +1309,7 @@ impl IrBuilder {
             input_count: 0,
             cursor_input_count: 0,
             cursor_resources: SmallVec::new(),
+            sorter_resources: SmallVec::new(),
             parameter_declarations: SmallVec::new(),
         }
     }
@@ -1129,6 +1340,39 @@ impl IrBuilder {
         Ok(())
     }
 
+    fn allocate_sorter(
+        &mut self,
+        keys: SmallVec<[SortKey; 4]>,
+        record_width: usize,
+    ) -> Result<SorterId> {
+        if keys.is_empty() {
+            return Err(LimboError::InternalError(
+                "compiler IR sorter must have at least one key".to_owned(),
+            ));
+        }
+        if record_width < keys.len() {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR sorter has {} keys but record width {record_width}",
+                keys.len()
+            )));
+        }
+        let id = u32::try_from(self.sorter_resources.len()).map_err(|_| {
+            LimboError::InternalError("compiler IR sorter identifier overflow".to_owned())
+        })?;
+        self.sorter_resources
+            .push(SorterResource { keys, record_width });
+        Ok(SorterId(id))
+    }
+
+    fn ensure_sorter_declared(&self, sorter: SorterId) -> Result<()> {
+        if sorter.index() >= self.sorter_resources.len() {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR references undeclared sorter {sorter:?}"
+            )));
+        }
+        Ok(())
+    }
+
     fn allocate_value(&mut self) -> Result<ValueId> {
         let value = ValueId(self.next_value);
         self.next_value = self.next_value.checked_add(1).ok_or_else(|| {
@@ -1146,6 +1390,9 @@ impl IrBuilder {
         if let Some(cursor) = op.cursor() {
             self.ensure_cursor_declared(cursor)?;
         }
+        if let Some(sorter) = op.sorter() {
+            self.ensure_sorter_declared(sorter)?;
+        }
         if let ScalarOp::Parameter(variable) = &op {
             self.parameter_declarations.push(variable.clone());
         }
@@ -1159,10 +1406,22 @@ impl IrBuilder {
     fn push_effect(&mut self, op: EffectOp) -> Result<()> {
         let cursor = match &op {
             EffectOp::OpenRead { cursor, .. } => Some(*cursor),
-            EffectOp::ResultRow { .. } => None,
+            EffectOp::ResultRow { .. }
+            | EffectOp::OpenSorter { .. }
+            | EffectOp::SorterInsert { .. }
+            | EffectOp::SorterData { .. } => None,
         };
         if let Some(cursor) = cursor {
             self.ensure_cursor_declared(cursor)?;
+        }
+        let sorter = match &op {
+            EffectOp::OpenSorter { sorter }
+            | EffectOp::SorterInsert { sorter, .. }
+            | EffectOp::SorterData { sorter } => Some(*sorter),
+            EffectOp::OpenRead { .. } | EffectOp::ResultRow { .. } => None,
+        };
+        if let Some(sorter) = sorter {
+            self.ensure_sorter_declared(sorter)?;
         }
         self.blocks[self.current.index()]
             .instructions
@@ -1225,6 +1484,9 @@ impl IrBuilder {
         if let Some(cursor) = terminator.cursor() {
             self.ensure_cursor_declared(cursor)?;
         }
+        if let Some(sorter) = terminator.sorter() {
+            self.ensure_sorter_declared(sorter)?;
+        }
         let block = &mut self.blocks[self.current.index()];
         if block.terminator.replace(terminator).is_some() {
             return Err(LimboError::InternalError(format!(
@@ -1261,6 +1523,7 @@ impl IrBuilder {
             input_count: self.input_count,
             cursor_input_count: self.cursor_input_count,
             cursor_resources: self.cursor_resources,
+            sorter_resources: self.sorter_resources,
             parameter_declarations: self.parameter_declarations,
         };
         program.verify()?;
@@ -1274,6 +1537,19 @@ struct Definition {
     instruction: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SorterPhase {
+    Unopened,
+    Filling,
+    Reading,
+}
+
+impl SorterPhase {
+    const fn mask(self) -> u8 {
+        1 << self as u8
+    }
+}
+
 /// A verified SSA control-flow region.
 #[derive(Debug)]
 pub(crate) struct IrProgram {
@@ -1282,6 +1558,7 @@ pub(crate) struct IrProgram {
     input_count: u32,
     cursor_input_count: u32,
     cursor_resources: SmallVec<[CursorResource; 2]>,
+    sorter_resources: SmallVec<[SorterResource; 1]>,
     parameter_declarations: SmallVec<[Variable; 2]>,
 }
 
@@ -1296,6 +1573,7 @@ impl IrProgram {
         let block_count = self.blocks.len();
         let mut definitions = vec![None; self.value_count as usize];
         let mut cursor_definitions = vec![None; self.cursor_resources.len()];
+        let mut sorter_definitions = vec![None; self.sorter_resources.len()];
         let mut predecessors = vec![Vec::new(); block_count];
         let mut return_count = 0;
 
@@ -1338,6 +1616,21 @@ impl IrProgram {
                     return Err(LimboError::InternalError(
                         "compiler IR result row must contain at least one value".to_owned(),
                     ));
+                }
+                if let Instruction::Effect(EffectOp::SorterInsert { sorter, pack }) = instruction {
+                    let resource = self.sorter_resources.get(sorter.index()).ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "compiler IR inserts into out-of-range sorter {sorter:?}"
+                        ))
+                    })?;
+                    if pack.values().len() != resource.record_width {
+                        return Err(LimboError::InternalError(format!(
+                            "compiler IR sorter {:?} expects record width {}, received {}",
+                            sorter,
+                            resource.record_width,
+                            pack.values().len()
+                        )));
+                    }
                 }
                 if let Instruction::Value { result, op } = instruction {
                     if let ScalarOp::Input(input) = op {
@@ -1383,6 +1676,28 @@ impl IrProgram {
                         },
                     )?;
                 }
+                if let Some(sorter) = instruction.sorter_use() {
+                    if sorter.index() >= self.sorter_resources.len() {
+                        return Err(LimboError::InternalError(format!(
+                            "compiler IR references out-of-range sorter {sorter:?}"
+                        )));
+                    }
+                }
+                if let Some(sorter) = instruction.sorter_definition() {
+                    if sorter.index() >= self.sorter_resources.len() {
+                        return Err(LimboError::InternalError(format!(
+                            "compiler IR defines out-of-range sorter {sorter:?}"
+                        )));
+                    }
+                    Self::record_sorter_definition(
+                        &mut sorter_definitions,
+                        sorter,
+                        Definition {
+                            block: block.id,
+                            instruction: Some(instruction_index),
+                        },
+                    )?;
+                }
             }
             for (successor, arguments) in block.terminator.edges() {
                 let Some(target) = self.blocks.get(successor.index()) else {
@@ -1408,6 +1723,13 @@ impl IrProgram {
                     )));
                 }
             }
+            if let Some(sorter) = block.terminator.sorter() {
+                if sorter.index() >= self.sorter_resources.len() {
+                    return Err(LimboError::InternalError(format!(
+                        "compiler IR references out-of-range sorter {sorter:?}"
+                    )));
+                }
+            }
             if matches!(block.terminator, Terminator::Return(_)) {
                 return_count += 1;
             }
@@ -1426,6 +1748,7 @@ impl IrProgram {
             )));
         }
         let dominators = Self::compute_dominators(&predecessors);
+        self.verify_sorter_phases()?;
 
         for block in &self.blocks {
             for (instruction_index, instruction) in block.instructions.iter().enumerate() {
@@ -1443,6 +1766,15 @@ impl IrProgram {
                         &cursor_definitions,
                         &dominators,
                         cursor,
+                        block.id,
+                        instruction_index,
+                    )?;
+                }
+                if let Some(sorter) = instruction.sorter_use() {
+                    Self::verify_sorter_use(
+                        &sorter_definitions,
+                        &dominators,
+                        sorter,
                         block.id,
                         instruction_index,
                     )?;
@@ -1466,6 +1798,129 @@ impl IrProgram {
                     block.instructions.len(),
                 )?;
             }
+            if let Some(sorter) = block.terminator.sorter() {
+                Self::verify_sorter_use(
+                    &sorter_definitions,
+                    &dominators,
+                    sorter,
+                    block.id,
+                    block.instructions.len(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_sorter_phases(&self) -> Result<()> {
+        if self.sorter_resources.is_empty() {
+            return Ok(());
+        }
+        let initial = vec![SorterPhase::Unopened.mask(); self.sorter_resources.len()];
+        let mut incoming = vec![None; self.blocks.len()];
+        incoming[0] = Some(initial);
+        let mut worklist = vec![BlockId(0)];
+
+        while let Some(block_id) = worklist.pop() {
+            let block = &self.blocks[block_id.index()];
+            let mut phases = incoming[block_id.index()]
+                .clone()
+                .expect("sorter phase worklist block has incoming state");
+            for instruction in &block.instructions {
+                match instruction {
+                    Instruction::Effect(EffectOp::OpenSorter { sorter }) => {
+                        Self::require_sorter_phase(
+                            &phases,
+                            *sorter,
+                            SorterPhase::Unopened,
+                            "open",
+                        )?;
+                        phases[sorter.index()] = SorterPhase::Filling.mask();
+                    }
+                    Instruction::Effect(EffectOp::SorterInsert { sorter, .. }) => {
+                        Self::require_sorter_phase(
+                            &phases,
+                            *sorter,
+                            SorterPhase::Filling,
+                            "insert into",
+                        )?;
+                    }
+                    Instruction::Effect(EffectOp::SorterData { sorter })
+                    | Instruction::Value {
+                        op: ScalarOp::SorterColumn { sorter, .. },
+                        ..
+                    } => {
+                        Self::require_sorter_phase(&phases, *sorter, SorterPhase::Reading, "read")?;
+                    }
+                    Instruction::Value { .. }
+                    | Instruction::Effect(EffectOp::OpenRead { .. } | EffectOp::ResultRow { .. }) =>
+                        {}
+                }
+            }
+
+            match &block.terminator {
+                Terminator::SorterSort { sorter, .. } => {
+                    Self::require_sorter_phase(&phases, *sorter, SorterPhase::Filling, "sort")?;
+                    phases[sorter.index()] = SorterPhase::Reading.mask();
+                }
+                Terminator::SorterNext { sorter, .. } => {
+                    Self::require_sorter_phase(&phases, *sorter, SorterPhase::Reading, "advance")?;
+                }
+                Terminator::Jump { .. }
+                | Terminator::Branch { .. }
+                | Terminator::Compare { .. }
+                | Terminator::CursorRewind { .. }
+                | Terminator::CursorNext { .. }
+                | Terminator::Return(_) => {}
+            }
+
+            for successor in block.terminator.successors() {
+                match &incoming[successor.index()] {
+                    None => {
+                        incoming[successor.index()] = Some(phases.clone());
+                        worklist.push(successor);
+                    }
+                    Some(existing) => {
+                        let mut merged = existing.clone();
+                        for (merged, incoming) in merged.iter_mut().zip(&phases) {
+                            *merged |= incoming;
+                        }
+                        if &merged != existing {
+                            incoming[successor.index()] = Some(merged);
+                            worklist.push(successor);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn require_sorter_phase(
+        phases: &[u8],
+        sorter: SorterId,
+        expected: SorterPhase,
+        operation: &str,
+    ) -> Result<()> {
+        let actual = phases[sorter.index()];
+        if actual != expected.mask() {
+            let mut names = SmallVec::<[&str; 3]>::new();
+            for phase in [
+                SorterPhase::Unopened,
+                SorterPhase::Filling,
+                SorterPhase::Reading,
+            ] {
+                if actual & phase.mask() != 0 {
+                    names.push(match phase {
+                        SorterPhase::Unopened => "Unopened",
+                        SorterPhase::Filling => "Filling",
+                        SorterPhase::Reading => "Reading",
+                    });
+                }
+            }
+            return Err(LimboError::InternalError(format!(
+                "compiler IR cannot {operation} sorter {sorter:?} in phase {}; expected {expected:?}",
+                names.join("|")
+            )));
         }
         Ok(())
     }
@@ -1501,6 +1956,24 @@ impl IrProgram {
         if slot.replace(definition).is_some() {
             return Err(LimboError::InternalError(format!(
                 "compiler IR cursor {cursor:?} has multiple definitions"
+            )));
+        }
+        Ok(())
+    }
+
+    fn record_sorter_definition(
+        definitions: &mut [Option<Definition>],
+        sorter: SorterId,
+        definition: Definition,
+    ) -> Result<()> {
+        let Some(slot) = definitions.get_mut(sorter.index()) else {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR defines out-of-range sorter {sorter:?}"
+            )));
+        };
+        if slot.replace(definition).is_some() {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR sorter {sorter:?} has multiple definitions"
             )));
         }
         Ok(())
@@ -1670,6 +2143,14 @@ impl IrProgram {
                 Terminator::CursorNext {
                     if_next, if_done, ..
                 } => Some((*if_next, *if_done)),
+                Terminator::SorterSort {
+                    if_non_empty,
+                    if_empty,
+                    ..
+                } => Some((*if_non_empty, *if_empty)),
+                Terminator::SorterNext {
+                    if_next, if_done, ..
+                } => Some((*if_next, *if_done)),
                 _ => None,
             };
             if let Some((first, second)) = shared_targets {
@@ -1808,6 +2289,33 @@ impl IrProgram {
         if !valid {
             return Err(LimboError::InternalError(format!(
                 "compiler IR cursor {cursor:?} is not open on every path to {use_block:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn verify_sorter_use(
+        definitions: &[Option<Definition>],
+        dominators: &[Vec<bool>],
+        sorter: SorterId,
+        use_block: BlockId,
+        use_instruction: usize,
+    ) -> Result<()> {
+        let Some(Some(definition)) = definitions.get(sorter.index()) else {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR uses unopened sorter {sorter:?}"
+            )));
+        };
+        let valid = if definition.block == use_block {
+            definition
+                .instruction
+                .is_none_or(|definition| definition < use_instruction)
+        } else {
+            dominators[use_block.index()][definition.block.index()]
+        };
+        if !valid {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR sorter {sorter:?} is not open on every path to {use_block:?}"
             )));
         }
         Ok(())
@@ -1954,6 +2462,14 @@ impl IrProgram {
                 Terminator::CursorNext {
                     if_next, if_done, ..
                 } => Some((*if_next, *if_done)),
+                Terminator::SorterSort {
+                    if_non_empty,
+                    if_empty,
+                    ..
+                } => Some((*if_non_empty, *if_empty)),
+                Terminator::SorterNext {
+                    if_next, if_done, ..
+                } => Some((*if_next, *if_done)),
                 _ => None,
             };
             if let Some((first, second)) = shared_targets {
@@ -2052,12 +2568,34 @@ impl IrProgram {
         required
     }
 
+    fn required_sorters(&self) -> Vec<bool> {
+        let mut required = vec![false; self.sorter_resources.len()];
+        for block in &self.blocks {
+            for instruction in &block.instructions {
+                for sorter in [instruction.sorter_use(), instruction.sorter_definition()]
+                    .into_iter()
+                    .flatten()
+                {
+                    required[sorter.index()] = true;
+                }
+            }
+            if let Some(sorter) = block.terminator.sorter() {
+                required[sorter.index()] = true;
+            }
+        }
+        required
+    }
+
     fn register_for(registers: &[Option<usize>], value: ValueId) -> usize {
         registers[value.index()].expect("verified live SSA value has a physical register")
     }
 
     fn cursor_for(cursors: &[Option<usize>], cursor: CursorId) -> usize {
         cursors[cursor.index()].expect("verified live cursor has a physical cursor")
+    }
+
+    fn sorter_for(sorters: &[Option<PhysicalSorter>], sorter: SorterId) -> PhysicalSorter {
+        sorters[sorter.index()].expect("verified live sorter has physical resources")
     }
 
     fn collect_edge_copies(
@@ -2209,6 +2747,21 @@ impl IrProgram {
                 },
             )
             .collect::<SmallVec<[Option<usize>; 2]>>();
+        let required_sorters = self.required_sorters();
+        let physical_sorters = self
+            .sorter_resources
+            .iter()
+            .enumerate()
+            .map(|(index, resource)| {
+                required_sorters[index].then(|| PhysicalSorter {
+                    cursor: program.alloc_cursor_id(CursorType::Sorter),
+                    pseudo_cursor: program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
+                        column_count: resource.record_width,
+                    })),
+                    data_register: program.alloc_register(),
+                })
+            })
+            .collect::<SmallVec<[Option<PhysicalSorter>; 1]>>();
         let registers = self.allocate_value_registers(program, target_register, input_registers);
         let labels = self
             .blocks
@@ -2331,6 +2884,14 @@ impl IrProgram {
                                     destination,
                                 );
                             }
+                            ScalarOp::SorterColumn { sorter, column } => {
+                                let sorter = Self::sorter_for(&physical_sorters, *sorter);
+                                program.emit_column_or_rowid(
+                                    sorter.pseudo_cursor,
+                                    *column,
+                                    destination,
+                                );
+                            }
                         }
                     }
                     Instruction::Effect(EffectOp::OpenRead {
@@ -2363,6 +2924,60 @@ impl IrProgram {
                         program.emit_insn(Insn::ResultRow {
                             start_reg: start,
                             count: pack.values().len(),
+                        });
+                    }
+                    Instruction::Effect(EffectOp::OpenSorter { sorter }) => {
+                        let physical = Self::sorter_for(&physical_sorters, *sorter);
+                        let resource = &self.sorter_resources[sorter.index()];
+                        program.emit_insn(Insn::SorterOpen {
+                            cursor_id: physical.cursor,
+                            columns: resource.keys.len(),
+                            order_collations_nulls: resource
+                                .keys
+                                .iter()
+                                .map(|key| (key.order, key.collation, key.nulls))
+                                .collect(),
+                            comparators: resource.keys.iter().map(|key| key.comparator).collect(),
+                        });
+                        program.emit_insn(Insn::OpenPseudo {
+                            cursor_id: physical.pseudo_cursor,
+                            content_reg: physical.data_register,
+                            num_fields: resource.record_width,
+                        });
+                    }
+                    Instruction::Effect(EffectOp::SorterInsert { sorter, pack }) => {
+                        let physical = Self::sorter_for(&physical_sorters, *sorter);
+                        let start = program.alloc_registers(pack.values().len());
+                        for (index, value) in pack.values().iter().enumerate() {
+                            let source = Self::register_for(&registers, *value);
+                            let destination = start + index;
+                            if source != destination {
+                                program.emit_insn(Insn::Copy {
+                                    src_reg: source,
+                                    dst_reg: destination,
+                                    extra_amount: 0,
+                                });
+                            }
+                        }
+                        let record = program.alloc_register();
+                        program.emit_insn(Insn::MakeRecord {
+                            start_reg: to_u16(start),
+                            count: to_u16(pack.values().len()),
+                            dest_reg: to_u16(record),
+                            index_name: None,
+                            affinity_str: None,
+                        });
+                        program.emit_insn(Insn::SorterInsert {
+                            cursor_id: physical.cursor,
+                            record_reg: record,
+                        });
+                    }
+                    Instruction::Effect(EffectOp::SorterData { sorter }) => {
+                        let physical = Self::sorter_for(&physical_sorters, *sorter);
+                        program.emit_insn(Insn::SorterData {
+                            cursor_id: physical.cursor,
+                            dest_reg: physical.data_register,
+                            pseudo_cursor: physical.pseudo_cursor,
                         });
                     }
                 }
@@ -2516,6 +3131,44 @@ impl IrProgram {
                         target_pc: labels[if_done.index()],
                     });
                 }
+                Terminator::SorterSort {
+                    sorter,
+                    if_non_empty,
+                    if_empty,
+                    arguments,
+                } => {
+                    let mut copies = SmallVec::new();
+                    for target in [if_non_empty, if_empty] {
+                        self.collect_edge_copies(&registers, *target, arguments, &mut copies);
+                    }
+                    Self::emit_parallel_copies(program, copies, &mut edge_copy_temporary);
+                    program.emit_insn(Insn::SorterSort {
+                        cursor_id: Self::sorter_for(&physical_sorters, *sorter).cursor,
+                        pc_if_empty: labels[if_empty.index()],
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: labels[if_non_empty.index()],
+                    });
+                }
+                Terminator::SorterNext {
+                    sorter,
+                    if_next,
+                    if_done,
+                    arguments,
+                } => {
+                    let mut copies = SmallVec::new();
+                    for target in [if_next, if_done] {
+                        self.collect_edge_copies(&registers, *target, arguments, &mut copies);
+                    }
+                    Self::emit_parallel_copies(program, copies, &mut edge_copy_temporary);
+                    program.emit_insn(Insn::SorterNext {
+                        cursor_id: Self::sorter_for(&physical_sorters, *sorter).cursor,
+                        pc_if_next: labels[if_next.index()],
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: labels[if_done.index()],
+                    });
+                }
                 Terminator::Return(_) => {
                     if let Some(continuation) = continuation {
                         program.emit_insn(Insn::Goto {
@@ -2549,7 +3202,26 @@ impl fmt::Display for IrProgram {
                 }
             }
         }
-        if !self.cursor_resources.is_empty() {
+        for (index, resource) in self.sorter_resources.iter().enumerate() {
+            write!(
+                f,
+                "sorter #{index} keys {} width {} [",
+                resource.keys.len(),
+                resource.record_width
+            )?;
+            for (key_index, key) in resource.keys.iter().enumerate() {
+                if key_index != 0 {
+                    write!(f, ", ")?;
+                }
+                write!(
+                    f,
+                    "{:?} {:?} {:?} {:?}",
+                    key.order, key.collation, key.nulls, key.comparator
+                )?;
+            }
+            writeln!(f, "]")?;
+        }
+        if !self.cursor_resources.is_empty() || !self.sorter_resources.is_empty() {
             writeln!(f)?;
         }
         for (block_index, block) in self.blocks.iter().enumerate() {
@@ -2600,6 +3272,9 @@ impl fmt::Display for IrProgram {
                             ScalarOp::Column { cursor, column } => {
                                 writeln!(f, "column ${}[{column}]", cursor.0)?;
                             }
+                            ScalarOp::SorterColumn { sorter, column } => {
+                                writeln!(f, "sorter_column #{}[{column}]", sorter.0)?;
+                            }
                         }
                     }
                     Instruction::Effect(EffectOp::OpenRead {
@@ -2616,6 +3291,17 @@ impl fmt::Display for IrProgram {
                         write!(f, "  result_row [")?;
                         Self::fmt_arguments(f, pack.values())?;
                         writeln!(f, "]")?;
+                    }
+                    Instruction::Effect(EffectOp::OpenSorter { sorter }) => {
+                        writeln!(f, "  open_sorter #{}", sorter.0)?;
+                    }
+                    Instruction::Effect(EffectOp::SorterInsert { sorter, pack }) => {
+                        write!(f, "  sorter_insert #{} [", sorter.0)?;
+                        Self::fmt_arguments(f, pack.values())?;
+                        writeln!(f, "]")?;
+                    }
+                    Instruction::Effect(EffectOp::SorterData { sorter }) => {
+                        writeln!(f, "  sorter_data #{}", sorter.0)?;
                     }
                 }
             }
@@ -2678,6 +3364,30 @@ impl fmt::Display for IrProgram {
                     arguments,
                 } => {
                     write!(f, "next ${}, block{}(", cursor.0, if_next.0)?;
+                    Self::fmt_arguments(f, arguments)?;
+                    write!(f, "), block{}(", if_done.0)?;
+                    Self::fmt_arguments(f, arguments)?;
+                    writeln!(f, ")")?;
+                }
+                Terminator::SorterSort {
+                    sorter,
+                    if_non_empty,
+                    if_empty,
+                    arguments,
+                } => {
+                    write!(f, "sort #{}, block{}(", sorter.0, if_non_empty.0)?;
+                    Self::fmt_arguments(f, arguments)?;
+                    write!(f, "), block{}(", if_empty.0)?;
+                    Self::fmt_arguments(f, arguments)?;
+                    writeln!(f, ")")?;
+                }
+                Terminator::SorterNext {
+                    sorter,
+                    if_next,
+                    if_done,
+                    arguments,
+                } => {
+                    write!(f, "sorter_next #{}, block{}(", sorter.0, if_next.0)?;
                     Self::fmt_arguments(f, arguments)?;
                     write!(f, "), block{}(", if_done.0)?;
                     Self::fmt_arguments(f, arguments)?;
@@ -2830,6 +3540,18 @@ pub(crate) trait RowStream: Sized + 'static {
             count,
         }
     }
+
+    /// Buffer value packs, then yield them in the declared key order.
+    fn sort(self, keys: SmallVec<[SortKey; 4]>, record_width: usize) -> SortRows<Self>
+    where
+        Self: RowStream<Item = ValuePack>,
+    {
+        SortRows {
+            source: self,
+            keys,
+            record_width,
+        }
+    }
 }
 
 impl RowStream for CursorRows {
@@ -2854,6 +3576,230 @@ impl RowStream for CursorRows {
             cursor: self.cursor,
             body,
             compiler: PhantomData,
+        }
+        .boxed()
+    }
+}
+
+/// A buffering row-stream boundary backed by a symbolic sorter resource.
+pub(crate) struct SortRows<Source> {
+    source: Source,
+    keys: SmallVec<[SortKey; 4]>,
+    record_width: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SortedRow {
+    sorter: SorterId,
+    record_width: usize,
+}
+
+impl SortedRow {
+    pub(crate) const fn column(self, column: usize) -> SorterColumn {
+        SorterColumn {
+            sorter: self.sorter,
+            column,
+            record_width: self.record_width,
+        }
+    }
+}
+
+pub(crate) struct SorterColumn {
+    sorter: SorterId,
+    column: usize,
+    record_width: usize,
+}
+
+impl Compile for SorterColumn {
+    type Output = ValueId;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        if self.column >= self.record_width {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR reads sorter column {} from width {}",
+                self.column, self.record_width
+            )));
+        }
+        builder.push(ScalarOp::SorterColumn {
+            sorter: self.sorter,
+            column: self.column,
+        })
+    }
+}
+
+struct InsertSorter {
+    sorter: SorterId,
+    pack: ValuePack,
+}
+
+impl Compile for InsertSorter {
+    type Output = ();
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        builder.push_effect(EffectOp::SorterInsert {
+            sorter: self.sorter,
+            pack: self.pack,
+        })
+    }
+}
+
+struct ForEachSorted<Source> {
+    source: Source,
+    keys: SmallVec<[SortKey; 4]>,
+    record_width: usize,
+    body: BoxedRowConsumer<SortedRow>,
+}
+
+impl<Source> Compile for ForEachSorted<Source>
+where
+    Source: RowStream<Item = ValuePack>,
+{
+    type Output = ();
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let sorter = builder.allocate_sorter(self.keys, self.record_width)?;
+        builder.push_effect(EffectOp::OpenSorter { sorter })?;
+        self.source
+            .for_each_boxed(Box::new(move |pack| InsertSorter { sorter, pack }.boxed()))
+            .compile(builder)?;
+
+        let row = builder.create_block()?;
+        let exit = builder.create_block()?;
+        builder.terminate(Terminator::SorterSort {
+            sorter,
+            if_non_empty: row,
+            if_empty: exit,
+            arguments: SmallVec::new(),
+        })?;
+
+        builder.switch_to(row)?;
+        builder.push_effect(EffectOp::SorterData { sorter })?;
+        (self.body)(SortedRow {
+            sorter,
+            record_width: self.record_width,
+        })
+        .compile(builder)?;
+        builder.terminate(Terminator::SorterNext {
+            sorter,
+            if_next: row,
+            if_done: exit,
+            arguments: SmallVec::new(),
+        })?;
+
+        builder.switch_to(exit)
+    }
+}
+
+struct TryFoldSorted<Source> {
+    source: Source,
+    keys: SmallVec<[SortKey; 4]>,
+    record_width: usize,
+    initial: BoxedCompile<LoopState>,
+    body: BoxedRowFolder<SortedRow>,
+}
+
+impl<Source> Compile for TryFoldSorted<Source>
+where
+    Source: RowStream<Item = ValuePack>,
+{
+    type Output = LoopState;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let initial = self.initial.compile(builder)?;
+        let sorter = builder.allocate_sorter(self.keys, self.record_width)?;
+        builder.push_effect(EffectOp::OpenSorter { sorter })?;
+        self.source
+            .for_each_boxed(Box::new(move |pack| InsertSorter { sorter, pack }.boxed()))
+            .compile(builder)?;
+
+        let row = builder.create_block()?;
+        let advance = builder.create_block()?;
+        let stop = builder.create_block()?;
+        let exit = builder.create_block()?;
+        let mut row_state = SmallVec::with_capacity(initial.len());
+        let mut result_state = SmallVec::with_capacity(initial.len());
+        for _ in 0..initial.len() {
+            row_state.push(builder.add_block_parameter(row)?);
+            result_state.push(builder.add_block_parameter(exit)?);
+        }
+        builder.terminate(Terminator::SorterSort {
+            sorter,
+            if_non_empty: row,
+            if_empty: exit,
+            arguments: initial.values,
+        })?;
+
+        builder.switch_to(row)?;
+        builder.push_effect(EffectOp::SorterData { sorter })?;
+        let step = (self.body)(
+            SortedRow {
+                sorter,
+                record_width: self.record_width,
+            },
+            LoopState { values: row_state },
+        )
+        .compile(builder)?;
+        if step.state.len() != result_state.len() {
+            return Err(LimboError::InternalError(format!(
+                "sorted row stream loop body changed state arity from {} to {}",
+                result_state.len(),
+                step.state.len()
+            )));
+        }
+        builder.terminate(Terminator::Branch {
+            condition: step.should_continue,
+            if_true: advance,
+            if_false: stop,
+        })?;
+
+        builder.switch_to(advance)?;
+        builder.terminate(Terminator::SorterNext {
+            sorter,
+            if_next: row,
+            if_done: exit,
+            arguments: step.state.values.clone(),
+        })?;
+
+        builder.switch_to(stop)?;
+        builder.terminate(Terminator::Jump {
+            target: exit,
+            arguments: step.state.values,
+        })?;
+
+        builder.switch_to(exit)?;
+        Ok(LoopState {
+            values: result_state,
+        })
+    }
+}
+
+impl<Source> RowStream for SortRows<Source>
+where
+    Source: RowStream<Item = ValuePack>,
+{
+    type Item = SortedRow;
+
+    fn for_each_boxed(self, body: BoxedRowConsumer<Self::Item>) -> BoxedCompile<()> {
+        ForEachSorted {
+            source: self.source,
+            keys: self.keys,
+            record_width: self.record_width,
+            body,
+        }
+        .boxed()
+    }
+
+    fn try_fold_boxed(
+        self,
+        initial: BoxedCompile<LoopState>,
+        body: BoxedRowFolder<Self::Item>,
+    ) -> BoxedCompile<LoopState> {
+        TryFoldSorted {
+            source: self.source,
+            keys: self.keys,
+            record_width: self.record_width,
+            initial,
+            body,
         }
         .boxed()
     }
@@ -3716,6 +4662,108 @@ mod tests {
                 "  return %1\n",
             )
         );
+    }
+
+    #[test]
+    fn row_stream_sort_materializes_then_yields_symbolic_records() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE sorted(a,b)", 2).unwrap());
+        let compiler = scan_table(table, 0, 0).and_then(|rows| {
+            rows.map(|row| pack_values(smallvec![row.column(1).boxed(), row.column(0).boxed()]))
+                .sort(
+                    smallvec![SortKey::new(
+                        SortOrder::Asc,
+                        Some(CollationSeq::Binary),
+                        None,
+                        None,
+                    )],
+                    2,
+                )
+                .for_each(|row| {
+                    pack_values(smallvec![row.column(1).boxed()]).and_then(result_row_pack)
+                })
+        });
+
+        let ir = compile_effect(compiler).unwrap();
+
+        assert_eq!(
+            ir.to_string(),
+            concat!(
+                "cursor $0 = btree_table \"sorted\" root 2\n",
+                "sorter #0 keys 1 width 2 [Asc Some(Binary) None None]\n",
+                "\n",
+                "block0:\n",
+                "  open_read $0 root 2 db 0 schema 0\n",
+                "  open_sorter #0\n",
+                "  rewind $0, block1(), block2()\n",
+                "\n",
+                "block1:\n",
+                "  %0 = column $0[1]\n",
+                "  %1 = column $0[0]\n",
+                "  sorter_insert #0 [%0, %1]\n",
+                "  next $0, block1(), block2()\n",
+                "\n",
+                "block2:\n",
+                "  sort #0, block3(), block4()\n",
+                "\n",
+                "block3:\n",
+                "  sorter_data #0\n",
+                "  %2 = sorter_column #0[1]\n",
+                "  result_row [%2]\n",
+                "  sorter_next #0, block3(), block4()\n",
+                "\n",
+                "block4:\n",
+                "  %3 = constant Null\n",
+                "  return %3\n",
+            )
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_reading_a_sorter_before_sorting() {
+        let mut builder = IrBuilder::new();
+        let sorter = builder
+            .allocate_sorter(smallvec![SortKey::new(SortOrder::Asc, None, None, None)], 1)
+            .unwrap();
+        builder
+            .push_effect(EffectOp::OpenSorter { sorter })
+            .unwrap();
+        builder
+            .push_effect(EffectOp::SorterData { sorter })
+            .unwrap();
+        let completion = builder.push(ScalarOp::Constant(Value::Null)).unwrap();
+
+        let error = builder.finish(completion).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cannot read sorter SorterId(0) in phase Filling"));
+    }
+
+    #[test]
+    fn verifier_rejects_sorter_records_with_the_wrong_width() {
+        let mut builder = IrBuilder::new();
+        let sorter = builder
+            .allocate_sorter(smallvec![SortKey::new(SortOrder::Asc, None, None, None)], 2)
+            .unwrap();
+        builder
+            .push_effect(EffectOp::OpenSorter { sorter })
+            .unwrap();
+        let value = builder
+            .push(ScalarOp::Constant(Value::from_i64(1)))
+            .unwrap();
+        builder
+            .push_effect(EffectOp::SorterInsert {
+                sorter,
+                pack: ValuePack(smallvec![value]),
+            })
+            .unwrap();
+        let completion = builder.push(ScalarOp::Constant(Value::Null)).unwrap();
+
+        let error = builder.finish(completion).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("expects record width 2, received 1"));
     }
 
     #[test]
@@ -4831,6 +5879,7 @@ mod tests {
             input_count: 0,
             cursor_input_count: 0,
             cursor_resources: SmallVec::new(),
+            sorter_resources: SmallVec::new(),
             parameter_declarations: SmallVec::new(),
         };
 
@@ -4854,6 +5903,7 @@ mod tests {
             input_count: 0,
             cursor_input_count: 0,
             cursor_resources: SmallVec::new(),
+            sorter_resources: SmallVec::new(),
             parameter_declarations: SmallVec::new(),
         };
 
@@ -4915,6 +5965,7 @@ mod tests {
             input_count: 0,
             cursor_input_count: 0,
             cursor_resources: SmallVec::new(),
+            sorter_resources: SmallVec::new(),
             parameter_declarations: SmallVec::new(),
         };
 
@@ -5025,6 +6076,7 @@ mod tests {
             input_count: 0,
             cursor_input_count: 0,
             cursor_resources: SmallVec::new(),
+            sorter_resources: SmallVec::new(),
             parameter_declarations: SmallVec::new(),
         };
 
@@ -5211,6 +6263,42 @@ mod tests {
                 vec![Value::from_i64(3), Value::from_i64(2), Value::from_i64(6),],
                 vec![Value::Null, Value::Null, Value::Null],
                 vec![Value::from_i64(1), Value::from_i64(-8), Value::from_i64(4),],
+            ]
+        );
+    }
+
+    #[test]
+    fn ordered_table_scan_runs_symbolic_sort_pipeline_through_vdbe() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute("CREATE TABLE sorted(key, payload, value)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sorted VALUES \
+                 (NULL, 'null', 0), ('b', 'bee', 3), ('A', 'aye', 2), \
+                 ('a', 'lower', 1), ('C', 'see', 4)",
+            )
+            .unwrap();
+
+        let rows = connection
+            .prepare(
+                "SELECT payload, value + 1 FROM sorted WHERE value >= 0 \
+                 ORDER BY key COLLATE NOCASE DESC NULLS FIRST, value ASC \
+                 LIMIT 3 OFFSET 1",
+            )
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::from_text("see"), Value::from_i64(5)],
+                vec![Value::from_text("bee"), Value::from_i64(4)],
+                vec![Value::from_text("lower"), Value::from_i64(2)],
             ]
         );
     }

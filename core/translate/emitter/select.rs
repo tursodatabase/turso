@@ -5,9 +5,10 @@ use crate::{
     sync::Arc,
     translate::{
         aggregation::emit_ungrouped_aggregation,
+        collate::get_collseq_from_expr_with_symbols,
         compiler::{
-            compile_effect, result_row_pack, scan_table, BoxedCompile, Compile, Row, RowStream,
-            ValueId,
+            compile_effect, pack_values, result_row_pack, scan_table, BoxedCompile, Compile, Row,
+            RowStream, SortKey, SortedRow, ValueId,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -20,7 +21,7 @@ use crate::{
         },
         group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
-        order_by::EmitOrderBy,
+        order_by::{custom_type_comparator, EmitOrderBy},
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, IterationDirection,
             JoinOrderMember, Operation, QueryDestination, Scan, Search, SeekKeyComponent,
@@ -78,7 +79,6 @@ fn try_emit_declarative_table_scan(
         || !matches!(plan.query_destination, QueryDestination::ResultRows)
         || !matches!(plan.distinctness, Distinctness::NonDistinct)
         || plan.group_by.is_some()
-        || !plan.order_by.is_empty()
         || !plan.aggregates.is_empty()
         || plan.contains_constant_false_condition
         || !plan.values.is_empty()
@@ -123,6 +123,24 @@ fn try_emit_declarative_table_scan(
         table,
         &plan.table_references,
     );
+    let mut sort_keys = SmallVec::<[SortKey; 4]>::with_capacity(plan.order_by.len());
+    let mut sort_expressions =
+        SmallVec::<[ResolvedScalarExpr; 4]>::with_capacity(plan.order_by.len());
+    for (expression, order, nulls) in &plan.order_by {
+        let Some(resolved) = expr_resolver.resolve(expression)? else {
+            return Ok(None);
+        };
+        let collation = get_collseq_from_expr_with_symbols(
+            expression,
+            &plan.table_references,
+            Some(resolver.symbol_table),
+        )?;
+        let comparator = resolver.with_schema(joined.database_id, |schema| {
+            custom_type_comparator(expression, &plan.table_references, schema)
+        });
+        sort_keys.push(SortKey::new(*order, collation, *nulls, comparator));
+        sort_expressions.push(resolved);
+    }
     let limit = match plan.limit.as_deref() {
         None => None,
         Some(limit) => {
@@ -180,13 +198,25 @@ fn try_emit_declarative_table_scan(
     let table = table.clone();
     let database_id = joined.database_id;
     let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
+    let result_column_count = projections.len();
     let compiler = scan_table(table, database_id, schema_cookie).and_then(move |rows| {
         if predicates.is_empty() {
-            compile_declarative_projection(rows, projections, limit, offset)
+            compile_declarative_rows(
+                rows,
+                projections,
+                sort_expressions,
+                sort_keys,
+                result_column_count,
+                limit,
+                offset,
+            )
         } else {
-            compile_declarative_projection(
+            compile_declarative_rows(
                 rows.filter(move |row| compile_symbolic_conjunction(row, &predicates)),
                 projections,
+                sort_expressions,
+                sort_keys,
+                result_column_count,
                 limit,
                 offset,
             )
@@ -203,6 +233,85 @@ fn try_emit_declarative_table_scan(
         )));
     }
     Ok(Some(result_cols_start))
+}
+
+fn compile_declarative_rows<Stream>(
+    rows: Stream,
+    projections: SmallVec<[ResolvedScalarExpr; 4]>,
+    mut sort_expressions: SmallVec<[ResolvedScalarExpr; 4]>,
+    sort_keys: SmallVec<[SortKey; 4]>,
+    result_column_count: usize,
+    limit: Option<BoxedCompile<ValueId>>,
+    offset: Option<BoxedCompile<ValueId>>,
+) -> BoxedCompile<()>
+where
+    Stream: RowStream<Item = Row> + 'static,
+{
+    if sort_keys.is_empty() {
+        compile_declarative_projection(rows, projections, limit, offset)
+    } else {
+        sort_expressions.extend(projections);
+        compile_declarative_sorted_projection(
+            rows,
+            sort_expressions,
+            sort_keys,
+            result_column_count,
+            limit,
+            offset,
+        )
+    }
+}
+
+fn compile_declarative_sorted_projection<Stream>(
+    rows: Stream,
+    expressions: SmallVec<[ResolvedScalarExpr; 4]>,
+    sort_keys: SmallVec<[SortKey; 4]>,
+    result_column_count: usize,
+    limit: Option<BoxedCompile<ValueId>>,
+    offset: Option<BoxedCompile<ValueId>>,
+) -> BoxedCompile<()>
+where
+    Stream: RowStream<Item = Row> + 'static,
+{
+    let key_count = sort_keys.len();
+    let record_width = expressions.len();
+    let rows = rows
+        .map(move |row| compile_symbolic_exprs(row, &expressions))
+        .sort(sort_keys, record_width);
+    match (limit, offset) {
+        (Some(limit), Some(offset)) => rows
+            .skip(offset)
+            .take(limit)
+            .map(move |row| sorted_result_pack(row, key_count, result_column_count))
+            .for_each(result_row_pack)
+            .boxed(),
+        (Some(limit), None) => rows
+            .take(limit)
+            .map(move |row| sorted_result_pack(row, key_count, result_column_count))
+            .for_each(result_row_pack)
+            .boxed(),
+        (None, Some(offset)) => rows
+            .skip(offset)
+            .map(move |row| sorted_result_pack(row, key_count, result_column_count))
+            .for_each(result_row_pack)
+            .boxed(),
+        (None, None) => rows
+            .map(move |row| sorted_result_pack(row, key_count, result_column_count))
+            .for_each(result_row_pack)
+            .boxed(),
+    }
+}
+
+fn sorted_result_pack(
+    row: SortedRow,
+    key_count: usize,
+    result_column_count: usize,
+) -> impl Compile<Output = crate::translate::compiler::ValuePack> {
+    let mut values = SmallVec::with_capacity(result_column_count);
+    for column in key_count..key_count + result_column_count {
+        values.push(row.column(column).boxed());
+    }
+    pack_values(values)
 }
 
 fn compile_declarative_projection<Stream>(
