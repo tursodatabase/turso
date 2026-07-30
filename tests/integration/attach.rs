@@ -1,4 +1,5 @@
 use crate::common::{do_flush, limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
+use anyhow::Context;
 use rusqlite::params;
 use rusqlite::Connection as RusqliteConnection;
 use std::fs::File;
@@ -80,6 +81,43 @@ fn test_attached_schema_refreshes_after_other_connection_create(
     );
     assert_eq!(rows[0], vec![rusqlite::types::Value::Integer(1)]);
 
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_attached_write_does_not_upgrade_stale_main_snapshot(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let aux_path = tmp_db.path.with_extension("attach_busy_snapshot.db");
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1.execute("CREATE TABLE main_t(x INTEGER)")?;
+    conn1.execute("INSERT INTO main_t VALUES (1)")?;
+    conn1.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn2.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn1.execute("CREATE TABLE aux.t(x INTEGER)")?;
+    conn1.execute("INSERT INTO aux.t VALUES (1)")?;
+
+    conn1.execute("BEGIN")?;
+    let main_rows = limbo_exec_rows(&conn1, "SELECT x FROM main_t");
+    assert_eq!(main_rows, vec![vec![rusqlite::types::Value::Integer(1)]]);
+
+    conn2
+        .execute("UPDATE main_t SET x = 2")
+        .context("update main")?;
+    conn2
+        .execute("UPDATE aux.t SET x = 2")
+        .context("update aux")?;
+
+    conn1
+        .execute("DELETE FROM aux.t")
+        .context("delete from aux")?;
+    let rows = limbo_exec_rows(&conn1, "SELECT x FROM aux.t");
+    assert!(rows.is_empty());
+    let main_rows = limbo_exec_rows(&conn1, "SELECT x FROM main_t");
+    assert_eq!(main_rows, vec![vec![rusqlite::types::Value::Integer(1)]]);
+    conn1.execute("ROLLBACK")?;
     Ok(())
 }
 
