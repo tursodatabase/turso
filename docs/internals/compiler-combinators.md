@@ -25,6 +25,9 @@ result register.
 - Every value must dominate its use; loop-carried and merged values enter blocks
   through explicit block parameters.
 - An owned cursor's open effect must dominate every operation that uses it.
+- A once-only cursor initializer may satisfy resource dominance across its
+  re-entry edge, but it never makes values defined by the initializer available
+  as SSA outputs.
 - Intermediate representations contain no physical VDBE locations.
 - Invalid intermediate representations are rejected before VDBE emission.
 - VDBE lowering is deterministic.
@@ -198,6 +201,17 @@ operations. The existing combined open operation is built from those two
 primitives. This distinction lets structured control-flow regions own the open
 effect without selecting a physical cursor early, while the verifier continues
 to reject every path that uses a declared but unopened resource.
+
+`initialize_cursor_once` places that open and an arbitrary effectful producer
+behind an IR `Once` terminator. First entry follows the initializer edge;
+subsequent entries in the same statement execution jump directly to the ready
+edge and reuse the populated cursor. Lowering emits VDBE `Once` plus an explicit
+jump to the initializer, so correctness does not depend on physical block
+layout. Verification keeps two dominance views: ordinary values use the full
+CFG, while cursor-open checks omit only the stateful re-entry edge. A value
+defined inside the initializer therefore still cannot escape it. Nested
+uncorrelated `IN` materialization uses this region to compose its producer and
+consumer as one deferred program while preserving once-per-statement behavior.
 
 Row production is an effect over a symbolic `ValuePack`, not an eagerly chosen
 register range. Each pack member remains an ordinary SSA value and must dominate

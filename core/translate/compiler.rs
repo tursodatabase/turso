@@ -241,6 +241,47 @@ where
     }
 }
 
+/// Initializes one symbolic cursor the first time control reaches this region.
+///
+/// The cursor identity is allocated while the compiler description is built,
+/// but its open and population effects remain in the guarded runtime region.
+/// Re-entry skips those effects and continues with the already-open cursor.
+pub(crate) struct InitializeCursorOnce<Compiler> {
+    compiler: Compiler,
+}
+
+pub(crate) const fn initialize_cursor_once<Compiler>(
+    compiler: Compiler,
+) -> InitializeCursorOnce<Compiler>
+where
+    Compiler: Compile<Output = CursorId>,
+{
+    InitializeCursorOnce { compiler }
+}
+
+impl<Compiler> Compile for InitializeCursorOnce<Compiler>
+where
+    Compiler: Compile<Output = CursorId>,
+{
+    type Output = CursorId;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let initialize = builder.create_block()?;
+        let ready = builder.create_block()?;
+        builder.terminate(Terminator::Once { initialize, ready })?;
+
+        builder.switch_to(initialize)?;
+        let cursor = self.compiler.compile(builder)?;
+        builder.terminate(Terminator::Jump {
+            target: ready,
+            arguments: SmallVec::new(),
+        })?;
+
+        builder.switch_to(ready)?;
+        Ok(cursor)
+    }
+}
+
 pub(crate) struct Branch<Condition, IfTrue, IfFalse> {
     condition: Condition,
     if_true: IfTrue,
@@ -1386,6 +1427,12 @@ enum Terminator {
         if_true: BlockId,
         if_false: BlockId,
     },
+    /// Run `initialize` on first entry and jump directly to `ready` whenever
+    /// the same VDBE program execution reaches this terminator again.
+    Once {
+        initialize: BlockId,
+        ready: BlockId,
+    },
     Compare {
         lhs: ValueId,
         rhs: ValueId,
@@ -1480,6 +1527,9 @@ impl Terminator {
             Self::Branch {
                 if_true, if_false, ..
             } => [Some((*if_true, &[][..])), Some((*if_false, &[][..])), None],
+            Self::Once { initialize, ready } => {
+                [Some((*initialize, &[][..])), Some((*ready, &[][..])), None]
+            }
             Self::Compare {
                 if_true,
                 if_false,
@@ -1594,6 +1644,7 @@ impl Terminator {
         let operands = match self {
             Self::Jump { arguments, .. } => arguments.iter().copied().collect(),
             Self::Branch { condition, .. } | Self::Return(condition) => smallvec![*condition],
+            Self::Once { .. } => SmallVec::new(),
             Self::Compare { lhs, rhs, .. } => smallvec![*lhs, *rhs],
             Self::CursorStart { arguments, .. }
             | Self::CursorAdvance { arguments, .. }
@@ -1633,6 +1684,7 @@ impl Terminator {
             }
             Self::DistinctCheck { pack, .. } => pack.values().iter().copied().collect(),
             Self::Jump { .. }
+            | Self::Once { .. }
             | Self::CursorStart { .. }
             | Self::CursorAdvance { .. }
             | Self::SorterSort { .. }
@@ -1650,9 +1702,11 @@ impl Terminator {
             | Self::IndexSeek { cursor, .. }
             | Self::IndexBound { cursor, .. }
             | Self::CursorAdvance { cursor, .. } => Some(*cursor),
-            Self::Jump { .. } | Self::Branch { .. } | Self::Compare { .. } | Self::Return(_) => {
-                None
-            }
+            Self::Jump { .. }
+            | Self::Branch { .. }
+            | Self::Once { .. }
+            | Self::Compare { .. }
+            | Self::Return(_) => None,
             Self::SorterSort { .. } | Self::SorterNext { .. } | Self::DistinctCheck { .. } => None,
         }
     }
@@ -1662,6 +1716,7 @@ impl Terminator {
             Self::SorterSort { sorter, .. } | Self::SorterNext { sorter, .. } => Some(*sorter),
             Self::Jump { .. }
             | Self::Branch { .. }
+            | Self::Once { .. }
             | Self::Compare { .. }
             | Self::CursorStart { .. }
             | Self::CursorSeekRowid { .. }
@@ -1680,6 +1735,7 @@ impl Terminator {
             Self::DistinctCheck { set, .. } => Some(*set),
             Self::Jump { .. }
             | Self::Branch { .. }
+            | Self::Once { .. }
             | Self::Compare { .. }
             | Self::CursorStart { .. }
             | Self::CursorSeekRowid { .. }
@@ -1714,6 +1770,10 @@ impl Terminator {
             } => {
                 remap_target(if_true)?;
                 remap_target(if_false)
+            }
+            Self::Once { initialize, ready } => {
+                remap_target(initialize)?;
+                remap_target(ready)
             }
             Self::Compare {
                 if_true,
@@ -1940,6 +2000,7 @@ impl Terminator {
                 retain_live_arguments(arguments, &parameter_live[if_next.index()])
             }
             Self::Branch { .. }
+            | Self::Once { .. }
             | Self::Compare { .. }
             | Self::DistinctCheck { .. }
             | Self::Return(_) => false,
@@ -2348,6 +2409,7 @@ impl IrProgram {
         let mut sorter_definitions = vec![None; self.sorter_resources.len()];
         let mut distinct_set_definitions = vec![None; self.distinct_set_resources.len()];
         let mut predecessors = vec![Vec::new(); block_count];
+        let mut cursor_predecessors = vec![Vec::new(); block_count];
         let mut return_count = 0;
 
         for (index, resource) in self.cursor_resources.iter().enumerate() {
@@ -2507,6 +2569,17 @@ impl IrProgram {
                     )));
                 }
                 predecessors[target.id.index()].push(block.id);
+                // A Once re-entry edge is stateful: it can execute only after
+                // the initialization edge completed during this statement
+                // execution. Cursor opens in the initialization region
+                // therefore dominate uses after `ready`, while ordinary SSA
+                // values continue to use the complete CFG above.
+                if !matches!(
+                    block.terminator,
+                    Terminator::Once { ready, .. } if ready == successor
+                ) {
+                    cursor_predecessors[target.id.index()].push(block.id);
+                }
             }
             if let Some(cursor) = block.terminator.cursor() {
                 let Some(resource) = self.cursor_resources.get(cursor.index()) else {
@@ -2578,6 +2651,7 @@ impl IrProgram {
             )));
         }
         let dominators = Self::compute_dominators(&predecessors);
+        let cursor_dominators = Self::compute_dominators(&cursor_predecessors);
         self.verify_sorter_phases()?;
 
         for block in &self.blocks {
@@ -2594,7 +2668,7 @@ impl IrProgram {
                 for cursor in instruction.cursor_uses() {
                     Self::verify_cursor_use(
                         &cursor_definitions,
-                        &dominators,
+                        &cursor_dominators,
                         cursor,
                         block.id,
                         instruction_index,
@@ -2622,7 +2696,7 @@ impl IrProgram {
             if let Some(cursor) = block.terminator.cursor() {
                 Self::verify_cursor_use(
                     &cursor_definitions,
-                    &dominators,
+                    &cursor_dominators,
                     cursor,
                     block.id,
                     block.instructions.len(),
@@ -2712,6 +2786,7 @@ impl IrProgram {
                 }
                 Terminator::Jump { .. }
                 | Terminator::Branch { .. }
+                | Terminator::Once { .. }
                 | Terminator::Compare { .. }
                 | Terminator::CursorStart { .. }
                 | Terminator::CursorSeekRowid { .. }
@@ -4099,6 +4174,14 @@ impl IrProgram {
                         target_pc: labels[if_true.index()],
                     });
                 }
+                Terminator::Once { initialize, ready } => {
+                    program.emit_insn(Insn::Once {
+                        target_pc_when_reentered: labels[ready.index()],
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: labels[initialize.index()],
+                    });
+                }
                 Terminator::Compare {
                     lhs,
                     rhs,
@@ -4768,6 +4851,9 @@ impl fmt::Display for IrProgram {
                     "branch %{}, block{}, block{}",
                     condition.0, if_true.0, if_false.0
                 )?,
+                Terminator::Once { initialize, ready } => {
+                    writeln!(f, "once block{}, block{}", initialize.0, ready.0)?
+                }
                 Terminator::Compare {
                     lhs,
                     rhs,
@@ -9246,6 +9332,71 @@ mod tests {
     }
 
     #[test]
+    fn once_initialized_cursor_can_be_consumed_after_its_guarded_region() {
+        let compiler =
+            declare_ephemeral_index(test_ephemeral_index("once_ephemeral")).and_then(|unopened| {
+                initialize_cursor_once(open_declared_ephemeral_index(unopened).and_then(|cursor| {
+                    pack_values(smallvec![constant(Value::from_i64(7)).boxed()])
+                        .and_then(move |pack| {
+                            insert_index_pack(
+                                cursor,
+                                pack,
+                                "once_ephemeral".to_owned(),
+                                Some("D".to_owned()),
+                            )
+                        })
+                        .map(move |()| cursor)
+                }))
+                .and_then(|cursor| {
+                    scan_cursor(cursor, ScanDirection::Forward).for_each(|row| {
+                        pack_values(smallvec![row.column(0).boxed()]).and_then(result_row_pack)
+                    })
+                })
+            });
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+
+        assert!(rendered.contains("once block1, block2"));
+        assert!(rendered.contains("block1:\n  open_ephemeral_index $0"));
+        assert!(rendered.contains("block2:\n  cursor_start Forward $0"));
+
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 2, 0));
+        let target = program.alloc_register();
+        ir.lower_into(&mut program, target).unwrap();
+        program.resolve_labels().unwrap();
+
+        let once = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::Once { .. }))
+            .unwrap();
+        let open = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::OpenEphemeral { .. }))
+            .unwrap();
+        let insert = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::IdxInsert { .. }))
+            .unwrap();
+        let rewind = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::Rewind { .. }))
+            .unwrap();
+        let Insn::Once {
+            target_pc_when_reentered,
+        } = &program.insns[once].0
+        else {
+            unreachable!();
+        };
+        assert_eq!(target_pc_when_reentered.as_offset_int() as usize, rewind);
+        assert!(once < open && open < insert && insert < rewind);
+    }
+
+    #[test]
     fn verifier_rejects_a_declared_but_unopened_cursor() {
         let compiler = declare_ephemeral_index(test_ephemeral_index("unopened_ephemeral"))
             .and_then(|unopened| {
@@ -9473,6 +9624,31 @@ mod tests {
         };
 
         let error = ir.verify().unwrap_err();
+        assert!(error.to_string().contains("does not dominate"));
+    }
+
+    #[test]
+    fn once_initialization_does_not_weaken_value_ssa_dominance() {
+        let mut builder = IrBuilder::new();
+        let initialize = builder.create_block().unwrap();
+        let ready = builder.create_block().unwrap();
+        builder
+            .terminate(Terminator::Once { initialize, ready })
+            .unwrap();
+        builder.switch_to(initialize).unwrap();
+        let initialized_value = builder
+            .push(ScalarOp::Constant(Value::from_i64(1)))
+            .unwrap();
+        builder
+            .terminate(Terminator::Jump {
+                target: ready,
+                arguments: SmallVec::new(),
+            })
+            .unwrap();
+        builder.switch_to(ready).unwrap();
+
+        let error = builder.finish(initialized_value).unwrap_err();
+
         assert!(error.to_string().contains("does not dominate"));
     }
 

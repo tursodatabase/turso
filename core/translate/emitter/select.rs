@@ -7,12 +7,13 @@ use crate::{
         aggregation::emit_ungrouped_aggregation,
         collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         compiler::{
-            bind_cursor_input, compile_effect, cursor_input, cursor_values, insert_index_pack,
-            literal_values, open_ephemeral_index, pack_values, result_row_pack, scan_index,
-            scan_table, seek_in_values, seek_index, seek_rowid, seek_table_range, select_pack,
-            BoxedCompile, Compile, CursorId, CursorInputId, DeferredIndexBound, DeferredIndexRange,
-            DeferredTableBound, DeferredTableRange, Row, RowStream, ScanDirection, SortKey,
-            SortedRow, ValueId, ValuePack,
+            bind_cursor_input, compile_effect, cursor_input, cursor_values,
+            declare_ephemeral_index, initialize_cursor_once, insert_index_pack, literal_values,
+            open_declared_ephemeral_index, open_ephemeral_index, pack_values, result_row_pack,
+            scan_index, scan_table, seek_in_values, seek_index, seek_rowid, seek_table_range,
+            select_pack, BoxedCompile, Compile, CursorId, CursorInputId, DeferredIndexBound,
+            DeferredIndexRange, DeferredTableBound, DeferredTableRange, Row, RowStream,
+            ScanDirection, SortKey, SortedRow, ValueId, ValuePack,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -242,10 +243,13 @@ fn try_emit_declarative_table_scan(
     else {
         return Ok(None);
     };
-    if !program.is_nested() {
-        compilation =
-            compose_declarative_in_subquery(program.get_query_mode(), resolver, plan, compilation)?;
-    }
+    compilation = compose_declarative_in_subquery(
+        program.get_query_mode(),
+        resolver,
+        plan,
+        compilation,
+        program.is_nested(),
+    )?;
     let DeclarativeSelectProgram {
         compiler,
         destination_cursor,
@@ -308,6 +312,7 @@ fn compose_declarative_in_subquery(
     resolver: &Resolver,
     plan: &mut SelectPlan,
     outer: DeclarativeSelectProgram,
+    initialize_once: bool,
 ) -> Result<DeclarativeSelectProgram> {
     let Some(external) = outer.external_in_cursor else {
         return Ok(outer);
@@ -354,21 +359,25 @@ fn compose_declarative_in_subquery(
     let producer_input = inner_destination.input;
     let producer = inner.compiler;
     let consumer = outer.compiler;
-    let compiler = open_ephemeral_index(index)
-        .and_then(move |cursor| {
-            let combined = producer.and_then(move |()| consumer);
-            if producer_input == outer_input {
-                bind_cursor_input(producer_input, cursor, combined).boxed()
-            } else {
-                bind_cursor_input(
-                    producer_input,
-                    cursor,
-                    bind_cursor_input(outer_input, cursor, combined),
-                )
-                .boxed()
-            }
-        })
-        .boxed();
+    let compiler = if initialize_once {
+        declare_ephemeral_index(index)
+            .and_then(move |unopened| {
+                initialize_cursor_once(open_declared_ephemeral_index(unopened).and_then(
+                    move |cursor| {
+                        bind_cursor_input(producer_input, cursor, producer).map(move |()| cursor)
+                    },
+                ))
+                .and_then(move |cursor| bind_cursor_input(outer_input, cursor, consumer))
+            })
+            .boxed()
+    } else {
+        open_ephemeral_index(index)
+            .and_then(move |cursor| {
+                bind_cursor_input(producer_input, cursor, producer)
+                    .and_then(move |()| bind_cursor_input(outer_input, cursor, consumer))
+            })
+            .boxed()
+    };
 
     let subquery = plan
         .non_from_clause_subqueries
@@ -2371,9 +2380,14 @@ mod tests {
             )
             .unwrap();
         let nested_instructions = &nested.get_program().insns;
-        assert!(nested_instructions
+        let once_positions = nested_instructions
             .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::Once { .. })));
+            .enumerate()
+            .filter_map(|(position, (instruction, _))| {
+                matches!(instruction, Insn::Once { .. }).then_some(position)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(once_positions.len(), 2);
         let ephemeral_cursors = nested_instructions
             .iter()
             .filter_map(|(instruction, _)| match instruction {
@@ -2387,6 +2401,15 @@ mod tests {
         assert_eq!(ephemeral_cursors.len(), 2);
         let destination_cursor = ephemeral_cursors[0];
         let source_cursor = ephemeral_cursors[1];
+        let source_open = nested_instructions
+            .iter()
+            .position(|(instruction, _)| {
+                matches!(
+                    instruction,
+                    Insn::OpenEphemeral { cursor_id, .. } if *cursor_id == source_cursor
+                )
+            })
+            .unwrap();
         let source_insert = nested_instructions
             .iter()
             .position(|(instruction, _)| {
@@ -2396,7 +2419,6 @@ mod tests {
         let source_scan = nested_instructions
             .iter()
             .enumerate()
-            .skip(source_insert + 1)
             .find_map(|(position, (instruction, _))| {
                 matches!(instruction, Insn::Rewind { cursor_id, .. } if *cursor_id == source_cursor)
                     .then_some(position)
@@ -2420,9 +2442,22 @@ mod tests {
                     .then_some(position)
             })
             .expect("outer declarative consumer must scan the nested destination cursor");
+
+        let inner_once = once_positions[1];
+        let Insn::Once {
+            target_pc_when_reentered,
+        } = &nested_instructions[inner_once].0
+        else {
+            unreachable!();
+        };
+        let Insn::Goto { target_pc } = &nested_instructions[inner_once + 1].0 else {
+            panic!("compiler Once must explicitly enter its initializer");
+        };
+        assert_eq!(target_pc.as_offset_int() as usize, source_open);
+        assert!(target_pc_when_reentered.as_offset_int() as usize <= source_scan);
         assert!(
-            source_insert < source_scan
-                && source_scan < destination_insert
+            source_open < source_insert
+                && source_insert < destination_insert
                 && destination_insert < destination_scan
         );
         assert_eq!(
