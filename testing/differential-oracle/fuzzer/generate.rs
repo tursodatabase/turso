@@ -80,11 +80,19 @@ impl SqlGenBackend {
         policy.insert_config.or_ignore_probability = 0.0;
         policy.update_config.expression_value_probability = 0.0;
         policy.update_config.or_replace_probability = 0.1;
-        policy.update_config.or_ignore_probability = 0.1;
+        // If several rows try to set the same UNIQUE value, OR IGNORE keeps
+        // whichever row is visited first. SQLite and Turso may visit the rows
+        // in a different order. Both results are allowed, but the final tables
+        // do not match.
+        policy.update_config.or_ignore_probability = 0.0;
         // Boost UPDATE FROM coverage
         policy.update_config.from_probability = 0.4;
         policy.update_config.returning_probability = 0.2;
-        policy.update_config.self_join_probability = 0.3;
+        // An UPDATE FROM self-join can find several source rows for one row
+        // being updated. SQLite allows any one of them to supply the new
+        // values, so Turso may make a different but equally valid choice.
+        // UPDATE FROM with two different tables remains enabled.
+        policy.update_config.self_join_probability = 0.0;
         policy.update_config.join_in_from_probability = 0.3;
         policy.update_config.subquery_from_probability = 0.15;
         policy.update_config.target_alias_probability = 0.2;
@@ -279,4 +287,16 @@ fn to_prop_schema(schema: &sql_gen::Schema) -> sql_gen_prop::Schema {
         builder = builder.add_index(idx);
     }
     builder.build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn updates_that_can_choose_different_rows_are_disabled() {
+        let sql_gen = SqlGenBackend::new(1);
+        assert_eq!(sql_gen.policy.update_config.or_ignore_probability, 0.0);
+        assert_eq!(sql_gen.policy.update_config.self_join_probability, 0.0);
+    }
 }
