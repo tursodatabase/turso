@@ -29,53 +29,13 @@ fn validate_cte_explicit_columns(name: &str, cte: &CteEntry) -> Result<()> {
         && cte.explicit_columns.len() != cte.result_column_count
     {
         crate::bail_parse_error!(
-            "table {} has {} columns but {} column names were provided",
+            "table {} has {} values for {} columns",
             name,
             cte.result_column_count,
             cte.explicit_columns.len()
         );
     }
     Ok(())
-}
-
-/// Collect unqualified table names referenced in a SELECT's FROM clauses.
-/// Schema-qualified references (main.t) are skipped — they can never refer to
-/// a CTE.
-fn collect_unqualified_from_clause_table_refs(select: &ast::Select, out: &mut Vec<String>) {
-    fn walk_one(one: &ast::OneSelect, out: &mut Vec<String>) {
-        if let ast::OneSelect::Select {
-            from: Some(from), ..
-        } = one
-        {
-            walk_table(&from.select, out);
-            for join in &from.joins {
-                walk_table(&join.table, out);
-            }
-        }
-    }
-    fn walk_table(table: &ast::SelectTable, out: &mut Vec<String>) {
-        match table {
-            ast::SelectTable::Table(qualified_name, _, _)
-            | ast::SelectTable::TableCall(qualified_name, _, _) => {
-                if qualified_name.db_name.is_none() {
-                    out.push(normalize_ident(qualified_name.name.as_str()));
-                }
-            }
-            ast::SelectTable::Select(subselect, _) => {
-                collect_unqualified_from_clause_table_refs(subselect, out);
-            }
-            ast::SelectTable::Sub(from_clause, _) => {
-                walk_table(&from_clause.select, out);
-                for join in &from_clause.joins {
-                    walk_table(&join.table, out);
-                }
-            }
-        }
-    }
-    walk_one(&select.body.select, out);
-    for compound in &select.body.compounds {
-        walk_one(&compound.select, out);
-    }
 }
 
 // ── IdGenerator ─────────────────────────────────────────────────────────
@@ -701,6 +661,16 @@ pub struct CteEntry {
     pub referenced_cte_indices: SmallVec<[usize; 2]>,
     /// True if `AS MATERIALIZED` was specified, forcing materialization.
     pub materialize_hint: bool,
+    /// True if the body references its own name (a recursive CTE, whether or
+    /// not the RECURSIVE keyword was written). Recursive bodies are stored
+    /// unbound (`select` is the raw AST, `inner_bound` is `None`): the
+    /// planner's recursive-CTE machinery resolves them itself, since the
+    /// self-reference only exists as a table during that planning.
+    pub recursive: bool,
+    /// Binding error deferred until the CTE is referenced. SQLite never
+    /// resolves the body of an unused CTE, so errors in unused bodies (bad
+    /// columns, circular references) must not surface eagerly.
+    pub bind_error: Option<String>,
 }
 
 impl Clone for CteEntry {
@@ -714,6 +684,8 @@ impl Clone for CteEntry {
             inner_bound: None,
             referenced_cte_indices: self.referenced_cte_indices.clone(),
             materialize_hint: self.materialize_hint,
+            recursive: self.recursive,
+            bind_error: self.bind_error.clone(),
         }
     }
 }
@@ -749,6 +721,12 @@ pub struct BindContext<'a, G: IdGenerator> {
 
     /// CTE definitions visible in the current query.
     ctes: HashMap<String, CteEntry>,
+
+    /// `(cte_id, name)` of CTEs whose bodies are currently being bound. A
+    /// reference to one of these from inside another CTE body is a circular
+    /// reference. Tracked by id so a shadowing nested CTE with the same name
+    /// is not mistaken for the in-flight one.
+    ctes_being_bound: Vec<(usize, String)>,
 
     /// SELECT result columns for alias resolution in later phases.
     /// Populated after binding the SELECT list. Arc-shared so pushing a
@@ -793,6 +771,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             outer_frame_floor: 0,
             outer_from_scope: None,
             ctes: HashMap::default(),
+            ctes_being_bound: Vec::new(),
             aliases: Arc::new(Vec::new()),
             phase: BindPhase::NoAliases,
             allow_unbound: false,
@@ -1408,7 +1387,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             }
             ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
                 if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner.as_ref() {
-                    if num.parse::<usize>().is_ok() {
+                    if num.parse::<i32>().is_ok() {
                         crate::bail_parse_error!(
                             "1st {} term out of range - should be between 1 and {}",
                             clause_name,
@@ -1421,16 +1400,19 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             _ => None,
         };
         if let Some(num) = num_str {
-            if let Ok(column_number) = num.parse::<usize>() {
+            // Mirroring SQLite's sqlite3ExprIsInteger, only literals that fit
+            // a 32-bit int count as column positions; larger integers (and
+            // floats) are ordinary constant expressions.
+            if let Ok(column_number) = num.parse::<i32>() {
                 let aliases = self.aliases();
-                if column_number == 0 || column_number > aliases.len() {
+                if column_number <= 0 || column_number as usize > aliases.len() {
                     crate::bail_parse_error!(
                         "1st {} term out of range - should be between 1 and {}",
                         clause_name,
                         aliases.len()
                     );
                 }
-                *expr = aliases[column_number - 1].expr.clone();
+                *expr = aliases[column_number as usize - 1].expr.clone();
             }
         }
         Ok(())
@@ -1662,14 +1644,13 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     }
 
     fn bind_cte(&mut self, with: &mut ast::With) -> Result<()> {
-        if with.recursive {
-            crate::bail_parse_error!("Recursive CTEs are not yet supported");
-        }
-
         // Collect CTE names in definition order for referenced_cte_indices lookup.
         let mut cte_names: Vec<String> = Vec::with_capacity(with.ctes.len());
+        let mut referenced_tables_by_cte: Vec<Vec<String>> = Vec::with_capacity(with.ctes.len());
 
-        // Pass 1: register all CTE names, allocate IDs, compute cross-references
+        // Pass 1: register all CTE names and allocate IDs. Bodies are not
+        // bound yet — SQLite resolves a CTE body only when the CTE is
+        // referenced, so binding errors are deferred via `bind_error`.
         for cte in &with.ctes {
             let cte_name = normalize_ident(cte.tbl_name.as_str());
             // Check for duplicates within the same WITH clause only.
@@ -1686,65 +1667,168 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             let cte_id = self.id_gen.next_cte_id();
             let materialize_hint = cte.materialized == turso_parser::ast::Materialized::Yes;
 
-            // Determine which preceding CTEs this one directly references.
-            // Schema-qualified references (e.g. main.t) always name real
-            // schema objects, never CTEs, so they are excluded both from the
-            // dependency edges and from circular-reference detection.
+            // Table names this body references (schema-qualified names are
+            // excluded — they can never refer to a CTE). Sibling dependency
+            // edges are computed from these once all names are known.
             let mut referenced_tables = Vec::new();
-            collect_unqualified_from_clause_table_refs(&cte.select, &mut referenced_tables);
+            crate::translate::planner::collect_from_clause_table_refs(
+                &cte.select,
+                &mut referenced_tables,
+            );
 
-            // Detect self-referencing CTEs (circular reference).
-            if referenced_tables.contains(&cte_name) {
-                crate::bail_parse_error!("circular reference: {}", cte.tbl_name.as_str());
-            }
+            // A body that references its own name is a recursive CTE (the
+            // RECURSIVE keyword is not required, matching SQLite) — unless the
+            // reference is in the first arm, which is a circular reference.
+            let (recursive, first_arm_self_ref) =
+                crate::translate::planner::cte_self_reference_info(&cte_name, &cte.select);
+            let bind_error = first_arm_self_ref
+                .then(|| format!("circular reference: {}", cte.tbl_name.as_str()));
 
-            let idx = cte_names.len();
-            let referenced_cte_indices: SmallVec<[usize; 2]> = (0..idx)
-                .filter(|&i| referenced_tables.contains(&cte_names[i]))
-                .collect();
-
+            referenced_tables_by_cte.push(referenced_tables);
             cte_names.push(cte_name.clone());
             self.insert_cte(
                 cte_name,
                 CteEntry {
                     select: cte.select.clone(),
+                    // Explicit columns are the reference-visible columns and
+                    // are known up front — forward references to this CTE can
+                    // bind before its body does.
+                    resolved_columns: explicit_columns.clone(),
                     explicit_columns,
                     cte_id,
-                    resolved_columns: vec![],
                     result_column_count: 0,
                     inner_bound: None,
-                    referenced_cte_indices,
+                    referenced_cte_indices: SmallVec::new(),
                     materialize_hint,
+                    recursive,
+                    bind_error,
                 },
             );
         }
 
-        // Pass 2: bind each CTE body and populate resolved columns + inner binding.
-        // We collect inner_bound values separately because bind_select calls with_query
-        // which clones self.ctes (setting inner_bound = None via the custom Clone impl),
-        // then restores them — destroying inner_bound values set in prior iterations.
-        let mut inner_bounds: Vec<(String, BoundSelect)> = Vec::with_capacity(with.ctes.len());
-        for cte in &mut with.ctes {
-            let cte_name = normalize_ident(cte.tbl_name.as_str());
-            let bound = self.bind_select(&mut cte.select)?;
+        // Sibling dependency edges. Forward references are included: SQLite
+        // allows a CTE to reference one defined later in the same WITH clause.
+        for (idx, referenced_tables) in referenced_tables_by_cte.iter().enumerate() {
+            let indices: SmallVec<[usize; 2]> = (0..cte_names.len())
+                .filter(|&i| i != idx && referenced_tables.contains(&cte_names[i]))
+                .collect();
+            self.ctes
+                .get_mut(&cte_names[idx])
+                .unwrap()
+                .referenced_cte_indices = indices;
+        }
 
-            let entry = self.ctes.get_mut(&cte_name).unwrap();
-            entry.result_column_count = bound.result_columns.len();
-            if entry.explicit_columns.is_empty() {
-                entry.resolved_columns = bound
-                    .result_columns
-                    .iter()
-                    .map(|bc| bc.name.clone())
-                    .collect();
-            } else {
-                entry.resolved_columns = entry.explicit_columns.clone();
-            }
-            entry.select = cte.select.clone();
-            inner_bounds.push((cte_name, bound));
+        // Pass 2: bind bodies dependency-first so referenced siblings (in
+        // either direction) have their result columns resolved before any
+        // body that reads them. We collect inner_bound values separately
+        // because bind_select calls with_query which clones self.ctes
+        // (setting inner_bound = None via the custom Clone impl), then
+        // restores them — destroying inner_bound values set in prior
+        // iterations.
+        let mut inner_bounds: Vec<(String, BoundSelect)> = Vec::with_capacity(with.ctes.len());
+        let mut done = vec![false; with.ctes.len()];
+        for idx in 0..with.ctes.len() {
+            self.bind_one_cte(with, &cte_names, idx, &mut done, &mut inner_bounds)?;
         }
         // Assign inner_bound values after all binding is done.
         for (cte_name, bound) in inner_bounds {
             self.ctes.get_mut(&cte_name).unwrap().inner_bound = Some(bound);
+        }
+        Ok(())
+    }
+
+    /// Bind one CTE body (dependencies first). Errors don't propagate: they
+    /// are stored on the entry and surface when the CTE is referenced,
+    /// matching SQLite's lazy resolution of CTE bodies.
+    fn bind_one_cte(
+        &mut self,
+        with: &mut ast::With,
+        cte_names: &[String],
+        idx: usize,
+        done: &mut [bool],
+        inner_bounds: &mut Vec<(String, BoundSelect)>,
+    ) -> Result<()> {
+        if done[idx] {
+            return Ok(());
+        }
+        done[idx] = true;
+        let cte_name = cte_names[idx].clone();
+        let Some(entry) = self.ctes.get(&cte_name) else {
+            return Ok(());
+        };
+        if entry.bind_error.is_some() {
+            return Ok(());
+        }
+        let cte_id = entry.cte_id;
+        let deps = entry.referenced_cte_indices.clone();
+        let is_recursive = entry.recursive;
+
+        self.ctes_being_bound.push((cte_id, cte_name.clone()));
+        let result: Result<()> = (|| {
+            for &dep in &deps {
+                let dep_id = self.ctes.get(&cte_names[dep]).map(|e| e.cte_id);
+                if dep_id.is_some_and(|id| self.ctes_being_bound.iter().any(|(b, _)| *b == id)) {
+                    crate::bail_parse_error!("circular reference: {}", cte_names[dep]);
+                }
+                self.bind_one_cte(with, cte_names, dep, done, inner_bounds)?;
+            }
+            let cte = &mut with.ctes[idx];
+            if is_recursive {
+                // Structure errors (circular reference, multiple recursive
+                // references) match the recursive planner's exactly.
+                crate::translate::planner::validate_recursive_cte_structure(
+                    &cte_name,
+                    &cte.select,
+                )?;
+                // The recursive body stays unbound — the recursive planner
+                // resolves it. Bind a throwaway copy of the initial arm (plus
+                // the body-level WITH) to learn the result column names and
+                // arity: SQLite takes them from the left-most arm, which
+                // cannot reference the recursive table.
+                let mut probe = ast::Select {
+                    with: cte.select.with.clone(),
+                    body: ast::SelectBody {
+                        select: cte.select.body.select.clone(),
+                        compounds: vec![],
+                    },
+                    order_by: vec![],
+                    limit: None,
+                };
+                let bound = self.bind_select(&mut probe)?;
+                let entry = self.ctes.get_mut(&cte_name).unwrap();
+                entry.result_column_count = bound.result_columns.len();
+                if entry.explicit_columns.is_empty() {
+                    entry.resolved_columns = bound
+                        .result_columns
+                        .iter()
+                        .map(|bc| bc.name.clone())
+                        .collect();
+                }
+            } else {
+                let bound = self.bind_select(&mut cte.select)?;
+                let entry = self.ctes.get_mut(&cte_name).unwrap();
+                entry.result_column_count = bound.result_columns.len();
+                if entry.explicit_columns.is_empty() {
+                    entry.resolved_columns = bound
+                        .result_columns
+                        .iter()
+                        .map(|bc| bc.name.clone())
+                        .collect();
+                }
+                entry.select = cte.select.clone();
+                inner_bounds.push((cte_name.clone(), bound));
+            }
+            Ok(())
+        })();
+        self.ctes_being_bound.pop();
+        if let Err(err) = result {
+            let msg = match err {
+                crate::LimboError::ParseError(m) => m,
+                other => other.to_string(),
+            };
+            if let Some(entry) = self.ctes.get_mut(&cte_name) {
+                entry.bind_error = Some(msg);
+            }
         }
         Ok(())
     }
@@ -1772,6 +1856,21 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     .get(&table_name)
                     .filter(|_| name.db_name.is_none())
                 {
+                    // Referencing a CTE whose body is currently being bound is
+                    // a circular reference (identity-checked by cte_id, so a
+                    // shadowing nested CTE with the same name is unaffected).
+                    if self
+                        .ctes_being_bound
+                        .iter()
+                        .any(|(id, _)| *id == cte.cte_id)
+                    {
+                        crate::bail_parse_error!("circular reference: {}", table_name);
+                    }
+                    // Surface any binding error deferred from the (lazy) CTE
+                    // body bind.
+                    if let Some(msg) = &cte.bind_error {
+                        return Err(crate::LimboError::ParseError(msg.clone()));
+                    }
                     validate_cte_explicit_columns(&table_name, cte)?;
                     //    - resolved_columns was populated by bind_cte pass 2
                     //    - Build Arc<CteTable> as the BindTable
@@ -1998,6 +2097,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             // Virtual table function call: SELECT ... FROM table_func(args)
             ast::SelectTable::TableCall(name, args, alias) => {
                 let table_name = normalize_ident(name.name.as_str());
+                // Call arguments on a CTE are an error (mirrors parse_table).
+                if name.db_name.is_none() && self.ctes.contains_key(&table_name) && !args.is_empty()
+                {
+                    crate::bail_parse_error!("'{}' is not a function", name.name.as_str());
+                }
                 // 1. Look up the virtual table via resolver
                 let schema_table =
                     self.resolver
@@ -2006,6 +2110,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         .ok_or_else(|| {
                             crate::LimboError::ParseError(format!("no such table: {table_name}"))
                         })?;
+                // Call arguments on a plain table are an error too — only
+                // virtual tables (table-valued functions) accept them.
+                if !args.is_empty() && schema_table.btree().is_some() {
+                    crate::bail_parse_error!("'{}' is not a function", name.name.as_str());
+                }
 
                 let identifier = alias
                     .as_ref()

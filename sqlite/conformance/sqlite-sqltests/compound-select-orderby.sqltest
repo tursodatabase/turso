@@ -1,5 +1,14 @@
 @database :memory:
 
+# Integer literals past the 32-bit range are not column positions; in a
+# compound ORDER BY they fail to match a result column (SQLite semantics).
+test compound-order-by-integer-beyond-i32-does-not-match {
+    SELECT 1 UNION SELECT 2 ORDER BY 6641019685895816357;
+}
+expect error {
+    1st ORDER BY term does not match any column in the result set
+}
+
 setup schema {
     CREATE TABLE t1 (a INTEGER, b TEXT, c INTEGER);
     INSERT INTO t1 VALUES (3, 'cherry', 30);

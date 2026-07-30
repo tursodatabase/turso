@@ -48,7 +48,7 @@ pub use create_trigger::{
     CreateTriggerContext, CreateTriggerKind, CreateTriggerOpWeights, CreateTriggerStatement,
     TriggerEvent, TriggerTiming,
 };
-pub use cte::{CteDefinition, CteMaterialization, CteProfile, WithClause};
+pub use cte::{CteDefinition, CteMaterialization, CteProfile, CteQuery, WithClause};
 pub use delete::DeleteStatement;
 pub use drop_index::DropIndexStatement;
 pub use drop_table::DropTableStatement;

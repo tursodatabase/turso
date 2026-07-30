@@ -1,0 +1,1969 @@
+# Recursive CTE conformance and regression coverage.
+#
+# These cases intentionally exercise the queue semantics described by SQLite's
+# select.c: anchors fill the queue, one row becomes the current recursive row,
+# and the recursive terms append work until the queue is empty.
+
+@database :memory:
+
+test recursive-cte-series-with-keyword {
+    WITH RECURSIVE seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 10
+    )
+    SELECT x FROM seq;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+    10
+}
+
+test recursive-cte-series-keyword-optional {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 5
+    )
+    SELECT x FROM seq;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+test recursive-cte-multiple-anchor-rows {
+    WITH seq(x) AS (
+        VALUES(1), (10)
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 3
+    )
+    SELECT x FROM seq;
+}
+expect {
+    1
+    10
+    2
+    3
+}
+
+test recursive-cte-multiple-anchor-arms {
+    WITH seq(x) AS (
+        SELECT 1
+        UNION ALL
+        SELECT 10
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 3
+    )
+    SELECT x FROM seq;
+}
+expect {
+    1
+    10
+    2
+    3
+}
+
+test recursive-cte-multiple-recursive-arms {
+    WITH seq(x) AS (
+        VALUES(0)
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 2
+        UNION ALL
+        SELECT x + 10 FROM seq WHERE x < 20
+    )
+    SELECT x FROM seq LIMIT 12;
+}
+expect {
+    0
+    1
+    10
+    2
+    11
+    20
+    12
+    21
+    22
+}
+
+test recursive-cte-union-stops-cycle {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION
+        SELECT (x + 1) % 10 FROM seq
+    )
+    SELECT x FROM seq;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+    0
+}
+
+test recursive-cte-union-null-equality {
+    WITH seq(x) AS (
+        VALUES(NULL)
+        UNION
+        SELECT NULL FROM seq
+    )
+    SELECT quote(x) FROM seq;
+}
+expect {
+    NULL
+}
+
+test recursive-cte-union-numeric-equality {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION
+        SELECT 1.0 FROM seq
+    )
+    SELECT typeof(x), quote(x) FROM seq;
+}
+expect {
+    integer|1
+}
+
+test recursive-cte-union-anchor-collation {
+    WITH seq(x) AS (
+        VALUES('a' COLLATE nocase)
+        UNION
+        SELECT upper(x) FROM seq
+    )
+    SELECT x FROM seq;
+}
+expect {
+    a
+}
+
+test recursive-cte-union-recursive-collation {
+    WITH seq(x) AS (
+        VALUES('a')
+        UNION
+        SELECT upper(x) COLLATE nocase FROM seq
+    )
+    SELECT x FROM seq;
+}
+expect {
+    a
+}
+
+test recursive-cte-limit {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM seq
+        LIMIT 5
+    )
+    SELECT x FROM seq;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+test recursive-cte-limit-offset {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM seq
+        LIMIT 5 OFFSET 5
+    )
+    SELECT x FROM seq;
+}
+expect {
+    6
+    7
+    8
+    9
+    10
+}
+
+test recursive-cte-zero-limit-does-not-recurse {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT 1 / 0 FROM seq
+        LIMIT 0
+    )
+    SELECT x FROM seq;
+}
+expect {
+}
+
+test recursive-cte-zero-limit-skips-initial-query {
+    WITH seq(x) AS (
+        SELECT json_extract('not-json', '$')
+        UNION ALL
+        SELECT x FROM seq
+        LIMIT 0
+    )
+    SELECT x FROM seq;
+}
+expect {
+}
+
+test recursive-cte-outer-limit-short-circuits-infinite-sequence {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM seq
+    )
+    SELECT x FROM seq LIMIT 5;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+test recursive-cte-large-linear-count {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 10000
+    )
+    SELECT count(*), min(x), max(x), sum(x) FROM seq;
+}
+expect {
+    10000|1|10000|50005000
+}
+
+test recursive-cte-large-union-cycle-uses-global-distinct-index {
+    WITH cycle(x) AS (
+        VALUES(0)
+        UNION
+        SELECT (x + 1) % 20000 FROM cycle
+    )
+    SELECT count(*), min(x), max(x), sum(x) FROM cycle;
+}
+expect {
+    20000|0|19999|199990000
+}
+
+@cross-check-integrity
+test recursive-cte-graph-breadth-first {
+    CREATE TABLE edge(parent INTEGER, child INTEGER);
+    CREATE INDEX edge_parent ON edge(parent);
+    INSERT INTO edge VALUES
+        (1,2), (1,3), (2,4), (2,5), (3,6), (5,7);
+    WITH path(node, depth) AS (
+        VALUES(1, 0)
+        UNION ALL
+        SELECT child, depth + 1
+          FROM edge JOIN path ON edge.parent = path.node
+        ORDER BY 2, 1
+    )
+    SELECT node, depth FROM path;
+}
+expect {
+    1|0
+    2|1
+    3|1
+    4|2
+    5|2
+    6|2
+    7|3
+}
+
+# Minimized from differential-fuzzer seed 120717, statement 481. Older SQLite
+# releases incorrectly elide the outer ORDER BY for this shape; Turso must sort
+# before applying the outer OFFSET.
+@skip-if sqlite "SQLite 3.49.1 elides the outer ORDER BY for this recursive CTE shape"
+test recursive-cte-fuzz-120717-outer-order-after-priority-queue {
+    WITH RECURSIVE c(x) AS MATERIALIZED (
+        VALUES(8)
+        UNION
+        SELECT (x + 3) % 10 FROM c
+        ORDER BY 1
+        LIMIT 20 OFFSET 2
+    )
+    SELECT x FROM c ORDER BY x LIMIT 20 OFFSET 2;
+}
+expect {
+    3
+    4
+    5
+    6
+    7
+    9
+}
+
+test recursive-cte-anchor-only-when-step-filter-is-false {
+    WITH RECURSIVE c(x) AS (
+        VALUES(7)
+        UNION ALL
+        SELECT x + 1 FROM c WHERE 0
+    )
+    SELECT x FROM c;
+}
+expect {
+    7
+}
+
+test recursive-cte-negative-limit-means-unlimited {
+    WITH RECURSIVE c(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM c WHERE x < 4
+        LIMIT -1
+    )
+    SELECT x FROM c;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+test recursive-cte-expression-limit-and-offset {
+    WITH RECURSIVE c(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM c WHERE x < 20
+        LIMIT 2 + 3 OFFSET 1 + 1
+    )
+    SELECT x FROM c;
+}
+expect {
+    3
+    4
+    5
+    6
+    7
+}
+
+test recursive-cte-multicolumn-union-distinct {
+    WITH RECURSIVE c(x, label) AS (
+        VALUES(0, 'A')
+        UNION
+        SELECT (x + 1) % 3, lower(label) FROM c
+    )
+    SELECT x, label FROM c;
+}
+expect {
+    0|A
+    1|a
+    2|a
+    0|a
+}
+
+@cross-check-integrity
+test recursive-cte-recursive-step-joins-indexed-table {
+    CREATE TABLE edge(parent INTEGER, child INTEGER);
+    CREATE INDEX edge_parent_idx ON edge(parent);
+    INSERT INTO edge VALUES (1,2), (1,3), (2,4), (3,5);
+    WITH RECURSIVE walk(node) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT child
+          FROM walk JOIN edge ON edge.parent = walk.node
+        ORDER BY 1
+    )
+    SELECT node FROM walk;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+@cross-check-integrity
+test recursive-cte-step-uses-scalar-subquery {
+    CREATE TABLE config(delta INTEGER);
+    INSERT INTO config VALUES(2);
+    WITH RECURSIVE c(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + (SELECT delta FROM config) FROM c WHERE x < 5
+    )
+    SELECT x FROM c;
+}
+expect {
+    1
+    3
+    5
+}
+
+test recursive-cte-text-values-grow-dynamically {
+    WITH RECURSIVE c(value) AS (
+        VALUES('a')
+        UNION ALL
+        SELECT value || 'x' FROM c WHERE length(value) < 4
+    )
+    SELECT value, typeof(value) FROM c;
+}
+expect {
+    a|text
+    ax|text
+    axx|text
+    axxx|text
+}
+
+test recursive-cte-consumed-by-in-and-scalar-aggregate {
+    WITH RECURSIVE c(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM c WHERE x < 5
+    )
+    SELECT 4 IN (SELECT x FROM c),
+           (SELECT sum(x) FROM c);
+}
+expect {
+    1|15
+}
+
+test recursive-cte-outer-distinct-collapses-union-all {
+    WITH RECURSIVE c(x, depth) AS (
+        VALUES(1, 0)
+        UNION ALL
+        SELECT 1, depth + 1 FROM c WHERE depth < 4
+    )
+    SELECT DISTINCT x FROM c;
+}
+expect {
+    1
+}
+
+test recursive-cte-name-shadows-base-table {
+    CREATE TABLE c(x);
+    INSERT INTO c VALUES(99);
+    WITH RECURSIVE c(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM c WHERE x < 3
+    )
+    SELECT x FROM c;
+}
+expect {
+    1
+    2
+    3
+}
+
+test recursive-cte-quoted-identifiers {
+    WITH RECURSIVE "odd name"("odd column") AS (
+        VALUES(1)
+        UNION ALL
+        SELECT "odd column" + 2 FROM "odd name" WHERE "odd column" < 5
+    )
+    SELECT "odd column" FROM "odd name";
+}
+expect {
+    1
+    3
+    5
+}
+
+test recursive-cte-inside-view {
+    CREATE VIEW sequence_view AS
+        WITH RECURSIVE c(x) AS (
+            VALUES(2)
+            UNION ALL
+            SELECT x + 2 FROM c WHERE x < 6
+        )
+        SELECT x FROM c;
+    SELECT x FROM sequence_view;
+}
+expect {
+    2
+    4
+    6
+}
+
+@cross-check-integrity
+test recursive-cte-update-with-in-consumer {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, value INTEGER);
+    INSERT INTO target VALUES (1,10), (2,20), (3,30), (4,40);
+    WITH RECURSIVE ids(id) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT id + 1 FROM ids WHERE id < 3
+    )
+    UPDATE target SET value = value + 5
+     WHERE id IN (SELECT id FROM ids);
+    SELECT id, value FROM target ORDER BY id;
+}
+expect {
+    1|15
+    2|25
+    3|35
+    4|40
+}
+
+@cross-check-integrity
+test recursive-cte-create-table-as-select {
+    CREATE TABLE generated AS
+        WITH RECURSIVE c(x) AS (
+            VALUES(3)
+            UNION ALL
+            SELECT x + 3 FROM c WHERE x < 9
+        )
+        SELECT x, x * x AS square FROM c;
+    SELECT x, square FROM generated;
+}
+expect {
+    3|9
+    6|36
+    9|81
+}
+
+test recursive-cte-dependent-recursive-producers {
+    WITH RECURSIVE
+      first(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM first WHERE x < 3
+      ),
+      second(x) AS (
+        SELECT x FROM first
+        UNION ALL
+        SELECT x + 10 FROM second WHERE x < 3
+      )
+    SELECT x FROM second;
+}
+expect {
+    1
+    2
+    3
+    11
+    12
+}
+
+@cross-check-integrity
+test recursive-cte-graph-depth-first {
+    CREATE TABLE edge(parent INTEGER, child INTEGER);
+    INSERT INTO edge VALUES
+        (1,2), (1,3), (2,4), (2,5), (3,6), (5,7);
+    WITH path(node, depth) AS (
+        VALUES(1, 0)
+        UNION ALL
+        SELECT child, depth + 1
+          FROM edge JOIN path ON edge.parent = path.node
+        ORDER BY 2 DESC, 1
+    )
+    SELECT node, depth FROM path;
+}
+expect {
+    1|0
+    2|1
+    4|2
+    5|2
+    7|3
+    3|1
+    6|2
+}
+
+@cross-check-integrity
+test recursive-cte-graph-union-deduplicates-diamonds {
+    CREATE TABLE edge(parent INTEGER, child INTEGER);
+    INSERT INTO edge VALUES
+        (1,2), (1,3), (2,4), (3,4), (4,5), (5,1);
+    WITH path(node) AS (
+        VALUES(1)
+        UNION
+        SELECT child FROM edge JOIN path ON edge.parent = path.node
+    )
+    SELECT node FROM path;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+test recursive-cte-order-null-modes {
+    WITH seq(label, priority) AS (
+        VALUES('null', NULL), ('one', 1), ('zero', 0)
+        UNION ALL
+        SELECT label, priority FROM seq WHERE 0
+        ORDER BY 2 DESC NULLS FIRST
+    )
+    SELECT label FROM seq;
+}
+expect {
+    null
+    one
+    zero
+}
+
+test recursive-cte-order-inherits-recursive-collation {
+    WITH seq(x) AS (
+        VALUES('b'), ('A')
+        UNION ALL
+        SELECT 'c' COLLATE nocase FROM seq WHERE 0
+        ORDER BY 1
+    )
+    SELECT x FROM seq;
+}
+expect {
+    A
+    b
+}
+
+test recursive-cte-order-alias-from-anchor {
+    WITH seq(x) AS (
+        SELECT 1 AS anchor_name
+        UNION ALL
+        SELECT x + 1 AS recursive_name FROM seq WHERE x < 4
+        ORDER BY anchor_name DESC
+    )
+    SELECT x FROM seq;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+test recursive-cte-order-alias-from-recursive-term {
+    WITH seq(x) AS (
+        SELECT 1 AS anchor_name
+        UNION ALL
+        SELECT x + 1 AS recursive_name FROM seq WHERE x < 4
+        ORDER BY recursive_name
+    )
+    SELECT x FROM seq;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+test recursive-cte-two-independent-producers {
+    WITH RECURSIVE
+      a(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM a WHERE x < 3),
+      b(y) AS (VALUES(7) UNION ALL SELECT y + 1 FROM b WHERE y < 9)
+    SELECT x, y FROM a, b ORDER BY x, y;
+}
+expect {
+    1|7
+    1|8
+    1|9
+    2|7
+    2|8
+    2|9
+    3|7
+    3|8
+    3|9
+}
+
+test recursive-cte-dependency-chain {
+    WITH RECURSIVE
+      seq(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM seq WHERE x < 3),
+      scaled(y) AS (SELECT x * 10 FROM seq),
+      labeled(z) AS (SELECT printf('v=%d', y) FROM scaled)
+    SELECT z FROM labeled;
+}
+expect {
+    v=10
+    v=20
+    v=30
+}
+
+test recursive-cte-forward-dependency {
+    WITH RECURSIVE
+      scaled(y) AS (SELECT x * 10 FROM seq),
+      seq(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM seq WHERE x < 3)
+    SELECT y FROM scaled;
+}
+expect {
+    10
+    20
+    30
+}
+
+test recursive-cte-multiple-references-materialized {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 3
+    )
+    SELECT a.x, b.x FROM seq AS a, seq AS b ORDER BY a.x, b.x;
+}
+expect {
+    1|1
+    1|2
+    1|3
+    2|1
+    2|2
+    2|3
+    3|1
+    3|2
+    3|3
+}
+
+test recursive-cte-multiple-scalar-subquery-references {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 4
+    )
+    SELECT (SELECT sum(x) FROM seq), (SELECT count(*) FROM seq);
+}
+expect {
+    10|4
+}
+
+test recursive-cte-inline-subquery-reference {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 3
+    )
+    SELECT x FROM (SELECT x FROM seq);
+}
+expect {
+    1
+    2
+    3
+}
+
+@cross-check-integrity
+test recursive-cte-insert-select {
+    CREATE TABLE output(x INTEGER);
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 4
+    )
+    INSERT INTO output SELECT x FROM seq;
+    SELECT x FROM output;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+@cross-check-integrity
+test recursive-cte-delete-subquery {
+    CREATE TABLE output(x INTEGER);
+    INSERT INTO output VALUES(1),(2),(3),(4),(5);
+    WITH seq(x) AS (
+        VALUES(2)
+        UNION ALL
+        SELECT x + 2 FROM seq WHERE x < 4
+    )
+    DELETE FROM output WHERE x IN (SELECT x FROM seq);
+    SELECT x FROM output;
+}
+expect {
+    1
+    3
+    5
+}
+
+@cross-check-integrity
+test recursive-cte-update-correlated-subquery {
+    CREATE TABLE output(x INTEGER, y INTEGER);
+    INSERT INTO output VALUES(1,0),(2,0),(3,0);
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 3
+    )
+    UPDATE output
+       SET y = (SELECT x * 10 FROM seq WHERE seq.x = output.x);
+    SELECT x, y FROM output;
+}
+expect {
+    1|10
+    2|20
+    3|30
+}
+
+@cross-check-integrity
+test recursive-cte-forward-insert-select {
+    CREATE TABLE output(x INTEGER);
+    WITH
+      projected AS (SELECT x FROM seq),
+      seq(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM seq WHERE x < 3)
+    INSERT INTO output SELECT x FROM projected;
+    SELECT x FROM output;
+}
+expect {
+    1
+    2
+    3
+}
+
+test recursive-cte-dynamic-types {
+    WITH seq(n, value) AS (
+        VALUES(0, NULL)
+        UNION ALL
+        SELECT n + 1,
+               CASE n
+                 WHEN 0 THEN 42
+                 WHEN 1 THEN 3.5
+                 WHEN 2 THEN 'text'
+                 ELSE x'0102'
+               END
+          FROM seq
+         WHERE n < 4
+    )
+    SELECT n, typeof(value), quote(value) FROM seq;
+}
+expect {
+    0|null|NULL
+    1|integer|42
+    2|real|3.5
+    3|text|'text'
+    4|blob|X'0102'
+}
+
+test recursive-cte-explicit-columns-used-in-step {
+    WITH seq(number, doubled) AS (
+        VALUES(1, 2)
+        UNION ALL
+        SELECT number + 1, doubled + 2 FROM seq WHERE number < 4
+    )
+    SELECT number, doubled FROM seq;
+}
+expect {
+    1|2
+    2|4
+    3|6
+    4|8
+}
+
+test recursive-cte-anchor-compound-except {
+    WITH seq(x) AS (
+        SELECT 1
+        UNION
+        SELECT 2
+        EXCEPT
+        SELECT 2
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 4
+    )
+    SELECT x FROM seq;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+test recursive-cte-anchor-compound-intersect {
+    WITH seq(x) AS (
+        SELECT 1
+        INTERSECT
+        SELECT 1
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 3
+    )
+    SELECT x FROM seq;
+}
+expect {
+    1
+    2
+    3
+}
+
+test recursive-cte-aliased-self-reference {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT s.x + 1 FROM seq AS s WHERE s.x < 3
+    )
+    SELECT x FROM seq;
+}
+expect {
+    1
+    2
+    3
+}
+
+test recursive-cte-left-join-keeps-current-row-on-left {
+    CREATE TABLE edge(parent INTEGER, child INTEGER);
+    INSERT INTO edge VALUES(1,2),(2,3);
+    WITH path(node) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT edge.child
+          FROM path LEFT JOIN edge ON edge.parent = path.node
+         WHERE edge.child IS NOT NULL
+    )
+    SELECT node FROM path;
+}
+expect {
+    1
+    2
+    3
+}
+
+test recursive-cte-left-join-allows-on-clause-reading-only-current-row {
+    CREATE TABLE edge_for_recursive_right(parent INTEGER, child INTEGER);
+    INSERT INTO edge_for_recursive_right VALUES(1,2);
+    WITH path(node) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT edge_for_recursive_right.child
+          FROM edge_for_recursive_right LEFT JOIN path ON path.node = 1
+         WHERE path.node < 2
+        LIMIT 2
+    )
+    SELECT node FROM path;
+}
+expect {
+    1
+    2
+}
+
+test recursive-cte-right-join-allows-current-row-on-left {
+    CREATE TABLE edge_for_recursive_left(parent INTEGER, child INTEGER);
+    INSERT INTO edge_for_recursive_left VALUES(1,2);
+    WITH path(node) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT edge_for_recursive_left.child
+          FROM path RIGHT JOIN edge_for_recursive_left
+            ON edge_for_recursive_left.parent = path.node
+         WHERE path.node < 2
+        LIMIT 2
+    )
+    SELECT node FROM path;
+}
+expect {
+    1
+    2
+}
+
+# SQLite 3.53 rejects an outer-join ON clause reading tables left of the
+# recursive table ("ON clause references tables to its right") because the
+# recursive table is scanned outermost; 3.43-3.50 accept and evaluate it, and
+# the rejection was reported upstream as a regression. We accept.
+@skip-if sqlite "SQLite 3.53 rejects this form due to an upstream regression; 3.43-3.50 accept"
+test recursive-cte-left-join-on-clause-reading-left-table {
+    CREATE TABLE edge_for_recursive_right(parent INTEGER, child INTEGER);
+    INSERT INTO edge_for_recursive_right VALUES(1, 2);
+    WITH RECURSIVE path(node) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT edge_for_recursive_right.child
+          FROM edge_for_recursive_right LEFT JOIN path
+            ON edge_for_recursive_right.parent = path.node
+        LIMIT 2
+    )
+    SELECT node FROM path;
+}
+expect {
+    1
+    2
+}
+
+@skip-if sqlite "SQLite 3.53 rejects this form due to an upstream regression; 3.43-3.50 accept"
+test recursive-cte-left-join-on-clause-reading-only-left-table {
+    CREATE TABLE lj_const_on(a);
+    INSERT INTO lj_const_on VALUES(5),(6);
+    WITH RECURSIVE c(x) AS (
+        SELECT 1
+        UNION ALL
+        SELECT c.x + 1 FROM lj_const_on LEFT JOIN c ON lj_const_on.a = 5
+        WHERE c.x < 3
+    )
+    SELECT * FROM c;
+}
+expect {
+    1
+    2
+    3
+}
+
+# SQLite supports FULL JOIN with the recursive table on the left, but our
+# FULL OUTER implementation requires a hash join and the recursive input
+# cannot be its build side. Verify we return a useful error.
+@skip-if sqlite "supported in sqlite"
+test recursive-cte-full-join-recursive-on-left-not-supported {
+    CREATE TABLE edge_for_recursive_full(parent INTEGER, child INTEGER);
+    INSERT INTO edge_for_recursive_full VALUES(1, 2);
+    WITH RECURSIVE path(node) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT edge_for_recursive_full.child
+          FROM path FULL JOIN edge_for_recursive_full
+            ON edge_for_recursive_full.parent = path.node
+         WHERE path.node < 2
+        LIMIT 2
+    )
+    SELECT node FROM path;
+}
+expect error {
+    FULL OUTER JOIN with a recursive reference is not yet supported
+}
+
+# Like recursive-on-left FULL JOIN above, this needs a hash join with the
+# recursive input as a build side, which is not supported yet.
+@skip-if sqlite "supported in sqlite"
+test recursive-cte-full-join-recursive-on-right-not-supported {
+    CREATE TABLE edge_for_invalid_recursive_full(parent INTEGER, child INTEGER);
+    INSERT INTO edge_for_invalid_recursive_full VALUES(1, 2);
+    WITH RECURSIVE path(node) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT edge_for_invalid_recursive_full.child
+          FROM edge_for_invalid_recursive_full FULL JOIN path
+            ON edge_for_invalid_recursive_full.parent = path.node
+        LIMIT 2
+    )
+    SELECT node FROM path;
+}
+expect error {
+    FULL OUTER JOIN with a recursive reference is not yet supported
+}
+
+@skip-if sqlite "SQLite 3.53 rejects this form due to an upstream regression; 3.43-3.50 accept"
+test recursive-cte-left-join-on-clause-subquery-reading-left-table {
+    CREATE TABLE edge_for_recursive_on_subquery(parent INTEGER, child INTEGER);
+    INSERT INTO edge_for_recursive_on_subquery VALUES(1, 2);
+    WITH RECURSIVE path(node) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT edge_for_recursive_on_subquery.child
+          FROM edge_for_recursive_on_subquery LEFT JOIN path
+            ON path.node = (SELECT edge_for_recursive_on_subquery.parent)
+        LIMIT 2
+    )
+    SELECT node FROM path;
+}
+expect {
+    1
+    2
+}
+
+test recursive-cte-cross-join-current-row-inner {
+    CREATE TABLE edge(parent INTEGER, child INTEGER);
+    INSERT INTO edge VALUES(1,2),(2,3);
+    WITH path(node) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT edge.child FROM edge CROSS JOIN path WHERE edge.parent = path.node
+    )
+    SELECT node FROM path;
+}
+expect {
+    1
+    2
+    3
+}
+
+test recursive-cte-distinct-in-recursive-step {
+    WITH seq(x) AS (
+        VALUES(1),(1)
+        UNION ALL
+        SELECT DISTINCT x + 1 FROM seq WHERE x < 3
+    )
+    SELECT x FROM seq;
+}
+expect {
+    1
+    1
+    2
+    2
+    3
+    3
+}
+
+test recursive-cte-aggregate-in-anchor {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES(5),(6);
+    WITH seq(x) AS (
+        SELECT count(*) FROM t
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 4
+    )
+    SELECT x FROM seq;
+}
+expect {
+    2
+    3
+    4
+}
+
+test recursive-cte-nested-with-in-body {
+    WITH RECURSIVE outer_seq(x) AS (
+        WITH inner_seq(y) AS (SELECT 2)
+        SELECT y FROM inner_seq
+        UNION ALL
+        SELECT x * 2 FROM outer_seq WHERE x < 20
+    )
+    SELECT x FROM outer_seq;
+}
+expect {
+    2
+    4
+    8
+    16
+    32
+}
+
+test recursive-cte-correlated-subquery-consumer {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES(2),(4);
+    SELECT (
+        SELECT count(*) FROM (
+            WITH RECURSIVE r(i) AS (
+                SELECT 1
+                UNION ALL
+                SELECT i + 1 FROM r WHERE i < t.a
+            )
+            SELECT i FROM r
+        )
+    ) FROM t;
+}
+expect {
+    2
+    4
+}
+
+test recursive-cte-union-dedups-anchor-duplicates {
+    WITH seq(x) AS (
+        VALUES(1),(1),(2)
+        UNION
+        SELECT x FROM seq
+    )
+    SELECT x FROM seq;
+}
+expect {
+    1
+    2
+}
+
+test recursive-cte-union-distinct-cross-type {
+    WITH seq(x) AS (
+        SELECT '1'
+        UNION
+        SELECT 1 FROM seq
+        UNION
+        SELECT NULL FROM seq
+    )
+    SELECT quote(x), typeof(x) FROM seq;
+}
+expect {
+    '1'|text
+    1|integer
+    NULL|null
+}
+
+test recursive-cte-order-by-ordinals {
+    WITH seq(a, b) AS (
+        VALUES(1,3),(1,1),(2,0)
+        UNION ALL
+        SELECT a + 1, b FROM seq WHERE a < 3
+        ORDER BY 2, 1 DESC
+    )
+    SELECT a, b FROM seq;
+}
+expect {
+    2|0
+    3|0
+    1|1
+    2|1
+    3|1
+    1|3
+    2|3
+    3|3
+}
+
+# The ORDER BY drives queue extraction, not a final sort: rows produced after
+# the queue has moved past their key are emitted out of global order.
+test recursive-cte-order-is-priority-queue-not-final-sort {
+    WITH seq(x) AS (
+        SELECT 5 AS x
+        UNION ALL
+        SELECT 1
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 7
+        ORDER BY x DESC
+    )
+    SELECT x FROM seq;
+}
+expect {
+    5
+    6
+    7
+    1
+    2
+    3
+    4
+    5
+    6
+    7
+}
+
+test recursive-cte-order-multi-arm-depth-first {
+    WITH seq(x, d) AS (
+        SELECT 1 AS x, 0 AS d
+        UNION ALL
+        SELECT x * 2, d + 1 FROM seq WHERE d < 3
+        UNION ALL
+        SELECT x * 3, d + 1 FROM seq WHERE d < 3
+        ORDER BY d DESC, x ASC
+    )
+    SELECT x, d FROM seq;
+}
+expect {
+    1|0
+    2|1
+    4|2
+    8|3
+    12|3
+    6|2
+    12|3
+    18|3
+    3|1
+    6|2
+    12|3
+    18|3
+    9|2
+    18|3
+    27|3
+}
+
+test recursive-cte-order-ties-preserve-fifo {
+    WITH seq(x, s) AS (
+        SELECT 1 AS x, 'a' AS s
+        UNION ALL
+        SELECT 1, 'b'
+        UNION ALL
+        SELECT x + 1, s FROM seq WHERE x < 3
+        ORDER BY x
+    )
+    SELECT x, s FROM seq;
+}
+expect {
+    1|a
+    1|b
+    2|a
+    2|b
+    3|a
+    3|b
+}
+
+test recursive-cte-order-with-limit-stops-infinite {
+    WITH seq(x) AS (
+        SELECT 1 AS x
+        UNION ALL
+        SELECT x + 1 FROM seq
+        ORDER BY x
+        LIMIT 6
+    )
+    SELECT x FROM seq;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    6
+}
+
+test recursive-cte-circular-reference-in-subquery {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT (SELECT x FROM seq)
+    )
+    SELECT x FROM seq;
+}
+expect error {
+    circular reference: seq
+}
+
+test recursive-cte-multiple-direct-references {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT a.x + b.x FROM seq AS a, seq AS b
+    )
+    SELECT x FROM seq;
+}
+expect error {
+    multiple references to recursive table: seq
+}
+
+test recursive-cte-multiple-nested-references {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x FROM seq WHERE x IN (SELECT x FROM seq)
+    )
+    SELECT x FROM seq;
+}
+expect error {
+    multiple recursive references: seq
+}
+
+test recursive-cte-aggregate-rejected {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT max(x) FROM seq
+    )
+    SELECT x FROM seq;
+}
+expect error {
+    recursive aggregate queries not supported
+}
+
+test recursive-cte-window-rejected {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT row_number() OVER () FROM seq
+    )
+    SELECT x FROM seq;
+}
+expect error {
+    cannot use window functions in recursive queries
+}
+
+test recursive-cte-column-count-rejected {
+    WITH seq(x, y) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM seq
+    )
+    SELECT * FROM seq;
+}
+expect error {
+    table seq has 1 values for 2 columns
+}
+
+test recursive-cte-arm-column-count-rejected {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1, x + 2 FROM seq
+    )
+    SELECT * FROM seq;
+}
+expect error {
+    SELECTs to the left and right of UNION ALL do not have the same number of result columns
+}
+
+test recursive-cte-order-expression-must-match-output {
+    WITH seq(x) AS (
+        SELECT 1 AS anchor_name
+        UNION ALL
+        SELECT x + 1 AS recursive_name FROM seq WHERE x < 4
+        ORDER BY x
+    )
+    SELECT x FROM seq;
+}
+expect error {
+    1st ORDER BY term does not match any column in the result set
+}
+
+test recursive-cte-mutual-cycle-rejected {
+    WITH RECURSIVE
+      a(x) AS (SELECT x FROM b),
+      b(x) AS (SELECT x FROM a)
+    SELECT x FROM a;
+}
+expect error {
+    circular reference: a
+}
+
+test recursive-cte-rowid-not-visible {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 3
+    )
+    SELECT rowid FROM seq;
+}
+expect error {
+    no such column: rowid
+}
+
+test recursive-cte-first-term-self-reference-rejected {
+    WITH RECURSIVE seq(x) AS (
+        SELECT x FROM seq
+        UNION ALL
+        SELECT 1
+    )
+    SELECT x FROM seq;
+}
+expect error {
+    circular reference: seq
+}
+
+test recursive-cte-non-recursive-term-after-recursive-rejected {
+    WITH seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 3
+        UNION ALL
+        SELECT 100
+    )
+    SELECT x FROM seq;
+}
+expect error {
+    circular reference: seq
+}
+
+test recursive-cte-correlated-union-resets-seen-rows-per-invocation {
+    CREATE TABLE bounds(n INTEGER);
+    INSERT INTO bounds VALUES(2),(4);
+    SELECT n, (
+        WITH RECURSIVE r(x) AS (
+            VALUES(1)
+            UNION
+            SELECT x + 1 FROM r WHERE x < bounds.n
+        )
+        SELECT count(*) FROM r
+    )
+    FROM bounds;
+}
+expect {
+    2|2
+    4|4
+}
+
+test recursive-cte-correlated-resets-limit-and-offset-per-invocation {
+    CREATE TABLE bounds(n INTEGER);
+    INSERT INTO bounds VALUES(3),(5),(2);
+    SELECT n, (
+        WITH RECURSIVE r(x) AS (
+            VALUES(1)
+            UNION ALL
+            SELECT x + 1 FROM r WHERE x < bounds.n
+            LIMIT 3 OFFSET 1
+        )
+        SELECT group_concat(x) FROM r
+    )
+    FROM bounds;
+}
+expect {
+    3|2,3
+    5|2,3,4
+    2|2
+}
+
+test recursive-cte-correlated-anchor-feeds-priority-queue {
+    CREATE TABLE bounds(n INTEGER);
+    INSERT INTO bounds VALUES(4),(2),(6);
+    SELECT n, (
+        WITH RECURSIVE r(x) AS (
+            VALUES(bounds.n)
+            UNION
+            SELECT x - 1 FROM r WHERE x > 0
+            ORDER BY 1 DESC
+        )
+        SELECT group_concat(x) FROM r
+    )
+    FROM bounds;
+}
+expect {
+    4|4,3,2,1,0
+    2|2,1,0
+    6|6,5,4,3,2,1,0
+}
+
+test recursive-cte-correlated-same-cte-twice-per-outer-row {
+    CREATE TABLE bounds(n INTEGER);
+    INSERT INTO bounds VALUES(2),(4);
+    SELECT n,
+        (WITH RECURSIVE r(x) AS (VALUES(1) UNION SELECT x + 1 FROM r WHERE x < bounds.n)
+         SELECT count(*) FROM r),
+        (WITH RECURSIVE r(x) AS (VALUES(1) UNION SELECT x + 1 FROM r WHERE x < bounds.n)
+         SELECT sum(x) FROM r)
+    FROM bounds;
+}
+expect {
+    2|2|3
+    4|4|10
+}
+
+test recursive-cte-correlated-in-where-clause {
+    CREATE TABLE bounds(n INTEGER);
+    INSERT INTO bounds VALUES(1),(3),(5);
+    SELECT n FROM bounds
+    WHERE n = (
+        WITH RECURSIVE r(x) AS (
+            VALUES(1)
+            UNION ALL
+            SELECT x + 2 FROM r WHERE x < bounds.n
+        )
+        SELECT max(x) FROM r
+    );
+}
+expect {
+    1
+    3
+    5
+}
+
+test recursive-cte-correlated-graph-traversal-per-root {
+    CREATE TABLE edge(parent INTEGER, child INTEGER);
+    INSERT INTO edge VALUES(1,2),(2,3),(3,4),(1,5);
+    CREATE TABLE roots(root INTEGER);
+    INSERT INTO roots VALUES(1),(2),(3);
+    SELECT root, (
+        WITH RECURSIVE reach(node) AS (
+            VALUES(roots.root)
+            UNION
+            SELECT edge.child FROM reach JOIN edge ON edge.parent = reach.node
+        )
+        SELECT group_concat(node) FROM reach
+    )
+    FROM roots;
+}
+expect {
+    1|1,2,5,3,4
+    2|2,3,4
+    3|3,4
+}
+
+test recursive-cte-correlated-multi-arm-recursion {
+    CREATE TABLE bounds(n INTEGER);
+    INSERT INTO bounds VALUES(2),(3);
+    SELECT n, (
+        WITH RECURSIVE r(x, depth) AS (
+            VALUES(1, 0)
+            UNION
+            SELECT x * 2, depth + 1 FROM r WHERE depth < bounds.n
+            UNION
+            SELECT x * 2 + 1, depth + 1 FROM r WHERE depth < bounds.n
+        )
+        SELECT count(*) FROM r
+    )
+    FROM bounds;
+}
+expect {
+    2|7
+    3|15
+}
+
+test recursive-cte-correlated-with-two-outer-tables {
+    CREATE TABLE bounds(n INTEGER);
+    INSERT INTO bounds VALUES(3),(1),(4);
+    SELECT lo.n, hi.n, (
+        WITH RECURSIVE r(x) AS (
+            VALUES(lo.n)
+            UNION
+            SELECT x + 1 FROM r WHERE x < hi.n
+        )
+        SELECT group_concat(x) FROM r
+    )
+    FROM bounds lo JOIN bounds hi ON lo.n < hi.n;
+}
+expect {
+    3|4|3,4
+    1|3|1,2,3
+    1|4|1,2,3,4
+}
+
+test recursive-cte-self-join-consumer {
+    WITH RECURSIVE r(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM r WHERE x < 3
+    )
+    SELECT a.x, b.x FROM r a JOIN r b ON a.x <= b.x ORDER BY 1, 2;
+}
+expect {
+    1|1
+    1|2
+    1|3
+    2|2
+    2|3
+    3|3
+}
+
+test recursive-cte-correlated-order-by-desc-with-limit {
+    CREATE TABLE bounds(n INTEGER);
+    INSERT INTO bounds VALUES(5),(2),(7);
+    SELECT n, (
+        WITH RECURSIVE r(x) AS (
+            VALUES(1)
+            UNION ALL
+            SELECT x + 1 FROM r WHERE x < bounds.n
+            ORDER BY 1 DESC
+            LIMIT 3
+        )
+        SELECT group_concat(x) FROM r
+    )
+    FROM bounds;
+}
+expect {
+    5|1,2,3
+    2|1,2
+    7|1,2,3
+}
+
+test recursive-cte-correlated-nocase-priority-queue {
+    CREATE TABLE words(w TEXT);
+    INSERT INTO words VALUES('b'),('D');
+    SELECT w, (
+        WITH RECURSIVE r(s) AS (
+            SELECT words.w
+            UNION
+            SELECT s || 'x' FROM r WHERE length(s) < 3
+            ORDER BY 1 COLLATE NOCASE DESC
+        )
+        SELECT group_concat(s) FROM r
+    )
+    FROM words;
+}
+expect {
+    b|b,bx,bxx
+    D|D,Dx,Dxx
+}
+
+test recursive-cte-correlated-limit-zero-and-offset-past-end {
+    CREATE TABLE bounds(n INTEGER);
+    INSERT INTO bounds VALUES(3),(0),(2);
+    SELECT n, (
+        WITH RECURSIVE r(x) AS (
+            VALUES(1)
+            UNION ALL
+            SELECT x + 1 FROM r WHERE x < 5
+            LIMIT 10 OFFSET 20
+        )
+        SELECT count(*) FROM r
+    ), (
+        WITH RECURSIVE r2(x) AS (
+            VALUES(1)
+            UNION ALL
+            SELECT x + 1 FROM r2 WHERE x < 5
+            LIMIT 0
+        )
+        SELECT count(*) FROM r2
+    )
+    FROM bounds;
+}
+expect {
+    3|0|0
+    0|0|0
+    2|0|0
+}
+
+test recursive-cte-in-insert-update-delete {
+    CREATE TABLE target(v INTEGER);
+    INSERT INTO target
+    WITH RECURSIVE r(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM r WHERE x < 4)
+    SELECT x FROM r;
+    SELECT v FROM target ORDER BY v;
+    UPDATE target SET v = v * 10
+    WHERE v IN (
+        WITH RECURSIVE s(x) AS (VALUES(2) UNION ALL SELECT x + 2 FROM s WHERE x < 4)
+        SELECT x FROM s
+    );
+    SELECT v FROM target ORDER BY v;
+    DELETE FROM target
+    WHERE v IN (
+        WITH RECURSIVE d(x) AS (VALUES(1) UNION ALL SELECT x + 2 FROM d WHERE x < 3)
+        SELECT x FROM d
+    );
+    SELECT v FROM target ORDER BY v;
+}
+expect {
+    1
+    2
+    3
+    4
+    1
+    3
+    20
+    40
+    20
+    40
+}
+
+@skip-if sqlite "SQLite 3.50 drops rows from a recursive CTE that combines ORDER BY with scalar-subquery placement; 3.43 and 3.53 return the correct result"
+test recursive-cte-order-by-inside-scalar-subquery-keeps-all-rows {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES(15);
+    SELECT (
+        WITH RECURSIVE c(x) AS (
+            VALUES(-8)
+            UNION
+            SELECT x + 1 FROM c WHERE x < min(t.a, -7)
+            ORDER BY 1 DESC
+        )
+        SELECT max(x) FROM c
+    ), (
+        WITH RECURSIVE c(x) AS (
+            VALUES(-8)
+            UNION ALL
+            SELECT x + 1 FROM c WHERE x < min(15, -7)
+            ORDER BY 1 DESC
+        )
+        SELECT max(x) FROM c
+    )
+    FROM t;
+}
+expect {
+    -7|-7
+}
+
+test recursive-cte-correlated-nested-recursion-in-recursive-step {
+    CREATE TABLE bounds(n INTEGER);
+    INSERT INTO bounds VALUES(2),(3);
+    SELECT n, (
+        WITH RECURSIVE outer_r(x) AS (
+            VALUES(1)
+            UNION ALL
+            SELECT x + (
+                WITH RECURSIVE inner_r(y) AS (
+                    VALUES(1)
+                    UNION ALL
+                    SELECT y + 1 FROM inner_r WHERE y < 2
+                )
+                SELECT max(y) FROM inner_r
+            )
+            FROM outer_r WHERE x < bounds.n
+        )
+        SELECT group_concat(x) FROM outer_r
+    )
+    FROM bounds;
+}
+expect {
+    2|1,3
+    3|1,3
+}
+
+test recursive-cte-left-join-recursive-ref-on-inner-side {
+    CREATE TABLE lj(a);
+    INSERT INTO lj VALUES(1),(2),(3);
+    WITH RECURSIVE c(x) AS (
+        SELECT 1
+        UNION
+        SELECT lj.a FROM lj LEFT JOIN c ON 0
+    )
+    SELECT * FROM c;
+}
+expect {
+    1
+    2
+    3
+}
+
+test recursive-cte-nested-with-shadows-outer-name {
+    WITH RECURSIVE t21(a, b) AS (
+        WITH t21(x) AS (VALUES (1))
+        SELECT x, x FROM t21 ORDER BY 1 LIMIT 5
+    )
+    SELECT * FROM t21 AS tA, t21 AS tB;
+}
+expect {
+    1|1|1|1
+}
+
+test recursive-cte-unused-nested-cte-self-ref-is-not-a-recursive-ref {
+    WITH RECURSIVE c(x) AS (
+        WITH t(y) AS (SELECT x FROM c)
+        SELECT 1
+        UNION ALL
+        SELECT x + 1 FROM c WHERE x < 3
+    )
+    SELECT * FROM c;
+}
+expect {
+    1
+    2
+    3
+}
+
+test recursive-cte-unused-nested-cte-self-ref-keeps-cte-non-recursive {
+    WITH RECURSIVE c AS (
+        WITH t AS (SELECT * FROM c)
+        SELECT 1
+    )
+    SELECT * FROM c;
+}
+expect {
+    1
+}
+
+test recursive-cte-used-nested-cte-self-ref-rejected {
+    WITH RECURSIVE c(x, m) AS (
+        WITH t AS (SELECT max(x) AS m FROM c)
+        SELECT 1, 0
+        UNION ALL
+        SELECT x + 1, (SELECT m FROM t) FROM c WHERE x < 4
+    )
+    SELECT * FROM c;
+}
+expect error {
+    multiple recursive references: c
+}
+
+test recursive-cte-visited-set-via-nested-cte-rejected {
+    CREATE TABLE visited_edge(a, b);
+    INSERT INTO visited_edge VALUES(1, 2), (2, 3), (3, 2);
+    WITH RECURSIVE reach(n) AS (
+        WITH seen AS (SELECT n FROM reach)
+        SELECT 1
+        UNION ALL
+        SELECT e.b FROM reach r JOIN visited_edge e ON e.a = r.n
+        WHERE e.b NOT IN (SELECT n FROM seen)
+    )
+    SELECT count(*) FROM reach;
+}
+expect error {
+    multiple recursive references: reach
+}
+
+test recursive-cte-window-clause-self-ref-rejected {
+    WITH RECURSIVE w(x) AS (
+        SELECT 1
+        UNION ALL
+        SELECT x + 1 FROM w WHERE x < 3
+        WINDOW win AS (PARTITION BY (SELECT max(x) FROM w))
+    )
+    SELECT * FROM w;
+}
+expect error {
+    multiple recursive references: w
+}
+
+# An unqualified column in a correlated subquery resolves against the
+# recursive self-reference like any other outer table.
+test recursive-cte-unqualified-correlated-ref-in-exists {
+    WITH RECURSIVE c(x) AS (
+        SELECT 1
+        UNION ALL
+        SELECT x + 1 FROM c WHERE x < 3 AND EXISTS (SELECT 1 WHERE x > 0)
+    )
+    SELECT * FROM c;
+}
+expect {
+    1
+    2
+    3
+}
+
+# GROUP BY makes the recursive term an aggregate query even without aggregate
+# functions; SQLite rejects it rather than producing non-monotonic results.
+test recursive-cte-group-by-in-recursive-term-rejected {
+    CREATE TABLE gb_edge(p, c);
+    INSERT INTO gb_edge VALUES (1, 2), (1, 3), (2, 4);
+    WITH RECURSIVE w(n, d) AS (
+        VALUES (1, 0)
+        UNION ALL
+        SELECT gb_edge.c, d + 1
+        FROM w JOIN gb_edge ON gb_edge.p = w.n
+        WHERE d < 2
+        GROUP BY 'k'
+    )
+    SELECT n, d FROM w;
+}
+expect error {
+    recursive aggregate queries not supported
+}
+
+# Aggregates in the anchor query are fine; only the recursive term is restricted.
+test recursive-cte-aggregate-in-anchor-allowed {
+    CREATE TABLE agg_anchor(p);
+    INSERT INTO agg_anchor VALUES (1), (2);
+    WITH RECURSIVE w(n) AS (
+        SELECT max(p) FROM agg_anchor
+        UNION ALL
+        SELECT n + 1 FROM w WHERE n < 3
+    )
+    SELECT n FROM w;
+}
+expect {
+    2
+    3
+}
+
+# The recursive self-reference reads the queue table, whose columns have no
+# declared type: text '2' compares after numeric 3, stopping the recursion.
+test recursive-cte-self-reference-has-no-affinity {
+    CREATE TABLE aff_anchor(a INT);
+    INSERT INTO aff_anchor VALUES(1);
+    WITH RECURSIVE c(x) AS (
+        SELECT a FROM aff_anchor
+        UNION ALL
+        SELECT '2' FROM c WHERE x < 3
+    )
+    SELECT count(*) FROM c;
+}
+expect {
+    2
+}
+
+# The outer read of the CTE keeps the affinity derived from the anchor query,
+# so comparing against text '1' still coerces.
+test recursive-cte-outer-read-keeps-anchor-affinity {
+    CREATE TABLE aff_anchor_outer(a INT);
+    INSERT INTO aff_anchor_outer VALUES(1);
+    WITH RECURSIVE c(x) AS (
+        SELECT a FROM aff_anchor_outer
+        UNION ALL
+        SELECT x FROM c WHERE 0
+    )
+    SELECT x = '1' FROM c;
+}
+expect {
+    1
+}
+
+# Seven recursive CTEs at the 2000-column limit need well over 65535 registers
+# in one program; register-carrying instruction fields must not overflow.
+test recursive-cte-many-max-width-ctes-no-register-overflow {
+    WITH RECURSIVE
+    c0 AS (VALUES(0{{repeat:1999:,0}}) UNION ALL SELECT * FROM c0 WHERE 0),
+    c1 AS (VALUES(0{{repeat:1999:,0}}) UNION ALL SELECT * FROM c1 WHERE 0),
+    c2 AS (VALUES(0{{repeat:1999:,0}}) UNION ALL SELECT * FROM c2 WHERE 0),
+    c3 AS (VALUES(0{{repeat:1999:,0}}) UNION ALL SELECT * FROM c3 WHERE 0),
+    c4 AS (VALUES(0{{repeat:1999:,0}}) UNION ALL SELECT * FROM c4 WHERE 0),
+    c5 AS (VALUES(0{{repeat:1999:,0}}) UNION ALL SELECT * FROM c5 WHERE 0),
+    c6 AS (VALUES(0{{repeat:1999:,0}}) UNION ALL SELECT * FROM c6 WHERE 0)
+    SELECT 1 FROM c0, c1, c2, c3, c4, c5, c6 LIMIT 1;
+}
+expect {
+    1
+}
+
+test recursive-cte-self-ref-with-call-arguments-rejected {
+    CREATE TABLE tvf_probe(a);
+    WITH RECURSIVE cte1(x, y, z) AS (
+        VALUES(1, 2, 3)
+        UNION ALL
+        SELECT x, 4, 5 FROM tvf_probe RIGHT JOIN cte1(x)
+    )
+    SELECT * FROM cte1;
+}
+expect error {
+    too many arguments on cte1\(\) - max 0
+}

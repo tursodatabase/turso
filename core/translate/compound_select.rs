@@ -25,35 +25,26 @@ use tracing::Level;
 pub fn emit_program_for_compound_select(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    plan: Plan,
+    plan: &mut Plan,
 ) -> crate::Result<Option<usize>> {
-    // Extract fields we need before plan is consumed by emit_compound_select.
-    let (has_order_by, order_by_owned, limit_owned, offset_owned, right_plan) = {
-        let Plan::CompoundSelect {
-            left: _,
-            right_most,
-            limit,
-            offset,
-            order_by,
-        } = &plan
-        else {
-            crate::bail_parse_error!("expected compound select plan");
-        };
-        (
-            order_by.is_some(),
-            order_by.clone(),
-            limit.clone(),
-            offset.clone(),
-            right_most.clone(),
-        )
+    let Plan::CompoundSelect {
+        left,
+        right_most,
+        limit,
+        offset,
+        order_by,
+    } = plan
+    else {
+        crate::bail_parse_error!("expected compound select plan");
     };
-    let Plan::CompoundSelect { ref left, .. } = plan else {
-        unreachable!()
-    };
+    let has_order_by = order_by.is_some();
+    let order_by_owned = order_by.clone();
+    let limit_owned = limit.clone();
+    let offset_owned = offset.clone();
     let right_most_ctx = Box::new(TranslateCtx::new(
         program,
         resolver.fork(),
-        right_plan.table_references.joined_tables().len(),
+        right_most.table_references.joined_tables().len(),
         false,
     ));
 
@@ -144,13 +135,13 @@ pub fn emit_program_for_compound_select(
             .transpose()?
     };
 
-    let real_query_destination = right_plan.query_destination.clone();
-    let num_result_cols = right_plan.result_columns.len();
+    let real_query_destination = right_most.query_destination.clone();
+    let num_result_cols = right_most.result_columns.len();
 
     // When ORDER BY is present, redirect compound output to a collection index,
     // then sort and emit to the real destination afterwards.
     let (query_destination, collection_cursor, collection_index) = if has_order_by {
-        let (cursor_id, index) = create_collection_index(program, &left[0].0, &right_plan)?;
+        let (cursor_id, index) = create_collection_index(program, &left[0].0, right_most)?;
         let dest = QueryDestination::EphemeralIndex {
             cursor_id,
             index: index.clone(),
@@ -166,6 +157,7 @@ pub fn emit_program_for_compound_select(
     let reg_result_cols_start = match &query_destination {
         QueryDestination::CoroutineYield { .. }
         | QueryDestination::EphemeralTable { .. }
+        | QueryDestination::RecursiveCteQueue { .. }
         | QueryDestination::EphemeralIndex { .. } => Some(program.alloc_registers(num_result_cols)),
         QueryDestination::ResultRows => None,
         other => {
@@ -187,24 +179,34 @@ pub fn emit_program_for_compound_select(
     // any tables are actually touched by the query. Previously this only used the rightmost subselect's
     // table references, but that breaks down with e.g. "SELECT * FROM t UNION VALUES(1)" where VALUES(1)
     // does not have any table references and we would erroneously not start a transaction.
-    for (plan, _) in left {
+    for (plan, _) in left.iter() {
         program
             .table_references
             .extend(plan.table_references.clone());
     }
-    program.table_references.extend(right_plan.table_references);
+    program
+        .table_references
+        .extend(right_most.table_references.clone());
 
     // When ORDER BY is present, update all subselect destinations in the Plan
     // to write to the collection index instead of ResultRows.
-    let mut plan = plan;
     if has_order_by {
-        set_compound_plan_destinations(&mut plan, &query_destination);
+        set_select_plan_destination(plan, &query_destination);
     }
+    let Plan::CompoundSelect {
+        left, right_most, ..
+    } = plan
+    else {
+        unreachable!()
+    };
 
     program.with_scoped_result_cols_start(|program| {
         emit_compound_select(
             program,
-            plan,
+            left,
+            right_most,
+            &limit_owned,
+            &offset_owned,
             &right_most_ctx.resolver,
             limit_ctx,
             offset_reg,
@@ -241,6 +243,15 @@ pub fn emit_program_for_compound_select(
         program.reg_result_cols_start = reg_result_cols_start;
     }
 
+    // Emission redirects subplan destinations to internal collection/dedupe
+    // indexes. The compound plan's externally visible destination is
+    // right_most's, and callers read it after emission (e.g. the scan opener
+    // locating a coroutine's yield register), so put the real one back.
+    let Plan::CompoundSelect { right_most, .. } = plan else {
+        unreachable!()
+    };
+    right_most.query_destination = real_query_destination;
+
     Ok(program.reg_result_cols_start)
 }
 
@@ -249,24 +260,16 @@ pub fn emit_program_for_compound_select(
 #[allow(clippy::too_many_arguments)]
 fn emit_compound_select(
     program: &mut ProgramBuilder,
-    plan: Plan,
+    left: &mut [(SelectPlan, CompoundOperator)],
+    right_most: &mut SelectPlan,
+    limit: &Option<Box<Expr>>,
+    offset: &Option<Box<Expr>>,
     resolver: &Resolver,
     limit_ctx: Option<LimitCtx>,
     offset_reg: Option<usize>,
     reg_result_cols_start: Option<usize>,
     query_destination: &QueryDestination,
 ) -> crate::Result<()> {
-    let Plan::CompoundSelect {
-        mut left,
-        mut right_most,
-        limit,
-        offset,
-        order_by,
-    } = plan
-    else {
-        unreachable!()
-    };
-
     let compound_select_end = program.allocate_label();
     if let Some(limit_ctx) = &limit_ctx {
         program.emit_insn(Insn::IfNot {
@@ -282,27 +285,24 @@ fn emit_compound_select(
         false,
     ));
     right_most_ctx.reg_result_cols_start = reg_result_cols_start;
-    match left.pop() {
-        Some((mut plan, operator)) => match operator {
+    match left.split_last_mut() {
+        Some(((plan, operator), left)) => match operator {
             CompoundOperator::UnionAll => {
                 if matches!(
                     right_most.query_destination,
                     QueryDestination::EphemeralIndex { .. }
                         | QueryDestination::CoroutineYield { .. }
                         | QueryDestination::EphemeralTable { .. }
+                        | QueryDestination::RecursiveCteQueue { .. }
                 ) {
                     plan.query_destination = right_most.query_destination.clone();
                 }
-                let compound_select = Plan::CompoundSelect {
-                    left,
-                    right_most: Box::new(plan),
-                    limit: limit.clone(),
-                    offset: offset.clone(),
-                    order_by,
-                };
                 emit_compound_select(
                     program,
-                    compound_select,
+                    left,
+                    plan,
+                    limit,
+                    offset,
                     resolver,
                     limit_ctx,
                     offset_reg,
@@ -317,21 +317,18 @@ fn emit_compound_select(
                         target_pc: label_next_select,
                         jump_if_null: true,
                     });
-                    right_most.limit = limit;
+                    right_most.limit.clone_from(limit);
                     right_most_ctx.limit_ctx = Some(limit_ctx);
                 }
                 if offset_reg.is_some() {
-                    right_most.offset = offset;
+                    right_most.offset.clone_from(offset);
                     right_most_ctx.reg_offset = offset_reg;
                 }
 
                 emit_explain!(program, true, "UNION ALL".to_owned());
-                right_most_ctx.materialized_build_inputs = emit_materialized_build_inputs(
-                    program,
-                    &right_most_ctx.resolver,
-                    &mut right_most,
-                )?;
-                emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                right_most_ctx.materialized_build_inputs =
+                    emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
+                emit_query(program, right_most, &mut right_most_ctx)?;
                 program.pop_current_parent_explain();
                 program.preassign_label_to_next_insn(label_next_select);
             }
@@ -347,7 +344,7 @@ fn emit_compound_select(
                     } if !index.has_rowid => (*cursor_id, index.clone()),
                     _ => {
                         new_dedupe_index = true;
-                        create_dedupe_index(program, &plan, &right_most)?
+                        create_dedupe_index(program, plan, right_most)?
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -356,16 +353,12 @@ fn emit_compound_select(
                     affinity_str: affinity_str.clone(),
                     is_delete: false,
                 };
-                let compound_select = Plan::CompoundSelect {
-                    left,
-                    right_most: Box::new(plan),
-                    limit,
-                    offset,
-                    order_by,
-                };
                 emit_compound_select(
                     program,
-                    compound_select,
+                    left,
+                    plan,
+                    limit,
+                    offset,
                     resolver,
                     None,
                     None,
@@ -381,12 +374,9 @@ fn emit_compound_select(
                 };
 
                 emit_explain!(program, true, "UNION USING TEMP B-TREE".to_owned());
-                right_most_ctx.materialized_build_inputs = emit_materialized_build_inputs(
-                    program,
-                    &right_most_ctx.resolver,
-                    &mut right_most,
-                )?;
-                emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                right_most_ctx.materialized_build_inputs =
+                    emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
+                emit_query(program, right_most, &mut right_most_ctx)?;
                 program.pop_current_parent_explain();
 
                 if new_dedupe_index {
@@ -407,8 +397,7 @@ fn emit_compound_select(
                 // this BEFORE we overwrite it with our own indexes for the intersection.
                 let intersect_destination = right_most.query_destination.clone();
 
-                let (left_cursor_id, left_index) =
-                    create_dedupe_index(program, &plan, &right_most)?;
+                let (left_cursor_id, left_index) = create_dedupe_index(program, plan, right_most)?;
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: left_cursor_id,
                     index: left_index.clone(),
@@ -417,23 +406,19 @@ fn emit_compound_select(
                 };
 
                 let (right_cursor_id, right_index) =
-                    create_dedupe_index(program, &plan, &right_most)?;
+                    create_dedupe_index(program, plan, right_most)?;
                 right_most.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: right_cursor_id,
                     index: right_index,
                     affinity_str: None,
                     is_delete: false,
                 };
-                let compound_select = Plan::CompoundSelect {
-                    left,
-                    right_most: Box::new(plan),
-                    limit,
-                    offset,
-                    order_by,
-                };
                 emit_compound_select(
                     program,
-                    compound_select,
+                    left,
+                    plan,
+                    limit,
+                    offset,
                     resolver,
                     None,
                     None,
@@ -442,12 +427,9 @@ fn emit_compound_select(
                 )?;
 
                 emit_explain!(program, true, "INTERSECT USING TEMP B-TREE".to_owned());
-                right_most_ctx.materialized_build_inputs = emit_materialized_build_inputs(
-                    program,
-                    &right_most_ctx.resolver,
-                    &mut right_most,
-                )?;
-                emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                right_most_ctx.materialized_build_inputs =
+                    emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
+                emit_query(program, right_most, &mut right_most_ctx)?;
                 program.pop_current_parent_explain();
                 read_intersect_rows(
                     program,
@@ -468,7 +450,7 @@ fn emit_compound_select(
                     } if !index.has_rowid => (*cursor_id, index.clone()),
                     _ => {
                         new_index = true;
-                        create_dedupe_index(program, &plan, &right_most)?
+                        create_dedupe_index(program, plan, right_most)?
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -477,16 +459,12 @@ fn emit_compound_select(
                     affinity_str: None,
                     is_delete: false,
                 };
-                let compound_select = Plan::CompoundSelect {
-                    left,
-                    right_most: Box::new(plan),
-                    limit,
-                    offset,
-                    order_by,
-                };
                 emit_compound_select(
                     program,
-                    compound_select,
+                    left,
+                    plan,
+                    limit,
+                    offset,
                     resolver,
                     None,
                     None,
@@ -500,12 +478,9 @@ fn emit_compound_select(
                     is_delete: true,
                 };
                 emit_explain!(program, true, "EXCEPT USING TEMP B-TREE".to_owned());
-                right_most_ctx.materialized_build_inputs = emit_materialized_build_inputs(
-                    program,
-                    &right_most_ctx.resolver,
-                    &mut right_most,
-                )?;
-                emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                right_most_ctx.materialized_build_inputs =
+                    emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
+                emit_query(program, right_most, &mut right_most_ctx)?;
                 program.pop_current_parent_explain();
                 if new_index {
                     read_deduplicated_union_or_except_rows(
@@ -523,16 +498,16 @@ fn emit_compound_select(
         None => {
             if let Some(limit_ctx) = limit_ctx {
                 right_most_ctx.limit_ctx = Some(limit_ctx);
-                right_most.limit = limit;
+                right_most.limit.clone_from(limit);
             }
             if offset_reg.is_some() {
-                right_most.offset = offset;
+                right_most.offset.clone_from(offset);
                 right_most_ctx.reg_offset = offset_reg;
             }
             emit_explain!(program, true, "LEFT-MOST SUBQUERY".to_owned());
             right_most_ctx.materialized_build_inputs =
-                emit_materialized_build_inputs(program, &right_most_ctx.resolver, &mut right_most)?;
-            emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
+            emit_query(program, right_most, &mut right_most_ctx)?;
             program.pop_current_parent_explain();
         }
     }
@@ -740,22 +715,24 @@ fn read_intersect_rows(
     Ok(())
 }
 
-/// Recursively sets the query_destination of all SelectPlans within a CompoundSelect.
-/// This ensures UNION ALL subselects write to the collection index instead of ResultRows.
-fn set_compound_plan_destinations(plan: &mut Plan, dest: &QueryDestination) {
+/// Sets where a SELECT plan writes its rows, including each query in a compound SELECT.
+pub(crate) fn set_select_plan_destination(plan: &mut Plan, destination: &QueryDestination) {
     match plan {
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
             for (subplan, _) in left.iter_mut() {
-                subplan.query_destination = dest.clone();
+                subplan.query_destination = destination.clone();
             }
-            right_most.query_destination = dest.clone();
+            right_most.query_destination = destination.clone();
         }
         Plan::Select(select_plan) => {
-            select_plan.query_destination = dest.clone();
+            select_plan.query_destination = destination.clone();
         }
-        _ => {}
+        Plan::RecursiveCte(plan) => plan.query_destination = destination.clone(),
+        Plan::Delete(_) | Plan::Update(_) => {
+            unreachable!("only SELECT plans have query destinations")
+        }
     }
 }
 

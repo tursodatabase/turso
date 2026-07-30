@@ -19,7 +19,7 @@ use crate::translate::{
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
 };
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
-use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
+use crate::vdbe::insn::{to_u32, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEMP_DB_ID};
 use crate::{
     schema::{
@@ -416,9 +416,9 @@ fn emit_refill_index(
         });
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(start_reg),
-            count: to_u16(columns.len() + 1),
-            dest_reg: to_u16(record_reg),
+            start_reg: to_u32(start_reg),
+            count: to_u32(columns.len() + 1),
+            dest_reg: to_u32(record_reg),
             index_name: Some(idx.name.clone()),
             affinity_str: None,
         });
@@ -427,7 +427,7 @@ fn emit_refill_index(
             cursor_id: index_cursor_id,
             record_reg,
             unpacked_start: Some(start_reg),
-            unpacked_count: Some((columns.len() + 1) as u16),
+            unpacked_count: Some((columns.len() + 1) as u32),
             flags: IdxInsertFlags::new().use_seek(false),
         });
 
@@ -513,9 +513,9 @@ fn emit_refill_index(
         });
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(start_reg),
-            count: to_u16(columns.len() + 1),
-            dest_reg: to_u16(record_reg),
+            start_reg: to_u32(start_reg),
+            count: to_u32(columns.len() + 1),
+            dest_reg: to_u32(record_reg),
             index_name: Some(idx.name.clone()),
             affinity_str: None,
         });

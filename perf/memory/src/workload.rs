@@ -7,7 +7,8 @@ use turso::params::Params;
 
 use super::profile::{
     Phase, Profile, WorkItem, checkpoint::Checkpoint, insert::InsertHeavy, mixed::Mixed,
-    read::ReadHeavy, scan::ScanHeavy, series_blob::SeriesBlob, update_churn::UpdateChurn,
+    read::ReadHeavy, recursive_cte::RecursiveCte, scan::ScanHeavy, series_blob::SeriesBlob,
+    update_churn::UpdateChurn,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -31,6 +32,7 @@ pub enum WorkloadProfile {
     ReadHeavy,
     Mixed,
     ScanHeavy,
+    RecursiveCte,
     SeriesBlob,
     UpdateChurn,
 }
@@ -42,6 +44,7 @@ impl std::fmt::Display for WorkloadProfile {
             WorkloadProfile::ReadHeavy => write!(f, "read-heavy"),
             WorkloadProfile::Mixed => write!(f, "mixed"),
             WorkloadProfile::ScanHeavy => write!(f, "scan-heavy"),
+            WorkloadProfile::RecursiveCte => write!(f, "recursive-cte"),
             WorkloadProfile::SeriesBlob => write!(f, "series-blob"),
             WorkloadProfile::UpdateChurn => write!(f, "update-churn"),
         }
@@ -91,6 +94,7 @@ pub fn create_profile(
         WorkloadProfile::ReadHeavy => Box::new(ReadHeavy::new(iterations, batch_size)),
         WorkloadProfile::Mixed => Box::new(Mixed::new(iterations, batch_size)),
         WorkloadProfile::ScanHeavy => Box::new(ScanHeavy::new(iterations, batch_size)),
+        WorkloadProfile::RecursiveCte => Box::new(RecursiveCte::new(iterations, batch_size)),
         WorkloadProfile::SeriesBlob => Box::new(SeriesBlob::new(iterations, batch_size)),
         WorkloadProfile::UpdateChurn => Box::new(UpdateChurn::new(iterations, batch_size)),
     };

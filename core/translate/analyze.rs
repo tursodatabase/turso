@@ -13,7 +13,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u16, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
+        insn::{to_u32, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     Result,
 };
@@ -400,9 +400,9 @@ pub fn translate_analyze(
                 affinity: Affinity::Text,
             });
             program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u16(tablename_reg),
-                count: to_u16(3),
-                dest_reg: to_u16(record_reg),
+                start_reg: to_u32(tablename_reg),
+                count: to_u32(3),
+                dest_reg: to_u32(record_reg),
                 index_name: None,
                 affinity_str: None,
             });
@@ -618,9 +618,9 @@ fn emit_index_stats(
 
     let idx_record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(record_start),
-        count: to_u16(3),
-        dest_reg: to_u16(idx_record_reg),
+        start_reg: to_u32(record_start),
+        count: to_u32(3),
+        dest_reg: to_u32(idx_record_reg),
         index_name: None,
         affinity_str: None,
     });

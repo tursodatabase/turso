@@ -2657,6 +2657,16 @@ pub fn translate_expr(
                     });
                     Ok(target_register)
                 }
+                Table::RecursiveCteInput(_) => {
+                    let cursor_id = program.resolve_cursor_id(&CursorKey::table(*table_ref_id));
+                    program.emit_insn(Insn::Column {
+                        cursor_id,
+                        column: *column,
+                        dest: target_register,
+                        default: None,
+                    });
+                    Ok(target_register)
+                }
                 Table::Virtual(_) => {
                     let cursor_id = program.resolve_cursor_id(&CursorKey::table(*table_ref_id));
                     program.emit_insn(Insn::VColumn {
