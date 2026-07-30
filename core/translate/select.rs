@@ -114,67 +114,27 @@ pub fn bind_select_stmt(
 #[turso_macros::trace_stack]
 pub fn prepare_bound_select_plan(
     select: ast::Select,
-    mut bound: super::bind::BoundSelect,
+    bound: super::bind::BoundSelect,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
-    use crate::translate::planner::{plan_bound_ctes, plan_derived_tables};
-
-    // Plan CTEs using pre-bound data from the binder.
-    let cte_definitions = std::mem::take(&mut bound.cte_definitions);
-    let mut planned_ctes = plan_bound_ctes(cte_definitions, resolver, program, connection)?;
-
-    // Plan derived tables (FROM subqueries) using pre-bound data.
-    let derived_bindings = std::mem::take(&mut bound.derived_bindings);
-    let mut planned_derived = plan_derived_tables(
-        derived_bindings,
-        &mut planned_ctes,
+    let (all_table_refs, bound_subqueries) = crate::translate::planner::plan_bound_select_refs(
+        bound,
         resolver,
         program,
         connection,
+        Vec::new(),
+        &Default::default(),
     )?;
-
-    // Extract pre-bound expression subqueries for planning in the walker.
-    let subquery_bindings = std::mem::take(&mut bound.subquery_bindings);
-
-    let mut all_table_refs =
-        bound.into_table_references(&mut planned_ctes, &mut planned_derived)?;
-
-    // Add planned CTEs as definition-only outer query refs on each
-    // TableReferences so subqueries can reference CTEs from the outer WITH
-    // clause (e.g. WITH t AS (...) SELECT (SELECT x FROM t)).
-    if !planned_ctes.is_empty() {
-        for tr in &mut all_table_refs {
-            for (name, jt) in &planned_ctes {
-                if tr.outer_query_refs().iter().any(|r| r.identifier == *name) {
-                    continue;
-                }
-                tr.add_outer_query_reference(OuterQueryReference {
-                    identifier: name.clone(),
-                    internal_id: jt.internal_id,
-                    table: jt.table.clone(),
-                    using_dedup_hidden_cols: super::plan::ColumnMask::default(),
-                    col_used_mask: super::plan::ColumnUsedMask::default(),
-                    cte_select: None,
-                    cte_explicit_columns: vec![],
-                    cte_id: None,
-                    cte_definition_only: true,
-                    rowid_referenced: false,
-                    scope_depth: 0,
-                });
-            }
-        }
-    }
-
     prepare_select_plan(
         select,
         resolver,
         program,
         SelectBinding::Bound {
             table_refs: all_table_refs.into_iter(),
-            bound_subqueries: subquery_bindings,
+            bound_subqueries,
         },
         query_destination,
         connection,

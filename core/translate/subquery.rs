@@ -697,30 +697,15 @@ fn prepare_bound_subquery_plan(
     outer_query_refs: crate::alloc::Vec<OuterQueryReference>,
     query_destination: QueryDestination,
 ) -> Result<Plan> {
-    let mut inner_bound = bound_sq.inner_bound;
-
-    // Extract nested subquery bindings, CTE definitions, and derived bindings.
-    let nested_subquery_bindings = std::mem::take(&mut inner_bound.subquery_bindings);
-    let inner_cte_defs = std::mem::take(&mut inner_bound.cte_definitions);
-    let inner_derived_bindings = std::mem::take(&mut inner_bound.derived_bindings);
-
-    // Plan any inner CTEs, propagating the correlation refs so a recursive
-    // CTE body (planned raw, not pre-bound) can reference outer tables.
-    let mut planned_ctes = super::planner::plan_bound_ctes_with_outer_refs(
-        inner_cte_defs,
-        resolver,
-        program,
-        connection,
-        &outer_query_refs,
-    )?;
-
     // Make outer CTEs available for inner scope resolution. Outer CTEs sit in
     // referenced_tables' outer_query_refs with cte_definition_only = true; they
     // were planned at the statement level and need to be visible here so
     // into_table_references can find them by name.
+    let mut inherited_ctes: rustc_hash::FxHashMap<String, super::plan::JoinedTable> =
+        Default::default();
     for oqr in referenced_tables.outer_query_refs() {
-        if oqr.cte_definition_only && !planned_ctes.contains_key(&oqr.identifier) {
-            planned_ctes.insert(
+        if oqr.cte_definition_only && !inherited_ctes.contains_key(&oqr.identifier) {
+            inherited_ctes.insert(
                 oqr.identifier.clone(),
                 super::plan::JoinedTable {
                     table: oqr.table.clone(),
@@ -738,33 +723,14 @@ fn prepare_bound_subquery_plan(
         }
     }
 
-    // Plan any nested derived tables, propagating outer refs so correlated
-    // references inside a derived table are visible.
-    let mut planned_derived = super::planner::plan_derived_tables_with_outer_refs(
-        inner_derived_bindings,
-        &mut planned_ctes,
+    super::planner::plan_bound_subquery(
+        bound_sq,
         resolver,
         program,
         connection,
-        outer_query_refs.to_vec(),
-    )?;
-
-    let table_refs_vec = inner_bound.into_table_references_with_outer_refs(
-        &mut planned_ctes,
-        &mut planned_derived,
-        outer_query_refs.to_vec(),
-    )?;
-
-    prepare_select_plan(
-        bound_sq.select,
-        resolver,
-        program,
-        crate::translate::select::SelectBinding::Bound {
-            table_refs: table_refs_vec.into_iter(),
-            bound_subqueries: nested_subquery_bindings,
-        },
+        outer_query_refs.into_iter().collect(),
+        &inherited_ctes,
         query_destination,
-        connection,
     )
 }
 

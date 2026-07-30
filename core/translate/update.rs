@@ -349,12 +349,13 @@ fn prepare_update_plan(
     // Plan CTEs and FROM-clause derived tables from the pre-bound data.
     let mut planned_ctes =
         super::planner::plan_bound_ctes(cte_definitions, resolver, program, connection)?;
-    let mut planned_derived = super::planner::plan_derived_tables(
+    let mut planned_derived = super::planner::plan_derived_tables_with_outer_refs(
         derived_bindings,
         &mut planned_ctes,
         resolver,
         program,
         connection,
+        Vec::new(),
     )?;
 
     let target_table = {
@@ -365,21 +366,10 @@ fn prepare_update_plan(
 
     // Add planned CTEs as definition-only outer query refs so subqueries in
     // ON/SET/WHERE/RETURNING can reference them.
-    for (name, jt) in &planned_ctes {
-        from_tables.add_outer_query_reference(super::plan::OuterQueryReference {
-            identifier: name.clone(),
-            internal_id: jt.internal_id,
-            table: jt.table.clone(),
-            using_dedup_hidden_cols: super::plan::ColumnMask::default(),
-            col_used_mask: ColumnUsedMask::default(),
-            cte_select: None,
-            cte_explicit_columns: vec![],
-            cte_id: None,
-            cte_definition_only: true,
-            rowid_referenced: false,
-            scope_depth: 0,
-        });
-    }
+    super::planner::add_planned_ctes_as_outer_refs(
+        std::slice::from_mut(&mut from_tables),
+        &planned_ctes,
+    );
 
     // Fold pre-bound JOIN ON/USING constraints and vtab arguments from the
     // FROM clause into WHERE terms.

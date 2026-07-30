@@ -462,17 +462,10 @@ struct OuterQueryFrame {
 }
 
 impl BoundSelect {
-    pub fn into_table_references(
-        self,
-        planned_ctes: &mut HashMap<String, super::plan::JoinedTable>,
-        planned_derived: &mut HashMap<ast::TableInternalId, super::plan::JoinedTable>,
-    ) -> Result<Vec<TableReferences>> {
-        self.into_table_references_with_outer_refs(planned_ctes, planned_derived, Vec::new())
-    }
-
-    /// Like `into_table_references`, but also sets outer query references
-    /// on the main scope's `TableReferences` so that column usage tracking
-    /// for correlated columns can find their target tables.
+    /// Convert the bound scopes into `TableReferences` (one per SELECT core,
+    /// main scope first). Outer query references are set on each scope's
+    /// `TableReferences` so that column usage tracking for correlated columns
+    /// can find their target tables.
     pub fn into_table_references_with_outer_refs(
         self,
         planned_ctes: &mut HashMap<String, super::plan::JoinedTable>,
@@ -3717,7 +3710,11 @@ mod tests {
             let mut select = parse_select("SELECT b FROM t WHERE a = 1");
             let bound = ctx.bind_select(&mut select).unwrap();
             let mut all_refs = bound
-                .into_table_references(&mut HashMap::default(), &mut HashMap::default())
+                .into_table_references_with_outer_refs(
+                    &mut HashMap::default(),
+                    &mut HashMap::default(),
+                    Vec::new(),
+                )
                 .unwrap();
 
             assert_eq!(all_refs.len(), 1);

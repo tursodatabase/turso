@@ -1106,22 +1106,17 @@ fn plan_cte(
                 connection,
                 false,
             )?;
-            outer_query_refs.push(OuterQueryReference {
-                identifier: referenced_cte_table.identifier.clone(),
-                internal_id: referenced_cte_table.internal_id,
-                table: referenced_cte_table.table.clone(),
-                using_dedup_hidden_cols: referenced_cte_table.using_dedup_hidden_cols()?,
-                col_used_mask: ColumnUsedMask::default(),
-                cte_select: None,
-                cte_explicit_columns: vec![],
-                cte_id: Some(cte_definitions[referenced_cte_index].cte_id),
-                // This entry only lets the body's FROM clause find the sibling
-                // CTE by name; its columns become visible when a FROM clause
-                // actually adds the table.
-                cte_definition_only: true,
-                rowid_referenced: false,
-                scope_depth: 0,
-            });
+            // This entry only lets the body's FROM clause find the sibling
+            // CTE by name; its columns become visible when a FROM clause
+            // actually adds the table.
+            let mut outer_ref = OuterQueryReference::cte_definition_only(
+                referenced_cte_table.identifier.clone(),
+                referenced_cte_table.internal_id,
+                referenced_cte_table.table.clone(),
+            );
+            outer_ref.using_dedup_hidden_cols = referenced_cte_table.using_dedup_hidden_cols()?;
+            outer_ref.cte_id = Some(cte_definitions[referenced_cte_index].cte_id);
+            outer_query_refs.push(outer_ref);
         }
         Ok(outer_query_refs)
     })();
@@ -1442,19 +1437,18 @@ pub fn plan_ctes_as_outer_refs(
             connection,
             false,
         )?;
-        table_references.add_outer_query_reference(OuterQueryReference {
-            identifier: cte_definition.name.clone(),
-            internal_id: joined_table.internal_id,
-            table: joined_table.table,
-            using_dedup_hidden_cols: ColumnMask::default(),
-            col_used_mask: ColumnUsedMask::default(),
-            cte_select: (!cte_definition.references_itself).then(|| cte_definition.select.clone()),
-            cte_explicit_columns: cte_definition.explicit_columns.clone(),
-            cte_id: Some(cte_definition.cte_id),
-            cte_definition_only: true,
-            rowid_referenced: false,
-            scope_depth: 0,
-        });
+        let mut outer_ref = OuterQueryReference::cte_definition_only(
+            cte_definition.name.clone(),
+            joined_table.internal_id,
+            joined_table.table,
+        );
+        outer_ref.cte_select =
+            (!cte_definition.references_itself).then(|| cte_definition.select.clone());
+        outer_ref
+            .cte_explicit_columns
+            .clone_from(&cte_definition.explicit_columns);
+        outer_ref.cte_id = Some(cte_definition.cte_id);
+        table_references.add_outer_query_reference(outer_ref);
     }
 
     Ok(())
@@ -2041,21 +2035,19 @@ pub fn parse_from(
                     connection,
                     false,
                 )?;
-                table_references.add_outer_query_reference(OuterQueryReference {
-                    identifier: cte_definition.name.clone(),
-                    internal_id: cte_table.internal_id,
-                    table: cte_table.table,
-                    using_dedup_hidden_cols: ColumnMask::default(),
-                    col_used_mask: ColumnUsedMask::default(),
-                    cte_select: (!cte_definition.references_itself)
-                        .then(|| cte_definition.select.clone()),
-                    cte_explicit_columns: cte_definition.explicit_columns.clone(),
-                    cte_id: Some(cte_definition.cte_id),
-                    // This entry only lets a nested FROM clause find the CTE name.
-                    cte_definition_only: true,
-                    rowid_referenced: false,
-                    scope_depth: 0,
-                });
+                // This entry only lets a nested FROM clause find the CTE name.
+                let mut outer_ref = OuterQueryReference::cte_definition_only(
+                    cte_definition.name.clone(),
+                    cte_table.internal_id,
+                    cte_table.table,
+                );
+                outer_ref.cte_select =
+                    (!cte_definition.references_itself).then(|| cte_definition.select.clone());
+                outer_ref
+                    .cte_explicit_columns
+                    .clone_from(&cte_definition.explicit_columns);
+                outer_ref.cte_id = Some(cte_definition.cte_id);
+                table_references.add_outer_query_reference(outer_ref);
             }
         }
     }
@@ -2199,24 +2191,9 @@ pub fn plan_bound_ctes_with_outer_refs(
 ///
 /// Each derived table's inner select is already bound. This function plans them
 /// and returns a map of `internal_id` → `JoinedTable` for use in
-/// [super::bind::BoundSelect::into_table_references].
-pub fn plan_derived_tables(
-    derived_bindings: rustc_hash::FxHashMap<TableInternalId, super::bind::BoundSubquery>,
-    planned_ctes: &mut rustc_hash::FxHashMap<String, JoinedTable>,
-    resolver: &Resolver,
-    program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
-) -> Result<rustc_hash::FxHashMap<TableInternalId, JoinedTable>> {
-    plan_derived_tables_with_outer_refs(
-        derived_bindings,
-        planned_ctes,
-        resolver,
-        program,
-        connection,
-        Vec::new(),
-    )
-}
-
+/// [super::bind::BoundSelect::into_table_references_with_outer_refs]. Outer refs from the
+/// enclosing scope are propagated so correlated references inside a derived
+/// table stay visible.
 pub fn plan_derived_tables_with_outer_refs(
     derived_bindings: rustc_hash::FxHashMap<TableInternalId, super::bind::BoundSubquery>,
     planned_ctes: &mut rustc_hash::FxHashMap<String, JoinedTable>,
@@ -2228,93 +2205,15 @@ pub fn plan_derived_tables_with_outer_refs(
     let mut planned: rustc_hash::FxHashMap<TableInternalId, JoinedTable> = Default::default();
 
     for (internal_id, bound_sq) in derived_bindings {
-        let mut inner_bound = bound_sq.inner_bound;
-
-        // Extract nested CTE definitions and subquery bindings.
-        let inner_cte_defs = std::mem::take(&mut inner_bound.cte_definitions);
-        let inner_subquery_bindings = std::mem::take(&mut inner_bound.subquery_bindings);
-        let inner_derived_bindings = std::mem::take(&mut inner_bound.derived_bindings);
-
-        // Plan any inner CTEs.
-        let mut inner_planned_ctes = plan_bound_ctes_with_outer_refs(
-            inner_cte_defs,
-            resolver,
-            program,
-            connection,
-            &outer_query_refs,
-        )?;
-
-        // Make parent CTEs available for inner references.
-        for (name, jt) in planned_ctes.iter() {
-            if !inner_planned_ctes.contains_key(name) {
-                inner_planned_ctes.insert(name.clone(), jt.clone());
-            }
-        }
-
-        // Plan any nested derived tables.
-        let mut inner_planned_derived = plan_derived_tables_with_outer_refs(
-            inner_derived_bindings,
-            &mut inner_planned_ctes,
+        let subplan = plan_bound_subquery(
+            bound_sq,
             resolver,
             program,
             connection,
             outer_query_refs.clone(),
-        )?;
-
-        let mut all_table_refs = inner_bound.into_table_references_with_outer_refs(
-            &mut inner_planned_ctes,
-            &mut inner_planned_derived,
-            outer_query_refs.clone(),
-        )?;
-
-        // Expose the planned CTEs (own + inherited from the parent scope) as
-        // definition-only outer refs so expression subqueries inside this
-        // derived table can still reference them (e.g. a WITH-clause CTE read
-        // from an IN (...) subquery nested in a FROM subquery).
-        for tr in &mut all_table_refs {
-            for (name, jt) in inner_planned_ctes.iter() {
-                if tr.outer_query_refs().iter().any(|r| r.identifier == *name) {
-                    continue;
-                }
-                tr.add_outer_query_reference(OuterQueryReference {
-                    identifier: name.clone(),
-                    internal_id: jt.internal_id,
-                    table: jt.table.clone(),
-                    using_dedup_hidden_cols: ColumnMask::default(),
-                    col_used_mask: ColumnUsedMask::default(),
-                    cte_select: None,
-                    cte_explicit_columns: vec![],
-                    cte_id: None,
-                    cte_definition_only: true,
-                    rowid_referenced: false,
-                    scope_depth: 0,
-                });
-            }
-        }
-
-        let subplan = prepare_select_plan(
-            bound_sq.select,
-            resolver,
-            program,
-            crate::translate::select::SelectBinding::Bound {
-                table_refs: all_table_refs.into_iter(),
-                bound_subqueries: inner_subquery_bindings,
-            },
+            planned_ctes,
             QueryDestination::placeholder_for_subquery(),
-            connection,
         )?;
-
-        match &subplan {
-            Plan::Select(_) | Plan::CompoundSelect { .. } => {}
-            Plan::Delete(_) | Plan::Update(_) => {
-                crate::bail_parse_error!(
-                    "DELETE/UPDATE queries are not supported in FROM clause subqueries"
-                );
-            }
-            Plan::RecursiveCte(_) => {
-                unreachable!("recursive CTE plans are only built for CTE definitions")
-            }
-        }
 
         let jt = JoinedTable::new_subquery_from_plan(
             String::new(), // identifier set later by scope_to_table_references
@@ -2329,6 +2228,122 @@ pub fn plan_derived_tables_with_outer_refs(
     }
 
     Ok(planned)
+}
+
+/// Add every planned CTE as a definition-only outer query reference on each
+/// `TableReferences`, skipping names already present. This lets subqueries
+/// inside the query reference CTEs from an enclosing WITH clause by name.
+pub fn add_planned_ctes_as_outer_refs(
+    table_refs: &mut [TableReferences],
+    planned_ctes: &rustc_hash::FxHashMap<String, JoinedTable>,
+) {
+    for tr in table_refs {
+        for (name, jt) in planned_ctes {
+            if tr.outer_query_refs().iter().any(|r| r.identifier == *name) {
+                continue;
+            }
+            tr.add_outer_query_reference(OuterQueryReference::cte_definition_only(
+                name.clone(),
+                jt.internal_id,
+                jt.table.clone(),
+            ));
+        }
+    }
+}
+
+/// Turn a [super::bind::BoundSelect] into ready-to-use [TableReferences],
+/// one per SELECT core (main first, then compounds).
+///
+/// This is the single place where bound output becomes table references:
+/// 1. plan the WITH-clause CTEs
+/// 2. make CTEs planned by enclosing scopes available by name
+/// 3. plan the FROM-clause subqueries (derived tables)
+/// 4. convert the bound scopes into `TableReferences` (with the caller's
+///    outer refs attached for correlation)
+/// 5. attach every planned CTE as a definition-only outer ref so subqueries
+///    can still reference them by name
+///
+/// Also returns the pre-bound expression subqueries, keyed by the id in the
+/// corresponding [ast::Expr::SubqueryResult].
+pub fn plan_bound_select_refs(
+    mut bound: super::bind::BoundSelect,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+    outer_query_refs: Vec<OuterQueryReference>,
+    inherited_ctes: &rustc_hash::FxHashMap<String, JoinedTable>,
+) -> Result<(
+    Vec<TableReferences>,
+    rustc_hash::FxHashMap<TableInternalId, super::bind::BoundSubquery>,
+)> {
+    let cte_definitions = std::mem::take(&mut bound.cte_definitions);
+    let subquery_bindings = std::mem::take(&mut bound.subquery_bindings);
+    let derived_bindings = std::mem::take(&mut bound.derived_bindings);
+
+    let mut planned_ctes = plan_bound_ctes_with_outer_refs(
+        cte_definitions,
+        resolver,
+        program,
+        connection,
+        &outer_query_refs,
+    )?;
+    for (name, jt) in inherited_ctes {
+        planned_ctes
+            .entry(name.clone())
+            .or_insert_with(|| jt.clone());
+    }
+
+    let mut planned_derived = plan_derived_tables_with_outer_refs(
+        derived_bindings,
+        &mut planned_ctes,
+        resolver,
+        program,
+        connection,
+        outer_query_refs.clone(),
+    )?;
+
+    let mut table_refs = bound.into_table_references_with_outer_refs(
+        &mut planned_ctes,
+        &mut planned_derived,
+        outer_query_refs,
+    )?;
+
+    add_planned_ctes_as_outer_refs(&mut table_refs, &planned_ctes);
+
+    Ok((table_refs, subquery_bindings))
+}
+
+/// Plan a pre-bound subquery ([super::bind::BoundSubquery]) into a [Plan]
+/// with no name resolution: [plan_bound_select_refs] followed by
+/// [prepare_select_plan] in bound mode.
+pub fn plan_bound_subquery(
+    bound_sq: super::bind::BoundSubquery,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+    outer_query_refs: Vec<OuterQueryReference>,
+    inherited_ctes: &rustc_hash::FxHashMap<String, JoinedTable>,
+    query_destination: QueryDestination,
+) -> Result<Plan> {
+    let (table_refs, bound_subqueries) = plan_bound_select_refs(
+        bound_sq.inner_bound,
+        resolver,
+        program,
+        connection,
+        outer_query_refs,
+        inherited_ctes,
+    )?;
+    prepare_select_plan(
+        bound_sq.select,
+        resolver,
+        program,
+        crate::translate::select::SelectBinding::Bound {
+            table_refs: table_refs.into_iter(),
+            bound_subqueries,
+        },
+        query_destination,
+        connection,
+    )
 }
 
 /// Plan a single CTE using its pre-bound data from the binder.
@@ -2390,22 +2405,17 @@ fn plan_one_bound_cte(
         // refs, mirroring plan_cte's sibling handling on the raw path.
         let mut planning_outer_refs = Vec::with_capacity(planned.len() + outer_query_refs.len());
         for (ref_name, ref_table) in planned.iter() {
-            planning_outer_refs.push(OuterQueryReference {
-                identifier: ref_name.clone(),
-                internal_id: ref_table.internal_id,
-                table: ref_table.table.clone(),
-                using_dedup_hidden_cols: ref_table.using_dedup_hidden_cols()?,
-                col_used_mask: ColumnUsedMask::default(),
-                cte_select: None,
-                cte_explicit_columns: vec![],
-                cte_id: cte_definitions
-                    .iter()
-                    .find(|(n, _)| n == ref_name)
-                    .map(|(_, e)| e.cte_id),
-                cte_definition_only: true,
-                rowid_referenced: false,
-                scope_depth: 0,
-            });
+            let mut outer_ref = OuterQueryReference::cte_definition_only(
+                ref_name.clone(),
+                ref_table.internal_id,
+                ref_table.table.clone(),
+            );
+            outer_ref.using_dedup_hidden_cols = ref_table.using_dedup_hidden_cols()?;
+            outer_ref.cte_id = cte_definitions
+                .iter()
+                .find(|(n, _)| n == ref_name)
+                .map(|(_, e)| e.cte_id);
+            planning_outer_refs.push(outer_ref);
         }
         // Correlation refs from the enclosing scope (e.g. a recursive CTE in
         // a correlated expression subquery referencing an outer table).
@@ -2444,91 +2454,29 @@ fn plan_one_bound_cte(
 
     let entry = &mut cte_definitions[cte_idx].1;
 
-    // Take the pre-bound data produced by the binder.
-    let mut inner_bound = entry
-        .inner_bound
-        .take()
-        .expect("CTE inner binding should be present");
-    let cte_select = entry.select.clone();
-
-    // Extract nested CTE definitions, subquery bindings, and derived bindings.
-    let inner_cte_defs = std::mem::take(&mut inner_bound.cte_definitions);
-    let inner_subquery_bindings = std::mem::take(&mut inner_bound.subquery_bindings);
-    let inner_derived_bindings = std::mem::take(&mut inner_bound.derived_bindings);
+    // Take the pre-bound data produced by the binder. Already-planned sibling
+    // CTEs are passed as inherited: CTEs can be referenced not only from the
+    // FROM clause (tracked by referenced_cte_indices) but also from correlated
+    // subqueries within the CTE body.
+    let bound_sq = super::bind::BoundSubquery {
+        select: entry.select.clone(),
+        inner_bound: entry
+            .inner_bound
+            .take()
+            .expect("CTE inner binding should be present"),
+    };
 
     // Block circular references during planning.
     program.push_cte_being_defined(name.clone());
-
-    let plan_result = (|| -> Result<Plan> {
-        // Plan any nested CTEs from inner WITH clauses.
-        let mut inner_planned = plan_bound_ctes_with_outer_refs(
-            inner_cte_defs,
-            resolver,
-            program,
-            connection,
-            outer_query_refs,
-        )?;
-
-        // Make all already-planned sibling CTEs available. CTEs can be
-        // referenced not only from the FROM clause (tracked by
-        // referenced_cte_indices) but also from correlated subqueries within
-        // the CTE body.
-        for (ref_name, ref_table) in planned.iter() {
-            if !inner_planned.contains_key(ref_name) {
-                inner_planned.insert(ref_name.clone(), ref_table.clone());
-            }
-        }
-
-        // Plan any derived tables (FROM subqueries).
-        let mut inner_planned_derived = plan_derived_tables(
-            inner_derived_bindings,
-            &mut inner_planned,
-            resolver,
-            program,
-            connection,
-        )?;
-
-        let mut all_table_refs =
-            inner_bound.into_table_references(&mut inner_planned, &mut inner_planned_derived)?;
-
-        // Add sibling CTEs as outer query refs so correlated subqueries within
-        // this CTE body can reference them.
-        for tr in &mut all_table_refs {
-            for (ref_name, ref_table) in planned.iter() {
-                if !tr
-                    .outer_query_refs()
-                    .iter()
-                    .any(|r| r.identifier == *ref_name)
-                {
-                    tr.add_outer_query_reference(OuterQueryReference {
-                        identifier: ref_name.clone(),
-                        internal_id: ref_table.internal_id,
-                        table: ref_table.table.clone(),
-                        using_dedup_hidden_cols: ColumnMask::default(),
-                        col_used_mask: ColumnUsedMask::default(),
-                        cte_select: None,
-                        cte_explicit_columns: vec![],
-                        cte_id: None,
-                        cte_definition_only: true,
-                        rowid_referenced: false,
-                        scope_depth: 0,
-                    });
-                }
-            }
-        }
-
-        prepare_select_plan(
-            cte_select,
-            resolver,
-            program,
-            crate::translate::select::SelectBinding::Bound {
-                table_refs: all_table_refs.into_iter(),
-                bound_subqueries: inner_subquery_bindings,
-            },
-            QueryDestination::placeholder_for_subquery(),
-            connection,
-        )
-    })();
+    let plan_result = plan_bound_subquery(
+        bound_sq,
+        resolver,
+        program,
+        connection,
+        outer_query_refs.to_vec(),
+        planned,
+        QueryDestination::placeholder_for_subquery(),
+    );
     program.pop_cte_being_defined();
     let cte_plan = plan_result?;
 
@@ -2541,23 +2489,15 @@ fn plan_one_bound_cte(
         Some(entry.explicit_columns.as_slice())
     };
 
-    let cte_table = match cte_plan {
-        Plan::Select(_) | Plan::CompoundSelect { .. } => JoinedTable::new_subquery_from_plan(
-            name.clone(),
-            cte_plan,
-            None,
-            program.table_reference_counter.next(),
-            explicit_cols,
-            Some(entry.cte_id),
-            entry.materialize_hint,
-        )?,
-        Plan::Delete(_) | Plan::Update(_) => {
-            crate::bail_parse_error!("DELETE/UPDATE queries are not supported in CTEs")
-        }
-        Plan::RecursiveCte(_) => {
-            unreachable!("recursive CTE entries take the prepare_recursive_cte_plan branch above")
-        }
-    };
+    let cte_table = JoinedTable::new_subquery_from_plan(
+        name.clone(),
+        cte_plan,
+        None,
+        program.table_reference_counter.next(),
+        explicit_cols,
+        Some(entry.cte_id),
+        entry.materialize_hint,
+    )?;
 
     planned.insert(name, cte_table);
     Ok(())

@@ -18,7 +18,7 @@ use crate::Result;
 use smallvec::SmallVec;
 use turso_parser::ast::{Expr, Limit, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
 
-use super::plan::{ColumnUsedMask, WhereTerm};
+use super::plan::WhereTerm;
 
 // validate the delete statment, returning the underlying table if validation passes
 fn validate_delete(
@@ -249,28 +249,15 @@ pub fn prepare_delete_plan(
     let bound_subqueries = std::mem::take(&mut bound.subquery_bindings);
 
     // Plan CTEs using pre-bound data from the binder, then convert the bound
-    // scope into TableReferences.
+    // scope into TableReferences. Planned CTEs become definition-only outer
+    // query refs so subqueries in WHERE/RETURNING can reference them.
     let mut planned_ctes =
         super::planner::plan_bound_ctes(cte_definitions, resolver, program, connection)?;
     let mut table_references = bound.into_table_references(&mut planned_ctes)?;
-
-    // Add planned CTEs as definition-only outer query refs so subqueries in
-    // WHERE/RETURNING can reference them.
-    for (name, jt) in &planned_ctes {
-        table_references.add_outer_query_reference(super::plan::OuterQueryReference {
-            identifier: name.clone(),
-            internal_id: jt.internal_id,
-            table: jt.table.clone(),
-            using_dedup_hidden_cols: super::plan::ColumnMask::default(),
-            col_used_mask: ColumnUsedMask::default(),
-            cte_select: None,
-            cte_explicit_columns: vec![],
-            cte_id: None,
-            cte_definition_only: true,
-            rowid_referenced: false,
-            scope_depth: 0,
-        });
-    }
+    super::planner::add_planned_ctes_as_outer_refs(
+        std::slice::from_mut(&mut table_references),
+        &planned_ctes,
+    );
 
     let mut where_predicates = vec![];
     super::planner::parse_where_bound(where_clause.as_deref(), &mut where_predicates)?;

@@ -361,21 +361,10 @@ pub fn translate_insert(
         // RETURNING subqueries can reference them.
         let planned_ctes =
             super::planner::plan_bound_ctes(cte_definitions, resolver, program, connection)?;
-        for (name, jt) in &planned_ctes {
-            table_references.add_outer_query_reference(super::plan::OuterQueryReference {
-                identifier: name.clone(),
-                internal_id: jt.internal_id,
-                table: jt.table.clone(),
-                using_dedup_hidden_cols: super::plan::ColumnMask::default(),
-                col_used_mask: ColumnUsedMask::default(),
-                cte_select: None,
-                cte_explicit_columns: vec![],
-                cte_id: None,
-                cte_definition_only: true,
-                rowid_referenced: false,
-                scope_depth: 0,
-            });
-        }
+        super::planner::add_planned_ctes_as_outer_refs(
+            std::slice::from_mut(&mut table_references),
+            &planned_ctes,
+        );
         subquery_bindings
     };
 

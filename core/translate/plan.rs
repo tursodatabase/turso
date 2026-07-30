@@ -1254,6 +1254,28 @@ pub struct OuterQueryReference {
 }
 
 impl OuterQueryReference {
+    /// A definition-only entry: it lets a subquery's FROM clause find a CTE
+    /// by name, but its columns are not visible for column resolution.
+    pub fn cte_definition_only(
+        identifier: String,
+        internal_id: TableInternalId,
+        table: Table,
+    ) -> Self {
+        Self {
+            identifier,
+            internal_id,
+            table,
+            using_dedup_hidden_cols: ColumnMask::default(),
+            col_used_mask: ColumnUsedMask::default(),
+            cte_select: None,
+            cte_explicit_columns: vec![],
+            cte_id: None,
+            cte_definition_only: true,
+            rowid_referenced: false,
+            scope_depth: 0,
+        }
+    }
+
     /// Returns the columns of the table that this outer query reference refers to.
     pub fn columns(&self) -> &[Column] {
         self.table.columns()
