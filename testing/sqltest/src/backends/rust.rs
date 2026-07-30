@@ -266,7 +266,9 @@ fn value_to_string(value: &Value) -> String {
 
 /// Format a floating-point number to match SQLite's output
 /// SQLite uses %!.15g format (15 significant digits, no trailing zeros)
-fn format_real(f: f64) -> String {
+/// Also used by the matrix oracle so both engines' reals are rendered
+/// through the identical formatter, making text comparison value-exact.
+pub(crate) fn format_real(f: f64) -> String {
     if f.is_nan() {
         return "NaN".to_string();
     }

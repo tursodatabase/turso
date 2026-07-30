@@ -1,8 +1,9 @@
 use crate::backends::{BackendError, QueryResult, SqlBackend};
 use crate::comparison::{ComparisonResult, compare};
+use crate::matrix_oracle::{OracleOutcome, run_oracle};
 use crate::parser::ast::{
-    Backend, Capability, DatabaseConfig, DatabaseLocation, Expectation, Requirement, SetupRef,
-    Skip, SkipCondition, SnapshotCase, TestCase, TestFile,
+    Backend, Capability, CaseModifiers, DatabaseConfig, DatabaseLocation, Expectation, Requirement,
+    SetupRef, Skip, SkipCondition, SnapshotCase, TestCase, TestFile,
 };
 use crate::snapshot::{SnapshotInfo, SnapshotManager, SnapshotResult, SnapshotUpdateMode};
 use async_trait::async_trait;
@@ -242,6 +243,113 @@ impl Runnable for SnapshotCase {
             SnapshotResult::New { content } => TestOutcome::SnapshotNew { content },
             SnapshotResult::Updated { old, new } => TestOutcome::SnapshotUpdated { old, new },
             SnapshotResult::Error { msg } => TestOutcome::Error { message: msg },
+        }
+    }
+}
+
+/// One expansion of a `matrix` block. Runs like a test whose expectation is
+/// produced at run time by the bundled-SQLite oracle: Turso and SQLite must
+/// return the same rows in the same order, or both must reject the
+/// statement.
+#[derive(Clone)]
+struct MatrixRunCase {
+    name: String,
+    sql: String,
+    modifiers: CaseModifiers,
+}
+
+#[async_trait]
+impl Runnable for MatrixRunCase {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn skip(&self) -> &[Skip] {
+        &self.modifiers.skip
+    }
+
+    fn setups(&self) -> &[SetupRef] {
+        &self.modifiers.setups
+    }
+
+    fn check_skip_conditions(&self, options: &RunOptions) -> Option<String> {
+        for req in options
+            .global_requires
+            .iter()
+            .chain(self.modifiers.requires.iter())
+        {
+            if !options.backend_capabilities.contains(&req.capability) {
+                return Some(format!("requires {}: {}", req.capability, req.reason));
+            }
+        }
+        None
+    }
+
+    fn queries_to_execute(&self) -> Vec<String> {
+        vec![self.sql.clone()]
+    }
+
+    async fn evaluate_results(
+        &self,
+        results: Vec<QueryResult>,
+        options: &RunOptions,
+    ) -> TestOutcome {
+        assert!(results.len() == 1);
+        let turso = results.first().unwrap();
+
+        // Run the same setups + statement against the bundled SQLite. The
+        // setup names were validated at parse time, so lookups can't miss.
+        let setups: Vec<String> = self
+            .modifiers
+            .setups
+            .iter()
+            .map(|s| options.setups[&s.name].clone())
+            .collect();
+        let oracle = match run_oracle(&setups, &self.sql) {
+            Ok(outcome) => outcome,
+            Err(message) => return TestOutcome::Error { message },
+        };
+
+        match (turso.error.as_ref(), oracle) {
+            (Some(_), OracleOutcome::Error(_)) => TestOutcome::Passed,
+            (Some(turso_err), OracleOutcome::Rows(rows)) => TestOutcome::Failed {
+                reason: format!(
+                    "Turso errored but SQLite returned {} row(s):\n  turso error: {}",
+                    rows.len(),
+                    turso_err
+                ),
+            },
+            (None, OracleOutcome::Error(sqlite_err)) => TestOutcome::Failed {
+                reason: format!(
+                    "SQLite errored but Turso returned {} row(s):\n  sqlite error: {}",
+                    turso.rows.len(),
+                    sqlite_err
+                ),
+            },
+            (None, OracleOutcome::Rows(sqlite_rows)) => {
+                if turso.rows == sqlite_rows {
+                    return TestOutcome::Passed;
+                }
+                let join = |rows: &[Vec<String>]| {
+                    rows.iter()
+                        .map(|r| r.join("|"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                let sqlite_str = join(&sqlite_rows);
+                let turso_str = join(&turso.rows);
+                let diff = similar::TextDiff::from_lines(&sqlite_str, &turso_str);
+                let mut reason = String::from("--- sqlite (oracle)\n+++ turso\n");
+                for change in diff.iter_all_changes() {
+                    let sign = match change.tag() {
+                        similar::ChangeTag::Delete => "-",
+                        similar::ChangeTag::Insert => "+",
+                        similar::ChangeTag::Equal => " ",
+                    };
+                    reason.push_str(&format!("{sign}{change}"));
+                }
+                TestOutcome::Failed { reason }
+            }
         }
     }
 }
@@ -925,6 +1033,64 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
         futures
     }
 
+    /// Spawn all matrix expansions for a parsed file, returning futures.
+    /// Matrix cases run only on the Rust backend: the oracle comparison
+    /// renders both engines' values through that backend's formatting.
+    fn spawn_matrix_tests(
+        &self,
+        path: &Path,
+        test_file: &TestFile,
+    ) -> FuturesUnordered<tokio::task::JoinHandle<TestResult>> {
+        let futures = FuturesUnordered::new();
+        let backend_type = self.backend.backend_type();
+        if backend_type != Backend::Rust {
+            return futures;
+        }
+        let backend_capabilities = self.backend.capabilities();
+
+        // Like snapshots, matrices use the first database configuration.
+        if let Some(db_config) = test_file.databases.first() {
+            for matrix in &test_file.matrices {
+                for expansion in matrix.expand() {
+                    if let Some(ref filter) = self.config.filter {
+                        if !matches_filter(&expansion.name, filter) {
+                            continue;
+                        }
+                    }
+
+                    let backend = Arc::clone(&self.backend);
+                    let semaphore = Arc::clone(&self.semaphore);
+                    let case = MatrixRunCase {
+                        name: expansion.name,
+                        sql: expansion.sql,
+                        modifiers: matrix.modifiers.clone(),
+                    };
+
+                    let options = RunOptions {
+                        file_path: path.to_path_buf(),
+                        db_config: db_config.clone(),
+                        setups: test_file.setups.clone(),
+                        mvcc: self.config.mvcc,
+                        global_skip: test_file.global_skip.clone(),
+                        global_requires: test_file.global_requires.clone(),
+                        backend_capabilities: backend_capabilities.clone(),
+                        backend_type,
+                        backend_is_sqlite: self.backend.is_sqlite(),
+                        snapshot_update_mode: self.config.snapshot_update_mode,
+                        cross_check_binary: self.config.cross_check_binary.clone(),
+                    };
+
+                    futures.push(tokio::spawn(async move {
+                        let _permit = semaphore.acquire_owned().await.unwrap();
+                        run_single(backend, case, options).await
+                    }));
+                }
+            }
+        }
+
+        futures
+    }
+
     /// Run all tests in a file
     pub async fn run_file(
         &self,
@@ -932,7 +1098,11 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
         test_file: &TestFile,
     ) -> Result<FileResult, BackendError> {
         let start = Instant::now();
-        let mut futures = self.spawn_file_tests(path, test_file);
+        let futures = self.spawn_file_tests(path, test_file);
+        for future in self.spawn_matrix_tests(path, test_file) {
+            futures.push(future);
+        }
+        let mut futures = futures;
 
         let mut results = Vec::new();
         while let Some(result) = futures.next().await {
@@ -1016,6 +1186,12 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
             // Spawn snapshot tests
             let snapshot_futures = self.spawn_snapshot_tests(path, test_file);
             for future in snapshot_futures {
+                all_futures.push(future);
+            }
+
+            // Spawn matrix expansions
+            let matrix_futures = self.spawn_matrix_tests(path, test_file);
+            for future in matrix_futures {
                 all_futures.push(future);
             }
         }
