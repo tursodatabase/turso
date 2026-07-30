@@ -43,7 +43,7 @@ use crate::{
             CursorKey, CursorType, HashBuildSignature, MaterializedBuildInputModeTag,
             ProgramBuilder,
         },
-        insn::{to_u16, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
+        insn::{to_u32, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
     Result,

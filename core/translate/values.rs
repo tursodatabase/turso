@@ -4,7 +4,7 @@ use crate::translate::plan::{QueryDestination, SelectPlan};
 use crate::translate::result_row::{emit_columns_to_destination, emit_offset};
 use crate::turso_assert_eq;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::vdbe::insn::{to_u16, IdxInsertFlags, InsertFlags, Insn};
+use crate::vdbe::insn::{to_u32, IdxInsertFlags, InsertFlags, Insn};
 use crate::vdbe::BranchOffset;
 use crate::Result;
 
@@ -319,9 +319,9 @@ fn emit_values_to_index(
         };
 
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(record_start),
-            count: to_u16(record_count),
-            dest_reg: to_u16(record_reg),
+            start_reg: to_u32(record_start),
+            count: to_u32(record_count),
+            dest_reg: to_u32(record_reg),
             index_name: Some(index.name.clone()),
             affinity_str: affinity_str.as_ref().map(|s| (**s).clone()),
         });
@@ -351,9 +351,9 @@ fn emit_values_to_table(
     let record_reg = program.alloc_register();
     let rowid_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(start_reg),
-        count: to_u16(row_len),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(start_reg),
+        count: to_u32(row_len),
+        dest_reg: to_u32(record_reg),
         index_name: Some(table.name.clone()),
         affinity_str: None,
     });

@@ -2,7 +2,7 @@ use crate::turso_assert_eq;
 use crate::{
     vdbe::{
         builder::ProgramBuilder,
-        insn::{to_u16, IdxInsertFlags, InsertFlags, Insn},
+        insn::{to_u32, IdxInsertFlags, InsertFlags, Insn},
         BranchOffset,
     },
     Result,
@@ -239,9 +239,9 @@ pub fn emit_columns_to_destination(
                     };
 
                 program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u16(record_start),
-                    count: to_u16(record_count),
-                    dest_reg: to_u16(record_reg),
+                    start_reg: to_u32(record_start),
+                    count: to_u32(record_count),
+                    dest_reg: to_u32(record_reg),
                     index_name: Some(dedupe_index.name.clone()),
                     affinity_str: affinity_str.as_ref().map(|s| (**s).clone()),
                 });
@@ -269,17 +269,17 @@ pub fn emit_columns_to_destination(
                     // create a record containing the rowid so it can be read back later.
                     if num_columns == 1 {
                         program.emit_insn(Insn::MakeRecord {
-                            start_reg: to_u16(start_reg),
-                            count: to_u16(1),
-                            dest_reg: to_u16(record_reg),
+                            start_reg: to_u32(start_reg),
+                            count: to_u32(1),
+                            dest_reg: to_u32(record_reg),
                             index_name: Some(table.name.clone()),
                             affinity_str: None,
                         });
                     } else if num_columns > 1 {
                         program.emit_insn(Insn::MakeRecord {
-                            start_reg: to_u16(start_reg),
-                            count: to_u16(num_columns - 1),
-                            dest_reg: to_u16(record_reg),
+                            start_reg: to_u32(start_reg),
+                            count: to_u32(num_columns - 1),
+                            dest_reg: to_u32(record_reg),
                             index_name: Some(table.name.clone()),
                             affinity_str: None,
                         });
@@ -297,9 +297,9 @@ pub fn emit_columns_to_destination(
                 super::plan::EphemeralRowidMode::Auto => {
                     if num_columns > 0 {
                         program.emit_insn(Insn::MakeRecord {
-                            start_reg: to_u16(start_reg),
-                            count: to_u16(num_columns),
-                            dest_reg: to_u16(record_reg),
+                            start_reg: to_u32(start_reg),
+                            count: to_u32(num_columns),
+                            dest_reg: to_u32(record_reg),
                             index_name: Some(table.name.clone()),
                             affinity_str: None,
                         });
@@ -336,9 +336,9 @@ pub fn emit_columns_to_destination(
                 });
                 let record_reg = program.alloc_register();
                 program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u16(start_reg),
-                    count: to_u16(num_columns),
-                    dest_reg: to_u16(record_reg),
+                    start_reg: to_u32(start_reg),
+                    count: to_u32(num_columns),
+                    dest_reg: to_u32(record_reg),
                     index_name: Some(index.name.clone()),
                     affinity_str: None,
                 });
@@ -346,7 +346,7 @@ pub fn emit_columns_to_destination(
                     cursor_id: *cursor_id,
                     record_reg,
                     unpacked_start: Some(start_reg),
-                    unpacked_count: Some(to_u16(num_columns)),
+                    unpacked_count: Some(to_u32(num_columns)),
                     flags: IdxInsertFlags::new().no_op_duplicate(),
                 });
                 skip_seen_row
@@ -396,9 +396,9 @@ pub fn emit_columns_to_destination(
             });
             let record_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u16(queue_row_start_reg),
-                count: to_u16(sort_key_column_count + 1 + num_columns),
-                dest_reg: to_u16(record_reg),
+                start_reg: to_u32(queue_row_start_reg),
+                count: to_u32(sort_key_column_count + 1 + num_columns),
+                dest_reg: to_u32(record_reg),
                 index_name: Some(index.name.clone()),
                 affinity_str: None,
             });

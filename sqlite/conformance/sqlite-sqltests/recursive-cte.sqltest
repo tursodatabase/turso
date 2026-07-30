@@ -1829,6 +1829,23 @@ expect error {
     multiple recursive references: w
 }
 
+# Seven recursive CTEs at the 2000-column limit need well over 65535 registers
+# in one program; register-carrying instruction fields must not overflow.
+test recursive-cte-many-max-width-ctes-no-register-overflow {
+    WITH RECURSIVE
+    c0 AS (VALUES(0{{repeat:1999:,0}}) UNION ALL SELECT * FROM c0 WHERE 0),
+    c1 AS (VALUES(0{{repeat:1999:,0}}) UNION ALL SELECT * FROM c1 WHERE 0),
+    c2 AS (VALUES(0{{repeat:1999:,0}}) UNION ALL SELECT * FROM c2 WHERE 0),
+    c3 AS (VALUES(0{{repeat:1999:,0}}) UNION ALL SELECT * FROM c3 WHERE 0),
+    c4 AS (VALUES(0{{repeat:1999:,0}}) UNION ALL SELECT * FROM c4 WHERE 0),
+    c5 AS (VALUES(0{{repeat:1999:,0}}) UNION ALL SELECT * FROM c5 WHERE 0),
+    c6 AS (VALUES(0{{repeat:1999:,0}}) UNION ALL SELECT * FROM c6 WHERE 0)
+    SELECT 1 FROM c0, c1, c2, c3, c4, c5, c6 LIMIT 1;
+}
+expect {
+    1
+}
+
 test recursive-cte-self-ref-with-call-arguments-rejected {
     CREATE TABLE tvf_probe(a);
     WITH RECURSIVE cte1(x, y, z) AS (

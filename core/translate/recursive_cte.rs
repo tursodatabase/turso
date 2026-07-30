@@ -13,7 +13,7 @@ use crate::translate::emitter::{
 use crate::translate::plan::{Plan, QueryDestination, RecursiveCtePlan, RecursiveCteQueueKey};
 use crate::translate::result_row::{emit_columns_to_destination, emit_offset};
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
-use crate::vdbe::insn::{to_u16, Insn};
+use crate::vdbe::insn::{to_u32, Insn};
 use crate::{emit_explain, LimboError, Result};
 use turso_parser::ast::{NullsOrder, SortOrder};
 
@@ -187,9 +187,9 @@ pub(crate) fn emit_recursive_cte(
     });
 
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(result_row_regs),
-        count: to_u16(num_result_columns),
-        dest_reg: to_u16(input_record_reg),
+        start_reg: to_u32(result_row_regs),
+        count: to_u32(num_result_columns),
+        dest_reg: to_u32(input_record_reg),
         index_name: None,
         affinity_str: None,
     });

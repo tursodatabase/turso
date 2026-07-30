@@ -21,7 +21,7 @@ use crate::types::KeyInfo;
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
-    to_u16, {InsertFlags, Insn},
+    to_u32, {InsertFlags, Insn},
 };
 use crate::vdbe::{BranchOffset, CursorID};
 use crate::Connection;
@@ -1296,9 +1296,9 @@ fn emit_insert_row_into_buffer(
     let reg_record = program.alloc_register();
 
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(registers.src_columns_start),
-        count: to_u16(*input_column_count),
-        dest_reg: to_u16(reg_record),
+        start_reg: to_u32(registers.src_columns_start),
+        count: to_u32(*input_column_count),
+        dest_reg: to_u32(reg_record),
         index_name: None,
         affinity_str: None,
     });
