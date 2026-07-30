@@ -2292,6 +2292,50 @@ pub fn translate_alter_table(
                         connection,
                         database_id,
                     );
+
+                    // The rewrite changes the stored values of the altered
+                    // column, so every index that contains those values must be
+                    // rebuilt from the new rows or index seeks would keep
+                    // finding the old values.
+                    let from_normalized = normalize_ident(from);
+                    let affected_indexes: Vec<Arc<crate::schema::Index>> =
+                        resolver.with_schema(database_id, |s| {
+                            s.get_indices(table_name)
+                                .filter(|index| {
+                                    index.columns.iter().any(|ic| {
+                                        ic.pos_in_table == column_index
+                                            || ic.expr.as_deref().is_some_and(|expr| {
+                                                check_expr_references_column(expr, &from_normalized)
+                                            })
+                                    }) || index.where_clause.as_deref().is_some_and(|expr| {
+                                        check_expr_references_column(expr, &from_normalized)
+                                    })
+                                })
+                                .cloned()
+                                .collect()
+                        });
+                    if !affected_indexes.is_empty() {
+                        if database_uses_mvcc(connection, database_id) {
+                            return Err(LimboError::ParseError(
+                                "ALTER COLUMN cannot change the values of an indexed column in MVCC mode"
+                                    .to_string(),
+                            ));
+                        }
+                        let altered_table_arc = Arc::new(altered_table.clone());
+                        for index in &affected_indexes {
+                            let index_cursor_id = program.alloc_cursor_index(None, index)?;
+                            crate::translate::index::emit_refill_index(
+                                program,
+                                resolver,
+                                database_id,
+                                &altered_table_arc,
+                                index,
+                                index_cursor_id,
+                                RegisterOrLiteral::Literal(index.root_page),
+                                Some(index.root_page),
+                            )?;
+                        }
+                    }
                 }
             }
 
