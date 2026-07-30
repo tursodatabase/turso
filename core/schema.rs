@@ -8,7 +8,6 @@ use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
-use crate::translate::emitter::Resolver;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::index::{reject_explicit_nulls, resolve_index_method_parameters};
 use crate::translate::planner::ROWID_STRS;
@@ -5917,91 +5916,6 @@ impl Index {
                     .as_ref()
                     .is_some_and(|e| exprs_are_equivalent(e, expr))
         })
-    }
-
-    /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
-    /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table, _resolver: &Resolver) -> bool {
-        let Some(where_clause) = &self.where_clause else {
-            return true;
-        };
-
-        let tbl_norm = self.table_name.as_str();
-        let has_col = |name: &str| {
-            table.columns().iter().any(|c| {
-                c.name
-                    .as_ref()
-                    .is_some_and(|cn| cn.eq_ignore_ascii_case(name))
-            })
-        };
-        let is_tbl = |ns: &str| normalize_ident(ns) == tbl_norm;
-        let is_deterministic_fn = |name: &str, argc: usize| {
-            let n = normalize_ident(name);
-            Func::resolve_function(&n, argc).is_ok_and(|f| f.is_some_and(|f| f.is_deterministic()))
-        };
-
-        let mut ok = true;
-        let _ = walk_expr(where_clause.as_ref(), &mut |e: &Expr| -> crate::Result<
-            WalkControl,
-        > {
-            if !ok {
-                return Ok(WalkControl::SkipChildren);
-            }
-            match e {
-                Expr::Literal(_) | Expr::RowId { .. } => {}
-                // Unqualified identifier: must be a column of the target table or ROWID
-                Expr::Id(n) => {
-                    let n = n.as_str();
-                    if !ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(n)) && !has_col(n) {
-                        ok = false;
-                    }
-                }
-                // Qualified: qualifier must match this index's table; column must exist
-                Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
-                    if !is_tbl(ns.as_str()) || !has_col(col.as_str()) {
-                        ok = false;
-                    }
-                }
-                Expr::FunctionCall {
-                    name, filter_over, ..
-                }
-                | Expr::FunctionCallStar {
-                    name, filter_over, ..
-                } => {
-                    // reject windowed
-                    if filter_over.over_clause.is_some() {
-                        ok = false;
-                    } else {
-                        let argc = match e {
-                            Expr::FunctionCall { args, .. } => args.len(),
-                            Expr::FunctionCallStar { .. } => 0,
-                            _ => unreachable!(),
-                        };
-                        // Reject non-deterministic functions. Function arguments can reference
-                        // columns of the indexed table (e.g., LENGTH(t0.c0)), which will be
-                        // validated by the Expr::Id and Expr::Qualified cases during the walk.
-                        if !is_deterministic_fn(name.as_str(), argc) {
-                            ok = false;
-                        }
-                    }
-                }
-                // Explicitly disallowed constructs
-                Expr::Exists(_)
-                | Expr::InSelect { .. }
-                | Expr::Subquery(_)
-                | Expr::Raise { .. }
-                | Expr::Variable(_) => {
-                    ok = false;
-                }
-                _ => {}
-            }
-            Ok(if ok {
-                WalkControl::Continue
-            } else {
-                WalkControl::SkipChildren
-            })
-        });
-        ok
     }
 }
 

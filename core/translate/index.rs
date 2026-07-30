@@ -217,7 +217,7 @@ pub fn translate_create_index(
         on_conflict: None,
     });
 
-    if !idx.validate_where_expr(&table, resolver) {
+    if !crate::translate::bind::validate_partial_index_predicate(&idx, &table) {
         crate::bail_parse_error!(
             "Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:\n {}",
             where_clause

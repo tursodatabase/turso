@@ -1,5 +1,5 @@
 use crate::alloc::TursoVecExt;
-use crate::function::{Func, MathFunc, ScalarFunc};
+use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::sync::Arc;
 use crate::vdbe::builder::ProgramBuilder;
 
@@ -14,8 +14,8 @@ use super::expr::{unwrap_parens, walk_expr, walk_expr_mut, WalkControl};
 use super::plan::{JoinInfo, TableReferences};
 use super::planner::parse_row_id;
 use crate::schema::{
-    is_deterministic_schema_function_call, BTreeTable, Column, GeneratedType, IndexColumn, Schema,
-    Table, EXPR_INDEX_SENTINEL,
+    is_deterministic_schema_function_call, BTreeTable, Column, GeneratedType, Index, IndexColumn,
+    Schema, Table, EXPR_INDEX_SENTINEL,
 };
 use crate::util::normalize_ident;
 use crate::Result;
@@ -220,6 +220,87 @@ pub fn bind_index_columns(
             .expect("bound index columns vector was preallocated to columns.len()");
     }
     Ok(bound)
+}
+
+/// Validate that a partial-index predicate only refers to its indexed table.
+pub fn validate_partial_index_predicate(index: &Index, table: &Table) -> bool {
+    let Some(predicate) = &index.where_clause else {
+        return true;
+    };
+
+    let has_column = |name: &str| {
+        table.columns().iter().any(|column| {
+            column
+                .name
+                .as_ref()
+                .is_some_and(|column_name| column_name.eq_ignore_ascii_case(name))
+        })
+    };
+    let is_table = |name: &str| normalize_ident(name) == index.table_name;
+    let is_deterministic_function = |name: &str, arg_count: usize| {
+        let name = normalize_ident(name);
+        Func::resolve_function(&name, arg_count)
+            .is_ok_and(|function| function.is_some_and(|function| function.is_deterministic()))
+    };
+
+    let mut valid = true;
+    let _ = walk_expr(
+        predicate.as_ref(),
+        &mut |expr: &ast::Expr| -> Result<WalkControl> {
+            if !valid {
+                return Ok(WalkControl::SkipChildren);
+            }
+            match expr {
+                ast::Expr::Literal(_) | ast::Expr::RowId { .. } => {}
+                ast::Expr::Id(name) => {
+                    if !super::planner::ROWID_STRS
+                        .iter()
+                        .any(|rowid| rowid.eq_ignore_ascii_case(name.as_str()))
+                        && !has_column(name.as_str())
+                    {
+                        valid = false;
+                    }
+                }
+                ast::Expr::Qualified(namespace, column)
+                | ast::Expr::DoublyQualified(_, namespace, column) => {
+                    if !is_table(namespace.as_str()) || !has_column(column.as_str()) {
+                        valid = false;
+                    }
+                }
+                ast::Expr::FunctionCall {
+                    name, filter_over, ..
+                }
+                | ast::Expr::FunctionCallStar {
+                    name, filter_over, ..
+                } => {
+                    if filter_over.over_clause.is_some() {
+                        valid = false;
+                    } else {
+                        let arg_count = match expr {
+                            ast::Expr::FunctionCall { args, .. } => args.len(),
+                            ast::Expr::FunctionCallStar { .. } => 0,
+                            _ => unreachable!(),
+                        };
+                        if !is_deterministic_function(name.as_str(), arg_count) {
+                            valid = false;
+                        }
+                    }
+                }
+                ast::Expr::Exists(_)
+                | ast::Expr::InSelect { .. }
+                | ast::Expr::Subquery(_)
+                | ast::Expr::Raise { .. }
+                | ast::Expr::Variable(_) => valid = false,
+                _ => {}
+            }
+            Ok(if valid {
+                WalkControl::Continue
+            } else {
+                WalkControl::SkipChildren
+            })
+        },
+    );
+    valid
 }
 
 /// Bind and validate a CHECK constraint against its table columns.
