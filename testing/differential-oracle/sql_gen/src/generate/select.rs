@@ -288,20 +288,24 @@ fn generate_select_impl_inner<C: Capabilities>(
     // --- Compound SELECT decision ---
     // Only at top level (not inside subqueries) since Turso doesn't support
     // compound SELECTs in subquery positions yet.
+    let compound_column_types = compound_column_types(&columns, ctx);
     let is_compound = mode == SelectMode::Full
         && ctx.subquery_depth() == 0
         && joins.is_empty()
         && group_by.is_none()
+        && compound_column_types.as_ref().is_some_and(|column_types| {
+            generator.schema().tables.iter().any(|table| {
+                column_types
+                    .iter()
+                    .all(|data_type| table.columns_of_type(*data_type).next().is_some())
+            })
+        })
         && ctx.gen_bool_with_prob(select_config.compound_probability);
 
     if is_compound {
-        let num_result_cols = if columns.is_empty() {
-            // SELECT * — count columns from primary table
-            ctx.tables_in_scope()[0].table.columns.len()
-        } else {
-            columns.len()
-        };
-        let compounds = generate_compound_arms(generator, ctx, num_result_cols)?;
+        let column_types = compound_column_types.as_ref().unwrap();
+        let num_result_cols = column_types.len();
+        let compounds = generate_compound_arms(generator, ctx, column_types)?;
 
         // ORDER BY for compounds uses positional indices (1..N)
         let mut order_by = if ctx.gen_bool_with_prob(select_config.compound_order_by_probability) {
@@ -1276,14 +1280,57 @@ pub(crate) fn generate_join_on_condition<C: Capabilities>(
     Ok(Expr::binary_op(ctx, col_expr, op, lit_expr))
 }
 
+/// Return the declared type of each result column when every result is a table
+/// column. Expressions have no dependable declared type for compound queries.
+fn compound_column_types(columns: &[SelectColumn], ctx: &Context) -> Option<Vec<DataType>> {
+    if columns.is_empty() {
+        return Some(
+            ctx.tables_in_scope()[0]
+                .table
+                .columns
+                .iter()
+                .map(|column| column.data_type)
+                .collect(),
+        );
+    }
+
+    columns
+        .iter()
+        .map(|column| {
+            let Expr::ColumnRef(column_ref) = &column.expr else {
+                return None;
+            };
+            ctx.tables_in_scope()
+                .iter()
+                .filter(|table| {
+                    column_ref.table.as_ref().is_none_or(|qualifier| {
+                        qualifier == &table.qualifier || qualifier == &table.table.name
+                    })
+                })
+                .find_map(|table| {
+                    table
+                        .table
+                        .columns
+                        .iter()
+                        .find(|column| column.name == column_ref.column)
+                        .map(|column| column.data_type)
+                })
+        })
+        .collect()
+}
+
 /// Generate compound arms for a compound SELECT.
 ///
-/// Each arm picks a table, generates columns matching `num_cols`, and optionally
-/// generates a WHERE clause. The compound operator is chosen by weighted random.
+/// Each arm picks a table, generates columns matching `column_types`, and
+/// optionally generates a WHERE clause. SQLite is free to choose the declared
+/// type of a compound result column from any SELECT arm. If the arms use
+/// different types, SQLite may turn an integer into a real while Turso leaves it
+/// unchanged, and both results are allowed. Using the same type in every arm
+/// gives the fuzzer one result to compare.
 fn generate_compound_arms<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    num_cols: usize,
+    column_types: &[DataType],
 ) -> Result<Vec<CompoundSelectArm>, GenError> {
     let select_config = &generator.policy().select_config;
     let weights = &select_config.compound_operator_weights;
@@ -1317,18 +1364,43 @@ fn generate_compound_arms<C: Capabilities>(
 
         let arm = ctx.scope(origin, |ctx| {
             // Pick a table for this arm
+            let tables: Vec<_> = generator
+                .schema()
+                .tables
+                .iter()
+                .filter(|table| {
+                    column_types
+                        .iter()
+                        .all(|data_type| table.columns_of_type(*data_type).next().is_some())
+                })
+                .cloned()
+                .collect();
             let table = ctx
-                .choose(&generator.schema().tables)
-                .ok_or_else(|| GenError::schema_empty("tables"))?;
-            let table = table.clone();
+                .choose(&tables)
+                .ok_or_else(|| {
+                    GenError::exhausted("compound_select", "no table has matching columns")
+                })?
+                .clone();
             let table_name = table.qualified_name();
 
             // Generate columns in a temporary table scope for this arm's table
             let (columns, where_clause) = ctx.with_table_scope(vec![(table, None)], |ctx| {
-                // Generate columns matching the required count
-                let mut cols = Vec::with_capacity(num_cols);
-                for _ in 0..num_cols {
-                    let expr = pick_scoped_column_ref(ctx)?;
+                let matching_columns: Vec<Vec<String>> = {
+                    let table = &ctx.tables_in_scope()[0].table;
+                    column_types
+                        .iter()
+                        .map(|data_type| {
+                            table
+                                .columns_of_type(*data_type)
+                                .map(|column| column.name.clone())
+                                .collect()
+                        })
+                        .collect()
+                };
+                let mut cols = Vec::with_capacity(column_types.len());
+                for column_names in matching_columns {
+                    let column_name = ctx.choose(&column_names).unwrap().clone();
+                    let expr = Expr::column_ref(ctx, None, column_name);
                     cols.push(SelectColumn { expr, alias: None });
                 }
 
@@ -1981,6 +2053,35 @@ mod tests {
              offset_range={saw_offset_range}, \
              unexcluded_removable_prefix={saw_unexcluded_removable_prefix}"
         );
+    }
+
+    #[test]
+    fn test_compound_arms_use_matching_column_types() {
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "mixed",
+                vec![
+                    ColumnDef::new("integer_value", DataType::Integer),
+                    ColumnDef::new("real_value", DataType::Real),
+                ],
+            ))
+            .table(Table::new(
+                "integers",
+                vec![ColumnDef::new("integer_value", DataType::Integer)],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, Policy::default());
+        let mut ctx = Context::new_with_seed(42);
+
+        let arms =
+            generate_compound_arms(&generator, &mut ctx, &[DataType::Integer, DataType::Real])
+                .unwrap();
+
+        for arm in arms {
+            assert_eq!(arm.from.unwrap().table, "mixed");
+            assert_eq!(arm.columns[0].expr.to_string(), "integer_value");
+            assert_eq!(arm.columns[1].expr.to_string(), "real_value");
+        }
     }
 
     #[test]
