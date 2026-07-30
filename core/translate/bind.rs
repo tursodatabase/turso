@@ -552,6 +552,7 @@ impl BoundSelect {
         planned_derived: &mut HashMap<ast::TableInternalId, super::plan::JoinedTable>,
         outer_query_refs: Vec<super::plan::OuterQueryReference>,
     ) -> Result<TableReferences> {
+        let right_join_swapped = scope.right_join_swapped;
         let joined_tables = scope
             .tables
             .into_iter()
@@ -607,6 +608,11 @@ impl BoundSelect {
             .collect::<Result<Vec<_>>>()?;
 
         let mut table_references = TableReferences::new(joined_tables, outer_query_refs);
+        if right_join_swapped {
+            // The planner's select_star consults this to restore the original
+            // column order when RIGHT JOIN planning swapped the tables.
+            table_references.set_right_join_swapped();
+        }
         tracking.flush(&mut table_references);
         Ok(table_references)
     }
