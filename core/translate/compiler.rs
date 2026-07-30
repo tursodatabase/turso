@@ -209,14 +209,12 @@ where
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct BindCursorInput<Compiler> {
     input: CursorInputId,
     cursor: CursorId,
     compiler: Compiler,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn bind_cursor_input<Compiler>(
     input: CursorInputId,
     cursor: CursorId,
@@ -1165,7 +1163,6 @@ enum EffectOp {
         db: usize,
         schema_cookie: u32,
     },
-    #[cfg_attr(not(test), allow(dead_code))]
     OpenEphemeralIndex {
         cursor: CursorId,
     },
@@ -2026,7 +2023,6 @@ impl IrBuilder {
         self.allocate_cursor(CursorResource::External(input))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn bind_cursor_input(
         &mut self,
         input: CursorInputId,
@@ -2039,7 +2035,6 @@ impl IrBuilder {
         Ok(self.cursor_input_bindings[input.index()].replace(cursor))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn restore_cursor_input(&mut self, input: CursorInputId, previous: Option<CursorId>) {
         self.cursor_input_bindings[input.index()] = previous;
     }
@@ -5017,7 +5012,6 @@ pub(crate) struct OpenReadCursor {
     schema_cookie: u32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct OpenEphemeralIndex {
     index: Arc<Index>,
 }
@@ -6722,7 +6716,6 @@ pub(crate) fn open_read_table(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn open_ephemeral_index(index: Arc<Index>) -> OpenEphemeralIndex {
     OpenEphemeralIndex { index }
 }

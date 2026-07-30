@@ -7,12 +7,12 @@ use crate::{
         aggregation::emit_ungrouped_aggregation,
         collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         compiler::{
-            compile_effect, cursor_input, cursor_values, insert_index_pack, literal_values,
-            pack_values, result_row_pack, scan_index, scan_table, seek_in_values, seek_index,
-            seek_rowid, seek_table_range, select_pack, BoxedCompile, Compile, CursorId,
-            CursorInputId, DeferredIndexBound, DeferredIndexRange, DeferredTableBound,
-            DeferredTableRange, Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId,
-            ValuePack,
+            bind_cursor_input, compile_effect, cursor_input, cursor_values, insert_index_pack,
+            literal_values, open_ephemeral_index, pack_values, result_row_pack, scan_index,
+            scan_table, seek_in_values, seek_index, seek_rowid, seek_table_range, select_pack,
+            BoxedCompile, Compile, CursorId, CursorInputId, DeferredIndexBound, DeferredIndexRange,
+            DeferredTableBound, DeferredTableRange, Row, RowStream, ScanDirection, SortKey,
+            SortedRow, ValueId, ValuePack,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -28,7 +28,7 @@ use crate::{
         order_by::{custom_type_comparator, EmitOrderBy},
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, InSeekSource, IndexMethodQuery,
-            IterationDirection, JoinOrderMember, Operation, QueryDestination, Scan, Search,
+            IterationDirection, JoinOrderMember, Operation, Plan, QueryDestination, Scan, Search,
             SeekDef, SeekKey, SeekKeyComponent, SelectPlan, SimpleAggregate, SubqueryEvalPhase,
             SubqueryState,
         },
@@ -164,6 +164,7 @@ enum DeclarativeSelectOutcome {
 struct DeclarativeSelectProgram {
     compiler: BoxedCompile<()>,
     destination_cursor: Option<CursorID>,
+    destination_index: Option<Arc<Index>>,
     external_in_cursor: Option<(CursorID, TableInternalId)>,
     result_column_count: usize,
 }
@@ -223,14 +224,19 @@ fn try_emit_declarative_table_scan(
     resolver: &Resolver,
     plan: &mut SelectPlan,
 ) -> Result<Option<DeclarativeSelectOutcome>> {
-    let Some(compilation) =
+    let Some(mut compilation) =
         try_compile_declarative_table_scan(program.get_query_mode(), resolver, plan)?
     else {
         return Ok(None);
     };
+    if !program.is_nested() {
+        compilation =
+            compose_declarative_in_subquery(program.get_query_mode(), resolver, plan, compilation)?;
+    }
     let DeclarativeSelectProgram {
         compiler,
         destination_cursor,
+        destination_index: _,
         external_in_cursor,
         result_column_count,
     } = compilation;
@@ -268,6 +274,74 @@ fn try_emit_declarative_table_scan(
     }
 }
 
+fn compose_declarative_in_subquery(
+    query_mode: QueryMode,
+    resolver: &Resolver,
+    plan: &mut SelectPlan,
+    outer: DeclarativeSelectProgram,
+) -> Result<DeclarativeSelectProgram> {
+    let Some((cursor_id, subquery_id)) = outer.external_in_cursor else {
+        return Ok(outer);
+    };
+    let Some(subquery) = plan
+        .non_from_clause_subqueries
+        .iter()
+        .find(|subquery| subquery.internal_id == subquery_id)
+    else {
+        return Err(LimboError::InternalError(format!(
+            "declarative IN references missing subquery {subquery_id:?}",
+        )));
+    };
+    let SubqueryState::Unevaluated {
+        plan: Some(subquery_plan),
+    } = &subquery.state
+    else {
+        return Err(LimboError::InternalError(format!(
+            "declarative IN subquery {subquery_id:?} has no unevaluated plan",
+        )));
+    };
+    let Plan::Select(select_plan) = subquery_plan.as_ref() else {
+        return Ok(outer);
+    };
+    let Some(inner) = try_compile_declarative_table_scan(query_mode, resolver, select_plan)? else {
+        return Ok(outer);
+    };
+    if inner.destination_cursor != Some(cursor_id) || inner.external_in_cursor.is_some() {
+        return Ok(outer);
+    }
+    let Some(index) = inner.destination_index.clone() else {
+        return Err(LimboError::InternalError(format!(
+            "declarative IN producer {subquery_id:?} has no ephemeral destination index",
+        )));
+    };
+    let inner_table_references = select_plan.table_references.clone();
+
+    let input = CursorInputId::new(0);
+    let producer = inner.compiler;
+    let consumer = outer.compiler;
+    let compiler = open_ephemeral_index(index)
+        .and_then(move |cursor| {
+            bind_cursor_input(input, cursor, producer.and_then(move |()| consumer))
+        })
+        .boxed();
+
+    let subquery = plan
+        .non_from_clause_subqueries
+        .iter_mut()
+        .find(|subquery| subquery.internal_id == subquery_id)
+        .expect("declarative IN subquery must remain present while it is composed");
+    drop(subquery.consume_plan(EvalAt::BeforeLoop));
+    plan.table_references.extend(inner_table_references);
+
+    Ok(DeclarativeSelectProgram {
+        compiler,
+        destination_cursor: outer.destination_cursor,
+        destination_index: outer.destination_index,
+        external_in_cursor: None,
+        result_column_count: outer.result_column_count,
+    })
+}
+
 fn try_compile_declarative_table_scan(
     query_mode: QueryMode,
     resolver: &Resolver,
@@ -281,14 +355,14 @@ fn try_compile_declarative_table_scan(
         || plan.window.is_some()
         || plan.simple_aggregate.is_some()
         || !plan.phantom_params.is_empty()
-        || !plan.table_references.outer_query_refs().is_empty()
+        || plan.is_correlated()
         || plan.result_columns.is_empty()
     {
         return Ok(None);
     }
 
-    let (destination, destination_cursor) = match &plan.query_destination {
-        QueryDestination::ResultRows => (DeclarativeSelectDestination::ResultRows, None),
+    let (destination, destination_cursor, destination_index) = match &plan.query_destination {
+        QueryDestination::ResultRows => (DeclarativeSelectDestination::ResultRows, None, None),
         // The first producer migration covers the identity-shaped index used by
         // scalar IN subqueries. Wider/reordered keys and generated rowids retain
         // the eager destination code until those policies are explicit IR data.
@@ -309,6 +383,7 @@ fn try_compile_declarative_table_scan(
                     affinity: affinity_str.as_ref().map(|value| (**value).clone()),
                 },
                 Some(*cursor_id),
+                Some(index.clone()),
             )
         }
         _ => return Ok(None),
@@ -760,6 +835,7 @@ fn try_compile_declarative_table_scan(
     Ok(Some(DeclarativeSelectProgram {
         compiler,
         destination_cursor,
+        destination_index,
         external_in_cursor,
         result_column_count: plan.result_columns.len(),
     }))
@@ -2166,7 +2242,18 @@ mod tests {
         );
         assert!(instructions
             .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::OpenEphemeral { .. })));
+            .all(|(instruction, _)| !matches!(instruction, Insn::Once { .. })));
+        let (open_ephemeral, ephemeral_cursor) = instructions
+            .iter()
+            .enumerate()
+            .find_map(|(position, (instruction, _))| match instruction {
+                Insn::OpenEphemeral {
+                    cursor_id,
+                    is_table: false,
+                } => Some((position, *cursor_id)),
+                _ => None,
+            })
+            .expect("composed IN compiler must own its ephemeral index");
         assert!(instructions
             .iter()
             .any(|(instruction, _)| matches!(instruction, Insn::HashDistinct { .. })));
@@ -2185,10 +2272,21 @@ mod tests {
                 )
             })
             .expect("declarative subquery producer must materialize its projected pack");
+        let insert = materialize_record + 1;
         assert!(matches!(
-            instructions[materialize_record + 1].0,
-            Insn::IdxInsert { .. }
+            instructions[insert].0,
+            Insn::IdxInsert { cursor_id, .. } if cursor_id == ephemeral_cursor
         ));
+        let consume = instructions
+            .iter()
+            .enumerate()
+            .skip(insert + 1)
+            .find_map(|(position, (instruction, _))| match instruction {
+                Insn::Rewind { cursor_id, .. } if *cursor_id == ephemeral_cursor => Some(position),
+                _ => None,
+            })
+            .expect("composed IN consumer must scan the producer's ephemeral index");
+        assert!(open_ephemeral < materialize_record && insert < consume);
         let result_row = instructions
             .iter()
             .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 2, .. }))
@@ -2202,6 +2300,29 @@ mod tests {
             vec![
                 vec![Value::from_i64(3), Value::from_text("three")],
                 vec![Value::from_i64(5), Value::from_text("five")],
+            ]
+        );
+
+        let mut nested = connection
+            .prepare(
+                "SELECT id FROM subquery_rows WHERE id IN (\
+                     SELECT id FROM subquery_rows WHERE id IN (\
+                         SELECT id FROM subquery_keys\
+                     )\
+                 ) ORDER BY id",
+            )
+            .unwrap();
+        assert!(nested
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Once { .. })));
+        assert_eq!(
+            nested.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(1)],
+                vec![Value::from_i64(3)],
+                vec![Value::from_i64(5)],
             ]
         );
 
