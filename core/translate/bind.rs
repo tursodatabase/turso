@@ -36,6 +36,17 @@ fn rebase_self_table_expr(expr: &mut ast::Expr, internal_id: ast::TableInternalI
     });
 }
 
+/// Clone a stored schema expression and bind its SELF_TABLE references to a
+/// concrete table reference.
+pub fn bind_schema_expr(expr: &ast::Expr, internal_id: ast::TableInternalId) -> Result<ast::Expr> {
+    let mut bound = expr.clone();
+    if let Some(name) = crate::schema::first_unresolved_identifier(&bound) {
+        crate::bail_parse_error!("no such column: {}", name);
+    }
+    rebase_self_table_expr(&mut bound, internal_id);
+    Ok(bound)
+}
+
 /// Validate a referenced CTE's explicit column list against its SELECT's
 /// result column count. SQLite defers this check until the CTE is actually
 /// referenced, so unreferenced CTEs with mismatched counts don't error.

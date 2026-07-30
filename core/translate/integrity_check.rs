@@ -133,23 +133,6 @@ fn emit_row_missing_from_index_error(
     emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
 }
 
-fn bind_expr_for_table(
-    expr: &ast::Expr,
-    table_references: &mut TableReferences,
-) -> crate::Result<ast::Expr> {
-    let mut out = expr.clone();
-    // Index key expressions, partial-index WHERE clauses, CHECK constraints,
-    // and generated columns are stored pre-resolved to SELF_TABLE form.
-    // Leftover identifiers mean lenient schema-load resolution failed.
-    if let Some(name) = crate::schema::first_unresolved_identifier(&out) {
-        crate::bail_parse_error!("no such column: {}", name);
-    }
-    if let Some(jt) = table_references.joined_tables().first() {
-        crate::schema::bind_self_table_expr(&mut out, jt.internal_id);
-    }
-    Ok(out)
-}
-
 fn translate_integrity_check_impl(
     schema: &Schema,
     program: &mut ProgramBuilder,
@@ -266,7 +249,7 @@ fn translate_integrity_check_impl(
             db: database_id,
         });
 
-        let mut table_references = TableReferences::new(
+        let table_references = TableReferences::new(
             vec![JoinedTable {
                 op: Operation::Scan(Scan::BTreeTable {
                     iter_dir: IterationDirection::Forwards,
@@ -306,7 +289,10 @@ fn translate_integrity_check_impl(
 
                 let mut where_expr = None;
                 if let Some(pred) = index.where_clause.as_deref() {
-                    where_expr = Some(bind_expr_for_table(pred, &mut table_references)?);
+                    where_expr = Some(crate::translate::bind::bind_schema_expr(
+                        pred,
+                        table_ref_id,
+                    )?);
                 }
 
                 let mut columns = Vec::with_capacity(index.columns.len());
@@ -320,7 +306,10 @@ fn translate_integrity_check_impl(
                             None
                         };
                         columns.push(BoundIndexColumn::Expr(
-                            Box::new(bind_expr_for_table(expr, &mut table_references)?),
+                            Box::new(crate::translate::bind::bind_schema_expr(
+                                expr,
+                                table_ref_id,
+                            )?),
                             affinity,
                         ));
                         unique_nullable.push(true);
@@ -343,7 +332,10 @@ fn translate_integrity_check_impl(
 
         let mut bound_checks = Vec::with_capacity(btree_table.check_constraints.len());
         for check in &btree_table.check_constraints {
-            bound_checks.push(bind_expr_for_table(&check.expr, &mut table_references)?);
+            bound_checks.push(crate::translate::bind::bind_schema_expr(
+                &check.expr,
+                table_ref_id,
+            )?);
         }
 
         let not_null_columns: Vec<(BoundIndexColumn, String)> = btree_table
@@ -355,7 +347,8 @@ fn translate_integrity_check_impl(
                 let name = col.name.clone().unwrap_or_else(|| format!("column{idx}"));
                 match col.generated_type() {
                     GeneratedType::Virtual { expr, .. } => {
-                        let bound = bind_expr_for_table(expr, &mut table_references).ok()?;
+                        let bound =
+                            crate::translate::bind::bind_schema_expr(expr, table_ref_id).ok()?;
                         Some((
                             BoundIndexColumn::Expr(Box::new(bound), Some(col.affinity())),
                             name,
