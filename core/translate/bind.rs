@@ -756,6 +756,286 @@ fn validate_delete(
     Ok(table)
 }
 
+/// Output of the statement-level bind phase for INSERT.
+///
+/// INSERT's body binding is intentionally partial: single-row VALUES bind
+/// scope-less (there is no FROM clause), UPSERT `DO UPDATE` expressions
+/// defer full resolution to emission (they resolve against the target row
+/// image and EXCLUDED registers), and multi-row/SELECT sources bind when
+/// the source SELECT is planned. Virtual table inserts consume the unbound
+/// body.
+pub struct BoundInsert {
+    #[allow(clippy::vec_box)]
+    pub values: Vec<Box<ast::Expr>>,
+    pub upsert_actions: Vec<(
+        super::upsert::ResolvedUpsertTarget,
+        crate::vdbe::BranchOffset,
+        Box<ast::Upsert>,
+    )>,
+    pub inserting_multiple_rows: bool,
+    /// Database the target table lives in (0 = main).
+    pub database_id: usize,
+    /// The validated target table.
+    pub table: Arc<Table>,
+}
+
+/// Bind an INSERT statement up front: validate the target table, resolve
+/// defaults in VALUES rows, bind single-row VALUES scope-less, and resolve
+/// UPSERT conflict targets.
+#[turso_macros::trace_stack]
+pub fn bind_insert_stmt(
+    tbl_name: &ast::QualifiedName,
+    columns: &[ast::Name],
+    body: &mut ast::InsertBody,
+    on_conflict: ast::ResolveType,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<BoundInsert> {
+    let database_id = resolver.resolve_existing_table_database_id_qualified(tbl_name)?;
+    let table_name = &tbl_name.name;
+    let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
+        Some(table) => table,
+        None => crate::bail_parse_error!("no such table: {}", table_name),
+    };
+    if program.trigger.is_some() && table.virtual_table().is_some() {
+        crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
+    }
+    validate_insert(table_name.as_str(), resolver, connection)?;
+
+    if table.virtual_table().is_some() {
+        return Ok(BoundInsert {
+            values: vec![],
+            upsert_actions: vec![],
+            inserting_multiple_rows: false,
+            database_id,
+            table,
+        });
+    }
+
+    let mut values: Vec<Box<ast::Expr>> = vec![];
+    let mut upsert: Option<Box<ast::Upsert>> = None;
+    let mut upsert_actions: Vec<(
+        super::upsert::ResolvedUpsertTarget,
+        crate::vdbe::BranchOffset,
+        Box<ast::Upsert>,
+    )> = Vec::new();
+    let mut inserting_multiple_rows = false;
+    match body {
+        ast::InsertBody::DefaultValues => {
+            // Generate default values for the table.
+            // Check column-level default first, then type-level default.
+            let is_strict = table.is_strict();
+            values = table
+                .columns()
+                .iter()
+                .filter(|c| !c.hidden() && !c.is_generated())
+                .map(|c| {
+                    c.default.clone().unwrap_or_else(|| {
+                        if let Ok(Some(resolved)) =
+                            resolver.schema().resolve_type(&c.ty_str, is_strict)
+                        {
+                            if let Some(default_expr) = resolved.default_expr() {
+                                return Box::new(default_expr.clone());
+                            }
+                        }
+                        Box::new(ast::Expr::Literal(ast::Literal::Null))
+                    })
+                })
+                .collect();
+        }
+        ast::InsertBody::Select(select, upsert_opt) => {
+            // Resolve Expr::Default in all VALUES rows before any compilation.
+            if let ast::OneSelect::Values(values_expr) = &mut select.body.select {
+                for row in values_expr.iter_mut() {
+                    resolve_defaults_in_row(row, &table, columns, resolver);
+                }
+            }
+            for compound in select.body.compounds.iter_mut() {
+                if let ast::OneSelect::Values(values_expr) = &mut compound.select {
+                    for row in values_expr.iter_mut() {
+                        resolve_defaults_in_row(row, &table, columns, resolver);
+                    }
+                }
+            }
+            if select.body.compounds.is_empty() {
+                match &mut select.body.select {
+                    // TODO see how to avoid clone
+                    ast::OneSelect::Values(values_expr) if values_expr.len() <= 1 => {
+                        if values_expr.is_empty() {
+                            crate::bail_parse_error!("no values to insert");
+                        }
+                        // Check if any VALUES expression contains a subquery.
+                        // If so, route through multi-row path which handles subqueries.
+                        let has_subquery = values_expr
+                            .iter()
+                            .any(|row| row.iter().any(|expr| expr_contains_subquery(expr)));
+                        if has_subquery {
+                            inserting_multiple_rows = true;
+                        } else {
+                            for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
+                                match expr.as_mut() {
+                                    ast::Expr::Id(name) => {
+                                        if name.quoted_with('"') && resolver.dqs_dml.is_enabled() {
+                                            *expr = ast::Expr::Literal(ast::Literal::String(
+                                                name.as_literal(),
+                                            ))
+                                            .into();
+                                        } else {
+                                            crate::bail_parse_error!("no such column: {name}");
+                                        }
+                                    }
+                                    ast::Expr::Qualified(first_name, second_name) => {
+                                        // an INSERT INTO ... VALUES (...) cannot reference columns
+                                        crate::bail_parse_error!(
+                                            "no such column: {first_name}.{second_name}"
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                                bind_fixed_scope_expr(expr, None, resolver, false)?;
+                            }
+                            values = values_expr.pop().unwrap_or_else(Vec::new);
+                        }
+                    }
+                    _ => inserting_multiple_rows = true,
+                }
+            } else {
+                inserting_multiple_rows = true;
+            }
+            upsert = upsert_opt.take();
+        }
+    }
+    if let ast::ResolveType::Ignore = on_conflict {
+        program.set_resolve_type(ast::ResolveType::Ignore);
+        upsert.replace(Box::new(ast::Upsert {
+            do_clause: ast::UpsertDo::Nothing,
+            index: None,
+            next: None,
+        }));
+    } else {
+        program.set_resolve_type(on_conflict);
+    }
+    while let Some(mut upsert_opt) = upsert.take() {
+        if let ast::UpsertDo::Set {
+            ref mut sets,
+            ref mut where_clause,
+        } = &mut upsert_opt.do_clause
+        {
+            for set in sets.iter_mut() {
+                bind_fixed_scope_expr(&mut set.expr, None, resolver, true)?;
+            }
+            if let Some(ref mut where_expr) = where_clause {
+                bind_fixed_scope_expr(where_expr, None, resolver, true)?;
+            }
+        }
+        let next = upsert_opt.next.take();
+        upsert_actions.push((
+            // resolve the constrained target for UPSERT in the chain
+            resolver.with_schema(database_id, |s| {
+                super::upsert::resolve_upsert_target(s, &table, &upsert_opt)
+            })?,
+            program.allocate_label(),
+            upsert_opt,
+        ));
+        upsert = next;
+    }
+    Ok(BoundInsert {
+        values,
+        upsert_actions,
+        inserting_multiple_rows,
+        database_id,
+        table,
+    })
+}
+
+/// Validate the INSERT target table.
+fn validate_insert(
+    table_name: &str,
+    resolver: &Resolver,
+    conn: &Arc<crate::Connection>,
+) -> Result<()> {
+    // Check if this is a system table that should be protected from direct writes
+    if !conn.is_nested_stmt()
+        && !conn.is_mvcc_bootstrap_connection()
+        && !crate::schema::allow_user_dml(table_name)
+    {
+        crate::bail_parse_error!("table {} may not be modified", table_name);
+    }
+    // Check if this is a materialized view
+    if resolver.schema().is_materialized_view(table_name) {
+        crate::bail_parse_error!("cannot modify materialized view {}", table_name);
+    }
+    // Check if this table has any incompatible dependent views
+    resolver.schema().with_incompatible_dependent_views(table_name, |views| {
+    if !views.is_empty() {
+        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        crate::bail_parse_error!(
+            "Cannot DELETE from table '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
+             These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
+             Please DROP and recreate the view(s) before modifying this table.",
+            views.iter().fold(String::new(), |_, s| s.to_string() + ", "),
+        );
+    }
+    Ok(())
+    })
+}
+
+/// Resolve `Expr::Default` in a VALUES row by replacing it with the column's
+/// default expression from the schema.
+fn resolve_defaults_in_row(
+    row: &mut [Box<ast::Expr>],
+    table: &Table,
+    columns: &[ast::Name],
+    resolver: &Resolver,
+) {
+    let is_strict = table.is_strict();
+    for (i, expr) in row.iter_mut().enumerate() {
+        if !matches!(expr.as_ref(), ast::Expr::Default) {
+            continue;
+        }
+        let col = if columns.is_empty() {
+            // No column list — position maps to non-hidden columns in order
+            table.columns().iter().filter(|c| !c.hidden()).nth(i)
+        } else {
+            // Column list — map by name
+            columns.get(i).and_then(|name| {
+                let name = crate::util::normalize_ident(name.as_str());
+                table.get_column_by_name(&name).map(|(_, col)| col)
+            })
+        };
+        *expr = match col {
+            Some(col) => col.default.clone().unwrap_or_else(|| {
+                if let Ok(Some(resolved)) = resolver.schema().resolve_type(&col.ty_str, is_strict) {
+                    if let Some(default_expr) = resolved.default_expr() {
+                        return Box::new(default_expr.clone());
+                    }
+                }
+                Box::new(ast::Expr::Literal(ast::Literal::Null))
+            }),
+            None => Box::new(ast::Expr::Literal(ast::Literal::Null)),
+        };
+    }
+}
+
+/// Check if an expression contains a subquery (Subquery, InSelect, or Exists).
+/// Used to detect when single-row VALUES should be routed through the
+/// multi-row path, which has proper subquery handling.
+fn expr_contains_subquery(expr: &ast::Expr) -> bool {
+    let mut found_subquery = false;
+    let _ = walk_expr(expr, &mut |e| {
+        if matches!(
+            e,
+            ast::Expr::Subquery(_) | ast::Expr::InSelect { .. } | ast::Expr::Exists(_)
+        ) {
+            found_subquery = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    });
+    found_subquery
+}
+
 /// Validate the UPDATE target and statement shape.
 fn validate_update(
     schema: &crate::schema::Schema,
@@ -2197,6 +2477,18 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 })();
                 self.recursive_self = saved_self;
                 let recursive_arms = arms_result?;
+                // Bind the body-level LIMIT/OFFSET up front. They are
+                // scope-less (identifiers cannot resolve against the body's
+                // tables), and the recursive-CTE planner consumes them as
+                // already bound.
+                let resolver = self.resolver;
+                let entry = self.ctes.get_mut(&cte_name).unwrap();
+                if let Some(limit) = entry.select.limit.as_mut() {
+                    bind_fixed_scope_expr(&mut limit.expr, None, resolver, false)?;
+                    if let Some(offset) = limit.offset.as_mut() {
+                        bind_fixed_scope_expr(offset, None, resolver, false)?;
+                    }
+                }
                 recursive_bindings.push((
                     cte_name.clone(),
                     RecursiveCteBinding {

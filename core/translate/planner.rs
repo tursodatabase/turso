@@ -10,6 +10,7 @@ use super::{
     },
     select::prepare_select_plan,
 };
+use crate::function::{AccumulatorFunc, AggFunc, ExtFunc};
 use crate::translate::plan::BitSet;
 use crate::translate::{
     emitter::Resolver,
@@ -20,15 +21,10 @@ use crate::translate::{
     plan::{NonFromClauseSubquery, SubqueryState},
 };
 use crate::{
-    ast::Limit,
     function::Func,
     schema::Table,
     util::{exprs_are_equivalent, normalize_ident},
     Result,
-};
-use crate::{
-    function::{AccumulatorFunc, AggFunc, ExtFunc},
-    translate::bind::bind_fixed_scope_expr,
 };
 use crate::{
     translate::plan::{Window, WindowFunction},
@@ -1471,10 +1467,11 @@ fn prepare_bound_recursive_cte_plan(
         &initial_query,
         &recursive_query,
     )?;
+    // The binder already resolved the body-level LIMIT/OFFSET.
     let (limit, offset) = select
         .limit
         .clone()
-        .map_or(Ok((None, None)), |limit| parse_limit(limit, resolver))?;
+        .map_or((None, None), |limit| (Some(limit.expr), limit.offset));
 
     Ok(Plan::RecursiveCte(Box::new(
         super::plan::RecursiveCtePlan {
@@ -2208,17 +2205,4 @@ where
         }));
     }
     Ok(None)
-}
-
-#[allow(clippy::type_complexity)]
-#[turso_macros::trace_stack]
-pub fn parse_limit(
-    mut limit: Limit,
-    resolver: &Resolver,
-) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
-    bind_fixed_scope_expr(&mut limit.expr, None, resolver, false)?;
-    if let Some(ref mut off_expr) = limit.offset {
-        bind_fixed_scope_expr(off_expr, None, resolver, false)?;
-    }
-    Ok((Some(limit.expr), limit.offset))
 }
