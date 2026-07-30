@@ -251,6 +251,11 @@ In that case every use resolves directly to the producer's `ValueId`, no
 external input remains at lowering, and ordinary dominance verification covers
 the composed value. Simple uncorrelated `EXISTS` children compile to `has_rows`;
 simple uncorrelated single-column scalar children compile to `first_or(NULL)`.
+Symbolic expression resolution declares and deduplicates these scalar inputs as
+it encounters `SubqueryResult` nodes, including when they are nested inside a
+larger expression. The SELECT compiler validates the returned requirements
+against planned producers and restores frontend dependency order; it does not
+pre-allocate expression inputs by scanning the subquery list.
 Each subquery dependency is an ordered typed stage: either a scalar producer
 that binds an SSA input or an `IN` producer that materializes and binds a
 symbolic cursor. The stages are folded around the consumer in reverse

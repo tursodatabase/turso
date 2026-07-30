@@ -48,6 +48,25 @@ pub(crate) enum ResolvedScalarExpr {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScalarInputKind {
+    Exists,
+    RowValue,
+}
+
+/// A symbolic value that expression compilation requires from a scalar
+/// subquery producer.
+///
+/// Resolution allocates the input when it encounters the `SubqueryResult` in
+/// the expression tree. The SELECT compiler later binds that input without
+/// needing to rediscover which expressions consume the subquery.
+#[derive(Clone, Copy)]
+pub(crate) struct ScalarInputDependency {
+    pub(crate) input: InputId,
+    pub(crate) subquery_id: TableInternalId,
+    pub(crate) kind: ScalarInputKind,
+}
+
 /// Physical source used to read one logical table row.
 #[derive(Clone, Copy)]
 pub(crate) enum RowLayout<'a> {
@@ -63,11 +82,11 @@ pub(crate) struct RowExprResolver<'a, 'schema> {
     table: &'a BTreeTable,
     layout: RowLayout<'a>,
     referenced_tables: &'a TableReferences,
-    subquery_inputs: &'a [(TableInternalId, InputId)],
+    scalar_dependencies: SmallVec<[ScalarInputDependency; 2]>,
 }
 
 impl<'a, 'schema> RowExprResolver<'a, 'schema> {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         resolver: &'a Resolver<'schema>,
         database_id: usize,
         table_id: TableInternalId,
@@ -82,21 +101,26 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
             table,
             layout,
             referenced_tables,
-            subquery_inputs: &[],
+            scalar_dependencies: SmallVec::new(),
         }
     }
 
-    pub(crate) const fn with_subquery_inputs(
-        mut self,
-        subquery_inputs: &'a [(TableInternalId, InputId)],
-    ) -> Self {
-        self.subquery_inputs = subquery_inputs;
-        self
+    pub(crate) fn into_scalar_dependencies(self) -> SmallVec<[ScalarInputDependency; 2]> {
+        self.scalar_dependencies
     }
 
     /// Returns `None` when any part of the expression still requires the eager
     /// SQL emitter. Resolution is all-or-nothing and never mutates a program.
-    pub(crate) fn resolve(&self, expr: &Expr) -> Result<Option<ResolvedScalarExpr>> {
+    pub(crate) fn resolve(&mut self, expr: &Expr) -> Result<Option<ResolvedScalarExpr>> {
+        let dependency_count = self.scalar_dependencies.len();
+        let resolved = self.resolve_inner(expr);
+        if !matches!(&resolved, Ok(Some(_))) {
+            self.scalar_dependencies.truncate(dependency_count);
+        }
+        resolved
+    }
+
+    fn resolve_inner(&mut self, expr: &Expr) -> Result<Option<ResolvedScalarExpr>> {
         let expr = unwrap_single_parentheses(expr);
         match expr {
             Expr::Collate(inner, collation) => {
@@ -116,10 +140,16 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
                 subquery_id,
                 lhs: None,
                 not_in: false,
-                query_type: SubqueryType::RowValue { num_regs: 1, .. },
-            } => Ok(self.subquery_inputs.iter().find_map(|(candidate, input)| {
-                (*candidate == *subquery_id).then_some(ResolvedScalarExpr::Input(*input))
-            })),
+                query_type,
+            } => match query_type {
+                SubqueryType::Exists { .. } => self
+                    .resolve_scalar_input(*subquery_id, ScalarInputKind::Exists)
+                    .map(Some),
+                SubqueryType::RowValue { num_regs: 1, .. } => self
+                    .resolve_scalar_input(*subquery_id, ScalarInputKind::RowValue)
+                    .map(Some),
+                SubqueryType::RowValue { .. } | SubqueryType::In { .. } => Ok(None),
+            },
             Expr::Binary(lhs, operator, rhs) => self.resolve_binary(lhs, *operator, rhs),
             Expr::Case {
                 base,
@@ -128,6 +158,35 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
             } => self.resolve_case(base.as_deref(), when_then_pairs, else_expr.as_deref()),
             _ => Ok(None),
         }
+    }
+
+    fn resolve_scalar_input(
+        &mut self,
+        subquery_id: TableInternalId,
+        kind: ScalarInputKind,
+    ) -> Result<ResolvedScalarExpr> {
+        if let Some(dependency) = self
+            .scalar_dependencies
+            .iter()
+            .find(|dependency| dependency.subquery_id == subquery_id)
+        {
+            if dependency.kind != kind {
+                return Err(LimboError::InternalError(format!(
+                    "subquery {subquery_id:?} has conflicting scalar result kinds",
+                )));
+            }
+            return Ok(ResolvedScalarExpr::Input(dependency.input));
+        }
+
+        let input_index = u32::try_from(self.scalar_dependencies.len())
+            .map_err(|_| LimboError::InternalError("too many symbolic scalar inputs".to_owned()))?;
+        let dependency = ScalarInputDependency {
+            input: InputId::new(input_index),
+            subquery_id,
+            kind,
+        };
+        self.scalar_dependencies.push(dependency);
+        Ok(ResolvedScalarExpr::Input(dependency.input))
     }
 
     fn resolve_column(
@@ -205,7 +264,7 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
     }
 
     fn resolve_binary(
-        &self,
+        &mut self,
         lhs: &Expr,
         operator: Operator,
         rhs: &Expr,
@@ -255,7 +314,7 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
     }
 
     fn resolve_case(
-        &self,
+        &mut self,
         base: Option<&Expr>,
         when_then_pairs: &[(Box<Expr>, Box<Expr>)],
         else_expr: Option<&Expr>,

@@ -23,6 +23,7 @@ use crate::{
         expr::{
             compile_symbolic_conjunction, compile_symbolic_expr, compile_symbolic_exprs,
             compile_symbolic_static_expr, ResolvedScalarExpr, RowExprResolver, RowLayout,
+            ScalarInputDependency, ScalarInputKind,
         },
         group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
@@ -81,7 +82,7 @@ pub fn emit_program_for_select_with_resolver(
 
 fn compile_deferred_index_bound(
     key: &SeekKey,
-    expr_resolver: &RowExprResolver<'_, '_>,
+    expr_resolver: &mut RowExprResolver<'_, '_>,
 ) -> Result<Option<DeferredIndexBound>> {
     Ok(Some(match &key.last_component {
         SeekKeyComponent::None => DeferredIndexBound::prefix(key.op),
@@ -105,7 +106,7 @@ fn compile_deferred_index_bound(
 
 fn compile_deferred_table_bound(
     key: &SeekKey,
-    expr_resolver: &RowExprResolver<'_, '_>,
+    expr_resolver: &mut RowExprResolver<'_, '_>,
 ) -> Result<Option<DeferredTableBound>> {
     Ok(Some(match &key.last_component {
         SeekKeyComponent::None => DeferredTableBound::unbounded(key.op),
@@ -188,16 +189,9 @@ struct DeclarativeInCursor {
 }
 
 #[derive(Clone, Copy)]
-struct DeclarativeScalarInput {
-    input: InputId,
-    subquery_id: TableInternalId,
-    kind: DeclarativeScalarKind,
-}
-
-#[derive(Clone, Copy)]
 enum DeclarativeDependency {
     InCursor(DeclarativeInCursor),
-    Scalar(DeclarativeScalarInput),
+    Scalar(ScalarInputDependency),
 }
 
 impl DeclarativeDependency {
@@ -230,10 +224,77 @@ struct CompiledDeclarativeDependency {
     table_references: TableReferences,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DeclarativeScalarKind {
-    Exists,
-    RowValue,
+fn validate_and_order_declarative_dependencies(
+    plan: &SelectPlan,
+    external_in_cursor: Option<DeclarativeInCursor>,
+    scalar_dependencies: SmallVec<[ScalarInputDependency; 2]>,
+) -> Result<Option<SmallVec<[DeclarativeDependency; 2]>>> {
+    let mut dependencies = SmallVec::with_capacity(
+        scalar_dependencies.len() + usize::from(external_in_cursor.is_some()),
+    );
+    let mut matched_scalars = 0;
+    let mut matched_in_cursor = false;
+
+    for subquery in &plan.non_from_clause_subqueries {
+        let in_cursor =
+            external_in_cursor.filter(|dependency| dependency.subquery_id == subquery.internal_id);
+        let scalar = scalar_dependencies
+            .iter()
+            .find(|dependency| dependency.subquery_id == subquery.internal_id)
+            .copied();
+        let dependency = match (in_cursor, scalar) {
+            (Some(_), Some(_)) => {
+                return Err(LimboError::InternalError(format!(
+                    "subquery {:?} is both a scalar and cursor dependency",
+                    subquery.internal_id,
+                )));
+            }
+            (Some(dependency), None) => {
+                matched_in_cursor = true;
+                DeclarativeDependency::InCursor(dependency)
+            }
+            (None, Some(dependency)) => {
+                let matching_kind = matches!(
+                    (&subquery.query_type, dependency.kind),
+                    (SubqueryType::Exists { .. }, ScalarInputKind::Exists)
+                        | (
+                            SubqueryType::RowValue { num_regs: 1, .. },
+                            ScalarInputKind::RowValue
+                        )
+                );
+                if !matching_kind {
+                    return Err(LimboError::InternalError(format!(
+                        "subquery {:?} does not match its symbolic scalar dependency",
+                        subquery.internal_id,
+                    )));
+                }
+                matched_scalars += 1;
+                DeclarativeDependency::Scalar(dependency)
+            }
+            (None, None) => return Ok(None),
+        };
+        if subquery.correlated
+            || subquery.eval_phase != SubqueryEvalPhase::BeforeLoop
+            || !matches!(
+                &subquery.state,
+                SubqueryState::Unevaluated { plan: Some(_) }
+            )
+            || subquery.get_eval_at(&plan.join_order, Some(&plan.table_references))?
+                != EvalAt::BeforeLoop
+        {
+            return Ok(None);
+        }
+        dependencies.push(dependency);
+    }
+
+    if matched_scalars != scalar_dependencies.len()
+        || matched_in_cursor != external_in_cursor.is_some()
+    {
+        return Err(LimboError::InternalError(
+            "symbolic expression dependency references a missing planned subquery".to_owned(),
+        ));
+    }
+    Ok(Some(dependencies))
 }
 
 enum DeclarativeSelectDestination {
@@ -254,24 +315,6 @@ enum DeclarativePackSink {
         index_name: String,
         affinity: Option<String>,
     },
-}
-
-fn direct_exists_subquery(expr: &Expr) -> Option<TableInternalId> {
-    match expr {
-        Expr::Parenthesized(expressions) => {
-            let [expression] = expressions.as_slice() else {
-                return None;
-            };
-            direct_exists_subquery(expression)
-        }
-        Expr::SubqueryResult {
-            subquery_id,
-            lhs: None,
-            not_in: false,
-            query_type: SubqueryType::Exists { .. },
-        } => Some(*subquery_id),
-        _ => None,
-    }
 }
 
 impl DeclarativePackSink {
@@ -790,56 +833,6 @@ fn try_compile_declarative_table_scan(
         }
         _ => None,
     };
-    let mut dependencies = SmallVec::<[DeclarativeDependency; 2]>::new();
-    let mut scalar_input_count = 0_u32;
-    for subquery in &plan.non_from_clause_subqueries {
-        if let Some(external) =
-            external_in_cursor.filter(|external| external.subquery_id == subquery.internal_id)
-        {
-            dependencies.push(DeclarativeDependency::InCursor(external));
-            continue;
-        }
-        let kind = match subquery.query_type {
-            SubqueryType::Exists { .. } => {
-                let Some(predicate) = plan
-                    .where_clause
-                    .iter()
-                    .filter(|predicate| !predicate.consumed)
-                    .find(|predicate| {
-                        direct_exists_subquery(&predicate.expr) == Some(subquery.internal_id)
-                    })
-                else {
-                    return Ok(None);
-                };
-                if predicate.from_outer_join.is_some() {
-                    return Ok(None);
-                }
-                DeclarativeScalarKind::Exists
-            }
-            SubqueryType::RowValue { num_regs: 1, .. } => DeclarativeScalarKind::RowValue,
-            SubqueryType::RowValue { .. } | SubqueryType::In { .. } => return Ok(None),
-        };
-        if subquery.correlated
-            || subquery.eval_phase != SubqueryEvalPhase::BeforeLoop
-            || !matches!(
-                &subquery.state,
-                SubqueryState::Unevaluated { plan: Some(_) }
-            )
-            || subquery.get_eval_at(&plan.join_order, Some(&plan.table_references))?
-                != EvalAt::BeforeLoop
-        {
-            return Ok(None);
-        }
-        let input = DeclarativeScalarInput {
-            input: InputId::new(scalar_input_count),
-            subquery_id: subquery.internal_id,
-            kind,
-        };
-        scalar_input_count = scalar_input_count.checked_add(1).ok_or_else(|| {
-            LimboError::InternalError("too many declarative scalar subquery inputs".to_owned())
-        })?;
-        dependencies.push(DeclarativeDependency::Scalar(input));
-    }
     let direction = access.direction();
     let index = access.index();
     let Table::BTree(table) = &joined.table else {
@@ -871,27 +864,14 @@ fn try_compile_declarative_table_scan(
     let row_layout = covering_index
         .map(RowLayout::CoveringIndex)
         .unwrap_or(RowLayout::Table);
-    let scalar_subquery_inputs: SmallVec<[(TableInternalId, InputId); 2]> = dependencies
-        .iter()
-        .filter_map(|dependency| match dependency {
-            DeclarativeDependency::Scalar(external)
-                if external.kind == DeclarativeScalarKind::RowValue =>
-            {
-                Some((external.subquery_id, external.input))
-            }
-            DeclarativeDependency::InCursor(_) | DeclarativeDependency::Scalar(_) => None,
-        })
-        .collect();
-
-    let expr_resolver = RowExprResolver::new(
+    let mut expr_resolver = RowExprResolver::new(
         resolver,
         joined.database_id,
         joined.internal_id,
         table,
         row_layout,
         &plan.table_references,
-    )
-    .with_subquery_inputs(&scalar_subquery_inputs);
+    );
     let in_values = match access {
         DeclarativeBtreeAccess::InValues {
             source: DeclarativeInSource::Literal { values, affinity },
@@ -946,10 +926,11 @@ fn try_compile_declarative_table_scan(
             direction,
             seek_def,
         } if seek_def.prefix.is_empty() => {
-            let Some(start) = compile_deferred_table_bound(&seek_def.start, &expr_resolver)? else {
+            let Some(start) = compile_deferred_table_bound(&seek_def.start, &mut expr_resolver)?
+            else {
                 return Ok(None);
             };
-            let Some(end) = compile_deferred_table_bound(&seek_def.end, &expr_resolver)? else {
+            let Some(end) = compile_deferred_table_bound(&seek_def.end, &mut expr_resolver)? else {
                 return Ok(None);
             };
             let affinity = table
@@ -993,11 +974,13 @@ fn try_compile_declarative_table_scan(
                     *affinity
                 });
             }
-            let Some(mut start) = compile_deferred_index_bound(&seek_def.start, &expr_resolver)?
+            let Some(mut start) =
+                compile_deferred_index_bound(&seek_def.start, &mut expr_resolver)?
             else {
                 return Ok(None);
             };
-            let Some(mut end) = compile_deferred_index_bound(&seek_def.end, &expr_resolver)? else {
+            let Some(mut end) = compile_deferred_index_bound(&seek_def.end, &mut expr_resolver)?
+            else {
                 return Ok(None);
             };
             // An unconstrained physical edge can include NULL keys that SQL
@@ -1110,25 +1093,17 @@ fn try_compile_declarative_table_scan(
         if predicate.consumed {
             continue;
         }
-        if let Some(external) = dependencies.iter().find_map(|dependency| match dependency {
-            DeclarativeDependency::Scalar(external)
-                if external.kind == DeclarativeScalarKind::Exists
-                    && direct_exists_subquery(&predicate.expr) == Some(external.subquery_id) =>
-            {
-                Some(external)
-            }
-            DeclarativeDependency::InCursor(_) | DeclarativeDependency::Scalar(_) => None,
-        }) {
-            predicates.push(ResolvedScalarExpr::Input(external.input));
-            continue;
-        }
         if predicate.from_outer_join.is_some()
-            || !predicate.should_eval_at_loop(
+            || !(predicate.should_eval_at_loop(
                 0,
                 &plan.join_order,
                 &plan.non_from_clause_subqueries,
                 Some(&plan.table_references),
-            )
+            ) || predicate.should_eval_before_loop(
+                &plan.join_order,
+                &plan.non_from_clause_subqueries,
+                Some(&plan.table_references),
+            ))
         {
             return Ok(None);
         }
@@ -1137,6 +1112,15 @@ fn try_compile_declarative_table_scan(
         };
         predicates.push(predicate);
     }
+
+    let Some(dependencies) = validate_and_order_declarative_dependencies(
+        plan,
+        external_in_cursor,
+        expr_resolver.into_scalar_dependencies(),
+    )?
+    else {
+        return Ok(None);
+    };
 
     let table = table.clone();
     let database_id = joined.database_id;
@@ -3094,6 +3078,26 @@ mod tests {
             ]
         );
 
+        let mut nested_expression = connection
+            .prepare(
+                "SELECT value FROM exists_outer \
+                 WHERE value + EXISTS (SELECT 1 FROM exists_inner) > 2",
+            )
+            .unwrap();
+        assert!(nested_expression
+            .get_program()
+            .insns
+            .iter()
+            .all(|(instruction, _)| !matches!(
+                instruction,
+                Insn::BeginSubrtn { .. } | Insn::Return { .. } | Insn::Once { .. }
+            )));
+        assert_eq!(
+            nested_expression.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(2)], vec![Value::from_i64(3)]],
+            "expression resolution must declare nested EXISTS inputs"
+        );
+
         connection.execute("DELETE FROM exists_inner").unwrap();
         statement.reset().unwrap();
         assert!(statement.run_collect_rows().unwrap().is_empty());
@@ -3117,6 +3121,23 @@ mod tests {
                 vec![Value::from_i64(3)],
             ],
             "an aggregate EXISTS child must remain available to the eager fallback"
+        );
+
+        let mut nested_aggregate_fallback = connection
+            .prepare(
+                "SELECT value FROM exists_outer \
+                 WHERE value + EXISTS (SELECT max(value) FROM exists_inner) > 2",
+            )
+            .unwrap();
+        assert!(nested_aggregate_fallback
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::BeginSubrtn { .. })));
+        assert_eq!(
+            nested_aggregate_fallback.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(2)], vec![Value::from_i64(3)]],
+            "an unsupported nested dependency must return the whole expression to eager emission"
         );
 
         connection

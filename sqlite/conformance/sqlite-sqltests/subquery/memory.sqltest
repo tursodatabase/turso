@@ -111,6 +111,21 @@ expect {
     3|Charlie
 }
 
+@cross-check-integrity
+test subquery-exists-scalar-expression {
+    create table exists_expression_outer(value integer);
+    create table exists_expression_inner(value integer);
+    insert into exists_expression_outer values (1), (2), (3);
+    insert into exists_expression_inner values (10);
+    select value
+      from exists_expression_outer
+     where value + exists (select 1 from exists_expression_inner) > 2;
+}
+expect {
+    2
+    3
+}
+
 # Get all products when there are no users
 @cross-check-integrity
 test subquery-not-exists-uncorrelated {
