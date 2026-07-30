@@ -22,6 +22,47 @@ fn take_expr(expr: &mut ast::Expr) -> ast::Expr {
     std::mem::replace(expr, ast::Expr::Literal(ast::Literal::Null))
 }
 
+fn rewrite_between_node(expr: &mut ast::Expr) -> bool {
+    let ast::Expr::Between {
+        lhs,
+        not,
+        start,
+        end,
+    } = expr
+    else {
+        return false;
+    };
+    let lhs = take_expr(lhs);
+    let start = take_expr(start);
+    let end = take_expr(end);
+    let (lower, upper, combine) = if *not {
+        (
+            ast::Expr::Binary(Box::new(lhs.clone()), ast::Operator::Less, Box::new(start)),
+            ast::Expr::Binary(Box::new(lhs), ast::Operator::Greater, Box::new(end)),
+            ast::Operator::Or,
+        )
+    } else {
+        (
+            ast::Expr::Binary(
+                Box::new(lhs.clone()),
+                ast::Operator::GreaterEquals,
+                Box::new(start),
+            ),
+            ast::Expr::Binary(Box::new(lhs), ast::Operator::LessEquals, Box::new(end)),
+            ast::Operator::And,
+        )
+    };
+    *expr = ast::Expr::Binary(Box::new(lower), combine, Box::new(upper));
+    true
+}
+
+fn rewrite_between_expressions(expr: &mut ast::Expr) {
+    let _ = walk_expr_mut(expr, &mut |expr| {
+        rewrite_between_node(expr);
+        Ok(WalkControl::Continue)
+    });
+}
+
 /// Point SELF_TABLE references in a stored schema expression at a concrete
 /// table reference. This does not reject unresolved identifiers because ALTER
 /// validation may deliberately bind them through an expression register cache.
@@ -170,9 +211,11 @@ fn bind_table_index_expressions(
             let mut where_clause = index.where_clause.clone();
             for expr in columns.iter_mut().flatten() {
                 rebase_schema_expr(expr, internal_id);
+                rewrite_between_expressions(expr);
             }
             if let Some(expr) = where_clause.as_mut() {
                 rebase_schema_expr(expr, internal_id);
+                rewrite_between_expressions(expr);
             }
             super::plan::BoundIndexExpressions {
                 index_name: index.name.clone(),
@@ -4505,50 +4548,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     fn bind_expr(&mut self, expr: &mut ast::Expr, scope: &BindScope) -> Result<()> {
         walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
             match expr {
-                ast::Expr::Between {
-                    lhs,
-                    not,
-                    start,
-                    end,
-                } => {
-                    // Rewrite BETWEEN with the tested expression on the LHS of
-                    // both comparisons (mirrors rewrite_between_exprs): SQLite
-                    // collation precedence uses the left operand's collation,
-                    // and `x BETWEEN a AND b` must use x's collation.
-                    let lhs_v = take_expr(lhs);
-                    let start = take_expr(start);
-                    let end = take_expr(end);
-
-                    let (lower, upper, combine_op) = if *not {
-                        (
-                            ast::Expr::Binary(
-                                Box::new(lhs_v.clone()),
-                                ast::Operator::Less,
-                                Box::new(start),
-                            ),
-                            ast::Expr::Binary(
-                                Box::new(lhs_v),
-                                ast::Operator::Greater,
-                                Box::new(end),
-                            ),
-                            ast::Operator::Or,
-                        )
-                    } else {
-                        (
-                            ast::Expr::Binary(
-                                Box::new(lhs_v.clone()),
-                                ast::Operator::GreaterEquals,
-                                Box::new(start),
-                            ),
-                            ast::Expr::Binary(
-                                Box::new(lhs_v),
-                                ast::Operator::LessEquals,
-                                Box::new(end),
-                            ),
-                            ast::Operator::And,
-                        )
-                    };
-                    *expr = ast::Expr::Binary(Box::new(lower), combine_op, Box::new(upper));
+                ast::Expr::Between { .. } => {
+                    // Keep BETWEEN's tested expression on the left side of
+                    // both comparisons so SQLite collation precedence holds.
+                    rewrite_between_node(expr);
                 }
                 ast::Expr::Id(_)
                 | ast::Expr::Qualified(_, _)

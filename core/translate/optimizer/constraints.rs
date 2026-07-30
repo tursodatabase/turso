@@ -5,10 +5,7 @@ use crate::{
         collate::get_collseq_from_expr,
         expr::{as_binary_components, comparison_affinity, get_expr_affinity, unwrap_parens},
         plan::{JoinOrderMember, JoinedTable, NonFromClauseSubquery, TableReferences, WhereTerm},
-        planner::{
-            break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
-            TableMask,
-        },
+        planner::{break_predicate_at_and_boundaries, table_mask_from_expr, TableMask},
     },
     util::exprs_are_equivalent,
     vdbe::affinity::Affinity,
@@ -1295,10 +1292,9 @@ pub(super) fn partial_index_predicate_terms(
     };
     // The binder rebased the schema predicate to this query's table id. Each
     // conjunct must match some query WHERE term for the partial index to be safe.
-    let mut bound = table_reference.bound_partial_index_where(index)?.to_owned();
-    rewrite_between_exprs(&mut bound).ok()?;
+    let bound = table_reference.bound_partial_index_where(index)?;
     let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
-    break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
+    break_predicate_at_and_boundaries(bound, &mut index_conjuncts);
     let mut matched_terms = SmallVec::<[usize; 4]>::new();
     for index_conjunct in index_conjuncts.iter() {
         let (term_idx, _) = query_where_clause.iter().enumerate().find(|(_, term)| {

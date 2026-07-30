@@ -3,7 +3,7 @@ use crate::turso_assert;
 
 use super::plan::NamedWindowBound;
 use super::{
-    expr::{walk_expr, walk_expr_mut},
+    expr::walk_expr,
     plan::{
         Aggregate, Distinctness, EvalAt, JoinOrderMember, JoinedTable, Operation,
         OuterQueryReference, Plan, QueryDestination, TableReferences, WhereTerm,
@@ -1864,55 +1864,6 @@ fn collect_vtab_predicates_for_table(
             transform_args_into_where_terms(args, jt.internal_id, vtab_predicates, &jt.table)?;
         }
     }
-    Ok(())
-}
-
-pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
-    walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
-        if let Expr::Between {
-            lhs,
-            not,
-            start,
-            end,
-        } = e
-        {
-            let lhs_expr = std::mem::take(lhs.as_mut());
-            let start_expr = std::mem::take(start.as_mut());
-            let end_expr = std::mem::take(end.as_mut());
-
-            let (lower, upper, combine_op) = if *not {
-                (
-                    Expr::Binary(
-                        Box::new(lhs_expr.clone()),
-                        ast::Operator::Less,
-                        Box::new(start_expr),
-                    ),
-                    Expr::Binary(
-                        Box::new(lhs_expr),
-                        ast::Operator::Greater,
-                        Box::new(end_expr),
-                    ),
-                    ast::Operator::Or,
-                )
-            } else {
-                (
-                    Expr::Binary(
-                        Box::new(lhs_expr.clone()),
-                        ast::Operator::GreaterEquals,
-                        Box::new(start_expr),
-                    ),
-                    Expr::Binary(
-                        Box::new(lhs_expr),
-                        ast::Operator::LessEquals,
-                        Box::new(end_expr),
-                    ),
-                    ast::Operator::And,
-                )
-            };
-            *e = Expr::Binary(Box::new(lower), combine_op, Box::new(upper));
-        }
-        Ok(WalkControl::Continue)
-    })?;
     Ok(())
 }
 
