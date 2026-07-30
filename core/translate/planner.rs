@@ -1341,7 +1341,7 @@ pub fn plan_bound_subquery(
 /// Making that id resolve to the recursive input table only requires seeding
 /// the arms' planned-CTE map with the input table under the CTE's own name.
 /// Compound-operator validation, ORDER BY (queue order), and LIMIT still read
-/// the raw body in `select`, mirroring [prepare_recursive_cte_plan].
+/// the raw body in `select`, which the binder leaves untouched.
 #[allow(clippy::too_many_arguments)]
 fn prepare_bound_recursive_cte_plan(
     name: &str,
@@ -1820,7 +1820,6 @@ pub fn fold_join_constraints(
 
 /// Walk the FROM clause AST and generate virtual-table argument predicates.
 ///
-/// Bound-path counterpart of the vtab argument handling in [parse_table]:
 /// `TableReferences` already contains the resolved `JoinedTable`s. For each
 /// `TableCall` node we find the matching joined table by identifier and call
 /// [transform_args_into_where_terms].

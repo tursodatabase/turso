@@ -2149,7 +2149,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 }
 
                 // 3b. Materialized views with storage are treated as
-                // regular BTree tables (mirrors parse_table).
+                // regular BTree tables.
                 let matview = self.resolver.with_schema(database_id, |schema| {
                     schema.get_materialized_view(&table_name)
                 });
@@ -2285,7 +2285,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             // Virtual table function call: SELECT ... FROM table_func(args)
             ast::SelectTable::TableCall(name, args, alias) => {
                 let table_name = normalize_ident(name.name.as_str());
-                // Call arguments on a CTE are an error (mirrors parse_table).
+                // Call arguments on a CTE are an error.
                 if name.db_name.is_none() && self.ctes.contains_key(&table_name) && !args.is_empty()
                 {
                     // A recursive self-reference gets SQLite's table-valued

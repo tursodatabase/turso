@@ -734,7 +734,7 @@ impl ProgramBuilder {
     }
 
     /// Mark a CTE name as currently being planned. While on the stack,
-    /// `parse_table` will reject references to this name with "circular
+    /// CTE planning rejects references to this name with "circular
     /// reference" instead of falling through to schema resolution.
     pub fn push_cte_being_defined(&mut self, name: String) {
         self.ctes_being_defined.push(name);
