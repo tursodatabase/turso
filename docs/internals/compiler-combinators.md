@@ -260,10 +260,17 @@ order are not necessarily the same.
 The compiler-layer `InputProducer` satisfies one declared slot and owns scoped
 binding plus ordered composition. Binding validates the producer against the
 region interface and removes only that requirement, leaving any caller-supplied
-inputs explicit for lowering. SQL frontends retain dependency discovery,
-source ordering, and producer-specific policy, but do not reproduce value
-dominance or cursor lifetime rules. Both declarative SELECT compilation and the
-legacy deferred-expression bridge use this same region interface. Simple
+inputs explicit for lowering. Remaining inputs are bound to physical registers
+and cursors by symbolic slot identity rather than by slice position. The
+binding map is intentionally sparse: if composition satisfies slot zero while
+slot one remains external, lowering represents that hole directly and verifies
+that every residual requirement has exactly one physical resource. A region
+owns the complete compile, verify, optimize, and lower transition, so frontend
+adapters no longer unpack its compiler or assemble dense resource arrays.
+SQL frontends retain dependency discovery, source ordering, and
+producer-specific policy, but do not reproduce value dominance, cursor
+lifetime, or physical-interface rules. Both declarative SELECT compilation and
+the legacy deferred-expression bridge use this same region interface. Simple
 uncorrelated `EXISTS` children compile to `has_rows`;
 simple uncorrelated single-column scalar children compile to `first_or(NULL)`.
 Symbolic expression resolution declares and deduplicates these scalar inputs as

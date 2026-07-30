@@ -1,7 +1,9 @@
 use super::*;
+#[cfg(test)]
+use crate::translate::compiler::compile_scalar;
 use crate::translate::compiler::{
-    add, compile_scalar, constant, input, BoxedCompile, Compile, CompileRegion, InputRequirements,
-    InputSlot, ValueId,
+    add, constant, input, BoxedCompile, Compile, CompileRegion, InputRequirements, InputSlot,
+    PhysicalInputBinding, ValueId,
 };
 
 /// Reason why [translate_expr_no_constant_opt()] was called.
@@ -199,14 +201,12 @@ fn translate_deferred_expr(
     let Some(deferred) = deferred_expr(expr, &can_compile_add)? else {
         return Ok(false);
     };
-    let (compiler, inputs) = deferred.into_parts();
-    let mut input_registers = Vec::with_capacity(inputs.inputs().len());
+    let mut physical_inputs = Vec::with_capacity(deferred.inputs().len());
     let mut collation_ctx = None;
-    for requirement in inputs.inputs() {
+    for requirement in deferred.inputs() {
         let InputSlot::Value(input) = requirement.slot() else {
             unreachable!("deferred scalar expressions only declare value inputs");
         };
-        assert_eq!(input.index(), input_registers.len());
         let expr = *requirement.source();
         let register = program.alloc_register();
         program.reset_collation();
@@ -218,14 +218,9 @@ fn translate_deferred_expr(
             (None, input_collation_ctx) => input_collation_ctx,
             (collation_ctx, _) => collation_ctx,
         };
-        input_registers.push(register);
+        physical_inputs.push(PhysicalInputBinding::value(input, register));
     }
-    let ir = compile_scalar(compiler)?;
-    if input_registers.is_empty() {
-        ir.lower_into(program, target_register)?;
-    } else {
-        ir.lower_into_with_inputs(program, target_register, &input_registers)?;
-    }
+    deferred.lower_scalar_into(program, target_register, physical_inputs)?;
     program.set_collation(collation_ctx);
     Ok(true)
 }

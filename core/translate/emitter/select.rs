@@ -7,14 +7,14 @@ use crate::{
         aggregation::emit_ungrouped_aggregation,
         collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         compiler::{
-            bind_cursor_input, compile_effect, constant, cursor_input, cursor_values,
-            declare_ephemeral_index, initialize_cursor_once, insert_index_pack, literal_values,
+            bind_cursor_input, constant, cursor_input, cursor_values, declare_ephemeral_index,
+            initialize_cursor_once, insert_index_pack, literal_values,
             open_declared_ephemeral_index, open_ephemeral_index, pack_values, result_row_pack,
             scan_index, scan_table, seek_in_values, seek_index, seek_rowid, seek_table_range,
             select_pack, BoxedCompile, Compile, CompileRegion, CursorId, CursorInputId,
             DeferredIndexBound, DeferredIndexRange, DeferredTableBound, DeferredTableRange,
-            InputProducer, InputRequirement, InputRequirements, InputSlot, Row, RowStream,
-            ScanDirection, SortKey, SortedRow, ValueId, ValuePack,
+            InputProducer, InputRequirement, InputRequirements, InputSlot, PhysicalInputBinding,
+            Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId, ValuePack,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -416,7 +416,7 @@ fn try_emit_declarative_table_scan(
     };
     let mut destination_cursor = None;
     let mut external_in_subqueries = SmallVec::<[TableInternalId; 2]>::new();
-    let mut cursor_inputs = SmallVec::<[(CursorInputId, CursorID); 2]>::new();
+    let mut physical_inputs = SmallVec::<[PhysicalInputBinding; 2]>::new();
     for requirement in region.inputs() {
         let InputSlot::Cursor(input) = requirement.slot() else {
             return Ok(None);
@@ -442,18 +442,8 @@ fn try_emit_declarative_table_scan(
                 ..
             } => return Ok(None),
         };
-        cursor_inputs.push((input, cursor));
+        physical_inputs.push(PhysicalInputBinding::cursor(input, cursor));
     }
-    cursor_inputs.sort_by_key(|(input, _)| input.index());
-    for (index, (input, _)) in cursor_inputs.iter().enumerate() {
-        if input.index() != index {
-            return Err(LimboError::InternalError(
-                "declarative SELECT cursor interface is not dense".to_owned(),
-            ));
-        }
-    }
-    let (compiler, _) = region.into_parts();
-    let ir = compile_effect(compiler)?;
     let target_register = program.alloc_register();
     if !external_in_subqueries.is_empty() {
         emit_non_from_clause_subqueries_for_eval_at(
@@ -466,15 +456,7 @@ fn try_emit_declarative_table_scan(
             |subquery| external_in_subqueries.contains(&subquery.internal_id),
         )?;
     }
-    let cursor_inputs = cursor_inputs
-        .into_iter()
-        .map(|(_, cursor)| cursor)
-        .collect::<SmallVec<[CursorID; 2]>>();
-    let lowered = if cursor_inputs.is_empty() {
-        ir.lower_into(program, target_register)?
-    } else {
-        ir.lower_into_with_resources(program, target_register, &[], &cursor_inputs)?
-    };
+    let lowered = region.lower_effect_into(program, target_register, physical_inputs)?;
     if destination_cursor.is_some() {
         lowered.expect_no_result_rows()?;
         Ok(Some(DeclarativeSelectOutcome::Consumed))

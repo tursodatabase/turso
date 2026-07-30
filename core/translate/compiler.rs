@@ -236,6 +236,57 @@ pub(crate) enum InputSlot {
     Cursor(CursorInputId),
 }
 
+/// One symbolic compiler input bound to a physical lowering resource.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PhysicalInputBinding {
+    Value { input: InputId, register: usize },
+    Cursor { input: CursorInputId, cursor: usize },
+}
+
+impl PhysicalInputBinding {
+    pub(crate) const fn value(input: InputId, register: usize) -> Self {
+        Self::Value { input, register }
+    }
+
+    pub(crate) const fn cursor(input: CursorInputId, cursor: usize) -> Self {
+        Self::Cursor { input, cursor }
+    }
+
+    const fn slot(self) -> InputSlot {
+        match self {
+            Self::Value { input, .. } => InputSlot::Value(input),
+            Self::Cursor { input, .. } => InputSlot::Cursor(input),
+        }
+    }
+}
+
+/// Sparse physical resources keyed by their symbolic input identities.
+///
+/// Slots satisfied by compiler producers remain empty. This matters when a
+/// producer satisfies an earlier slot while a later slot stays external.
+struct PhysicalInputs {
+    registers: Vec<Option<usize>>,
+    cursors: Vec<Option<usize>>,
+}
+
+impl PhysicalInputs {
+    #[cfg(test)]
+    fn dense(registers: &[usize], cursors: &[usize]) -> Self {
+        Self {
+            registers: registers.iter().copied().map(Some).collect(),
+            cursors: cursors.iter().copied().map(Some).collect(),
+        }
+    }
+
+    fn register(&self, input: InputId) -> Option<usize> {
+        self.registers.get(input.index()).copied().flatten()
+    }
+
+    fn cursor(&self, input: CursorInputId) -> Option<usize> {
+        self.cursors.get(input.index()).copied().flatten()
+    }
+}
+
 /// A symbolic input slot paired with frontend-owned source metadata.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InputRequirement<Source> {
@@ -370,10 +421,39 @@ impl<Source> InputRequirements<Source> {
         &self.inputs
     }
 
+    fn bind_physical<Bindings>(mut self, bindings: Bindings) -> Result<PhysicalInputs>
+    where
+        Bindings: IntoIterator<Item = PhysicalInputBinding>,
+    {
+        let mut physical = PhysicalInputs {
+            registers: vec![None; self.value_count as usize],
+            cursors: vec![None; self.cursor_count as usize],
+        };
+        for binding in bindings {
+            let slot = binding.slot();
+            self.remove(slot)?;
+            match binding {
+                PhysicalInputBinding::Value { input, register } => {
+                    physical.registers[input.index()] = Some(register);
+                }
+                PhysicalInputBinding::Cursor { input, cursor } => {
+                    physical.cursors[input.index()] = Some(cursor);
+                }
+            }
+        }
+        if !self.inputs.is_empty() {
+            return Err(LimboError::InternalError(format!(
+                "compiler lowering is missing {} physical input bindings",
+                self.inputs.len()
+            )));
+        }
+        Ok(physical)
+    }
+
     fn remove(&mut self, slot: InputSlot) -> Result<InputRequirement<Source>> {
         let Some(index) = self.inputs.iter().position(|input| input.slot == slot) else {
             return Err(LimboError::InternalError(format!(
-                "compiler producer targets undeclared input {slot:?}",
+                "compiler binding targets undeclared input {slot:?}",
             )));
         };
         Ok(self.inputs.remove(index))
@@ -437,6 +517,50 @@ impl<Output: 'static, Source> CompileRegion<Output, Source> {
         }
         self.compiler = bind_input_producers(validated, self.compiler);
         Ok(self)
+    }
+}
+
+impl<Source> CompileRegion<ValueId, Source> {
+    /// Compile, verify, optimize, and lower a scalar region after binding its
+    /// remaining symbolic interface to physical resources.
+    pub(crate) fn lower_scalar_into<Bindings>(
+        self,
+        program: &mut ProgramBuilder,
+        target_register: usize,
+        bindings: Bindings,
+    ) -> Result<LoweredRegion>
+    where
+        Bindings: IntoIterator<Item = PhysicalInputBinding>,
+    {
+        let (compiler, inputs) = self.into_parts();
+        let physical = inputs.bind_physical(bindings)?;
+        compile_scalar(compiler)?.lower_into_with_physical_inputs(
+            program,
+            target_register,
+            physical,
+        )
+    }
+}
+
+impl<Source> CompileRegion<(), Source> {
+    /// Compile, verify, optimize, and lower an effect region after binding its
+    /// remaining symbolic interface to physical resources.
+    pub(crate) fn lower_effect_into<Bindings>(
+        self,
+        program: &mut ProgramBuilder,
+        target_register: usize,
+        bindings: Bindings,
+    ) -> Result<LoweredRegion>
+    where
+        Bindings: IntoIterator<Item = PhysicalInputBinding>,
+    {
+        let (compiler, inputs) = self.into_parts();
+        let physical = inputs.bind_physical(bindings)?;
+        compile_effect(compiler)?.lower_into_with_physical_inputs(
+            program,
+            target_register,
+            physical,
+        )
     }
 }
 
@@ -3884,7 +4008,7 @@ impl IrProgram {
         &self,
         program: &mut ProgramBuilder,
         target_register: usize,
-        input_registers: &[usize],
+        physical_inputs: &PhysicalInputs,
     ) -> SmallVec<[Option<usize>; 8]> {
         let output = self.output();
         let defined_values = self.defined_values();
@@ -3939,7 +4063,11 @@ impl IrProgram {
                 } else if value == output {
                     Some(target_register)
                 } else if let Some(input) = input_values[value.index()] {
-                    Some(input_registers[input.index()])
+                    Some(
+                        physical_inputs
+                            .register(input)
+                            .expect("physical value input was validated"),
+                    )
                 } else {
                     Some(physical_colors[colors[value.index()].expect("allocatable SSA value")])
                 }
@@ -4139,6 +4267,7 @@ impl IrProgram {
     }
 
     /// Assign physical registers and labels, then append equivalent VDBE instructions.
+    #[cfg(test)]
     pub(crate) fn lower_into(
         self,
         program: &mut ProgramBuilder,
@@ -4148,6 +4277,7 @@ impl IrProgram {
     }
 
     /// Bind symbolic inputs to existing registers and lower the region.
+    #[cfg(test)]
     pub(crate) fn lower_into_with_inputs(
         self,
         program: &mut ProgramBuilder,
@@ -4158,14 +4288,14 @@ impl IrProgram {
     }
 
     /// Bind symbolic values and cursors, then lower the region.
+    #[cfg(test)]
     pub(crate) fn lower_into_with_resources(
-        mut self,
+        self,
         program: &mut ProgramBuilder,
         target_register: usize,
         input_registers: &[usize],
         cursor_ids: &[usize],
     ) -> Result<LoweredRegion> {
-        self = self.optimize()?;
         if input_registers.len() != self.input_count as usize {
             return Err(LimboError::InternalError(format!(
                 "compiler IR expects {} inputs, received {}",
@@ -4180,8 +4310,39 @@ impl IrProgram {
                 cursor_ids.len()
             )));
         }
-        if let Some(cursor) = cursor_ids
+        self.lower_into_with_physical_inputs(
+            program,
+            target_register,
+            PhysicalInputs::dense(input_registers, cursor_ids),
+        )
+    }
+
+    fn lower_into_with_physical_inputs(
+        mut self,
+        program: &mut ProgramBuilder,
+        target_register: usize,
+        physical_inputs: PhysicalInputs,
+    ) -> Result<LoweredRegion> {
+        self = self.optimize()?;
+        for block in &self.blocks {
+            for instruction in &block.instructions {
+                if let Instruction::Value {
+                    op: ScalarOp::Input(input),
+                    ..
+                } = instruction
+                {
+                    if physical_inputs.register(*input).is_none() {
+                        return Err(LimboError::InternalError(format!(
+                            "compiler IR input {input:?} has no physical register binding"
+                        )));
+                    }
+                }
+            }
+        }
+        if let Some(cursor) = physical_inputs
+            .cursors
             .iter()
+            .flatten()
             .copied()
             .find(|cursor| *cursor >= program.cursor_ref.len())
         {
@@ -4197,16 +4358,22 @@ impl IrProgram {
             .cursor_resources
             .iter()
             .enumerate()
-            .map(
-                |(index, resource)| match (required_cursors[index], resource) {
-                    (false, _) => None,
-                    (true, CursorResource::External(input)) => Some(cursor_ids[input.index()]),
-                    (true, CursorResource::Owned(cursor_type)) => {
-                        Some(program.alloc_cursor_id(cursor_type.clone()))
+            .map(|(index, resource)| -> Result<Option<usize>> {
+                match (required_cursors[index], resource) {
+                    (false, _) => Ok(None),
+                    (true, CursorResource::External(input)) => {
+                        physical_inputs.cursor(*input).map(Some).ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "compiler IR cursor input {input:?} has no physical cursor binding"
+                            ))
+                        })
                     }
-                },
-            )
-            .collect::<SmallVec<[Option<usize>; 2]>>();
+                    (true, CursorResource::Owned(cursor_type)) => {
+                        Ok(Some(program.alloc_cursor_id(cursor_type.clone())))
+                    }
+                }
+            })
+            .collect::<Result<SmallVec<[Option<usize>; 2]>>>()?;
         let required_sorters = self.required_sorters();
         let physical_sorters = self
             .sorter_resources
@@ -4229,7 +4396,7 @@ impl IrProgram {
             .enumerate()
             .map(|(index, _)| required_distinct_sets[index].then(|| program.alloc_hash_table_id()))
             .collect::<SmallVec<[Option<usize>; 1]>>();
-        let registers = self.allocate_value_registers(program, target_register, input_registers);
+        let registers = self.allocate_value_registers(program, target_register, &physical_inputs);
         let labels = self
             .blocks
             .iter()
@@ -4265,7 +4432,9 @@ impl IrProgram {
                         let destination = Self::register_for(&registers, *result);
                         match op {
                             ScalarOp::Input(input) => {
-                                let source = input_registers[input.index()];
+                                let source = physical_inputs
+                                    .register(*input)
+                                    .expect("physical value input was validated");
                                 if source != destination {
                                     program.emit_insn(Insn::Copy {
                                         src_reg: source,
@@ -10100,7 +10269,50 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("producer targets undeclared input Cursor(CursorInputId(0))"));
+            .contains("binding targets undeclared input Cursor(CursorInputId(0))"));
+    }
+
+    #[test]
+    fn compile_region_lowers_sparse_residual_inputs_by_symbolic_identity() {
+        let mut inputs = InputRequirements::new();
+        let produced = inputs.require_value("value producer").unwrap();
+        let external = inputs.require_value("external value").unwrap();
+        let consumer = input(produced)
+            .then(input(external))
+            .and_then(|(lhs, rhs)| add(lhs, rhs));
+        let region = CompileRegion::new(consumer, inputs)
+            .bind_inputs([InputProducer::value(produced, constant(Value::from_i64(7)))])
+            .unwrap();
+
+        assert_eq!(region.inputs().len(), 1);
+        assert_eq!(region.inputs()[0].slot(), InputSlot::Value(external));
+        assert_eq!(external, InputId::new(1));
+
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 3, 0));
+        region
+            .lower_scalar_into(&mut program, 7, [PhysicalInputBinding::value(external, 4)])
+            .unwrap();
+
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Add { lhs: 4, .. } | Insn::Add { rhs: 4, .. })));
+    }
+
+    #[test]
+    fn compile_region_rejects_missing_physical_input_bindings() {
+        let mut inputs = InputRequirements::new();
+        let external = inputs.require_value("external value").unwrap();
+        let region = CompileRegion::new(input(external), inputs);
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 1, 0));
+
+        let error = region.lower_scalar_into(&mut program, 1, []).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("lowering is missing 1 physical input bindings"));
     }
 
     #[test]
