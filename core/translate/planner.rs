@@ -899,11 +899,9 @@ fn resolve_effective_frame(
             exclude: None,
         });
     };
-    // Aggregates we haven't ported an xInverse for. SQLite supports
-    // sliding frames over these via per-function strategies (sorted
-    // index for min/max, separator-length tracking for group_concat,
-    // JSON-buffer parsing for the json_group_* family); they will be
-    // wired up alongside the xInverse implementations themselves.
+    // min/max still need SQLite's per-function sorted-index strategy.
+    // group_concat and json_group_* maintain removable-prefix state in
+    // their aggregate payloads, matching their SQLite xInverse behavior.
     // first_value / nth_value don't need xInverse — they're WINDOWFUNCNOOP
     // (window.c:591) and read positionally from csr_app at output time, so
     // any frame shape works as long as the frame-index counters are
@@ -912,11 +910,28 @@ fn resolve_effective_frame(
     let supports_sliding = matches!(
         func,
         AccumulatorFunc::Agg(
-            AggFunc::Sum | AggFunc::Total | AggFunc::Count | AggFunc::Count0 | AggFunc::Avg,
+            AggFunc::Sum
+                | AggFunc::Total
+                | AggFunc::Count
+                | AggFunc::Count0
+                | AggFunc::Avg
+                | AggFunc::GroupConcat
+                | AggFunc::StringAgg,
         ) | AccumulatorFunc::Window(
             WindowFunc::FirstValue | WindowFunc::NthValue | WindowFunc::LastValue
         )
     );
+    #[cfg(feature = "json")]
+    let supports_sliding = supports_sliding
+        || matches!(
+            func,
+            AccumulatorFunc::Agg(
+                AggFunc::JsonGroupObject
+                    | AggFunc::JsonbGroupObject
+                    | AggFunc::JsonGroupArray
+                    | AggFunc::JsonbGroupArray
+            )
+        );
     // Anything but an UNBOUNDED PRECEDING start makes the frame shrink
     // from the left, firing xInverse.
     let moving_start = !matches!(
