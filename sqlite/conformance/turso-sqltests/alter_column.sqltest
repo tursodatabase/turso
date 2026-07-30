@@ -868,3 +868,43 @@ test fail-alter-column-keeps-table-level-check {
 }
 expect error {
 }
+
+# STRICT: a type change must fail when existing values cannot be stored
+# under the new type.
+test fail-alter-column-strict-nonconforming-data {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    INSERT INTO t VALUES (1, 'abc');
+    ALTER TABLE t ALTER COLUMN v TO v INT;
+}
+expect error {
+}
+
+# STRICT: values that convert cleanly are converted, like an insert would.
+test alter-column-strict-convertible-data {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    INSERT INTO t VALUES (1, '123');
+    ALTER TABLE t ALTER COLUMN v TO v INT;
+    SELECT v, typeof(v) FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    123|integer
+    ok
+}
+
+# STRICT: the new type must be a valid STRICT type name.
+test fail-alter-column-strict-invalid-type-name {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    ALTER TABLE t ALTER COLUMN v TO v VARCHAR;
+}
+expect error {
+}
+
+# STRICT: the new type is enforced on later writes.
+test fail-insert-after-alter-column-strict-type-change {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    ALTER TABLE t ALTER COLUMN v TO v INT;
+    INSERT INTO t VALUES (1, 'abc');
+}
+expect error {
+}

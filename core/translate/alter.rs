@@ -1198,6 +1198,7 @@ pub fn translate_alter_table(
                             &btree,
                             source_column_by_schema_idx,
                             layout,
+                            resolver,
                             connection,
                             database_id,
                         );
@@ -1831,6 +1832,46 @@ pub fn translate_alter_table(
                 true => (false, None),
                 false => {
                     let replacement_column = Column::try_from(&definition)?;
+                    if btree.is_strict {
+                        let Some(col_type) = definition.col_type.as_ref() else {
+                            return Err(LimboError::ParseError(format!(
+                                "missing datatype for {table_name}.{col_name}"
+                            )));
+                        };
+                        let type_name = col_type.name.as_str();
+                        let is_builtin = type_name.eq_ignore_ascii_case("INT")
+                            || type_name.eq_ignore_ascii_case("INTEGER")
+                            || type_name.eq_ignore_ascii_case("REAL")
+                            || type_name.eq_ignore_ascii_case("TEXT")
+                            || type_name.eq_ignore_ascii_case("BLOB")
+                            || type_name.eq_ignore_ascii_case("ANY");
+                        if !is_builtin {
+                            match resolver
+                                .schema()
+                                .get_type_def_unchecked(&normalize_ident(type_name))
+                            {
+                                None => {
+                                    return Err(LimboError::ParseError(format!(
+                                        "unknown datatype for {table_name}.{col_name}: \"{type_name}\""
+                                    )));
+                                }
+                                Some(td) if td.user_params().next().is_some() => {
+                                    let provided = match &col_type.size {
+                                        Some(ast::TypeSize::TypeSize(_, _)) => 2,
+                                        Some(ast::TypeSize::MaxSize(_)) => 1,
+                                        None => 0,
+                                    };
+                                    let expected = td.user_params().count();
+                                    if provided != expected {
+                                        return Err(LimboError::ParseError(format!(
+                                            "type \"{type_name}\" requires {expected} parameter(s), got {provided}"
+                                        )));
+                                    }
+                                }
+                                Some(_) => {}
+                            }
+                        }
+                    }
                     let old_column = &btree.columns()[column_index];
                     let becomes_generated =
                         !old_column.is_generated() && replacement_column.is_generated();
@@ -2247,6 +2288,7 @@ pub fn translate_alter_table(
                         &altered_table,
                         &source_column_by_schema_idx,
                         &layout,
+                        resolver,
                         connection,
                         database_id,
                     );
@@ -2288,6 +2330,7 @@ fn emit_rewrite_table_rows(
     rewritten_table: &BTreeTable,
     source_column_by_schema_idx: &[Option<usize>],
     layout: &ColumnLayout,
+    resolver: &Resolver,
     connection: &Arc<crate::Connection>,
     database_id: usize,
 ) {
@@ -2296,6 +2339,9 @@ fn emit_rewrite_table_rows(
         rewritten_table.columns().len()
     );
 
+    let type_check_table_ref = rewritten_table.is_strict.then(|| {
+        BTreeTable::type_check_table_ref(&Arc::new(rewritten_table.clone()), resolver.schema())
+    });
     let non_virtual_column_count = layout.num_non_virtual_cols();
     let root_page = rewritten_table.root_page;
     let table_name = rewritten_table.name.clone();
@@ -2323,6 +2369,17 @@ fn emit_rewrite_table_rows(
                 *source_column_idx,
                 layout.to_register(base_dest_reg, schema_idx),
             );
+        }
+
+        // For STRICT tables, coerce each value to the new declared type and
+        // fail on values that cannot be stored under it, like an insert would.
+        if let Some(table_reference) = &type_check_table_ref {
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: base_dest_reg,
+                count: non_virtual_column_count,
+                check_generated: true,
+                table_reference: table_reference.clone(),
+            });
         }
 
         let record = program.alloc_register();
