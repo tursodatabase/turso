@@ -173,3 +173,58 @@ test moving-min-max-large-partition {
 expect {
     1000|376|99752
 }
+
+# An outer ORDER BY that references a moving-start min/max window column
+# (by ordinal, alias, or repeated expression) must share the function's
+# Window instead of spawning a duplicate window layer: the duplicate's
+# functions never go through the subquery rewrite, and the min/max index
+# setup then resolves its argument against a table that is no longer in
+# scope ("table not found"). Regression for the Window::is_equivalent
+# merge of identical user-specified frames.
+setup orderby_shape {
+    CREATE TABLE t3(a TEXT, b TEXT, c INTEGER);
+    INSERT INTO t3 VALUES ('BB','aa',3),('AA','bb',2),('AA','aa',1),('CC','aa',5),('BB','bb',4);
+}
+
+@setup orderby_shape
+test moving-max-ordered-by-ordinal {
+    SELECT a, b, max(c) OVER (ORDER BY a, b GROUPS BETWEEN 2 PRECEDING AND 1 PRECEDING)
+    FROM t3 ORDER BY 3, 1, 2;
+}
+expect {
+    AA|aa|
+    AA|bb|1
+    BB|aa|2
+    BB|bb|3
+    CC|aa|4
+}
+
+@setup orderby_shape
+test moving-min-ordered-by-alias {
+    SELECT a, min(c) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS m
+    FROM t3 ORDER BY m DESC, a;
+}
+expect {
+    CC|4
+    BB|3
+    AA|2
+    AA|1
+    BB|1
+}
+
+# Two functions over the same named window with a user frame must merge
+# into one Window (one buffer pass), and both stay referencable from the
+# outer ORDER BY.
+@setup orderby_shape
+test moving-min-max-shared-frame-ordered {
+    SELECT max(c) OVER w AS hi, min(c) OVER w AS lo
+    FROM t3 WINDOW w AS (ORDER BY a ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+    ORDER BY hi, lo;
+}
+expect {
+    2|1
+    2|2
+    3|1
+    4|3
+    5|4
+}

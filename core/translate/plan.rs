@@ -3099,15 +3099,13 @@ impl Window {
     /// clause matches AND the coerced frames agree — see SQLite's invariant
     /// at `window.c:1679`.
     pub fn is_equivalent(&self, ast: &ast::Window, frame: &Frame) -> bool {
+        // The effective frames must agree exactly (mode, bounds including
+        // offset expressions, EXCLUDE). Two occurrences of the same OVER
+        // clause then share one Window; a window that is NOT merged here
+        // spawns its own subquery layer, and only the layer that owns a
+        // function's rewrite pass populates `WindowFunction::rewritten` —
+        // a duplicate layer would emit against un-rewritten expressions.
         if &self.frame != frame {
-            return false;
-        }
-        // User-written FRAME clauses aren't supported yet, and
-        // `Window::new` is where they get rejected. Returning false
-        // here forces the planner to call `Window::new` for the new
-        // function instead of merging it into this Window (which would
-        // skip the rejection).
-        if ast.frame_clause.is_some() {
             return false;
         }
 
