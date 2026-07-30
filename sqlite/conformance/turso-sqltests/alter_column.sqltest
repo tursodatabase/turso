@@ -1125,3 +1125,62 @@ expect {
     integer
     ok
 }
+
+# Non-convertible values keep their stored type; convertible ones
+# convert, matching SQLite affinity rules on insert.
+test alter-column-text-to-integer-mixed-values {
+    CREATE TABLE t (x TEXT);
+    INSERT INTO t VALUES ('123'), ('abc'), ('45.0'), ('');
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+    SELECT quote(x), typeof(x) FROM t ORDER BY rowid;
+}
+expect {
+    123|integer
+    'abc'|text
+    45|integer
+    ''|text
+}
+
+# BLOB values are never converted by an affinity change.
+test alter-column-conversion-never-touches-blobs {
+    CREATE TABLE t (x);
+    INSERT INTO t VALUES (x'deadbeef'), (42), ('7');
+    ALTER TABLE t ALTER COLUMN x TO x TEXT;
+    SELECT quote(x), typeof(x) FROM t ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    X'DEADBEEF'|blob
+    '42'|text
+    '7'|text
+    ok
+}
+
+# A type change within the same affinity keeps stored values untouched.
+test alter-column-varchar-to-text-same-affinity {
+    CREATE TABLE t (x VARCHAR);
+    INSERT INTO t VALUES ('a'), (1);
+    ALTER TABLE t ALTER COLUMN x TO x TEXT;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT quote(x), typeof(x) FROM t ORDER BY rowid;
+}
+expect {
+    CREATE TABLE t (x TEXT)
+    'a'|text
+    '1'|text
+}
+
+# Conversion must survive values large enough to spill to overflow pages.
+test alter-column-conversion-with-overflow-pages {
+    CREATE TABLE t (x TEXT);
+    INSERT INTO t VALUES (replace(hex(zeroblob(5000)), '00', 'ab'));
+    INSERT INTO t VALUES ('77');
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+    SELECT length(x), typeof(x) FROM t ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    10000|text
+    2|integer
+    ok
+}
