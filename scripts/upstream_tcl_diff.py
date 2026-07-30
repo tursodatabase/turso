@@ -64,22 +64,44 @@ def run_engine(cmd, blocks):
     return parsed
 
 
+def error_count(stderr, stdout_lines):
+    n = stderr.lower().count("error")
+    n += sum(1 for l in stdout_lines if "error" in l.lower() and ("×" in l or "Error" in l))
+    return n
+
+
 def classify(cmd, prior_sql, sql):
-    out = subprocess.run(
+    """Classify only the statement under test: prior statements may
+    themselves error (in either engine), so the error signal is the
+    *delta* between running the priors alone and priors + statement,
+    and rows are read from after a marker emitted between them."""
+    prior = "\n".join(prior_sql)
+    base = subprocess.run(cmd, input=prior.encode(), capture_output=True, timeout=300)
+    full = subprocess.run(
         cmd,
-        input=("\n".join(prior_sql) + "\n" + sql + ";").encode(),
+        input=f"{prior}\nSELECT '{MARKER}X';\n{sql};".encode(),
         capture_output=True,
         timeout=300,
     )
-    stdout = out.stdout.decode("utf-8", errors="replace")
-    stderr = out.stderr.decode("utf-8", errors="replace")
-    errored = "error" in stderr.lower() or "×" in stdout or "error:" in stdout.lower()
-    rows = [
+    base_stdout = base.stdout.decode("utf-8", errors="replace").splitlines()
+    full_stdout = full.stdout.decode("utf-8", errors="replace").splitlines()
+    tail = []
+    seen_marker = False
+    for l in full_stdout:
+        if l.strip() == f"{MARKER}X":
+            seen_marker = True
+            continue
+        if seen_marker:
+            tail.append(l)
+    base_errs = error_count(base.stderr.decode("utf-8", errors="replace"), base_stdout)
+    full_errs = error_count(full.stderr.decode("utf-8", errors="replace"), full_stdout)
+    errored = full_errs > base_errs
+    rows = tuple(
         l.strip()
-        for l in stdout.splitlines()
-        if l.strip() and "error" not in l.lower()
-    ]
-    return ("error" if errored else "ok", tuple(rows))
+        for l in tail
+        if l.strip() and not ("error" in l.lower() and ("×" in l or "Error" in l))
+    )
+    return ("error" if errored else "ok", rows)
 
 
 def main():
@@ -103,8 +125,8 @@ def main():
             # that already look different.
             if (terr and not sl) or (not terr and trows == tuple(sl)):
                 continue
-            # Re-run this block solo on both engines with all prior SQL as
-            # state, classifying error-vs-rows uniformly.
+            # Re-run this block on both engines with all prior SQL as
+            # state, classifying only the statement under test.
             prior = []
             for _, prior_sql, _ in blocks[:i]:
                 prior.append(prior_sql if prior_sql.rstrip().endswith(";") else prior_sql + ";")
