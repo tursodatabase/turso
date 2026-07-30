@@ -1173,6 +1173,59 @@ mod tests {
         };
     }
 
+    /// Run the condition pipeline for a column-free predicate under the
+    /// standard WHERE contract; `None` = fell back.
+    fn condition_pipeline(sql: &str) -> Option<Vec<Insn>> {
+        use crate::translate::expr::ConditionMetadata;
+        let expr = parse_expr(sql);
+        let mut program = test_program();
+        let false_label = program.allocate_label();
+        let metadata = ConditionMetadata {
+            jump_if_condition_is_true: false,
+            jump_target_when_true: program.allocate_label(),
+            jump_target_when_false: false_label,
+            jump_target_when_null: false_label,
+        };
+        let built = compile_condition_expr(&expr, &BuildCtx::NO_TABLES).unwrap()?;
+        emit_condition(&mut program, built.predicate, &metadata, None).unwrap();
+        program.preassign_label_to_next_insn(metadata.jump_target_when_true);
+        program.preassign_label_to_next_insn(false_label);
+        program.resolve_labels().unwrap();
+        Some(program.insns.into_iter().map(|(insn, _)| insn).collect())
+    }
+
+    #[test]
+    fn in_lists_chain_equality_tests() {
+        // 5 IN (1, 2), NULL joining the miss side: one Eq to the match
+        // continuation per element, the last negated to fall through on
+        // a match — the exact eager shape, no NULL bookkeeping.
+        let insns = condition_pipeline("5 IN (1, 2)").unwrap();
+        let [Insn::Integer { value: 5, .. }, Insn::Integer { value: 1, .. }, Insn::Integer { value: 2, .. }, Insn::Eq { .. }, Insn::Ne { .. }] =
+            insns[..]
+        else {
+            panic!("unexpected IN shape: {insns:?}");
+        };
+        // NOT IN forces NULL tracking (its miss side is the true
+        // continuation, distinct from the NULL target): the probe's
+        // nullness is accumulated with BitAnd and checked at the end.
+        let insns = condition_pipeline("5 NOT IN (1, 2)").unwrap();
+        assert!(
+            insns.iter().any(|insn| matches!(insn, Insn::BitAnd { .. })),
+            "{insns:?}"
+        );
+        assert!(
+            insns.iter().any(|insn| matches!(insn, Insn::IsNull { .. })),
+            "{insns:?}"
+        );
+        // Empty lists never reach translation: the parser desugars
+        // `x IN ()` to the literal 0, a truthiness terminal.
+        let insns = condition_pipeline("5 IN ()").unwrap();
+        assert!(
+            insns.iter().any(|insn| matches!(insn, Insn::IfNot { .. })),
+            "{insns:?}"
+        );
+    }
+
     #[test]
     fn pure_and_map_pass_values_through() {
         let description = Compiler::pure(41).map(|v| v + 1);

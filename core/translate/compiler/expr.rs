@@ -877,6 +877,135 @@ pub(crate) fn compile_condition_expr<'a>(
         {
             null_test_predicate(lhs, ctx, true)?
         }
+        // Scalar IN-lists: a chain of equality tests against a shared
+        // probe, with NULL tracking threaded as plain SSA values through
+        // the linearly-dominating chain blocks — the eager path's
+        // check_null register accumulation, without the mutable cell.
+        ast::Expr::InList { lhs, not, rhs } => {
+            // Empty lists and row-valued probes stay eager (the operand
+            // compilation refuses vectors/subqueries anyway).
+            if rhs.is_empty() {
+                return Ok(None);
+            }
+            let Some(lhs_built) = compile_value_expr(lhs.as_ref(), ctx)? else {
+                return Ok(None);
+            };
+            // The IN comparison affinity comes from the probe (SQLite's
+            // exprINAffinity); for parenthesized vectors, its first
+            // element — but vectors already fell back above.
+            let affinity = crate::translate::expr::get_expr_affinity(
+                lhs.as_ref(),
+                ctx.referenced_tables,
+                ctx.resolver,
+            );
+            // Collation state threads through eager emission order (lhs,
+            // then each element) with no resets; each Eq's payload is
+            // the running state after its element.
+            let mut running = lhs_built.effect;
+            let mut elements = Vec::with_capacity(rhs.len());
+            for element in rhs {
+                let Some(built) = compile_value_expr(element.as_ref(), ctx)? else {
+                    return Ok(None);
+                };
+                if let CollationEffect::Sets(collation) = built.effect {
+                    running = CollationEffect::Sets(collation);
+                }
+                let payload = running.contribution().map(|(collation, _)| collation);
+                elements.push((built.compiler, payload, element.can_be_null()));
+            }
+            let negated = *not;
+            let lhs_compiler = lhs_built.compiler;
+            Some(CondBuilt {
+                predicate: Predicate::build_with(move |builder, targets| {
+                    // NOT IN swaps the match/no-match continuations; the
+                    // NULL continuation stays (the eager label
+                    // relabeling does exactly this).
+                    let (match_t, miss_t) = if negated {
+                        (targets.if_false, targets.if_true)
+                    } else {
+                        (targets.if_true, targets.if_false)
+                    };
+                    let null_t = targets.if_null;
+                    // NULL is only tracked when it goes somewhere other
+                    // than the miss continuation, mirroring the eager
+                    // `jump_target_when_false != jump_target_when_null`
+                    // gate (blocks dedupe by label, so this is the same
+                    // comparison).
+                    let null_distinct = null_t != miss_t;
+                    let probe = lhs_compiler.run(builder)?;
+                    let mut null_check = if null_distinct {
+                        Some(builder.binary(BinOp::BitAnd, probe, probe))
+                    } else {
+                        None
+                    };
+                    let count = elements.len();
+                    for (index, (element, payload, can_be_null)) in elements.into_iter().enumerate()
+                    {
+                        let last = index + 1 == count;
+                        let value = element.run(builder)?;
+                        if let Some(check) = null_check {
+                            if can_be_null {
+                                null_check = Some(builder.binary(BinOp::BitAnd, check, value));
+                            }
+                        }
+                        if !last || null_distinct {
+                            let next = builder.create_block();
+                            if probe == value {
+                                // The probe IS this element (shared SSA
+                                // value): it matches iff non-NULL.
+                                builder.null_branch(
+                                    probe,
+                                    JumpTarget::new(next, Vec::new()),
+                                    JumpTarget::new(match_t, Vec::new()),
+                                );
+                            } else {
+                                builder.cmp_branch(
+                                    CmpOp::Eq,
+                                    Some(affinity),
+                                    payload,
+                                    probe,
+                                    value,
+                                    JumpTarget::new(match_t, Vec::new()),
+                                    JumpTarget::new(next, Vec::new()),
+                                    JumpTarget::new(next, Vec::new()),
+                                );
+                            }
+                            builder.switch_to(next);
+                        } else if probe == value {
+                            builder.null_branch(
+                                probe,
+                                JumpTarget::new(miss_t, Vec::new()),
+                                JumpTarget::new(match_t, Vec::new()),
+                            );
+                        } else {
+                            // Last element with NULL joining the miss
+                            // side: one comparison decides.
+                            builder.cmp_branch(
+                                CmpOp::Eq,
+                                Some(affinity),
+                                payload,
+                                probe,
+                                value,
+                                JumpTarget::new(match_t, Vec::new()),
+                                JumpTarget::new(miss_t, Vec::new()),
+                                JumpTarget::new(miss_t, Vec::new()),
+                            );
+                        }
+                    }
+                    if let Some(check) = null_check {
+                        // No element matched: NULL result if the probe or
+                        // any nullable element was NULL, otherwise a miss.
+                        builder.null_branch(
+                            check,
+                            JumpTarget::new(null_t, Vec::new()),
+                            JumpTarget::new(miss_t, Vec::new()),
+                        );
+                    }
+                    Ok(())
+                }),
+                effect: running,
+            })
+        }
         // Any value-representable expression is a truthiness terminal in
         // condition position, exactly the set the eager path routes
         // through translate_expr + emit_cond_jump (or the non-comparison

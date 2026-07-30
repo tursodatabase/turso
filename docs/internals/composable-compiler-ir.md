@@ -296,10 +296,22 @@ boundary (the whole tree is constant, so the span opened by
       hand-rolled CSE. `Expr::Collate` is pure effect: passthrough value,
       `Sets(Some((collation, true)))`. Condition-position COLLATE roots
       keep the eager parse error (explicit fallback arm).
-- [ ] 2b-3c. IN-list — needs the `Slot` concept: the eager
-      `translate_in_list` accumulates a NULL flag by repeated `BitAnd`
-      into one register, which pure SSA cannot express. LIKE/GLOB (via
-      `translate_like_base`) also remain.
+- [x] 2b-3c. Scalar IN-lists in condition position. Correction to the
+      earlier analysis: no `Slot` needed — the eager check_null register
+      "mutation" is a straight-line accumulation, which in SSA is just
+      successive `BitAnd` values threaded through linearly-dominating
+      chain blocks. Per element: `Eq probe,elem -> match` else next
+      block; NULL tracked only when the NULL continuation differs from
+      the miss side (the eager `false != null` gate — NOT IN always
+      tracks, since its miss side is the true continuation); final
+      `NullBranch(check)`. Probe==element (shared SSA value) becomes a
+      nullness test, mirroring the eager reg-equality special case.
+      Affinity from the probe (`exprINAffinity`); per-element collation
+      payloads from the running fold. Empty lists never reach
+      translation (parser desugars to 0/1); row-valued probes fall back
+      via operand compilation. Value-position IN and LIKE/GLOB remain
+      eager. `Slot` remains future work for genuine cross-iteration
+      mutation (aggregate accumulators, coroutine cells).
 - [ ] 2c. Constant hoisting as an IR transform (move constant-only
       instructions to the entry block) so IR islands stop depending on
       the constant-span machinery; then start deleting
