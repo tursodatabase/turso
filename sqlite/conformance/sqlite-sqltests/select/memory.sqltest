@@ -2090,3 +2090,21 @@ expect {
     one
     null
 }
+
+@cross-check-integrity
+test symbolic-inner-join-stream {
+    CREATE TABLE join_left(id INTEGER, a INTEGER);
+    CREATE TABLE join_right(id INTEGER, left_id INTEGER, b INTEGER);
+    INSERT INTO join_left VALUES (1, 10), (2, 20), (3, NULL);
+    INSERT INTO join_right VALUES
+        (1, 1, 2), (2, 1, 3), (3, 2, 4), (4, 2, 5), (5, 3, 1);
+    SELECT l.id, l.a + r.b, r.b
+      FROM join_left AS l JOIN join_right AS r ON r.left_id = l.id
+     WHERE l.a >= r.b
+     ORDER BY r.b DESC, l.id
+     LIMIT 2 OFFSET 1;
+}
+expect {
+    2|24|4
+    1|13|3
+}

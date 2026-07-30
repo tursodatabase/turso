@@ -107,6 +107,7 @@ pub(crate) use symbolic::{
     compile_conjunction as compile_symbolic_conjunction, compile_expr as compile_symbolic_expr,
     compile_exprs as compile_symbolic_exprs, compile_static_expr as compile_symbolic_static_expr,
     ResolvedScalarExpr, RowExprResolver, RowLayout, ScalarInputKind, ScalarInputSource,
+    SymbolicRows,
 };
 pub use translator::{
     resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,

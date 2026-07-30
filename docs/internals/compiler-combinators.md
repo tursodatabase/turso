@@ -107,12 +107,12 @@ moves. This makes register coalescing and reuse independent of edge-copy order.
 
 The current IR supports straight-line scalar operations, conditional diamonds,
 explicit loops with block parameters, and effectful cursor folds and row
-production. A production SELECT path uses these pieces for a forward scan of
-one B-tree table. Its frontend first resolves an owned scalar description, then
-compiles that description against each symbolic row. Columns, literals,
-numeric and bitwise arithmetic, three-valued `AND` and `OR`, both forms of
-`CASE`, parentheses, collation wrappers, and ordinary comparisons can be nested
-and shared by both result expressions and predicates.
+production. A production SELECT path uses these pieces for B-tree scans and a
+first two-table inner nested-loop join. Its frontend first resolves an owned
+scalar description, then compiles that description against each symbolic row
+set. Columns, literals, numeric and bitwise arithmetic, three-valued `AND` and
+`OR`, both forms of `CASE`, parentheses, collation wrappers, and ordinary
+comparisons can be nested and shared by both result expressions and predicates.
 It composes `scan_table`, row-stream operators, scalar projection, and
 `result_row`, then builds and verifies the complete IR before touching
 `ProgramBuilder`.
@@ -124,6 +124,15 @@ consumer; false and NULL rows proceed directly to cursor advance. A map runs a
 deferred compiler and changes the item type, so SELECT projection is expressed
 as `filter(...).map(...).for_each(result_row)` rather than being embedded in the
 terminal consumer.
+`flat_map` gives nested row production the same shape as Rust's iterator
+adapter. The first production join composes two ordinary B-tree scan sources,
+opens both resources before entering the outer loop, and maps each outer row to
+a fresh traversal of the inner stream. Each yielded item contains ordered
+symbolic row slots. SQL table identities are resolved to those slots before IR
+construction, so join predicates and projections can reference either row
+without leaking SQL identifiers into the compiler IR. Filtering, sorting,
+distinctness, slicing, and destinations then consume the joined stream through
+the same operators as a single-table scan.
 Short-circuiting consumers use an SSA `try_fold` protocol: each accepted item
 returns a state pack and a symbolic continuation value. A false continuation
 branches directly to the loop exit, while a true continuation reaches the
@@ -178,8 +187,10 @@ each `WHEN` arm. The compiler evaluates the base once, retains its `ValueId`,
 and composes each ordered arm from `then`, `and_then`, comparison, and `branch`;
 NULL comparison results follow the false arm, as required by SQLite.
 The path also falls back when SQL semantics still live in the eager frontend:
-other expression forms, joins, aggregates, most subquery forms, generated
-values, arrays, and custom-type decoding.
+other expression forms, outer and semi/anti joins, join inputs selected through
+indexes or dependent seeks, joins wider than two tables or spanning attached
+databases, aggregates, most subquery forms, generated values, arrays, and
+custom-type decoding.
 `EXPLAIN QUERY PLAN` also remains on the eager path until the IR models
 explain-tree effects.
 Ordinary column lowering does reuse the VDBE backend's logical-column helper, so

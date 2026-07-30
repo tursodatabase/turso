@@ -9,12 +9,13 @@ use crate::{
         compiler::{
             bind_cursor_input, constant, cursor_input, cursor_values, declare_ephemeral_index,
             initialize_cursor_once, insert_index_pack, literal_values,
-            open_declared_ephemeral_index, open_ephemeral_index, pack_values, result_row_pack,
-            scan_index, scan_table, seek_in_values, seek_index, seek_rowid, seek_table_range,
-            select_pack, BoxedCompile, Compile, CompileRegion, CursorId, CursorInputId,
-            DeferredIndexBound, DeferredIndexRange, DeferredTableBound, DeferredTableRange,
-            InputProducer, InputRequirement, InputRequirements, InputSlot, PhysicalInputBinding,
-            Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId, ValuePack,
+            open_declared_ephemeral_index, open_ephemeral_index, pack_values, pure,
+            result_row_pack, scan_index, scan_table, seek_in_values, seek_index, seek_rowid,
+            seek_table_range, select_pack, BoxedCompile, Compile, CompileRegion, CursorId,
+            CursorInputId, DeferredIndexBound, DeferredIndexRange, DeferredTableBound,
+            DeferredTableRange, InputProducer, InputRequirement, InputRequirements, InputSlot,
+            PhysicalInputBinding, Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId,
+            ValuePack,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -24,16 +25,16 @@ use crate::{
         expr::{
             compile_symbolic_conjunction, compile_symbolic_expr, compile_symbolic_exprs,
             compile_symbolic_static_expr, ResolvedScalarExpr, RowExprResolver, RowLayout,
-            ScalarInputKind, ScalarInputSource,
+            ScalarInputKind, ScalarInputSource, SymbolicRows,
         },
         group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
         order_by::{custom_type_comparator, EmitOrderBy},
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, InSeekSource, IndexMethodQuery,
-            IterationDirection, JoinOrderMember, Operation, Plan, QueryDestination, Scan, Search,
-            SeekDef, SeekKey, SeekKeyComponent, SelectPlan, SimpleAggregate, SubqueryEvalPhase,
-            SubqueryState, TableReferences,
+            IterationDirection, JoinOrderMember, JoinType, Operation, Plan, QueryDestination, Scan,
+            Search, SeekDef, SeekKey, SeekKeyComponent, SelectPlan, SimpleAggregate,
+            SubqueryEvalPhase, SubqueryState, TableReferences,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -737,6 +738,16 @@ fn try_compile_declarative_table_scan(
         _ => return Ok(None),
     };
 
+    if plan.join_order.len() == 2 {
+        return try_compile_declarative_inner_join(
+            resolver,
+            plan,
+            destination,
+            destination_index,
+            inputs,
+        );
+    }
+
     let [joined] = plan.table_references.joined_tables() else {
         return Ok(None);
     };
@@ -1041,98 +1052,11 @@ fn try_compile_declarative_table_scan(
         DeclarativeBtreeAccess::IndexRange { .. } => return Ok(None),
         _ => None,
     };
-    let mut sort_keys = SmallVec::<[SortKey; 4]>::with_capacity(plan.order_by.len());
-    let mut sort_expressions =
-        SmallVec::<[ResolvedScalarExpr; 4]>::with_capacity(plan.order_by.len());
-    for (expression, order, nulls) in &plan.order_by {
-        let Some(resolved) = expr_resolver.resolve(expression)? else {
-            return Ok(None);
-        };
-        let collation = get_collseq_from_expr_with_symbols(
-            expression,
-            &plan.table_references,
-            Some(resolver.symbol_table),
-        )?;
-        let comparator = resolver.with_schema(joined.database_id, |schema| {
-            custom_type_comparator(expression, &plan.table_references, schema)
-        });
-        sort_keys.push(SortKey::new(*order, collation, *nulls, comparator));
-        sort_expressions.push(resolved);
-    }
-    let limit = match plan.limit.as_deref() {
-        None => None,
-        Some(limit) => {
-            let Some(limit) = expr_resolver.resolve(limit)? else {
-                return Ok(None);
-            };
-            let Some(limit) = compile_symbolic_static_expr(&limit) else {
-                return Ok(None);
-            };
-            Some(limit)
-        }
+    let Some(body) =
+        resolve_declarative_select_body(plan, resolver, &mut expr_resolver, joined.database_id, 0)?
+    else {
+        return Ok(None);
     };
-    let offset = match plan.offset.as_deref() {
-        None => None,
-        Some(offset) => {
-            let Some(offset) = expr_resolver.resolve(offset)? else {
-                return Ok(None);
-            };
-            let Some(offset) = compile_symbolic_static_expr(&offset) else {
-                return Ok(None);
-            };
-            Some(offset)
-        }
-    };
-    let mut projections =
-        SmallVec::<[ResolvedScalarExpr; 4]>::with_capacity(plan.result_columns.len());
-    for result_column in &plan.result_columns {
-        let Some(expression) = expr_resolver.resolve(&result_column.expr)? else {
-            return Ok(None);
-        };
-        projections.push(expression);
-    }
-    let distinct_collations = if matches!(plan.distinctness, Distinctness::Distinct { .. }) {
-        Some(
-            plan.result_columns
-                .iter()
-                .map(|column| {
-                    get_collseq_from_expr_with_symbols(
-                        &column.expr,
-                        &plan.table_references,
-                        Some(resolver.symbol_table),
-                    )
-                    .map(|collation| collation.unwrap_or(CollationSeq::Binary))
-                })
-                .collect::<Result<SmallVec<[CollationSeq; 4]>>>()?,
-        )
-    } else {
-        None
-    };
-
-    let mut predicates = SmallVec::<[ResolvedScalarExpr; 2]>::new();
-    for predicate in &plan.where_clause {
-        if predicate.consumed {
-            continue;
-        }
-        if predicate.from_outer_join.is_some()
-            || !(predicate.should_eval_at_loop(
-                0,
-                &plan.join_order,
-                &plan.non_from_clause_subqueries,
-                Some(&plan.table_references),
-            ) || predicate.should_eval_before_loop(
-                &plan.join_order,
-                &plan.non_from_clause_subqueries,
-                Some(&plan.table_references),
-            ))
-        {
-            return Ok(None);
-        }
-        let Some(predicate) = expr_resolver.resolve(&predicate.expr)? else {
-            return Ok(None);
-        };
-        predicates.push(predicate);
-    }
 
     let Some(dependencies) = validate_and_order_declarative_dependencies(
         plan,
@@ -1149,16 +1073,6 @@ fn try_compile_declarative_table_scan(
     let table = table.clone();
     let database_id = joined.database_id;
     let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
-    let result_column_count = projections.len();
-    let body = DeclarativeSelectBody {
-        predicates,
-        projections,
-        sort_expressions,
-        sort_keys,
-        result_column_count,
-        distinct_collations,
-        slice: DeclarativeSlice { limit, offset },
-    };
     let compiler = match access {
         DeclarativeBtreeAccess::RowidEq(_) => body.into_compiler(
             seek_rowid(
@@ -1231,6 +1145,127 @@ fn try_compile_declarative_table_scan(
     }))
 }
 
+fn try_compile_declarative_inner_join(
+    resolver: &Resolver,
+    plan: &SelectPlan,
+    destination: DeclarativeSelectDestination,
+    destination_index: Option<Arc<Index>>,
+    mut inputs: InputRequirements<DeclarativeInputSource>,
+) -> Result<Option<DeclarativeSelectProgram>> {
+    let [outer_member, inner_member] = plan.join_order.as_slice() else {
+        return Ok(None);
+    };
+    let joined_tables = plan.table_references.joined_tables();
+    let [_, _] = joined_tables else {
+        return Ok(None);
+    };
+    let Some(outer) = joined_tables.get(outer_member.original_idx) else {
+        return Ok(None);
+    };
+    let Some(inner) = joined_tables.get(inner_member.original_idx) else {
+        return Ok(None);
+    };
+    if outer_member.table_id != outer.internal_id
+        || inner_member.table_id != inner.internal_id
+        || outer_member.original_idx == inner_member.original_idx
+        || outer_member.is_outer
+        || inner_member.is_outer
+        || outer.database_id != inner.database_id
+        || joined_tables.iter().any(|joined| {
+            joined
+                .join_info
+                .as_ref()
+                .is_some_and(|info| info.join_type != JoinType::Inner)
+        })
+    {
+        return Ok(None);
+    }
+
+    let (outer_direction, inner_direction) = match (&outer.op, &inner.op) {
+        (
+            Operation::Scan(Scan::BTreeTable {
+                iter_dir: outer_direction,
+                index: None,
+            }),
+            Operation::Scan(Scan::BTreeTable {
+                iter_dir: inner_direction,
+                index: None,
+            }),
+        ) => (
+            match outer_direction {
+                IterationDirection::Forwards => ScanDirection::Forward,
+                IterationDirection::Backwards => ScanDirection::Reverse,
+            },
+            match inner_direction {
+                IterationDirection::Forwards => ScanDirection::Forward,
+                IterationDirection::Backwards => ScanDirection::Reverse,
+            },
+        ),
+        _ => return Ok(None),
+    };
+    let (Table::BTree(outer_table), Table::BTree(inner_table)) = (&outer.table, &inner.table)
+    else {
+        return Ok(None);
+    };
+
+    let mut expr_resolver = RowExprResolver::new(
+        resolver,
+        outer.database_id,
+        outer.internal_id,
+        outer_table,
+        RowLayout::Table,
+        &plan.table_references,
+    );
+    expr_resolver.add_source(
+        inner.database_id,
+        inner.internal_id,
+        inner_table,
+        RowLayout::Table,
+    );
+    let Some(body) =
+        resolve_declarative_select_body(plan, resolver, &mut expr_resolver, outer.database_id, 1)?
+    else {
+        return Ok(None);
+    };
+    let Some(dependencies) = validate_and_order_declarative_dependencies(
+        plan,
+        None,
+        expr_resolver.into_scalar_inputs(),
+    )?
+    else {
+        return Ok(None);
+    };
+    for dependency in dependencies {
+        inputs.declare(dependency)?;
+    }
+
+    let database_id = outer.database_id;
+    let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
+    let scans = scan_table(
+        outer_table.clone(),
+        database_id,
+        schema_cookie,
+        outer_direction,
+    )
+    .then(scan_table(
+        inner_table.clone(),
+        database_id,
+        schema_cookie,
+        inner_direction,
+    ))
+    .map(|(outer_rows, inner_rows)| {
+        outer_rows.flat_map(move |outer_row| {
+            pure(inner_rows.map(move |inner_row| pure(SymbolicRows::pair(outer_row, inner_row))))
+        })
+    });
+    let compiler = body.into_symbolic_compiler(scans, destination, inputs);
+    Ok(Some(DeclarativeSelectProgram {
+        compiler,
+        destination_index,
+        result_column_count: plan.result_columns.len(),
+    }))
+}
+
 struct DeclarativeSlice {
     limit: Option<BoxedCompile<ValueId>>,
     offset: Option<BoxedCompile<ValueId>>,
@@ -1251,6 +1286,120 @@ struct DeclarativeSelectBody {
     slice: DeclarativeSlice,
 }
 
+fn resolve_declarative_select_body(
+    plan: &SelectPlan,
+    resolver: &Resolver,
+    expr_resolver: &mut RowExprResolver<'_, '_>,
+    database_id: usize,
+    last_loop_index: usize,
+) -> Result<Option<DeclarativeSelectBody>> {
+    let mut sort_keys = SmallVec::<[SortKey; 4]>::with_capacity(plan.order_by.len());
+    let mut sort_expressions =
+        SmallVec::<[ResolvedScalarExpr; 4]>::with_capacity(plan.order_by.len());
+    for (expression, order, nulls) in &plan.order_by {
+        let Some(resolved) = expr_resolver.resolve(expression)? else {
+            return Ok(None);
+        };
+        let collation = get_collseq_from_expr_with_symbols(
+            expression,
+            &plan.table_references,
+            Some(resolver.symbol_table),
+        )?;
+        let comparator = resolver.with_schema(database_id, |schema| {
+            custom_type_comparator(expression, &plan.table_references, schema)
+        });
+        sort_keys.push(SortKey::new(*order, collation, *nulls, comparator));
+        sort_expressions.push(resolved);
+    }
+
+    let limit = match plan.limit.as_deref() {
+        None => None,
+        Some(limit) => {
+            let Some(limit) = expr_resolver.resolve(limit)? else {
+                return Ok(None);
+            };
+            let Some(limit) = compile_symbolic_static_expr(&limit) else {
+                return Ok(None);
+            };
+            Some(limit)
+        }
+    };
+    let offset = match plan.offset.as_deref() {
+        None => None,
+        Some(offset) => {
+            let Some(offset) = expr_resolver.resolve(offset)? else {
+                return Ok(None);
+            };
+            let Some(offset) = compile_symbolic_static_expr(&offset) else {
+                return Ok(None);
+            };
+            Some(offset)
+        }
+    };
+
+    let mut projections =
+        SmallVec::<[ResolvedScalarExpr; 4]>::with_capacity(plan.result_columns.len());
+    for result_column in &plan.result_columns {
+        let Some(expression) = expr_resolver.resolve(&result_column.expr)? else {
+            return Ok(None);
+        };
+        projections.push(expression);
+    }
+    let distinct_collations = if matches!(plan.distinctness, Distinctness::Distinct { .. }) {
+        Some(
+            plan.result_columns
+                .iter()
+                .map(|column| {
+                    get_collseq_from_expr_with_symbols(
+                        &column.expr,
+                        &plan.table_references,
+                        Some(resolver.symbol_table),
+                    )
+                    .map(|collation| collation.unwrap_or(CollationSeq::Binary))
+                })
+                .collect::<Result<SmallVec<[CollationSeq; 4]>>>()?,
+        )
+    } else {
+        None
+    };
+
+    let mut predicates = SmallVec::<[ResolvedScalarExpr; 2]>::new();
+    for predicate in &plan.where_clause {
+        if predicate.consumed {
+            continue;
+        }
+        let can_evaluate = predicate.should_eval_before_loop(
+            &plan.join_order,
+            &plan.non_from_clause_subqueries,
+            Some(&plan.table_references),
+        ) || (0..=last_loop_index).any(|loop_index| {
+            predicate.should_eval_at_loop(
+                loop_index,
+                &plan.join_order,
+                &plan.non_from_clause_subqueries,
+                Some(&plan.table_references),
+            )
+        });
+        if predicate.from_outer_join.is_some() || !can_evaluate {
+            return Ok(None);
+        }
+        let Some(predicate) = expr_resolver.resolve(&predicate.expr)? else {
+            return Ok(None);
+        };
+        predicates.push(predicate);
+    }
+
+    Ok(Some(DeclarativeSelectBody {
+        predicates,
+        result_column_count: projections.len(),
+        projections,
+        sort_expressions,
+        sort_keys,
+        distinct_collations,
+        slice: DeclarativeSlice { limit, offset },
+    }))
+}
+
 impl DeclarativeSelectBody {
     fn into_compiler<Scan, Rows>(
         self,
@@ -1261,6 +1410,23 @@ impl DeclarativeSelectBody {
     where
         Scan: Compile<Output = Rows> + 'static,
         Rows: RowStream<Item = Row> + 'static,
+    {
+        self.into_symbolic_compiler(
+            scan.and_then(|rows| pure(rows.map(|row| pure(SymbolicRows::single(row))))),
+            destination,
+            inputs,
+        )
+    }
+
+    fn into_symbolic_compiler<Scan, Rows>(
+        self,
+        scan: Scan,
+        destination: DeclarativeSelectDestination,
+        inputs: InputRequirements<DeclarativeInputSource>,
+    ) -> DeclarativeSelectCompiler
+    where
+        Scan: Compile<Output = Rows> + 'static,
+        Rows: RowStream<Item = SymbolicRows> + 'static,
     {
         match destination {
             DeclarativeSelectDestination::ResultRows => {
@@ -1302,7 +1468,7 @@ impl DeclarativeSelectBody {
     fn exists<Scan, Rows>(self, scan: Scan) -> BoxedCompile<ValueId>
     where
         Scan: Compile<Output = Rows> + 'static,
-        Rows: RowStream<Item = Row> + 'static,
+        Rows: RowStream<Item = SymbolicRows> + 'static,
     {
         let Self {
             predicates,
@@ -1314,7 +1480,7 @@ impl DeclarativeSelectBody {
                 compile_declarative_exists(rows, limit, offset)
             } else {
                 compile_declarative_exists(
-                    rows.filter(move |row| compile_symbolic_conjunction(row, &predicates)),
+                    rows.filter(move |rows| compile_symbolic_conjunction(&rows, &predicates)),
                     limit,
                     offset,
                 )
@@ -1326,7 +1492,7 @@ impl DeclarativeSelectBody {
     fn row_value<Scan, Rows>(self, scan: Scan) -> BoxedCompile<ValueId>
     where
         Scan: Compile<Output = Rows> + 'static,
-        Rows: RowStream<Item = Row> + 'static,
+        Rows: RowStream<Item = SymbolicRows> + 'static,
     {
         let Self {
             predicates,
@@ -1343,7 +1509,7 @@ impl DeclarativeSelectBody {
                 compile_declarative_row_value(rows, projection, limit, offset)
             } else {
                 compile_declarative_row_value(
-                    rows.filter(move |row| compile_symbolic_conjunction(row, &predicates)),
+                    rows.filter(move |rows| compile_symbolic_conjunction(&rows, &predicates)),
                     projection,
                     limit,
                     offset,
@@ -1356,7 +1522,7 @@ impl DeclarativeSelectBody {
     fn with_sink<Scan, Rows>(self, scan: Scan, sink: DeclarativePackSink) -> BoxedCompile<()>
     where
         Scan: Compile<Output = Rows> + 'static,
-        Rows: RowStream<Item = Row> + 'static,
+        Rows: RowStream<Item = SymbolicRows> + 'static,
     {
         let Self {
             predicates,
@@ -1381,7 +1547,7 @@ impl DeclarativeSelectBody {
                 )
             } else {
                 compile_declarative_rows(
-                    rows.filter(move |row| compile_symbolic_conjunction(row, &predicates)),
+                    rows.filter(move |rows| compile_symbolic_conjunction(&rows, &predicates)),
                     projections,
                     sort_expressions,
                     sort_keys,
@@ -1418,24 +1584,24 @@ fn compile_declarative_row_value<Stream>(
     offset: Option<BoxedCompile<ValueId>>,
 ) -> BoxedCompile<ValueId>
 where
-    Stream: RowStream<Item = Row> + 'static,
+    Stream: RowStream<Item = SymbolicRows> + 'static,
 {
     match (limit, offset) {
         (Some(limit), Some(offset)) => rows
             .skip(offset)
-            .map(move |row| compile_symbolic_expr(row, &projection))
+            .map(move |rows| compile_symbolic_expr(&rows, &projection))
             .take(limit)
             .first_or(constant(Value::Null)),
         (Some(limit), None) => rows
-            .map(move |row| compile_symbolic_expr(row, &projection))
+            .map(move |rows| compile_symbolic_expr(&rows, &projection))
             .take(limit)
             .first_or(constant(Value::Null)),
         (None, Some(offset)) => rows
             .skip(offset)
-            .map(move |row| compile_symbolic_expr(row, &projection))
+            .map(move |rows| compile_symbolic_expr(&rows, &projection))
             .first_or(constant(Value::Null)),
         (None, None) => rows
-            .map(move |row| compile_symbolic_expr(row, &projection))
+            .map(move |rows| compile_symbolic_expr(&rows, &projection))
             .first_or(constant(Value::Null)),
     }
 }
@@ -1450,7 +1616,7 @@ fn compile_declarative_rows<Stream>(
     terminal: DeclarativeTerminal,
 ) -> BoxedCompile<()>
 where
-    Stream: RowStream<Item = Row> + 'static,
+    Stream: RowStream<Item = SymbolicRows> + 'static,
 {
     if sort_keys.is_empty() {
         let DeclarativeTerminal {
@@ -1491,10 +1657,10 @@ fn compile_declarative_distinct_projection<Stream>(
     sink: DeclarativePackSink,
 ) -> BoxedCompile<()>
 where
-    Stream: RowStream<Item = Row> + 'static,
+    Stream: RowStream<Item = SymbolicRows> + 'static,
 {
     let rows = rows
-        .map(move |row| compile_symbolic_exprs(row, &projections))
+        .map(move |rows| compile_symbolic_exprs(&rows, &projections))
         .distinct(collations);
     match (limit, offset) {
         (Some(limit), Some(offset)) => rows
@@ -1523,11 +1689,11 @@ fn compile_declarative_sorted_projection<Stream>(
     terminal: DeclarativeTerminal,
 ) -> BoxedCompile<()>
 where
-    Stream: RowStream<Item = Row> + 'static,
+    Stream: RowStream<Item = SymbolicRows> + 'static,
 {
     let key_count = sort_keys.len();
     let record_width = expressions.len();
-    let rows = rows.map(move |row| compile_symbolic_exprs(row, &expressions));
+    let rows = rows.map(move |rows| compile_symbolic_exprs(&rows, &expressions));
     if let Some(collations) = distinct_collations {
         compile_declarative_sorted_stream(
             rows.distinct_by(collations, move |pack| {
@@ -1605,27 +1771,27 @@ fn compile_declarative_projection<Stream>(
     sink: DeclarativePackSink,
 ) -> BoxedCompile<()>
 where
-    Stream: RowStream<Item = Row> + 'static,
+    Stream: RowStream<Item = SymbolicRows> + 'static,
 {
     match (limit, offset) {
         (Some(limit), Some(offset)) => rows
             .skip(offset)
-            .map(move |row| compile_symbolic_exprs(row, &projections))
+            .map(move |rows| compile_symbolic_exprs(&rows, &projections))
             .take(limit)
             .for_each(move |pack| sink.consume(pack))
             .boxed(),
         (Some(limit), None) => rows
-            .map(move |row| compile_symbolic_exprs(row, &projections))
+            .map(move |rows| compile_symbolic_exprs(&rows, &projections))
             .take(limit)
             .for_each(move |pack| sink.consume(pack))
             .boxed(),
         (None, Some(offset)) => rows
             .skip(offset)
-            .map(move |row| compile_symbolic_exprs(row, &projections))
+            .map(move |rows| compile_symbolic_exprs(&rows, &projections))
             .for_each(move |pack| sink.consume(pack))
             .boxed(),
         (None, None) => rows
-            .map(move |row| compile_symbolic_exprs(row, &projections))
+            .map(move |rows| compile_symbolic_exprs(&rows, &projections))
             .for_each(move |pack| sink.consume(pack))
             .boxed(),
     }
@@ -4596,6 +4762,66 @@ mod tests {
                 vec![Value::from_i64(4), Value::from_text("two")],
                 vec![Value::Null, Value::from_text("other")],
                 vec![Value::from_i64(99), Value::from_text("other")],
+            ]
+        );
+    }
+
+    #[test]
+    fn inner_join_crosses_the_declarative_compiler_boundary() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute("CREATE TABLE join_left(id INTEGER, a INTEGER)")
+            .unwrap();
+        connection
+            .execute(
+                "CREATE TABLE join_right(\
+                     id INTEGER, left_id INTEGER, b INTEGER\
+                 )",
+            )
+            .unwrap();
+        connection
+            .execute("INSERT INTO join_left VALUES (1, 10), (2, 20), (3, NULL)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO join_right VALUES \
+                 (1, 1, 2), (2, 1, 3), (3, 2, 4), (4, 2, 5), (5, 3, 1)",
+            )
+            .unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT l.id, l.a + r.b, r.b \
+                   FROM join_left AS l JOIN join_right AS r ON r.left_id = l.id \
+                  WHERE l.a >= r.b \
+                  ORDER BY r.b DESC, l.id \
+                  LIMIT 2 OFFSET 1",
+            )
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::Rewind { .. }))
+                .count(),
+            2,
+            "the composed stream must rewind each table cursor"
+        );
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::SorterOpen { .. })));
+        instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 3, .. }))
+            .expect("declarative join must produce one three-value result pack");
+
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(2), Value::from_i64(24), Value::from_i64(4),],
+                vec![Value::from_i64(1), Value::from_i64(13), Value::from_i64(3),],
             ]
         );
     }

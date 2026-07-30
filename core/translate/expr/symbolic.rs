@@ -27,9 +27,16 @@ use super::{comparison_affinity, comparison_collation};
 /// Compiling it later only needs the symbolic row that supplies its columns.
 pub(crate) enum ResolvedScalarExpr {
     Input(InputId),
-    Column(usize),
-    RowId,
-    IndexRowId,
+    Column {
+        row: usize,
+        column: usize,
+    },
+    RowId {
+        row: usize,
+    },
+    IndexRowId {
+        row: usize,
+    },
     Parameter(Variable),
     Constant(Value),
     Arithmetic {
@@ -84,13 +91,46 @@ pub(crate) enum RowLayout<'a> {
     CoveringIndex(&'a Index),
 }
 
-/// Resolves expressions for one symbolic B-tree row without emitting bytecode.
-pub(crate) struct RowExprResolver<'a, 'schema> {
-    resolver: &'a Resolver<'schema>,
+#[derive(Clone, Copy)]
+struct ResolvedRowSource<'a> {
     database_id: usize,
     table_id: TableInternalId,
     table: &'a BTreeTable,
     layout: RowLayout<'a>,
+}
+
+/// The ordered symbolic rows visible while compiling one stream item.
+///
+/// Positions are compiler-local identities. SQL table identities are resolved
+/// to these positions before the compiler description is constructed.
+#[derive(Clone)]
+pub(crate) struct SymbolicRows {
+    rows: SmallVec<[Row; 2]>,
+}
+
+impl SymbolicRows {
+    pub(crate) fn single(row: Row) -> Self {
+        Self {
+            rows: smallvec::smallvec![row],
+        }
+    }
+
+    pub(crate) fn pair(first: Row, second: Row) -> Self {
+        Self {
+            rows: smallvec::smallvec![first, second],
+        }
+    }
+
+    fn get(&self, position: usize) -> Option<Row> {
+        self.rows.get(position).copied()
+    }
+}
+
+/// Resolves expressions for an ordered set of symbolic B-tree rows without
+/// emitting bytecode.
+pub(crate) struct RowExprResolver<'a, 'schema> {
+    resolver: &'a Resolver<'schema>,
+    rows: SmallVec<[ResolvedRowSource<'a>; 2]>,
     referenced_tables: &'a TableReferences,
     scalar_inputs: InputRequirements<ScalarInputSource>,
 }
@@ -106,13 +146,34 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
     ) -> Self {
         Self {
             resolver,
+            rows: smallvec::smallvec![ResolvedRowSource {
+                database_id,
+                table_id,
+                table,
+                layout,
+            }],
+            referenced_tables,
+            scalar_inputs: InputRequirements::new(),
+        }
+    }
+
+    pub(crate) fn add_source(
+        &mut self,
+        database_id: usize,
+        table_id: TableInternalId,
+        table: &'a BTreeTable,
+        layout: RowLayout<'a>,
+    ) {
+        assert!(
+            self.rows.iter().all(|source| source.table_id != table_id),
+            "a symbolic row source must have a unique SQL table identity"
+        );
+        self.rows.push(ResolvedRowSource {
             database_id,
             table_id,
             table,
             layout,
-            referenced_tables,
-            scalar_inputs: InputRequirements::new(),
-        }
+        });
     }
 
     pub(crate) fn into_scalar_inputs(self) -> InputRequirements<ScalarInputSource> {
@@ -204,18 +265,23 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
         column: usize,
         is_rowid_alias: bool,
     ) -> Result<Option<ResolvedScalarExpr>> {
-        if expr_table != self.table_id {
+        let Some((row, source)) = self
+            .rows
+            .iter()
+            .enumerate()
+            .find(|(_, source)| source.table_id == expr_table)
+        else {
             return Ok(None);
-        }
-        let column_definition = self.table.columns().get(column).ok_or_else(|| {
+        };
+        let column_definition = source.table.columns().get(column).ok_or_else(|| {
             LimboError::InternalError(format!(
                 "SELECT plan references column {column} outside table {}",
-                self.table.name
+                source.table.name
             ))
         })?;
         let requires_frontend_decoding = column_definition.is_virtual_generated()
             || column_definition.is_array()
-            || self.resolver.with_schema(self.database_id, |schema| {
+            || self.resolver.with_schema(source.database_id, |schema| {
                 schema
                     .get_type_def_unchecked(&column_definition.ty_str)
                     .is_some()
@@ -226,33 +292,44 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
         if is_rowid_alias {
             return self.resolve_rowid(expr_table);
         }
-        match self.layout {
-            RowLayout::Table => Ok(Some(ResolvedScalarExpr::Column(column))),
+        match source.layout {
+            RowLayout::Table => Ok(Some(ResolvedScalarExpr::Column { row, column })),
             RowLayout::CoveringIndex(index) => {
                 let index_column =
                     index.column_table_pos_to_index_pos(column).ok_or_else(|| {
                         LimboError::InternalError(format!(
                             "covering index {} does not contain column {column} of table {}",
-                            index.name, self.table.name
+                            index.name, source.table.name
                         ))
                     })?;
-                Ok(Some(ResolvedScalarExpr::Column(index_column)))
+                Ok(Some(ResolvedScalarExpr::Column {
+                    row,
+                    column: index_column,
+                }))
             }
         }
     }
 
     fn resolve_rowid(&self, expr_table: TableInternalId) -> Result<Option<ResolvedScalarExpr>> {
-        if expr_table != self.table_id || !self.table.has_rowid {
+        let Some((row, source)) = self
+            .rows
+            .iter()
+            .enumerate()
+            .find(|(_, source)| source.table_id == expr_table)
+        else {
+            return Ok(None);
+        };
+        if !source.table.has_rowid {
             return Ok(None);
         }
-        match self.layout {
-            RowLayout::Table => Ok(Some(ResolvedScalarExpr::RowId)),
+        match source.layout {
+            RowLayout::Table => Ok(Some(ResolvedScalarExpr::RowId { row })),
             RowLayout::CoveringIndex(index) if index.has_rowid => {
-                Ok(Some(ResolvedScalarExpr::IndexRowId))
+                Ok(Some(ResolvedScalarExpr::IndexRowId { row }))
             }
             RowLayout::CoveringIndex(index) => Err(LimboError::InternalError(format!(
                 "covering index {} cannot supply rowid for table {}",
-                index.name, self.table.name
+                index.name, source.table.name
             ))),
         }
     }
@@ -441,9 +518,12 @@ const fn arithmetic_op(operator: Operator) -> Option<ArithmeticOp> {
     }
 }
 
-/// Builds a compiler for one resolved expression against a symbolic row.
-pub(crate) fn compile_expr(row: Row, expr: &ResolvedScalarExpr) -> BoxedCompile<ValueId> {
-    try_compile_expr(Some(row), expr)
+/// Builds a compiler for one resolved expression against symbolic rows.
+pub(crate) fn compile_expr(
+    rows: &SymbolicRows,
+    expr: &ResolvedScalarExpr,
+) -> BoxedCompile<ValueId> {
+    try_compile_expr(Some(rows), expr)
         .expect("row-backed symbolic expressions must have a column source")
 }
 
@@ -452,17 +532,22 @@ pub(crate) fn compile_static_expr(expr: &ResolvedScalarExpr) -> Option<BoxedComp
     try_compile_expr(None, expr)
 }
 
-fn try_compile_expr(row: Option<Row>, expr: &ResolvedScalarExpr) -> Option<BoxedCompile<ValueId>> {
+fn try_compile_expr(
+    rows: Option<&SymbolicRows>,
+    expr: &ResolvedScalarExpr,
+) -> Option<BoxedCompile<ValueId>> {
     match expr {
         ResolvedScalarExpr::Input(input_id) => Some(input(*input_id).boxed()),
-        ResolvedScalarExpr::Column(column) => Some(row?.column(*column).boxed()),
-        ResolvedScalarExpr::RowId => Some(row?.rowid().boxed()),
-        ResolvedScalarExpr::IndexRowId => Some(row?.index_rowid().boxed()),
+        ResolvedScalarExpr::Column { row, column } => {
+            Some(rows?.get(*row)?.column(*column).boxed())
+        }
+        ResolvedScalarExpr::RowId { row } => Some(rows?.get(*row)?.rowid().boxed()),
+        ResolvedScalarExpr::IndexRowId { row } => Some(rows?.get(*row)?.index_rowid().boxed()),
         ResolvedScalarExpr::Parameter(variable) => Some(parameter(variable.clone()).boxed()),
         ResolvedScalarExpr::Constant(value) => Some(constant(value.clone()).boxed()),
         ResolvedScalarExpr::Arithmetic { op, lhs, rhs } => Some(
-            try_compile_expr(row, lhs)?
-                .then(try_compile_expr(row, rhs)?)
+            try_compile_expr(rows, lhs)?
+                .then(try_compile_expr(rows, rhs)?)
                 .and_then({
                     let op = *op;
                     move |(lhs, rhs)| arithmetic(op, lhs, rhs)
@@ -470,8 +555,8 @@ fn try_compile_expr(row: Option<Row>, expr: &ResolvedScalarExpr) -> Option<Boxed
                 .boxed(),
         ),
         ResolvedScalarExpr::Logical { op, lhs, rhs } => Some(
-            try_compile_expr(row, lhs)?
-                .then(try_compile_expr(row, rhs)?)
+            try_compile_expr(rows, lhs)?
+                .then(try_compile_expr(rows, rhs)?)
                 .and_then({
                     let op = *op;
                     move |(lhs, rhs)| logical(op, lhs, rhs)
@@ -483,8 +568,8 @@ fn try_compile_expr(row: Option<Row>, expr: &ResolvedScalarExpr) -> Option<Boxed
             rhs,
             comparison,
         } => Some(
-            try_compile_expr(row, lhs)?
-                .then(try_compile_expr(row, rhs)?)
+            try_compile_expr(rows, lhs)?
+                .then(try_compile_expr(rows, rhs)?)
                 .and_then({
                     let comparison = *comparison;
                     move |(lhs, rhs)| compare(lhs, rhs, comparison)
@@ -494,49 +579,49 @@ fn try_compile_expr(row: Option<Row>, expr: &ResolvedScalarExpr) -> Option<Boxed
         ResolvedScalarExpr::Case {
             when_then_pairs,
             else_expr,
-        } => compile_case(row, when_then_pairs, else_expr),
+        } => compile_case(rows, when_then_pairs, else_expr),
         ResolvedScalarExpr::SimpleCase {
             base,
             when_then_pairs,
             else_expr,
-        } => compile_simple_case(row, base, when_then_pairs, else_expr),
+        } => compile_simple_case(rows, base, when_then_pairs, else_expr),
     }
 }
 
 fn compile_case(
-    row: Option<Row>,
+    rows: Option<&SymbolicRows>,
     when_then_pairs: &[(ResolvedScalarExpr, ResolvedScalarExpr)],
     else_expr: &ResolvedScalarExpr,
 ) -> Option<BoxedCompile<ValueId>> {
     let Some(((when_expr, then_expr), remaining)) = when_then_pairs.split_first() else {
-        return try_compile_expr(row, else_expr);
+        return try_compile_expr(rows, else_expr);
     };
     Some(
-        try_compile_expr(row, when_expr)?
+        try_compile_expr(rows, when_expr)?
             .branch(
-                try_compile_expr(row, then_expr)?,
-                compile_case(row, remaining, else_expr)?,
+                try_compile_expr(rows, then_expr)?,
+                compile_case(rows, remaining, else_expr)?,
             )
             .boxed(),
     )
 }
 
 fn compile_simple_case(
-    row: Option<Row>,
+    rows: Option<&SymbolicRows>,
     base: &ResolvedScalarExpr,
     when_then_pairs: &[ResolvedSimpleCaseArm],
     else_expr: &ResolvedScalarExpr,
 ) -> Option<BoxedCompile<ValueId>> {
-    let base = try_compile_expr(row, base)?;
+    let base = try_compile_expr(rows, base)?;
     let mut arms = Vec::with_capacity(when_then_pairs.len());
     for arm in when_then_pairs {
         arms.push((
-            try_compile_expr(row, &arm.when_expr)?,
-            try_compile_expr(row, &arm.then_expr)?,
+            try_compile_expr(rows, &arm.when_expr)?,
+            try_compile_expr(rows, &arm.then_expr)?,
             arm.comparison,
         ));
     }
-    let else_compiler = try_compile_expr(row, else_expr)?;
+    let else_compiler = try_compile_expr(rows, else_expr)?;
     Some(
         base.and_then(move |base| compile_simple_case_arms(base, arms.into_iter(), else_compiler))
             .boxed(),
@@ -563,25 +648,25 @@ fn compile_simple_case_arms(
 }
 
 /// Compiles expressions in source order into one symbolic register pack.
-pub(crate) fn compile_exprs(row: Row, expressions: &[ResolvedScalarExpr]) -> PackValues {
+pub(crate) fn compile_exprs(rows: &SymbolicRows, expressions: &[ResolvedScalarExpr]) -> PackValues {
     let mut compilers = SmallVec::with_capacity(expressions.len());
     for expression in expressions {
-        compilers.push(compile_expr(row, expression));
+        compilers.push(compile_expr(rows, expression));
     }
     pack_values(compilers)
 }
 
 /// Compiles a WHERE-clause conjunction with SQL short-circuit truthiness.
 pub(crate) fn compile_conjunction(
-    row: Row,
+    rows: &SymbolicRows,
     expressions: &[ResolvedScalarExpr],
 ) -> BoxedCompile<ValueId> {
     let Some((expression, remaining)) = expressions.split_first() else {
         return constant(Value::from_i64(1)).boxed();
     };
-    compile_expr(row, expression)
+    compile_expr(rows, expression)
         .branch(
-            compile_conjunction(row, remaining),
+            compile_conjunction(rows, remaining),
             constant(Value::from_i64(0)),
         )
         .boxed()
