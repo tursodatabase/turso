@@ -584,6 +584,13 @@ pub struct WindowRegisters {
     /// gates AGGINVERSE with it. Mirrors SQLite's `regStart`
     /// (window.c:2883).
     pub start_offset_reg: Option<usize>,
+    /// Register holding the runtime-evaluated `N` for frames whose end
+    /// boundary is `Preceding(_)` or `Following(_)`, gating the op that
+    /// must lag the frame end by N rows (pattern-dependent: the
+    /// RETURN_ROW / AGGINVERSE pair under a bounded FOLLOWING end, the
+    /// AGGSTEP under a PRECEDING end). Mirrors SQLite's `regEnd`
+    /// (window.c:2885-2887).
+    pub end_offset_reg: Option<usize>,
     /// Return-address register for the `labels.row_output` Gosub. Mirrors
     /// SQLite's `regGosub` (window.c:2793).
     pub row_output_return: usize,
@@ -680,7 +687,26 @@ fn emit_window_check_offset(
     let label_halt = program.allocate_label();
     let label_ok = program.allocate_label();
     let reg_zero = program.alloc_register();
-    if mode != FrameMode::Range {
+    if mode == FrameMode::Range {
+        // With NUMERIC affinity, numeric text is converted before this
+        // comparison and remains below the empty string. Non-numeric text
+        // and blobs compare at or above it; JUMP_IF_NULL catches NULL.
+        // Those invalid values branch directly to the frame-specific error.
+        let reg_empty = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            value: String::new(),
+            dest: reg_empty,
+        });
+        program.emit_insn(Insn::Ge {
+            lhs: offset_reg,
+            rhs: reg_empty,
+            target_pc: label_halt,
+            flags: crate::vdbe::insn::CmpInsFlags::default()
+                .jump_if_null()
+                .with_affinity(crate::vdbe::affinity::Affinity::Numeric),
+            collation: None,
+        });
+    } else {
         // ROWS / GROUPS: coerce to integer; route the failure into
         // the frame-specific Halt so the user sees the SQLite-matching
         // error instead of the generic "datatype mismatch".
@@ -697,7 +723,8 @@ fn emit_window_check_offset(
         lhs: offset_reg,
         rhs: reg_zero,
         target_pc: label_ok,
-        flags: crate::vdbe::insn::CmpInsFlags::default(),
+        flags: crate::vdbe::insn::CmpInsFlags::default()
+            .with_affinity(crate::vdbe::affinity::Affinity::Numeric),
         collation: None,
     });
     program.preassign_label_to_next_insn(label_halt);
@@ -941,6 +968,13 @@ impl EmitWindow {
                     }
                     _ => None,
                 },
+                end_offset_reg: match window.frame.end {
+                    crate::translate::plan::FrameBoundary::Preceding(_)
+                    | crate::translate::plan::FrameBoundary::Following(_) => {
+                        Some(program.alloc_register())
+                    }
+                    _ => None,
+                },
                 row_output_return: program.alloc_register(),
                 frame_counters,
             },
@@ -1107,6 +1141,29 @@ impl EmitWindow {
                 /* is_start = */ true,
             );
         }
+        if let Some(end_offset_reg) = registers.end_offset_reg {
+            let offset_expr = match &window.frame.end {
+                crate::translate::plan::FrameBoundary::Preceding(expr)
+                | crate::translate::plan::FrameBoundary::Following(expr) => expr,
+                _ => unreachable!(
+                    "end_offset_reg is only allocated when frame.end is Preceding/Following"
+                ),
+            };
+            translate_expr_no_constant_opt(
+                program,
+                Some(&plan.table_references),
+                offset_expr,
+                end_offset_reg,
+                &t_ctx.resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+            emit_window_check_offset(
+                program,
+                end_offset_reg,
+                window.frame.mode,
+                /* is_start = */ false,
+            );
+        }
         emit_insert_row_into_buffer(
             program,
             &registers,
@@ -1114,6 +1171,103 @@ impl EmitWindow {
             &src_column_count,
             &buffer_table_name,
         );
+        // Degenerate-frame check (window.c:2950-2961): for non-RANGE
+        // frames bounded on both sides by the same kind — `N PRECEDING
+        // AND M PRECEDING` or `N FOLLOWING AND M FOLLOWING` — the frame
+        // is empty for every row whenever the bounds cross (M > N for
+        // PRECEDING pairs, M < N for FOLLOWING pairs). Each row then
+        // emits its empty-frame value (aggregates finalize their
+        // never-stepped state, positional lookups yield NULL because the
+        // frame counters stay 0) and the buffer is cleared. Re-Nulling
+        // `rowid_reg` sends every subsequent row back through this
+        // branch — SQLite gets that re-entry for free because its
+        // first-row test is `rowid == 1` and ResetSorter restarts the
+        // rowids.
+        let same_kind_bounded = window.frame.mode != turso_parser::ast::FrameMode::Range
+            && matches!(
+                (&window.frame.start, &window.frame.end),
+                (
+                    crate::translate::plan::FrameBoundary::Preceding(_),
+                    crate::translate::plan::FrameBoundary::Preceding(_)
+                ) | (
+                    crate::translate::plan::FrameBoundary::Following(_),
+                    crate::translate::plan::FrameBoundary::Following(_)
+                )
+            );
+        if same_kind_bounded {
+            let start_offset_reg = registers
+                .start_offset_reg
+                .expect("same-kind bounded frames carry a start offset");
+            let end_offset_reg = registers
+                .end_offset_reg
+                .expect("same-kind bounded frames carry an end offset");
+            let label_frame_valid = program.allocate_label();
+            program.add_comment(program.offset(), "empty-frame check");
+            // FOLLOWING pair: valid iff end >= start. PRECEDING pair:
+            // valid iff end <= start. Mirrors the Ge/Le pick at
+            // window.c:2951.
+            if matches!(
+                window.frame.start,
+                crate::translate::plan::FrameBoundary::Following(_)
+            ) {
+                program.emit_insn(Insn::Ge {
+                    lhs: end_offset_reg,
+                    rhs: start_offset_reg,
+                    target_pc: label_frame_valid,
+                    flags: crate::vdbe::insn::CmpInsFlags::default(),
+                    collation: None,
+                });
+            } else {
+                program.emit_insn(Insn::Le {
+                    lhs: end_offset_reg,
+                    rhs: start_offset_reg,
+                    target_pc: label_frame_valid,
+                    flags: crate::vdbe::insn::CmpInsFlags::default(),
+                    collation: None,
+                });
+            }
+            emit_window_agg_final(program, window, &registers);
+            // The row was just inserted, so the empty branch of this
+            // Rewind is unreachable — the label lands on the next
+            // instruction either way.
+            let label_unreachable_empty = program.allocate_label();
+            program.emit_insn(Insn::Rewind {
+                cursor_id: cursors.csr_current,
+                pc_if_empty: label_unreachable_empty,
+            });
+            program.preassign_label_to_next_insn(label_unreachable_empty);
+            emit_return_one_row(program, t_ctx, plan)?;
+            program.emit_insn(Insn::ResetSorter {
+                cursor_id: cursors.csr_current,
+            });
+            program.emit_insn(Insn::Null {
+                dest: registers.rowid,
+                dest_end: None,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: label_step_end,
+            });
+            program.preassign_label_to_next_insn(label_frame_valid);
+        }
+        // `N FOLLOWING AND M FOLLOWING`: AGGINVERSE must fire M - N
+        // times behind AGGSTEP, not M times behind RETURN_ROW, so the
+        // start countdown becomes the offset difference
+        // (window.c:2962-2965).
+        if matches!(
+            window.frame.start,
+            crate::translate::plan::FrameBoundary::Following(_)
+        ) && window.frame.mode != turso_parser::ast::FrameMode::Range
+        {
+            if let (Some(start_offset_reg), Some(end_offset_reg)) =
+                (registers.start_offset_reg, registers.end_offset_reg)
+            {
+                program.emit_insn(Insn::Subtract {
+                    lhs: end_offset_reg,
+                    rhs: start_offset_reg,
+                    dest: start_offset_reg,
+                });
+            }
+        }
         // Position each frame cursor at the just-inserted first row.
         // Mirrors `window.c:2967-2971` — `csr_start` is rewound only when
         // the frame start isn't UNBOUNDED PRECEDING (otherwise the
@@ -1178,23 +1332,143 @@ impl EmitWindow {
         // the planner still rejects; they gain bodies as the
         // corresponding frame support lands.
         use crate::translate::plan::FrameBoundary;
+        let is_range = window.frame.mode == turso_parser::ast::FrameMode::Range;
         let end_is_unbounded = matches!(window.frame.end, FrameBoundary::UnboundedFollowing);
         if matches!(window.frame.start, FrameBoundary::Following(_)) {
             // Pattern A — `<expr> FOLLOWING` start (window.c:2987-3002).
-            emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None)?;
+            // The frame-end cursor leads the emit point, so AGGSTEP runs
+            // ungated; the end countdown holds RETURN_ROW back by M rows
+            // and the start countdown (rewritten to M - N in the
+            // first-row branch) keeps AGGINVERSE N rows behind that.
+            emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None, false)?;
             if !end_is_unbounded {
-                unreachable!(
-                    "FOLLOWING frame starts with a bounded end are rejected by the planner"
-                );
+                if is_range {
+                    let label_done = program.allocate_label();
+                    let label_loop = program.allocate_label();
+                    program.preassign_label_to_next_insn(label_loop);
+                    emit_window_range_test(
+                        program,
+                        plan,
+                        RangeCmp::Ge,
+                        cursors.csr_current,
+                        registers
+                            .end_offset_reg
+                            .expect("bounded RANGE end has an offset register"),
+                        cursors.csr_end,
+                        label_done,
+                    )?;
+                    emit_window_op(
+                        program,
+                        t_ctx,
+                        plan,
+                        WindowOp::AggInverse,
+                        registers.start_offset_reg,
+                        None,
+                        false,
+                    )?;
+                    emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, None, None, false)?;
+                    program.emit_insn(Insn::Goto {
+                        target_pc: label_loop,
+                    });
+                    program.preassign_label_to_next_insn(label_done);
+                } else {
+                    emit_window_op(
+                        program,
+                        t_ctx,
+                        plan,
+                        WindowOp::ReturnRow,
+                        registers.end_offset_reg,
+                        None,
+                        false,
+                    )?;
+                    emit_window_op(
+                        program,
+                        t_ctx,
+                        plan,
+                        WindowOp::AggInverse,
+                        registers.start_offset_reg,
+                        None,
+                        false,
+                    )?;
+                }
             }
         } else if matches!(window.frame.end, FrameBoundary::Preceding(_)) {
             // Pattern B — `<expr> PRECEDING` end (window.c:3004-3009).
-            unreachable!("PRECEDING frame ends are rejected by the planner");
+            // The frame-end cursor trails the emit point: AGGSTEP is
+            // held back by the end countdown while RETURN_ROW runs
+            // ungated on every row.
+            emit_window_op(
+                program,
+                t_ctx,
+                plan,
+                WindowOp::AggStep,
+                registers.end_offset_reg,
+                None,
+                false,
+            )?;
+            let inverse_before_return =
+                is_range && matches!(window.frame.start, FrameBoundary::Preceding(_));
+            if inverse_before_return {
+                emit_window_op(
+                    program,
+                    t_ctx,
+                    plan,
+                    WindowOp::AggInverse,
+                    registers.start_offset_reg,
+                    None,
+                    false,
+                )?;
+            }
+            emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, None, None, false)?;
+            if !inverse_before_return {
+                emit_window_op(
+                    program,
+                    t_ctx,
+                    plan,
+                    WindowOp::AggInverse,
+                    registers.start_offset_reg,
+                    None,
+                    false,
+                )?;
+            }
         } else {
             // Pattern C — everything else (window.c:3010-3037).
-            emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None)?;
+            emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None, false)?;
             if !end_is_unbounded {
-                emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, None, None)?;
+                let range_loop = (is_range && registers.end_offset_reg.is_some()).then(|| {
+                    let label = program.allocate_label();
+                    program.preassign_label_to_next_insn(label);
+                    label
+                });
+                let range_done = range_loop.map(|_| program.allocate_label());
+                if let Some(label_done) = range_done {
+                    emit_window_range_test(
+                        program,
+                        plan,
+                        RangeCmp::Ge,
+                        cursors.csr_current,
+                        registers.end_offset_reg.expect("checked above"),
+                        cursors.csr_end,
+                        label_done,
+                    )?;
+                }
+                // A `<expr> FOLLOWING` end holds the RETURN_ROW +
+                // AGGINVERSE pair back by M rows. Unlike the countdowns
+                // inside `emit_window_op`, this gate skips the *pair*
+                // together — SQLite emits it inline at window.c:3028-3034.
+                let label_skip_pair = (!is_range)
+                    .then_some(registers.end_offset_reg)
+                    .flatten()
+                    .map(|end_offset_reg| {
+                        let label = program.allocate_label();
+                        program.emit_insn(Insn::IfPos {
+                            reg: end_offset_reg,
+                            target_pc: label,
+                            decrement_by: 1,
+                        });
+                        label
+                    });
+                emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, None, None, false)?;
                 // AGGINVERSE is a structural no-op for UNBOUNDED
                 // PRECEDING starts (`emit_window_op` early-returns,
                 // window.c:2252-2257); for `N PRECEDING` starts the
@@ -1207,7 +1481,19 @@ impl EmitWindow {
                     WindowOp::AggInverse,
                     registers.start_offset_reg,
                     None,
+                    false,
                 )?;
+                if let Some(range_loop) = range_loop {
+                    program.emit_insn(Insn::Goto {
+                        target_pc: range_loop,
+                    });
+                    program.preassign_label_to_next_insn(
+                        range_done.expect("range loop and done labels are paired"),
+                    );
+                }
+                if let Some(label) = label_skip_pair {
+                    program.preassign_label_to_next_insn(label);
+                }
             }
         }
 
@@ -1578,6 +1864,202 @@ fn emit_window_agg_final(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RangeCmp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+fn emit_range_cmp(
+    program: &mut ProgramBuilder,
+    op: RangeCmp,
+    lhs: usize,
+    rhs: usize,
+    target_pc: BranchOffset,
+    flags: crate::vdbe::insn::CmpInsFlags,
+    collation: Option<CollationSeq>,
+) {
+    let insn = match op {
+        RangeCmp::Lt => Insn::Lt {
+            lhs,
+            rhs,
+            target_pc,
+            flags,
+            collation,
+        },
+        RangeCmp::Le => Insn::Le {
+            lhs,
+            rhs,
+            target_pc,
+            flags,
+            collation,
+        },
+        RangeCmp::Gt => Insn::Gt {
+            lhs,
+            rhs,
+            target_pc,
+            flags,
+            collation,
+        },
+        RangeCmp::Ge => Insn::Ge {
+            lhs,
+            rhs,
+            target_pc,
+            flags,
+            collation,
+        },
+    };
+    program.emit_insn(insn);
+}
+
+/// Emit the value-based boundary comparison used by numeric RANGE offsets.
+/// For ascending order this jumps when `csr1.order_value + offset` satisfies
+/// `op` against `csr2.order_value`; descending order subtracts the offset and
+/// reverses the comparison. Non-numeric ORDER BY values are compared without
+/// arithmetic, and explicit NULLS ordering is handled before the normal
+/// comparison op. Mirrors SQLite's `windowCodeRangeTest`.
+fn emit_window_range_test(
+    program: &mut ProgramBuilder,
+    plan: &SelectPlan,
+    op: RangeCmp,
+    csr1: CursorID,
+    offset_reg: usize,
+    csr2: CursorID,
+    target_pc: BranchOffset,
+) -> Result<()> {
+    let window = plan.window.as_ref().expect("missing window");
+    let [(order_expr, sort_order, nulls_order)] = window.order_by.as_slice() else {
+        unreachable!("RANGE offsets require exactly one ORDER BY expression");
+    };
+    let Expr::Column { column, .. } = order_expr else {
+        unreachable!("window ORDER BY expressions are buffer columns after rewrite");
+    };
+    let reg1 = program.alloc_register();
+    let reg2 = program.alloc_register();
+    program.emit_insn(Insn::Column {
+        cursor_id: csr1,
+        column: *column,
+        dest: reg1,
+        default: None,
+    });
+    program.emit_insn(Insn::Column {
+        cursor_id: csr2,
+        column: *column,
+        dest: reg2,
+        default: None,
+    });
+
+    let (op, subtract) = if *sort_order == SortOrder::Desc {
+        (
+            match op {
+                RangeCmp::Ge => RangeCmp::Le,
+                RangeCmp::Gt => RangeCmp::Lt,
+                RangeCmp::Le => RangeCmp::Ge,
+                RangeCmp::Lt => RangeCmp::Gt,
+            },
+            true,
+        )
+    } else {
+        (op, false)
+    };
+    let collation = get_collseq_from_expr(order_expr, &plan.table_references)?.unwrap_or_default();
+    let big_null = matches!(
+        (sort_order, nulls_order),
+        (SortOrder::Asc, Some(turso_parser::ast::NullsOrder::Last))
+            | (SortOrder::Desc, Some(turso_parser::ast::NullsOrder::First))
+    );
+    let label_done = program.allocate_label();
+
+    if big_null {
+        let label_reg1_not_null = program.allocate_label();
+        program.emit_insn(Insn::NotNull {
+            reg: reg1,
+            target_pc: label_reg1_not_null,
+        });
+        match op {
+            RangeCmp::Ge => program.emit_insn(Insn::Goto { target_pc }),
+            RangeCmp::Gt => program.emit_insn(Insn::NotNull {
+                reg: reg2,
+                target_pc,
+            }),
+            RangeCmp::Le => program.emit_insn(Insn::IsNull {
+                reg: reg2,
+                target_pc,
+            }),
+            RangeCmp::Lt => {}
+        }
+        program.emit_insn(Insn::Goto {
+            target_pc: label_done,
+        });
+        program.preassign_label_to_next_insn(label_reg1_not_null);
+        program.emit_insn(Insn::IsNull {
+            reg: reg2,
+            target_pc: if matches!(op, RangeCmp::Gt | RangeCmp::Ge) {
+                label_done
+            } else {
+                target_pc
+            },
+        });
+    }
+
+    // Text and blobs sort at or above the empty string, so only numeric
+    // values fall through to Add/Subtract. NULL arithmetic remains NULL.
+    let reg_empty = program.alloc_register();
+    let label_after_arithmetic = program.allocate_label();
+    program.emit_insn(Insn::String8 {
+        value: String::new(),
+        dest: reg_empty,
+    });
+    program.emit_insn(Insn::Ge {
+        lhs: reg1,
+        rhs: reg_empty,
+        target_pc: label_after_arithmetic,
+        flags: crate::vdbe::insn::CmpInsFlags::default(),
+        collation: None,
+    });
+
+    // SQLite performs this comparison before arithmetic in the two cases
+    // where overflow to +/-infinity cannot change a successful result.
+    if (op == RangeCmp::Ge && !subtract) || (op == RangeCmp::Le && subtract) {
+        emit_range_cmp(
+            program,
+            op,
+            reg1,
+            reg2,
+            target_pc,
+            crate::vdbe::insn::CmpInsFlags::default(),
+            Some(collation),
+        );
+    }
+    if subtract {
+        program.emit_insn(Insn::Subtract {
+            lhs: reg1,
+            rhs: offset_reg,
+            dest: reg1,
+        });
+    } else {
+        program.emit_insn(Insn::Add {
+            lhs: reg1,
+            rhs: offset_reg,
+            dest: reg1,
+        });
+    }
+    program.preassign_label_to_next_insn(label_after_arithmetic);
+    emit_range_cmp(
+        program,
+        op,
+        reg1,
+        reg2,
+        target_pc,
+        crate::vdbe::insn::CmpInsFlags::default().null_eq(),
+        Some(collation),
+    );
+    program.preassign_label_to_next_insn(label_done);
+    Ok(())
+}
+
 /// Emit one of the three frame-cursor operations, mirroring SQLite's
 /// `windowCodeOp` helper (`window.c:2229-2376`).
 ///
@@ -1603,6 +2085,7 @@ fn emit_window_op(
     op: WindowOp,
     countdown_reg: Option<usize>,
     break_on_eof: Option<BranchOffset>,
+    in_flush: bool,
 ) -> Result<()> {
     let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
     let window = plan.window.as_ref().expect("missing window");
@@ -1649,18 +2132,65 @@ fn emit_window_op(
         ),
     };
 
-    // Optional `OP_IfPos` countdown — when the register is positive,
-    // decrement and skip the op body. Mirrors SQLite at `window.c:2279`.
-    // The caller decides which op gets the gate; for cume_dist's
-    // `Following(1)` start it gates RETURN_ROW, for `ROWS BETWEEN N
-    // PRECEDING` it gates AGGINVERSE.
-    if let Some(reg) = countdown_reg {
-        program.emit_insn(Insn::IfPos {
-            reg,
-            target_pc: label_done,
-            decrement_by: 1,
-        });
-    }
+    // ROWS/GROUPS offsets use a countdown. RANGE offsets instead compare
+    // ORDER BY values and loop back after each peer group until the cursor
+    // reaches the value boundary.
+    let range_loop_start = if let Some(reg) = countdown_reg {
+        if frame_mode == turso_parser::ast::FrameMode::Range {
+            let label = program.allocate_label();
+            program.preassign_label_to_next_insn(label);
+            match op {
+                WindowOp::AggInverse => {
+                    if matches!(
+                        window.frame.start,
+                        crate::translate::plan::FrameBoundary::Following(_)
+                    ) {
+                        emit_window_range_test(
+                            program,
+                            plan,
+                            RangeCmp::Le,
+                            cursors.csr_current,
+                            reg,
+                            cursor_for_op,
+                            label_done,
+                        )?;
+                    } else {
+                        emit_window_range_test(
+                            program,
+                            plan,
+                            RangeCmp::Ge,
+                            cursor_for_op,
+                            reg,
+                            cursors.csr_current,
+                            label_done,
+                        )?;
+                    }
+                }
+                WindowOp::AggStep => emit_window_range_test(
+                    program,
+                    plan,
+                    RangeCmp::Gt,
+                    cursor_for_op,
+                    reg,
+                    cursors.csr_current,
+                    label_done,
+                )?,
+                WindowOp::ReturnRow => {
+                    unreachable!("RANGE offsets never gate RETURN_ROW directly")
+                }
+            }
+            Some(label)
+        } else {
+            program.emit_insn(Insn::IfPos {
+                reg,
+                target_pc: label_done,
+                decrement_by: 1,
+            });
+            None
+        }
+    } else {
+        None
+    };
 
     // RETURN_ROW finalizes accumulators before emitting (SQLite's
     // windowAggFinal at window.c:2284).
@@ -1670,6 +2200,61 @@ fn emit_window_op(
 
     let label_continue = program.allocate_label();
     program.preassign_label_to_next_insn(label_continue);
+
+    // For same-kind RANGE offsets, keep the frame-start cursor at or before
+    // the frame-end cursor. While the source is still producing rows, also
+    // keep csr_end at or before the newest buffered row. During flush SQLite
+    // clears its source-rowid register, disabling the latter guard.
+    let same_kind_range_offsets = frame_mode == turso_parser::ast::FrameMode::Range
+        && countdown_reg.is_some()
+        && matches!(
+            (&window.frame.start, &window.frame.end),
+            (
+                crate::translate::plan::FrameBoundary::Preceding(_),
+                crate::translate::plan::FrameBoundary::Preceding(_)
+            ) | (
+                crate::translate::plan::FrameBoundary::Following(_),
+                crate::translate::plan::FrameBoundary::Following(_)
+            )
+        );
+    if same_kind_range_offsets {
+        match op {
+            WindowOp::AggInverse => {
+                let start_rowid = program.alloc_register();
+                let end_rowid = program.alloc_register();
+                program.emit_insn(Insn::RowId {
+                    cursor_id: cursor_for_op,
+                    dest: start_rowid,
+                });
+                program.emit_insn(Insn::RowId {
+                    cursor_id: cursors.csr_end,
+                    dest: end_rowid,
+                });
+                program.emit_insn(Insn::Ge {
+                    lhs: start_rowid,
+                    rhs: end_rowid,
+                    target_pc: label_done,
+                    flags: crate::vdbe::insn::CmpInsFlags::default(),
+                    collation: None,
+                });
+            }
+            WindowOp::AggStep if !in_flush => {
+                let end_rowid = program.alloc_register();
+                program.emit_insn(Insn::RowId {
+                    cursor_id: cursor_for_op,
+                    dest: end_rowid,
+                });
+                program.emit_insn(Insn::Ge {
+                    lhs: end_rowid,
+                    rhs: registers.rowid,
+                    target_pc: label_done,
+                    flags: crate::vdbe::insn::CmpInsFlags::default(),
+                    collation: None,
+                });
+            }
+            WindowOp::AggStep | WindowOp::ReturnRow => {}
+        }
+    }
 
     match op {
         WindowOp::AggStep => {
@@ -1777,6 +2362,11 @@ fn emit_window_op(
         )?;
     }
 
+    if let Some(range_loop_start) = range_loop_start {
+        program.emit_insn(Insn::Goto {
+            target_pc: range_loop_start,
+        });
+    }
     program.preassign_label_to_next_insn(label_done);
 
     Ok(())
@@ -2524,13 +3114,39 @@ pub fn emit_window_flush(
     let window = plan.window.as_ref().expect("missing window");
     use crate::translate::plan::FrameBoundary;
     if matches!(window.frame.end, FrameBoundary::Preceding(_)) {
-        // Pattern B flush (window.c:3052-3056).
-        unreachable!("PRECEDING frame ends are rejected by the planner");
+        // Pattern B flush (window.c:3052-3056): the main loop emitted a
+        // row on every iteration, so exactly one row is still pending —
+        // a single ungated RETURN_ROW, no loop. The drain AGGSTEP keeps
+        // its countdown: rows the frame end never reached must stay
+        // un-stepped.
+        emit_window_op(
+            program,
+            t_ctx,
+            plan,
+            WindowOp::AggStep,
+            registers.end_offset_reg,
+            None,
+            true,
+        )?;
+        let inverse_before_return = window.frame.mode == turso_parser::ast::FrameMode::Range
+            && matches!(window.frame.start, FrameBoundary::Preceding(_));
+        if inverse_before_return {
+            emit_window_op(
+                program,
+                t_ctx,
+                plan,
+                WindowOp::AggInverse,
+                registers.start_offset_reg,
+                None,
+                true,
+            )?;
+        }
+        emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, None, None, true)?;
     } else if matches!(window.frame.start, FrameBoundary::Following(_)) {
         // Pattern A flush (window.c:3057-3084): two-stage loop.
         //
         //   loop_1:
-        //     RETURN_ROW (with IfPos countdown → skips first call),
+        //     RETURN_ROW (with IfPos countdown → skips first calls),
         //                 break_on_eof = label_break
         //     AGGINVERSE,  break_on_eof = label_after_inverse_eof
         //     Goto loop_1
@@ -2540,36 +3156,68 @@ pub fn emit_window_flush(
         //     Goto loop_2
         //   label_break:
         //
-        // The IfPos defers the first emit so AGGINVERSE fires for the
-        // first group before the first RETURN_ROW reads its value
-        // (cume_dist's `1 FOLLOWING` start). After AGGINVERSE exhausts
-        // (csr_start EOF), the second loop drains the remaining
+        // Stage-one countdowns depend on the frame end
+        // (window.c:3068-3077). With an UNBOUNDED FOLLOWING end the
+        // RETURN_ROW countdown is the start offset — it defers the first
+        // emits so AGGINVERSE fires for the leading groups before their
+        // value is read (cume_dist's `1 FOLLOWING` start), and
+        // AGGINVERSE runs ungated. With a bounded `M FOLLOWING` end the
+        // RETURN_ROW countdown continues the end offset and AGGINVERSE
+        // continues the (rewritten, M - N) start offset — both pick up
+        // whatever the main loop left undrained. After AGGINVERSE
+        // exhausts (csr_start EOF), the second loop drains the remaining
         // csr_current rows with the now-final accumulator state.
-        emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None)?;
-        if !matches!(window.frame.end, FrameBoundary::UnboundedFollowing) {
-            // The RANGE and bounded-FOLLOWING-end stage-one variants
-            // (window.c:3063-3077) land with their frame support.
-            unreachable!("FOLLOWING frame starts with a bounded end are rejected by the planner");
-        }
+        emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None, true)?;
+        let (return_row_countdown, agg_inverse_countdown) =
+            if window.frame.mode == turso_parser::ast::FrameMode::Range {
+                (None, registers.start_offset_reg)
+            } else if matches!(window.frame.end, FrameBoundary::UnboundedFollowing) {
+                (registers.start_offset_reg, None)
+            } else {
+                (registers.end_offset_reg, registers.start_offset_reg)
+            };
         let label_after_inverse_eof = program.allocate_label();
         let label_loop_1 = program.allocate_label();
         program.preassign_label_to_next_insn(label_loop_1);
-        emit_window_op(
-            program,
-            t_ctx,
-            plan,
-            WindowOp::ReturnRow,
-            registers.start_offset_reg,
-            Some(label_break),
-        )?;
-        emit_window_op(
-            program,
-            t_ctx,
-            plan,
-            WindowOp::AggInverse,
-            None,
-            Some(label_after_inverse_eof),
-        )?;
+        if window.frame.mode == turso_parser::ast::FrameMode::Range {
+            emit_window_op(
+                program,
+                t_ctx,
+                plan,
+                WindowOp::AggInverse,
+                agg_inverse_countdown,
+                Some(label_after_inverse_eof),
+                true,
+            )?;
+            emit_window_op(
+                program,
+                t_ctx,
+                plan,
+                WindowOp::ReturnRow,
+                return_row_countdown,
+                Some(label_break),
+                true,
+            )?;
+        } else {
+            emit_window_op(
+                program,
+                t_ctx,
+                plan,
+                WindowOp::ReturnRow,
+                return_row_countdown,
+                Some(label_break),
+                true,
+            )?;
+            emit_window_op(
+                program,
+                t_ctx,
+                plan,
+                WindowOp::AggInverse,
+                agg_inverse_countdown,
+                Some(label_after_inverse_eof),
+                true,
+            )?;
+        }
         program.emit_insn(Insn::Goto {
             target_pc: label_loop_1,
         });
@@ -2584,6 +3232,7 @@ pub fn emit_window_flush(
             WindowOp::ReturnRow,
             None,
             Some(label_break),
+            true,
         )?;
         program.emit_insn(Insn::Goto {
             target_pc: label_loop_2,
@@ -2603,7 +3252,7 @@ pub fn emit_window_flush(
         // there is no countdown register and csr_start advances in
         // lockstep; for `N PRECEDING` the countdown grows the frame to
         // width N+1 before csr_start starts sliding.
-        emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None)?;
+        emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None, true)?;
         let label_loop_start = program.allocate_label();
         program.preassign_label_to_next_insn(label_loop_start);
         emit_window_op(
@@ -2613,6 +3262,7 @@ pub fn emit_window_flush(
             WindowOp::ReturnRow,
             None,
             Some(label_break),
+            true,
         )?;
         emit_window_op(
             program,
@@ -2621,6 +3271,7 @@ pub fn emit_window_flush(
             WindowOp::AggInverse,
             registers.start_offset_reg,
             None,
+            true,
         )?;
         program.emit_insn(Insn::Goto {
             target_pc: label_loop_start,
