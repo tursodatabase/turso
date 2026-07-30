@@ -1,6 +1,7 @@
 use super::*;
 use crate::translate::compiler::{
-    add, compile_scalar, constant, input, BoxedCompile, Compile, InputId, ValueId,
+    add, compile_scalar, constant, input, BoxedCompile, Compile, CompileRegion, InputRequirements,
+    InputSlot, ValueId,
 };
 
 /// Reason why [translate_expr_no_constant_opt()] was called.
@@ -62,32 +63,24 @@ enum ExternalInputs {
     Deny,
 }
 
-struct DeferredExpr<'a> {
-    compiler: BoxedCompile<ValueId>,
-    inputs: Vec<&'a ast::Expr>,
-}
-
 fn compiler_for_child<'a, CanCompileAdd>(
     expr: &'a ast::Expr,
-    inputs: &mut Vec<&'a ast::Expr>,
+    inputs: &mut InputRequirements<&'a ast::Expr>,
     external_inputs: ExternalInputs,
     can_compile_add: &CanCompileAdd,
 ) -> Result<Option<BoxedCompile<ValueId>>>
 where
     CanCompileAdd: Fn(&ast::Expr, &ast::Expr) -> bool + ?Sized,
 {
-    let input_count = inputs.len();
+    let checkpoint = inputs.checkpoint();
     if let Some(compiler) = compiler_for_expr(expr, inputs, external_inputs, can_compile_add)? {
         return Ok(Some(compiler));
     }
-    inputs.truncate(input_count);
+    inputs.restore(checkpoint);
     match external_inputs {
         ExternalInputs::Allow => {
-            let index = u32::try_from(inputs.len()).map_err(|_| {
-                LimboError::InternalError("too many deferred compiler inputs".to_owned())
-            })?;
-            inputs.push(expr);
-            Ok(Some(input(InputId::new(index)).boxed()))
+            let input_id = inputs.require_value(expr)?;
+            Ok(Some(input(input_id).boxed()))
         }
         ExternalInputs::Deny => Ok(None),
     }
@@ -95,7 +88,7 @@ where
 
 fn compiler_for_expr<'a, CanCompileAdd>(
     expr: &'a ast::Expr,
-    inputs: &mut Vec<&'a ast::Expr>,
+    inputs: &mut InputRequirements<&'a ast::Expr>,
     external_inputs: ExternalInputs,
     can_compile_add: &CanCompileAdd,
 ) -> Result<Option<BoxedCompile<ValueId>>>
@@ -179,17 +172,17 @@ where
 fn deferred_expr<'a, CanCompileAdd>(
     expr: &'a ast::Expr,
     can_compile_add: &CanCompileAdd,
-) -> Result<Option<DeferredExpr<'a>>>
+) -> Result<Option<CompileRegion<ValueId, &'a ast::Expr>>>
 where
     CanCompileAdd: Fn(&ast::Expr, &ast::Expr) -> bool + ?Sized,
 {
-    let mut inputs = Vec::new();
+    let mut inputs = InputRequirements::new();
     let Some(compiler) =
         compiler_for_expr(expr, &mut inputs, ExternalInputs::Allow, can_compile_add)?
     else {
         return Ok(None);
     };
-    Ok(Some(DeferredExpr { compiler, inputs }))
+    Ok(Some(CompileRegion::new(compiler, inputs)))
 }
 
 fn translate_deferred_expr(
@@ -206,9 +199,15 @@ fn translate_deferred_expr(
     let Some(deferred) = deferred_expr(expr, &can_compile_add)? else {
         return Ok(false);
     };
-    let mut input_registers = Vec::with_capacity(deferred.inputs.len());
+    let (compiler, inputs) = deferred.into_parts();
+    let mut input_registers = Vec::with_capacity(inputs.inputs().len());
     let mut collation_ctx = None;
-    for expr in deferred.inputs {
+    for requirement in inputs.inputs() {
+        let InputSlot::Value(input) = requirement.slot() else {
+            unreachable!("deferred scalar expressions only declare value inputs");
+        };
+        assert_eq!(input.index(), input_registers.len());
+        let expr = *requirement.source();
         let register = program.alloc_register();
         program.reset_collation();
         translate_expr(program, referenced_tables, expr, register, resolver)?;
@@ -221,7 +220,7 @@ fn translate_deferred_expr(
         };
         input_registers.push(register);
     }
-    let ir = compile_scalar(deferred.compiler)?;
+    let ir = compile_scalar(compiler)?;
     if input_registers.is_empty() {
         ir.lower_into(program, target_register)?;
     } else {
@@ -3353,15 +3352,17 @@ mod tests {
         let expr = first_result_expr("SELECT (a + 1) + (?1 + abs(b))");
 
         let deferred = deferred_expr(&expr, &|_, _| true).unwrap().unwrap();
-        let ir = compile_scalar(deferred.compiler).unwrap().to_string();
+        let (compiler, inputs) = deferred.into_parts();
+        let ir = compile_scalar(compiler).unwrap().to_string();
+        let inputs = inputs.inputs();
 
-        assert_eq!(deferred.inputs.len(), 3);
+        assert_eq!(inputs.len(), 3);
         assert!(matches!(
-            deferred.inputs[0],
+            inputs[0].source(),
             ast::Expr::Id(_) | ast::Expr::Name(_)
         ));
-        assert!(matches!(deferred.inputs[1], ast::Expr::Variable(_)));
-        assert!(matches!(deferred.inputs[2], ast::Expr::FunctionCall { .. }));
+        assert!(matches!(inputs[1].source(), ast::Expr::Variable(_)));
+        assert!(matches!(inputs[2].source(), ast::Expr::FunctionCall { .. }));
         assert!(ir.contains("input @0"));
         assert!(ir.contains("input @1"));
         assert!(ir.contains("input @2"));
@@ -3379,9 +3380,13 @@ mod tests {
         let expr = first_result_expr("SELECT CASE WHEN flag THEN abs(value) ELSE 0 END + 1");
 
         let deferred = deferred_expr(&expr, &|_, _| true).unwrap().unwrap();
+        let (_, inputs) = deferred.into_parts();
 
-        assert_eq!(deferred.inputs.len(), 1);
-        assert!(matches!(deferred.inputs[0], ast::Expr::Case { .. }));
+        assert_eq!(inputs.inputs().len(), 1);
+        assert!(matches!(
+            inputs.inputs()[0].source(),
+            ast::Expr::Case { .. }
+        ));
     }
 
     #[test]
@@ -3391,9 +3396,10 @@ mod tests {
             |lhs: &ast::Expr, _: &ast::Expr| matches!(lhs, ast::Expr::Parenthesized(_));
 
         let deferred = deferred_expr(&expr, &can_compile_add).unwrap().unwrap();
+        let (_, inputs) = deferred.into_parts();
 
-        assert_eq!(deferred.inputs.len(), 1);
-        assert!(matches!(deferred.inputs[0], ast::Expr::Binary(..)));
+        assert_eq!(inputs.inputs().len(), 1);
+        assert!(matches!(inputs.inputs()[0].source(), ast::Expr::Binary(..)));
     }
 
     #[test]

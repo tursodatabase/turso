@@ -7,8 +7,8 @@ use crate::{
         alter::literal_default_value,
         compiler::{
             add, compare, constant, input, logical, pack_values, parameter, resolved_comparison,
-            BoxedCompile, ComparisonOp, Compile, InputId, LogicalOp, PackValues,
-            ResolvedComparison, Row, ValueId,
+            BoxedCompile, ComparisonOp, Compile, InputId, InputRequirements, InputSlot, LogicalOp,
+            PackValues, ResolvedComparison, Row, ValueId,
         },
         emitter::Resolver,
         plan::TableReferences,
@@ -54,15 +54,9 @@ pub(crate) enum ScalarInputKind {
     RowValue,
 }
 
-/// A symbolic value that expression compilation requires from a scalar
-/// subquery producer.
-///
-/// Resolution allocates the input when it encounters the `SubqueryResult` in
-/// the expression tree. The SELECT compiler later binds that input without
-/// needing to rediscover which expressions consume the subquery.
+/// SQL identity retained as opaque source metadata for a scalar region input.
 #[derive(Clone, Copy)]
-pub(crate) struct ScalarInputDependency {
-    pub(crate) input: InputId,
+pub(crate) struct ScalarInputSource {
     pub(crate) subquery_id: TableInternalId,
     pub(crate) kind: ScalarInputKind,
 }
@@ -82,7 +76,7 @@ pub(crate) struct RowExprResolver<'a, 'schema> {
     table: &'a BTreeTable,
     layout: RowLayout<'a>,
     referenced_tables: &'a TableReferences,
-    scalar_dependencies: SmallVec<[ScalarInputDependency; 2]>,
+    scalar_inputs: InputRequirements<ScalarInputSource>,
 }
 
 impl<'a, 'schema> RowExprResolver<'a, 'schema> {
@@ -101,21 +95,21 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
             table,
             layout,
             referenced_tables,
-            scalar_dependencies: SmallVec::new(),
+            scalar_inputs: InputRequirements::new(),
         }
     }
 
-    pub(crate) fn into_scalar_dependencies(self) -> SmallVec<[ScalarInputDependency; 2]> {
-        self.scalar_dependencies
+    pub(crate) fn into_scalar_inputs(self) -> InputRequirements<ScalarInputSource> {
+        self.scalar_inputs
     }
 
     /// Returns `None` when any part of the expression still requires the eager
     /// SQL emitter. Resolution is all-or-nothing and never mutates a program.
     pub(crate) fn resolve(&mut self, expr: &Expr) -> Result<Option<ResolvedScalarExpr>> {
-        let dependency_count = self.scalar_dependencies.len();
+        let checkpoint = self.scalar_inputs.checkpoint();
         let resolved = self.resolve_inner(expr);
         if !matches!(&resolved, Ok(Some(_))) {
-            self.scalar_dependencies.truncate(dependency_count);
+            self.scalar_inputs.restore(checkpoint);
         }
         resolved
     }
@@ -165,28 +159,27 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
         subquery_id: TableInternalId,
         kind: ScalarInputKind,
     ) -> Result<ResolvedScalarExpr> {
-        if let Some(dependency) = self
-            .scalar_dependencies
+        if let Some(requirement) = self
+            .scalar_inputs
+            .inputs()
             .iter()
-            .find(|dependency| dependency.subquery_id == subquery_id)
+            .find(|requirement| requirement.source().subquery_id == subquery_id)
         {
-            if dependency.kind != kind {
+            if requirement.source().kind != kind {
                 return Err(LimboError::InternalError(format!(
                     "subquery {subquery_id:?} has conflicting scalar result kinds",
                 )));
             }
-            return Ok(ResolvedScalarExpr::Input(dependency.input));
+            let InputSlot::Value(input) = requirement.slot() else {
+                unreachable!("scalar expression requirements only contain value inputs");
+            };
+            return Ok(ResolvedScalarExpr::Input(input));
         }
 
-        let input_index = u32::try_from(self.scalar_dependencies.len())
-            .map_err(|_| LimboError::InternalError("too many symbolic scalar inputs".to_owned()))?;
-        let dependency = ScalarInputDependency {
-            input: InputId::new(input_index),
-            subquery_id,
-            kind,
-        };
-        self.scalar_dependencies.push(dependency);
-        Ok(ResolvedScalarExpr::Input(dependency.input))
+        let input = self
+            .scalar_inputs
+            .require_value(ScalarInputSource { subquery_id, kind })?;
+        Ok(ResolvedScalarExpr::Input(input))
     }
 
     fn resolve_column(

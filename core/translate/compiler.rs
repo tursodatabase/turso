@@ -229,6 +229,217 @@ pub(crate) struct InputProducer {
     binding: InputProducerBinding,
 }
 
+/// One symbolic value or cursor supplied across a compiler region interface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InputSlot {
+    Value(InputId),
+    Cursor(CursorInputId),
+}
+
+/// A symbolic input slot paired with frontend-owned source metadata.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InputRequirement<Source> {
+    slot: InputSlot,
+    source: Source,
+}
+
+impl<Source> InputRequirement<Source> {
+    pub(crate) const fn value(input: InputId, source: Source) -> Self {
+        Self {
+            slot: InputSlot::Value(input),
+            source,
+        }
+    }
+
+    pub(crate) const fn cursor(input: CursorInputId, source: Source) -> Self {
+        Self {
+            slot: InputSlot::Cursor(input),
+            source,
+        }
+    }
+
+    pub(crate) const fn slot(&self) -> InputSlot {
+        self.slot
+    }
+
+    pub(crate) const fn source(&self) -> &Source {
+        &self.source
+    }
+}
+
+/// The typed external interface required by one compiler region.
+pub(crate) struct InputRequirements<Source> {
+    inputs: SmallVec<[InputRequirement<Source>; 2]>,
+    value_count: u32,
+    cursor_count: u32,
+}
+
+/// A rollback point for speculative recursive input discovery.
+#[derive(Clone, Copy)]
+pub(crate) struct InputRequirementsCheckpoint {
+    len: usize,
+    value_count: u32,
+    cursor_count: u32,
+}
+
+impl<Source> Default for InputRequirements<Source> {
+    fn default() -> Self {
+        Self {
+            inputs: SmallVec::new(),
+            value_count: 0,
+            cursor_count: 0,
+        }
+    }
+}
+
+impl<Source> InputRequirements<Source> {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn require_value(&mut self, source: Source) -> Result<InputId> {
+        let input = InputId::new(self.value_count);
+        self.declare(InputRequirement::value(input, source))?;
+        Ok(input)
+    }
+
+    pub(crate) fn require_cursor(&mut self, source: Source) -> Result<CursorInputId> {
+        let input = CursorInputId::new(self.cursor_count);
+        self.declare(InputRequirement::cursor(input, source))?;
+        Ok(input)
+    }
+
+    /// Declare a preallocated slot without renumbering it.
+    ///
+    /// Frontends use this when semantic discovery order assigns identities but
+    /// a later pass restores a different runtime execution order.
+    pub(crate) fn declare(&mut self, input: InputRequirement<Source>) -> Result<()> {
+        if self
+            .inputs
+            .iter()
+            .any(|declared| declared.slot == input.slot)
+        {
+            return Err(LimboError::InternalError(format!(
+                "compiler input {slot:?} is declared more than once",
+                slot = input.slot,
+            )));
+        }
+        match input.slot {
+            InputSlot::Value(input) => {
+                self.value_count =
+                    self.value_count.max(input.0.checked_add(1).ok_or_else(|| {
+                        LimboError::InternalError(
+                            "compiler value input identifier overflow".to_owned(),
+                        )
+                    })?);
+            }
+            InputSlot::Cursor(input) => {
+                self.cursor_count =
+                    self.cursor_count.max(input.0.checked_add(1).ok_or_else(|| {
+                        LimboError::InternalError(
+                            "compiler cursor input identifier overflow".to_owned(),
+                        )
+                    })?);
+            }
+        }
+        self.inputs.push(input);
+        Ok(())
+    }
+
+    pub(crate) fn checkpoint(&self) -> InputRequirementsCheckpoint {
+        InputRequirementsCheckpoint {
+            len: self.inputs.len(),
+            value_count: self.value_count,
+            cursor_count: self.cursor_count,
+        }
+    }
+
+    pub(crate) fn restore(&mut self, checkpoint: InputRequirementsCheckpoint) {
+        assert!(
+            checkpoint.len <= self.inputs.len()
+                && checkpoint.value_count <= self.value_count
+                && checkpoint.cursor_count <= self.cursor_count,
+            "compiler input checkpoint must belong to the current requirement set"
+        );
+        self.inputs.truncate(checkpoint.len);
+        self.value_count = checkpoint.value_count;
+        self.cursor_count = checkpoint.cursor_count;
+    }
+
+    pub(crate) fn inputs(&self) -> &[InputRequirement<Source>] {
+        &self.inputs
+    }
+
+    fn remove(&mut self, slot: InputSlot) -> Result<InputRequirement<Source>> {
+        let Some(index) = self.inputs.iter().position(|input| input.slot == slot) else {
+            return Err(LimboError::InternalError(format!(
+                "compiler producer targets undeclared input {slot:?}",
+            )));
+        };
+        Ok(self.inputs.remove(index))
+    }
+
+    fn is_dense(&self) -> bool {
+        let value_inputs = self
+            .inputs
+            .iter()
+            .filter(|input| matches!(input.slot, InputSlot::Value(_)))
+            .count();
+        let cursor_inputs = self
+            .inputs
+            .iter()
+            .filter(|input| matches!(input.slot, InputSlot::Cursor(_)))
+            .count();
+        value_inputs == self.value_count as usize && cursor_inputs == self.cursor_count as usize
+    }
+}
+
+/// A deferred compiler together with every symbolic input it still requires.
+pub(crate) struct CompileRegion<Output, Source> {
+    compiler: BoxedCompile<Output>,
+    inputs: InputRequirements<Source>,
+}
+
+impl<Output: 'static, Source> CompileRegion<Output, Source> {
+    pub(crate) fn new<Compiler>(compiler: Compiler, inputs: InputRequirements<Source>) -> Self
+    where
+        Compiler: Compile<Output = Output> + 'static,
+    {
+        assert!(
+            inputs.is_dense(),
+            "compiler region inputs must densely cover every declared slot"
+        );
+        Self {
+            compiler: compiler.boxed(),
+            inputs,
+        }
+    }
+
+    pub(crate) fn inputs(&self) -> &[InputRequirement<Source>] {
+        self.inputs.inputs()
+    }
+
+    pub(crate) fn into_parts(self) -> (BoxedCompile<Output>, InputRequirements<Source>) {
+        (self.compiler, self.inputs)
+    }
+
+    /// Satisfy declared inputs in producer execution order.
+    pub(crate) fn bind_inputs<Producers>(mut self, producers: Producers) -> Result<Self>
+    where
+        Producers: IntoIterator<Item = InputProducer>,
+        Producers::IntoIter: DoubleEndedIterator,
+    {
+        let producers = producers.into_iter();
+        let mut validated = SmallVec::<[InputProducer; 2]>::new();
+        for producer in producers {
+            self.inputs.remove(producer.slot())?;
+            validated.push(producer);
+        }
+        self.compiler = bind_input_producers(validated, self.compiler);
+        Ok(self)
+    }
+}
+
 enum InputProducerBinding {
     Value {
         input: InputId,
@@ -277,6 +488,13 @@ impl InputProducer {
             InputProducerBinding::Cursor { input, producer } => producer
                 .and_then(move |cursor| bind_cursor_input(input, cursor, consumer))
                 .boxed(),
+        }
+    }
+
+    const fn slot(&self) -> InputSlot {
+        match self.binding {
+            InputProducerBinding::Value { input, .. } => InputSlot::Value(input),
+            InputProducerBinding::Cursor { input, .. } => InputSlot::Cursor(input),
         }
     }
 }
@@ -1210,7 +1428,7 @@ impl InputId {
         Self(index)
     }
 
-    fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         self.0 as usize
     }
 }
@@ -1224,7 +1442,7 @@ impl CursorInputId {
         Self(index)
     }
 
-    fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         self.0 as usize
     }
 }
@@ -9776,6 +9994,113 @@ mod tests {
             ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 2, 0));
         ir.lower_into(&mut program, 1).unwrap();
         assert_eq!(program.cursor_ref.len(), 1);
+    }
+
+    #[test]
+    fn input_requirement_checkpoints_restore_dense_typed_slots() {
+        let mut inputs = InputRequirements::new();
+        let first_value = inputs.require_value("first value").unwrap();
+        let checkpoint = inputs.checkpoint();
+
+        assert_eq!(first_value, InputId::new(0));
+        assert_eq!(
+            inputs.require_cursor("discarded cursor").unwrap(),
+            CursorInputId::new(0)
+        );
+        assert_eq!(
+            inputs.require_value("discarded value").unwrap(),
+            InputId::new(1)
+        );
+
+        inputs.restore(checkpoint);
+
+        assert_eq!(
+            inputs.require_cursor("kept cursor").unwrap(),
+            CursorInputId::new(0)
+        );
+        assert_eq!(inputs.require_value("kept value").unwrap(), InputId::new(1));
+        assert_eq!(inputs.inputs().len(), 3);
+        assert_eq!(inputs.inputs()[0].source(), &"first value");
+        assert_eq!(inputs.inputs()[1].source(), &"kept cursor");
+        assert_eq!(inputs.inputs()[2].source(), &"kept value");
+    }
+
+    #[test]
+    fn input_requirements_reject_duplicate_preallocated_slots() {
+        let mut inputs = InputRequirements::new();
+        inputs
+            .declare(InputRequirement::value(InputId::new(0), "first"))
+            .unwrap();
+
+        let error = inputs
+            .declare(InputRequirement::value(InputId::new(0), "duplicate"))
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("input Value(InputId(0)) is declared more than once"));
+    }
+
+    #[test]
+    fn compile_region_binds_declared_inputs_and_retains_its_external_interface() {
+        let mut inputs = InputRequirements::new();
+        let external = inputs.require_value("external").unwrap();
+        let cursor_input_id = inputs.require_cursor("cursor producer").unwrap();
+        let produced = inputs.require_value("value producer").unwrap();
+        let consumer = cursor_input(cursor_input_id)
+            .then(
+                input(produced)
+                    .then(input(external))
+                    .and_then(|(lhs, rhs)| add(lhs, rhs)),
+            )
+            .map(|(_, value)| value);
+        let region = CompileRegion::new(consumer, inputs);
+        let cursor_producer = open_ephemeral_index(test_ephemeral_index("region_input"));
+        let region = region
+            .bind_inputs([
+                InputProducer::cursor(cursor_input_id, cursor_producer),
+                InputProducer::value(produced, constant(Value::from_i64(7))),
+            ])
+            .unwrap();
+
+        assert_eq!(region.inputs().len(), 1);
+        assert_eq!(region.inputs()[0].slot(), InputSlot::Value(external));
+        assert_eq!(region.inputs()[0].source(), &"external");
+
+        let (compiler, _) = region.into_parts();
+        let ir = compile_scalar(compiler).unwrap();
+        let rendered = ir.to_string();
+        assert!(!rendered.contains("external_cursor"));
+        assert!(!rendered.contains("input @1"));
+        let open = rendered.find("open_ephemeral_index").unwrap();
+        let produced = rendered.find("constant Numeric(Integer(7))").unwrap();
+        let external = rendered.find("input @0").unwrap();
+        let add = rendered.find(" = add ").unwrap();
+        assert!(open < produced && produced < external && external < add);
+
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 2, 0));
+        ir.lower_into_with_inputs(&mut program, 1, &[4]).unwrap();
+        assert_eq!(program.cursor_ref.len(), 1);
+    }
+
+    #[test]
+    fn compile_region_rejects_a_producer_for_an_undeclared_slot() {
+        let mut inputs = InputRequirements::new();
+        let value = inputs.require_value("external value").unwrap();
+        let region = CompileRegion::new(input(value), inputs);
+
+        let error = region
+            .bind_inputs([InputProducer::cursor(
+                CursorInputId::new(0),
+                open_ephemeral_index(test_ephemeral_index("undeclared_region_input")),
+            )])
+            .err()
+            .expect("undeclared producer must be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("producer targets undeclared input Cursor(CursorInputId(0))"));
     }
 
     #[test]

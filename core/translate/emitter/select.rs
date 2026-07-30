@@ -7,13 +7,14 @@ use crate::{
         aggregation::emit_ungrouped_aggregation,
         collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         compiler::{
-            bind_cursor_input, bind_input_producers, compile_effect, constant, cursor_input,
-            cursor_values, declare_ephemeral_index, initialize_cursor_once, insert_index_pack,
-            literal_values, open_declared_ephemeral_index, open_ephemeral_index, pack_values,
-            result_row_pack, scan_index, scan_table, seek_in_values, seek_index, seek_rowid,
-            seek_table_range, select_pack, BoxedCompile, Compile, CursorId, CursorInputId,
+            bind_cursor_input, compile_effect, constant, cursor_input, cursor_values,
+            declare_ephemeral_index, initialize_cursor_once, insert_index_pack, literal_values,
+            open_declared_ephemeral_index, open_ephemeral_index, pack_values, result_row_pack,
+            scan_index, scan_table, seek_in_values, seek_index, seek_rowid, seek_table_range,
+            select_pack, BoxedCompile, Compile, CompileRegion, CursorId, CursorInputId,
             DeferredIndexBound, DeferredIndexRange, DeferredTableBound, DeferredTableRange,
-            InputProducer, Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId, ValuePack,
+            InputProducer, InputRequirement, InputRequirements, InputSlot, Row, RowStream,
+            ScanDirection, SortKey, SortedRow, ValueId, ValuePack,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -23,7 +24,7 @@ use crate::{
         expr::{
             compile_symbolic_conjunction, compile_symbolic_expr, compile_symbolic_exprs,
             compile_symbolic_static_expr, ResolvedScalarExpr, RowExprResolver, RowLayout,
-            ScalarInputDependency, ScalarInputKind,
+            ScalarInputKind, ScalarInputSource,
         },
         group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
@@ -45,7 +46,7 @@ use crate::{
     vdbe::{affinity::Affinity, builder::QueryMode, insn::Insn},
     HashMap, HashSet, LimboError, Result,
 };
-use smallvec::{smallvec, SmallVec};
+use smallvec::SmallVec;
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
 use turso_parser::ast::{Expr, SortOrder, SubqueryType, TableInternalId};
@@ -165,15 +166,29 @@ enum DeclarativeSelectOutcome {
 
 struct DeclarativeSelectProgram {
     compiler: DeclarativeSelectCompiler,
-    destination_cursor: Option<DeclarativeCursorBinding>,
     destination_index: Option<Arc<Index>>,
-    dependencies: SmallVec<[DeclarativeDependency; 2]>,
     result_column_count: usize,
 }
 
 enum DeclarativeSelectCompiler {
-    Effect(BoxedCompile<()>),
-    Scalar(BoxedCompile<ValueId>),
+    Effect(CompileRegion<(), DeclarativeInputSource>),
+    Scalar(CompileRegion<ValueId, DeclarativeInputSource>),
+}
+
+impl DeclarativeSelectCompiler {
+    fn inputs(&self) -> &[InputRequirement<DeclarativeInputSource>] {
+        match self {
+            Self::Effect(region) => region.inputs(),
+            Self::Scalar(region) => region.inputs(),
+        }
+    }
+
+    fn bind_inputs(self, producers: Vec<InputProducer>) -> Result<Self> {
+        match self {
+            Self::Effect(region) => Ok(Self::Effect(region.bind_inputs(producers)?)),
+            Self::Scalar(region) => Ok(Self::Scalar(region.bind_inputs(producers)?)),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -189,21 +204,32 @@ struct DeclarativeInCursor {
 }
 
 #[derive(Clone, Copy)]
-enum DeclarativeDependency {
-    InCursor(DeclarativeInCursor),
-    Scalar(ScalarInputDependency),
+enum DeclarativeInputSource {
+    DestinationCursor {
+        cursor: CursorID,
+    },
+    Subquery {
+        id: TableInternalId,
+        kind: DeclarativeSubqueryInputKind,
+    },
 }
 
-impl DeclarativeDependency {
-    const fn subquery_id(self) -> TableInternalId {
+#[derive(Clone, Copy)]
+enum DeclarativeSubqueryInputKind {
+    InCursor { cursor: CursorID },
+    Scalar,
+}
+
+impl DeclarativeInputSource {
+    const fn subquery_id(self) -> Option<TableInternalId> {
         match self {
-            Self::InCursor(input) => input.subquery_id,
-            Self::Scalar(input) => input.subquery_id,
+            Self::DestinationCursor { .. } => None,
+            Self::Subquery { id, .. } => Some(id),
         }
     }
 }
 
-struct CompiledDeclarativeDependency {
+struct StagedDeclarativeProducer {
     subquery_id: TableInternalId,
     subquery_index: usize,
     producer: InputProducer,
@@ -213,10 +239,10 @@ struct CompiledDeclarativeDependency {
 fn validate_and_order_declarative_dependencies(
     plan: &SelectPlan,
     external_in_cursor: Option<DeclarativeInCursor>,
-    scalar_dependencies: SmallVec<[ScalarInputDependency; 2]>,
-) -> Result<Option<SmallVec<[DeclarativeDependency; 2]>>> {
+    scalar_inputs: InputRequirements<ScalarInputSource>,
+) -> Result<Option<SmallVec<[InputRequirement<DeclarativeInputSource>; 2]>>> {
     let mut dependencies = SmallVec::with_capacity(
-        scalar_dependencies.len() + usize::from(external_in_cursor.is_some()),
+        scalar_inputs.inputs().len() + usize::from(external_in_cursor.is_some()),
     );
     let mut matched_scalars = 0;
     let mut matched_in_cursor = false;
@@ -224,9 +250,10 @@ fn validate_and_order_declarative_dependencies(
     for subquery in &plan.non_from_clause_subqueries {
         let in_cursor =
             external_in_cursor.filter(|dependency| dependency.subquery_id == subquery.internal_id);
-        let scalar = scalar_dependencies
+        let scalar = scalar_inputs
+            .inputs()
             .iter()
-            .find(|dependency| dependency.subquery_id == subquery.internal_id)
+            .find(|dependency| dependency.source().subquery_id == subquery.internal_id)
             .copied();
         let dependency = match (in_cursor, scalar) {
             (Some(_), Some(_)) => {
@@ -237,11 +264,20 @@ fn validate_and_order_declarative_dependencies(
             }
             (Some(dependency), None) => {
                 matched_in_cursor = true;
-                DeclarativeDependency::InCursor(dependency)
+                InputRequirement::cursor(
+                    dependency.binding.input,
+                    DeclarativeInputSource::Subquery {
+                        id: dependency.subquery_id,
+                        kind: DeclarativeSubqueryInputKind::InCursor {
+                            cursor: dependency.binding.cursor,
+                        },
+                    },
+                )
             }
             (None, Some(dependency)) => {
+                let source = *dependency.source();
                 let matching_kind = matches!(
-                    (&subquery.query_type, dependency.kind),
+                    (&subquery.query_type, source.kind),
                     (SubqueryType::Exists { .. }, ScalarInputKind::Exists)
                         | (
                             SubqueryType::RowValue { num_regs: 1, .. },
@@ -255,7 +291,16 @@ fn validate_and_order_declarative_dependencies(
                     )));
                 }
                 matched_scalars += 1;
-                DeclarativeDependency::Scalar(dependency)
+                let InputSlot::Value(input) = dependency.slot() else {
+                    unreachable!("scalar expression requirements only contain value inputs");
+                };
+                InputRequirement::value(
+                    input,
+                    DeclarativeInputSource::Subquery {
+                        id: source.subquery_id,
+                        kind: DeclarativeSubqueryInputKind::Scalar,
+                    },
+                )
             }
             (None, None) => return Ok(None),
         };
@@ -273,7 +318,7 @@ fn validate_and_order_declarative_dependencies(
         dependencies.push(dependency);
     }
 
-    if matched_scalars != scalar_dependencies.len()
+    if matched_scalars != scalar_inputs.inputs().len()
         || matched_in_cursor != external_in_cursor.is_some()
     {
         return Err(LimboError::InternalError(
@@ -361,24 +406,56 @@ fn try_emit_declarative_table_scan(
     )?;
     let DeclarativeSelectProgram {
         compiler,
-        destination_cursor,
         destination_index: _,
-        dependencies,
         result_column_count,
     } = compilation;
-    let external_in_cursor = match dependencies.as_slice() {
-        [] => None,
-        [DeclarativeDependency::InCursor(external)] => Some(*external),
-        _ => return Ok(None),
-    };
-    let DeclarativeSelectCompiler::Effect(compiler) = compiler else {
+    let DeclarativeSelectCompiler::Effect(region) = compiler else {
         return Err(LimboError::InternalError(
             "top-level declarative SELECT produced a scalar compiler".to_owned(),
         ));
     };
+    let mut destination_cursor = None;
+    let mut external_in_subqueries = SmallVec::<[TableInternalId; 2]>::new();
+    let mut cursor_inputs = SmallVec::<[(CursorInputId, CursorID); 2]>::new();
+    for requirement in region.inputs() {
+        let InputSlot::Cursor(input) = requirement.slot() else {
+            return Ok(None);
+        };
+        let cursor = match *requirement.source() {
+            DeclarativeInputSource::DestinationCursor { cursor } => {
+                if destination_cursor.replace(cursor).is_some() {
+                    return Err(LimboError::InternalError(
+                        "declarative SELECT has multiple destination cursors".to_owned(),
+                    ));
+                }
+                cursor
+            }
+            DeclarativeInputSource::Subquery {
+                id,
+                kind: DeclarativeSubqueryInputKind::InCursor { cursor },
+            } => {
+                external_in_subqueries.push(id);
+                cursor
+            }
+            DeclarativeInputSource::Subquery {
+                kind: DeclarativeSubqueryInputKind::Scalar,
+                ..
+            } => return Ok(None),
+        };
+        cursor_inputs.push((input, cursor));
+    }
+    cursor_inputs.sort_by_key(|(input, _)| input.index());
+    for (index, (input, _)) in cursor_inputs.iter().enumerate() {
+        if input.index() != index {
+            return Err(LimboError::InternalError(
+                "declarative SELECT cursor interface is not dense".to_owned(),
+            ));
+        }
+    }
+    let (compiler, _) = region.into_parts();
     let ir = compile_effect(compiler)?;
     let target_register = program.alloc_register();
-    if let Some(external) = external_in_cursor {
+    if !external_in_subqueries.is_empty() {
         emit_non_from_clause_subqueries_for_eval_at(
             program,
             resolver,
@@ -386,25 +463,13 @@ fn try_emit_declarative_table_scan(
             &plan.join_order,
             Some(&plan.table_references),
             EvalAt::BeforeLoop,
-            |subquery| subquery.internal_id == external.subquery_id,
+            |subquery| external_in_subqueries.contains(&subquery.internal_id),
         )?;
     }
-    let cursor_inputs: SmallVec<[CursorID; 2]> = match (destination_cursor, external_in_cursor) {
-        (Some(destination), Some(external)) => {
-            turso_assert!(destination.input == CursorInputId::new(0));
-            turso_assert!(external.binding.input == CursorInputId::new(1));
-            smallvec![destination.cursor, external.binding.cursor]
-        }
-        (Some(destination), None) => {
-            turso_assert!(destination.input == CursorInputId::new(0));
-            smallvec![destination.cursor]
-        }
-        (None, Some(external)) => {
-            turso_assert!(external.binding.input == CursorInputId::new(0));
-            smallvec![external.binding.cursor]
-        }
-        (None, None) => SmallVec::new(),
-    };
+    let cursor_inputs = cursor_inputs
+        .into_iter()
+        .map(|(_, cursor)| cursor)
+        .collect::<SmallVec<[CursorID; 2]>>();
     let lowered = if cursor_inputs.is_empty() {
         ir.lower_into(program, target_register)?
     } else {
@@ -433,13 +498,22 @@ fn compose_declarative_dependencies(
     outer: DeclarativeSelectProgram,
     initialize_once: bool,
 ) -> Result<DeclarativeSelectProgram> {
-    if outer.dependencies.is_empty() {
+    let dependencies = outer
+        .compiler
+        .inputs()
+        .iter()
+        .filter(|requirement| requirement.source().subquery_id().is_some())
+        .copied()
+        .collect::<SmallVec<[InputRequirement<DeclarativeInputSource>; 2]>>();
+    if dependencies.is_empty() {
         return Ok(outer);
     }
 
-    let mut producers = Vec::with_capacity(outer.dependencies.len());
-    for dependency in &outer.dependencies {
-        let subquery_id = dependency.subquery_id();
+    let mut producers = Vec::with_capacity(dependencies.len());
+    for dependency in dependencies {
+        let Some(subquery_id) = dependency.source().subquery_id() else {
+            unreachable!("dependency list contains only subquery inputs");
+        };
         let Some(subquery_index) = plan
             .non_from_clause_subqueries
             .iter()
@@ -469,8 +543,13 @@ fn compose_declarative_dependencies(
         else {
             return Ok(outer);
         };
-        let child_initialize_once =
-            matches!(dependency, DeclarativeDependency::InCursor(_)) && initialize_once;
+        let child_initialize_once = matches!(
+            dependency.source(),
+            DeclarativeInputSource::Subquery {
+                kind: DeclarativeSubqueryInputKind::InCursor { .. },
+                ..
+            }
+        ) && initialize_once;
         let inner = compose_declarative_dependencies(
             query_mode,
             resolver,
@@ -478,25 +557,49 @@ fn compose_declarative_dependencies(
             inner,
             child_initialize_once,
         )?;
-        if !inner.dependencies.is_empty() {
-            return Ok(outer);
-        }
-        let producer = match (*dependency, inner.compiler) {
+        let producer = match (dependency.slot(), *dependency.source(), inner.compiler) {
             (
-                DeclarativeDependency::Scalar(external),
-                DeclarativeSelectCompiler::Scalar(compiler),
-            ) => InputProducer::value(external.input, compiler),
-            (DeclarativeDependency::Scalar(_), DeclarativeSelectCompiler::Effect(_)) => {
+                InputSlot::Value(input),
+                DeclarativeInputSource::Subquery {
+                    kind: DeclarativeSubqueryInputKind::Scalar,
+                    ..
+                },
+                DeclarativeSelectCompiler::Scalar(region),
+            ) if region.inputs().is_empty() => {
+                let (compiler, _) = region.into_parts();
+                InputProducer::value(input, compiler)
+            }
+            (
+                InputSlot::Value(_),
+                DeclarativeInputSource::Subquery {
+                    kind: DeclarativeSubqueryInputKind::Scalar,
+                    ..
+                },
+                _,
+            ) => {
                 return Ok(outer);
             }
             (
-                DeclarativeDependency::InCursor(external),
-                DeclarativeSelectCompiler::Effect(compiler),
+                InputSlot::Cursor(input),
+                DeclarativeInputSource::Subquery {
+                    kind: DeclarativeSubqueryInputKind::InCursor { cursor },
+                    ..
+                },
+                DeclarativeSelectCompiler::Effect(region),
             ) => {
-                let Some(destination) = inner.destination_cursor else {
+                let [destination] = region.inputs() else {
                     return Ok(outer);
                 };
-                if destination.cursor != external.binding.cursor {
+                let (
+                    InputSlot::Cursor(destination_input),
+                    DeclarativeInputSource::DestinationCursor {
+                        cursor: destination_cursor,
+                    },
+                ) = (destination.slot(), *destination.source())
+                else {
+                    return Ok(outer);
+                };
+                if destination_cursor != cursor {
                     return Ok(outer);
                 }
                 let Some(index) = inner.destination_index else {
@@ -504,21 +607,34 @@ fn compose_declarative_dependencies(
                         "declarative IN producer {subquery_id:?} has no ephemeral destination index",
                     )));
                 };
+                let (compiler, _) = region.into_parts();
                 InputProducer::cursor(
-                    external.binding.input,
+                    input,
                     compile_declarative_in_producer(
                         index,
-                        destination.input,
+                        destination_input,
                         compiler,
                         initialize_once,
                     ),
                 )
             }
-            (DeclarativeDependency::InCursor(_), DeclarativeSelectCompiler::Scalar(_)) => {
+            (
+                InputSlot::Cursor(_),
+                DeclarativeInputSource::Subquery {
+                    kind: DeclarativeSubqueryInputKind::InCursor { .. },
+                    ..
+                },
+                DeclarativeSelectCompiler::Scalar(_),
+            ) => {
                 return Ok(outer);
             }
+            _ => {
+                return Err(LimboError::InternalError(format!(
+                    "declarative subquery {subquery_id:?} has an incompatible compiler input slot",
+                )));
+            }
         };
-        producers.push(CompiledDeclarativeDependency {
+        producers.push(StagedDeclarativeProducer {
             subquery_id,
             subquery_index,
             producer,
@@ -534,21 +650,16 @@ fn compose_declarative_dependencies(
             .extend(producer.table_references.clone());
     }
 
-    let producers = producers.into_iter().map(|producer| producer.producer);
-    let compiler = match outer.compiler {
-        DeclarativeSelectCompiler::Effect(consumer) => {
-            DeclarativeSelectCompiler::Effect(bind_input_producers(producers, consumer))
-        }
-        DeclarativeSelectCompiler::Scalar(consumer) => {
-            DeclarativeSelectCompiler::Scalar(bind_input_producers(producers, consumer))
-        }
-    };
+    let compiler = outer.compiler.bind_inputs(
+        producers
+            .into_iter()
+            .map(|producer| producer.producer)
+            .collect(),
+    )?;
 
     Ok(DeclarativeSelectProgram {
         compiler,
-        destination_cursor: outer.destination_cursor,
         destination_index: outer.destination_index,
-        dependencies: SmallVec::new(),
         result_column_count: outer.result_column_count,
     })
 }
@@ -597,7 +708,7 @@ fn try_compile_declarative_table_scan(
         return Ok(None);
     }
 
-    let destination_input = CursorInputId::new(0);
+    let mut inputs = InputRequirements::new();
     let (destination, destination_cursor, destination_index) = match &plan.query_destination {
         QueryDestination::ResultRows => (DeclarativeSelectDestination::ResultRows, None, None),
         QueryDestination::ExistsSubqueryResult { .. }
@@ -626,6 +737,8 @@ fn try_compile_declarative_table_scan(
             && index.columns.len() == 1
             && index.columns[0].pos_in_table == 0 =>
         {
+            let destination_input = inputs
+                .require_cursor(DeclarativeInputSource::DestinationCursor { cursor: *cursor_id })?;
             (
                 DeclarativeSelectDestination::EphemeralIndex {
                     input: destination_input,
@@ -1042,11 +1155,14 @@ fn try_compile_declarative_table_scan(
     let Some(dependencies) = validate_and_order_declarative_dependencies(
         plan,
         external_in_cursor,
-        expr_resolver.into_scalar_dependencies(),
+        expr_resolver.into_scalar_inputs(),
     )?
     else {
         return Ok(None);
     };
+    for dependency in dependencies {
+        inputs.declare(dependency)?;
+    }
 
     let table = table.clone();
     let database_id = joined.database_id;
@@ -1070,6 +1186,7 @@ fn try_compile_declarative_table_scan(
                 rowid_eq.expect("rowid equality access must compile a key"),
             ),
             destination,
+            inputs,
         ),
         DeclarativeBtreeAccess::TableRange { .. } => body.into_compiler(
             seek_table_range(
@@ -1079,6 +1196,7 @@ fn try_compile_declarative_table_scan(
                 table_range.expect("table range access must compile a range"),
             ),
             destination,
+            inputs,
         ),
         DeclarativeBtreeAccess::IndexRange { index, .. } => body.into_compiler(
             seek_index(
@@ -1090,6 +1208,7 @@ fn try_compile_declarative_table_scan(
                 index_range.expect("index range access must compile a range"),
             ),
             destination,
+            inputs,
         ),
         DeclarativeBtreeAccess::InValues { index, .. } => body.into_compiler(
             seek_in_values(
@@ -1101,6 +1220,7 @@ fn try_compile_declarative_table_scan(
                 in_values.expect("IN access must compile its value source"),
             ),
             destination,
+            inputs,
         ),
         DeclarativeBtreeAccess::Scan {
             index: Some(index), ..
@@ -1114,17 +1234,17 @@ fn try_compile_declarative_table_scan(
                 direction,
             ),
             destination,
+            inputs,
         ),
         DeclarativeBtreeAccess::Scan { index: None, .. } => body.into_compiler(
             scan_table(table, database_id, schema_cookie, direction),
             destination,
+            inputs,
         ),
     };
     Ok(Some(DeclarativeSelectProgram {
         compiler,
-        destination_cursor,
         destination_index,
-        dependencies,
         result_column_count: plan.result_columns.len(),
     }))
 }
@@ -1154,20 +1274,24 @@ impl DeclarativeSelectBody {
         self,
         scan: Scan,
         destination: DeclarativeSelectDestination,
+        inputs: InputRequirements<DeclarativeInputSource>,
     ) -> DeclarativeSelectCompiler
     where
         Scan: Compile<Output = Rows> + 'static,
         Rows: RowStream<Item = Row> + 'static,
     {
         match destination {
-            DeclarativeSelectDestination::ResultRows => DeclarativeSelectCompiler::Effect(
-                self.with_sink(scan, DeclarativePackSink::ResultRows),
-            ),
+            DeclarativeSelectDestination::ResultRows => {
+                DeclarativeSelectCompiler::Effect(CompileRegion::new(
+                    self.with_sink(scan, DeclarativePackSink::ResultRows),
+                    inputs,
+                ))
+            }
             DeclarativeSelectDestination::Exists => {
-                DeclarativeSelectCompiler::Scalar(self.exists(scan))
+                DeclarativeSelectCompiler::Scalar(CompileRegion::new(self.exists(scan), inputs))
             }
             DeclarativeSelectDestination::RowValue => {
-                DeclarativeSelectCompiler::Scalar(self.row_value(scan))
+                DeclarativeSelectCompiler::Scalar(CompileRegion::new(self.row_value(scan), inputs))
             }
             DeclarativeSelectDestination::EphemeralIndex {
                 input,
@@ -1176,20 +1300,19 @@ impl DeclarativeSelectBody {
             } => {
                 // The description owns only a symbolic input slot. Its physical
                 // destination cursor is not selected until lowering.
-                DeclarativeSelectCompiler::Effect(
-                    cursor_input(input)
-                        .and_then(move |cursor| {
-                            self.with_sink(
-                                scan,
-                                DeclarativePackSink::EphemeralIndex {
-                                    cursor,
-                                    index_name,
-                                    affinity,
-                                },
-                            )
-                        })
-                        .boxed(),
-                )
+                DeclarativeSelectCompiler::Effect(CompileRegion::new(
+                    cursor_input(input).and_then(move |cursor| {
+                        self.with_sink(
+                            scan,
+                            DeclarativePackSink::EphemeralIndex {
+                                cursor,
+                                index_name,
+                                affinity,
+                            },
+                        )
+                    }),
+                    inputs,
+                ))
             }
         }
     }
@@ -2935,6 +3058,25 @@ mod tests {
                 vec![Value::from_i64(1), Value::from_i64(11)],
                 vec![Value::from_i64(3), Value::from_i64(13)],
             ]
+        );
+
+        let mut nested_scalar_producer = connection
+            .prepare(
+                "SELECT id FROM mixed_rows WHERE id IN (\
+                     SELECT id FROM mixed_keys \
+                     WHERE id < (SELECT value FROM mixed_bound)\
+                 ) ORDER BY id",
+            )
+            .unwrap();
+        assert!(nested_scalar_producer.get_program().insns.iter().all(
+            |(instruction, _)| !matches!(
+                instruction,
+                Insn::BeginSubrtn { .. } | Insn::Return { .. } | Insn::Once { .. }
+            )
+        ));
+        assert_eq!(
+            nested_scalar_producer.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(1)], vec![Value::from_i64(3)]],
         );
 
         let mut fallback = connection
