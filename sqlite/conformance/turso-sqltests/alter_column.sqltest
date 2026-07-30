@@ -717,3 +717,40 @@ expect {
     a2|a2c2|c2
     ok
 }
+
+# Altering a column while keeping its name must not trip the duplicate
+# column name check against the column being altered.
+test alter-column-same-name-change-type {
+    CREATE TABLE t (x INT);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ALTER COLUMN x TO x TEXT;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT x, typeof(x) FROM t ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE TABLE t (x TEXT)
+    1|text
+    2|text
+    ok
+}
+
+test alter-column-same-name-add-default {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    ALTER TABLE t ALTER COLUMN b TO b TEXT DEFAULT 'none';
+    INSERT INTO t (a) VALUES (1);
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT a, b FROM t;
+}
+expect {
+    CREATE TABLE t (a INTEGER, b TEXT DEFAULT 'none')
+    1|none
+}
+
+# Colliding with a different existing column must still be an error.
+test fail-alter-column-collides-with-other-column {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    ALTER TABLE t ALTER COLUMN a TO b TEXT;
+}
+expect error {
+}

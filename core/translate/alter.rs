@@ -1798,7 +1798,10 @@ pub fn translate_alter_table(
                 )));
             };
 
-            if btree.get_column(col_name).is_some() {
+            if btree
+                .get_column(col_name)
+                .is_some_and(|(index, _)| index != column_index)
+            {
                 return Err(LimboError::ParseError(format!(
                     "duplicate column name: \"{col_name}\""
                 )));
