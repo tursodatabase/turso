@@ -23,6 +23,19 @@ use super::ir::{
 };
 use super::verify::verify;
 
+/// Structural verification is a development safety net: it runs in every
+/// debug and test build, where all correctness CI lives, and is skipped
+/// in release builds so prepare time does not pay for it (the IR a
+/// release build emits is the same IR the debug suites verified).
+fn debug_verify(func: &Function) -> Result<()> {
+    if cfg!(debug_assertions) {
+        verify(func).map_err(|e| {
+            LimboError::InternalError(format!("compiler IR failed verification: {e}"))
+        })?;
+    }
+    Ok(())
+}
+
 /// Callback that emits an opaque leaf ([`Inst::Leaf`]) by materializing
 /// the given AST expression into `dest`. In production this delegates to
 /// the eager `translate_expr`, which keeps cursor/index/collation
@@ -62,8 +75,7 @@ pub fn emit_function_bound(
     cursors: &[usize],
     leaf_emitter: Option<&mut LeafEmitter<'_>>,
 ) -> Result<()> {
-    verify(func)
-        .map_err(|e| LimboError::InternalError(format!("compiler IR failed verification: {e}")))?;
+    debug_verify(func)?;
     bind_cursors(func, cursors)?;
     // Explicit reborrow: `Option<&mut dyn ...>` is invariant, so shorten
     // the emitter borrow to this call's lifetime by hand.
@@ -100,8 +112,7 @@ pub fn emit_condition_function(
     fallthrough_label: Option<BranchOffset>,
     leaf_emitter: Option<&mut LeafEmitter<'_>>,
 ) -> Result<()> {
-    verify(func)
-        .map_err(|e| LimboError::InternalError(format!("compiler IR failed verification: {e}")))?;
+    debug_verify(func)?;
     if exit_labels.len() != func.num_exits() {
         return Err(LimboError::InternalError(format!(
             "compiler IR: {} exit labels bound but {} exits declared",

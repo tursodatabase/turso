@@ -418,10 +418,54 @@ pub enum Terminator {
     },
 }
 
+/// The outgoing edges of a [`Terminator`], allocation-free (at most
+/// three). Verification and emission walk terminator targets in their
+/// hottest loops, so this must not heap-allocate per call.
+#[derive(Clone, Copy)]
+pub struct Targets<'a> {
+    items: [Option<&'a JumpTarget>; 3],
+    len: usize,
+}
+
+impl<'a> Targets<'a> {
+    fn new(items: &[&'a JumpTarget]) -> Self {
+        let mut fixed = [None; 3];
+        for (slot, &target) in fixed.iter_mut().zip(items) {
+            *slot = Some(target);
+        }
+        Self {
+            items: fixed,
+            len: items.len(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl<'a> std::ops::Index<usize> for Targets<'a> {
+    type Output = JumpTarget;
+
+    fn index(&self, index: usize) -> &JumpTarget {
+        assert!(index < self.len);
+        self.items[index].expect("index checked against len")
+    }
+}
+
+impl<'a> IntoIterator for Targets<'a> {
+    type Item = &'a JumpTarget;
+    type IntoIter = std::iter::Flatten<std::array::IntoIter<Option<&'a JumpTarget>, 3>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter().flatten()
+    }
+}
+
 impl Terminator {
-    pub fn targets(&self) -> Vec<&JumpTarget> {
+    pub fn targets(&self) -> Targets<'_> {
         match self {
-            Terminator::Jump(target) => vec![target],
+            Terminator::Jump(target) => Targets::new(&[target]),
             Terminator::Branch {
                 if_true,
                 if_false,
@@ -433,25 +477,25 @@ impl Terminator {
                 if_false,
                 if_null,
                 ..
-            } => vec![if_true, if_false, if_null],
+            } => Targets::new(&[if_true, if_false, if_null]),
             Terminator::NullBranch {
                 if_null,
                 if_not_null,
                 ..
-            } => vec![if_null, if_not_null],
+            } => Targets::new(&[if_null, if_not_null]),
             Terminator::ScanStart {
                 if_empty, if_rows, ..
-            } => vec![if_empty, if_rows],
+            } => Targets::new(&[if_empty, if_rows]),
             Terminator::ScanAdvance {
                 if_more, if_done, ..
-            } => vec![if_more, if_done],
+            } => Targets::new(&[if_more, if_done]),
             Terminator::DecrJumpZero {
                 if_zero, if_more, ..
-            } => vec![if_zero, if_more],
+            } => Targets::new(&[if_zero, if_more]),
             Terminator::IfPos {
                 if_pos, if_rest, ..
-            } => vec![if_pos, if_rest],
-            Terminator::Ret { .. } | Terminator::Exit(_) => Vec::new(),
+            } => Targets::new(&[if_pos, if_rest]),
+            Terminator::Ret { .. } | Terminator::Exit(_) => Targets::new(&[]),
         }
     }
 }

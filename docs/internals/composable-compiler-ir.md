@@ -83,7 +83,12 @@ breaking the suite.
   headers must be their own blocks); every reachable block terminated;
   edge arity matches target params; every use dominated by its def
   (dominator tree via Cooper–Harvey–Kennedy on RPO). Malformed IR fails
-  *before* bytecode exists.
+  *before* bytecode exists. Emission-time verification runs only under
+  `debug_assertions`: all correctness CI runs debug builds, and release
+  prepare time must not pay for the safety net (CodSpeed caught a 21%
+  prepare regression on TPC-DS q41's ~60-node predicate tree when it
+  did — the per-use idom chain walks are quadratic-ish on deep
+  OR-chains). Unit tests calling `verify` directly are unaffected.
 
 ### VDBE backend — `compiler/emit.rs`
 
