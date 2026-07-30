@@ -9,18 +9,21 @@
 //! Coverage today: literals, parenthesization, unary `+`/`-`/`~`/NOT
 //! (including the eager path's compile-time folds for signed and
 //! bit-inverted numeric literals), arithmetic/bitwise/concat binary
-//! operators, and column/rowid reads as opaque leaves. Comparisons,
-//! functions, and short-circuit operators are future slices (see
-//! docs/internals/composable-compiler-ir.md).
+//! operators, column/rowid reads as opaque leaves, and scalar function
+//! calls on the generic `Insn::Function` path (see
+//! [`scalar_call_is_generic`]). Comparisons and short-circuit operators
+//! are future slices (see docs/internals/composable-compiler-ir.md).
 
 use turso_parser::ast::{self, UnaryOperator};
 
 use crate::alloc::TursoIteratorExt;
+use crate::function::{Func, FuncCtx, ScalarFunc};
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::sanitize_string;
+use crate::translate::optimizer::Optimizable;
 use crate::translate::plan::TableReferences;
-use crate::util::parse_numeric_literal;
+use crate::util::{exprs_are_equivalent, parse_numeric_literal};
 use crate::{Numeric, Result, Value, ValueBlob};
 
 use super::combine::{self, Compiler};
@@ -50,22 +53,56 @@ impl BuildCtx<'_> {
     };
 }
 
-/// A successfully described expression plus the collation context its
-/// evaluation leaves behind. The eager path threads collation through
-/// `ProgramBuilder` state as a side effect of emission order; this
-/// frontend computes the same final context statically (same merge rules
-/// as `binary_expr_shared`) so the integration hook can restore it after
-/// emission.
+/// What evaluating an expression does to the ambient collation context,
+/// assuming a clean incoming state (the eager path resets before each
+/// binary operand, so subtree contributions are always clean-state).
+///
+/// The distinction between `Untouched` and `Sets(None)` is real eager
+/// behavior: a literal leaves the caller's state alone, while a
+/// non-equivalent binary always overwrites it (possibly with `None`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum CollationEffect {
+    /// Evaluation does not touch the collation state.
+    Untouched,
+    /// Evaluation overwrites the collation state with this context.
+    Sets(Option<(CollationSeq, bool)>),
+}
+
+impl CollationEffect {
+    /// The collation context this expression contributes to an enclosing
+    /// binary operator's merge, i.e. its post-state from a clean start.
+    fn contribution(self) -> Option<(CollationSeq, bool)> {
+        match self {
+            CollationEffect::Untouched => None,
+            CollationEffect::Sets(collation) => collation,
+        }
+    }
+
+    /// Apply this effect to the integration boundary: restore the state
+    /// the eager path would have left behind.
+    pub fn apply(self, program: &mut crate::vdbe::builder::ProgramBuilder) {
+        match self {
+            CollationEffect::Untouched => {}
+            CollationEffect::Sets(collation) => program.set_collation(collation),
+        }
+    }
+}
+
+/// A successfully described expression plus its collation effect. The
+/// eager path threads collation through `ProgramBuilder` state as a side
+/// effect of emission order; this frontend computes the same final state
+/// statically (same merge rules as `binary_expr_shared`) so the
+/// integration hook can restore it after emission.
 pub(crate) struct Built<'a> {
     pub compiler: Compiler<'a, ValueId>,
-    pub collation: Option<(CollationSeq, bool)>,
+    pub effect: CollationEffect,
 }
 
 impl<'a> Built<'a> {
     fn plain(compiler: Compiler<'a, ValueId>) -> Self {
         Self {
             compiler,
-            collation: None,
+            effect: CollationEffect::Untouched,
         }
     }
 }
@@ -122,7 +159,7 @@ pub(crate) fn compile_value_expr<'a>(
                         let zero = builder.int(0);
                         Ok(builder.binary(BinOp::Subtract, zero, value))
                     }),
-                    collation: operand.collation,
+                    effect: operand.effect,
                 })
             }
             (UnaryOperator::BitwiseNot, operand) => {
@@ -130,7 +167,7 @@ pub(crate) fn compile_value_expr<'a>(
                     compiler: operand
                         .compiler
                         .map_with(|builder, value| Ok(builder.unary(UnaryOp::BitNot, value))),
-                    collation: operand.collation,
+                    effect: operand.effect,
                 })
             }
             (UnaryOperator::Not, operand) => {
@@ -138,34 +175,111 @@ pub(crate) fn compile_value_expr<'a>(
                     compiler: operand
                         .compiler
                         .map_with(|builder, value| Ok(builder.unary(UnaryOp::Not, value))),
-                    collation: operand.collation,
+                    effect: operand.effect,
                 })
             }
         },
-        ast::Expr::Binary(lhs, op, rhs) => {
+        ast::Expr::Binary(lhs_expr, op, rhs_expr) => {
             let Some(op) = value_binop(op) else {
                 return Ok(None);
             };
             // Array concatenation emits ArrayConcat, not Concat; leave
             // any array-typed operand to the eager path.
             if matches!(op, BinOp::Concat)
-                && (crate::translate::expr::expr_is_array(lhs, ctx.referenced_tables)
-                    || crate::translate::expr::expr_is_array(rhs, ctx.referenced_tables))
+                && (crate::translate::expr::expr_is_array(lhs_expr, ctx.referenced_tables)
+                    || crate::translate::expr::expr_is_array(rhs_expr, ctx.referenced_tables))
             {
                 return Ok(None);
             }
-            let Some(lhs) = compile_value_expr(lhs.as_ref(), ctx)? else {
+            let Some(lhs) = compile_value_expr(lhs_expr.as_ref(), ctx)? else {
                 return Ok(None);
             };
-            let Some(rhs) = compile_value_expr(rhs.as_ref(), ctx)? else {
+            let Some(rhs) = compile_value_expr(rhs_expr.as_ref(), ctx)? else {
                 return Ok(None);
+            };
+            // The eager equivalent-operand branch translates the shared
+            // operand once and never writes the collation state; the
+            // general branch always overwrites it with the merge result.
+            let effect = if exprs_are_equivalent(lhs_expr, rhs_expr) {
+                lhs.effect
+            } else {
+                CollationEffect::Sets(merge_collation(
+                    lhs.effect.contribution(),
+                    rhs.effect.contribution(),
+                ))
             };
             Some(Built {
                 compiler: lhs
                     .compiler
                     .then(rhs.compiler)
                     .map_with(move |builder, (lhs, rhs)| Ok(builder.binary(op, lhs, rhs))),
-                collation: merge_collation(lhs.collation, rhs.collation),
+                effect,
+            })
+        }
+        ast::Expr::FunctionCall {
+            name,
+            distinctness,
+            args,
+            order_by,
+            within_group,
+            filter_over,
+        } => {
+            // Only plain scalar calls; anything with aggregate/window
+            // shape stays eager.
+            if distinctness.is_some()
+                || !order_by.is_empty()
+                || !within_group.is_empty()
+                || filter_over.filter_clause.is_some()
+                || filter_over.over_clause.is_some()
+            {
+                return Ok(None);
+            }
+            let Some(resolver) = ctx.resolver else {
+                return Ok(None);
+            };
+            // Unknown functions fall back so the eager path raises its
+            // usual "no such function" error.
+            let Some(func) = resolver.resolve_function(name.as_str(), args.len())? else {
+                return Ok(None);
+            };
+            let Func::Scalar(scalar) = &func else {
+                return Ok(None);
+            };
+            if !scalar_call_is_generic(scalar, args.len()) {
+                return Ok(None);
+            }
+            let mut arg_builds = Vec::with_capacity(args.len());
+            for arg in args {
+                let Some(built) = compile_value_expr(arg, ctx)? else {
+                    return Ok(None);
+                };
+                arg_builds.push(built);
+            }
+            // Eager translation evaluates the arguments in order with no
+            // collation resets between them: the post-state is the last
+            // argument that sets one.
+            let effect = arg_builds
+                .iter()
+                .fold(CollationEffect::Untouched, |acc, arg| match arg.effect {
+                    CollationEffect::Sets(collation) => CollationEffect::Sets(collation),
+                    CollationEffect::Untouched => acc,
+                });
+            let constant = expr.is_constant(resolver);
+            let func_ctx = FuncCtx {
+                func,
+                arg_count: args.len(),
+            };
+            let arg_compilers: Vec<Compiler<'a, ValueId>> =
+                arg_builds.into_iter().map(|built| built.compiler).collect();
+            Some(Built {
+                compiler: Compiler::build_with(move |builder| {
+                    let mut values = Vec::with_capacity(arg_compilers.len());
+                    for arg in arg_compilers {
+                        values.push(arg.run(builder)?);
+                    }
+                    Ok(builder.call(func_ctx, constant, values))
+                }),
+                effect,
             })
         }
         ast::Expr::Column {
@@ -203,10 +317,10 @@ pub(crate) fn compile_value_expr<'a>(
             }
             // Matches the eager Column arm: a column read always
             // establishes its column's collation.
-            let collation = Some((table_column.collation(), false));
+            let effect = CollationEffect::Sets(Some((table_column.collation(), false)));
             Some(Built {
                 compiler: Compiler::build_with(move |builder| Ok(builder.leaf(expr))),
-                collation,
+                effect,
             })
         }
         ast::Expr::RowId {
@@ -280,6 +394,40 @@ fn compile_numeric(value: &str) -> Result<Compiler<'static, ValueId>> {
         Value::Numeric(Numeric::Float(real_value)) => combine::real(f64::from(real_value)),
         _ => unreachable!(),
     })
+}
+
+/// Scalar functions whose eager translation is exactly the generic shape
+/// this frontend mirrors: arguments translated in order into a contiguous
+/// register block, then one `Insn::Function` — no extra instructions,
+/// compile-time evaluation, or collation bookkeeping. The arity gates
+/// match the eager arms' checks, so unsupported arities fall back and
+/// fail with identical errors.
+fn scalar_call_is_generic(func: &ScalarFunc, arg_count: usize) -> bool {
+    match func {
+        ScalarFunc::Abs
+        | ScalarFunc::Lower
+        | ScalarFunc::Upper
+        | ScalarFunc::Length
+        | ScalarFunc::OctetLength
+        | ScalarFunc::Typeof
+        | ScalarFunc::Unicode
+        | ScalarFunc::Unistr
+        | ScalarFunc::UnistrQuote
+        | ScalarFunc::Quote
+        | ScalarFunc::RandomBlob
+        | ScalarFunc::Sign
+        | ScalarFunc::Soundex
+        | ScalarFunc::ZeroBlob => arg_count == 1,
+        ScalarFunc::Trim
+        | ScalarFunc::LTrim
+        | ScalarFunc::RTrim
+        | ScalarFunc::Round
+        | ScalarFunc::Unhex => arg_count <= 2,
+        ScalarFunc::Nullif | ScalarFunc::Instr => arg_count == 2,
+        ScalarFunc::Min | ScalarFunc::Max | ScalarFunc::Concat => arg_count >= 1,
+        ScalarFunc::Char | ScalarFunc::Printf => true,
+        _ => false,
+    }
 }
 
 const fn value_binop(op: &ast::Operator) -> Option<BinOp> {

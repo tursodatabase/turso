@@ -74,6 +74,9 @@ struct Emitter<'a> {
     /// hoisting into the program prologue, matching what nested eager
     /// translation does for constant subtrees of mixed expressions.
     is_const: Vec<bool>,
+    /// Contiguous register pack per call site (indexed by `CallId`):
+    /// `Insn::Function` requires its arguments in adjacent registers.
+    call_packs: Vec<usize>,
 }
 
 impl<'a> Emitter<'a> {
@@ -123,22 +126,92 @@ impl<'a> Emitter<'a> {
                 Some(Inst::Binary { lhs, rhs, .. }) => {
                     is_const[lhs.index()] && is_const[rhs.index()]
                 }
+                // Constant only when the frontend proved the whole call
+                // constant (deterministic function); the argument check
+                // guards against hoisting a call whose inputs are not in
+                // the same constant run.
+                Some(Inst::Call { call, args }) => {
+                    func.call_data(*call).constant && args.iter().all(|arg| is_const[arg.index()])
+                }
                 // External inputs, leaves, and block parameters read
                 // state the prologue cannot see.
                 Some(Inst::External { .. }) | Some(Inst::Leaf(_)) | None => false,
             };
         }
 
+        // Use counts drive call-argument placement below: a value used
+        // exactly once (by the call) can have its defining instruction
+        // write directly into the pack slot, eliminating the copy.
+        let mut use_count = vec![0usize; func.num_values()];
+        let mut count = |value: &super::ir::ValueId| use_count[value.index()] += 1;
+        for &block_id in &order {
+            let block = func.block(block_id);
+            for (_, inst) in &block.insts {
+                match inst {
+                    Inst::Const(_) | Inst::External { .. } | Inst::Leaf(_) => {}
+                    Inst::Unary { operand, .. } => count(operand),
+                    Inst::Binary { lhs, rhs, .. } => {
+                        count(lhs);
+                        count(rhs);
+                    }
+                    Inst::Call { args, .. } => args.iter().for_each(&mut count),
+                }
+            }
+            if let Some(terminator) = &block.terminator {
+                match terminator {
+                    Terminator::Jump(_) => {}
+                    Terminator::Branch { cond, .. } => count(cond),
+                    Terminator::Ret { value } => count(value),
+                }
+                for target in terminator.targets() {
+                    target.args.iter().for_each(&mut count);
+                }
+            }
+        }
+
+        // Allocate one contiguous register pack per call site, in
+        // creation order (deterministic), and steer single-use argument
+        // definitions straight into their pack slots. Shared arguments
+        // (interned constants, deduped leaves used elsewhere) keep their
+        // own register and are copied into the slot at the call site.
+        let mut regs: Vec<Option<usize>> = vec![None; func.num_values()];
+        let mut call_packs = vec![0usize; func.num_calls()];
+        for &block_id in &order {
+            for (_, inst) in &func.block(block_id).insts {
+                let Inst::Call { call, args } = inst else {
+                    continue;
+                };
+                let pack = program.alloc_registers(args.len());
+                call_packs[call.index()] = pack;
+                for (slot, arg) in args.iter().enumerate() {
+                    let bindable = matches!(
+                        inst_of[arg.index()],
+                        Some(
+                            Inst::Const(_)
+                                | Inst::Unary { .. }
+                                | Inst::Binary { .. }
+                                | Inst::Call { .. }
+                                | Inst::Leaf(_)
+                        )
+                    );
+                    if use_count[arg.index()] == 1 && regs[arg.index()].is_none() && bindable {
+                        regs[arg.index()] = Some(pack + slot);
+                    }
+                }
+            }
+        }
+
         Self {
             program,
             func,
             dest,
-            regs: vec![None; func.num_values()],
+            regs,
             labels: vec![None; func.blocks.len()],
             order,
             exit_label: None,
             leaf_emitter,
             is_const,
+            call_packs,
         }
     }
 
@@ -199,6 +272,29 @@ impl<'a> Emitter<'a> {
                         )
                     })?;
                     emitter(self.program, expr, dest)?;
+                }
+                Inst::Call { call, args } => {
+                    let pack = self.call_packs[call.index()];
+                    // Arguments whose definitions were steered into their
+                    // pack slots are already in place; everything else is
+                    // copied in.
+                    for (slot, &arg) in args.iter().enumerate() {
+                        let src = self.reg_of(arg);
+                        if src != pack + slot {
+                            self.program.emit_insn(Insn::Copy {
+                                src_reg: src,
+                                dst_reg: pack + slot,
+                                extra_amount: 0,
+                            });
+                        }
+                    }
+                    let dest = self.reg_of(value);
+                    self.program.emit_insn(Insn::Function {
+                        constant_mask: 0,
+                        start_reg: pack,
+                        dest,
+                        func: self.func.call_data(*call).func.clone(),
+                    });
                 }
                 Inst::Const(constant) => {
                     let dest = self.reg_of(value);

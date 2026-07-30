@@ -188,10 +188,29 @@ boundary (the whole tree is constant, so the span opened by
       overloads), array operands of `||` (ArrayConcat), SELF_TABLE
       placeholders. Region rule: one IR island = one region; no cursor
       movement inside.
-- [ ] 1d. Function calls as instructions — needs contiguous argument
-      packs in the emitter (allocate N adjacent registers; `lower` each
-      arg into its pack slot). Start with pure scalar functions on the
-      generic `Function` path.
+- [x] 1d. Function calls as instructions (`Inst::Call` + per-call-site
+      contiguous register packs). `FuncCtx` is not `Eq`/`Hash`, so call
+      payloads live in a side table and calls are never interned. The
+      emitter counts uses and steers single-use argument definitions
+      directly into their pack slots (constants, tree results, leaves via
+      `translate_expr(arg → slot)`, nested call results), so the common
+      shape emits zero copies — identical to eager; shared values are
+      copied in at the call site. Constness rides a frontend-set flag
+      (`Expr::is_constant`, i.e. deterministic + constant args) ANDed
+      with IR-level argument constness, so `abs(-5)` still hoists into
+      the prologue (verified via EXPLAIN). Frontend coverage is the
+      allowlist in `scalar_call_is_generic`: scalar functions whose eager
+      arm is exactly args-into-contiguous-registers + one
+      `Insn::Function` (abs/lower/upper/length/…, trim family, round,
+      nullif, instr, scalar min/max, concat, char, printf), with arity
+      gates matching the eager checks so violations fall back to
+      identical errors. Also this slice: `Built.collation` replaced by
+      `CollationEffect` (Untouched vs Sets), modeling the eager
+      distinction between "leaves ambient collation alone" (literals,
+      equivalent-operand binaries over neutral operands) and "overwrites
+      it, possibly with None" (columns, non-equivalent binaries, calls
+      fold their args' effects in order); the integration hook just
+      applies the effect.
 - [ ] 1e. Comparisons with affinity + collation payloads in value
       position (`Insn::Eq/Ne/Lt/...`), `CmpInsFlags` captured at build
       time.

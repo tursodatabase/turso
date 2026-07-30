@@ -16,6 +16,8 @@ use std::collections::HashMap;
 
 use turso_parser::ast;
 
+use crate::function::FuncCtx;
+
 /// A symbolic SSA value. Defined exactly once, either by an instruction or
 /// as a block parameter; mapped to a physical register only at emission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -102,9 +104,33 @@ pub enum BinOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeafId(u32);
 
+/// Handle to a function-call payload ([`CallData`]). `FuncCtx` is neither
+/// `Eq` nor `Hash`, so call payloads live in a side table and each call
+/// site gets a fresh id — calls are never interned or deduplicated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CallId(u32);
+
+impl CallId {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Payload of an [`Inst::Call`].
+#[derive(Debug, Clone)]
+pub struct CallData {
+    pub func: FuncCtx,
+    /// Whether the whole call expression is constant (deterministic
+    /// function over constant arguments, per `Expr::is_constant`). Set by
+    /// the frontend at description time; emission uses it to keep
+    /// constant calls eligible for hoisting into the prologue.
+    pub constant: bool,
+}
+
 /// A value-producing instruction. Effectful operations (cursor movement,
 /// row production) will grow here as the migration proceeds; today the IR
-/// covers pure scalar computation plus external inputs and opaque leaves.
+/// covers pure scalar computation plus calls, external inputs, and opaque
+/// leaves.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Inst {
     Const(Const),
@@ -116,6 +142,14 @@ pub enum Inst {
         op: BinOp,
         lhs: ValueId,
         rhs: ValueId,
+    },
+    /// A scalar function call on the generic `Insn::Function` path. The
+    /// callee requires its arguments in adjacent registers, so emission
+    /// allocates a contiguous register pack per call site and steers or
+    /// copies each argument into its slot.
+    Call {
+        call: CallId,
+        args: Vec<ValueId>,
     },
     /// A value that already lives in a physical register owned by code
     /// outside this function (the eager translation surrounding an IR
@@ -202,6 +236,8 @@ pub struct Function {
     defs: Vec<DefSite>,
     /// AST expressions backing [`Inst::Leaf`] instructions.
     leaves: Vec<ast::Expr>,
+    /// Payloads backing [`Inst::Call`] instructions.
+    calls: Vec<CallData>,
 }
 
 impl Function {
@@ -220,6 +256,14 @@ impl Function {
     pub fn leaf_expr(&self, id: LeafId) -> &ast::Expr {
         &self.leaves[id.0 as usize]
     }
+
+    pub fn call_data(&self, id: CallId) -> &CallData {
+        &self.calls[id.0 as usize]
+    }
+
+    pub fn num_calls(&self) -> usize {
+        self.calls.len()
+    }
 }
 
 /// Builds a [`Function`] one block at a time. The builder has a *current*
@@ -232,6 +276,7 @@ pub struct FuncBuilder {
     current: BlockId,
     interned: HashMap<Inst, ValueId>,
     leaves: Vec<ast::Expr>,
+    calls: Vec<CallData>,
 }
 
 impl FuncBuilder {
@@ -242,6 +287,7 @@ impl FuncBuilder {
             current: BlockId::ENTRY,
             interned: HashMap::new(),
             leaves: Vec::new(),
+            calls: Vec::new(),
         }
     }
 
@@ -330,6 +376,15 @@ impl FuncBuilder {
         self.push_inst(Inst::Binary { op, lhs, rhs })
     }
 
+    /// A scalar function call. `constant` marks calls that are
+    /// deterministic over constant arguments (hoistable); calls are never
+    /// deduplicated, so two identical calls run twice.
+    pub fn call(&mut self, func: FuncCtx, constant: bool, args: Vec<ValueId>) -> ValueId {
+        let id = CallId(u32::try_from(self.calls.len()).expect("call count fits in u32"));
+        self.calls.push(CallData { func, constant });
+        self.push_inst(Inst::Call { call: id, args })
+    }
+
     pub fn jump(&mut self, block: BlockId, args: Vec<ValueId>) {
         self.terminate(Terminator::Jump(JumpTarget::new(block, args)));
     }
@@ -358,6 +413,7 @@ impl FuncBuilder {
             blocks: self.blocks,
             defs: self.defs,
             leaves: self.leaves,
+            calls: self.calls,
         }
     }
 

@@ -144,6 +144,11 @@ pub fn verify(func: &Function) -> Result<(), VerifyError> {
                     check(*lhs, index)?;
                     check(*rhs, index)?;
                 }
+                super::ir::Inst::Call { args, .. } => {
+                    for &arg in args {
+                        check(arg, index)?;
+                    }
+                }
             }
         }
 

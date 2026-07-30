@@ -466,18 +466,10 @@ pub fn translate_expr(
                         Some(&mut emit_leaf),
                     )?;
                     // Restore the collation post-state the eager path
-                    // would have left: the statically computed context
-                    // when there is one; otherwise cleared, except in the
-                    // equivalent-operand shape where the eager path
-                    // leaves the state untouched.
-                    match built.collation {
-                        Some(collation) => program.set_collation(Some(collation)),
-                        None => {
-                            if !exprs_are_equivalent(e1, e2) {
-                                program.set_collation(None);
-                            }
-                        }
-                    }
+                    // would have left behind (computed statically by the
+                    // frontend, including the equivalent-operand shape
+                    // that leaves the ambient state untouched).
+                    built.effect.apply(program);
                     if let Some(span) = constant_span {
                         program.constant_span_end(span);
                     }

@@ -596,6 +596,125 @@ mod tests {
         ));
     }
 
+    fn abs_ctx() -> crate::function::FuncCtx {
+        crate::function::FuncCtx {
+            func: crate::function::Func::Scalar(crate::function::ScalarFunc::Abs),
+            arg_count: 1,
+        }
+    }
+
+    #[test]
+    fn call_args_steer_into_the_pack() {
+        // abs(5): the single-use argument's definition writes directly
+        // into the pack slot — no Copy, exactly the eager shape.
+        let mut builder = FuncBuilder::new();
+        let five = builder.int(5);
+        let call = builder.call(abs_ctx(), true, vec![five]);
+        builder.ret(call);
+        let func = builder.finish();
+
+        let mut program = test_program();
+        let dest = program.alloc_register();
+        emit::emit_function(&mut program, &func, dest).unwrap();
+        let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
+        let [Insn::Integer {
+            value: 5,
+            dest: arg_reg,
+        }, Insn::Function {
+            start_reg,
+            dest: fdest,
+            ..
+        }] = insns[..]
+        else {
+            panic!("expected Integer + Function, got {insns:?}");
+        };
+        assert_eq!(arg_reg, start_reg, "argument lands in the pack slot");
+        assert_eq!(*fdest, dest);
+        // The whole call is constant: one span covering both insns.
+        assert_eq!(program.constant_spans, vec![(0, 1)]);
+    }
+
+    #[test]
+    fn shared_call_args_are_copied_into_slots() {
+        // f(v, v) where v is one interned constant: the shared value
+        // keeps its register and is copied into both pack slots.
+        let mut builder = FuncBuilder::new();
+        let seven = builder.int(7);
+        let ctx = crate::function::FuncCtx {
+            func: crate::function::Func::Scalar(crate::function::ScalarFunc::Instr),
+            arg_count: 2,
+        };
+        let call = builder.call(ctx, true, vec![seven, seven]);
+        builder.ret(call);
+        let func = builder.finish();
+
+        let mut program = test_program();
+        let dest = program.alloc_register();
+        emit::emit_function(&mut program, &func, dest).unwrap();
+        let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
+        let [Insn::Integer { dest: v, .. }, Insn::Copy {
+            src_reg: s1,
+            dst_reg: d1,
+            ..
+        }, Insn::Copy {
+            src_reg: s2,
+            dst_reg: d2,
+            ..
+        }, Insn::Function { start_reg, .. }] = insns[..]
+        else {
+            panic!("expected Integer + 2 Copies + Function, got {insns:?}");
+        };
+        assert_eq!((s1, s2), (v, v));
+        assert_eq!(*d1, *start_reg);
+        assert_eq!(*d2, *start_reg + 1);
+    }
+
+    #[test]
+    fn nested_calls_chain_through_pack_slots() {
+        // outer(inner(x)): the inner call's single-use result is steered
+        // into the outer call's pack slot — no intermediate Copy.
+        let mut builder = FuncBuilder::new();
+        let x = builder.int(3);
+        let inner = builder.call(abs_ctx(), true, vec![x]);
+        let outer = builder.call(abs_ctx(), true, vec![inner]);
+        builder.ret(outer);
+        let func = builder.finish();
+
+        let mut program = test_program();
+        let dest = program.alloc_register();
+        emit::emit_function(&mut program, &func, dest).unwrap();
+        let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
+        let [Insn::Integer { .. }, Insn::Function {
+            dest: inner_dest, ..
+        }, Insn::Function {
+            start_reg: outer_pack,
+            dest: outer_dest,
+            ..
+        }] = insns[..]
+        else {
+            panic!("expected Integer + 2 Functions, got {insns:?}");
+        };
+        assert_eq!(inner_dest, outer_pack);
+        assert_eq!(*outer_dest, dest);
+    }
+
+    #[test]
+    fn non_constant_calls_do_not_join_spans() {
+        // A call marked non-constant (e.g. randomblob) must not emit
+        // inside a constant span even when its argument is constant.
+        let mut builder = FuncBuilder::new();
+        let n = builder.int(8);
+        let call = builder.call(abs_ctx(), false, vec![n]);
+        builder.ret(call);
+        let func = builder.finish();
+
+        let mut program = test_program();
+        let dest = program.alloc_register();
+        emit::emit_function(&mut program, &func, dest).unwrap();
+        // Only the Integer argument is in a span; the Function is not.
+        assert_eq!(program.constant_spans, vec![(0, 0)]);
+    }
+
     #[test]
     fn pure_and_map_pass_values_through() {
         let description = Compiler::pure(41).map(|v| v + 1);
