@@ -189,8 +189,8 @@ pub fn verify(func: &Function) -> Result<(), VerifyError> {
             }
             Terminator::NullBranch { value, .. } => check(*value, end)?,
             Terminator::Ret { value } => check(*value, end)?,
-            Terminator::Rewind { .. }
-            | Terminator::Next { .. }
+            Terminator::ScanStart { .. }
+            | Terminator::ScanAdvance { .. }
             | Terminator::DecrJumpZero { .. }
             | Terminator::IfPos { .. } => {}
         }

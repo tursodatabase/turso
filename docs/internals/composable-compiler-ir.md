@@ -346,8 +346,12 @@ boundary (the whole tree is constant, so the span opened by
       gives per-iteration column re-reads. IR-level tests only — the
       production integration is Phase 4a.
 - [ ] 3b. IR-owned cursors: symbolic cursor declaration with open/close
-      effects (table root/type as opaque frontend payloads), seeks, and
-      the remaining cursor movement terminators (SeekGE, Last, Prev).
+      effects (table root/type as opaque frontend payloads) and seeks
+      (SeekGE and friends). Last/Prev are done: the scan terminators
+      are direction-aware (`ScanStart`/`ScanAdvance` carrying an
+      IR-owned `ScanDirection`, emitting Rewind/Next forward and
+      Last/Prev backward; `rewind`/`next_row` remain as forward
+      builder shorthands).
 - [ ] 3c. Register packs are done (calls, rows); remaining: `Slot`
       (explicit mutable cells) for aggregate accumulators and coroutine
       yield cells; liveness-based register reuse instead of
@@ -412,6 +416,11 @@ boundary (the whole tree is constant, so the span opened by
       structurally complete for single-table forward scans; what
       remains outside it is plan-shaped (indexes, joins, aggregates,
       ORDER BY, DISTINCT, subqueries, non-ResultRows destinations).
+- [x] 4a-5. Backward scans in the gate: `iter_dir: Backwards` (e.g.
+      ORDER BY rowid DESC satisfied by scan direction, order_by
+      cleared by the optimizer) maps to `ScanDirection::Backward` and
+      emits the eager-identical Last/.../Prev loop. Composes with
+      WHERE/LIMIT/OFFSET.
 - [ ] 4b. Joins, aggregates, sorters, subqueries as stream operators;
       `emitter/` + `main_loop/` sequencing becomes tree lowering.
 - [ ] 4c. Shrink and remove the eager-emission fallback per construct.

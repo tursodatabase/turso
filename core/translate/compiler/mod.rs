@@ -43,7 +43,7 @@ use crate::vdbe::BranchOffset;
 use crate::Result;
 
 /// Compile a whole simple-scan SELECT through the pipeline: one
-/// forward B-tree table scan with no index, filtering rows with
+/// B-tree table scan (either direction) with no index, filtering rows with
 /// IR-representable WHERE terms, skipping OFFSET rows, projecting
 /// IR-representable result columns straight to result rows, and
 /// counting down LIMIT. This is the first row-stream integration:
@@ -86,11 +86,15 @@ pub(crate) fn try_emit_scan_query(
         return Ok(false);
     };
     let Operation::Scan(Scan::BTreeTable {
-        iter_dir: IterationDirection::Forwards,
+        iter_dir,
         index: None,
     }) = &table.op
     else {
         return Ok(false);
+    };
+    let direction = match iter_dir {
+        IterationDirection::Forwards => ir::ScanDirection::Forward,
+        IterationDirection::Backwards => ir::ScanDirection::Backward,
     };
     if !matches!(table.table, Table::BTree(_)) || !table.expression_index_usages.is_empty() {
         return Ok(false);
@@ -200,8 +204,9 @@ pub(crate) fn try_emit_scan_query(
     };
     let row = (filter.is_some() || offset_counter.is_some()).then(|| builder.create_block());
     let latch = builder.create_block();
-    builder.rewind(
+    builder.scan_start(
         cursor,
+        direction,
         ir::JumpTarget::new(done, Vec::new()),
         ir::JumpTarget::new(body, Vec::new()),
     );
@@ -243,8 +248,9 @@ pub(crate) fn try_emit_scan_query(
         None => builder.jump(latch, Vec::new()),
     }
     builder.switch_to(latch);
-    builder.next_row(
+    builder.scan_advance(
         cursor,
+        direction,
         ir::JumpTarget::new(body, Vec::new()),
         ir::JumpTarget::new(done, Vec::new()),
     );
@@ -1714,6 +1720,60 @@ mod tests {
             insns[..]
         else {
             panic!("unexpected offset scan shape: {insns:?}");
+        };
+    }
+
+    #[test]
+    fn backward_scans_emit_the_last_prev_shape() {
+        use super::ir::ScanDirection;
+        // scan(t, Backward).map(x), the shape try_emit_scan_query
+        // builds for iter_dir Backwards (e.g. ORDER BY rowid DESC
+        // satisfied by the scan direction): the same loop with Last
+        // opening the iteration and Prev as the back edge.
+        let column_leaf = parse_expr("x");
+        let mut builder = FuncBuilder::new();
+        let done_exit = builder.declare_exit();
+        let done = builder.exit_block(done_exit);
+        let body = builder.create_block();
+        let latch = builder.create_block();
+        builder.scan_start(
+            0,
+            ScanDirection::Backward,
+            JumpTarget::new(done, Vec::new()),
+            JumpTarget::new(body, Vec::new()),
+        );
+        builder.switch_to(body);
+        let projected = builder.leaf(&column_leaf);
+        builder.emit_row(vec![projected]);
+        builder.jump(latch, Vec::new());
+        builder.switch_to(latch);
+        builder.scan_advance(
+            0,
+            ScanDirection::Backward,
+            JumpTarget::new(body, Vec::new()),
+            JumpTarget::new(done, Vec::new()),
+        );
+        let func = builder.finish();
+        verify(&func).unwrap();
+
+        let mut program = test_program();
+        let fallthrough = program.allocate_label();
+        let mut leaf_emitter = stub_leaf_emitter();
+        emit::emit_condition_function(
+            &mut program,
+            &func,
+            &[fallthrough],
+            Some(fallthrough),
+            Some(&mut leaf_emitter),
+        )
+        .unwrap();
+        program.preassign_label_to_next_insn(fallthrough);
+        program.resolve_labels().unwrap();
+        let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
+        let [Insn::Last { cursor_id: 0, .. }, Insn::Integer { value: 7, .. }, Insn::ResultRow { count: 1, .. }, Insn::Prev { cursor_id: 0, .. }] =
+            insns[..]
+        else {
+            panic!("unexpected backward scan shape: {insns:?}");
         };
     }
 

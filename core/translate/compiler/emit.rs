@@ -18,7 +18,9 @@ use crate::vdbe::insn::{CmpInsFlags, Insn};
 use crate::vdbe::BranchOffset;
 use crate::{LimboError, Result};
 
-use super::ir::{BinOp, BlockId, CmpOp, Const, Function, Inst, JumpTarget, Terminator, UnaryOp};
+use super::ir::{
+    BinOp, BlockId, CmpOp, Const, Function, Inst, JumpTarget, ScanDirection, Terminator, UnaryOp,
+};
 use super::verify::verify;
 
 /// Callback that emits an opaque leaf ([`Inst::Leaf`]) by materializing
@@ -232,8 +234,8 @@ impl<'a> Emitter<'a> {
                     }
                     Terminator::NullBranch { value, .. } => count(value),
                     Terminator::Ret { value } => count(value),
-                    Terminator::Rewind { .. }
-                    | Terminator::Next { .. }
+                    Terminator::ScanStart { .. }
+                    | Terminator::ScanAdvance { .. }
                     | Terminator::DecrJumpZero { .. }
                     | Terminator::IfPos { .. } => {}
                 }
@@ -784,16 +786,23 @@ impl<'a> Emitter<'a> {
                     self.program.emit_insn(Insn::Goto { target_pc: pc });
                 }
             }
-            Terminator::Rewind {
+            Terminator::ScanStart {
                 cursor,
+                direction,
                 if_empty,
                 if_rows,
             } => {
                 let mut trampolines: Vec<(BranchOffset, JumpTarget)> = Vec::new();
                 let pc_if_empty = self.edge_entry_pc(if_empty, &mut trampolines);
-                self.program.emit_insn(Insn::Rewind {
-                    cursor_id: *cursor,
-                    pc_if_empty,
+                self.program.emit_insn(match direction {
+                    ScanDirection::Forward => Insn::Rewind {
+                        cursor_id: *cursor,
+                        pc_if_empty,
+                    },
+                    ScanDirection::Backward => Insn::Last {
+                        cursor_id: *cursor,
+                        pc_if_empty,
+                    },
                 });
                 self.emit_edge(if_rows);
                 self.emit_goto_unless_next(if_rows.block, next, trampolines.is_empty());
@@ -804,16 +813,23 @@ impl<'a> Emitter<'a> {
                     self.program.emit_insn(Insn::Goto { target_pc: pc });
                 }
             }
-            Terminator::Next {
+            Terminator::ScanAdvance {
                 cursor,
+                direction,
                 if_more,
                 if_done,
             } => {
                 let mut trampolines: Vec<(BranchOffset, JumpTarget)> = Vec::new();
-                let pc_if_next = self.edge_entry_pc(if_more, &mut trampolines);
-                self.program.emit_insn(Insn::Next {
-                    cursor_id: *cursor,
-                    pc_if_next,
+                let pc_back_edge = self.edge_entry_pc(if_more, &mut trampolines);
+                self.program.emit_insn(match direction {
+                    ScanDirection::Forward => Insn::Next {
+                        cursor_id: *cursor,
+                        pc_if_next: pc_back_edge,
+                    },
+                    ScanDirection::Backward => Insn::Prev {
+                        cursor_id: *cursor,
+                        pc_if_prev: pc_back_edge,
+                    },
                 });
                 self.emit_edge(if_done);
                 self.emit_goto_unless_next(if_done.block, next, trampolines.is_empty());

@@ -312,6 +312,15 @@ impl JumpTarget {
     }
 }
 
+/// Which way a scan walks its cursor. The IR's own vocabulary (not the
+/// planner's `IterationDirection`) so the IR stays independent of plan
+/// types; emission picks Rewind/Next or Last/Prev from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanDirection {
+    Forward,
+    Backward,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Terminator {
     Jump(JumpTarget),
@@ -357,19 +366,23 @@ pub enum Terminator {
     /// Leave the IR island for an external continuation. See [`ExitId`].
     Exit(ExitId),
     /// Position `cursor` (externally opened, referenced by its physical
-    /// id like `Inst::External` references registers) at its first row:
-    /// `if_empty` when the table has no rows, `if_rows` otherwise
-    /// (`Insn::Rewind`).
-    Rewind {
+    /// id like `Inst::External` references registers) at the first row
+    /// in iteration order — the table start going forward
+    /// (`Insn::Rewind`), the table end going backward (`Insn::Last`):
+    /// `if_empty` when the table has no rows, `if_rows` otherwise.
+    ScanStart {
         cursor: usize,
+        direction: ScanDirection,
         if_empty: JumpTarget,
         if_rows: JumpTarget,
     },
-    /// Advance `cursor`: `if_more` (the loop back-edge, which may carry
-    /// loop values as block arguments) when another row exists,
-    /// `if_done` otherwise (`Insn::Next`).
-    Next {
+    /// Advance `cursor` one row in iteration order (`Insn::Next`
+    /// forward, `Insn::Prev` backward): `if_more` (the loop back-edge,
+    /// which may carry loop values as block arguments) when another
+    /// row exists, `if_done` otherwise.
+    ScanAdvance {
         cursor: usize,
+        direction: ScanDirection,
         if_more: JumpTarget,
         if_done: JumpTarget,
     },
@@ -415,10 +428,10 @@ impl Terminator {
                 if_not_null,
                 ..
             } => vec![if_null, if_not_null],
-            Terminator::Rewind {
+            Terminator::ScanStart {
                 if_empty, if_rows, ..
             } => vec![if_empty, if_rows],
-            Terminator::Next {
+            Terminator::ScanAdvance {
                 if_more, if_done, ..
             } => vec![if_more, if_done],
             Terminator::DecrJumpZero {
@@ -671,22 +684,49 @@ impl FuncBuilder {
         });
     }
 
-    /// Terminate the current block by rewinding an external cursor.
-    pub fn rewind(&mut self, cursor: usize, if_empty: JumpTarget, if_rows: JumpTarget) {
-        self.terminate(Terminator::Rewind {
+    /// Terminate the current block by positioning an external cursor
+    /// at the first row in `direction`'s iteration order.
+    pub fn scan_start(
+        &mut self,
+        cursor: usize,
+        direction: ScanDirection,
+        if_empty: JumpTarget,
+        if_rows: JumpTarget,
+    ) {
+        self.terminate(Terminator::ScanStart {
             cursor,
+            direction,
             if_empty,
             if_rows,
         });
     }
 
-    /// Terminate the current block by advancing an external cursor.
-    pub fn next_row(&mut self, cursor: usize, if_more: JumpTarget, if_done: JumpTarget) {
-        self.terminate(Terminator::Next {
+    /// Terminate the current block by advancing an external cursor one
+    /// row in `direction`'s iteration order.
+    pub fn scan_advance(
+        &mut self,
+        cursor: usize,
+        direction: ScanDirection,
+        if_more: JumpTarget,
+        if_done: JumpTarget,
+    ) {
+        self.terminate(Terminator::ScanAdvance {
             cursor,
+            direction,
             if_more,
             if_done,
         });
+    }
+
+    /// Forward [`Self::scan_start`]: rewind an external cursor.
+    pub fn rewind(&mut self, cursor: usize, if_empty: JumpTarget, if_rows: JumpTarget) {
+        self.scan_start(cursor, ScanDirection::Forward, if_empty, if_rows);
+    }
+
+    /// Forward [`Self::scan_advance`]: step an external cursor to its
+    /// next row.
+    pub fn next_row(&mut self, cursor: usize, if_more: JumpTarget, if_done: JumpTarget) {
+        self.scan_advance(cursor, ScanDirection::Forward, if_more, if_done);
     }
 
     /// Terminate the current block by decrementing an external counter
