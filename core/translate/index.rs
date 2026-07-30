@@ -208,7 +208,7 @@ pub fn translate_create_index(
     // Resolution is lenient: names that don't resolve stay as identifiers,
     // and validate_where_expr below rejects them.
     let resolved_where_clause = where_clause.clone().map(|mut wc| {
-        crate::schema::resolve_index_expr_columns(&mut wc, &tbl);
+        crate::translate::bind::bind_index_schema_expr(&mut wc, &tbl);
         wc
     });
     let idx = Arc::new(Index {
@@ -947,7 +947,7 @@ fn resolve_sorted_columns_with_resolver(
         // SELF_TABLE form (validation above guarantees every identifier is a
         // column of the indexed table), like generated-column expressions.
         let mut key_expr = sc.expr.clone();
-        crate::schema::resolve_index_expr_columns(&mut key_expr, table);
+        crate::translate::bind::bind_index_schema_expr(&mut key_expr, table);
         resolved
             .push_within_capacity(IndexColumn {
                 name: sc.expr.to_string(),

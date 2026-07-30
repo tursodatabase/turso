@@ -161,7 +161,7 @@ use std::sync::OnceLock;
 use tracing::trace;
 use turso_parser::ast::{
     self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, ResolveType, SortOrder,
-    TableInternalId, TypeOperator,
+    TypeOperator,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -3828,7 +3828,7 @@ impl BTreeTable {
             for i in 0..guard.len() {
                 if guard[i].is_virtual_generated() {
                     let mut expr = guard[i].generated_expr().cloned().unwrap();
-                    resolve_gencol_expr_columns(&mut expr, &guard)?;
+                    crate::translate::bind::bind_generated_column_expr(&mut expr, &guard)?;
                     *guard[i].generated_expr_mut().unwrap() = expr;
                 }
             }
@@ -3838,7 +3838,7 @@ impl BTreeTable {
         // surface when the constraint is evaluated.
         let mut checks = std::mem::replace(&mut self.check_constraints, TursoAllocExt::new());
         for check in &mut checks {
-            resolve_index_expr_columns(&mut check.expr, self);
+            crate::translate::bind::bind_index_schema_expr(&mut check.expr, self);
         }
         self.check_constraints = checks;
         self.column_graph()?;
@@ -4128,82 +4128,6 @@ fn find_column_index_by_name(columns: &[Column], col_name: &str) -> Option<usize
     })
 }
 
-/// Resolve [Expr::Id] / [Expr::Qualified] / [Expr::DoublyQualified] in a generated column
-/// or partial-index expression to `Expr::Column { table: SELF_TABLE, column: idx }`.
-pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -> Result<()> {
-    walk_expr_mut(gencol_expr, &mut |e| match e {
-        Expr::Id(name) | Expr::Qualified(_, name) | Expr::DoublyQualified(_, _, name) => {
-            let col_name = normalize_ident(name.as_str());
-            let (idx, col) = columns
-                .iter()
-                .enumerate()
-                .find(|(_, c)| {
-                    c.name
-                        .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(&col_name))
-                })
-                .ok_or_else(|| LimboError::ParseError(format!("no such column: {col_name}")))?;
-            *e = Expr::Column {
-                database: None,
-                table: TableInternalId::SELF_TABLE,
-                column: idx,
-                is_rowid_alias: col.is_rowid_alias(),
-            };
-            Ok(WalkControl::Continue)
-        }
-        _ => Ok(WalkControl::Continue),
-    })?;
-    Ok(())
-}
-
-/// Resolve identifier leaves of an index key expression or partial-index
-/// WHERE clause to `Expr::Column { table: SELF_TABLE }` / `Expr::RowId
-/// { table: SELF_TABLE }` positional references, like generated-column
-/// expressions. Resolution is lenient: identifiers that are not columns of
-/// `table` (and not the rowid keyword) are left untouched, so loading a
-/// schema with a stale expression still succeeds and the error surfaces when
-/// the expression is actually used.
-pub fn resolve_index_expr_columns(expr: &mut Expr, table: &BTreeTable) {
-    let table_name = normalize_ident(table.name.as_str());
-    let _ = walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
-        let resolved = match e {
-            Expr::Id(name) | Expr::Name(name) => {
-                resolve_self_table_leaf(&normalize_ident(name.as_str()), table)
-            }
-            Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col)
-                if normalize_ident(ns.as_str()).eq_ignore_ascii_case(&table_name) =>
-            {
-                resolve_self_table_leaf(&normalize_ident(col.as_str()), table)
-            }
-            _ => None,
-        };
-        if let Some(resolved) = resolved {
-            *e = resolved;
-        }
-        Ok(WalkControl::Continue)
-    });
-}
-
-/// Resolve a single identifier against `table`: a column reference wins over
-/// the rowid keyword, matching binder precedence.
-fn resolve_self_table_leaf(name: &str, table: &BTreeTable) -> Option<Expr> {
-    if let Some((idx, col)) = table.get_column(name) {
-        return Some(Expr::Column {
-            database: None,
-            table: TableInternalId::SELF_TABLE,
-            column: idx,
-            is_rowid_alias: col.is_rowid_alias(),
-        });
-    }
-    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
-        return Some(Expr::RowId {
-            database: None,
-            table: TableInternalId::SELF_TABLE,
-        });
-    }
-    None
-}
-
 /// Decrement `SELF_TABLE` column positions greater than the dropped
 /// column's position in a stored schema expression (index key,
 /// partial-index WHERE, CHECK constraint).
@@ -4217,30 +4141,6 @@ pub fn shift_self_table_positions_after_drop(expr: &mut Expr, dropped_index: usi
         Ok(WalkControl::Continue)
     })?;
     Ok(())
-}
-
-/// Returns the first unresolved identifier leaf in the expression, if any
-/// (a name that lenient schema-load resolution could not map to a column).
-pub fn first_unresolved_identifier(expr: &Expr) -> Option<String> {
-    let mut found = None;
-    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
-        if found.is_some() {
-            return Ok(WalkControl::SkipChildren);
-        }
-        match e {
-            Expr::Id(name) | Expr::Name(name) => {
-                found = Some(name.as_str().to_string());
-                return Ok(WalkControl::SkipChildren);
-            }
-            Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
-                found = Some(format!("{}.{}", ns.as_str(), col.as_str()));
-                return Ok(WalkControl::SkipChildren);
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    });
-    found
 }
 
 /// Re-render the SQL text of a generated-column expression using current column names. The input
@@ -5870,7 +5770,7 @@ impl Index {
                     })
                 } else {
                     let where_clause = where_clause.map(|mut wc| {
-                        resolve_index_expr_columns(&mut wc, table);
+                        crate::translate::bind::bind_index_schema_expr(&mut wc, table);
                         wc
                     });
                     Ok(Index {

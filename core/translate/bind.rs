@@ -12,7 +12,7 @@ use super::emitter::Resolver;
 use super::expr::{walk_expr, walk_expr_mut, WalkControl};
 use super::plan::{JoinInfo, TableReferences};
 use super::planner::parse_row_id;
-use crate::schema::{BTreeTable, Table};
+use crate::schema::{BTreeTable, Column, Table};
 use crate::util::normalize_ident;
 use crate::Result;
 
@@ -43,11 +43,111 @@ pub fn rebase_schema_expr(expr: &mut ast::Expr, internal_id: ast::TableInternalI
 /// concrete table reference.
 pub fn bind_schema_expr(expr: &ast::Expr, internal_id: ast::TableInternalId) -> Result<ast::Expr> {
     let mut bound = expr.clone();
-    if let Some(name) = crate::schema::first_unresolved_identifier(&bound) {
+    if let Some(name) = first_unbound_identifier(&bound) {
         crate::bail_parse_error!("no such column: {}", name);
     }
     rebase_schema_expr(&mut bound, internal_id);
     Ok(bound)
+}
+
+/// Bind every generated-column name to a SELF_TABLE column position.
+pub fn bind_generated_column_expr(expr: &mut ast::Expr, columns: &[Column]) -> Result<()> {
+    walk_expr_mut(expr, &mut |expr| match expr {
+        ast::Expr::Id(name)
+        | ast::Expr::Qualified(_, name)
+        | ast::Expr::DoublyQualified(_, _, name) => {
+            let column_name = normalize_ident(name.as_str());
+            let (column, definition) = columns
+                .iter()
+                .enumerate()
+                .find(|(_, column)| {
+                    column
+                        .name
+                        .as_ref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&column_name))
+                })
+                .ok_or_else(|| {
+                    crate::LimboError::ParseError(format!("no such column: {column_name}"))
+                })?;
+            *expr = ast::Expr::Column {
+                database: None,
+                table: ast::TableInternalId::SELF_TABLE,
+                column,
+                is_rowid_alias: definition.is_rowid_alias(),
+            };
+            Ok(WalkControl::Continue)
+        }
+        _ => Ok(WalkControl::Continue),
+    })?;
+    Ok(())
+}
+
+/// Bind index keys, partial-index predicates, and CHECK expressions to
+/// SELF_TABLE positions. Unknown names remain unbound so stale schema entries
+/// can load and fail when the expression is used.
+pub fn bind_index_schema_expr(expr: &mut ast::Expr, table: &BTreeTable) {
+    let table_name = normalize_ident(table.name.as_str());
+    let _ = walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
+        let resolved = match expr {
+            ast::Expr::Id(name) | ast::Expr::Name(name) => {
+                bind_self_table_leaf(&normalize_ident(name.as_str()), table)
+            }
+            ast::Expr::Qualified(namespace, column)
+            | ast::Expr::DoublyQualified(_, namespace, column)
+                if normalize_ident(namespace.as_str()).eq_ignore_ascii_case(&table_name) =>
+            {
+                bind_self_table_leaf(&normalize_ident(column.as_str()), table)
+            }
+            _ => None,
+        };
+        if let Some(resolved) = resolved {
+            *expr = resolved;
+        }
+        Ok(WalkControl::Continue)
+    });
+}
+
+fn bind_self_table_leaf(name: &str, table: &BTreeTable) -> Option<ast::Expr> {
+    if let Some((column, definition)) = table.get_column(name) {
+        return Some(ast::Expr::Column {
+            database: None,
+            table: ast::TableInternalId::SELF_TABLE,
+            column,
+            is_rowid_alias: definition.is_rowid_alias(),
+        });
+    }
+    if super::planner::ROWID_STRS
+        .iter()
+        .any(|rowid| rowid.eq_ignore_ascii_case(name))
+    {
+        return Some(ast::Expr::RowId {
+            database: None,
+            table: ast::TableInternalId::SELF_TABLE,
+        });
+    }
+    None
+}
+
+fn first_unbound_identifier(expr: &ast::Expr) -> Option<String> {
+    let mut found = None;
+    let _ = walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        if found.is_some() {
+            return Ok(WalkControl::SkipChildren);
+        }
+        match expr {
+            ast::Expr::Id(name) | ast::Expr::Name(name) => {
+                found = Some(name.as_str().to_string());
+                Ok(WalkControl::SkipChildren)
+            }
+            ast::Expr::Qualified(namespace, column)
+            | ast::Expr::DoublyQualified(_, namespace, column) => {
+                found = Some(format!("{}.{}", namespace.as_str(), column.as_str()));
+                Ok(WalkControl::SkipChildren)
+            }
+            _ => Ok(WalkControl::Continue),
+        }
+    });
+    found
 }
 
 fn bind_table_index_expressions(
