@@ -6159,4 +6159,89 @@ mod tests {
         assert_eq!(actual_right.name, "right_id");
         assert_eq!(right_idx, 0);
     }
+
+    mod write_row_view_repoll {
+        use super::super::WriteRowView;
+        use crate::incremental::yield_test_support::OneShotYieldInjector;
+        use crate::mvcc::yield_hooks::YieldPointMarker;
+        use crate::storage::btree::{
+            BTreeCursor, BTreeWriteYieldPoint, CursorTrait, BTREE_WRITE_YIELD_FAMILY,
+        };
+        use crate::storage::pager::CreateBTreeFlags;
+        use crate::sync::Arc;
+        use crate::types::{SeekKey, SeekOp, SeekResult};
+        use crate::util::IOExt;
+        use crate::{Connection, Database, MemoryIO, SqliteDialect, Value, IO};
+
+        fn setup() -> (Arc<Connection>, Arc<crate::Pager>, i64) {
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect().unwrap();
+            let pager = conn.pager.load().clone();
+            let _ = pager.io.block(|| pager.allocate_page1());
+            let root = pager
+                .io
+                .block(|| pager.btree_create(&CreateBTreeFlags::new_table()))
+                .unwrap() as i64;
+            (conn, pager, root)
+        }
+
+        /// Same re-poll contract as `persistence::WriteRow`, for the per-row view cursor:
+        /// a mid-balance yield must not lose the matview row.
+        #[test]
+        fn write_row_view_completes_yielded_overflowing_insert() {
+            let (conn, pager, root) = setup();
+
+            let injector = OneShotYieldInjector::new(
+                BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance.point(),
+                BTREE_WRITE_YIELD_FAMILY ^ root as u64,
+            );
+            conn.set_yield_injector(Some(injector.clone()));
+
+            // ~1200-byte on-page cells fill leaves; the insert that overflows a page
+            // triggers the mid-balance yield. Fresh per-row cursor, as in UpdateView.
+            let mut victim_rowid = None;
+            for rowid in 1i64..=200 {
+                let mut cursor = BTreeCursor::new_table(pager.clone(), root, 2);
+                cursor.install_yield_context(&conn);
+
+                let key = SeekKey::TableRowId(rowid);
+                let build = move |final_weight: isize| -> Vec<Value> {
+                    vec![
+                        Value::from_slice(&[0xcd_u8; 1200]).unwrap(),
+                        Value::from_i64(final_weight as i64),
+                    ]
+                };
+
+                let mut wr = WriteRowView::new();
+                pager
+                    .io
+                    .block(|| wr.write_row(&mut cursor, key.clone(), build, 1))
+                    .unwrap();
+
+                if injector.fired() {
+                    victim_rowid = Some(rowid);
+                    break;
+                }
+            }
+            let victim_rowid = victim_rowid
+                .expect("no insert ever overflowed a page; test does not exercise the bug");
+            conn.set_yield_injector(None);
+
+            let mut verify = BTreeCursor::new_table(pager.clone(), root, 2);
+            let found = pager
+                .io
+                .block(|| {
+                    verify.seek(
+                        SeekKey::TableRowId(victim_rowid),
+                        SeekOp::GE { eq_only: true },
+                    )
+                })
+                .unwrap();
+            assert!(
+                matches!(found, SeekResult::Found),
+                "matview row {victim_rowid} lost: WriteRowView advanced to Done past a yielded insert"
+            );
+        }
+    }
 }

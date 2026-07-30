@@ -376,7 +376,7 @@ pub(crate) enum BTreeWriteYieldPoint {
 }
 
 #[cfg(any(test, injected_yields))]
-const BTREE_WRITE_YIELD_FAMILY: u64 = 0x4254_5245_5752_4954;
+pub(crate) const BTREE_WRITE_YIELD_FAMILY: u64 = 0x4254_5245_5752_4954;
 
 #[cfg(any(test, injected_yields))]
 impl YieldPointMarker for BTreeWriteYieldPoint {
