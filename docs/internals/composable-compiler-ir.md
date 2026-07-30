@@ -288,8 +288,18 @@ boundary (the whole tree is constant, so the span opened by
       (`Expr::Variable`) as **non-deduping** leaves via `leaf_unique` —
       anonymous `?` registers a fresh index per occurrence, and eager
       never dedups variables either. Root hooks added for the Cast arm.
-- [ ] 2b-3b. Remaining short-circuit value forms: BETWEEN, IN-list,
-      LIKE/GLOB (via translate_like_base), Collate(expr).
+- [x] 2b-3b. BETWEEN and COLLATE. `x BETWEEN a AND b` compiles as two
+      shared-probe comparisons combined with And (NOT: Lt/Gt with Or) —
+      the eager path forks a resolver with an expression→register cache
+      solely to evaluate x once; SSA value sharing provides that by
+      construction, validating the design thesis that the expr cache is
+      hand-rolled CSE. `Expr::Collate` is pure effect: passthrough value,
+      `Sets(Some((collation, true)))`. Condition-position COLLATE roots
+      keep the eager parse error (explicit fallback arm).
+- [ ] 2b-3c. IN-list — needs the `Slot` concept: the eager
+      `translate_in_list` accumulates a NULL flag by repeated `BitAnd`
+      into one register, which pure SSA cannot express. LIKE/GLOB (via
+      `translate_like_base`) also remain.
 - [ ] 2c. Constant hoisting as an IR transform (move constant-only
       instructions to the entry block) so IR islands stop depending on
       the constant-span machinery; then start deleting

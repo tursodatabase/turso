@@ -595,6 +595,88 @@ pub(crate) fn compile_value_expr<'a>(
         ast::Expr::Variable(_) => Some(Built::plain(Compiler::build_with(move |builder| {
             Ok(builder.leaf_unique(expr))
         }))),
+        // COLLATE changes no value — it overwrites the ambient collation
+        // context with an explicit assignment (from_collate = true).
+        ast::Expr::Collate(inner, collation_name) => {
+            let Some(resolver) = ctx.resolver else {
+                return Ok(None);
+            };
+            let collation = resolver.resolve_collation(collation_name.as_str())?;
+            compile_value_expr(inner.as_ref(), ctx)?.map(|inner| Built {
+                compiler: inner.compiler,
+                effect: CollationEffect::Sets(Some((collation, true))),
+            })
+        }
+        ast::Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } => {
+            // `x BETWEEN a AND b` is `x >= a AND x <= b` (NOT: `x < a OR
+            // x > b`) with x evaluated once. The eager path builds a
+            // forked resolver with an expression→register cache to get
+            // that sharing; here the shared SSA value provides it by
+            // construction.
+            if crate::translate::expr::expr_is_array(lhs, ctx.referenced_tables)
+                || crate::translate::expr::expr_is_array(start, ctx.referenced_tables)
+                || crate::translate::expr::expr_is_array(end, ctx.referenced_tables)
+            {
+                return Ok(None);
+            }
+            let Some(lhs_built) = compile_value_expr(lhs.as_ref(), ctx)? else {
+                return Ok(None);
+            };
+            let Some(start_built) = compile_value_expr(start.as_ref(), ctx)? else {
+                return Ok(None);
+            };
+            let Some(end_built) = compile_value_expr(end.as_ref(), ctx)? else {
+                return Ok(None);
+            };
+            let lower_affinity = crate::translate::expr::comparison_affinity(
+                lhs,
+                start,
+                ctx.referenced_tables,
+                ctx.resolver,
+            );
+            let upper_affinity = crate::translate::expr::comparison_affinity(
+                lhs,
+                end,
+                ctx.referenced_tables,
+                ctx.resolver,
+            );
+            let lower_collation = merge_collation(
+                lhs_built.effect.contribution(),
+                start_built.effect.contribution(),
+            )
+            .map(|(collation, _)| collation);
+            let upper_collation = merge_collation(
+                lhs_built.effect.contribution(),
+                end_built.effect.contribution(),
+            )
+            .map(|(collation, _)| collation);
+            let (lower_op, upper_op, combine) = if *not {
+                (CmpOp::Lt, CmpOp::Gt, BinOp::Or)
+            } else {
+                (CmpOp::Ge, CmpOp::Le, BinOp::And)
+            };
+            let (lhs_c, start_c, end_c) =
+                (lhs_built.compiler, start_built.compiler, end_built.compiler);
+            Some(Built {
+                compiler: Compiler::build_with(move |builder| {
+                    let x = lhs_c.run(builder)?;
+                    let lower = start_c.run(builder)?;
+                    let below =
+                        builder.compare(lower_op, Some(lower_affinity), lower_collation, x, lower);
+                    let upper = end_c.run(builder)?;
+                    let above =
+                        builder.compare(upper_op, Some(upper_affinity), upper_collation, x, upper);
+                    Ok(builder.binary(combine, below, above))
+                }),
+                // Both rewritten comparisons reset the collation context.
+                effect: CollationEffect::Sets(None),
+            })
+        }
         ast::Expr::Cast {
             expr: operand,
             type_name,
@@ -778,6 +860,9 @@ pub(crate) fn compile_condition_expr<'a>(
                 effect: CollationEffect::Sets(None),
             })
         }
+        // The eager path rejects COLLATE as a bare condition root with a
+        // parse error; keep that behavior by falling back.
+        ast::Expr::Collate(..) => None,
         // IS NULL / IS NOT NULL terminals, in both AST spellings. These
         // use nullness jumps, not equality (matching the eager arms).
         ast::Expr::IsNull(operand) => null_test_predicate(operand, ctx, false)?,

@@ -313,7 +313,31 @@ mod tests {
         assert!(pipeline("CURRENT_TIMESTAMP").is_none());
         // Named-type casts need a resolver to rule out custom types.
         assert!(pipeline("CAST(1 AS TEXT)").is_none());
-        assert!(pipeline("1 BETWEEN 0 AND 2").is_none());
+        // IN lists need mutable null-flag accumulation (slots).
+        assert!(pipeline("1 IN (1, 2)").is_none());
+    }
+
+    #[test]
+    fn between_shares_the_probe_value() {
+        // x BETWEEN a AND b: two comparisons over ONE evaluation of x
+        // (the eager path needs a forked expression cache for this; SSA
+        // sharing gives it by construction), combined with And.
+        let insns = pipeline("7 BETWEEN 0 AND 9").unwrap();
+        let sevens = insns
+            .iter()
+            .filter(|insn| matches!(insn, Insn::Integer { value: 7, .. }))
+            .count();
+        // Only the interned constant load — cmp idiom uses 1/0 markers,
+        // not 7.
+        assert_eq!(sevens, 1, "{insns:?}");
+        assert!(insns.iter().any(|insn| matches!(insn, Insn::Ge { .. })));
+        assert!(insns.iter().any(|insn| matches!(insn, Insn::Le { .. })));
+        assert!(matches!(insns.last(), Some(Insn::And { .. })));
+        // NOT BETWEEN inverts to Lt/Gt combined with Or.
+        let insns = pipeline("7 NOT BETWEEN 0 AND 9").unwrap();
+        assert!(insns.iter().any(|insn| matches!(insn, Insn::Lt { .. })));
+        assert!(insns.iter().any(|insn| matches!(insn, Insn::Gt { .. })));
+        assert!(matches!(insns.last(), Some(Insn::Or { .. })));
     }
 
     #[test]

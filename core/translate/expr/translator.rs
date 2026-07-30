@@ -408,6 +408,22 @@ pub fn translate_expr(
             }
         }
         ast::Expr::Between { .. } => {
+            // Composable compiler path; falls back to eager emission
+            // below for anything the pipeline cannot represent yet.
+            if try_compiler_value_expr(
+                program,
+                referenced_tables,
+                expr,
+                target_register,
+                resolver,
+                has_expression_indexes,
+            )? {
+                if let Some(span) = constant_span {
+                    program.constant_span_end(span);
+                }
+                return Ok(target_register);
+            }
+
             translate_between_expr(
                 program,
                 referenced_tables,
