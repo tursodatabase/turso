@@ -67,10 +67,10 @@ pub(crate) fn emit_recursive_cte(
                 default: None,
                 expr: None,
             })?;
-            queue_sort_keys.push(RecursiveCteQueueKey {
+            queue_sort_keys.try_push(RecursiveCteQueueKey {
                 result_column_index: *result_column_index,
                 nulls_override,
-            });
+            })?;
         }
     }
     let queue_sort_column_count = queue_index_columns.len();
