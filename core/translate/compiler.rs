@@ -1062,6 +1062,7 @@ enum CursorResource {
 struct SorterResource {
     keys: SmallVec<[SortKey; 4]>,
     record_width: usize,
+    affinities: Option<SmallVec<[Affinity; 4]>>,
 }
 
 #[derive(Debug)]
@@ -1960,6 +1961,15 @@ impl IrBuilder {
         keys: SmallVec<[SortKey; 4]>,
         record_width: usize,
     ) -> Result<SorterId> {
+        self.allocate_sorter_with_affinities(keys, record_width, None)
+    }
+
+    fn allocate_sorter_with_affinities(
+        &mut self,
+        keys: SmallVec<[SortKey; 4]>,
+        record_width: usize,
+        affinities: Option<SmallVec<[Affinity; 4]>>,
+    ) -> Result<SorterId> {
         if keys.is_empty() {
             return Err(LimboError::InternalError(
                 "compiler IR sorter must have at least one key".to_owned(),
@@ -1971,11 +1981,23 @@ impl IrBuilder {
                 keys.len()
             )));
         }
+        if affinities
+            .as_ref()
+            .is_some_and(|affinities| affinities.len() != record_width)
+        {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR sorter record width {record_width} has {} affinities",
+                affinities.as_ref().map_or(0, SmallVec::len)
+            )));
+        }
         let id = u32::try_from(self.sorter_resources.len()).map_err(|_| {
             LimboError::InternalError("compiler IR sorter identifier overflow".to_owned())
         })?;
-        self.sorter_resources
-            .push(SorterResource { keys, record_width });
+        self.sorter_resources.push(SorterResource {
+            keys,
+            record_width,
+            affinities,
+        });
         Ok(SorterId(id))
     }
 
@@ -3864,6 +3886,7 @@ impl IrProgram {
                     }
                     Instruction::Effect(EffectOp::SorterInsert { sorter, pack }) => {
                         let physical = Self::sorter_for(&physical_sorters, *sorter);
+                        let resource = &self.sorter_resources[sorter.index()];
                         let start = program.alloc_registers(pack.values().len());
                         for (index, value) in pack.values().iter().enumerate() {
                             let source = Self::register_for(&registers, *value);
@@ -3882,7 +3905,12 @@ impl IrProgram {
                             count: to_u16(pack.values().len()),
                             dest_reg: to_u16(record),
                             index_name: None,
-                            affinity_str: None,
+                            affinity_str: resource.affinities.as_ref().map(|affinities| {
+                                affinities
+                                    .iter()
+                                    .map(Affinity::aff_mask)
+                                    .collect::<String>()
+                            }),
                         });
                         program.emit_insn(Insn::SorterInsert {
                             cursor_id: physical.cursor,
@@ -4452,7 +4480,11 @@ impl fmt::Display for IrProgram {
                     key.order, key.collation, key.nulls, key.comparator
                 )?;
             }
-            writeln!(f, "]")?;
+            write!(f, "]")?;
+            if let Some(affinities) = &resource.affinities {
+                write!(f, " affinity {affinities:?}")?;
+            }
+            writeln!(f)?;
         }
         for (index, resource) in self.distinct_set_resources.iter().enumerate() {
             write!(
@@ -4949,6 +4981,26 @@ pub(crate) trait RowStream: Sized + 'static {
         }
     }
 
+    /// Compile each item into another stream and yield that stream's items.
+    ///
+    /// The mapper itself is deferred, so it may use symbolic values produced
+    /// by the outer stream when constructing the inner stream.
+    fn flat_map<MapperFn, Mapper, Stream>(
+        self,
+        mapper: MapperFn,
+    ) -> FlatMapRows<Self, MapperFn, Mapper, Stream>
+    where
+        MapperFn: FnOnce(Self::Item) -> Mapper + 'static,
+        Mapper: Compile<Output = Stream> + 'static,
+        Stream: RowStream + 'static,
+    {
+        FlatMapRows {
+            source: self,
+            mapper,
+            compiler: PhantomData,
+        }
+    }
+
     fn filter<PredicateFn, Predicate>(
         self,
         predicate: PredicateFn,
@@ -5138,31 +5190,14 @@ where
         self.source
             .for_each_boxed(Box::new(move |pack| InsertSorter { sorter, pack }.boxed()))
             .compile(builder)?;
-
-        let row = builder.create_block()?;
-        let exit = builder.create_block()?;
-        builder.terminate(Terminator::SorterSort {
-            sorter,
-            if_non_empty: row,
-            if_empty: exit,
-            arguments: SmallVec::new(),
-        })?;
-
-        builder.switch_to(row)?;
-        builder.push_effect(EffectOp::SorterData { sorter })?;
-        (self.body)(SortedRow {
-            sorter,
-            record_width: self.record_width,
-        })
-        .compile(builder)?;
-        builder.terminate(Terminator::SorterNext {
-            sorter,
-            if_next: row,
-            if_done: exit,
-            arguments: SmallVec::new(),
-        })?;
-
-        builder.switch_to(exit)
+        ForEachReadySorter {
+            rows: ReadySorterRows {
+                sorter,
+                record_width: self.record_width,
+            },
+            body: self.body,
+        }
+        .compile(builder)
     }
 }
 
@@ -5181,71 +5216,20 @@ where
     type Output = LoopState;
 
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
-        let initial = self.initial.compile(builder)?;
         let sorter = builder.allocate_sorter(self.keys, self.record_width)?;
         builder.push_effect(EffectOp::OpenSorter { sorter })?;
         self.source
             .for_each_boxed(Box::new(move |pack| InsertSorter { sorter, pack }.boxed()))
             .compile(builder)?;
-
-        let row = builder.create_block()?;
-        let advance = builder.create_block()?;
-        let stop = builder.create_block()?;
-        let exit = builder.create_block()?;
-        let mut row_state = SmallVec::with_capacity(initial.len());
-        let mut result_state = SmallVec::with_capacity(initial.len());
-        for _ in 0..initial.len() {
-            row_state.push(builder.add_block_parameter(row)?);
-            result_state.push(builder.add_block_parameter(exit)?);
-        }
-        builder.terminate(Terminator::SorterSort {
-            sorter,
-            if_non_empty: row,
-            if_empty: exit,
-            arguments: initial.values,
-        })?;
-
-        builder.switch_to(row)?;
-        builder.push_effect(EffectOp::SorterData { sorter })?;
-        let step = (self.body)(
-            SortedRow {
+        TryFoldReadySorter {
+            rows: ReadySorterRows {
                 sorter,
                 record_width: self.record_width,
             },
-            LoopState { values: row_state },
-        )
-        .compile(builder)?;
-        if step.state.len() != result_state.len() {
-            return Err(LimboError::InternalError(format!(
-                "sorted row stream loop body changed state arity from {} to {}",
-                result_state.len(),
-                step.state.len()
-            )));
+            initial: self.initial,
+            body: self.body,
         }
-        builder.terminate(Terminator::Branch {
-            condition: step.should_continue,
-            if_true: advance,
-            if_false: stop,
-        })?;
-
-        builder.switch_to(advance)?;
-        builder.terminate(Terminator::SorterNext {
-            sorter,
-            if_next: row,
-            if_done: exit,
-            arguments: step.state.values.clone(),
-        })?;
-
-        builder.switch_to(stop)?;
-        builder.terminate(Terminator::Jump {
-            target: exit,
-            arguments: step.state.values,
-        })?;
-
-        builder.switch_to(exit)?;
-        Ok(LoopState {
-            values: result_state,
-        })
+        .compile(builder)
     }
 }
 
@@ -5278,6 +5262,187 @@ where
             body,
         }
         .boxed()
+    }
+}
+
+/// A sorter that has already been populated and is ready to yield rows.
+pub(crate) struct ReadySorterRows {
+    sorter: SorterId,
+    record_width: usize,
+}
+
+struct ForEachReadySorter {
+    rows: ReadySorterRows,
+    body: BoxedRowConsumer<SortedRow>,
+}
+
+impl Compile for ForEachReadySorter {
+    type Output = ();
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let row = builder.create_block()?;
+        let exit = builder.create_block()?;
+        builder.terminate(Terminator::SorterSort {
+            sorter: self.rows.sorter,
+            if_non_empty: row,
+            if_empty: exit,
+            arguments: SmallVec::new(),
+        })?;
+
+        builder.switch_to(row)?;
+        builder.push_effect(EffectOp::SorterData {
+            sorter: self.rows.sorter,
+        })?;
+        (self.body)(SortedRow {
+            sorter: self.rows.sorter,
+            record_width: self.rows.record_width,
+        })
+        .compile(builder)?;
+        builder.terminate(Terminator::SorterNext {
+            sorter: self.rows.sorter,
+            if_next: row,
+            if_done: exit,
+            arguments: SmallVec::new(),
+        })?;
+
+        builder.switch_to(exit)
+    }
+}
+
+struct TryFoldReadySorter {
+    rows: ReadySorterRows,
+    initial: BoxedCompile<LoopState>,
+    body: BoxedRowFolder<SortedRow>,
+}
+
+impl Compile for TryFoldReadySorter {
+    type Output = LoopState;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let initial = self.initial.compile(builder)?;
+        let row = builder.create_block()?;
+        let advance = builder.create_block()?;
+        let stop = builder.create_block()?;
+        let exit = builder.create_block()?;
+        let mut row_state = SmallVec::with_capacity(initial.len());
+        let mut result_state = SmallVec::with_capacity(initial.len());
+        for _ in 0..initial.len() {
+            row_state.push(builder.add_block_parameter(row)?);
+            result_state.push(builder.add_block_parameter(exit)?);
+        }
+        builder.terminate(Terminator::SorterSort {
+            sorter: self.rows.sorter,
+            if_non_empty: row,
+            if_empty: exit,
+            arguments: initial.values,
+        })?;
+
+        builder.switch_to(row)?;
+        builder.push_effect(EffectOp::SorterData {
+            sorter: self.rows.sorter,
+        })?;
+        let step = (self.body)(
+            SortedRow {
+                sorter: self.rows.sorter,
+                record_width: self.rows.record_width,
+            },
+            LoopState { values: row_state },
+        )
+        .compile(builder)?;
+        if step.state.len() != result_state.len() {
+            return Err(LimboError::InternalError(format!(
+                "ready sorter loop body changed state arity from {} to {}",
+                result_state.len(),
+                step.state.len()
+            )));
+        }
+        builder.terminate(Terminator::Branch {
+            condition: step.should_continue,
+            if_true: advance,
+            if_false: stop,
+        })?;
+
+        builder.switch_to(advance)?;
+        builder.terminate(Terminator::SorterNext {
+            sorter: self.rows.sorter,
+            if_next: row,
+            if_done: exit,
+            arguments: step.state.values.clone(),
+        })?;
+
+        builder.switch_to(stop)?;
+        builder.terminate(Terminator::Jump {
+            target: exit,
+            arguments: step.state.values,
+        })?;
+
+        builder.switch_to(exit)?;
+        Ok(LoopState {
+            values: result_state,
+        })
+    }
+}
+
+impl RowStream for ReadySorterRows {
+    type Item = SortedRow;
+
+    fn for_each_boxed(self, body: BoxedRowConsumer<Self::Item>) -> BoxedCompile<()> {
+        ForEachReadySorter { rows: self, body }.boxed()
+    }
+
+    fn try_fold_boxed(
+        self,
+        initial: BoxedCompile<LoopState>,
+        body: BoxedRowFolder<Self::Item>,
+    ) -> BoxedCompile<LoopState> {
+        TryFoldReadySorter {
+            rows: self,
+            initial,
+            body,
+        }
+        .boxed()
+    }
+}
+
+pub(crate) struct DeferredLiteralValues {
+    values: SmallVec<[BoxedCompile<ValueId>; 4]>,
+    affinity: Affinity,
+    collation: Option<CollationSeq>,
+}
+
+pub(crate) fn literal_values(
+    values: SmallVec<[BoxedCompile<ValueId>; 4]>,
+    affinity: Affinity,
+    collation: Option<CollationSeq>,
+) -> DeferredLiteralValues {
+    DeferredLiteralValues {
+        values,
+        affinity,
+        collation,
+    }
+}
+
+impl Compile for DeferredLiteralValues {
+    type Output = ReadySorterRows;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let sorter = builder.allocate_sorter_with_affinities(
+            smallvec![SortKey::new(SortOrder::Asc, self.collation, None, None,)],
+            1,
+            Some(smallvec![self.affinity]),
+        )?;
+        builder.push_effect(EffectOp::OpenSorter { sorter })?;
+        for value in self.values {
+            let value = value.compile(builder)?;
+            builder.push_effect(EffectOp::SorterInsert {
+                sorter,
+                pack: ValuePack(smallvec![value]),
+            })?;
+        }
+        Ok(ReadySorterRows {
+            sorter,
+            record_width: 1,
+        })
     }
 }
 
@@ -5444,6 +5609,81 @@ pub(crate) struct MapRows<Source, MapperFn, Mapper> {
     source: Source,
     mapper: MapperFn,
     compiler: PhantomData<fn() -> Mapper>,
+}
+
+/// A nested stream stage analogous to `Iterator::flat_map`.
+pub(crate) struct FlatMapRows<Source, MapperFn, Mapper, Stream> {
+    source: Source,
+    mapper: MapperFn,
+    compiler: PhantomData<fn() -> (Mapper, Stream)>,
+}
+
+impl<Source, MapperFn, Mapper, Stream> RowStream for FlatMapRows<Source, MapperFn, Mapper, Stream>
+where
+    Source: RowStream,
+    MapperFn: FnOnce(Source::Item) -> Mapper + 'static,
+    Mapper: Compile<Output = Stream> + 'static,
+    Stream: RowStream + 'static,
+{
+    type Item = Stream::Item;
+
+    fn for_each_boxed(self, body: BoxedRowConsumer<Self::Item>) -> BoxedCompile<()> {
+        let Self { source, mapper, .. } = self;
+        source.for_each_boxed(Box::new(move |item| {
+            mapper(item)
+                .and_then(move |stream| stream.for_each_boxed(body))
+                .boxed()
+        }))
+    }
+
+    fn try_fold_boxed(
+        self,
+        initial: BoxedCompile<LoopState>,
+        body: BoxedRowFolder<Self::Item>,
+    ) -> BoxedCompile<LoopState> {
+        let Self { source, mapper, .. } = self;
+        source.try_fold_boxed(
+            initial,
+            Box::new(move |outer_item, state| {
+                mapper(outer_item)
+                    .and_then(move |stream| {
+                        constant(Value::from_i64(1))
+                            .map(move |continue_outer| {
+                                let mut state = state;
+                                state.values.push(continue_outer);
+                                state
+                            })
+                            .and_then(move |inner_initial| {
+                                stream.try_fold_boxed(
+                                    pure(inner_initial).boxed(),
+                                    Box::new(move |inner_item, mut inner_state| {
+                                        inner_state.values.pop().expect(
+                                            "flat-map inner state must carry its continuation",
+                                        );
+                                        body(inner_item, inner_state)
+                                            .map(|mut step| {
+                                                step.state.values.push(step.should_continue);
+                                                step
+                                            })
+                                            .boxed()
+                                    }),
+                                )
+                            })
+                            .map(|mut inner_result| {
+                                let should_continue = inner_result
+                                    .values
+                                    .pop()
+                                    .expect("flat-map result must carry its continuation");
+                                LoopStep {
+                                    state: inner_result,
+                                    should_continue,
+                                }
+                            })
+                    })
+                    .boxed()
+            }),
+        )
+    }
 }
 
 impl<Source, MapperFn, Mapper> RowStream for MapRows<Source, MapperFn, Mapper>
@@ -5758,10 +5998,119 @@ enum ScanBtreeSource {
     },
 }
 
+struct OpenedBtree {
+    cursor: CursorId,
+    row_cursor: CursorId,
+    deferred_seek: Option<DeferredSeekCursors>,
+}
+
+impl ScanBtreeSource {
+    fn open(self, builder: &mut IrBuilder) -> Result<OpenedBtree> {
+        let (cursor, row_cursor, deferred_seek) = match self {
+            Self::Table(table) => {
+                let cursor = table.compile(builder)?;
+                (cursor, cursor, None)
+            }
+            Self::CoveringIndex(index) => {
+                let cursor = index.compile(builder)?;
+                (cursor, cursor, None)
+            }
+            Self::IndexLookup { table, index } => {
+                let table = table.compile(builder)?;
+                let index = index.compile(builder)?;
+                (index, table, Some(DeferredSeekCursors { index, table }))
+            }
+        };
+        Ok(OpenedBtree {
+            cursor,
+            row_cursor,
+            deferred_seek,
+        })
+    }
+}
+
 /// Opens a B-tree source when compiled and returns its symbolic row stream.
 pub(crate) struct ScanBtree {
     source: ScanBtreeSource,
     start: ScanBtreeStart,
+}
+
+pub(crate) struct InSeekBtree {
+    source: ScanBtreeSource,
+    values: DeferredLiteralValues,
+    target: InSeekTarget,
+    collation: CollationSeq,
+}
+
+#[derive(Clone, Copy)]
+enum InSeekTarget {
+    Rowid,
+    Index,
+}
+
+pub(crate) struct InSeekRows {
+    values: ReadySorterRows,
+    target: CursorRows,
+    kind: InSeekTarget,
+    collation: CollationSeq,
+}
+
+impl InSeekRows {
+    fn target_for_key(mut target: CursorRows, kind: InSeekTarget, key: ValueId) -> CursorRows {
+        target.source = match kind {
+            InSeekTarget::Rowid => CursorRowSource::Rowid(key),
+            InSeekTarget::Index => {
+                let key = IndexKey {
+                    pack: ValuePack(smallvec![key]),
+                    // RHS values were coerced while the sorter record was
+                    // built, matching the eager IN-list ephemeral index.
+                    affinities: smallvec![Affinity::Blob],
+                    null_policies: smallvec![IndexNullPolicy::AbortRange],
+                };
+                CursorRowSource::IndexRange(IndexRangeSource {
+                    start: Some(IndexBoundSpec {
+                        key: key.clone(),
+                        op: SeekOp::GE { eq_only: false },
+                    }),
+                    end: Some(IndexBoundSpec {
+                        key,
+                        op: SeekOp::GT,
+                    }),
+                    direction: ScanDirection::Forward,
+                })
+            }
+        };
+        target
+    }
+
+    fn stream(self) -> impl RowStream<Item = Row> {
+        let target = self.target;
+        let kind = self.kind;
+        self.values
+            .distinct_by(smallvec![self.collation], |row| {
+                pack_values(smallvec![row.column(0).boxed()])
+            })
+            .flat_map(move |row| {
+                row.column(0)
+                    .map(move |key| Self::target_for_key(target, kind, key))
+            })
+    }
+}
+
+impl RowStream for InSeekRows {
+    type Item = Row;
+
+    fn for_each_boxed(self, body: BoxedRowConsumer<Self::Item>) -> BoxedCompile<()> {
+        self.stream().for_each_boxed(body)
+    }
+
+    fn try_fold_boxed(
+        self,
+        initial: BoxedCompile<LoopState>,
+        body: BoxedRowFolder<Self::Item>,
+    ) -> BoxedCompile<LoopState> {
+        self.stream().try_fold_boxed(initial, body)
+    }
 }
 
 enum ScanBtreeStart {
@@ -5991,6 +6340,33 @@ pub(crate) fn seek_table_range(
     }
 }
 
+pub(crate) fn seek_in_values(
+    table: Arc<BTreeTable>,
+    index: Option<Arc<Index>>,
+    covering: bool,
+    db: usize,
+    schema_cookie: u32,
+    values: DeferredLiteralValues,
+) -> InSeekBtree {
+    let collation = values.collation;
+    let (source, target) = match index {
+        Some(index) => (
+            index_source(table, index, covering, db, schema_cookie),
+            InSeekTarget::Index,
+        ),
+        None => (
+            ScanBtreeSource::Table(open_read_table(table, db, schema_cookie)),
+            InSeekTarget::Rowid,
+        ),
+    };
+    InSeekBtree {
+        source,
+        values,
+        target,
+        collation: collation.unwrap_or(CollationSeq::Binary),
+    }
+}
+
 pub(crate) fn scan_index(
     table: Arc<BTreeTable>,
     index: Arc<Index>,
@@ -6042,21 +6418,7 @@ impl Compile for ScanBtree {
     type Output = CursorRows;
 
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
-        let (cursor, row_cursor, deferred_seek) = match self.source {
-            ScanBtreeSource::Table(table) => {
-                let cursor = table.compile(builder)?;
-                (cursor, cursor, None)
-            }
-            ScanBtreeSource::CoveringIndex(index) => {
-                let cursor = index.compile(builder)?;
-                (cursor, cursor, None)
-            }
-            ScanBtreeSource::IndexLookup { table, index } => {
-                let table = table.compile(builder)?;
-                let index = index.compile(builder)?;
-                (index, table, Some(DeferredSeekCursors { index, table }))
-            }
-        };
+        let opened = self.source.open(builder)?;
         let source = match self.start {
             ScanBtreeStart::Full(direction) => CursorRowSource::Scan(direction),
             ScanBtreeStart::Rowid(rowid) => CursorRowSource::Rowid(rowid.compile(builder)?),
@@ -6068,10 +6430,31 @@ impl Compile for ScanBtree {
             }
         };
         Ok(CursorRows {
-            cursor,
-            row_cursor,
-            deferred_seek,
+            cursor: opened.cursor,
+            row_cursor: opened.row_cursor,
+            deferred_seek: opened.deferred_seek,
             source,
+        })
+    }
+}
+
+impl Compile for InSeekBtree {
+    type Output = InSeekRows;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let opened = self.source.open(builder)?;
+        let values = self.values.compile(builder)?;
+        Ok(InSeekRows {
+            values,
+            target: CursorRows {
+                cursor: opened.cursor,
+                row_cursor: opened.row_cursor,
+                deferred_seek: opened.deferred_seek,
+                // Replaced with the current RHS key by `InSeekRows`.
+                source: CursorRowSource::Scan(ScanDirection::Forward),
+            },
+            kind: self.target,
+            collation: self.collation,
         })
     }
 }
@@ -6787,6 +7170,67 @@ mod tests {
             instruction,
             Insn::Rewind { .. } | Insn::Last { .. } | Insn::Next { .. } | Insn::Prev { .. }
         )));
+    }
+
+    #[test]
+    fn in_values_flat_maps_a_coerced_distinct_stream_into_rowid_seeks() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE pointed(a)", 2).unwrap());
+        let values = literal_values(
+            smallvec![
+                constant(Value::from_i64(3)).boxed(),
+                constant(Value::from_text("1")).boxed(),
+                constant(Value::from_i64(3)).boxed(),
+                constant(Value::Null).boxed(),
+            ],
+            Affinity::Integer,
+            None,
+        );
+        let compiler = seek_in_values(table, None, false, 0, 0, values).and_then(|rows| {
+            rows.take(constant(Value::from_i64(2))).for_each(|row| {
+                pack_values(smallvec![row.rowid().boxed()]).and_then(result_row_pack)
+            })
+        });
+
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+
+        assert!(
+            rendered.contains("sorter #0 keys 1 width 1 [Asc None None None] affinity [Integer]")
+        );
+        assert!(rendered.contains("distinct_set &0 width 1 [Binary]"));
+        assert!(rendered.contains("distinct_check &0 ["));
+        assert!(rendered.contains("cursor_seek_rowid $0,"));
+        assert!(rendered.contains("sorter_next #0"));
+
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 2, 0));
+        let target = program.alloc_register();
+        ir.lower_into(&mut program, target).unwrap();
+        program.resolve_labels().unwrap();
+
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::SeekRowid { .. }))
+                .count(),
+            1
+        );
+        assert!(program.insns.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::MakeRecord {
+                affinity_str: Some(affinity),
+                ..
+            } if affinity == "D"
+        )));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::SorterOpen { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::HashDistinct { .. })));
     }
 
     #[test]

@@ -7,10 +7,11 @@ use crate::{
         aggregation::emit_ungrouped_aggregation,
         collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         compiler::{
-            compile_effect, pack_values, result_row_pack, scan_index, scan_table, seek_index,
-            seek_rowid, seek_table_range, select_pack, BoxedCompile, Compile, DeferredIndexBound,
-            DeferredIndexRange, DeferredTableBound, DeferredTableRange, Row, RowStream,
-            ScanDirection, SortKey, SortedRow, ValueId,
+            compile_effect, literal_values, pack_values, result_row_pack, scan_index, scan_table,
+            seek_in_values, seek_index, seek_rowid, seek_table_range, select_pack, BoxedCompile,
+            Compile, DeferredIndexBound, DeferredIndexRange, DeferredTableBound,
+            DeferredTableRange, IrProgram, Row, RowStream, ScanDirection, SortKey, SortedRow,
+            ValueId,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -25,9 +26,9 @@ use crate::{
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
         order_by::{custom_type_comparator, EmitOrderBy},
         plan::{
-            BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, IterationDirection,
-            JoinOrderMember, Operation, QueryDestination, Scan, Search, SeekDef, SeekKey,
-            SeekKeyComponent, SelectPlan, SimpleAggregate,
+            BitSet, Distinctness, EphemeralRowidMode, EvalAt, InSeekSource, IndexMethodQuery,
+            IterationDirection, JoinOrderMember, Operation, QueryDestination, Scan, Search,
+            SeekDef, SeekKey, SeekKeyComponent, SelectPlan, SimpleAggregate,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -134,6 +135,11 @@ enum DeclarativeBtreeAccess<'a> {
         index: &'a Arc<Index>,
         seek_def: &'a SeekDef,
     },
+    InValues {
+        index: Option<&'a Arc<Index>>,
+        values: &'a [Expr],
+        affinity: Affinity,
+    },
 }
 
 impl<'a> DeclarativeBtreeAccess<'a> {
@@ -142,7 +148,7 @@ impl<'a> DeclarativeBtreeAccess<'a> {
             Self::Scan { direction, .. }
             | Self::TableRange { direction, .. }
             | Self::IndexRange { direction, .. } => direction,
-            Self::RowidEq(_) => ScanDirection::Forward,
+            Self::RowidEq(_) | Self::InValues { .. } => ScanDirection::Forward,
         }
     }
 
@@ -150,6 +156,7 @@ impl<'a> DeclarativeBtreeAccess<'a> {
         match self {
             Self::Scan { index, .. } => index,
             Self::IndexRange { index, .. } => Some(index),
+            Self::InValues { index, .. } => index,
             Self::RowidEq(_) | Self::TableRange { .. } => None,
         }
     }
@@ -221,6 +228,14 @@ fn try_emit_declarative_table_scan(
             index,
             seek_def,
         },
+        Operation::Search(Search::InSeek {
+            index,
+            source: InSeekSource::LiteralList { values, affinity },
+        }) => DeclarativeBtreeAccess::InValues {
+            index: index.as_ref(),
+            values,
+            affinity: *affinity,
+        },
         _ => return Ok(None),
     };
     let direction = access.direction();
@@ -231,19 +246,21 @@ fn try_emit_declarative_table_scan(
     if index.is_some_and(|index| index.ephemeral || index.index_method.is_some()) {
         return Ok(None);
     }
-    if matches!(access, DeclarativeBtreeAccess::IndexRange { .. })
-        && index.is_some_and(|index| {
-            resolver.with_schema(joined.database_id, |schema| {
-                index.columns.iter().any(|index_column| {
-                    table
-                        .columns()
-                        .get(index_column.pos_in_table)
-                        .and_then(|column| schema.get_type_def(&column.ty_str, table.is_strict))
-                        .is_some_and(|type_def| type_def.encode().is_some())
-                })
+    if matches!(
+        access,
+        DeclarativeBtreeAccess::IndexRange { .. }
+            | DeclarativeBtreeAccess::InValues { index: Some(_), .. }
+    ) && index.is_some_and(|index| {
+        resolver.with_schema(joined.database_id, |schema| {
+            index.columns.iter().any(|index_column| {
+                table
+                    .columns()
+                    .get(index_column.pos_in_table)
+                    .and_then(|column| schema.get_type_def(&column.ty_str, table.is_strict))
+                    .is_some_and(|type_def| type_def.encode().is_some())
             })
         })
-    {
+    }) {
         return Ok(None);
     }
     let covering_index = index
@@ -261,6 +278,22 @@ fn try_emit_declarative_table_scan(
         row_layout,
         &plan.table_references,
     );
+    let in_values = match access {
+        DeclarativeBtreeAccess::InValues { values, .. } => {
+            let mut compiled = SmallVec::with_capacity(values.len());
+            for value in values {
+                let Some(resolved) = expr_resolver.resolve(value)? else {
+                    return Ok(None);
+                };
+                let Some(value) = compile_symbolic_static_expr(&resolved) else {
+                    return Ok(None);
+                };
+                compiled.push(value);
+            }
+            Some(compiled)
+        }
+        _ => None,
+    };
     let rowid_eq = match access {
         DeclarativeBtreeAccess::RowidEq(rowid_eq) => {
             let Some(rowid_eq) = expr_resolver.resolve(rowid_eq)? else {
@@ -462,65 +495,66 @@ fn try_emit_declarative_table_scan(
     let database_id = joined.database_id;
     let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
     let result_column_count = projections.len();
-    let scan = match access {
-        DeclarativeBtreeAccess::RowidEq(_) => seek_rowid(
+    let body = DeclarativeSelectBody {
+        predicates,
+        projections,
+        sort_expressions,
+        sort_keys,
+        result_column_count,
+        distinct_collations,
+        slice: DeclarativeSlice { limit, offset },
+    };
+    let ir = match access {
+        DeclarativeBtreeAccess::RowidEq(_) => body.compile(seek_rowid(
             table,
             database_id,
             schema_cookie,
             rowid_eq.expect("rowid equality access must compile a key"),
-        ),
-        DeclarativeBtreeAccess::TableRange { .. } => seek_table_range(
+        )),
+        DeclarativeBtreeAccess::TableRange { .. } => body.compile(seek_table_range(
             table,
             database_id,
             schema_cookie,
             table_range.expect("table range access must compile a range"),
-        ),
-        DeclarativeBtreeAccess::IndexRange { index, .. } => seek_index(
+        )),
+        DeclarativeBtreeAccess::IndexRange { index, .. } => body.compile(seek_index(
             table,
             index.clone(),
             covering_index.is_some(),
             database_id,
             schema_cookie,
             index_range.expect("index range access must compile a range"),
-        ),
+        )),
+        DeclarativeBtreeAccess::InValues {
+            index, affinity, ..
+        } => body.compile(seek_in_values(
+            table,
+            index.cloned(),
+            covering_index.is_some(),
+            database_id,
+            schema_cookie,
+            literal_values(
+                in_values.expect("IN-list access must compile its values"),
+                affinity,
+                index
+                    .and_then(|index| index.columns.first())
+                    .and_then(|column| column.collation),
+            ),
+        )),
         DeclarativeBtreeAccess::Scan {
             index: Some(index), ..
-        } => scan_index(
+        } => body.compile(scan_index(
             table,
             index.clone(),
             covering_index.is_some(),
             database_id,
             schema_cookie,
             direction,
-        ),
+        )),
         DeclarativeBtreeAccess::Scan { index: None, .. } => {
-            scan_table(table, database_id, schema_cookie, direction)
+            body.compile(scan_table(table, database_id, schema_cookie, direction))
         }
-    };
-    let compiler = scan.and_then(move |rows| {
-        if predicates.is_empty() {
-            compile_declarative_rows(
-                rows,
-                projections,
-                sort_expressions,
-                sort_keys,
-                result_column_count,
-                distinct_collations,
-                DeclarativeSlice { limit, offset },
-            )
-        } else {
-            compile_declarative_rows(
-                rows.filter(move |row| compile_symbolic_conjunction(row, &predicates)),
-                projections,
-                sort_expressions,
-                sort_keys,
-                result_column_count,
-                distinct_collations,
-                DeclarativeSlice { limit, offset },
-            )
-        }
-    });
-    let ir = compile_effect(compiler)?;
+    }?;
     let target_register = program.alloc_register();
     let lowered = ir.lower_into(program, target_register)?;
     let (result_cols_start, result_column_count) = lowered.single_result_row_pack()?;
@@ -536,6 +570,57 @@ fn try_emit_declarative_table_scan(
 struct DeclarativeSlice {
     limit: Option<BoxedCompile<ValueId>>,
     offset: Option<BoxedCompile<ValueId>>,
+}
+
+struct DeclarativeSelectBody {
+    predicates: SmallVec<[ResolvedScalarExpr; 2]>,
+    projections: SmallVec<[ResolvedScalarExpr; 4]>,
+    sort_expressions: SmallVec<[ResolvedScalarExpr; 4]>,
+    sort_keys: SmallVec<[SortKey; 4]>,
+    result_column_count: usize,
+    distinct_collations: Option<SmallVec<[CollationSeq; 4]>>,
+    slice: DeclarativeSlice,
+}
+
+impl DeclarativeSelectBody {
+    fn compile<Scan, Rows>(self, scan: Scan) -> Result<IrProgram>
+    where
+        Scan: Compile<Output = Rows>,
+        Rows: RowStream<Item = Row> + 'static,
+    {
+        let Self {
+            predicates,
+            projections,
+            sort_expressions,
+            sort_keys,
+            result_column_count,
+            distinct_collations,
+            slice,
+        } = self;
+        compile_effect(scan.and_then(move |rows| {
+            if predicates.is_empty() {
+                compile_declarative_rows(
+                    rows,
+                    projections,
+                    sort_expressions,
+                    sort_keys,
+                    result_column_count,
+                    distinct_collations,
+                    slice,
+                )
+            } else {
+                compile_declarative_rows(
+                    rows.filter(move |row| compile_symbolic_conjunction(row, &predicates)),
+                    projections,
+                    sort_expressions,
+                    sort_keys,
+                    result_column_count,
+                    distinct_collations,
+                    slice,
+                )
+            }
+        }))
+    }
 }
 
 fn compile_declarative_rows<Stream>(
@@ -1726,6 +1811,160 @@ mod tests {
             .bind_at(1.try_into().unwrap(), Value::Null)
             .unwrap();
         assert!(statement.run_collect_rows().unwrap().is_empty());
+    }
+
+    #[test]
+    fn literal_rowid_in_uses_a_declarative_nested_stream() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute("CREATE TABLE in_rows(id INTEGER PRIMARY KEY, payload TEXT)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO in_rows VALUES \
+                 (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four'), (5, 'five')",
+            )
+            .unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT id, payload FROM in_rows \
+                 WHERE id IN (5, '1', 1, NULL, 3) LIMIT 2 OFFSET 1",
+            )
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::SeekRowid { .. }))
+                .count(),
+            1
+        );
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::SorterOpen { .. })));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::HashDistinct { .. })));
+        assert!(instructions.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::MakeRecord {
+                affinity_str: Some(affinity),
+                ..
+            } if affinity == "D"
+        )));
+        let result_row = instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 2, .. }))
+            .expect("declarative IN stream must produce its projected row pack");
+        assert!(instructions[result_row - 2..result_row]
+            .iter()
+            .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })));
+
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(3), Value::from_text("three")],
+                vec![Value::from_i64(5), Value::from_text("five")],
+            ]
+        );
+    }
+
+    #[test]
+    fn literal_index_in_preserves_target_duplicates_and_deduplicates_rhs_keys() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE in_indexed(\
+                    id INTEGER PRIMARY KEY, key NUMERIC, payload TEXT\
+                )",
+            )
+            .unwrap();
+        connection
+            .execute("CREATE INDEX in_indexed_key ON in_indexed(key)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO in_indexed VALUES \
+                 (1, 1, 'one-a'), (2, 1, 'one-b'), (3, 2, 'two'), \
+                 (4, 3, 'three-a'), (5, 3, 'three-b'), (6, 4, 'four')",
+            )
+            .unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT id, payload FROM in_indexed \
+                 WHERE key IN (3, '1', 3, NULL, 2) ORDER BY id",
+            )
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+        assert!(
+            instructions.iter().any(|(instruction, _)| matches!(
+                instruction,
+                Insn::SeekGE {
+                    is_index: true,
+                    num_regs: 1,
+                    ..
+                }
+            )),
+            "literal index IN should lower to an exact seek: {instructions:#?}"
+        );
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::IdxGT { num_regs: 1, .. })));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::DeferredSeek { .. })));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::HashDistinct { .. })));
+        assert!(instructions.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::MakeRecord {
+                affinity_str: Some(affinity),
+                ..
+            } if affinity == "C"
+        )));
+
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(1), Value::from_text("one-a")],
+                vec![Value::from_i64(2), Value::from_text("one-b")],
+                vec![Value::from_i64(3), Value::from_text("two")],
+                vec![Value::from_i64(4), Value::from_text("three-a")],
+                vec![Value::from_i64(5), Value::from_text("three-b")],
+            ]
+        );
+
+        let mut eager_fallback = connection
+            .prepare(
+                "SELECT id FROM in_indexed \
+                 WHERE key IN (abs(?1), 2) ORDER BY id",
+            )
+            .unwrap();
+        let fallback_instructions = &eager_fallback.get_program().insns;
+        assert!(fallback_instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::OpenEphemeral { .. })));
+        assert!(fallback_instructions
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::HashDistinct { .. })));
+        eager_fallback
+            .bind_at(1.try_into().unwrap(), Value::from_i64(-3))
+            .unwrap();
+        assert_eq!(
+            eager_fallback.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(3)],
+                vec![Value::from_i64(4)],
+                vec![Value::from_i64(5)],
+            ]
+        );
     }
 
     #[test]
