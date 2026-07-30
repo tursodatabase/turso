@@ -725,10 +725,6 @@ pub struct BindContext<'a, G: IdGenerator> {
     /// Function and schema resolver.
     pub resolver: &'a Resolver<'a>,
 
-    /// PRAGMA full_column_names && !short_column_names: star expansion names
-    /// columns as `table.column` (mirrors select_star's `long_names`).
-    long_names: bool,
-
     /// Generates unique table IDs for scope tables.
     id_gen: &'a mut G,
 
@@ -786,7 +782,6 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     pub fn new(resolver: &'a Resolver<'a>, id_gen: &'a mut G) -> Self {
         Self {
             resolver,
-            long_names: false,
             id_gen,
             outer_query_frames: Vec::new(),
             outer_frame_floor: 0,
@@ -800,13 +795,6 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             shared_subqueries: Vec::new(),
             derived_bindings: HashMap::default(),
         }
-    }
-
-    /// Enable `table.column` naming for star expansion
-    /// (PRAGMA full_column_names on, short_column_names off).
-    pub fn with_long_names(mut self, long_names: bool) -> Self {
-        self.long_names = long_names;
-        self
     }
 
     // ── Outer scope stack (mirrors DataFusion PlannerContext) ─────────
@@ -998,14 +986,75 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     self.bind_expr(expr, scope)?;
                     result.push(BoundColumn {
                         name,
-                        expr: *expr.clone(),
+                        expr: expr.as_ref().clone(),
                         is_explicit_alias,
                     });
                 }
                 ast::ResultColumn::Star => {
-                    // Expand * — each column becomes a resolved Expr::Column
-                    for st in &scope.tables {
+                    // The star stays unexpanded in the AST (the planner's
+                    // `select_star` produces the plan columns), but its names
+                    // and arity are needed here for alias resolution and
+                    // compound-select checks. Mirror `select_star`'s
+                    // visibility rules exactly: ordering under RIGHT JOIN
+                    // swapping, semi/anti-join exclusion, ambiguity on
+                    // duplicate identifiers, hidden columns, USING dedup.
+                    let table_iter: Vec<&ScopeTable> = if scope.right_join_swapped {
+                        scope.tables.iter().rev().collect()
+                    } else {
+                        scope.tables.iter().collect()
+                    };
+                    for st in table_iter {
+                        if st.join_info.as_ref().is_some_and(|ji| ji.is_semi_or_anti()) {
+                            continue;
+                        }
+                        // If this table's identifier appears more than once in
+                        // the FROM clause, expanding * would produce ambiguous
+                        // column references (matches SQLite). Columns
+                        // deduplicated by USING/NATURAL are not ambiguous.
+                        let has_duplicate_identifier = scope
+                            .tables
+                            .iter()
+                            .filter(|t| t.identifier == st.identifier)
+                            .count()
+                            > 1;
+                        if has_duplicate_identifier {
+                            let using_cols: Vec<&str> = scope
+                                .tables
+                                .iter()
+                                .filter(|t| t.identifier == st.identifier)
+                                .filter_map(|t| t.join_info.as_ref())
+                                .flat_map(|ji| ji.using.iter().map(|u| u.as_str()))
+                                .collect();
+                            for col_ref in st.table.columns() {
+                                if col_ref.is_hidden {
+                                    continue;
+                                }
+                                let in_using = using_cols
+                                    .iter()
+                                    .any(|u| u.eq_ignore_ascii_case(col_ref.name));
+                                if !in_using {
+                                    crate::bail_parse_error!(
+                                        "ambiguous column name: {}.{}",
+                                        st.identifier,
+                                        col_ref.name
+                                    );
+                                }
+                            }
+                        }
                         for col_ref in st.table.columns() {
+                            if col_ref.is_hidden {
+                                continue;
+                            }
+                            // USING dedup: skip right-table columns named in USING
+                            if let Some(ji) = &st.join_info {
+                                if ji
+                                    .using
+                                    .iter()
+                                    .any(|u| u.as_str().eq_ignore_ascii_case(col_ref.name))
+                                {
+                                    continue;
+                                }
+                            }
                             result.push(BoundColumn {
                                 name: col_ref.name.to_string(),
                                 expr: ast::Expr::Column {
@@ -1024,6 +1073,9 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         crate::bail_parse_error!("no such table: {}", table_name);
                     };
                     for col_ref in st.table.columns() {
+                        if col_ref.is_hidden {
+                            continue;
+                        }
                         result.push(BoundColumn {
                             name: col_ref.name.to_string(),
                             expr: ast::Expr::Column {
@@ -1148,8 +1200,12 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         }
                     };
 
-                    // 2. Expand Star/TableStar in-place before any binding
-                    ctx.expand_stars(columns, &scope)?;
+                    // 2. Star/TableStar result columns stay unexpanded in the
+                    // AST: `extract_bound_columns` derives their names and
+                    // arity for alias resolution, and the planner's
+                    // `select_star` fast path expands them into plan columns
+                    // without materializing per-column AST nodes (which is
+                    // wasteful for wide tables).
 
                     // 3. Bind WINDOW definitions (NoAliases — same phase as SELECT list)
                     ctx.with_phase(BindPhase::NoAliases, |ctx| {
@@ -1478,7 +1534,9 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         Ok(())
     }
 
-    /// Expand `Star` and `TableStar` result columns in-place.
+    /// Expand `Star` and `TableStar` result columns in-place (RETURNING only —
+    /// SELECT lists keep stars unexpanded and go through the planner's
+    /// `select_star` fast path instead).
     ///
     /// After this, the `columns` vec contains only `ResultColumn::Expr` entries.
     /// Handles USING dedup, hidden columns, semi/anti-join filtering, and
@@ -1558,7 +1616,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                                     column: col_ref.idx,
                                     is_rowid_alias: col_ref.is_rowid_alias,
                                 }),
-                                Some(self.star_column_alias(&st.identifier, col_ref.name)),
+                                Some(ast::As::As(ast::Name::exact(col_ref.name.to_string()))),
                             ));
                         }
                     }
@@ -1582,7 +1640,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                                     column: col_ref.idx,
                                     is_rowid_alias: col_ref.is_rowid_alias,
                                 }),
-                                Some(self.star_column_alias(&st.identifier, col_ref.name)),
+                                Some(ast::As::As(ast::Name::exact(col_ref.name.to_string()))),
                             ));
                         }
                     } else {
@@ -1595,19 +1653,6 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         }
         *columns = expanded;
         Ok(())
-    }
-
-    /// Alias for a star-expanded column, mirroring select_star: the bare
-    /// column name, or `table.column` under long_names. Setting the alias
-    /// keeps runtime column naming (which applies PRAGMA full_column_names to
-    /// alias-less columns) identical to the legacy path.
-    fn star_column_alias(&self, table_identifier: &str, col_name: &str) -> ast::As {
-        let name = if self.long_names {
-            format!("{table_identifier}.{col_name}")
-        } else {
-            col_name.to_string()
-        };
-        ast::As::As(ast::Name::exact(name))
     }
 
     fn bind_cte(&mut self, with: &mut ast::With) -> Result<()> {
@@ -3130,7 +3175,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         .unwrap_or_else(|| Self::infer_column_name(expr));
                     result.push(BoundColumn {
                         name,
-                        expr: *expr.clone(),
+                        expr: expr.as_ref().clone(),
                         is_explicit_alias: alias.is_some(),
                     });
                 }
@@ -4323,13 +4368,18 @@ mod tests {
     fn expand_star_single_table() {
         with_bind_context(&["CREATE TABLE t(a, b, c)"], |ctx| {
             let mut select = parse_select("SELECT * FROM t");
-            ctx.bind_select(&mut select).unwrap();
+            let bound = ctx.bind_select(&mut select).unwrap();
 
-            let cols = select_columns(&select);
-            assert_eq!(cols.len(), 3);
-            assert_column_expr(select_expr(&select, 0), 0, 0);
-            assert_column_expr(select_expr(&select, 1), 0, 1);
-            assert_column_expr(select_expr(&select, 2), 0, 2);
+            // The star stays unexpanded in the AST (the planner's select_star
+            // expands it); its columns are visible in the bound output.
+            assert!(matches!(
+                select_columns(&select)[0],
+                ast::ResultColumn::Star
+            ));
+            assert_eq!(bound.result_columns.len(), 3);
+            assert_column_expr(&bound.result_columns[0].expr, 0, 0);
+            assert_column_expr(&bound.result_columns[1].expr, 0, 1);
+            assert_column_expr(&bound.result_columns[2].expr, 0, 2);
         });
     }
 
@@ -4337,15 +4387,14 @@ mod tests {
     fn expand_star_multiple_tables() {
         with_bind_context(&["CREATE TABLE t(a, b)", "CREATE TABLE u(x, y)"], |ctx| {
             let mut select = parse_select("SELECT * FROM t, u");
-            ctx.bind_select(&mut select).unwrap();
+            let bound = ctx.bind_select(&mut select).unwrap();
 
-            let cols = select_columns(&select);
-            assert_eq!(cols.len(), 4);
+            assert_eq!(bound.result_columns.len(), 4);
             // t.a, t.b, u.x, u.y
-            assert_column_expr(select_expr(&select, 0), 0, 0);
-            assert_column_expr(select_expr(&select, 1), 0, 1);
-            assert_column_expr(select_expr(&select, 2), 1, 0);
-            assert_column_expr(select_expr(&select, 3), 1, 1);
+            assert_column_expr(&bound.result_columns[0].expr, 0, 0);
+            assert_column_expr(&bound.result_columns[1].expr, 0, 1);
+            assert_column_expr(&bound.result_columns[2].expr, 1, 0);
+            assert_column_expr(&bound.result_columns[3].expr, 1, 1);
         });
     }
 
@@ -4353,13 +4402,12 @@ mod tests {
     fn expand_table_star() {
         with_bind_context(&["CREATE TABLE t(a, b)", "CREATE TABLE u(x, y)"], |ctx| {
             let mut select = parse_select("SELECT u.* FROM t, u");
-            ctx.bind_select(&mut select).unwrap();
+            let bound = ctx.bind_select(&mut select).unwrap();
 
-            let cols = select_columns(&select);
-            assert_eq!(cols.len(), 2);
+            assert_eq!(bound.result_columns.len(), 2);
             // u.x, u.y
-            assert_column_expr(select_expr(&select, 0), 1, 0);
-            assert_column_expr(select_expr(&select, 1), 1, 1);
+            assert_column_expr(&bound.result_columns[0].expr, 1, 0);
+            assert_column_expr(&bound.result_columns[1].expr, 1, 1);
         });
     }
 
@@ -4367,14 +4415,13 @@ mod tests {
     fn expand_star_with_join_using_dedup() {
         with_bind_context(&["CREATE TABLE t(a, b)", "CREATE TABLE u(b, c)"], |ctx| {
             let mut select = parse_select("SELECT * FROM t JOIN u USING(b)");
-            ctx.bind_select(&mut select).unwrap();
+            let bound = ctx.bind_select(&mut select).unwrap();
 
-            let cols = select_columns(&select);
             // t.a, t.b, u.c — u.b is deduped by USING
-            assert_eq!(cols.len(), 3);
-            assert_column_expr(select_expr(&select, 0), 0, 0);
-            assert_column_expr(select_expr(&select, 1), 0, 1);
-            assert_column_expr(select_expr(&select, 2), 1, 1);
+            assert_eq!(bound.result_columns.len(), 3);
+            assert_column_expr(&bound.result_columns[0].expr, 0, 0);
+            assert_column_expr(&bound.result_columns[1].expr, 0, 1);
+            assert_column_expr(&bound.result_columns[2].expr, 1, 1);
         });
     }
 
@@ -4382,18 +4429,17 @@ mod tests {
     fn expand_star_mixed_with_explicit_columns() {
         with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
             let mut select = parse_select("SELECT 1, *, a FROM t");
-            ctx.bind_select(&mut select).unwrap();
+            let bound = ctx.bind_select(&mut select).unwrap();
 
-            let cols = select_columns(&select);
             // literal 1, t.a, t.b, t.a
-            assert_eq!(cols.len(), 4);
+            assert_eq!(bound.result_columns.len(), 4);
             assert_eq!(
-                select_expr(&select, 0),
+                &bound.result_columns[0].expr,
                 &ast::Expr::Literal(ast::Literal::Numeric("1".into()))
             );
-            assert_column_expr(select_expr(&select, 1), 0, 0);
-            assert_column_expr(select_expr(&select, 2), 0, 1);
-            assert_column_expr(select_expr(&select, 3), 0, 0);
+            assert_column_expr(&bound.result_columns[1].expr, 0, 0);
+            assert_column_expr(&bound.result_columns[2].expr, 0, 1);
+            assert_column_expr(&bound.result_columns[3].expr, 0, 0);
         });
     }
 
@@ -4469,9 +4515,8 @@ mod tests {
         // cross join instead of erroring.
         with_bind_context(&["CREATE TABLE t(a)", "CREATE TABLE u(b)"], |ctx| {
             let mut select = parse_select("SELECT * FROM t NATURAL JOIN u");
-            ctx.bind_select(&mut select).unwrap();
-            let cols = select_columns(&select);
-            assert_eq!(cols.len(), 2); // t.a, u.b — no dedup, no constraint
+            let bound = ctx.bind_select(&mut select).unwrap();
+            assert_eq!(bound.result_columns.len(), 2); // t.a, u.b — no dedup, no constraint
         });
     }
 
@@ -4491,14 +4536,13 @@ mod tests {
     fn natural_join_star_deduplicates_common_columns() {
         with_bind_context(&["CREATE TABLE t(a, b)", "CREATE TABLE u(b, c)"], |ctx| {
             let mut select = parse_select("SELECT * FROM t NATURAL JOIN u");
-            ctx.bind_select(&mut select).unwrap();
+            let bound = ctx.bind_select(&mut select).unwrap();
 
-            let cols = select_columns(&select);
             // t.a, t.b, u.c — u.b is deduped by USING(b)
-            assert_eq!(cols.len(), 3);
-            assert_column_expr(select_expr(&select, 0), 0, 0); // t.a
-            assert_column_expr(select_expr(&select, 1), 0, 1); // t.b
-            assert_column_expr(select_expr(&select, 2), 1, 1); // u.c
+            assert_eq!(bound.result_columns.len(), 3);
+            assert_column_expr(&bound.result_columns[0].expr, 0, 0); // t.a
+            assert_column_expr(&bound.result_columns[1].expr, 0, 1); // t.b
+            assert_column_expr(&bound.result_columns[2].expr, 1, 1); // u.c
         });
     }
 

@@ -22,7 +22,6 @@ use crate::translate::planner::{
 use crate::translate::result_row::emit_select_result;
 use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
 use crate::translate::window::plan_windows;
-use crate::turso_assert;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
@@ -86,8 +85,7 @@ pub fn bind_prepare_select_plan(
 ) -> Result<Plan> {
     use crate::translate::planner::{plan_bound_ctes, plan_derived_tables};
 
-    let long_names = connection.get_full_column_names() && !connection.get_short_column_names();
-    let mut binder = super::bind::BindContext::new(resolver, program).with_long_names(long_names);
+    let mut binder = super::bind::BindContext::new(resolver, program);
     let mut bound = binder.bind_select(&mut select)?;
 
     // Plan CTEs using pre-bound data from the binder.
@@ -653,10 +651,6 @@ fn prepare_one_select_plan(
                 for column in columns.into_iter() {
                     match column {
                         ResultColumn::Star => {
-                            turso_assert!(
-                                !is_bound,
-                                "ResultColumn::Star must be expanded by the binder"
-                            );
                             select_star(
                                 plan.table_references.joined_tables(),
                                 &mut plan.result_columns,
