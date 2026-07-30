@@ -25,6 +25,64 @@ fn take_expr(expr: &mut ast::Expr) -> ast::Expr {
     std::mem::replace(expr, ast::Expr::Literal(ast::Literal::Null))
 }
 
+/// Validate a referenced CTE's explicit column list against its SELECT's
+/// result column count. SQLite defers this check until the CTE is actually
+/// referenced, so unreferenced CTEs with mismatched counts don't error.
+fn validate_cte_explicit_columns(name: &str, cte: &CteEntry) -> Result<()> {
+    if !cte.explicit_columns.is_empty()
+        && cte.result_column_count != 0
+        && cte.explicit_columns.len() != cte.result_column_count
+    {
+        crate::bail_parse_error!(
+            "table {} has {} columns but {} column names were provided",
+            name,
+            cte.result_column_count,
+            cte.explicit_columns.len()
+        );
+    }
+    Ok(())
+}
+
+/// Collect unqualified table names referenced in a SELECT's FROM clauses.
+/// Schema-qualified references (main.t) are skipped — they can never refer to
+/// a CTE.
+fn collect_unqualified_from_clause_table_refs(select: &ast::Select, out: &mut Vec<String>) {
+    fn walk_one(one: &ast::OneSelect, out: &mut Vec<String>) {
+        if let ast::OneSelect::Select {
+            from: Some(from), ..
+        } = one
+        {
+            walk_table(&from.select, out);
+            for join in &from.joins {
+                walk_table(&join.table, out);
+            }
+        }
+    }
+    fn walk_table(table: &ast::SelectTable, out: &mut Vec<String>) {
+        match table {
+            ast::SelectTable::Table(qualified_name, _, _)
+            | ast::SelectTable::TableCall(qualified_name, _, _) => {
+                if qualified_name.db_name.is_none() {
+                    out.push(normalize_ident(qualified_name.name.as_str()));
+                }
+            }
+            ast::SelectTable::Select(subselect, _) => {
+                collect_unqualified_from_clause_table_refs(subselect, out);
+            }
+            ast::SelectTable::Sub(from_clause, _) => {
+                walk_table(&from_clause.select, out);
+                for join in &from_clause.joins {
+                    walk_table(&join.table, out);
+                }
+            }
+        }
+    }
+    walk_one(&select.body.select, out);
+    for compound in &select.body.compounds {
+        walk_one(&compound.select, out);
+    }
+}
+
 // ── IdGenerator ─────────────────────────────────────────────────────────
 
 pub trait IdGenerator {
@@ -259,7 +317,7 @@ impl BindScope {
                             .any(|u| u.as_str().eq_ignore_ascii_case(&normalized))
                     });
                     if !in_using {
-                        crate::bail_parse_error!("Column {} is ambiguous", name);
+                        crate::bail_parse_error!("ambiguous column name: {}", name);
                     }
                 } else {
                     result = Some((st.internal_id, idx, st.table.column_is_rowid_alias(idx)));
@@ -272,32 +330,57 @@ impl BindScope {
 
     /// Find a qualified column (`table.column`) in this scope.
     ///
-    /// Returns `None` if the table is not found (caller can try outer scopes).
-    /// Errors if the table exists but the column doesn't.
+    /// SQLite allows the same table name/alias to appear more than once in a
+    /// FROM clause; every table whose identifier matches is a candidate, and
+    /// a column present on more than one candidate is ambiguous (unless the
+    /// duplicate is deduplicated by a USING/NATURAL join on that column).
+    ///
+    /// Returns `None` if no table matches the identifier (caller can try
+    /// outer scopes). Errors if a table matches but the column doesn't.
     pub fn find_column_qualified(
         &self,
         table_name: &str,
         col_name: &str,
     ) -> Result<Option<(TableInternalId, usize, bool)>> {
-        let Some(st) = self.find_table_by_identifier(table_name) else {
-            return Ok(None);
-        };
-
+        let normalized_table = normalize_ident(table_name);
         let normalized_col = normalize_ident(col_name);
-        let col_idx = st
-            .table
-            .columns()
-            .position(|col| col.name.eq_ignore_ascii_case(&normalized_col));
 
-        let Some(idx) = col_idx else {
+        let mut identifier_matched = false;
+        let mut result: Option<(TableInternalId, usize, bool)> = None;
+        for st in self
+            .tables
+            .iter()
+            .filter(|t| t.identifier == normalized_table)
+        {
+            identifier_matched = true;
+            let Some(idx) = st
+                .table
+                .columns()
+                .position(|col| col.name.eq_ignore_ascii_case(&normalized_col))
+            else {
+                continue;
+            };
+            if result.is_some() {
+                let in_using = st.join_info.as_ref().is_some_and(|ji| {
+                    ji.using
+                        .iter()
+                        .any(|u| u.as_str().eq_ignore_ascii_case(&normalized_col))
+                });
+                if !in_using {
+                    crate::bail_parse_error!("ambiguous column name: {}.{}", table_name, col_name);
+                }
+                continue;
+            }
+            result = Some((st.internal_id, idx, st.table.column_is_rowid_alias(idx)));
+        }
+
+        if !identifier_matched {
+            return Ok(None);
+        }
+        let Some(found) = result else {
             crate::bail_parse_error!("no such column: {}.{}", table_name, col_name);
         };
-
-        Ok(Some((
-            st.internal_id,
-            idx,
-            st.table.column_is_rowid_alias(idx),
-        )))
+        Ok(Some(found))
     }
 
     /// Find a table by its identifier (name or alias).
@@ -454,6 +537,18 @@ impl BoundSelect {
     ) -> Result<Vec<TableReferences>> {
         let mut all = Vec::with_capacity(1 + self.compound_scopes.len());
 
+        // Compound scopes get the same outer refs as the main scope: a
+        // correlated compound subquery (e.g. `x IN (... UNION ...)`) can
+        // reference the outer scope from any of its constituent SELECTs.
+        for scope in self.compound_scopes {
+            all.push(Self::scope_to_table_references(
+                scope,
+                &self.tracking,
+                planned_ctes,
+                planned_derived,
+                outer_query_refs.clone(),
+            )?);
+        }
         let main_refs = Self::scope_to_table_references(
             self.main_scope,
             &self.tracking,
@@ -461,17 +556,7 @@ impl BoundSelect {
             planned_derived,
             outer_query_refs,
         )?;
-        all.push(main_refs);
-
-        for scope in self.compound_scopes {
-            all.push(Self::scope_to_table_references(
-                scope,
-                &self.tracking,
-                planned_ctes,
-                planned_derived,
-                Vec::new(),
-            )?);
-        }
+        all.insert(0, main_refs);
 
         Ok(all)
     }
@@ -572,15 +657,28 @@ impl BindTracking {
     }
 
     /// Apply recorded usage back to `TableReferences`.
+    ///
+    /// Tracking spans the whole statement (main scope, compound scopes,
+    /// subquery scopes), but each `TableReferences` only holds one scope's
+    /// tables — usages recorded for other scopes are skipped here and flushed
+    /// when their own scope is converted.
     pub fn flush(&self, table_references: &mut TableReferences) {
+        let contains = |tr: &TableReferences, id: TableInternalId| {
+            tr.find_joined_table_by_internal_id(id).is_some()
+                || tr.find_outer_query_ref_by_internal_id(id).is_some()
+        };
         for &(table_id, col_idx) in &self.columns_used {
-            table_references.mark_column_used(table_id, col_idx);
+            if contains(table_references, table_id) {
+                table_references.mark_column_used(table_id, col_idx);
+            }
         }
         for &table_id in &self.rowids_used {
             table_references.mark_rowid_referenced(table_id);
         }
         for &(table_id, col_idx) in &self.outer_refs_used {
-            table_references.mark_column_used(table_id, col_idx);
+            if contains(table_references, table_id) {
+                table_references.mark_column_used(table_id, col_idx);
+            }
         }
     }
 }
@@ -603,6 +701,10 @@ pub struct CteEntry {
     /// If explicit_columns is non-empty, equals explicit_columns.
     /// Otherwise, extracted from the SELECT result columns.
     pub resolved_columns: Vec<String>,
+    /// Number of result columns produced by the CTE body's SELECT.
+    /// Used to validate explicit column names when the CTE is referenced
+    /// (SQLite defers this check until an actual reference).
+    pub result_column_count: usize,
     /// Inner binding results (scopes, tracking, subquery bindings).
     pub inner_bound: Option<BoundSelect>,
     /// Indexes of CTEs (in definition order) that this CTE directly references.
@@ -618,6 +720,7 @@ impl Clone for CteEntry {
             explicit_columns: self.explicit_columns.clone(),
             cte_id: self.cte_id,
             resolved_columns: self.resolved_columns.clone(),
+            result_column_count: self.result_column_count,
             inner_bound: None,
             referenced_cte_indices: self.referenced_cte_indices.clone(),
             materialize_hint: self.materialize_hint,
@@ -644,6 +747,13 @@ pub struct BindContext<'a, G: IdGenerator> {
     /// Stack of outer query scopes plus visible aliases.
     outer_query_frames: Vec<OuterQueryFrame>,
 
+    /// Index into `outer_query_frames` below which frames are invisible to
+    /// column resolution. GROUP BY expressions cannot reference the outer
+    /// query scope (SQLite rejects them with "no such column"), but the
+    /// frames must stay physically present so error messages can still name
+    /// the outer table (`no such column: t2.d`, not `no such table: t2`).
+    outer_frame_floor: usize,
+
     /// Outer FROM schema for LATERAL join support.
     outer_from_scope: Option<BindScopeRef>,
 
@@ -669,6 +779,14 @@ pub struct BindContext<'a, G: IdGenerator> {
     /// Moved into `BoundSelect` when binding completes.
     subquery_bindings: HashMap<ast::TableInternalId, BoundSubquery>,
 
+    /// Scalar subqueries shared between GROUP BY and the SELECT list of the
+    /// current SELECT core. Each entry holds the raw (pre-bind) expression and
+    /// the subquery id assigned when the first occurrence is bound; later
+    /// occurrences are rewritten to the same id so they share one evaluation
+    /// (and compare equal for GROUP BY expression matching), mirroring the
+    /// planner's scalar-subquery CSE.
+    shared_subqueries: Vec<(ast::Expr, Option<ast::TableInternalId>)>,
+
     /// FROM-clause subqueries (derived tables) bound during this query,
     /// keyed by the scope table's `internal_id`.
     derived_bindings: HashMap<ast::TableInternalId, BoundSubquery>,
@@ -680,6 +798,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             resolver,
             id_gen,
             outer_query_frames: Vec::new(),
+            outer_frame_floor: 0,
             outer_from_scope: None,
             ctes: HashMap::default(),
             aliases: Vec::new(),
@@ -687,6 +806,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             allow_unbound: false,
             tracking: BindTracking::default(),
             subquery_bindings: HashMap::default(),
+            shared_subqueries: Vec::new(),
             derived_bindings: HashMap::default(),
         }
     }
@@ -706,15 +826,28 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
     /// Iterate outer scopes innermost-first (reversed storage order).
     /// Matches column lookup precedence: nearest enclosing query first.
+    /// Frames below `outer_frame_floor` are hidden (see the field docs).
     fn outer_scopes_iter(&self) -> impl Iterator<Item = &BindScopeRef> {
-        self.outer_query_frames
+        self.outer_query_frames[self.outer_frame_floor..]
             .iter()
             .rev()
             .map(|frame| &frame.scope)
     }
 
     fn outer_query_frames_iter(&self) -> impl Iterator<Item = &OuterQueryFrame> {
-        self.outer_query_frames.iter().rev()
+        self.outer_query_frames[self.outer_frame_floor..]
+            .iter()
+            .rev()
+    }
+
+    /// Iterate ALL outer scopes, including frames hidden by
+    /// `outer_frame_floor`. Only for error reporting (naming a table that
+    /// exists but is not referenceable from the current clause).
+    fn all_outer_scopes_iter(&self) -> impl Iterator<Item = &BindScopeRef> {
+        self.outer_query_frames
+            .iter()
+            .rev()
+            .map(|frame| &frame.scope)
     }
 
     // ── CTEs ─────────────────────────────────────────────────────────
@@ -748,11 +881,13 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     fn with_scope<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         let saved_aliases = std::mem::take(&mut self.aliases);
         let saved_phase = self.phase;
+        let saved_shared = std::mem::take(&mut self.shared_subqueries);
 
         let result = f(self);
 
         self.aliases = saved_aliases;
         self.phase = saved_phase;
+        self.shared_subqueries = saved_shared;
 
         result
     }
@@ -771,6 +906,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         let saved_phase = self.phase;
         let saved_outer_from_scope = self.outer_from_scope.clone();
         let saved_tracking = std::mem::take(&mut self.tracking);
+        let saved_floor = self.outer_frame_floor;
         let saved_subquery_bindings = std::mem::take(&mut self.subquery_bindings);
         let saved_derived_bindings = std::mem::take(&mut self.derived_bindings);
 
@@ -781,6 +917,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         self.phase = saved_phase;
         self.outer_from_scope = saved_outer_from_scope;
         self.tracking = saved_tracking;
+        self.outer_frame_floor = saved_floor;
         self.subquery_bindings = saved_subquery_bindings;
         self.derived_bindings = saved_derived_bindings;
 
@@ -926,19 +1063,25 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 compound_scopes.push(compound_scope);
             }
 
-            // 4. Bind ORDER BY (AliasFirst phase — aliases take priority)
+            // 4. Bind ORDER BY (AliasFirst phase — aliases take priority).
+            // Compound SELECTs are excluded: their ORDER BY terms resolve by
+            // result-column position/name across all constituent SELECTs
+            // (see resolve_compound_order_by_expr in the planner), so the raw
+            // identifiers must be preserved.
             ctx.set_aliases(result_columns.clone());
-            ctx.with_phase(BindPhase::AliasFirst, |ctx| {
-                for sort_col in &mut select.order_by {
-                    ctx.replace_column_number(&mut sort_col.expr)?;
-                    // Optimize trivial subqueries like (SELECT alias) by inlining
-                    // the alias expression. This avoids creating a "correlated"
-                    // subquery that's really just an alias reference.
-                    ctx.try_inline_trivial_subquery(&mut sort_col.expr, &main_scope);
-                    ctx.bind_expr(&mut sort_col.expr, &main_scope)?;
-                }
-                Ok(())
-            })?;
+            if select.body.compounds.is_empty() {
+                ctx.with_phase(BindPhase::AliasFirst, |ctx| {
+                    for sort_col in &mut select.order_by {
+                        ctx.replace_column_number(&mut sort_col.expr)?;
+                        // Optimize trivial subqueries like (SELECT alias) by inlining
+                        // the alias expression. This avoids creating a "correlated"
+                        // subquery that's really just an alias reference.
+                        ctx.try_inline_trivial_subquery(&mut sort_col.expr, &main_scope);
+                        ctx.bind_expr(&mut sort_col.expr, &main_scope)?;
+                    }
+                    Ok(())
+                })?;
+            }
 
             // 5. Bind LIMIT/OFFSET (no scope — these are standalone expressions)
             if let Some(limit) = select.limit.as_mut() {
@@ -1008,12 +1151,17 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     };
 
                     // 2. Expand Star/TableStar in-place before any binding
-                    ctx.expand_stars(columns, &scope);
+                    ctx.expand_stars(columns, &scope)?;
 
                     // 3. Bind WINDOW definitions (NoAliases — same phase as SELECT list)
                     ctx.with_phase(BindPhase::NoAliases, |ctx| {
                         ctx.bind_window_defs(window_clause, &scope)
                     })?;
+
+                    // 5a. Detect scalar subqueries shared between GROUP BY and
+                    //     the SELECT list before either is bound. Shared
+                    //     occurrences get one subquery id (see bind_expr).
+                    ctx.collect_shared_subqueries(columns, group_by.as_ref());
 
                     // 5. Extract bound columns (names + resolved exprs) before
                     //    the main bind pass rewrites the AST in-place.
@@ -1034,10 +1182,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         })?;
                     }
 
-                    // 9. Bind GROUP BY and HAVING (aliases take priority in GROUP BY,
-                    //    matching SQLite behavior where SELECT alias shadows column name)
+                    // 9. Bind GROUP BY and HAVING. In GROUP BY, real columns
+                    //    take precedence over SELECT aliases (TableFirst);
+                    //    HAVING prefers aliases (AliasFirst) — matching SQLite.
                     if let Some(group_by) = group_by {
-                        ctx.with_phase(BindPhase::AliasFirst, |ctx| {
+                        ctx.with_phase(BindPhase::TableFirst, |ctx| {
                             ctx.bind_group_by(group_by, &scope)
                         })?;
                     }
@@ -1156,24 +1305,61 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     }
 
     /// Replace a numeric literal (e.g. `1`, `2`) with the corresponding
-    /// SELECT result column expression. Per SQLite semantics, only positive
-    /// integer literals are treated as column references; floats and negative
-    /// numbers are left as constant expressions.
+    /// SELECT result column expression, mirroring SQLite: only positive
+    /// integer literals are column references (floats stay constant
+    /// expressions); an explicit COLLATE or a single-element parenthesized
+    /// wrapper is looked through; `+2` counts as an ordinal while `-2` is out
+    /// of range.
     fn replace_column_number(&self, expr: &mut ast::Expr) -> Result<()> {
-        if let ast::Expr::Literal(ast::Literal::Numeric(num)) = expr {
+        self.replace_column_number_inner(expr, "ORDER BY")
+    }
+
+    fn replace_column_number_inner(&self, expr: &mut ast::Expr, clause_name: &str) -> Result<()> {
+        match expr {
+            ast::Expr::Collate(inner, _) => {
+                return self.replace_column_number_inner(inner, clause_name);
+            }
+            ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+                let inner = exprs[0].as_mut();
+                return self.replace_column_number_inner(inner, clause_name);
+            }
+            _ => {}
+        }
+
+        let num_str = match expr {
+            ast::Expr::Literal(ast::Literal::Numeric(num)) => Some(num.clone()),
+            ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
+                if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner.as_ref() {
+                    Some(num.clone())
+                } else {
+                    None
+                }
+            }
+            ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
+                if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner.as_ref() {
+                    if num.parse::<usize>().is_ok() {
+                        crate::bail_parse_error!(
+                            "1st {} term out of range - should be between 1 and {}",
+                            clause_name,
+                            self.aliases().len()
+                        );
+                    }
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(num) = num_str {
             if let Ok(column_number) = num.parse::<usize>() {
-                if column_number == 0 {
-                    crate::bail_parse_error!("invalid column index: {}", column_number);
-                }
                 let aliases = self.aliases();
-                match aliases.get(column_number - 1) {
-                    Some(bound_col) => {
-                        *expr = bound_col.expr.clone();
-                    }
-                    None => {
-                        crate::bail_parse_error!("invalid column index: {}", column_number);
-                    }
+                if column_number == 0 || column_number > aliases.len() {
+                    crate::bail_parse_error!(
+                        "1st {} term out of range - should be between 1 and {}",
+                        clause_name,
+                        aliases.len()
+                    );
                 }
+                *expr = aliases[column_number - 1].expr.clone();
             }
         }
         Ok(())
@@ -1181,15 +1367,21 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
     /// Bind GROUP BY expressions and HAVING clause.
     fn bind_group_by(&mut self, group_by: &mut ast::GroupBy, scope: &BindScope) -> Result<()> {
-        let saved_outer_query_frames = std::mem::take(&mut self.outer_query_frames);
+        // GROUP BY expressions in a correlated subquery cannot reference the
+        // outer query scope. Raise the frame floor so resolution can't see
+        // enclosing scopes (subqueries inside the GROUP BY expr still push and
+        // see frames above the floor), while error messages can still name
+        // outer tables correctly.
+        let saved_floor = self.outer_frame_floor;
+        self.outer_frame_floor = self.outer_query_frames.len();
         let group_result: Result<()> = (|| {
             for expr in &mut group_by.exprs {
-                self.replace_column_number(expr)?;
+                self.replace_column_number_inner(expr, "GROUP BY")?;
                 self.bind_expr(expr, scope)?;
             }
             Ok(())
         })();
-        self.outer_query_frames = saved_outer_query_frames;
+        self.outer_frame_floor = saved_floor;
         group_result?;
         if let Some(having) = &mut group_by.having {
             self.with_phase(BindPhase::AliasFirst, |ctx| {
@@ -1205,7 +1397,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     /// After this, the `columns` vec contains only `ResultColumn::Expr` entries.
     /// Handles USING dedup, hidden columns, semi/anti-join filtering, and
     /// right_join_swapped ordering — matching the planner's `select_star`.
-    fn expand_stars(&mut self, columns: &mut Vec<ast::ResultColumn>, scope: &BindScope) {
+    fn expand_stars(
+        &mut self,
+        columns: &mut Vec<ast::ResultColumn>,
+        scope: &BindScope,
+    ) -> Result<()> {
         let mut expanded = Vec::with_capacity(columns.len());
         for col in columns.drain(..) {
             match col {
@@ -1219,6 +1415,40 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         // Semi/anti-join tables don't contribute to SELECT *
                         if st.join_info.as_ref().is_some_and(|ji| ji.is_semi_or_anti()) {
                             continue;
+                        }
+                        // If this table's identifier appears more than once in
+                        // the FROM clause, expanding * would produce ambiguous
+                        // column references (matches SQLite). Columns
+                        // deduplicated by USING/NATURAL are not ambiguous.
+                        let has_duplicate_identifier = scope
+                            .tables
+                            .iter()
+                            .filter(|t| t.identifier == st.identifier)
+                            .count()
+                            > 1;
+                        if has_duplicate_identifier {
+                            let using_cols: Vec<&str> = scope
+                                .tables
+                                .iter()
+                                .filter(|t| t.identifier == st.identifier)
+                                .filter_map(|t| t.join_info.as_ref())
+                                .flat_map(|ji| ji.using.iter().map(|u| u.as_str()))
+                                .collect();
+                            for col_ref in st.table.columns() {
+                                if col_ref.is_hidden {
+                                    continue;
+                                }
+                                let in_using = using_cols
+                                    .iter()
+                                    .any(|u| u.eq_ignore_ascii_case(col_ref.name));
+                                if !in_using {
+                                    crate::bail_parse_error!(
+                                        "ambiguous column name: {}.{}",
+                                        st.identifier,
+                                        col_ref.name
+                                    );
+                                }
+                            }
                         }
                         for col_ref in st.table.columns() {
                             if col_ref.is_hidden {
@@ -1278,6 +1508,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             }
         }
         *columns = expanded;
+        Ok(())
     }
 
     fn bind_cte(&mut self, with: &mut ast::With) -> Result<()> {
@@ -1306,8 +1537,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             let materialize_hint = cte.materialized == turso_parser::ast::Materialized::Yes;
 
             // Determine which preceding CTEs this one directly references.
+            // Schema-qualified references (e.g. main.t) always name real
+            // schema objects, never CTEs, so they are excluded both from the
+            // dependency edges and from circular-reference detection.
             let mut referenced_tables = Vec::new();
-            super::planner::collect_from_clause_table_refs(&cte.select, &mut referenced_tables);
+            collect_unqualified_from_clause_table_refs(&cte.select, &mut referenced_tables);
 
             // Detect self-referencing CTEs (circular reference).
             if referenced_tables.contains(&cte_name) {
@@ -1327,6 +1561,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     explicit_columns,
                     cte_id,
                     resolved_columns: vec![],
+                    result_column_count: 0,
                     inner_bound: None,
                     referenced_cte_indices,
                     materialize_hint,
@@ -1344,6 +1579,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             let bound = self.bind_select(&mut cte.select)?;
 
             let entry = self.ctes.get_mut(&cte_name).unwrap();
+            entry.result_column_count = bound.result_columns.len();
             if entry.explicit_columns.is_empty() {
                 entry.resolved_columns = bound
                     .result_columns
@@ -1367,6 +1603,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         &mut self,
         table: &mut ast::SelectTable,
         lateral_scope: Option<&BindScope>,
+        position: usize,
     ) -> Result<ScopeTable> {
         match table {
             // Named table: CTE lookup first, then schema lookup
@@ -1378,8 +1615,14 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     .map(|a| normalize_ident(a.name().as_str()))
                     .unwrap_or_else(|| table_name.clone());
 
-                // 2. Check self.ctes for a CTE match
-                if let Some(cte) = self.ctes.get(&table_name) {
+                // 2. Check self.ctes for a CTE match. Schema-qualified names
+                // (e.g. main.t) always refer to schema objects, never CTEs.
+                if let Some(cte) = self
+                    .ctes
+                    .get(&table_name)
+                    .filter(|_| name.db_name.is_none())
+                {
+                    validate_cte_explicit_columns(&table_name, cte)?;
                     //    - resolved_columns was populated by bind_cte pass 2
                     //    - Build Arc<CteTable> as the BindTable
                     let cte_table = Arc::new(CteTable {
@@ -1402,7 +1645,9 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
                 // 3. Otherwise, schema lookup via resolver
                 //    - Handle cross-database references (e.g. aux.t1)
-                let database_id = self.resolver.resolve_database_id(name)?;
+                let database_id = self
+                    .resolver
+                    .resolve_existing_table_database_id_qualified(name)?;
 
                 // 3a. Check for views — expand them as derived tables (subqueries)
                 if let Some(view) = self
@@ -1469,13 +1714,88 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     });
                 }
 
-                // 3b. Regular table lookup
-                let schema_table = self
+                // 3b. Materialized views with storage are treated as
+                // regular BTree tables (mirrors parse_table).
+                let matview = self.resolver.with_schema(database_id, |schema| {
+                    schema.get_materialized_view(&table_name)
+                });
+                if let Some(view) = matview {
+                    let has_compatible_state = self.resolver.with_schema(database_id, |schema| {
+                        schema.has_compatible_dbsp_state_table(&table_name)
+                    });
+                    if !has_compatible_state {
+                        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+                        return Err(crate::LimboError::InternalError(format!(
+                            "Materialized view '{table_name}' has an incompatible version. \n\
+                             The current version is {DBSP_CIRCUIT_VERSION}, but the view was created with a different version. \n\
+                             Please DROP and recreate the view to use it."
+                        )));
+                    }
+                    let view_guard = view.lock();
+                    let root_page = view_guard.get_root_page();
+                    if root_page == 0 {
+                        drop(view_guard);
+                        return Err(crate::LimboError::InternalError(
+                            "Materialized view has no storage allocated".to_string(),
+                        ));
+                    }
+                    let columns = view_guard.column_schema.flat_columns();
+                    let btree_table = Arc::new(crate::schema::BTreeTable::new(
+                        root_page,
+                        view_guard.name().to_string(),
+                        crate::alloc::vec![],
+                        columns,
+                        crate::schema::BTreeCharacteristics::HAS_ROWID,
+                        crate::alloc::vec![],
+                        crate::alloc::vec![],
+                        crate::alloc::vec![],
+                        None,
+                    ));
+                    drop(view_guard);
+                    let table = Arc::new(Table::BTree(btree_table));
+                    return Ok(ScopeTable {
+                        identifier,
+                        internal_id: self.id_gen.next_table_id(),
+                        source: ScopeTableSource::Table(table.clone()),
+                        table,
+                        join_info: None,
+                        database_id,
+                        indexed: None,
+                    });
+                }
+
+                // 3c. Regular table lookup
+                let Some(schema_table) = self
                     .resolver
                     .with_schema(database_id, |s| s.get_table(&table_name))
-                    .ok_or_else(|| {
-                        crate::LimboError::ParseError(format!("no such table: {table_name}"))
-                    })?;
+                else {
+                    // Incompatible materialized view?
+                    let is_incompatible = self.resolver.with_schema(database_id, |schema| {
+                        schema.incompatible_views.contains(&table_name)
+                    });
+                    if is_incompatible {
+                        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+                        crate::bail_parse_error!(
+                            "Materialized view '{}' has an incompatible version. \n\
+                             The view was created with a different DBSP version than the current version ({}). \n\
+                             Please DROP and recreate the view to use it.",
+                            table_name,
+                            DBSP_CIRCUIT_VERSION
+                        );
+                    }
+                    // A view row whose stored SQL failed to parse at schema load
+                    let is_broken_view = self.resolver.with_schema(database_id, |schema| {
+                        schema.broken_views.contains(&table_name)
+                    });
+                    if is_broken_view {
+                        crate::bail_parse_error!(
+                            "view '{}' could not be loaded: its SQL in sqlite_schema does not parse. \n\
+                             Use DROP VIEW to remove it, then recreate it.",
+                            table_name
+                        );
+                    }
+                    crate::bail_parse_error!("no such table: {table_name}");
+                };
 
                 // 4. Generate internal_id via self.id_gen.next_table_id()
                 Ok(ScopeTable {
@@ -1493,7 +1813,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 let identifier = alias
                     .as_ref()
                     .map(|a| normalize_ident(a.name().as_str()))
-                    .unwrap_or_else(|| String::from("subquery"));
+                    .unwrap_or_else(|| format!("(subquery-{position})"));
 
                 // FROM subqueries don't correlate with the query being built.
                 let bound_select = self.bind_select(subselect)?;
@@ -1586,7 +1906,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 let identifier = alias
                     .as_ref()
                     .map(|a| normalize_ident(a.name().as_str()))
-                    .unwrap_or_else(|| String::from("subquery"));
+                    .unwrap_or_else(|| format!("(subquery-{position})"));
 
                 // If alias is present, wrap all columns under that alias
                 // If no alias, flatten tables into parent scope
@@ -1719,7 +2039,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             Ok(None) => {
                 // Table not found — continue to outer scope / rowid checks
             }
-            Err(_) => {
+            Err(err) => {
+                // Ambiguity is definitive — never fall back to rowid.
+                if err.to_string().contains("ambiguous column name") {
+                    return Err(err);
+                }
                 // Table found but column not found — try rowid pseudo-column
                 if let Some(st) = scope.find_table_by_identifier(table_name) {
                     if let Some(row_id_expr) = parse_row_id(col_name, st.internal_id, || false)? {
@@ -1794,6 +2118,104 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         Ok(None)
     }
 
+    /// Search scope tables for a column named `col_name` with a struct/union
+    /// type. Errors on ambiguity (>1 match). Returns
+    /// `(internal_id, col_idx, is_rowid_alias, type_def)` or `None`.
+    /// Scope-based counterpart of `find_custom_type_column`.
+    fn find_custom_type_column_in_scope<'t>(
+        &'t self,
+        scope: &BindScope,
+        col_name: &str,
+    ) -> Result<Option<(TableInternalId, usize, bool, &'t crate::schema::TypeDef)>> {
+        let mut result = None;
+        let mut match_count = 0usize;
+        for st in &scope.tables {
+            let ScopeTableSource::Table(table) = &st.source else {
+                continue;
+            };
+            let cols = table.columns();
+            if let Some(col_idx) = cols.iter().position(|c| {
+                c.name
+                    .as_ref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(col_name))
+            }) {
+                let col = &cols[col_idx];
+                let type_def = self.resolver.schema().get_type_def_unchecked(&col.ty_str);
+                let is_struct_or_union = type_def
+                    .map(|td| td.is_struct() || td.is_union())
+                    .unwrap_or(false);
+                if is_struct_or_union {
+                    match_count += 1;
+                    result = Some((
+                        st.internal_id,
+                        col_idx,
+                        col.is_rowid_alias(),
+                        &**type_def.unwrap(),
+                    ));
+                }
+            }
+        }
+        if match_count > 1 {
+            crate::bail_parse_error!(
+                "ambiguous column reference: '{}' — multiple tables have a struct/union column with this name",
+                col_name
+            );
+        }
+        Ok(result)
+    }
+
+    /// Try to resolve `col.mid.leaf` as 2-level deep field access
+    /// (e.g. `data.telegram.chat_id`). Scope-based counterpart of
+    /// `try_resolve_nested_field_access`.
+    fn try_resolve_nested_field_access_in_scope(
+        &mut self,
+        scope: &BindScope,
+        col_name: &str,
+        mid_name: &str,
+        leaf_name: &str,
+    ) -> Result<Option<ast::Expr>> {
+        let Some((table_id, col_idx, is_rowid_alias, td)) =
+            self.find_custom_type_column_in_scope(scope, col_name)?
+        else {
+            return Ok(None);
+        };
+
+        // Case A: UNION column — mid_name is a variant tag.
+        // Case B: STRUCT column — mid_name is a struct field.
+        let inner_type_name = td
+            .find_union_variant(mid_name)
+            .map(|(_, v)| v.type_name.as_str())
+            .or_else(|| {
+                td.find_struct_field(mid_name)
+                    .map(|(_, f)| f.type_name.as_str())
+            });
+
+        let has_leaf = inner_type_name
+            .and_then(|tn| self.resolver.schema().get_type_def_unchecked(tn))
+            .is_some_and(|itd| itd.find_struct_field(leaf_name).is_some());
+
+        if !has_leaf {
+            return Ok(None);
+        }
+
+        let nested_expr = ast::Expr::FieldAccess {
+            base: Box::new(ast::Expr::FieldAccess {
+                base: Box::new(ast::Expr::Column {
+                    database: None,
+                    table: table_id,
+                    column: col_idx,
+                    is_rowid_alias,
+                }),
+                field: ast::Name::from_bytes(mid_name.as_bytes()),
+                resolved: None,
+            }),
+            field: ast::Name::from_bytes(leaf_name.as_bytes()),
+            resolved: None,
+        };
+        self.tracking.record_column(table_id, col_idx);
+        Ok(Some(nested_expr))
+    }
+
     fn bind_identifier(&mut self, expr: &mut ast::Expr, scope: &BindScope) -> Result<()> {
         match expr {
             ast::Expr::Id(id) => {
@@ -1845,7 +2267,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     let table_exists = scope.find_table_by_identifier(tbl.as_str()).is_some()
                         || self.ctes.contains_key(&tbl_normalized)
                         || self
-                            .outer_scopes_iter()
+                            .all_outer_scopes_iter()
                             .any(|s| s.find_table_by_identifier(tbl.as_str()).is_some());
                     if table_exists {
                         crate::bail_parse_error!(
@@ -1853,9 +2275,25 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                             tbl.as_str(),
                             col.as_str()
                         );
-                    } else {
-                        crate::bail_parse_error!("no such table: {}", tbl.as_str());
                     }
+                    // Dot-notation fallback for struct/union field access:
+                    // for `a.b`, if no table `a` exists anywhere, try
+                    // a=column, b=struct field (table references win).
+                    let field_name = normalize_ident(col.as_str());
+                    if let Some((table_id, col_idx, is_rowid_alias, td)) =
+                        self.find_custom_type_column_in_scope(scope, &tbl_normalized)?
+                    {
+                        *expr = super::expr::make_field_access_expr(
+                            table_id,
+                            col_idx,
+                            is_rowid_alias,
+                            &field_name,
+                            td,
+                        );
+                        self.tracking.record_column(table_id, col_idx);
+                        return Ok(());
+                    }
+                    crate::bail_parse_error!("no such table: {}", tbl_normalized);
                 }
             }
             ast::Expr::DoublyQualified(db_name, tbl_name, col_name) => {
@@ -1894,35 +2332,96 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     return Ok(());
                 }
 
-                let database_id = self.resolver.resolve_database_id(&qname)?;
-
-                let Some(resolved) =
-                    self.resolve_qualified_column(tbl_name.as_str(), col_name.as_str(), scope)?
-                else {
-                    crate::bail_parse_error!(
-                        "no such column: {}.{}.{}",
-                        db_name.as_str(),
-                        tbl_name.as_str(),
-                        col_name.as_str()
-                    );
-                };
-
-                match resolved {
-                    ast::Expr::Column {
-                        table,
-                        column,
-                        is_rowid_alias,
-                        ..
-                    } => {
-                        *expr = ast::Expr::Column {
-                            database: Some(database_id),
-                            table,
-                            column,
-                            is_rowid_alias,
-                        };
+                // `a.b.c` resolution order (DuckDB-style precedence, mirrors
+                // bind_and_rewrite_expr):
+                //   1. a=database, b=table,  c=column
+                //   2. a=table,    b=column, c=struct/union field
+                //   3. a=column,   b=field,  c=sub-field
+                let db_resolution = self.resolver.resolve_database_id(&qname);
+                if let Ok(database_id) = db_resolution {
+                    if let Some(resolved) =
+                        self.resolve_qualified_column(tbl_name.as_str(), col_name.as_str(), scope)?
+                    {
+                        match resolved {
+                            ast::Expr::Column {
+                                table,
+                                column,
+                                is_rowid_alias,
+                                ..
+                            } => {
+                                *expr = ast::Expr::Column {
+                                    database: Some(database_id),
+                                    table,
+                                    column,
+                                    is_rowid_alias,
+                                };
+                            }
+                            other => *expr = other,
+                        }
+                        return Ok(());
                     }
-                    other => *expr = other,
                 }
+
+                // db.table.column failed — try table.column.field for
+                // struct/union access.
+                let normalized_tbl_name = normalize_ident(db_name.as_str());
+                let normalized_col = normalize_ident(tbl_name.as_str());
+                let field_name = normalize_ident(col_name.as_str());
+                if let Some(st) = scope.find_table_by_identifier(&normalized_tbl_name) {
+                    if let ScopeTableSource::Table(table) = &st.source {
+                        let cols = table.columns();
+                        if let Some(col_idx) = cols.iter().position(|c| {
+                            c.name
+                                .as_ref()
+                                .is_some_and(|n| n.eq_ignore_ascii_case(&normalized_col))
+                        }) {
+                            let col = &cols[col_idx];
+                            let type_def =
+                                self.resolver.schema().get_type_def_unchecked(&col.ty_str);
+                            let is_struct_or_union = type_def
+                                .map(|td| td.is_struct() || td.is_union())
+                                .unwrap_or(false);
+                            if is_struct_or_union {
+                                let internal_id = st.internal_id;
+                                let is_rowid_alias = col.is_rowid_alias();
+                                *expr = super::expr::make_field_access_expr(
+                                    internal_id,
+                                    col_idx,
+                                    is_rowid_alias,
+                                    &field_name,
+                                    type_def.unwrap(),
+                                );
+                                self.tracking.record_column(internal_id, col_idx);
+                                return Ok(());
+                            } else {
+                                // Column exists but is not a struct/union type
+                                return Err(crate::LimboError::ParseError(format!(
+                                    "column '{normalized_col}' is not a STRUCT or UNION type; \
+                                     cannot access field '{field_name}'"
+                                )));
+                            }
+                        }
+                    }
+                }
+
+                // Fallback (3): column.field.subfield for nested struct/union
+                // access (e.g. data.telegram.chat_id).
+                if let Some(nested_expr) = self.try_resolve_nested_field_access_in_scope(
+                    scope,
+                    &normalized_tbl_name,
+                    &normalized_col,
+                    &field_name,
+                )? {
+                    *expr = nested_expr;
+                    return Ok(());
+                }
+
+                crate::bail_parse_error!(
+                    "no such column: {}.{}.{}",
+                    db_name.as_str(),
+                    tbl_name.as_str(),
+                    col_name.as_str()
+                );
             }
             _ => unreachable!("bind_identifier only handles identifier nodes"),
         }
@@ -1942,6 +2441,42 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         result
     }
 
+    /// Populate `shared_subqueries` with scalar subqueries that appear in both
+    /// GROUP BY and the SELECT list (compared on the raw, pre-bind AST).
+    fn collect_shared_subqueries(
+        &mut self,
+        columns: &[ast::ResultColumn],
+        group_by: Option<&ast::GroupBy>,
+    ) {
+        self.shared_subqueries.clear();
+        let Some(group_by) = group_by else {
+            return;
+        };
+        let mut in_group_by: Vec<ast::Expr> = Vec::new();
+        for expr in &group_by.exprs {
+            let _ = walk_expr(expr, &mut |e: &ast::Expr| {
+                if matches!(e, ast::Expr::Subquery(_)) {
+                    in_group_by.push(e.clone());
+                }
+                Ok(WalkControl::Continue)
+            });
+        }
+        if in_group_by.is_empty() {
+            return;
+        }
+        for col in columns {
+            let ast::ResultColumn::Expr(expr, _) = col else {
+                continue;
+            };
+            let _ = walk_expr(expr.as_ref(), &mut |e: &ast::Expr| {
+                if matches!(e, ast::Expr::Subquery(_)) && in_group_by.contains(e) {
+                    self.shared_subqueries.push((e.clone(), None));
+                }
+                Ok(WalkControl::Continue)
+            });
+        }
+    }
+
     /// Bind an expression, resolving column references against the given scope.
     fn bind_expr(&mut self, expr: &mut ast::Expr, scope: &BindScope) -> Result<()> {
         walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
@@ -1952,24 +2487,44 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     start,
                     end,
                 } => {
-                    let (lower_op, upper_op) = if *not {
-                        (ast::Operator::Greater, ast::Operator::Greater)
-                    } else {
-                        (ast::Operator::LessEquals, ast::Operator::LessEquals)
-                    };
-                    let start = take_expr(start);
+                    // Rewrite BETWEEN with the tested expression on the LHS of
+                    // both comparisons (mirrors rewrite_between_exprs): SQLite
+                    // collation precedence uses the left operand's collation,
+                    // and `x BETWEEN a AND b` must use x's collation.
                     let lhs_v = take_expr(lhs);
+                    let start = take_expr(start);
                     let end = take_expr(end);
 
-                    let lower =
-                        ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs_v.clone()));
-                    let upper = ast::Expr::Binary(Box::new(lhs_v), upper_op, Box::new(end));
-
-                    *expr = if *not {
-                        ast::Expr::Binary(Box::new(lower), ast::Operator::Or, Box::new(upper))
+                    let (lower, upper, combine_op) = if *not {
+                        (
+                            ast::Expr::Binary(
+                                Box::new(lhs_v.clone()),
+                                ast::Operator::Less,
+                                Box::new(start),
+                            ),
+                            ast::Expr::Binary(
+                                Box::new(lhs_v),
+                                ast::Operator::Greater,
+                                Box::new(end),
+                            ),
+                            ast::Operator::Or,
+                        )
                     } else {
-                        ast::Expr::Binary(Box::new(lower), ast::Operator::And, Box::new(upper))
+                        (
+                            ast::Expr::Binary(
+                                Box::new(lhs_v.clone()),
+                                ast::Operator::GreaterEquals,
+                                Box::new(start),
+                            ),
+                            ast::Expr::Binary(
+                                Box::new(lhs_v),
+                                ast::Operator::LessEquals,
+                                Box::new(end),
+                            ),
+                            ast::Operator::And,
+                        )
                     };
+                    *expr = ast::Expr::Binary(Box::new(lower), combine_op, Box::new(upper));
                 }
                 ast::Expr::Id(_)
                 | ast::Expr::Qualified(_, _)
@@ -2000,7 +2555,36 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     return Ok(WalkControl::SkipChildren);
                 }
                 ast::Expr::Subquery(_) => {
+                    // Scalar-subquery CSE: an occurrence shared between GROUP BY
+                    // and the SELECT list reuses the first occurrence's id so
+                    // both point at a single evaluation.
+                    let shared_slot = self
+                        .shared_subqueries
+                        .iter()
+                        .position(|(raw, _)| raw == expr);
+                    if let Some(slot) = shared_slot {
+                        if let (_, Some(existing_id)) = self.shared_subqueries[slot] {
+                            let num_regs = self
+                                .subquery_bindings
+                                .get(&existing_id)
+                                .map(|b| b.inner_bound.result_columns.len())
+                                .unwrap_or(0);
+                            *expr = ast::Expr::SubqueryResult {
+                                subquery_id: existing_id,
+                                lhs: None,
+                                not_in: false,
+                                query_type: ast::SubqueryType::RowValue {
+                                    result_reg_start: 0,
+                                    num_regs,
+                                },
+                            };
+                            return Ok(WalkControl::SkipChildren);
+                        }
+                    }
                     let subquery_id = self.id_gen.next_table_id();
+                    if let Some(slot) = shared_slot {
+                        self.shared_subqueries[slot].1 = Some(subquery_id);
+                    }
                     let ast::Expr::Subquery(mut select) =
                         std::mem::replace(expr, ast::Expr::Literal(ast::Literal::Null))
                     else {
@@ -2060,6 +2644,16 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     };
                     return Ok(WalkControl::SkipChildren);
                 }
+                // Validate struct/union/array function calls at bind time
+                // (arity and literal-argument checks), mirroring
+                // bind_and_rewrite_expr.
+                ast::Expr::FunctionCall { name, args, .. } => {
+                    super::expr::validate_custom_type_function_call(
+                        name.as_str(),
+                        args,
+                        self.resolver,
+                    )?;
+                }
                 ast::Expr::FunctionCallStar { name, filter_over } => {
                     if let Ok(Some(func)) = Func::resolve_function(name.as_str(), 0) {
                         if func.needs_star_expansion() && !scope.tables.is_empty() {
@@ -2108,7 +2702,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         let mut tables: Vec<ScopeTable> = Vec::new();
         let mut right_join_swapped = false;
 
-        tables.push(self.resolve_select_table(&mut from.select, None)?);
+        tables.push(self.resolve_select_table(&mut from.select, None, 0)?);
         for join in &mut from.joins {
             // Build a temporary scope from tables accumulated so far, so that
             // table function arguments can reference previously-joined tables.
@@ -2116,19 +2710,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 tables: tables.clone(),
                 right_join_swapped: false,
             };
-            let mut st = self.resolve_select_table(&mut join.table, Some(&lateral_scope))?;
+            let mut st =
+                self.resolve_select_table(&mut join.table, Some(&lateral_scope), tables.len())?;
 
-            // Detect duplicate table identifiers (e.g. SELECT * FROM t JOIN t).
-            // SQLite requires aliases to disambiguate self-joins.
-            // Only check real tables — derived tables / subqueries may share
-            // synthetic identifiers like "subquery".
-            if matches!(st.source, ScopeTableSource::Table(_))
-                && tables.iter().any(|t| {
-                    matches!(t.source, ScopeTableSource::Table(_)) && t.identifier == st.identifier
-                })
-            {
-                crate::bail_parse_error!("ambiguous table reference: {}", st.identifier);
-            }
+            // SQLite allows duplicate table names/aliases in FROM clauses.
+            // Ambiguity is detected later during column resolution.
 
             let (is_outer, is_full_outer, is_right, is_cross, is_natural) = match &join.operator {
                 ast::JoinOperator::TypedJoin(Some(jt)) => {
@@ -2152,40 +2738,41 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             // NATURAL JOIN: find common columns and rewrite constraint to USING
             if is_natural {
                 if join.constraint.is_some() {
-                    crate::bail_parse_error!(
-                        "NATURAL JOIN cannot be combined with ON or USING clause"
-                    );
+                    crate::bail_parse_error!("a NATURAL join may not have an ON or USING clause");
                 }
+                // SQLite doesn't use HIDDEN columns for NATURAL joins:
+                // https://www3.sqlite.org/src/info/ab09ef427181130b
+                // The USING list uses the left table's column name spelling,
+                // matching parse_join. No common columns = cross join.
                 let right_table: &dyn BindTable = st.table.as_ref();
                 let mut common_cols: Vec<ast::Name> = Vec::new();
                 for right_col in right_table.columns() {
                     if right_col.is_hidden {
                         continue;
                     }
-                    let mut found = false;
+                    let mut found: Option<String> = None;
                     for left_st in &tables {
                         let left_table: &dyn BindTable = left_st.table.as_ref();
                         for left_col in left_table.columns() {
                             if left_col.is_hidden {
                                 continue;
                             }
-                            if left_col.name == right_col.name {
-                                found = true;
+                            if left_col.name.eq_ignore_ascii_case(right_col.name) {
+                                found = Some(left_col.name.to_string());
                                 break;
                             }
                         }
-                        if found {
+                        if found.is_some() {
                             break;
                         }
                     }
-                    if found {
-                        common_cols.push(ast::Name::exact(right_col.name.to_string()));
+                    if let Some(left_name) = found {
+                        common_cols.push(ast::Name::exact(left_name));
                     }
                 }
-                if common_cols.is_empty() {
-                    crate::bail_parse_error!("No columns found to NATURAL join on");
+                if !common_cols.is_empty() {
+                    join.constraint = Some(JoinConstraint::Using(common_cols));
                 }
-                join.constraint = Some(JoinConstraint::Using(common_cols));
             }
 
             // Determine USING columns from (possibly rewritten) constraint
@@ -2244,22 +2831,9 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 Some(JoinConstraint::On(expr)) => {
                     self.bind_expr(expr, &scope)?;
                 }
-                Some(JoinConstraint::Using(cols)) => {
-                    // Record USING columns as used so they get marked in TableReferences
-                    for col_name in cols.iter() {
-                        let name = normalize_ident(col_name.as_str());
-                        for st in &scope.tables {
-                            let bt: &dyn BindTable = st.table.as_ref();
-                            for col_ref in bt.columns() {
-                                if col_ref.name == name {
-                                    self.tracking.record_column(st.internal_id, col_ref.idx);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                None => {}
+                // USING column usage is marked by fold_join_constraints when
+                // the equality predicates are synthesized, matching parse_join.
+                Some(JoinConstraint::Using(_)) | None => {}
             }
         }
 
@@ -2371,6 +2945,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
         // Check CTEs first
         if let Some(cte) = self.ctes.get(&normalized) {
+            validate_cte_explicit_columns(&normalized, cte)?;
             let cte_table = Arc::new(CteTable {
                 columns: cte.resolved_columns.clone(),
             });
@@ -2532,7 +3107,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         }
 
         // Expand Star/TableStar in RETURNING
-        self.expand_stars(returning, scope);
+        self.expand_stars(returning, scope)?;
 
         let mut result = Vec::with_capacity(returning.len());
         for rc in returning.iter_mut() {
@@ -3170,18 +3745,14 @@ mod tests {
     }
 
     #[test]
-    fn group_by_prefers_alias_over_source_column() {
-        // SQLite uses AliasFirst for GROUP BY — alias `b` (= a+1) wins over column `t.b`
+    fn group_by_prefers_source_column_over_alias() {
+        // In GROUP BY, real columns take precedence over SELECT aliases
+        // (matches SQLite): `b` resolves to column t.b, not alias (a + 1).
         with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
             let mut select = parse_select("SELECT a + 1 AS b FROM t GROUP BY b");
             ctx.bind_select(&mut select).unwrap();
 
-            // GROUP BY resolves to the alias expression (a + 1), not column t.b
-            let expr = group_by_expr(&select, 0);
-            assert!(
-                matches!(expr, ast::Expr::Binary(_, ast::Operator::Add, _)),
-                "expected alias expression (a + 1), got {expr:?}"
-            );
+            assert_column_expr(group_by_expr(&select, 0), 0, 1);
         });
     }
 
@@ -3393,8 +3964,17 @@ mod tests {
             );
 
             assert_eq!(select_expr(&select, 0), &alias_expr);
-            // GROUP BY uses AliasFirst — resolves to alias expression (a + 1), not column cte.b
-            assert_eq!(group_by_expr(&select, 0), &alias_expr);
+            // GROUP BY prefers real columns over aliases (matches SQLite):
+            // `b` resolves to column cte.b, not the alias expression (a + 1).
+            assert_eq!(
+                group_by_expr(&select, 0),
+                &ast::Expr::Column {
+                    database: None,
+                    table: TableInternalId::from(2usize),
+                    column: 1,
+                    is_rowid_alias: false,
+                }
+            );
 
             let ast::Expr::Binary(lhs, ast::Operator::Greater, rhs) = having_expr(&select) else {
                 panic!("expected bound HAVING binary expression");
@@ -3494,18 +4074,14 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_compat_group_by_prefers_alias_over_source_column() {
-        // SQLite uses AliasFirst for GROUP BY — explicit alias `b` (= -a) wins over column `t.b`
+    fn sqlite_compat_group_by_prefers_source_column_over_alias() {
+        // In GROUP BY, real columns take precedence over SELECT aliases
+        // (matches SQLite): `b` resolves to column t.b, not alias (-a).
         with_bind_context(&["CREATE TABLE t(a, b)"], |ctx| {
             let mut select = parse_select("SELECT -a AS b, COUNT(*) FROM t GROUP BY b ORDER BY 1");
             ctx.bind_select(&mut select).unwrap();
 
-            // GROUP BY resolves to the alias expression (-a), not column t.b
-            let expr = group_by_expr(&select, 0);
-            assert!(
-                matches!(expr, ast::Expr::Unary(ast::UnaryOperator::Negative, _)),
-                "expected alias expression (-a), got {expr:?}"
-            );
+            assert_column_expr(group_by_expr(&select, 0), 0, 1);
         });
     }
 
@@ -3650,7 +4226,7 @@ mod tests {
         with_bind_context(&["CREATE TABLE t(a)"], |ctx| {
             let err = bind_select_error(ctx, "SELECT a FROM t ORDER BY 0").to_string();
             assert!(
-                err.contains("invalid column index: 0"),
+                err.contains("1st ORDER BY term out of range - should be between 1 and 1"),
                 "unexpected error: {err}"
             );
         });
@@ -3661,7 +4237,7 @@ mod tests {
         with_bind_context(&["CREATE TABLE t(a)"], |ctx| {
             let err = bind_select_error(ctx, "SELECT a FROM t ORDER BY 5").to_string();
             assert!(
-                err.contains("invalid column index: 5"),
+                err.contains("1st ORDER BY term out of range - should be between 1 and 1"),
                 "unexpected error: {err}"
             );
         });
@@ -4011,13 +4587,14 @@ mod tests {
     }
 
     #[test]
-    fn natural_join_no_common_columns_errors() {
+    fn natural_join_no_common_columns_is_cross_join() {
+        // Matches SQLite: a NATURAL JOIN with no common columns degrades to a
+        // cross join instead of erroring.
         with_bind_context(&["CREATE TABLE t(a)", "CREATE TABLE u(b)"], |ctx| {
-            let err = bind_select_error(ctx, "SELECT * FROM t NATURAL JOIN u").to_string();
-            assert!(
-                err.contains("No columns found to NATURAL join on"),
-                "unexpected error: {err}"
-            );
+            let mut select = parse_select("SELECT * FROM t NATURAL JOIN u");
+            ctx.bind_select(&mut select).unwrap();
+            let cols = select_columns(&select);
+            assert_eq!(cols.len(), 2); // t.a, u.b — no dedup, no constraint
         });
     }
 
@@ -4027,7 +4604,7 @@ mod tests {
             let err =
                 bind_select_error(ctx, "SELECT * FROM t NATURAL JOIN u ON t.b = u.b").to_string();
             assert!(
-                err.contains("NATURAL JOIN cannot be combined with ON or USING clause"),
+                err.contains("a NATURAL join may not have an ON or USING clause"),
                 "unexpected error: {err}"
             );
         });
@@ -4049,24 +4626,31 @@ mod tests {
     }
 
     #[test]
-    fn natural_join_tracks_using_columns_as_used() {
+    fn natural_join_rewrites_constraint_to_using() {
         with_bind_context(&["CREATE TABLE t(a, b)", "CREATE TABLE u(b, c)"], |ctx| {
             let mut select = parse_select("SELECT a FROM t NATURAL JOIN u");
             let bound = ctx.bind_select(&mut select).unwrap();
 
-            // Column b should be tracked as used in both tables (for USING equality)
+            // SELECT-list usage is tracked by the binder.
             assert!(bound
                 .tracking
                 .columns_used
                 .contains(&(TableInternalId::from(0usize), 0))); // t.a from SELECT
-            assert!(bound
-                .tracking
-                .columns_used
-                .contains(&(TableInternalId::from(0usize), 1))); // t.b from USING
-            assert!(bound
-                .tracking
-                .columns_used
-                .contains(&(TableInternalId::from(1usize), 0))); // u.b from USING
+
+            // The NATURAL constraint is rewritten to USING(b); the equality
+            // predicate synthesis (and its column-usage marking) happens later
+            // in fold_join_constraints, mirroring parse_join.
+            let ast::OneSelect::Select { from, .. } = &select.body.select else {
+                panic!("expected SELECT core");
+            };
+            let from = from.as_ref().expect("expected FROM clause");
+            match &from.joins[0].constraint {
+                Some(ast::JoinConstraint::Using(cols)) => {
+                    assert_eq!(cols.len(), 1);
+                    assert!(cols[0].as_str().eq_ignore_ascii_case("b"));
+                }
+                other => panic!("expected USING constraint, got {other:?}"),
+            }
         });
     }
 

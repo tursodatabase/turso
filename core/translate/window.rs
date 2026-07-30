@@ -99,6 +99,10 @@ pub fn plan_windows(
     resolver: &Resolver,
     connection: &Arc<Connection>,
     windows: &mut Vec<Window>,
+    bound_subqueries: &mut rustc_hash::FxHashMap<
+        turso_parser::ast::TableInternalId,
+        crate::translate::bind::BoundSubquery,
+    >,
 ) -> crate::Result<()> {
     // Remove named windows that are not referenced by any function, as they can be ignored.
     windows.retain(|w| !w.functions.is_empty());
@@ -111,7 +115,15 @@ pub fn plan_windows(
         );
     }
 
-    prepare_window_subquery(program, plan, resolver, connection, windows, 0)
+    prepare_window_subquery(
+        program,
+        plan,
+        resolver,
+        connection,
+        windows,
+        0,
+        bound_subqueries,
+    )
 }
 
 fn prepare_window_subquery(
@@ -121,13 +133,23 @@ fn prepare_window_subquery(
     connection: &Arc<Connection>,
     windows: &mut Vec<Window>,
     processed_window_count: usize,
+    bound_subqueries: &mut rustc_hash::FxHashMap<
+        turso_parser::ast::TableInternalId,
+        crate::translate::bind::BoundSubquery,
+    >,
 ) -> crate::Result<()> {
     if windows.is_empty() {
         // The innermost plan holds the original FROM/WHERE/GROUP BY plus any
         // raw subquery expressions pushed down from outer window layers.
         // Plan them now so they become SubqueryResult nodes with entries in
         // non_from_clause_subqueries.
-        plan_subqueries_from_select_plan(program, outer_plan, resolver, connection)?;
+        plan_subqueries_from_select_plan(
+            program,
+            outer_plan,
+            resolver,
+            connection,
+            bound_subqueries,
+        )?;
         return Ok(());
     }
 
@@ -249,6 +271,7 @@ fn prepare_window_subquery(
         connection,
         windows,
         processed_window_count + 1,
+        bound_subqueries,
     )?;
 
     let subquery = JoinedTable::new_subquery(

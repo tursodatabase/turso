@@ -88,6 +88,7 @@ pub(crate) use arrays::{
 };
 pub(crate) use binary::expr_is_array;
 pub use binding::{bind_and_rewrite_expr, BindingBehavior};
+pub(crate) use binding::{make_field_access_expr, validate_custom_type_function_call};
 pub use columns::{emit_table_column, emit_table_column_for_dml};
 pub use condition::translate_condition_expr;
 pub(crate) use custom_types::{

@@ -857,7 +857,7 @@ pub(super) fn find_custom_type_column<'a>(
 
 /// Build an `Expr::FieldAccess { base: Expr::Column { ... }, field, resolved }` node,
 /// pre-resolving the field index via `resolve_field_access`.
-pub(super) fn make_field_access_expr(
+pub(crate) fn make_field_access_expr(
     table_id: TableInternalId,
     col_idx: usize,
     is_rowid_alias: bool,
@@ -1014,7 +1014,7 @@ pub(super) fn resolve_expr_output_type<'a>(
 /// (for arity and literal checks). Catching errors here avoids wasting
 /// optimizer and translation cycles on invalid queries, and keeps the
 /// translate_expr match arms focused purely on register allocation and codegen.
-pub(super) fn validate_custom_type_function_call(
+pub(crate) fn validate_custom_type_function_call(
     name: &str,
     args: &[Box<ast::Expr>],
     resolver: &Resolver<'_>,

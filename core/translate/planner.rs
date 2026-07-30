@@ -1679,6 +1679,519 @@ pub fn parse_where(
     }
 }
 
+// ── Bound planning: consume the output of the binding phase ──────────────
+//
+// These functions are the planner-side counterpart of [super::bind::BindContext].
+// The binder resolves all names and produces `Bound*` structures; the functions
+// below turn pre-bound CTE definitions and derived tables into planned
+// `JoinedTable`s, and fold already-bound JOIN constraints / vtab arguments into
+// WHERE terms. They perform no name resolution themselves.
+
+/// Plan all CTE definitions produced by the binder, in definition order.
+///
+/// Explicit column-count validation is deferred until the CTE is actually
+/// referenced (matching SQLite, where unreferenced CTEs with mismatched
+/// column counts don't error) — see [plan_one_bound_cte].
+pub fn plan_bound_ctes(
+    mut cte_definitions: Vec<(String, super::bind::CteEntry)>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<rustc_hash::FxHashMap<String, JoinedTable>> {
+    let mut planned: rustc_hash::FxHashMap<String, JoinedTable> = Default::default();
+    for idx in 0..cte_definitions.len() {
+        if !planned.contains_key(&cte_definitions[idx].0) {
+            plan_one_bound_cte(
+                idx,
+                &mut cte_definitions,
+                resolver,
+                program,
+                connection,
+                &mut planned,
+            )?;
+        }
+    }
+    Ok(planned)
+}
+
+/// Plan derived tables (FROM-clause subqueries) from binder-provided bindings.
+///
+/// Each derived table's inner select is already bound. This function plans them
+/// and returns a map of `internal_id` → `JoinedTable` for use in
+/// [super::bind::BoundSelect::into_table_references].
+pub fn plan_derived_tables(
+    derived_bindings: rustc_hash::FxHashMap<TableInternalId, super::bind::BoundSubquery>,
+    planned_ctes: &mut rustc_hash::FxHashMap<String, JoinedTable>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<rustc_hash::FxHashMap<TableInternalId, JoinedTable>> {
+    plan_derived_tables_with_outer_refs(
+        derived_bindings,
+        planned_ctes,
+        resolver,
+        program,
+        connection,
+        Vec::new(),
+    )
+}
+
+pub fn plan_derived_tables_with_outer_refs(
+    derived_bindings: rustc_hash::FxHashMap<TableInternalId, super::bind::BoundSubquery>,
+    planned_ctes: &mut rustc_hash::FxHashMap<String, JoinedTable>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+    outer_query_refs: Vec<OuterQueryReference>,
+) -> Result<rustc_hash::FxHashMap<TableInternalId, JoinedTable>> {
+    let mut planned: rustc_hash::FxHashMap<TableInternalId, JoinedTable> = Default::default();
+
+    for (internal_id, bound_sq) in derived_bindings {
+        let mut inner_bound = bound_sq.inner_bound;
+
+        // Extract nested CTE definitions and subquery bindings.
+        let inner_cte_defs = std::mem::take(&mut inner_bound.cte_definitions);
+        let inner_subquery_bindings = std::mem::take(&mut inner_bound.subquery_bindings);
+        let inner_derived_bindings = std::mem::take(&mut inner_bound.derived_bindings);
+
+        // Plan any inner CTEs.
+        let mut inner_planned_ctes =
+            plan_bound_ctes(inner_cte_defs, resolver, program, connection)?;
+
+        // Make parent CTEs available for inner references.
+        for (name, jt) in planned_ctes.iter() {
+            if !inner_planned_ctes.contains_key(name) {
+                inner_planned_ctes.insert(name.clone(), jt.clone());
+            }
+        }
+
+        // Plan any nested derived tables.
+        let mut inner_planned_derived = plan_derived_tables_with_outer_refs(
+            inner_derived_bindings,
+            &mut inner_planned_ctes,
+            resolver,
+            program,
+            connection,
+            outer_query_refs.clone(),
+        )?;
+
+        let all_table_refs = inner_bound.into_table_references_with_outer_refs(
+            &mut inner_planned_ctes,
+            &mut inner_planned_derived,
+            outer_query_refs.clone(),
+        )?;
+
+        let subplan = prepare_select_plan(
+            bound_sq.select,
+            resolver,
+            program,
+            crate::translate::select::SelectBinding::Bound {
+                table_refs: all_table_refs.into_iter(),
+                bound_subqueries: inner_subquery_bindings,
+            },
+            QueryDestination::placeholder_for_subquery(),
+            connection,
+        )?;
+
+        match &subplan {
+            Plan::Select(_) | Plan::CompoundSelect { .. } => {}
+            Plan::Delete(_) | Plan::Update(_) => {
+                crate::bail_parse_error!(
+                    "DELETE/UPDATE queries are not supported in FROM clause subqueries"
+                );
+            }
+        }
+
+        let jt = JoinedTable::new_subquery_from_plan(
+            String::new(), // identifier set later by scope_to_table_references
+            subplan,
+            None, // join_info set later
+            internal_id,
+            None,  // no explicit columns
+            None,  // not a CTE
+            false, // no materialize hint
+        )?;
+        planned.insert(internal_id, jt);
+    }
+
+    Ok(planned)
+}
+
+/// Plan a single CTE using its pre-bound data from the binder.
+///
+/// The binder already resolved all names and column references in the CTE body.
+/// This function takes the pre-bound `inner_bound` and converts it into a plan
+/// without re-binding. Referenced sibling CTEs are planned recursively first
+/// to avoid exponential blowup on transitive dependencies.
+fn plan_one_bound_cte(
+    cte_idx: usize,
+    cte_definitions: &mut [(String, super::bind::CteEntry)],
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+    planned: &mut rustc_hash::FxHashMap<String, JoinedTable>,
+) -> Result<JoinedTable> {
+    // Copy metadata needed before mutably borrowing the entry.
+    let name = cte_definitions[cte_idx].0.clone();
+    let referenced_indices = cte_definitions[cte_idx].1.referenced_cte_indices.clone();
+
+    // Recursively plan referenced sibling CTEs first.
+    for &ref_idx in &referenced_indices {
+        if !planned.contains_key(&cte_definitions[ref_idx].0) {
+            plan_one_bound_cte(
+                ref_idx,
+                cte_definitions,
+                resolver,
+                program,
+                connection,
+                planned,
+            )?;
+        }
+    }
+
+    let entry = &mut cte_definitions[cte_idx].1;
+
+    // Take the pre-bound data produced by the binder.
+    let mut inner_bound = entry
+        .inner_bound
+        .take()
+        .expect("CTE inner binding should be present");
+    let cte_select = entry.select.clone();
+
+    // Extract nested CTE definitions, subquery bindings, and derived bindings.
+    let inner_cte_defs = std::mem::take(&mut inner_bound.cte_definitions);
+    let inner_subquery_bindings = std::mem::take(&mut inner_bound.subquery_bindings);
+    let inner_derived_bindings = std::mem::take(&mut inner_bound.derived_bindings);
+
+    // Block circular references during planning.
+    program.push_cte_being_defined(name.clone());
+
+    let plan_result = (|| -> Result<Plan> {
+        // Plan any nested CTEs from inner WITH clauses.
+        let mut inner_planned = plan_bound_ctes(inner_cte_defs, resolver, program, connection)?;
+
+        // Make all already-planned sibling CTEs available. CTEs can be
+        // referenced not only from the FROM clause (tracked by
+        // referenced_cte_indices) but also from correlated subqueries within
+        // the CTE body.
+        for (ref_name, ref_table) in planned.iter() {
+            if !inner_planned.contains_key(ref_name) {
+                inner_planned.insert(ref_name.clone(), ref_table.clone());
+            }
+        }
+
+        // Plan any derived tables (FROM subqueries).
+        let mut inner_planned_derived = plan_derived_tables(
+            inner_derived_bindings,
+            &mut inner_planned,
+            resolver,
+            program,
+            connection,
+        )?;
+
+        let mut all_table_refs =
+            inner_bound.into_table_references(&mut inner_planned, &mut inner_planned_derived)?;
+
+        // Add sibling CTEs as outer query refs so correlated subqueries within
+        // this CTE body can reference them.
+        for tr in &mut all_table_refs {
+            for (ref_name, ref_table) in planned.iter() {
+                if !tr
+                    .outer_query_refs()
+                    .iter()
+                    .any(|r| r.identifier == *ref_name)
+                {
+                    tr.add_outer_query_reference(OuterQueryReference {
+                        identifier: ref_name.clone(),
+                        internal_id: ref_table.internal_id,
+                        table: ref_table.table.clone(),
+                        using_dedup_hidden_cols: ColumnMask::default(),
+                        col_used_mask: ColumnUsedMask::default(),
+                        cte_select: None,
+                        cte_explicit_columns: vec![],
+                        cte_id: None,
+                        cte_definition_only: true,
+                        rowid_referenced: false,
+                        scope_depth: 0,
+                    });
+                }
+            }
+        }
+
+        prepare_select_plan(
+            cte_select,
+            resolver,
+            program,
+            crate::translate::select::SelectBinding::Bound {
+                table_refs: all_table_refs.into_iter(),
+                bound_subqueries: inner_subquery_bindings,
+            },
+            QueryDestination::placeholder_for_subquery(),
+            connection,
+        )
+    })();
+    program.pop_cte_being_defined();
+    let cte_plan = plan_result?;
+
+    let entry = &cte_definitions[cte_idx].1;
+    let explicit_cols = if entry.explicit_columns.is_empty() {
+        None
+    } else {
+        // SQLite defers explicit column-count validation until the CTE is
+        // actually referenced; scope_to_table_references performs the check.
+        Some(entry.explicit_columns.as_slice())
+    };
+
+    let cte_table = match cte_plan {
+        Plan::Select(_) | Plan::CompoundSelect { .. } => JoinedTable::new_subquery_from_plan(
+            name.clone(),
+            cte_plan,
+            None,
+            program.table_reference_counter.next(),
+            explicit_cols,
+            Some(entry.cte_id),
+            entry.materialize_hint,
+        )?,
+        Plan::Delete(_) | Plan::Update(_) => {
+            crate::bail_parse_error!("DELETE/UPDATE queries are not supported in CTEs")
+        }
+    };
+
+    planned.insert(name, cte_table.clone());
+    Ok(cte_table)
+}
+
+/// Break a pre-bound WHERE clause into [WhereTerm]s.
+///
+/// Bound-path counterpart of [parse_where]: the binder already resolved all
+/// identifiers (and rewrote BETWEEN into AND-connected comparisons), so this
+/// only needs to split at AND boundaries.
+pub fn parse_where_bound(
+    where_clause: Option<&Expr>,
+    out_where_clause: &mut Vec<WhereTerm>,
+) -> Result<()> {
+    if let Some(where_expr) = where_clause {
+        break_predicate_at_and_boundaries(where_expr, out_where_clause);
+    }
+    Ok(())
+}
+
+/// Fold pre-bound JOIN ON/USING constraints into [WhereTerm]s.
+///
+/// Bound-path counterpart of the constraint handling in [parse_join]: table
+/// resolution is already done and ON expressions are bound to `Expr::Column`.
+/// NATURAL joins were already transformed to USING by the binder.
+pub fn fold_join_constraints(
+    from: &ast::FromClause,
+    table_references: &mut TableReferences,
+    out_where_clause: &mut Vec<WhereTerm>,
+) -> Result<()> {
+    for (join_idx, join) in from.joins.iter().enumerate() {
+        // The first table is from.select (index 0 in joined_tables),
+        // joins start at index 1.
+        let table_idx = join_idx + 1;
+        // For right_join_swapped, the binder swapped table positions so
+        // index 0 is the originally-right table (no join_info) and index 1
+        // is the originally-left table (with LeftOuter join_info).
+        // The ON/USING constraint should be tagged with the outer table's id.
+        let actual_table_idx = if table_references.right_join_swapped() && table_idx == 1 {
+            0
+        } else {
+            table_idx
+        };
+
+        let outer = table_references.joined_tables()[actual_table_idx]
+            .join_info
+            .as_ref()
+            .is_some_and(|j| j.is_outer());
+        let outer_table_id = table_references.joined_tables()[actual_table_idx].internal_id;
+
+        match &join.constraint {
+            Some(ast::JoinConstraint::On(expr)) => {
+                let start_idx = out_where_clause.len();
+                break_predicate_at_and_boundaries(expr, out_where_clause);
+                for predicate in out_where_clause[start_idx..].iter_mut() {
+                    predicate.from_outer_join = if outer { Some(outer_table_id) } else { None };
+                }
+            }
+            Some(ast::JoinConstraint::Using(cols)) => {
+                // USING join is replaced with a list of equality predicates.
+                let right_table_idx = actual_table_idx;
+                turso_assert!(right_table_idx > 0);
+
+                for col_name in cols.iter() {
+                    let name_normalized = normalize_ident(col_name.as_str());
+
+                    // Scope the immutable borrows so mark_column_used below can
+                    // borrow table_references mutably.
+                    let (
+                        left_table_idx,
+                        left_table_id,
+                        left_col_idx,
+                        left_is_rowid_alias,
+                        right_col_idx,
+                        right_is_rowid_alias,
+                        right_table_internal_id,
+                    ) = {
+                        let tables = table_references.joined_tables();
+                        let left_tables = &tables[..right_table_idx];
+                        let right_table = &tables[right_table_idx];
+
+                        // Find column in left tables
+                        let mut left_col = None;
+                        for (left_table_offset, left_table) in left_tables.iter().enumerate() {
+                            left_col = left_table
+                                .columns()
+                                .iter()
+                                .enumerate()
+                                .find(|(_, col)| {
+                                    col.name.as_deref().is_some_and(|name| {
+                                        name.eq_ignore_ascii_case(&name_normalized)
+                                    })
+                                })
+                                .map(|(idx, col)| {
+                                    (
+                                        left_table_offset,
+                                        left_table.internal_id,
+                                        idx,
+                                        col.is_rowid_alias(),
+                                    )
+                                });
+                            if left_col.is_some() {
+                                break;
+                            }
+                        }
+                        let Some((
+                            left_table_idx,
+                            left_table_id,
+                            left_col_idx,
+                            left_is_rowid_alias,
+                        )) = left_col
+                        else {
+                            crate::bail_parse_error!(
+                                "cannot join using column {} - column not present in both tables",
+                                col_name.as_str()
+                            );
+                        };
+
+                        // Find column in right table
+                        let right_col = right_table
+                            .columns()
+                            .iter()
+                            .enumerate()
+                            .find(|(_, col)| {
+                                col.name
+                                    .as_deref()
+                                    .is_some_and(|name| name.eq_ignore_ascii_case(&name_normalized))
+                            })
+                            .map(|(idx, col)| (idx, col.is_rowid_alias()));
+                        let Some((right_col_idx, right_is_rowid_alias)) = right_col else {
+                            crate::bail_parse_error!(
+                                "cannot join using column {} - column not present in both tables",
+                                col_name.as_str()
+                            );
+                        };
+
+                        (
+                            left_table_idx,
+                            left_table_id,
+                            left_col_idx,
+                            left_is_rowid_alias,
+                            right_col_idx,
+                            right_is_rowid_alias,
+                            right_table.internal_id,
+                        )
+                    };
+
+                    let expr = Expr::Binary(
+                        Box::new(Expr::Column {
+                            database: None,
+                            table: left_table_id,
+                            column: left_col_idx,
+                            is_rowid_alias: left_is_rowid_alias,
+                        }),
+                        ast::Operator::Equals,
+                        Box::new(Expr::Column {
+                            database: None,
+                            table: right_table_internal_id,
+                            column: right_col_idx,
+                            is_rowid_alias: right_is_rowid_alias,
+                        }),
+                    );
+
+                    let left_table: &mut JoinedTable = table_references
+                        .joined_tables_mut()
+                        .get_mut(left_table_idx)
+                        .unwrap();
+                    left_table.mark_column_used(left_col_idx);
+                    let right_table: &mut JoinedTable = table_references
+                        .joined_tables_mut()
+                        .get_mut(right_table_idx)
+                        .unwrap();
+                    right_table.mark_column_used(right_col_idx);
+
+                    out_where_clause.push(WhereTerm {
+                        expr,
+                        from_outer_join: if outer {
+                            Some(right_table_internal_id)
+                        } else {
+                            None
+                        },
+                        consumed: false,
+                    });
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+/// Walk the FROM clause AST and generate virtual-table argument predicates.
+///
+/// Bound-path counterpart of the vtab argument handling in [parse_table]:
+/// `TableReferences` already contains the resolved `JoinedTable`s. For each
+/// `TableCall` node we find the matching joined table by identifier and call
+/// [transform_args_into_where_terms].
+pub fn collect_vtab_predicates(
+    from: &ast::FromClause,
+    table_references: &TableReferences,
+    vtab_predicates: &mut Vec<Expr>,
+) -> Result<()> {
+    collect_vtab_predicates_for_table(&from.select, table_references, vtab_predicates)?;
+    for join in &from.joins {
+        collect_vtab_predicates_for_table(&join.table, table_references, vtab_predicates)?;
+    }
+    Ok(())
+}
+
+fn collect_vtab_predicates_for_table(
+    select_table: &ast::SelectTable,
+    table_references: &TableReferences,
+    vtab_predicates: &mut Vec<Expr>,
+) -> Result<()> {
+    if let ast::SelectTable::TableCall(qualified_name, args, maybe_alias) = select_table {
+        if args.is_empty() {
+            return Ok(());
+        }
+        let table_name = normalize_ident(qualified_name.name.as_str());
+        let identifier = maybe_alias
+            .as_ref()
+            .map(|a| normalize_ident(a.name().as_str()))
+            .unwrap_or(table_name);
+
+        // Find the matching JoinedTable by identifier
+        let joined_table = table_references
+            .joined_tables()
+            .iter()
+            .find(|jt| jt.identifier == identifier);
+        if let Some(jt) = joined_table {
+            transform_args_into_where_terms(args, jt.internal_id, vtab_predicates, &jt.table)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
     walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
         if let Expr::Between {
@@ -2190,15 +2703,20 @@ pub(crate) fn append_vtab_predicates_to_where_clause(
     result_columns: &[ResultSetColumn],
     out_where_clause: &mut Vec<WhereTerm>,
     resolver: &Resolver,
+    is_bound: bool,
 ) -> Result<()> {
     for mut expr in vtab_predicates.drain(..) {
-        bind_and_rewrite_expr(
-            &mut expr,
-            Some(table_references),
-            Some(result_columns),
-            resolver,
-            BindingBehavior::TryCanonicalColumnsFirst,
-        )?;
+        // In bound mode the argument expressions were already resolved by the
+        // binder when the TableCall arguments were bound.
+        if !is_bound {
+            bind_and_rewrite_expr(
+                &mut expr,
+                Some(table_references),
+                Some(result_columns),
+                resolver,
+                BindingBehavior::TryCanonicalColumnsFirst,
+            )?;
+        }
 
         // Virtual table argument predicates (e.g. the 't2' in pragma_table_info('t2'))
         // must be associated with the virtual table's outer join context if the table is

@@ -230,6 +230,7 @@ pub fn plan_subqueries_from_select_plan(
     plan: &mut SelectPlan,
     resolver: &Resolver,
     connection: &Arc<Connection>,
+    bound_subqueries: &mut HashMap<ast::TableInternalId, crate::translate::bind::BoundSubquery>,
 ) -> Result<()> {
     // Common-subexpression elimination for scalar subqueries shared by GROUP BY and the SELECT
     // list (e.g. `SELECT (subq) AS rs ... GROUP BY rs`, where the GROUP BY term is a copy of the
@@ -272,6 +273,7 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryPosition::Where.allow_correlated(),
             &mut cse_map,
             &[],
+            bound_subqueries,
         )?;
     }
 
@@ -291,6 +293,7 @@ pub fn plan_subqueries_from_select_plan(
                 SubqueryPosition::GroupBy.allow_correlated(),
                 &mut cse_map,
                 &shared_subqueries,
+                bound_subqueries,
             )?;
         }
         if let Some(having) = group_by.having.as_mut() {
@@ -307,6 +310,7 @@ pub fn plan_subqueries_from_select_plan(
                 !group_by.exprs.is_empty(),
                 &mut cse_map,
                 &[],
+                bound_subqueries,
             )?;
         }
     }
@@ -326,6 +330,7 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryPosition::ResultColumn.allow_correlated(),
             &mut cse_map,
             &shared_subqueries,
+            bound_subqueries,
         )?;
     }
 
@@ -344,6 +349,7 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryPosition::OrderBy.allow_correlated(),
             &mut cse_map,
             &[],
+            bound_subqueries,
         )?;
     }
 
@@ -362,6 +368,7 @@ pub fn plan_subqueries_from_select_plan(
             false,
             &mut cse_map,
             &[],
+            bound_subqueries,
         );
         // Limit
         if let Some(limit) = &mut plan.limit {
@@ -413,6 +420,8 @@ pub fn plan_subqueries_from_where_clause(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    let mut bound_subqueries: HashMap<ast::TableInternalId, crate::translate::bind::BoundSubquery> =
+        HashMap::default();
     plan_subqueries_with_outer_query_access(
         program,
         non_from_clause_subqueries,
@@ -425,6 +434,7 @@ pub fn plan_subqueries_from_where_clause(
         SubqueryPosition::Where.allow_correlated(),
         &mut Vec::new(),
         &[],
+        &mut bound_subqueries,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
@@ -442,6 +452,7 @@ pub fn plan_subqueries_from_values(
     values: &mut [Vec<Box<ast::Expr>>],
     resolver: &Resolver,
     connection: &Arc<Connection>,
+    bound_subqueries: &mut HashMap<ast::TableInternalId, crate::translate::bind::BoundSubquery>,
 ) -> Result<()> {
     plan_subqueries_with_outer_query_access(
         program,
@@ -455,6 +466,7 @@ pub fn plan_subqueries_from_values(
         SubqueryPosition::ResultColumn.allow_correlated(),
         &mut Vec::new(),
         &[],
+        bound_subqueries,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
@@ -472,6 +484,8 @@ pub fn plan_subqueries_from_update_sets(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    let mut bound_subqueries: HashMap<ast::TableInternalId, crate::translate::bind::BoundSubquery> =
+        HashMap::default();
     plan_subqueries_with_outer_query_access(
         program,
         non_from_clause_subqueries,
@@ -484,6 +498,7 @@ pub fn plan_subqueries_from_update_sets(
         SubqueryPosition::ResultColumn.allow_correlated(),
         &mut Vec::new(),
         &[],
+        &mut bound_subqueries,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
@@ -502,6 +517,8 @@ pub fn plan_subqueries_from_returning(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    let mut bound_subqueries: HashMap<ast::TableInternalId, crate::translate::bind::BoundSubquery> =
+        HashMap::default();
     // Extract mutable references to expressions from ResultColumn::Expr variants
     let exprs = returning.iter_mut().filter_map(|rc| match rc {
         ast::ResultColumn::Expr(expr, _) => Some(expr.as_mut()),
@@ -520,6 +537,7 @@ pub fn plan_subqueries_from_returning(
         SubqueryPosition::ResultColumn.allow_correlated(),
         &mut Vec::new(),
         &[],
+        &mut bound_subqueries,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
@@ -537,6 +555,8 @@ pub fn plan_subqueries_from_trigger_when_clause(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    let mut bound_subqueries: HashMap<ast::TableInternalId, crate::translate::bind::BoundSubquery> =
+        HashMap::default();
     let mut table_references = TableReferences::new(vec![], vec![]);
     plan_subqueries_with_outer_query_access(
         program,
@@ -550,6 +570,7 @@ pub fn plan_subqueries_from_trigger_when_clause(
         false,
         &mut Vec::new(),
         &[],
+        &mut bound_subqueries,
     )
 }
 
@@ -568,6 +589,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
     allow_correlated: bool,
     cse_map: &mut Vec<(ast::Expr, ast::Expr)>,
     shared: &[ast::Expr],
+    bound_subqueries: &mut HashMap<ast::TableInternalId, crate::translate::bind::BoundSubquery>,
 ) -> Result<()> {
     // Most subqueries can reference columns from the outer query,
     // including nested cases where a subquery inside a subquery references columns from its parent's parent
@@ -628,6 +650,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
         allow_correlated,
         cse_map,
         shared,
+        bound_subqueries,
     );
     for expr in exprs {
         walk_expr_mut(expr, &mut subquery_parser)?;
@@ -654,6 +677,86 @@ fn collect_scalar_subqueries<'a>(
     Ok(found)
 }
 
+/// Plan a pre-bound subquery ([super::bind::BoundSubquery]) into a [Plan].
+///
+/// The binder already resolved all names inside the subquery; this plans its
+/// nested CTEs and derived tables, converts the bound scopes into
+/// [TableReferences] (with the caller's outer refs attached for correlation),
+/// and runs [prepare_select_plan] in bound mode. No name resolution happens.
+fn prepare_bound_subquery_plan(
+    bound_sq: crate::translate::bind::BoundSubquery,
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    referenced_tables: &TableReferences,
+    outer_query_refs: crate::alloc::Vec<OuterQueryReference>,
+    query_destination: QueryDestination,
+) -> Result<Plan> {
+    let mut inner_bound = bound_sq.inner_bound;
+
+    // Extract nested subquery bindings, CTE definitions, and derived bindings.
+    let nested_subquery_bindings = std::mem::take(&mut inner_bound.subquery_bindings);
+    let inner_cte_defs = std::mem::take(&mut inner_bound.cte_definitions);
+    let inner_derived_bindings = std::mem::take(&mut inner_bound.derived_bindings);
+
+    // Plan any inner CTEs.
+    let mut planned_ctes =
+        super::planner::plan_bound_ctes(inner_cte_defs, resolver, program, connection)?;
+
+    // Make outer CTEs available for inner scope resolution. Outer CTEs sit in
+    // referenced_tables' outer_query_refs with cte_definition_only = true; they
+    // were planned at the statement level and need to be visible here so
+    // into_table_references can find them by name.
+    for oqr in referenced_tables.outer_query_refs() {
+        if oqr.cte_definition_only && !planned_ctes.contains_key(&oqr.identifier) {
+            planned_ctes.insert(
+                oqr.identifier.clone(),
+                super::plan::JoinedTable {
+                    table: oqr.table.clone(),
+                    identifier: oqr.identifier.clone(),
+                    internal_id: oqr.internal_id,
+                    op: Operation::default_scan_for(&oqr.table),
+                    join_info: None,
+                    col_used_mask: ColumnUsedMask::default(),
+                    column_use_counts: Vec::new(),
+                    expression_index_usages: Vec::new(),
+                    database_id: 0,
+                    indexed: None,
+                },
+            );
+        }
+    }
+
+    // Plan any nested derived tables, propagating outer refs so correlated
+    // references inside a derived table are visible.
+    let mut planned_derived = super::planner::plan_derived_tables_with_outer_refs(
+        inner_derived_bindings,
+        &mut planned_ctes,
+        resolver,
+        program,
+        connection,
+        outer_query_refs.to_vec(),
+    )?;
+
+    let table_refs_vec = inner_bound.into_table_references_with_outer_refs(
+        &mut planned_ctes,
+        &mut planned_derived,
+        outer_query_refs.to_vec(),
+    )?;
+
+    prepare_select_plan(
+        bound_sq.select,
+        resolver,
+        program,
+        crate::translate::select::SelectBinding::Bound {
+            table_refs: table_refs_vec.into_iter(),
+            bound_subqueries: nested_subquery_bindings,
+        },
+        query_destination,
+        connection,
+    )
+}
+
 /// Create a closure that will walk the AST and replace subqueries with [ast::Expr::SubqueryResult] expressions.]
 #[allow(clippy::too_many_arguments)]
 fn get_subquery_parser<'a>(
@@ -669,6 +772,7 @@ fn get_subquery_parser<'a>(
     allow_correlated: bool,
     cse_map: &'a mut Vec<(ast::Expr, ast::Expr)>,
     shared: &'a [ast::Expr],
+    bound_subqueries: &'a mut HashMap<ast::TableInternalId, crate::translate::bind::BoundSubquery>,
 ) -> impl FnMut(&mut ast::Expr) -> Result<WalkControl> + 'a {
     let handle_unsupported_correlation =
         |correlated: bool, position: SubqueryPosition, allow_correlated: bool| -> Result<()> {
@@ -1021,6 +1125,308 @@ fn get_subquery_parser<'a>(
                     eval_phase: origin.phase_floor(),
                 });
                 Ok(WalkControl::Continue)
+            }
+            // Pre-bound subquery: the binder already rewrote the raw subquery
+            // expression to SubqueryResult and stored its bound form in
+            // `bound_subqueries`. Plan it here (no re-binding), allocate real
+            // registers/cursors for the placeholder values, and register the
+            // NonFromClauseSubquery.
+            ast::Expr::SubqueryResult { subquery_id, .. } => {
+                let sq_id = *subquery_id;
+                let Some(bound_sq) = bound_subqueries.remove(&sq_id) else {
+                    // Alias expansion (and GROUP BY/SELECT-list sharing) can
+                    // clone an already-planned subquery reference. Point this
+                    // clone at the planned subquery's registers/cursor so both
+                    // occurrences read the same evaluation.
+                    if let Some(planned) = out_subqueries.iter().find(|s| s.internal_id == sq_id) {
+                        let query_type_src = planned.query_type.clone();
+                        let ast::Expr::SubqueryResult { query_type, .. } = expr else {
+                            unreachable!();
+                        };
+                        *query_type = query_type_src;
+                    }
+                    return Ok(WalkControl::Continue);
+                };
+                let outer_query_refs = {
+                    crate::stack::trace_stack!("get_outer_refs");
+                    get_outer_query_refs(referenced_tables)
+                }?;
+
+                let node_query_type = {
+                    let ast::Expr::SubqueryResult { query_type, .. } = &*expr else {
+                        unreachable!();
+                    };
+                    query_type.clone()
+                };
+
+                match node_query_type {
+                    SubqueryType::Exists { .. } => {
+                        let result_reg = program.alloc_register();
+                        let plan = prepare_bound_subquery_plan(
+                            bound_sq,
+                            program,
+                            resolver,
+                            connection,
+                            referenced_tables,
+                            outer_query_refs,
+                            QueryDestination::ExistsSubqueryResult { result_reg },
+                        )?;
+                        let Plan::Select(mut plan) = plan else {
+                            crate::bail_parse_error!(
+                                "compound SELECT queries not supported yet in WHERE clause subqueries"
+                            );
+                        };
+                        optimize_select_plan(&mut plan, resolver)?;
+                        let correlated = select_plan_has_outer_scope_dependency(&plan);
+                        handle_unsupported_correlation(correlated, position, allow_correlated)?;
+                        let subquery_type = SubqueryType::Exists { result_reg };
+                        let ast::Expr::SubqueryResult { query_type, .. } = expr else {
+                            unreachable!();
+                        };
+                        *query_type = subquery_type.clone();
+                        out_subqueries.push(NonFromClauseSubquery {
+                            internal_id: sq_id,
+                            query_type: subquery_type,
+                            state: SubqueryState::Unevaluated {
+                                plan: Some(Box::new(Plan::Select(plan))),
+                            },
+                            correlated,
+                            origin,
+                            eval_phase: origin.phase_floor(),
+                        });
+                        Ok(WalkControl::Continue)
+                    }
+                    SubqueryType::RowValue { .. } => {
+                        let plan = prepare_bound_subquery_plan(
+                            bound_sq,
+                            program,
+                            resolver,
+                            connection,
+                            referenced_tables,
+                            outer_query_refs,
+                            QueryDestination::Unset,
+                        )?;
+                        let Plan::Select(mut plan) = plan else {
+                            crate::bail_parse_error!(
+                                "compound SELECT queries not supported yet in WHERE clause subqueries"
+                            );
+                        };
+                        optimize_select_plan(&mut plan, resolver)?;
+                        let reg_count = plan.result_columns.len();
+                        let reg_start = program.alloc_registers(reg_count);
+
+                        if reg_count == 1 {
+                            if let Some(result_col) = plan.result_columns.first() {
+                                let affinity = get_expr_affinity_info(
+                                    &result_col.expr,
+                                    Some(&plan.table_references),
+                                    None,
+                                );
+                                resolver
+                                    .subquery_affinities
+                                    .borrow_mut()
+                                    .insert(sq_id, affinity);
+                            }
+                        }
+
+                        plan.query_destination = QueryDestination::RowValueSubqueryResult {
+                            result_reg_start: reg_start,
+                            num_regs: reg_count,
+                        };
+
+                        // Only inject LIMIT 1 if there's no existing limit, or the
+                        // existing limit is > 1. If LIMIT 0, the subquery should
+                        // return no rows (NULL).
+                        let needs_limit = match &plan.limit {
+                            Some(expr) => match parse_signed_number(expr) {
+                                Ok(Value::Numeric(Numeric::Integer(v))) => !(0..=1).contains(&v),
+                                _ => true,
+                            },
+                            None => true,
+                        };
+                        if needs_limit {
+                            plan.limit = Some(Box::new(ast::Expr::Literal(ast::Literal::Numeric(
+                                "1".to_string(),
+                            ))));
+                        }
+
+                        let subquery_type = SubqueryType::RowValue {
+                            result_reg_start: reg_start,
+                            num_regs: reg_count,
+                        };
+                        let ast::Expr::SubqueryResult { query_type, .. } = expr else {
+                            unreachable!();
+                        };
+                        *query_type = subquery_type.clone();
+
+                        let correlated = select_plan_has_outer_scope_dependency(&plan);
+                        handle_unsupported_correlation(correlated, position, allow_correlated)?;
+
+                        out_subqueries.push(NonFromClauseSubquery {
+                            internal_id: sq_id,
+                            query_type: subquery_type,
+                            state: SubqueryState::Unevaluated {
+                                plan: Some(Box::new(Plan::Select(plan))),
+                            },
+                            correlated,
+                            origin,
+                            eval_phase: origin.phase_floor(),
+                        });
+                        Ok(WalkControl::Continue)
+                    }
+                    SubqueryType::In { .. } => {
+                        let plan = prepare_bound_subquery_plan(
+                            bound_sq,
+                            program,
+                            resolver,
+                            connection,
+                            referenced_tables,
+                            outer_query_refs,
+                            QueryDestination::Unset,
+                        )?;
+                        let mut plan = match plan {
+                            Plan::Select(mut select_plan) => {
+                                optimize_select_plan(&mut select_plan, resolver)?;
+                                Plan::Select(select_plan)
+                            }
+                            Plan::CompoundSelect {
+                                mut left,
+                                mut right_most,
+                                limit,
+                                offset,
+                                order_by,
+                            } => {
+                                optimize_select_plan(&mut right_most, resolver)?;
+                                for (select_plan, _) in left.iter_mut() {
+                                    optimize_select_plan(select_plan, resolver)?;
+                                }
+                                Plan::CompoundSelect {
+                                    left,
+                                    right_most,
+                                    limit,
+                                    offset,
+                                    order_by,
+                                }
+                            }
+                            _ => unreachable!("prepare_select_plan cannot return Delete/Update"),
+                        };
+
+                        // The binder stores the bound lhs on the node.
+                        let lhs_owned = {
+                            let ast::Expr::SubqueryResult { lhs, .. } = &mut *expr else {
+                                unreachable!();
+                            };
+                            lhs.take().expect("IN subquery should have lhs from binder")
+                        };
+
+                        let result_columns = plan.select_result_columns();
+                        let table_references = plan.select_table_references();
+                        // e.g. (x,y) IN (SELECT ...) or x IN (SELECT ...)
+                        let lhs_columns = match unwrap_parens(lhs_owned.as_ref())? {
+                            ast::Expr::Parenthesized(exprs) => {
+                                either::Left(exprs.iter().map(|e| e.as_ref()))
+                            }
+                            e => either::Right(core::iter::once(e)),
+                        };
+                        let lhs_column_count = lhs_columns.len();
+                        if lhs_column_count != result_columns.len() {
+                            crate::bail_parse_error!(
+                                "sub-select returns {} columns - expected {lhs_column_count}",
+                                result_columns.len()
+                            );
+                        }
+                        // Collect affinity and LHS collation in a single pass over
+                        // lhs_columns. "x IN (SELECT y ...)" uses the collation of x
+                        // (https://www.sqlite.org/datatype3.html#collation §7.1).
+                        let mut affinity_chars = String::with_capacity(lhs_column_count);
+                        let mut lhs_collations = Vec::with_capacity(lhs_column_count);
+                        for (i, lhs_expr) in lhs_columns.enumerate() {
+                            let lhs_affinity =
+                                get_expr_affinity_info(lhs_expr, Some(referenced_tables), None);
+                            affinity_chars.push(
+                                compare_affinity(
+                                    &result_columns[i].expr,
+                                    lhs_affinity,
+                                    Some(table_references),
+                                    None,
+                                )
+                                .aff_mask(),
+                            );
+                            lhs_collations
+                                .push(get_collseq_from_expr(lhs_expr, referenced_tables)?);
+                        }
+                        let in_affinity_str: Arc<String> = Arc::new(affinity_chars);
+
+                        let columns = result_columns
+                            .iter()
+                            .enumerate()
+                            .map(|(i, c)| {
+                                let rhs_collation =
+                                    get_collseq_from_expr(&c.expr, table_references)?;
+                                Ok::<_, crate::LimboError>(IndexColumn {
+                                    name: c.name(table_references).unwrap_or("").to_string(),
+                                    order: SortOrder::Asc,
+                                    pos_in_table: i,
+                                    collation: lhs_collations[i].or(rhs_collation),
+                                    default: None,
+                                    expr: None,
+                                })
+                            })
+                            .try_collect::<Result<crate::alloc::Vec<_>>>()??;
+
+                        let ephemeral_index = Arc::new(Index {
+                            columns,
+                            name: format!("ephemeral_index_where_sub_{sq_id}"),
+                            table_name: String::new(),
+                            ephemeral: true,
+                            has_rowid: false,
+                            root_page: 0,
+                            unique: false,
+                            where_clause: None,
+                            index_method: None,
+                            on_conflict: None,
+                        });
+
+                        let cursor_id = program
+                            .alloc_cursor_id(CursorType::BTreeIndex(ephemeral_index.clone()));
+
+                        *plan.select_query_destination_mut().unwrap() =
+                            QueryDestination::EphemeralIndex {
+                                cursor_id,
+                                index: ephemeral_index,
+                                affinity_str: Some(in_affinity_str.clone()),
+                                is_delete: false,
+                            };
+
+                        let subquery_type = SubqueryType::In {
+                            cursor_id,
+                            affinity_str: in_affinity_str,
+                        };
+                        let ast::Expr::SubqueryResult {
+                            lhs, query_type, ..
+                        } = expr
+                        else {
+                            unreachable!();
+                        };
+                        *lhs = Some(lhs_owned);
+                        *query_type = subquery_type.clone();
+
+                        let correlated = plan_has_outer_scope_dependency(&plan);
+                        handle_unsupported_correlation(correlated, position, allow_correlated)?;
+
+                        out_subqueries.push(NonFromClauseSubquery {
+                            internal_id: sq_id,
+                            query_type: subquery_type,
+                            state: SubqueryState::Unevaluated {
+                                plan: Some(Box::new(plan)),
+                            },
+                            correlated,
+                            origin,
+                            eval_phase: origin.phase_floor(),
+                        });
+                        Ok(WalkControl::Continue)
+                    }
+                }
             }
             _ => Ok(WalkControl::Continue),
         }

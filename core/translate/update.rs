@@ -412,6 +412,7 @@ fn prepare_update_plan(
         &result_columns,
         &mut where_clause,
         resolver,
+        false,
     )?;
     parse_where(
         body.where_clause.as_deref(),
