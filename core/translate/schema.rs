@@ -909,7 +909,9 @@ fn derive_ctas_schema(
         select,
         resolver,
         program,
-        &[],
+        crate::translate::select::SelectBinding::Raw {
+            outer_query_refs: vec![],
+        },
         QueryDestination::ResultRows,
         connection,
     )?;

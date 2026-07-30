@@ -34,6 +34,40 @@ use turso_parser::ast::{self, CompoundSelect, Expr};
 /// SQLite's default SQLITE_MAX_COLUMN is 2000, with a hard upper limit of 32767.
 const SQLITE_MAX_COLUMN: usize = 2000;
 
+/// Where a SELECT plan gets its name resolution from.
+///
+/// `Raw` is the legacy path: the planner binds identifiers itself
+/// (parse_from + bind_and_rewrite_expr) while planning.
+/// `Bound` consumes the output of the binding phase ([super::bind::BindContext]):
+/// one [TableReferences] per SELECT core (main + compounds, in order) and the
+/// pre-bound subqueries keyed by their [ast::Expr::SubqueryResult] id.
+///
+/// The `Raw` variant is transitional and will be removed once every statement
+/// path goes through the binder.
+// TODO(bind-integration): `Bound` is constructed once the binder is wired in.
+#[allow(dead_code)]
+pub enum SelectBinding {
+    Raw {
+        outer_query_refs: Vec<OuterQueryReference>,
+    },
+    Bound {
+        table_refs: std::vec::IntoIter<TableReferences>,
+        bound_subqueries: rustc_hash::FxHashMap<ast::TableInternalId, super::bind::BoundSubquery>,
+    },
+}
+
+/// Per-SELECT-core slice of a [SelectBinding], passed to `prepare_one_select_plan`.
+enum OneSelectBinding<'a> {
+    Raw {
+        outer_query_refs: &'a [OuterQueryReference],
+    },
+    Bound {
+        table_references: TableReferences,
+        bound_subqueries:
+            &'a mut rustc_hash::FxHashMap<ast::TableInternalId, super::bind::BoundSubquery>,
+    },
+}
+
 #[turso_macros::trace_stack]
 pub fn translate_select(
     select: ast::Select,
@@ -46,7 +80,9 @@ pub fn translate_select(
         select,
         resolver,
         program,
-        &[],
+        SelectBinding::Raw {
+            outer_query_refs: vec![],
+        },
         query_destination,
         connection,
     )?;
@@ -153,10 +189,34 @@ pub fn prepare_select_plan(
     select: ast::Select,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
-    outer_query_refs: &[OuterQueryReference],
+    binding: SelectBinding,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
+    // Split the statement-level binding into per-SELECT-core bindings.
+    // `Raw` shares the same outer refs across all cores; `Bound` hands each
+    // core its own pre-built TableReferences (main first, then compounds).
+    let (raw_outer_refs, mut bound_state) = match binding {
+        SelectBinding::Raw { outer_query_refs } => (Some(outer_query_refs), None),
+        SelectBinding::Bound {
+            table_refs,
+            bound_subqueries,
+        } => (None, Some((table_refs, bound_subqueries))),
+    };
+    macro_rules! next_binding {
+        () => {
+            match (&raw_outer_refs, &mut bound_state) {
+                (Some(outer_query_refs), None) => OneSelectBinding::Raw { outer_query_refs },
+                (None, Some((table_refs, bound_subqueries))) => OneSelectBinding::Bound {
+                    table_references: table_refs
+                        .next()
+                        .expect("missing table references for select core"),
+                    bound_subqueries,
+                },
+                _ => unreachable!(),
+            }
+        };
+    }
     let compounds = select.body.compounds;
     match compounds.is_empty() {
         true => Ok(Plan::Select(Box::new(prepare_one_select_plan(
@@ -166,7 +226,7 @@ pub fn prepare_select_plan(
             select.limit,
             select.order_by,
             select.with,
-            outer_query_refs,
+            next_binding!(),
             query_destination,
             connection,
         )?))),
@@ -183,7 +243,7 @@ pub fn prepare_select_plan(
                 None,
                 vec![],
                 with.clone(),
-                outer_query_refs,
+                next_binding!(),
                 query_destination.clone(),
                 connection,
             )?;
@@ -202,7 +262,7 @@ pub fn prepare_select_plan(
                     None,
                     vec![],
                     with.clone(),
-                    outer_query_refs,
+                    next_binding!(),
                     query_destination.clone(),
                     connection,
                 )?;
@@ -267,7 +327,7 @@ fn prepare_one_select_plan(
     limit: Option<ast::Limit>,
     order_by: Vec<ast::SortedColumn>,
     with: Option<ast::With>,
-    outer_query_refs: &[OuterQueryReference],
+    binding: OneSelectBinding<'_>,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<SelectPlan> {
@@ -288,39 +348,63 @@ fn prepare_one_select_plan(
             let mut where_predicates = vec![];
             let mut vtab_predicates = vec![];
 
-            let mut table_references = TableReferences::new(vec![], outer_query_refs.to_vec());
+            let (table_references, bound_subqueries) = match binding {
+                OneSelectBinding::Raw { outer_query_refs } => {
+                    let mut table_references =
+                        TableReferences::new(vec![], outer_query_refs.to_vec());
 
-            if from.is_none() {
-                for column in &columns {
-                    if matches!(column, ResultColumn::Star) {
-                        crate::bail_parse_error!("no tables specified");
+                    if from.is_none() {
+                        for column in &columns {
+                            if matches!(column, ResultColumn::Star) {
+                                crate::bail_parse_error!("no tables specified");
+                            }
+                        }
                     }
-                }
-            }
 
-            // Parse the FROM clause into a vec of TableReferences. Fold all the join conditions expressions into the WHERE clause.
-            let preplan_ctes_for_non_from_subqueries = with.is_some()
-                && select_has_non_from_subqueries(
-                    &columns,
-                    where_clause.as_deref(),
-                    group_by.as_ref(),
-                    &window_clause,
-                    &order_by,
-                    limit.as_ref(),
-                );
-            {
-                parse_from(
-                    from,
-                    resolver,
-                    program,
-                    with,
-                    preplan_ctes_for_non_from_subqueries,
-                    &mut where_predicates,
-                    &mut vtab_predicates,
-                    &mut table_references,
-                    connection,
-                )?;
-            }
+                    // Parse the FROM clause into a vec of TableReferences. Fold all the join conditions expressions into the WHERE clause.
+                    let preplan_ctes_for_non_from_subqueries = with.is_some()
+                        && select_has_non_from_subqueries(
+                            &columns,
+                            where_clause.as_deref(),
+                            group_by.as_ref(),
+                            &window_clause,
+                            &order_by,
+                            limit.as_ref(),
+                        );
+                    parse_from(
+                        from,
+                        resolver,
+                        program,
+                        with,
+                        preplan_ctes_for_non_from_subqueries,
+                        &mut where_predicates,
+                        &mut vtab_predicates,
+                        &mut table_references,
+                        connection,
+                    )?;
+                    (
+                        table_references,
+                        None::<
+                            &mut rustc_hash::FxHashMap<
+                                ast::TableInternalId,
+                                super::bind::BoundSubquery,
+                            >,
+                        >,
+                    )
+                }
+                OneSelectBinding::Bound {
+                    table_references,
+                    bound_subqueries,
+                } => {
+                    todo!(
+                        "bound select planning is wired in a follow-up commit: {:?} {:?}",
+                        table_references.joined_tables().len(),
+                        bound_subqueries.len()
+                    )
+                }
+            };
+            let mut bound_subqueries = bound_subqueries;
+            let _ = bound_subqueries.take();
 
             // Preallocate space for the result columns
             let result_columns = Vec::with_capacity(
@@ -837,7 +921,14 @@ fn prepare_one_select_plan(
                 });
             }
 
-            let mut table_references = TableReferences::new(vec![], outer_query_refs.to_vec());
+            let mut table_references = match binding {
+                OneSelectBinding::Raw { outer_query_refs } => {
+                    TableReferences::new(vec![], outer_query_refs.to_vec())
+                }
+                OneSelectBinding::Bound {
+                    table_references, ..
+                } => table_references,
+            };
 
             // Plan CTEs from WITH clause so they're available for subqueries in VALUES
             plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;

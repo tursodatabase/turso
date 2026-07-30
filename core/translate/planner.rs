@@ -814,7 +814,9 @@ fn plan_cte(
         cte_def.select.clone(),
         resolver,
         program,
-        &outer_query_refs,
+        crate::translate::select::SelectBinding::Raw {
+            outer_query_refs: outer_query_refs.clone(),
+        },
         QueryDestination::placeholder_for_subquery(),
         connection,
     );
@@ -911,7 +913,9 @@ pub fn plan_ctes_as_outer_refs(
             cte.select,
             resolver,
             program,
-            table_references.outer_query_refs(),
+            crate::translate::select::SelectBinding::Raw {
+                outer_query_refs: table_references.outer_query_refs().to_vec(),
+            },
             QueryDestination::placeholder_for_subquery(),
             connection,
         );
@@ -1034,7 +1038,9 @@ fn parse_from_clause_table(
                 subselect,
                 resolver,
                 program,
-                &outer_query_refs_for_subquery,
+                crate::translate::select::SelectBinding::Raw {
+                    outer_query_refs: outer_query_refs_for_subquery.clone(),
+                },
                 QueryDestination::placeholder_for_subquery(),
                 connection,
             )?;
@@ -1165,7 +1171,9 @@ fn parse_table(
                     cte_ast,
                     resolver,
                     program,
-                    table_references.outer_query_refs(),
+                    crate::translate::select::SelectBinding::Raw {
+                        outer_query_refs: table_references.outer_query_refs().to_vec(),
+                    },
                     QueryDestination::placeholder_for_subquery(),
                     connection,
                 )?;

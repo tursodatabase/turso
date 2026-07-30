@@ -709,7 +709,7 @@ fn get_subquery_parser<'a>(
                     subselect,
                     resolver,
                     program,
-                    &outer_query_refs,
+                    crate::translate::select::SelectBinding::Raw { outer_query_refs },
                     QueryDestination::ExistsSubqueryResult { result_reg },
                     connection,
                 )?;
@@ -782,7 +782,7 @@ fn get_subquery_parser<'a>(
                     subselect,
                     resolver,
                     program,
-                    &outer_query_refs,
+                    crate::translate::select::SelectBinding::Raw { outer_query_refs },
                     QueryDestination::Unset,
                     connection,
                 )?;
@@ -885,7 +885,7 @@ fn get_subquery_parser<'a>(
                     rhs,
                     resolver,
                     program,
-                    &outer_query_refs,
+                    crate::translate::select::SelectBinding::Raw { outer_query_refs },
                     QueryDestination::Unset,
                     connection,
                 )?;
