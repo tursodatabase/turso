@@ -266,12 +266,64 @@ fn resolve_index_range(
     }))
 }
 
-fn compile_deferred_table_bound(
+struct ResolvedTableBound {
+    rowid: Option<ResolvedScalarExpr>,
+    op: SeekOp,
+}
+
+impl ResolvedTableBound {
+    fn into_deferred<F>(self, compile: &mut F) -> Option<DeferredTableBound>
+    where
+        F: FnMut(&ResolvedScalarExpr) -> Option<BoxedCompile<ValueId>>,
+    {
+        Some(match self.rowid {
+            Some(rowid) => DeferredTableBound::expression(compile(&rowid)?, self.op),
+            None => DeferredTableBound::unbounded(self.op),
+        })
+    }
+}
+
+struct ResolvedTableRange {
+    start: ResolvedTableBound,
+    end: ResolvedTableBound,
+    direction: ScanDirection,
+    affinity: Affinity,
+}
+
+impl ResolvedTableRange {
+    fn into_deferred<F>(self, mut compile: F) -> Option<DeferredTableRange>
+    where
+        F: FnMut(&ResolvedScalarExpr) -> Option<BoxedCompile<ValueId>>,
+    {
+        let start = self.start.into_deferred(&mut compile)?;
+        let end = self.end.into_deferred(&mut compile)?;
+        Some(DeferredTableRange::new(
+            start,
+            end,
+            self.direction,
+            self.affinity,
+        ))
+    }
+
+    fn into_static_deferred(self) -> Option<DeferredTableRange> {
+        self.into_deferred(compile_symbolic_static_expr)
+    }
+
+    fn into_row_deferred(self, rows: &SymbolicRows) -> DeferredTableRange {
+        self.into_deferred(|expression| Some(compile_symbolic_expr(rows, expression)))
+            .expect("row-backed resolved table range expressions must compile")
+    }
+}
+
+fn resolve_table_bound(
     key: &SeekKey,
     expr_resolver: &mut RowExprResolver<'_, '_>,
-) -> Result<Option<DeferredTableBound>> {
+) -> Result<Option<ResolvedTableBound>> {
     Ok(Some(match &key.last_component {
-        SeekKeyComponent::None => DeferredTableBound::unbounded(key.op),
+        SeekKeyComponent::None => ResolvedTableBound {
+            rowid: None,
+            op: key.op,
+        },
         // A rowid range has no SQL NULL sentinel. If the planner ever
         // constructs one, retain the eager path until its meaning is explicit.
         SeekKeyComponent::Null => return Ok(None),
@@ -279,11 +331,40 @@ fn compile_deferred_table_bound(
             let Some(resolved) = expr_resolver.resolve(expression)? else {
                 return Ok(None);
             };
-            let Some(value) = compile_symbolic_static_expr(&resolved) else {
-                return Ok(None);
-            };
-            DeferredTableBound::expression(value, key.op)
+            ResolvedTableBound {
+                rowid: Some(resolved),
+                op: key.op,
+            }
         }
+    }))
+}
+
+fn resolve_table_range(
+    direction: ScanDirection,
+    table: &BTreeTable,
+    seek_def: &SeekDef,
+    expr_resolver: &mut RowExprResolver<'_, '_>,
+) -> Result<Option<ResolvedTableRange>> {
+    if !seek_def.prefix.is_empty() {
+        return Ok(None);
+    }
+    let Some(start) = resolve_table_bound(&seek_def.start, expr_resolver)? else {
+        return Ok(None);
+    };
+    let Some(end) = resolve_table_bound(&seek_def.end, expr_resolver)? else {
+        return Ok(None);
+    };
+    let affinity = table
+        .columns()
+        .iter()
+        .find(|column| column.is_rowid_alias())
+        .map(|column| column.affinity())
+        .unwrap_or(Affinity::Numeric);
+    Ok(Some(ResolvedTableRange {
+        start,
+        end,
+        direction,
+        affinity,
     }))
 }
 
@@ -313,6 +394,10 @@ enum DeclarativeBtreeAccess<'a> {
 enum DeclarativeInnerJoinAccess<'a> {
     Scan(ScanDirection),
     Rowid(&'a Expr),
+    TableRange {
+        direction: ScanDirection,
+        seek_def: &'a SeekDef,
+    },
     IndexRange {
         direction: ScanDirection,
         index: &'a Arc<Index>,
@@ -1128,23 +1213,16 @@ fn try_compile_declarative_table_scan(
         DeclarativeBtreeAccess::TableRange {
             direction,
             seek_def,
-        } if seek_def.prefix.is_empty() => {
-            let Some(start) = compile_deferred_table_bound(&seek_def.start, &mut expr_resolver)?
+        } => {
+            let Some(range) = resolve_table_range(direction, table, seek_def, &mut expr_resolver)?
             else {
                 return Ok(None);
             };
-            let Some(end) = compile_deferred_table_bound(&seek_def.end, &mut expr_resolver)? else {
+            let Some(range) = range.into_static_deferred() else {
                 return Ok(None);
             };
-            let affinity = table
-                .columns()
-                .iter()
-                .find(|column| column.is_rowid_alias())
-                .map(|column| column.affinity())
-                .unwrap_or(Affinity::Numeric);
-            Some(DeferredTableRange::new(start, end, direction, affinity))
+            Some(range)
         }
-        DeclarativeBtreeAccess::TableRange { .. } => return Ok(None),
         _ => None,
     };
     let index_range = match access {
@@ -1315,6 +1393,16 @@ fn try_compile_declarative_inner_join(
             DeclarativeInnerJoinAccess::Rowid(cmp_expr)
         }
         Operation::Search(Search::Seek {
+            index: None,
+            seek_def,
+        }) => DeclarativeInnerJoinAccess::TableRange {
+            direction: match seek_def.iter_dir {
+                IterationDirection::Forwards => ScanDirection::Forward,
+                IterationDirection::Backwards => ScanDirection::Reverse,
+            },
+            seek_def,
+        },
+        Operation::Search(Search::Seek {
             index: Some(index),
             seek_def,
         }) => DeclarativeInnerJoinAccess::IndexRange {
@@ -1351,7 +1439,9 @@ fn try_compile_declarative_inner_join(
             }
             inner.utilizes_covering_index().then_some(index)
         }
-        DeclarativeInnerJoinAccess::Scan(_) | DeclarativeInnerJoinAccess::Rowid(_) => None,
+        DeclarativeInnerJoinAccess::Scan(_)
+        | DeclarativeInnerJoinAccess::Rowid(_)
+        | DeclarativeInnerJoinAccess::TableRange { .. } => None,
     };
 
     let mut expr_resolver = RowExprResolver::new(
@@ -1369,7 +1459,25 @@ fn try_compile_declarative_inner_join(
             };
             Some(expression)
         }
-        DeclarativeInnerJoinAccess::Scan(_) | DeclarativeInnerJoinAccess::IndexRange { .. } => None,
+        DeclarativeInnerJoinAccess::Scan(_)
+        | DeclarativeInnerJoinAccess::TableRange { .. }
+        | DeclarativeInnerJoinAccess::IndexRange { .. } => None,
+    };
+    let inner_table_range = match inner_access {
+        DeclarativeInnerJoinAccess::TableRange {
+            direction,
+            seek_def,
+        } => {
+            let Some(range) =
+                resolve_table_range(direction, inner_table, seek_def, &mut expr_resolver)?
+            else {
+                return Ok(None);
+            };
+            Some(range)
+        }
+        DeclarativeInnerJoinAccess::Scan(_)
+        | DeclarativeInnerJoinAccess::Rowid(_)
+        | DeclarativeInnerJoinAccess::IndexRange { .. } => None,
     };
     let inner_index_range = match inner_access {
         DeclarativeInnerJoinAccess::IndexRange {
@@ -1383,7 +1491,9 @@ fn try_compile_declarative_inner_join(
             };
             Some(range)
         }
-        DeclarativeInnerJoinAccess::Scan(_) | DeclarativeInnerJoinAccess::Rowid(_) => None,
+        DeclarativeInnerJoinAccess::Scan(_)
+        | DeclarativeInnerJoinAccess::Rowid(_)
+        | DeclarativeInnerJoinAccess::TableRange { .. } => None,
     };
     expr_resolver.add_source(
         inner.database_id,
@@ -1438,6 +1548,22 @@ fn try_compile_declarative_inner_join(
                     compile_symbolic_expr(&rows, &inner_rowid).map(move |rowid| {
                         inner
                             .seek_rowid(rowid)
+                            .map(move |inner_row| pure(SymbolicRows::pair(outer_row, inner_row)))
+                    })
+                })
+            });
+            body.into_symbolic_compiler(rows, destination, inputs)
+        }
+        DeclarativeInnerJoinAccess::TableRange { .. } => {
+            let range = inner_table_range.expect("table range join access must resolve its range");
+            let tables =
+                outer_table.then(open_table(inner_table.clone(), database_id, schema_cookie));
+            let rows = tables.map(move |(outer, inner)| {
+                outer.scan(outer_direction).flat_map(move |outer_row| {
+                    let rows = SymbolicRows::single(outer_row);
+                    let range = range.into_row_deferred(&rows);
+                    inner.seek_range(range).map(move |inner_rows| {
+                        inner_rows
                             .map(move |inner_row| pure(SymbolicRows::pair(outer_row, inner_row)))
                     })
                 })
@@ -5104,6 +5230,79 @@ mod tests {
                 vec![Value::from_i64(1), Value::from_i64(13), Value::from_i64(3),],
                 vec![Value::from_i64(2), Value::from_i64(24), Value::from_i64(4),],
                 vec![Value::from_i64(2), Value::from_i64(25), Value::from_i64(5),],
+            ]
+        );
+    }
+
+    #[test]
+    fn dependent_table_range_join_crosses_the_declarative_compiler_boundary() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE range_windows(\
+                    id INTEGER PRIMARY KEY, lo INTEGER, hi INTEGER, bias INTEGER\
+                )",
+            )
+            .unwrap();
+        connection
+            .execute("CREATE TABLE range_points(id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO range_windows VALUES \
+                 (1, 1, 3, 10), (2, 3, 5, 100), (3, NULL, 6, 1000)",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO range_points VALUES \
+                 (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)",
+            )
+            .unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT w.id, p.id, w.bias + p.value \
+                   FROM range_windows AS w \
+                   JOIN range_points AS p ON p.id > w.lo AND p.id <= w.hi \
+                  WHERE p.value >= w.id",
+            )
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+        assert!(instructions.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::SeekGT {
+                is_index: false,
+                num_regs: 1,
+                ..
+            }
+        )));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Gt { .. })));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Next { .. })));
+        let result_row = instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 3, .. }))
+            .expect("dependent table range join must produce a three-value result pack");
+        assert!(
+            instructions[result_row - 3..result_row]
+                .iter()
+                .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })),
+            "dependent table range projections must remain symbolic until pack lowering"
+        );
+
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(1), Value::from_i64(2), Value::from_i64(30)],
+                vec![Value::from_i64(1), Value::from_i64(3), Value::from_i64(40)],
+                vec![Value::from_i64(2), Value::from_i64(4), Value::from_i64(140)],
+                vec![Value::from_i64(2), Value::from_i64(5), Value::from_i64(150)],
             ]
         );
     }

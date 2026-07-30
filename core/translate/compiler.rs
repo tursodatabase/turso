@@ -5788,6 +5788,15 @@ pub(crate) struct OpenedTable {
 }
 
 impl OpenedTable {
+    fn rows(self, source: CursorRowSource) -> CursorRows {
+        CursorRows {
+            cursor: self.cursor,
+            row_cursor: self.cursor,
+            deferred_seek: None,
+            source,
+        }
+    }
+
     pub(crate) const fn scan(self, direction: ScanDirection) -> CursorRows {
         CursorRows {
             cursor: self.cursor,
@@ -5805,6 +5814,15 @@ impl OpenedTable {
             source: CursorRowSource::Rowid(rowid),
         }
     }
+
+    pub(crate) const fn seek_range(self, range: DeferredTableRange) -> SeekOpenedTable {
+        SeekOpenedTable { table: self, range }
+    }
+}
+
+pub(crate) struct SeekOpenedTable {
+    table: OpenedTable,
+    range: DeferredTableRange,
 }
 
 /// Compiler operation that opens an index, and its table cursor when required,
@@ -7164,12 +7182,6 @@ impl ScanBtreeSource {
     }
 }
 
-/// Opens a B-tree source when compiled and returns its symbolic row stream.
-pub(crate) struct ScanBtree {
-    source: ScanBtreeSource,
-    start: ScanBtreeStart,
-}
-
 pub(crate) struct InSeekBtree {
     source: ScanBtreeSource,
     values: DeferredInValues,
@@ -7243,10 +7255,6 @@ impl RowStream for InSeekRows {
     ) -> BoxedCompile<LoopState> {
         self.stream().try_fold_boxed(initial, body)
     }
-}
-
-enum ScanBtreeStart {
-    TableRange(DeferredTableRange),
 }
 
 pub(crate) struct DeferredTableBound {
@@ -7458,11 +7466,8 @@ pub(crate) fn seek_table_range(
     db: usize,
     schema_cookie: u32,
     range: DeferredTableRange,
-) -> ScanBtree {
-    ScanBtree {
-        source: ScanBtreeSource::Table(open_read_table(table, db, schema_cookie)),
-        start: ScanBtreeStart::TableRange(range),
-    }
+) -> impl Compile<Output = CursorRows> {
+    open_table(table, db, schema_cookie).and_then(move |table| table.seek_range(range))
 }
 
 pub(crate) fn seek_in_values(
@@ -7541,25 +7546,6 @@ fn index_source(
             table: open_read_table(table, db, schema_cookie),
             index,
         }
-    }
-}
-
-impl Compile for ScanBtree {
-    type Output = CursorRows;
-
-    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
-        let opened = self.source.open(builder)?;
-        let source = match self.start {
-            ScanBtreeStart::TableRange(range) => {
-                CursorRowSource::TableRange(range.compile(builder)?)
-            }
-        };
-        Ok(CursorRows {
-            cursor: opened.cursor,
-            row_cursor: opened.row_cursor,
-            deferred_seek: opened.deferred_seek,
-            source,
-        })
     }
 }
 
@@ -7651,6 +7637,15 @@ impl Compile for OpenTable {
         self.cursor
             .compile(builder)
             .map(|cursor| OpenedTable { cursor })
+    }
+}
+
+impl Compile for SeekOpenedTable {
+    type Output = CursorRows;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let range = self.range.compile(builder)?;
+        Ok(self.table.rows(CursorRowSource::TableRange(range)))
     }
 }
 
@@ -8674,6 +8669,53 @@ mod tests {
         assert!(outer_scan < inner_seek);
         assert_eq!(rendered.matches("open_read").count(), 2);
         assert_eq!(rendered.matches("cursor_seek_rowid").count(), 1);
+    }
+
+    #[test]
+    fn opened_table_resource_can_feed_a_dependent_range_stream() {
+        let outer = Arc::new(BTreeTable::from_sql("CREATE TABLE outer_rows(lo,hi)", 2).unwrap());
+        let inner = Arc::new(BTreeTable::from_sql("CREATE TABLE inner_rows(value)", 3).unwrap());
+        let compiler = open_table(outer, 0, 0)
+            .then(open_table(inner, 0, 0))
+            .and_then(|(outer, inner)| {
+                outer
+                    .scan(ScanDirection::Forward)
+                    .flat_map(move |outer_row| {
+                        let range = DeferredTableRange::new(
+                            DeferredTableBound::expression(outer_row.column(0).boxed(), SeekOp::GT),
+                            DeferredTableBound::expression(outer_row.column(1).boxed(), SeekOp::GT),
+                            ScanDirection::Forward,
+                            Affinity::Numeric,
+                        );
+                        inner.seek_range(range)
+                    })
+                    .for_each(|inner_row| {
+                        pack_values(smallvec![inner_row.column(0).boxed()])
+                            .and_then(result_row_pack)
+                    })
+            });
+
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+        let outer_open = rendered
+            .find("open_read $0")
+            .expect("outer table must be opened");
+        let inner_open = rendered
+            .find("open_read $1")
+            .expect("inner table must be opened");
+        let outer_scan = rendered
+            .find("cursor_start Forward $0")
+            .expect("outer table must produce a scan stream");
+        let inner_seek = rendered
+            .find("table_seek GT $1")
+            .expect("inner table must produce a dependent range stream");
+
+        assert!(outer_open < outer_scan);
+        assert!(inner_open < outer_scan);
+        assert!(outer_scan < inner_seek);
+        assert!(rendered.contains("table_bound GT affinity Numeric $1"));
+        assert_eq!(rendered.matches("open_read").count(), 2);
+        assert_eq!(rendered.matches("table_seek").count(), 1);
     }
 
     #[test]

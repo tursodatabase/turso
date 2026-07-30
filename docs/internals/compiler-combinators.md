@@ -135,12 +135,13 @@ distinctness, slicing, and destinations then consume the joined stream through
 the same operators as a single-table scan.
 Table resource acquisition is separate from stream positioning. `open_table`
 produces a non-cloneable symbolic `OpenedTable`; consuming that handle with
-`scan` or `seek_rowid` produces the row stream. A dependent join can therefore
-open both tables in its entry block, compile a rowid key from the outer
-symbolic row, and turn the already-open inner table into a point stream inside
-`flat_map`. The inner cursor is repositioned per outer row without emitting an
-`OpenRead` in the loop. The `scan_table` and `seek_rowid` entry points are
-convenience compositions over this same resource API.
+`scan`, `seek_rowid`, or `seek_range` produces the row stream. A dependent join
+can therefore open both tables in its entry block, compile a point key or range
+endpoints from the outer symbolic row, and position the already-open inner
+table inside `flat_map`. The inner cursor is repositioned per outer row without
+emitting an `OpenRead` in the loop. The `scan_table`, `seek_rowid`, and
+`seek_table_range` entry points are convenience compositions over this same
+resource API.
 Index acquisition follows the same contract. `open_index` produces an
 `OpenedIndex` that owns the index cursor and, for a non-covering access, its
 table cursor and deferred-seek relationship. `scan` or `seek` consumes the
@@ -204,10 +205,10 @@ each `WHEN` arm. The compiler evaluates the base once, retains its `ValueId`,
 and composes each ordered arm from `then`, `and_then`, comparison, and `branch`;
 NULL comparison results follow the false arm, as required by SQLite.
 The path also falls back when SQL semantics still live in the eager frontend:
-other expression forms, outer and semi/anti joins, table-range and IN join
-inputs, unsupported index-range shapes, joins wider than two tables or spanning
-attached databases, aggregates, most subquery forms, generated values, arrays,
-and custom-type decoding.
+other expression forms, outer and semi/anti joins, IN join inputs, unsupported
+index-range shapes, joins wider than two tables or spanning attached databases,
+aggregates, most subquery forms, generated values, arrays, and custom-type
+decoding.
 `EXPLAIN QUERY PLAN` also remains on the eager path until the IR models
 explain-tree effects.
 Ordinary column lowering does reuse the VDBE backend's logical-column helper, so

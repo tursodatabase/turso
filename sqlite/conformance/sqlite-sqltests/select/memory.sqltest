@@ -2128,6 +2128,28 @@ expect {
 }
 
 @cross-check-integrity
+test symbolic-dependent-table-range-join-stream {
+    CREATE TABLE range_windows(
+        id INTEGER PRIMARY KEY, lo INTEGER, hi INTEGER, bias INTEGER
+    );
+    CREATE TABLE range_points(id INTEGER PRIMARY KEY, value INTEGER);
+    INSERT INTO range_windows VALUES
+        (1, 1, 3, 10), (2, 3, 5, 100), (3, NULL, 6, 1000);
+    INSERT INTO range_points VALUES
+        (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60);
+    SELECT w.id, p.id, w.bias + p.value
+      FROM range_windows AS w
+      JOIN range_points AS p ON p.id > w.lo AND p.id <= w.hi
+     WHERE p.value >= w.id;
+}
+expect {
+    1|2|30
+    1|3|40
+    2|4|140
+    2|5|150
+}
+
+@cross-check-integrity
 test symbolic-dependent-index-join-stream {
     CREATE TABLE join_keys(id INTEGER PRIMARY KEY, key TEXT, bonus INTEGER);
     CREATE TABLE join_values(id INTEGER PRIMARY KEY, key TEXT, amount INTEGER);
