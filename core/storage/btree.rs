@@ -10607,6 +10607,52 @@ mod tests {
         }
     }
 
+    /// No sanctioned path reaches drop_cell with an overflow cell after cell_idx, so build it by hand.
+    #[test]
+    #[should_panic(expected = "pending overflow cell positioned after dropped cell")]
+    fn test_drop_cell_rejects_overflow_cell_after_dropped_cell() {
+        let (pager, _, _, _) = empty_btree();
+        let usable_space = pager.usable_space();
+
+        let page = run_until_done(|| pager.allocate_page(), &pager).unwrap();
+        btree_init_page(&page, PageType::TableLeaf, 0, usable_space);
+        let page_contents = page.get_contents();
+
+        // Populate the leaf with a handful of regular cells.
+        for i in 0..10 {
+            let regs = &[Register::Value(Value::from_i64(i))];
+            let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
+            let mut payload = crate::alloc::vec![];
+            let mut fill_state = FillCellPayloadState::Start;
+            run_until_done(
+                || {
+                    fill_cell_payload(
+                        &PinGuard::new(page.clone()),
+                        Some(i),
+                        &mut payload,
+                        i as usize,
+                        &record,
+                        usable_space,
+                        pager.clone(),
+                        &mut fill_state,
+                    )
+                },
+                &pager,
+            )
+            .unwrap();
+            insert_into_cell(page_contents, &payload, i as usize, usable_space).unwrap();
+        }
+        assert_eq!(page_contents.cell_count(), 10);
+
+        // Illegal state: pending overflow at index 8, dropping index 5.
+        page_contents.overflow_cells.push(OverflowCell {
+            index: 8,
+            payload: std::pin::Pin::new(crate::alloc::vec![1, 2, 3, 4]),
+        });
+
+        let _ = drop_cell(page_contents, 5, usable_space);
+    }
+
     fn validate_btree(pager: Arc<Pager>, page_idx: i64) -> (usize, bool) {
         let num_columns = 5;
         let cursor = BTreeCursor::new_table(pager.clone(), page_idx, num_columns);
