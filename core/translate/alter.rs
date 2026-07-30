@@ -1925,6 +1925,24 @@ pub fn translate_alter_table(
                 }
             }
 
+            // Changing to a custom type would need the type's encode and
+            // validation rules to run on every stored value, which the row
+            // rewrite does not do. Require an empty table (checked at
+            // runtime), like ADD COLUMN does for CHECK constraints.
+            let changes_to_custom_type = !rename
+                && btree.is_strict
+                && replacement_column.as_ref().is_some_and(|column| {
+                    !column
+                        .ty_str
+                        .eq_ignore_ascii_case(&btree.columns()[column_index].ty_str)
+                        && resolver
+                            .schema()
+                            .resolve_type(&column.ty_str, true)
+                            .ok()
+                            .flatten()
+                            .is_some()
+                });
+
             let clears_autoincrement_sequence = !rename
                 && btree.has_autoincrement
                 && btree.columns()[column_index].is_rowid_alias()
@@ -2272,6 +2290,29 @@ pub fn translate_alter_table(
                     value: temp_schema_version as i32 + 1,
                     p5: 0,
                 });
+            }
+
+            if changes_to_custom_type {
+                let check_cursor_id =
+                    program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+                program.emit_insn(Insn::OpenRead {
+                    cursor_id: check_cursor_id,
+                    root_page: original_btree.root_page,
+                    db: database_id,
+                });
+                let skip_error_label = program.allocate_label();
+                program.emit_insn(Insn::Rewind {
+                    cursor_id: check_cursor_id,
+                    pc_if_empty: skip_error_label,
+                });
+                program.emit_insn(Insn::Halt {
+                    err_code: 1,
+                    description: "Cannot change a column to a custom type on a non-empty table"
+                        .to_string(),
+                    on_error: None,
+                    description_reg: None,
+                });
+                program.preassign_label_to_next_insn(skip_error_label);
             }
 
             if let Some(altered_table) = altered_table {

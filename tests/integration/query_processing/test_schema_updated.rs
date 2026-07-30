@@ -384,9 +384,7 @@ fn test_alter_column_visible_to_other_connection() {
     let conn1 = db.connect_limbo();
     let conn2 = db.connect_limbo();
 
-    conn1
-        .execute("CREATE TABLE t (a INTEGER, b TEXT)")
-        .unwrap();
+    conn1.execute("CREATE TABLE t (a INTEGER, b TEXT)").unwrap();
     conn2.execute("INSERT INTO t (a) VALUES (1)").unwrap();
 
     conn1

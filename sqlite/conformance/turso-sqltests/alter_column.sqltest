@@ -1520,3 +1520,33 @@ test fail-alter-column-add-notnull-with-nulls-mvcc {
 }
 expect error {
 }
+
+# Changing to a custom type must not leave stored values the type's own
+# rules reject. Custom-type encoding does not run on existing rows, so
+# the change requires an empty table.
+test fail-alter-column-to-custom-type-nonempty {
+    CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    INSERT INTO b VALUES (1, 'abcdef');
+    ALTER TABLE b ALTER COLUMN v TO v VARCHAR(3);
+}
+expect error {
+}
+
+test alter-column-to-custom-type-empty-table {
+    CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    ALTER TABLE b ALTER COLUMN v TO v VARCHAR(3);
+    INSERT INTO b VALUES (1, 'abc');
+    SELECT v FROM b;
+}
+expect {
+    abc
+}
+
+# The custom type's rules apply to writes after the change.
+test fail-insert-too-long-after-alter-to-varchar {
+    CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    ALTER TABLE b ALTER COLUMN v TO v VARCHAR(3);
+    INSERT INTO b VALUES (1, 'toolong');
+}
+expect error {
+}
