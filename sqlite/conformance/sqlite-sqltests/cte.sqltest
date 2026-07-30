@@ -1463,3 +1463,29 @@ expect {
     1
     2
 }
+
+# Regression test: a WITH-clause CTE referenced from an expression subquery
+# nested inside a FROM-clause derived table (shape from TPC-DS q23).
+test cte-referenced-from-subquery-in-derived-table {
+    CREATE TABLE items(i INT, cnt INT);
+    INSERT INTO items VALUES (1, 5), (2, 10), (3, 1);
+    WITH frequent AS (SELECT i FROM items WHERE cnt > 3)
+    SELECT * FROM (SELECT i FROM items WHERE i IN (SELECT i FROM frequent)) ORDER BY i;
+}
+expect {
+    1
+    2
+}
+
+test multiple-ctes-referenced-from-subqueries-in-derived-table {
+    CREATE TABLE items(i INT, cnt INT);
+    INSERT INTO items VALUES (1, 5), (2, 10), (3, 1);
+    WITH a AS (SELECT i FROM items WHERE cnt >= 5),
+         b AS (SELECT i FROM items WHERE cnt >= 10)
+    SELECT * FROM (SELECT i FROM items
+                   WHERE i IN (SELECT i FROM a)
+                     AND EXISTS (SELECT 1 FROM b WHERE b.i = items.i)) ORDER BY i;
+}
+expect {
+    2
+}

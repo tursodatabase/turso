@@ -411,7 +411,7 @@ pub struct BoundSubquery {
 }
 
 pub struct BoundSelect {
-    pub result_columns: Vec<BoundColumn>,
+    pub result_columns: Arc<Vec<BoundColumn>>,
     pub main_scope: BindScope,
     pub compound_scopes: Vec<BindScope>,
     pub tracking: BindTracking,
@@ -498,7 +498,7 @@ impl BoundDelete {
 #[derive(Clone)]
 struct OuterQueryFrame {
     scope: BindScopeRef,
-    aliases: Vec<BoundColumn>,
+    aliases: Arc<Vec<BoundColumn>>,
 }
 
 impl BoundSelect {
@@ -745,8 +745,10 @@ pub struct BindContext<'a, G: IdGenerator> {
     ctes: HashMap<String, CteEntry>,
 
     /// SELECT result columns for alias resolution in later phases.
-    /// Populated after binding the SELECT list.
-    aliases: Vec<BoundColumn>,
+    /// Populated after binding the SELECT list. Arc-shared so pushing a
+    /// subquery frame or switching phases never deep-clones the column
+    /// expressions (that cost scales with SELECT-list width).
+    aliases: Arc<Vec<BoundColumn>>,
 
     /// Current binding phase — controls alias visibility.
     phase: BindPhase,
@@ -785,7 +787,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             outer_frame_floor: 0,
             outer_from_scope: None,
             ctes: HashMap::default(),
-            aliases: Vec::new(),
+            aliases: Arc::new(Vec::new()),
             phase: BindPhase::NoAliases,
             allow_unbound: false,
             tracking: BindTracking::default(),
@@ -798,7 +800,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     // ── Outer scope stack (mirrors DataFusion PlannerContext) ─────────
 
     /// Push a scope onto the outer-scope stack (entering a subquery).
-    fn append_outer_query_scope(&mut self, scope: BindScopeRef, aliases: Vec<BoundColumn>) {
+    fn append_outer_query_scope(&mut self, scope: BindScopeRef, aliases: Arc<Vec<BoundColumn>>) {
         self.outer_query_frames
             .push(OuterQueryFrame { scope, aliases });
     }
@@ -851,7 +853,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         self.phase
     }
 
-    fn set_aliases(&mut self, aliases: Vec<BoundColumn>) {
+    fn set_aliases(&mut self, aliases: Arc<Vec<BoundColumn>>) {
         self.aliases = aliases;
     }
 
@@ -1052,7 +1054,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             // result-column position/name across all constituent SELECTs
             // (see resolve_compound_order_by_expr in the planner), so the raw
             // identifiers must be preserved.
-            ctx.set_aliases(result_columns.clone());
+            ctx.set_aliases(Arc::clone(&result_columns));
             if select.body.compounds.is_empty() {
                 ctx.with_phase(BindPhase::AliasFirst, |ctx| {
                     for sort_col in &mut select.order_by {
@@ -1109,7 +1111,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     fn bind_one_select(
         &mut self,
         one: &mut ast::OneSelect,
-    ) -> Result<(Vec<BoundColumn>, BindScope)> {
+    ) -> Result<(Arc<Vec<BoundColumn>>, BindScope)> {
         self.with_scope(|ctx| {
             match one {
                 ast::OneSelect::Select {
@@ -1149,10 +1151,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
                     // 5. Extract bound columns (names + resolved exprs) before
                     //    the main bind pass rewrites the AST in-place.
-                    let bound_columns = ctx.extract_bound_columns(columns, &scope)?;
+                    let bound_columns = Arc::new(ctx.extract_bound_columns(columns, &scope)?);
 
                     // 6. Store as aliases for later phases (WHERE, GROUP BY, ORDER BY)
-                    ctx.set_aliases(bound_columns.clone());
+                    ctx.set_aliases(Arc::clone(&bound_columns));
 
                     // 7. Bind SELECT expressions in-place (NoAliases phase)
                     ctx.with_phase(BindPhase::NoAliases, |ctx| {
@@ -1182,13 +1184,15 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     // Generate column1, column2, ... names from the arity
                     // of the first VALUES row (matching SQLite behavior).
                     let num_cols = rows.first().map_or(0, |row| row.len());
-                    let bound_columns: Vec<BoundColumn> = (0..num_cols)
-                        .map(|i| BoundColumn {
-                            name: format!("column{}", i + 1),
-                            expr: ast::Expr::Literal(ast::Literal::Numeric(i.to_string())),
-                            is_explicit_alias: false,
-                        })
-                        .collect();
+                    let bound_columns: Arc<Vec<BoundColumn>> = Arc::new(
+                        (0..num_cols)
+                            .map(|i| BoundColumn {
+                                name: format!("column{}", i + 1),
+                                expr: ast::Expr::Literal(ast::Literal::Numeric(i.to_string())),
+                                is_explicit_alias: false,
+                            })
+                            .collect(),
+                    );
                     for row in rows.iter_mut() {
                         for expr in row.iter_mut() {
                             ctx.bind_expr(expr, &scope)?;
@@ -2425,7 +2429,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         scope: &BindScope,
     ) -> Result<BoundSelect> {
         #[expect(clippy::arc_with_non_send_sync)]
-        self.append_outer_query_scope(Arc::new(scope.clone()), self.aliases.clone());
+        self.append_outer_query_scope(Arc::new(scope.clone()), Arc::clone(&self.aliases));
         let result = self.bind_select(select);
         self.pop_outer_query_scope();
         result

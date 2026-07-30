@@ -1775,11 +1775,36 @@ pub fn plan_derived_tables_with_outer_refs(
             outer_query_refs.clone(),
         )?;
 
-        let all_table_refs = inner_bound.into_table_references_with_outer_refs(
+        let mut all_table_refs = inner_bound.into_table_references_with_outer_refs(
             &mut inner_planned_ctes,
             &mut inner_planned_derived,
             outer_query_refs.clone(),
         )?;
+
+        // Expose the planned CTEs (own + inherited from the parent scope) as
+        // definition-only outer refs so expression subqueries inside this
+        // derived table can still reference them (e.g. a WITH-clause CTE read
+        // from an IN (...) subquery nested in a FROM subquery).
+        for tr in &mut all_table_refs {
+            for (name, jt) in inner_planned_ctes.iter() {
+                if tr.outer_query_refs().iter().any(|r| r.identifier == *name) {
+                    continue;
+                }
+                tr.add_outer_query_reference(OuterQueryReference {
+                    identifier: name.clone(),
+                    internal_id: jt.internal_id,
+                    table: jt.table.clone(),
+                    using_dedup_hidden_cols: ColumnMask::default(),
+                    col_used_mask: ColumnUsedMask::default(),
+                    cte_select: None,
+                    cte_explicit_columns: vec![],
+                    cte_id: None,
+                    cte_definition_only: true,
+                    rowid_referenced: false,
+                    scope_depth: 0,
+                });
+            }
+        }
 
         let subplan = prepare_select_plan(
             bound_sq.select,
