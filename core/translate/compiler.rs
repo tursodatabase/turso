@@ -334,7 +334,7 @@ pub(crate) struct ForEachRow<BodyFn, Body> {
     cursor: CursorId,
     row_cursor: CursorId,
     deferred_seek: Option<DeferredSeekCursors>,
-    direction: ScanDirection,
+    source: CursorRowSource,
     body: BodyFn,
     compiler: PhantomData<fn() -> Body>,
 }
@@ -345,7 +345,7 @@ pub(crate) struct TryFoldRows<Initial, BodyFn, Body> {
     cursor: CursorId,
     row_cursor: CursorId,
     deferred_seek: Option<DeferredSeekCursors>,
-    direction: ScanDirection,
+    source: CursorRowSource,
     body: BodyFn,
     compiler: PhantomData<fn() -> Body>,
 }
@@ -400,13 +400,22 @@ where
         let row = builder.create_block()?;
         let exit = builder.create_block()?;
 
-        builder.terminate(Terminator::CursorStart {
-            cursor: self.cursor,
-            direction: self.direction,
-            if_non_empty: row,
-            if_empty: exit,
-            arguments: SmallVec::new(),
-        })?;
+        match self.source {
+            CursorRowSource::Scan(direction) => builder.terminate(Terminator::CursorStart {
+                cursor: self.cursor,
+                direction,
+                if_non_empty: row,
+                if_empty: exit,
+                arguments: SmallVec::new(),
+            })?,
+            CursorRowSource::Rowid(rowid) => builder.terminate(Terminator::CursorSeekRowid {
+                cursor: self.cursor,
+                rowid,
+                if_found: row,
+                if_not_found: exit,
+                arguments: SmallVec::new(),
+            })?,
+        }
 
         builder.switch_to(row)?;
         if let Some(seek) = self.deferred_seek {
@@ -419,13 +428,19 @@ where
             cursor: self.row_cursor,
         })
         .compile(builder)?;
-        builder.terminate(Terminator::CursorAdvance {
-            cursor: self.cursor,
-            direction: self.direction,
-            if_next: row,
-            if_done: exit,
-            arguments: SmallVec::new(),
-        })?;
+        match self.source {
+            CursorRowSource::Scan(direction) => builder.terminate(Terminator::CursorAdvance {
+                cursor: self.cursor,
+                direction,
+                if_next: row,
+                if_done: exit,
+                arguments: SmallVec::new(),
+            })?,
+            CursorRowSource::Rowid(_) => builder.terminate(Terminator::Jump {
+                target: exit,
+                arguments: SmallVec::new(),
+            })?,
+        }
 
         builder.switch_to(exit)
     }
@@ -452,13 +467,22 @@ where
             result_state.push(builder.add_block_parameter(exit)?);
         }
 
-        builder.terminate(Terminator::CursorStart {
-            cursor: self.cursor,
-            direction: self.direction,
-            if_non_empty: row,
-            if_empty: exit,
-            arguments: initial.values,
-        })?;
+        match self.source {
+            CursorRowSource::Scan(direction) => builder.terminate(Terminator::CursorStart {
+                cursor: self.cursor,
+                direction,
+                if_non_empty: row,
+                if_empty: exit,
+                arguments: initial.values,
+            })?,
+            CursorRowSource::Rowid(rowid) => builder.terminate(Terminator::CursorSeekRowid {
+                cursor: self.cursor,
+                rowid,
+                if_found: row,
+                if_not_found: exit,
+                arguments: initial.values,
+            })?,
+        }
 
         builder.switch_to(row)?;
         if let Some(seek) = self.deferred_seek {
@@ -488,13 +512,19 @@ where
         })?;
 
         builder.switch_to(advance)?;
-        builder.terminate(Terminator::CursorAdvance {
-            cursor: self.cursor,
-            direction: self.direction,
-            if_next: row,
-            if_done: exit,
-            arguments: step.state.values.clone(),
-        })?;
+        match self.source {
+            CursorRowSource::Scan(direction) => builder.terminate(Terminator::CursorAdvance {
+                cursor: self.cursor,
+                direction,
+                if_next: row,
+                if_done: exit,
+                arguments: step.state.values.clone(),
+            })?,
+            CursorRowSource::Rowid(_) => builder.terminate(Terminator::Jump {
+                target: exit,
+                arguments: step.state.values.clone(),
+            })?,
+        }
 
         builder.switch_to(stop)?;
         builder.terminate(Terminator::Jump {
@@ -1090,6 +1120,13 @@ enum Terminator {
         if_empty: BlockId,
         arguments: SmallVec<[ValueId; 2]>,
     },
+    CursorSeekRowid {
+        cursor: CursorId,
+        rowid: ValueId,
+        if_found: BlockId,
+        if_not_found: BlockId,
+        arguments: SmallVec<[ValueId; 2]>,
+    },
     CursorAdvance {
         cursor: CursorId,
         direction: ScanDirection,
@@ -1149,6 +1186,16 @@ impl Terminator {
                 Some((*if_empty, arguments.as_slice())),
                 None,
             ],
+            Self::CursorSeekRowid {
+                if_found,
+                if_not_found,
+                arguments,
+                ..
+            } => [
+                Some((*if_found, arguments.as_slice())),
+                Some((*if_not_found, arguments.as_slice())),
+                None,
+            ],
             Self::CursorAdvance {
                 if_next,
                 if_done,
@@ -1200,6 +1247,9 @@ impl Terminator {
             | Self::CursorAdvance { arguments, .. }
             | Self::SorterSort { arguments, .. }
             | Self::SorterNext { arguments, .. } => (None, None, arguments.as_slice()),
+            Self::CursorSeekRowid {
+                rowid, arguments, ..
+            } => (Some(*rowid), None, arguments.as_slice()),
             Self::DistinctCheck { pack, .. } => (None, None, pack.values()),
         };
         first.into_iter().chain(second).chain(rest.iter().copied())
@@ -1209,6 +1259,7 @@ impl Terminator {
         let operands = match self {
             Self::Branch { condition, .. } | Self::Return(condition) => smallvec![*condition],
             Self::Compare { lhs, rhs, .. } => smallvec![*lhs, *rhs],
+            Self::CursorSeekRowid { rowid, .. } => smallvec![*rowid],
             Self::DistinctCheck { pack, .. } => pack.values().iter().copied().collect(),
             Self::Jump { .. }
             | Self::CursorStart { .. }
@@ -1221,7 +1272,9 @@ impl Terminator {
 
     fn cursor(&self) -> Option<CursorId> {
         match self {
-            Self::CursorStart { cursor, .. } | Self::CursorAdvance { cursor, .. } => Some(*cursor),
+            Self::CursorStart { cursor, .. }
+            | Self::CursorSeekRowid { cursor, .. }
+            | Self::CursorAdvance { cursor, .. } => Some(*cursor),
             Self::Jump { .. } | Self::Branch { .. } | Self::Compare { .. } | Self::Return(_) => {
                 None
             }
@@ -1236,6 +1289,7 @@ impl Terminator {
             | Self::Branch { .. }
             | Self::Compare { .. }
             | Self::CursorStart { .. }
+            | Self::CursorSeekRowid { .. }
             | Self::CursorAdvance { .. }
             | Self::DistinctCheck { .. }
             | Self::Return(_) => None,
@@ -1249,6 +1303,7 @@ impl Terminator {
             | Self::Branch { .. }
             | Self::Compare { .. }
             | Self::CursorStart { .. }
+            | Self::CursorSeekRowid { .. }
             | Self::CursorAdvance { .. }
             | Self::SorterSort { .. }
             | Self::SorterNext { .. }
@@ -1294,6 +1349,14 @@ impl Terminator {
             } => {
                 remap_target(if_non_empty)?;
                 remap_target(if_empty)
+            }
+            Self::CursorSeekRowid {
+                if_found,
+                if_not_found,
+                ..
+            } => {
+                remap_target(if_found)?;
+                remap_target(if_not_found)
             }
             Self::CursorAdvance {
                 if_next, if_done, ..
@@ -1360,6 +1423,19 @@ impl Terminator {
                     "shared cursor edge targets must retain the same parameter positions"
                 );
                 retain_live_arguments(arguments, &parameter_live[if_non_empty.index()])
+            }
+            Self::CursorSeekRowid {
+                if_found,
+                if_not_found,
+                arguments,
+                ..
+            } => {
+                assert_eq!(
+                    parameter_live[if_found.index()],
+                    parameter_live[if_not_found.index()],
+                    "shared cursor edge targets must retain the same parameter positions"
+                );
+                retain_live_arguments(arguments, &parameter_live[if_found.index()])
             }
             Self::CursorAdvance {
                 if_next,
@@ -2099,6 +2175,7 @@ impl IrProgram {
                 | Terminator::Branch { .. }
                 | Terminator::Compare { .. }
                 | Terminator::CursorStart { .. }
+                | Terminator::CursorSeekRowid { .. }
                 | Terminator::CursorAdvance { .. }
                 | Terminator::DistinctCheck { .. }
                 | Terminator::Return(_) => {}
@@ -2389,6 +2466,11 @@ impl IrProgram {
                     if_empty,
                     ..
                 } => Some((*if_non_empty, *if_empty)),
+                Terminator::CursorSeekRowid {
+                    if_found,
+                    if_not_found,
+                    ..
+                } => Some((*if_found, *if_not_found)),
                 Terminator::CursorAdvance {
                     if_next, if_done, ..
                 } => Some((*if_next, *if_done)),
@@ -2735,6 +2817,11 @@ impl IrProgram {
                     if_empty,
                     ..
                 } => Some((*if_non_empty, *if_empty)),
+                Terminator::CursorSeekRowid {
+                    if_found,
+                    if_not_found,
+                    ..
+                } => Some((*if_found, *if_not_found)),
                 Terminator::CursorAdvance {
                     if_next, if_done, ..
                 } => Some((*if_next, *if_done)),
@@ -3443,6 +3530,27 @@ impl IrProgram {
                         target_pc: labels[if_non_empty.index()],
                     });
                 }
+                Terminator::CursorSeekRowid {
+                    cursor,
+                    rowid,
+                    if_found,
+                    if_not_found,
+                    arguments,
+                } => {
+                    let mut copies = SmallVec::new();
+                    for target in [if_found, if_not_found] {
+                        self.collect_edge_copies(&registers, *target, arguments, &mut copies);
+                    }
+                    Self::emit_parallel_copies(program, copies, &mut edge_copy_temporary);
+                    program.emit_insn(Insn::SeekRowid {
+                        cursor_id: Self::cursor_for(&physical_cursors, *cursor),
+                        src_reg: Self::register_for(&registers, *rowid),
+                        target_pc: labels[if_not_found.index()],
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: labels[if_found.index()],
+                    });
+                }
                 Terminator::CursorAdvance {
                     cursor,
                     direction,
@@ -3767,6 +3875,23 @@ impl fmt::Display for IrProgram {
                     Self::fmt_arguments(f, arguments)?;
                     writeln!(f, ")")?;
                 }
+                Terminator::CursorSeekRowid {
+                    cursor,
+                    rowid,
+                    if_found,
+                    if_not_found,
+                    arguments,
+                } => {
+                    write!(
+                        f,
+                        "cursor_seek_rowid ${}, %{}, block{}(",
+                        cursor.0, rowid.0, if_found.0
+                    )?;
+                    Self::fmt_arguments(f, arguments)?;
+                    write!(f, "), block{}(", if_not_found.0)?;
+                    Self::fmt_arguments(f, arguments)?;
+                    writeln!(f, ")")?;
+                }
                 Terminator::CursorAdvance {
                     cursor,
                     direction,
@@ -3874,7 +3999,13 @@ pub(crate) struct CursorRows {
     cursor: CursorId,
     row_cursor: CursorId,
     deferred_seek: Option<DeferredSeekCursors>,
-    direction: ScanDirection,
+    source: CursorRowSource,
+}
+
+#[derive(Clone, Copy)]
+enum CursorRowSource {
+    Scan(ScanDirection),
+    Rowid(ValueId),
 }
 
 #[derive(Clone, Copy)]
@@ -4024,7 +4155,7 @@ impl RowStream for CursorRows {
             cursor: self.cursor,
             row_cursor: self.row_cursor,
             deferred_seek: self.deferred_seek,
-            direction: self.direction,
+            source: self.source,
             body,
             compiler: PhantomData,
         }
@@ -4041,7 +4172,7 @@ impl RowStream for CursorRows {
             cursor: self.cursor,
             row_cursor: self.row_cursor,
             deferred_seek: self.deferred_seek,
-            direction: self.direction,
+            source: self.source,
             body,
             compiler: PhantomData,
         }
@@ -4753,7 +4884,12 @@ enum ScanBtreeSource {
 /// Opens a B-tree source when compiled and returns its symbolic row stream.
 pub(crate) struct ScanBtree {
     source: ScanBtreeSource,
-    direction: ScanDirection,
+    start: ScanBtreeStart,
+}
+
+enum ScanBtreeStart {
+    Full(ScanDirection),
+    Rowid(BoxedCompile<ValueId>),
 }
 
 pub(crate) fn scan_table(
@@ -4764,7 +4900,19 @@ pub(crate) fn scan_table(
 ) -> ScanBtree {
     ScanBtree {
         source: ScanBtreeSource::Table(open_read_table(table, db, schema_cookie)),
-        direction,
+        start: ScanBtreeStart::Full(direction),
+    }
+}
+
+pub(crate) fn seek_rowid(
+    table: Arc<BTreeTable>,
+    db: usize,
+    schema_cookie: u32,
+    rowid: BoxedCompile<ValueId>,
+) -> ScanBtree {
+    ScanBtree {
+        source: ScanBtreeSource::Table(open_read_table(table, db, schema_cookie)),
+        start: ScanBtreeStart::Rowid(rowid),
     }
 }
 
@@ -4785,7 +4933,10 @@ pub(crate) fn scan_index(
             index,
         }
     };
-    ScanBtree { source, direction }
+    ScanBtree {
+        source,
+        start: ScanBtreeStart::Full(direction),
+    }
 }
 
 impl Compile for ScanBtree {
@@ -4807,11 +4958,15 @@ impl Compile for ScanBtree {
                 (index, table, Some(DeferredSeekCursors { index, table }))
             }
         };
+        let source = match self.start {
+            ScanBtreeStart::Full(direction) => CursorRowSource::Scan(direction),
+            ScanBtreeStart::Rowid(rowid) => CursorRowSource::Rowid(rowid.compile(builder)?),
+        };
         Ok(CursorRows {
             cursor,
             row_cursor,
             deferred_seek,
-            direction: self.direction,
+            source,
         })
     }
 }
@@ -5485,6 +5640,47 @@ mod tests {
         assert!(program.insns.iter().all(|(instruction, _)| !matches!(
             instruction,
             Insn::Rewind { .. } | Insn::Next { .. }
+        )));
+    }
+
+    #[test]
+    fn rowid_point_stream_seeks_once_without_building_a_scan_loop() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE pointed(a)", 2).unwrap());
+        let compiler =
+            seek_rowid(table, 0, 0, constant(Value::from_i64(7)).boxed()).and_then(|rows| {
+                rows.for_each(|row| {
+                    pack_values(smallvec![row.rowid().boxed(), row.column(0).boxed()])
+                        .and_then(result_row_pack)
+                })
+            });
+
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+
+        assert!(rendered.contains("%0 = constant Numeric(Integer(7))"));
+        assert!(rendered.contains("cursor_seek_rowid $0, %0, block1(), block2()"));
+        assert!(rendered.contains("%1 = rowid $0"));
+        assert!(rendered.contains("%2 = column $0[0]"));
+        assert!(!rendered.contains("cursor_start"));
+        assert!(!rendered.contains("cursor_advance"));
+
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 2, 0));
+        let target = program.alloc_register();
+        ir.lower_into(&mut program, target).unwrap();
+        program.resolve_labels().unwrap();
+
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::SeekRowid { .. }))
+                .count(),
+            1
+        );
+        assert!(program.insns.iter().all(|(instruction, _)| !matches!(
+            instruction,
+            Insn::Rewind { .. } | Insn::Last { .. } | Insn::Next { .. } | Insn::Prev { .. }
         )));
     }
 

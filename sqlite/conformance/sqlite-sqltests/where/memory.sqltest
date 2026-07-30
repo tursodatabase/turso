@@ -38,6 +38,18 @@ expect {
     2
 }
 
+@cross-check-integrity
+test where-declarative-rowid-point-expression {
+    CREATE TABLE declarative_point(id INTEGER PRIMARY KEY, payload TEXT);
+    INSERT INTO declarative_point VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    SELECT rowid, id, payload
+      FROM declarative_point
+     WHERE rowid = 1 + 1;
+}
+expect {
+    2|2|two
+}
+
 # in WHERE clauses, column aliases do not take precedence when resolving identifiers to columns.
 @cross-check-integrity
 test where_alias_precedence {

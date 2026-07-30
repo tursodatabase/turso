@@ -7,8 +7,9 @@ use crate::{
         aggregation::emit_ungrouped_aggregation,
         collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         compiler::{
-            compile_effect, pack_values, result_row_pack, scan_index, scan_table, select_pack,
-            BoxedCompile, Compile, Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId,
+            compile_effect, pack_values, result_row_pack, scan_index, scan_table, seek_rowid,
+            select_pack, BoxedCompile, Compile, Row, RowStream, ScanDirection, SortKey, SortedRow,
+            ValueId,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -104,24 +105,28 @@ fn try_emit_declarative_table_scan(
     {
         return Ok(None);
     }
-    let Operation::Scan(Scan::BTreeTable { iter_dir, index }) = &joined.op else {
-        return Ok(None);
-    };
-    let direction = match iter_dir {
-        IterationDirection::Forwards => ScanDirection::Forward,
-        IterationDirection::Backwards => ScanDirection::Reverse,
+    let (direction, index, rowid_eq) = match &joined.op {
+        Operation::Scan(Scan::BTreeTable { iter_dir, index }) => (
+            match iter_dir {
+                IterationDirection::Forwards => ScanDirection::Forward,
+                IterationDirection::Backwards => ScanDirection::Reverse,
+            },
+            index.as_ref(),
+            None,
+        ),
+        Operation::Search(Search::RowidEq { cmp_expr }) => {
+            (ScanDirection::Forward, None, Some(cmp_expr))
+        }
+        _ => return Ok(None),
     };
     let Table::BTree(table) = &joined.table else {
         return Ok(None);
     };
-    if index
-        .as_ref()
-        .is_some_and(|index| index.ephemeral || index.index_method.is_some())
-    {
+    if index.is_some_and(|index| index.ephemeral || index.index_method.is_some()) {
         return Ok(None);
     }
     let covering_index = index
-        .as_deref()
+        .map(Arc::as_ref)
         .filter(|_| joined.utilizes_covering_index());
     let row_layout = covering_index
         .map(RowLayout::CoveringIndex)
@@ -135,6 +140,18 @@ fn try_emit_declarative_table_scan(
         row_layout,
         &plan.table_references,
     );
+    let rowid_eq = match rowid_eq {
+        None => None,
+        Some(rowid_eq) => {
+            let Some(rowid_eq) = expr_resolver.resolve(rowid_eq)? else {
+                return Ok(None);
+            };
+            let Some(rowid_eq) = compile_symbolic_static_expr(&rowid_eq) else {
+                return Ok(None);
+            };
+            Some(rowid_eq)
+        }
+    };
     let mut sort_keys = SmallVec::<[SortKey; 4]>::with_capacity(plan.order_by.len());
     let mut sort_expressions =
         SmallVec::<[ResolvedScalarExpr; 4]>::with_capacity(plan.order_by.len());
@@ -228,8 +245,9 @@ fn try_emit_declarative_table_scan(
     let database_id = joined.database_id;
     let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
     let result_column_count = projections.len();
-    let scan = match index {
-        Some(index) => scan_index(
+    let scan = match (rowid_eq, index) {
+        (Some(rowid), None) => seek_rowid(table, database_id, schema_cookie, rowid),
+        (None, Some(index)) => scan_index(
             table,
             index.clone(),
             covering_index.is_some(),
@@ -237,7 +255,8 @@ fn try_emit_declarative_table_scan(
             schema_cookie,
             direction,
         ),
-        None => scan_table(table, database_id, schema_cookie, direction),
+        (None, None) => scan_table(table, database_id, schema_cookie, direction),
+        (Some(_), Some(_)) => unreachable!("rowid searches do not use secondary indexes"),
     };
     let compiler = scan.and_then(move |rows| {
         if predicates.is_empty() {
@@ -1406,6 +1425,69 @@ fn build_materialized_build_input_plan(
 mod tests {
     use super::*;
     use crate::{io::MemoryIO, types::Value, Database, SqliteDialect};
+
+    #[test]
+    fn rowid_equality_uses_a_declarative_point_stream() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute("CREATE TABLE point(id INTEGER PRIMARY KEY, payload TEXT)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO point VALUES (1, 'one'), (2, 'two')")
+            .unwrap();
+
+        let mut statement = connection
+            .prepare("SELECT rowid, id, payload FROM point WHERE rowid = ?1 + 0")
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::SeekRowid { .. }))
+                .count(),
+            1
+        );
+        assert!(instructions.iter().all(|(instruction, _)| !matches!(
+            instruction,
+            Insn::Rewind { .. } | Insn::Last { .. } | Insn::Next { .. } | Insn::Prev { .. }
+        )));
+        let result_row = instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 3, .. }))
+            .expect("point stream must produce its projected row");
+        assert!(
+            instructions[result_row - 3..result_row]
+                .iter()
+                .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })),
+            "point-stream projections must remain symbolic until lowering"
+        );
+
+        statement
+            .bind_at(1.try_into().unwrap(), Value::from_i64(2))
+            .unwrap();
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![vec![
+                Value::from_i64(2),
+                Value::from_i64(2),
+                Value::from_text("two"),
+            ]]
+        );
+
+        statement.reset().unwrap();
+        statement
+            .bind_at(1.try_into().unwrap(), Value::from_i64(99))
+            .unwrap();
+        assert!(statement.run_collect_rows().unwrap().is_empty());
+
+        statement.reset().unwrap();
+        statement
+            .bind_at(1.try_into().unwrap(), Value::Null)
+            .unwrap();
+        assert!(statement.run_collect_rows().unwrap().is_empty());
+    }
 
     #[test]
     fn simple_table_scan_crosses_the_declarative_compiler_boundary() {
