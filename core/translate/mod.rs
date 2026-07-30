@@ -11,6 +11,7 @@ pub(crate) mod aggregation;
 pub(crate) mod alter;
 pub(crate) mod analyze;
 pub(crate) mod attach;
+pub(crate) mod bind;
 pub(crate) mod collate;
 mod compound_select;
 pub(crate) mod delete;

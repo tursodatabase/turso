@@ -66,7 +66,7 @@ struct CteDefinition {
 
 /// Collect all table names referenced in a SELECT's FROM clause.
 /// Used to determine which earlier CTEs a CTE directly depends on.
-fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
+pub(crate) fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
     collect_from_select_body(&select.body, out);
     collect_subquery_table_refs_in_select_exprs(select, out);
 }

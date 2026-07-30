@@ -266,6 +266,11 @@ pub(crate) struct TriggerDatabaseContext {
 }
 
 impl TriggerDatabaseContext {
+    /// The database ID the trigger belongs to.
+    pub(crate) fn database_id(&self) -> usize {
+        self.database_id
+    }
+
     fn restricts_db_references(&self) -> bool {
         self.database_id != crate::TEMP_DB_ID
     }
