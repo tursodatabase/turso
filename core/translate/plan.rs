@@ -2531,7 +2531,14 @@ impl JoinedTable {
         internal_id: TableInternalId,
         explicit_columns: Option<&[String]>,
     ) -> Result<Self> {
-        let columns = query_output_columns(query, explicit_columns)?;
+        let mut columns = query_output_columns(query, explicit_columns)?;
+        // The recursive self-reference reads SQLite's queue table, whose
+        // columns have no declared type: comparisons in the recursive term
+        // see the stored value without the anchor query's affinity. Only the
+        // outer read of the CTE keeps the derived affinity.
+        for column in columns.iter_mut() {
+            column.set_base_affinity(Affinity::Blob);
+        }
         let table = Table::RecursiveCteInput(Arc::new(RecursiveCteInput {
             name: identifier.clone(),
             columns,

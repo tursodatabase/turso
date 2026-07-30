@@ -1829,6 +1829,38 @@ expect error {
     multiple recursive references: w
 }
 
+# The recursive self-reference reads the queue table, whose columns have no
+# declared type: text '2' compares after numeric 3, stopping the recursion.
+test recursive-cte-self-reference-has-no-affinity {
+    CREATE TABLE aff_anchor(a INT);
+    INSERT INTO aff_anchor VALUES(1);
+    WITH RECURSIVE c(x) AS (
+        SELECT a FROM aff_anchor
+        UNION ALL
+        SELECT '2' FROM c WHERE x < 3
+    )
+    SELECT count(*) FROM c;
+}
+expect {
+    2
+}
+
+# The outer read of the CTE keeps the affinity derived from the anchor query,
+# so comparing against text '1' still coerces.
+test recursive-cte-outer-read-keeps-anchor-affinity {
+    CREATE TABLE aff_anchor_outer(a INT);
+    INSERT INTO aff_anchor_outer VALUES(1);
+    WITH RECURSIVE c(x) AS (
+        SELECT a FROM aff_anchor_outer
+        UNION ALL
+        SELECT x FROM c WHERE 0
+    )
+    SELECT x = '1' FROM c;
+}
+expect {
+    1
+}
+
 # Seven recursive CTEs at the 2000-column limit need well over 65535 registers
 # in one program; register-carrying instruction fields must not overflow.
 test recursive-cte-many-max-width-ctes-no-register-overflow {
