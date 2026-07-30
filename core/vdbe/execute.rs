@@ -15364,19 +15364,36 @@ pub fn op_alter_column(
             .expect("btree column should be named")
             .clone();
 
-        // Update this table's indexes that reference the old column.
+        // Update this table's indexes that reference the old column. Index
+        // expressions store column references in SELF_TABLE positional form,
+        // which is unaffected by a rename — only leftover raw identifiers
+        // (lenient schema load) and the display name need updating.
         if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
+            let mut renamed_columns = btree.columns().to_vec();
+            if *rename {
+                if let Some(col) = renamed_columns.get_mut(*column_index) {
+                    col.name = Some(new_name.clone());
+                }
+            }
             for idx in idxs {
                 let idx = Arc::make_mut(idx);
                 for ic in &mut idx.columns {
                     if let Some(expr) = &mut ic.expr {
                         rename_identifiers(expr.as_mut(), &old_column_name, &new_name);
-                        ic.name = expr.to_string();
+                        if ic.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL {
+                            ic.name = crate::schema::render_gencol_expr_sql_with_new_names(
+                                expr,
+                                &renamed_columns,
+                            )?;
+                        } else if ic.name.eq_ignore_ascii_case(&existing_column_name) {
+                            ic.name.clone_from(&new_name);
+                        }
                     } else if ic.name.eq_ignore_ascii_case(&existing_column_name) {
                         ic.name.clone_from(&new_name);
                     }
                 }
-                // Update partial index WHERE clause column references
+                // Update leftover raw identifiers in the partial index WHERE
+                // clause (SELF_TABLE references survive renames unchanged).
                 if let Some(ref mut wc) = idx.where_clause {
                     rename_identifiers(wc, &old_column_name, &new_name);
                 }

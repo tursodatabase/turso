@@ -379,8 +379,13 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
             }
         } else {
             // Expression target (e.g. lower(val)): match against expression index
-            // columns using semantic equivalence.
+            // columns using semantic equivalence. Index expressions are stored
+            // with column references pre-resolved to SELF_TABLE form, so bind
+            // the target expression the same way before comparing.
             let (target_expr, target_collate) = extract_target_expr(&te.expr);
+            let mut target_expr = target_expr.clone();
+            bind_partial_index_where_expr(&mut target_expr, table);
+            let target_expr = &target_expr;
             for (i, ic) in index.columns.iter().enumerate() {
                 if matched.get(i) {
                     continue;

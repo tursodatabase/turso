@@ -140,6 +140,12 @@ fn bind_expr_for_table(
     resolver: &Resolver,
 ) -> crate::Result<ast::Expr> {
     let mut out = expr.clone();
+    // Index key expressions, partial-index WHERE clauses, and generated
+    // columns are stored pre-resolved to SELF_TABLE form. CHECK constraints
+    // still carry raw identifiers, resolved by the fixed-scope binder below.
+    if let Some(jt) = table_references.joined_tables().first() {
+        crate::schema::bind_self_table_expr(&mut out, jt.internal_id);
+    }
     bind_fixed_scope_expr(&mut out, Some(table_references), resolver, false)?;
     Ok(out)
 }

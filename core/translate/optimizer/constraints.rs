@@ -3,15 +3,12 @@ use crate::{
     schema::{Column, Index, Schema},
     translate::{
         collate::get_collseq_from_expr,
-        expr::{
-            as_binary_components, comparison_affinity, get_expr_affinity, unwrap_parens,
-            walk_expr_mut, WalkControl,
-        },
+        expr::{as_binary_components, comparison_affinity, get_expr_affinity, unwrap_parens},
         expression_index::normalize_expr_for_index_matching,
         plan::{JoinOrderMember, JoinedTable, NonFromClauseSubquery, TableReferences, WhereTerm},
         planner::{
             break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
-            TableMask, ROWID_STRS,
+            TableMask,
         },
     },
     util::exprs_are_equivalent,
@@ -1339,63 +1336,11 @@ pub(super) fn can_use_partial_index(
     partial_index_predicate_terms(index, table_reference, query_where_clause).is_some()
 }
 
-/// Rewrite identifier nodes in a partial-index WHERE expression to bound
-/// `Expr::Column` / `Expr::RowId` against `table_reference`. Partial-index
-/// WHERE clauses are validated to only reference columns of the indexed
-/// table (`Index::validate_where_expr`), so this minimal binder is enough
-/// to make the expression directly comparable to a bound query expression
-/// via `exprs_are_equivalent` — without threading a full `Resolver`.
+/// Rewrite the pre-resolved `SELF_TABLE` references in a partial-index WHERE
+/// expression to `table_reference`'s id, making the expression directly
+/// comparable to a bound query expression via `exprs_are_equivalent`.
 fn bind_partial_index_columns(expr: &mut ast::Expr, table_reference: &JoinedTable) {
-    let column_pos = |name: &str| -> Option<usize> {
-        table_reference.columns().iter().position(|c| {
-            c.name
-                .as_ref()
-                .is_some_and(|cn| cn.eq_ignore_ascii_case(name))
-        })
-    };
-    let is_rowid_keyword = |name: &str| ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name));
-    let qualifier_matches = |ns: &str| -> bool {
-        ns.eq_ignore_ascii_case(&table_reference.identifier)
-            || ns.eq_ignore_ascii_case(table_reference.table.get_name())
-    };
-    let make_column = |col_idx: usize| -> ast::Expr {
-        let col = &table_reference.columns()[col_idx];
-        ast::Expr::Column {
-            database: None,
-            table: table_reference.internal_id,
-            column: col_idx,
-            is_rowid_alias: col.is_rowid_alias(),
-        }
-    };
-    let make_rowid = || -> ast::Expr {
-        ast::Expr::RowId {
-            database: None,
-            table: table_reference.internal_id,
-        }
-    };
-
-    let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        match e {
-            ast::Expr::Id(name) => {
-                if let Some(idx) = column_pos(name.as_str()) {
-                    *e = make_column(idx);
-                } else if is_rowid_keyword(name.as_str()) {
-                    *e = make_rowid();
-                }
-            }
-            ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
-                if qualifier_matches(ns.as_str()) {
-                    if let Some(idx) = column_pos(col.as_str()) {
-                        *e = make_column(idx);
-                    } else if is_rowid_keyword(col.as_str()) {
-                        *e = make_rowid();
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    });
+    crate::schema::bind_self_table_expr(expr, table_reference.internal_id);
 }
 
 /// Estimate the selectivity of a partial index's WHERE clause, i.e. what

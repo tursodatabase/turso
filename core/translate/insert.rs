@@ -3581,8 +3581,13 @@ fn emit_replace_delete_conflicting_row(
             .with_schema(ctx.database_id, |s| s.get_index(table_name, name).cloned())
             .expect("index to exist");
         let skip_delete_label = if index.where_clause.is_some() {
+            let target_internal_id = table_references
+                .joined_tables()
+                .first()
+                .expect("INSERT has a target table reference")
+                .internal_id;
             let where_copy = index
-                .bind_where_expr(Some(table_references), resolver)
+                .bind_where_expr(target_internal_id)
                 .expect("where clause to exist");
             let skip_label = program.allocate_label();
             let reg = program.alloc_register();

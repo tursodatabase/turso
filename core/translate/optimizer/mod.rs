@@ -1092,8 +1092,7 @@ fn update_write_set_reason(
         let affected_cols = btree_table.columns_affected_by_update(&updated_cols)?;
         for c in index.columns.iter() {
             if let Some(ref expr) = c.expr {
-                let expr_idx_cols_mask =
-                    expression_index_column_usage(expr.as_ref(), table_ref, resolver)?;
+                let expr_idx_cols_mask = expression_index_column_usage(expr.as_ref())?;
                 if expr_idx_cols_mask
                     .iter()
                     .any(|cidx| affected_cols.get(cidx))

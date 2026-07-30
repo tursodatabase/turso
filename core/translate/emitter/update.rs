@@ -445,7 +445,6 @@ pub fn emit_program_for_update(
         &all_index_cursors,
         target_table_cursor_id,
         target_table,
-        resolver,
         returning_buffer.as_ref(),
         &mut update_subqueries,
     )?;
@@ -1042,7 +1041,6 @@ fn emit_update_insns<'a>(
     all_index_cursors: &[(Arc<Index>, usize)],
     target_table_cursor_id: usize,
     target_table: Arc<JoinedTable>,
-    resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
 ) -> crate::Result<()> {
@@ -1779,7 +1777,7 @@ fn emit_update_insns<'a>(
             // This means that we need to bind the column references to a copy of the index Expr,
             // so we can emit Insn::Column instructions and refer to the old values.
             let where_clause = index
-                .bind_where_expr(Some(table_references), resolver)
+                .bind_where_expr(internal_id)
                 .expect("where clause to exist");
             let old_satisfied_reg = program.alloc_register();
             translate_expr_no_constant_opt(

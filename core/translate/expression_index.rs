@@ -1,8 +1,5 @@
-use crate::translate::bind::bind_fixed_scope_expr;
-use crate::translate::emitter::Resolver;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{ColumnUsedMask, JoinedTable, TableReferences};
-use crate::translate::planner::ROWID_STRS;
 use crate::Result;
 use turso_parser::ast;
 use turso_parser::ast::TableInternalId;
@@ -10,34 +7,28 @@ use turso_parser::ast::TableInternalId;
 /// Normalize a query expression so it can be compared with an
 /// expression stored on an index definition.
 ///
-/// We need to remove the bindings and turn them back into identifiers so we can say:
+/// Index expressions are stored with their column references pre-resolved to
+/// `SELF_TABLE` positional form at schema load. A bound query expression uses
+/// the query's table ids, so rewriting `table_reference`'s id back to
+/// `SELF_TABLE` makes both sides directly comparable:
 ///
-/// - `CREATE INDEX idx ON t(Expr::Id(a) + Expr::Id(b));`
-/// - `SELECT * FROM t WHERE Expr::Column(name: 'a') + Expr::Column(name: 'b') = 10;`
+/// - `CREATE INDEX idx ON t(a + b);` stores `Column(SELF, 0) + Column(SELF, 1)`
+/// - `SELECT * FROM t WHERE a + b = 10;` binds to `Column(t, 0) + Column(t, 1)`
 ///
-/// After normalization, both sides look like `Expr::Id('a') + Expr::Id('b')`, allowing an
-/// equality check to spot the match.
+/// After normalization, both sides look like `Column(SELF, 0) + Column(SELF, 1)`.
+/// Columns of other tables keep their real ids and can never match.
 pub fn normalize_expr_for_index_matching(
     expr: &ast::Expr,
     table_reference: &JoinedTable,
-    table_references: &TableReferences,
+    _table_references: &TableReferences,
 ) -> ast::Expr {
     let mut expr = expr.clone();
-    let _table_idx = table_references
-        .joined_tables()
-        .iter()
-        .position(|t| t.internal_id == table_reference.internal_id)
-        .expect("table must exist in table_references");
-    let columns = table_reference.table.columns();
     let mut normalize = |e: &mut ast::Expr| -> Result<WalkControl> {
         match e {
-            ast::Expr::Column { column, .. } => {
-                if let Some(name) = columns.get(*column).and_then(|c| c.name.as_ref()) {
-                    *e = ast::Expr::Id(ast::Name::exact(name.clone()));
-                }
-            }
-            ast::Expr::RowId { .. } => {
-                *e = ast::Expr::Id(ast::Name::exact(ROWID_STRS[0].to_string()));
+            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. }
+                if *table == table_reference.internal_id =>
+            {
+                *table = TableInternalId::SELF_TABLE;
             }
             _ => {}
         }
@@ -82,26 +73,20 @@ pub fn single_table_column_usage(expr: &ast::Expr) -> Option<(TableInternalId, C
     }
 }
 
-/// Bind an expression index key expression against the target table and return
-/// the set of referenced columns.
+/// Return the set of table columns an expression-index key expression reads.
 ///
-/// Expression index SQL is stored in schema form and may use the base table
-/// name even when the query uses an alias. We bind using the base table name
-/// to keep dependency analysis stable across aliases.
-pub fn expression_index_column_usage(
-    expr: &ast::Expr,
-    table_reference: &JoinedTable,
-    resolver: &Resolver<'_>,
-) -> Result<ColumnUsedMask> {
-    let mut bound_expr = expr.clone();
-    let mut binding_table = table_reference.clone();
-    if let Some(btree_table) = binding_table.table.btree() {
-        binding_table.identifier.clone_from(&btree_table.name);
-    }
-    let mut binding_tables = TableReferences::new(vec![binding_table], vec![]);
-    bind_fixed_scope_expr(&mut bound_expr, Some(&mut binding_tables), resolver, false)?;
-
-    Ok(single_table_column_usage(&bound_expr)
-        .map(|(_, columns_mask)| columns_mask)
-        .unwrap_or_default())
+/// Index expressions are stored with their column references pre-resolved to
+/// `SELF_TABLE` positional form at schema load, so this is a plain walk — no
+/// name resolution.
+pub fn expression_index_column_usage(expr: &ast::Expr) -> Result<ColumnUsedMask> {
+    let mut mask = ColumnUsedMask::default();
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::Column { table, column, .. } = e {
+            if table.is_self_table() {
+                mask.set(*column)?;
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(mask)
 }

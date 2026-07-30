@@ -758,7 +758,9 @@ fn target_matches_index_column(
     }
     match (&target_col.target, &idx_col.expr) {
         (ColumnTarget::Column(col_no), None) => idx_col.pos_in_table == *col_no,
-        (ColumnTarget::Expr(expr), Some(idx_expr)) => {
+        (ColumnTarget::Expr(expr), Some(idx_expr))
+            if idx_col.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL =>
+        {
             let target_expr = unsafe { &**expr };
             if exprs_are_equivalent(target_expr, idx_expr) {
                 return true;

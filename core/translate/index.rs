@@ -5,7 +5,6 @@ use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
 use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
 use crate::sync::Arc;
-use crate::translate::bind::bind_fixed_scope_expr;
 use crate::translate::{
     collate::CollationSeq,
     emitter::{
@@ -205,6 +204,13 @@ pub fn translate_create_index(
             })?);
         }
     }
+    // Pre-resolve the WHERE clause's column references to SELF_TABLE form.
+    // Resolution is lenient: names that don't resolve stay as identifiers,
+    // and validate_where_expr below rejects them.
+    let resolved_where_clause = where_clause.clone().map(|mut wc| {
+        crate::schema::resolve_index_expr_columns(&mut wc, &tbl);
+        wc
+    });
     let idx = Arc::new(Index {
         name: idx_name.clone(),
         table_name: tbl.name.clone(),
@@ -213,9 +219,7 @@ pub fn translate_create_index(
         unique,
         ephemeral: false,
         has_rowid: tbl.has_rowid,
-        // store the *original* where clause, because we need to rewrite it
-        // before translating, and it cannot reference a table alias
-        where_clause: where_clause.clone(),
+        where_clause: resolved_where_clause,
         index_method: index_method.clone(),
         on_conflict: None,
     });
@@ -351,7 +355,7 @@ fn emit_refill_index(
         }],
         vec![],
     );
-    let where_clause = idx.bind_where_expr(Some(&mut table_references), resolver);
+    let where_clause = idx.bind_where_expr(table_ref);
 
     if idx
         .index_method
@@ -933,6 +937,11 @@ fn resolve_sorted_columns_with_resolver(
         if !validate_index_expression(unwrapped_expr, table) {
             crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
         }
+        // Store the key expression with its column references pre-resolved to
+        // SELF_TABLE form (validation above guarantees every identifier is a
+        // column of the indexed table), like generated-column expressions.
+        let mut key_expr = sc.expr.clone();
+        crate::schema::resolve_index_expr_columns(&mut key_expr, table);
         resolved
             .push_within_capacity(IndexColumn {
                 name: sc.expr.to_string(),
@@ -940,7 +949,7 @@ fn resolve_sorted_columns_with_resolver(
                 pos_in_table: EXPR_INDEX_SENTINEL,
                 collation: explicit_collation,
                 default: None,
-                expr: Some(sc.expr.clone()),
+                expr: Some(key_expr),
             })
             .expect("resolved index columns vector was preallocated to cols.len()");
     }
@@ -1120,8 +1129,12 @@ fn emit_index_column_value_from_cursor(
     dest_reg: usize,
 ) -> crate::Result<()> {
     if let Some(expr) = &idx_col.expr {
+        // Index expressions are stored pre-resolved to SELF_TABLE form;
+        // point them at this statement's table reference.
         let mut expr = expr.as_ref().clone();
-        bind_fixed_scope_expr(&mut expr, Some(table_references), resolver, false)?;
+        if let Some(jt) = table_references.joined_tables().first() {
+            crate::schema::bind_self_table_expr(&mut expr, jt.internal_id);
+        }
         let self_table_context =
             table_references
                 .joined_tables()

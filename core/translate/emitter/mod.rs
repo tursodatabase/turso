@@ -1951,8 +1951,10 @@ pub(crate) fn emit_index_column_value_old_image(
     dest_reg: usize,
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
+        // Index expressions are stored pre-resolved to SELF_TABLE form;
+        // point them at this statement's table reference.
         let mut expr = expr.as_ref().clone();
-        bind_fixed_scope_expr(&mut expr, Some(table_references), resolver, false)?;
+        crate::schema::bind_self_table_expr(&mut expr, table_internal_id);
 
         let self_table_context = SelfTableContext::ForSelect {
             table_ref_id: table_internal_id,

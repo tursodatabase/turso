@@ -8,7 +8,6 @@ use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
-use crate::translate::bind::bind_fixed_scope_expr;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::index::{
@@ -148,7 +147,7 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
+use crate::translate::plan::{BitSet, ColumnMask, Plan};
 use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, UnparsedFromSqlIndex,
 };
@@ -4144,6 +4143,87 @@ pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -
     Ok(())
 }
 
+/// Resolve identifier leaves of an index key expression or partial-index
+/// WHERE clause to `Expr::Column { table: SELF_TABLE }` / `Expr::RowId
+/// { table: SELF_TABLE }` positional references, like generated-column
+/// expressions. Resolution is lenient: identifiers that are not columns of
+/// `table` (and not the rowid keyword) are left untouched, so loading a
+/// schema with a stale expression still succeeds and the error surfaces when
+/// the expression is actually used.
+pub fn resolve_index_expr_columns(expr: &mut Expr, table: &BTreeTable) {
+    let table_name = normalize_ident(table.name.as_str());
+    let _ = walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
+        let resolved = match e {
+            Expr::Id(name) | Expr::Name(name) => {
+                resolve_self_table_leaf(&normalize_ident(name.as_str()), table)
+            }
+            Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col)
+                if normalize_ident(ns.as_str()).eq_ignore_ascii_case(&table_name) =>
+            {
+                resolve_self_table_leaf(&normalize_ident(col.as_str()), table)
+            }
+            _ => None,
+        };
+        if let Some(resolved) = resolved {
+            *e = resolved;
+        }
+        Ok(WalkControl::Continue)
+    });
+}
+
+/// Resolve a single identifier against `table`: a column reference wins over
+/// the rowid keyword, matching binder precedence.
+fn resolve_self_table_leaf(name: &str, table: &BTreeTable) -> Option<Expr> {
+    if let Some((idx, col)) = table.get_column(name) {
+        return Some(Expr::Column {
+            database: None,
+            table: TableInternalId::SELF_TABLE,
+            column: idx,
+            is_rowid_alias: col.is_rowid_alias(),
+        });
+    }
+    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+        return Some(Expr::RowId {
+            database: None,
+            table: TableInternalId::SELF_TABLE,
+        });
+    }
+    None
+}
+
+/// Rewrite `SELF_TABLE` positional references in a schema expression (index
+/// key expression, partial-index WHERE, generated column) to a real table id
+/// so the expression can be translated or compared against bound query
+/// expressions.
+pub fn bind_self_table_expr(expr: &mut Expr, internal_id: TableInternalId) {
+    let _ = walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
+        match e {
+            Expr::Column { table, .. } | Expr::RowId { table, .. } if table.is_self_table() => {
+                *table = internal_id;
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+}
+
+/// True if the expression still contains unresolved identifier leaves
+/// (names that lenient schema-load resolution could not map to a column).
+pub fn expr_has_unresolved_identifiers(expr: &Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
+        if matches!(
+            e,
+            Expr::Id(_) | Expr::Name(_) | Expr::Qualified(..) | Expr::DoublyQualified(..)
+        ) {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
 /// Re-render the SQL text of a generated-column expression using current column names. The input
 /// AST may have been previously resolved into `Expr::Column { table: SELF_TABLE, column: idx, .. }`
 /// nodes; we replace each such self-table reference with a fresh `Expr::Id(<col-name>)` before
@@ -5765,6 +5845,10 @@ impl Index {
                         on_conflict: None,
                     })
                 } else {
+                    let where_clause = where_clause.map(|mut wc| {
+                        resolve_index_expr_columns(&mut wc, table);
+                        wc
+                    });
                     Ok(Index {
                         name: index_name,
                         table_name: normalize_ident(tbl_name.as_str()),
@@ -5913,13 +5997,16 @@ impl Index {
     }
 
     /// Given an expression, return the position in the index if it matches an expression index column.
-    /// Expression index matching is textual (after binding), so the caller should normalize the query
-    /// expression to resemble the stored index expression (e.g. unqualified column names).
+    /// Index expressions are stored with column references pre-resolved to `SELF_TABLE` form, so the
+    /// caller should normalize the query expression the same way
+    /// (see `normalize_expr_for_index_matching`). Generated-column-backed index columns also carry
+    /// an expression (the column's defining expression) but are matched by column position, not here.
     pub fn expression_to_index_pos(&self, expr: &Expr) -> Option<usize> {
         self.columns.iter().position(|c| {
-            c.expr
-                .as_ref()
-                .is_some_and(|e| exprs_are_equivalent(e, expr))
+            c.pos_in_table == EXPR_INDEX_SENTINEL
+                && c.expr
+                    .as_ref()
+                    .is_some_and(|e| exprs_are_equivalent(e, expr))
         })
     }
 
@@ -6008,16 +6095,17 @@ impl Index {
         ok
     }
 
-    pub fn bind_where_expr(
-        &self,
-        table_refs: Option<&mut TableReferences>,
-        resolver: &Resolver,
-    ) -> Option<ast::Expr> {
-        let Some(where_clause) = &self.where_clause else {
+    /// Return the partial-index WHERE clause with its `SELF_TABLE`
+    /// references bound to `internal_id`. Returns `None` for indexes without
+    /// a WHERE clause, or when the stored clause still contains identifiers
+    /// that lenient schema-load resolution could not map to columns.
+    pub fn bind_where_expr(&self, internal_id: TableInternalId) -> Option<ast::Expr> {
+        let where_clause = self.where_clause.as_ref()?;
+        if expr_has_unresolved_identifiers(where_clause) {
             return None;
-        };
+        }
         let mut expr = where_clause.clone();
-        bind_fixed_scope_expr(&mut expr, table_refs, resolver, false).ok()?;
+        bind_self_table_expr(&mut expr, internal_id);
         Some(*expr)
     }
 }
