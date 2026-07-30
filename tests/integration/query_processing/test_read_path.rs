@@ -56,6 +56,32 @@ fn recursive_cte_with_bound_termination_predicate(tmp_db: TempDatabase) -> anyho
     Ok(())
 }
 
+#[turso_macros::test]
+fn recursive_cte_explain_query_plan_shows_setup_and_recursive_step(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let eqp_rows = limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN
+         WITH RECURSIVE t(a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM t WHERE a < 3)
+         SELECT * FROM t",
+    );
+    let plan = eqp_rows
+        .iter()
+        .filter_map(|row| match row.get(3) {
+            Some(rusqlite::types::Value::Text(detail)) => Some(detail.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("SETUP") && plan.contains("RECURSIVE STEP"),
+        "expected recursive CTE structure in query plan, got:\n{plan}"
+    );
+    Ok(())
+}
+
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
 fn test_statement_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
