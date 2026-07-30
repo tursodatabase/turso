@@ -317,11 +317,11 @@ fn emit_compound_select(
                         target_pc: label_next_select,
                         jump_if_null: true,
                     });
-                    right_most.limit = limit.clone();
+                    right_most.limit.clone_from(limit);
                     right_most_ctx.limit_ctx = Some(limit_ctx);
                 }
                 if offset_reg.is_some() {
-                    right_most.offset = offset.clone();
+                    right_most.offset.clone_from(offset);
                     right_most_ctx.reg_offset = offset_reg;
                 }
 
@@ -498,10 +498,10 @@ fn emit_compound_select(
         None => {
             if let Some(limit_ctx) = limit_ctx {
                 right_most_ctx.limit_ctx = Some(limit_ctx);
-                right_most.limit = limit.clone();
+                right_most.limit.clone_from(limit);
             }
             if offset_reg.is_some() {
-                right_most.offset = offset.clone();
+                right_most.offset.clone_from(offset);
                 right_most_ctx.reg_offset = offset_reg;
             }
             emit_explain!(program, true, "LEFT-MOST SUBQUERY".to_owned());

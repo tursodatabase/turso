@@ -592,7 +592,7 @@ pub enum QueryDestination {
         cursor_id: CursorID,
         index: Arc<Index>,
         /// Result columns that determine which queued row is read next.
-        sort_keys: Vec<RecursiveCteQueueKey>,
+        sort_keys: alloc::Vec<RecursiveCteQueueKey>,
         /// Index of rows already produced by a recursive `UNION`.
         seen_rows: Option<(CursorID, Arc<Index>)>,
     },
