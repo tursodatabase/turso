@@ -1182,8 +1182,7 @@ mod tests {
         let db_path = temp_file.path().to_str().unwrap();
 
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db =
-            turso_core::Database::open_file(io.clone(), db_path, Arc::new(SqliteDialect)).unwrap();
+        let db = turso_core::Database::open_file(io.clone(), db_path).unwrap();
         let db = Arc::new(DatabaseTape::new(db));
 
         let mut gen = genawaiter::sync::Gen::new({
@@ -1308,8 +1307,7 @@ mod tests {
         let db_path = temp_file.path().to_str().unwrap();
 
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db =
-            turso_core::Database::open_file(io.clone(), db_path, Arc::new(SqliteDialect)).unwrap();
+        let db = turso_core::Database::open_file(io.clone(), db_path).unwrap();
         let db = Arc::new(DatabaseTape::new(db));
 
         let mut gen = genawaiter::sync::Gen::new({
