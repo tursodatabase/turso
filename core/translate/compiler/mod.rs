@@ -61,14 +61,16 @@ use crate::Result;
 pub(crate) fn try_emit_scan_query(
     program: &mut ProgramBuilder,
     plan: &crate::translate::plan::SelectPlan,
-    resolver: &crate::translate::emitter::Resolver,
-    limit_ctx: Option<crate::translate::emitter::LimitCtx>,
-    reg_offset: Option<usize>,
+    t_ctx: &crate::translate::emitter::TranslateCtx<'_>,
 ) -> Result<bool> {
     use crate::schema::Table;
     use crate::translate::plan::{
         Distinctness, IterationDirection, Operation, QueryDestination, Scan,
     };
+
+    let resolver = &t_ctx.resolver;
+    let limit_ctx = t_ctx.limit_ctx;
+    let reg_offset = t_ctx.reg_offset;
 
     if !plan.aggregates.is_empty()
         || plan.group_by.is_some()
@@ -268,11 +270,14 @@ pub(crate) fn try_emit_scan_query(
             )
             .map(|_| ())
         };
+    // Result rows write the caller's pre-allocated result-column
+    // registers, exactly as the eager loop body does.
     emit::emit_condition_function(
         program,
         &func,
         &[fallthrough],
         &[physical_cursor],
+        t_ctx.reg_result_cols_start,
         Some(fallthrough),
         Some(&mut emit_leaf),
     )?;
@@ -364,6 +369,7 @@ pub(crate) fn emit_condition(
         &func,
         &exit_labels,
         &[],
+        None,
         Some(fallthrough),
         leaf_emitter,
     )?;
@@ -1547,6 +1553,7 @@ mod tests {
             &func,
             &[fallthrough],
             &[3],
+            None,
             Some(fallthrough),
             Some(&mut leaf_emitter),
         )
@@ -1627,6 +1634,7 @@ mod tests {
             &func,
             &[fallthrough],
             &[0],
+            None,
             Some(fallthrough),
             Some(&mut leaf_emitter),
         )
@@ -1691,6 +1699,7 @@ mod tests {
             &func,
             &[fallthrough],
             &[0],
+            None,
             Some(fallthrough),
             Some(&mut leaf_emitter),
         )
@@ -1752,6 +1761,7 @@ mod tests {
             &func,
             &[fallthrough],
             &[0],
+            None,
             Some(fallthrough),
             Some(&mut leaf_emitter),
         )
@@ -1812,6 +1822,7 @@ mod tests {
             &func,
             &[fallthrough],
             &[0],
+            None,
             Some(fallthrough),
             Some(&mut leaf_emitter),
         )

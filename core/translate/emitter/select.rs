@@ -242,13 +242,7 @@ pub fn emit_query<'a>(
     // Composable compiler path: gated whole simple scans compile as one
     // described pipeline (scan -> projection -> result rows) instead of
     // the eager OpenLoop/LoopBody/CloseLoop sequencing below.
-    if crate::translate::compiler::try_emit_scan_query(
-        program,
-        plan,
-        &t_ctx.resolver,
-        t_ctx.limit_ctx,
-        t_ctx.reg_offset,
-    )? {
+    if crate::translate::compiler::try_emit_scan_query(program, plan, t_ctx)? {
         program.preassign_label_to_next_insn(after_main_loop_label);
         return Ok(t_ctx.reg_result_cols_start.unwrap());
     }

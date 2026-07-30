@@ -74,10 +74,11 @@ pub fn emit_function_bound(
             Some(dest),
             &[],
             cursors,
+            None,
             Some(&mut *leaf_emitter),
         )
         .emit(),
-        None => Emitter::new(program, func, Some(dest), &[], cursors, None).emit(),
+        None => Emitter::new(program, func, Some(dest), &[], cursors, None, None).emit(),
     }
 }
 
@@ -85,12 +86,17 @@ pub fn emit_function_bound(
 /// declared exits rather than a `Ret` value. `exit_labels[i]` is the
 /// label bound to `ExitId(i)`; empty exit blocks are bypassed entirely
 /// (jumps go straight to the bound label). `cursors[i]` is the physical
-/// VDBE cursor id bound to the function's `CursorId(i)`.
+/// VDBE cursor id bound to the function's `CursorId(i)`. `row_dest`, if
+/// given, is the caller's pre-allocated result-column pack: every
+/// `EmitRow` writes those registers instead of a freshly allocated pack,
+/// matching eager result-column register numbering.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_condition_function(
     program: &mut ProgramBuilder,
     func: &Function,
     exit_labels: &[BranchOffset],
     cursors: &[usize],
+    row_dest: Option<usize>,
     fallthrough_label: Option<BranchOffset>,
     leaf_emitter: Option<&mut LeafEmitter<'_>>,
 ) -> Result<()> {
@@ -114,13 +120,15 @@ pub fn emit_condition_function(
                 None,
                 exit_labels,
                 cursors,
+                row_dest,
                 Some(&mut *leaf_emitter),
             );
             emitter.fallthrough_label = fallthrough_label;
             emitter.emit()
         }
         None => {
-            let mut emitter = Emitter::new(program, func, None, exit_labels, cursors, None);
+            let mut emitter =
+                Emitter::new(program, func, None, exit_labels, cursors, row_dest, None);
             emitter.fallthrough_label = fallthrough_label;
             emitter.emit()
         }
@@ -183,12 +191,14 @@ struct Emitter<'a> {
 }
 
 impl<'a> Emitter<'a> {
+    #[allow(clippy::too_many_arguments)] // internal constructor behind the pub entry points
     fn new(
         program: &'a mut ProgramBuilder,
         func: &'a Function,
         dest: Option<usize>,
         exit_labels: &'a [BranchOffset],
         cursors: &'a [usize],
+        row_dest: Option<usize>,
         leaf_emitter: Option<&'a mut LeafEmitter<'a>>,
     ) -> Self {
         // Emission order: creation order restricted to reachable blocks.
@@ -306,8 +316,9 @@ impl<'a> Emitter<'a> {
         let mut row_packs: Vec<Option<usize>> = vec![None; func.num_values()];
         let steer = |program: &mut ProgramBuilder,
                      regs: &mut Vec<Option<usize>>,
-                     args: &[super::ir::ValueId]| {
-            let pack = program.alloc_registers(args.len());
+                     args: &[super::ir::ValueId],
+                     preassigned: Option<usize>| {
+            let pack = preassigned.unwrap_or_else(|| program.alloc_registers(args.len()));
             for (slot, arg) in args.iter().enumerate() {
                 let bindable = matches!(
                     inst_of[arg.index()],
@@ -333,10 +344,15 @@ impl<'a> Emitter<'a> {
             for (value, inst) in &func.block(block_id).insts {
                 match inst {
                     Inst::Call { call, args } => {
-                        call_packs[call.index()] = steer(program, &mut regs, args);
+                        call_packs[call.index()] = steer(program, &mut regs, args, None);
                     }
+                    // All EmitRow sites share `row_dest` when the caller
+                    // supplies one — matching eager emission, where every
+                    // result row writes the same pre-allocated result
+                    // column registers.
                     Inst::EmitRow { values } => {
-                        row_packs[value.index()] = Some(steer(program, &mut regs, values));
+                        row_packs[value.index()] =
+                            Some(steer(program, &mut regs, values, row_dest));
                     }
                     _ => {}
                 }

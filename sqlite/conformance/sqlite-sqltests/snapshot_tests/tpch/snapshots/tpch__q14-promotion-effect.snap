@@ -33,42 +33,45 @@ addr  opcode       p1  p2  p3  p4                                     p5  commen
    2  OpenRead      0  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
    3  OpenRead      1   4   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=part, root=4, iDb=0
    4  Rewind        0  30   0                                          0  Rewind table lineitem
-   5    Column      0  10   5                                          0  r[5]=lineitem.L_SHIPDATE
-   6    Lt          5   6  29  Binary                                  0  if r[5]<r[6] goto 29
-   7    Column      0  10   8                                          0  r[8]=lineitem.L_SHIPDATE
-   8    Ge          8   9  29  Binary                                  0  if r[8]>=r[9] goto 29
-   9    Column      0   1  10                                          0  r[10]=lineitem.L_PARTKEY
-  10    SeekRowid   1  10  29                                          0  if (r[10]!=cursor 1 for table part.rowid) goto 29
-  11    Column      1   4  14                                          0  r[14]=part.P_TYPE
-  12    String8     0  13   0  PROMO%                                  0  r[13]='PROMO%'
-  13    Function    1  13  12  like(2)                                 0  r[12]=func(r[13..14])
-  14    IfNot      12  21   1                                          0  if !r[12] goto 21
-  15    Column      0   5  15                                          0  r[15]=lineitem.L_EXTENDEDPRICE
-  16    Integer     1  17   0                                          0  r[17]=1
-  17    Column      0   6  18                                          0  r[18]=lineitem.L_DISCOUNT
-  18    Subtract   17  18  16                                          0  r[16]=r[17]-r[18]
-  19    Multiply   15  16  11                                          0  r[11]=r[15]*r[16]
-  20    Goto        0  22   0                                          0
-  21    Integer     0  11   0                                          0  r[11]=0
-  22    Cast       11   0   0                                          0  affinity(r[11]=Numeric)
-  23    AggStep     0  11   2  sum                                     0  accum=r[2] step(r[11])
-  24    Column      0   5  20                                          0  r[20]=lineitem.L_EXTENDEDPRICE
+   5    Column      0  10   4                                          0  r[4]=lineitem.L_SHIPDATE
+   6    Lt          4   5  29  Binary                                  0  if r[4]<r[5] goto 29
+   7    Column      0  10   6                                          0  r[6]=lineitem.L_SHIPDATE
+   8    Ge          6   7  29  Binary                                  0  if r[6]>=r[7] goto 29
+   9    Column      0   1   8                                          0  r[8]=lineitem.L_PARTKEY
+  10    SeekRowid   1   8  29                                          0  if (r[8]!=cursor 1 for table part.rowid) goto 29
+  11    Column      1   4  11                                          0  r[11]=part.P_TYPE
+  12    Function    1  10  12  like(2)                                 0  r[12]=func(r[10..11])
+  13    IfNot      12  20   1                                          0  if !r[12] goto 20
+  14    Column      0   5  15                                          0  r[15]=lineitem.L_EXTENDEDPRICE
+  15    Column      0   6  16                                          0  r[16]=lineitem.L_DISCOUNT
+  16    Subtract   13  16  17                                          0  r[17]=r[13]-r[16]
+  17    Multiply   15  17  18                                          0  r[18]=r[15]*r[17]
+  18    Copy       18  19   0                                          0  r[19]=r[18]
+  19    Goto        0  21   0                                          0
+  20    Copy       14  19   0                                          0  r[19]=r[14]
+  21    Copy       19   9   0                                          0  r[9]=r[19]
+  22    Cast        9   0   0                                          0  affinity(r[9]=Numeric)
+  23    AggStep     0   9   2  sum                                     0  accum=r[2] step(r[9])
+  24    Column      0   5  21                                          0  r[21]=lineitem.L_EXTENDEDPRICE
   25    Column      0   6  23                                          0  r[23]=lineitem.L_DISCOUNT
-  26    Subtract   22  23  21                                          0  r[21]=r[22]-r[23]
-  27    Multiply   20  21  19                                          0  r[19]=r[20]*r[21]
-  28    AggStep     0  19   3  sum                                     0  accum=r[3] step(r[19])
+  26    Subtract   22  23  24                                          0  r[24]=r[22]-r[23]
+  27    Multiply   21  24  20                                          0  r[20]=r[21]*r[24]
+  28    AggStep     0  20   3  sum                                     0  accum=r[3] step(r[20])
   29  Next          0   5   0                                          0
   30  AggFinal      0   2   0  sum                                     0  accum=r[2]
   31  AggFinal      0   3   0  sum                                     0  accum=r[3]
-  32  Copy          2  27   0                                          0  r[27]=r[2]
-  33  Multiply     26  27  24                                          0  r[24]=r[26]*r[27]
-  34  Copy          3  25   0                                          0  r[25]=r[3]
-  35  Divide       24  25   1                                          0  r[1]=r[24]/r[25]
+  32  Copy          2  28   0                                          0  r[28]=r[2]
+  33  Multiply     27  28  25                                          0  r[25]=r[27]*r[28]
+  34  Copy          3  26   0                                          0  r[26]=r[3]
+  35  Divide       25  26   1                                          0  r[1]=r[25]/r[26]
   36  ResultRow     1   1   0                                          0  output=r[1]
   37  Halt          0   0   0                                          0
   38  Transaction   0   1   8                                          0  iDb=0 tx_mode=Read
-  39  String8       0   6   0  1994-03-01                              0  r[6]='1994-03-01'
-  40  String8       0   9   0  1994-04-01                              0  r[9]='1994-04-01'
-  41  Integer       1  22   0                                          0  r[22]=1
-  42  Real          0  26   0  100.0                                   0  r[26]=100
-  43  Goto          0   1   0                                          0
+  39  String8       0   5   0  1994-03-01                              0  r[5]='1994-03-01'
+  40  String8       0   7   0  1994-04-01                              0  r[7]='1994-04-01'
+  41  String8       0  10   0  PROMO%                                  0  r[10]='PROMO%'
+  42  Integer       1  13   0                                          0  r[13]=1
+  43  Integer       0  14   0                                          0  r[14]=0
+  44  Integer       1  22   0                                          0  r[22]=1
+  45  Real          0  27   0  100.0                                   0  r[27]=100
+  46  Goto          0   1   0                                          0

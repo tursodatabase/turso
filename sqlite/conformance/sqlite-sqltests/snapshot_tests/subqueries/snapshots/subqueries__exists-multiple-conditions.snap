@@ -44,8 +44,8 @@ addr  opcode              p1  p2  p3  p4              p5  comment
   13        DeferredSeek   2   1   0                   0
   14        Column         1   1   9                   0  r[9]=order_items.order_id
   15        SeekRowid      3   9  20                   0  if (r[9]!=cursor 3 for table orders.rowid) goto 20
-  16        Column         3   2  11                   0  r[11]=orders.order_date
-  17        Lt            11  12  20  Binary           0  if r[11]<r[12] goto 20
+  16        Column         3   2  10                   0  r[10]=orders.order_date
+  17        Lt            10  11  20  Binary           0  if r[10]<r[11] goto 20
   18        Integer        1   1   0                   0  r[1]=1
   19        DecrJumpZero   7  21   0                   0  if (--r[7]==0) goto 21
   20      Next             2  12   0                   0
@@ -59,5 +59,5 @@ addr  opcode              p1  p2  p3  p4              p5  comment
   28  Next                 0   3   0                   0
   29  Halt                 0   0   0                   0
   30  Transaction          0   1  11                   0  iDb=0 tx_mode=Read
-  31  String8              0  12   0  2024-01-01       0  r[12]='2024-01-01'
+  31  String8              0  11   0  2024-01-01       0  r[11]='2024-01-01'
   32  Goto                 0   1   0                   0

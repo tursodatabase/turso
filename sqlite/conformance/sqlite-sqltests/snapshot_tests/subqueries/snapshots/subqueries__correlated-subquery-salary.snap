@@ -33,21 +33,21 @@ addr  opcode              p1  p2  p3  p4              p5  comment
    7      IfNot            9  17   0                   0  if !r[9] goto 17
    8      OpenRead         1   7   0  k(5,B,B,B,B,B)   0  table=employees, root=7, iDb=0
    9      Rewind           1  17   0                   0  Rewind table employees
-  10        Column         1   3  11                   0  r[11]=employees.department
-  11        Column         0   3  12                   0  r[12]=employees.department
-  12        Ne            11  12  16  Binary           0  if r[11]!=r[12] goto 16
-  13        Column         1   4  13                   0  r[13]=employees.salary
-  14        RealAffinity  13   0   0                   0
-  15        AggStep        0  13   8  avg              0  accum=r[8] step(r[13])
+  10        Column         1   3  10                   0  r[10]=employees.department
+  11        Column         0   3  11                   0  r[11]=employees.department
+  12        Ne            10  11  16  Binary           0  if r[10]!=r[11] goto 16
+  13        Column         1   4  12                   0  r[12]=employees.salary
+  14        RealAffinity  12   0   0                   0
+  15        AggStep        0  12   8  avg              0  accum=r[8] step(r[12])
   16      Next             1  10   0                   0
   17      AggFinal         0   8   0  avg              0  accum=r[8]
   18      Copy             8   7   0                   0  r[7]=r[8]
   19      Copy             7   1   0                   0  r[1]=r[7]
   20    Return             6   0   1                   0
-  21    Column             0   4  15                   0  r[15]=employees.salary
-  22    RealAffinity      15   0   0                   0
-  23    Copy               1  16   0                   0  r[16]=r[1]
-  24    Le                15  16  31  Binary           0  if r[15]<=r[16] goto 31
+  21    Column             0   4  14                   0  r[14]=employees.salary
+  22    RealAffinity      14   0   0                   0
+  23    Copy               1  15   0                   0  r[15]=r[1]
+  24    Le                14  15  31  Binary           0  if r[14]<=r[15] goto 31
   25    RowId              0   2   0                   0  r[2]=employees.rowid
   26    Column             0   1   3                   0  r[3]=employees.name
   27    Column             0   3   4                   0  r[4]=employees.department

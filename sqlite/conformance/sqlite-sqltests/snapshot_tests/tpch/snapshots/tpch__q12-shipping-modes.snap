@@ -56,18 +56,18 @@ addr  opcode                  p1  p2  p3  p4                                    
    9            Column         3  14  15                                          0  r[15]=lineitem.L_SHIPMODE
   10            Eq            15  16  12  Binary                                  0  if r[15]==r[16] goto 12
   11            Ne            15  17  28  Binary                                  0  if r[15]!=r[17] goto 28
-  12            Column         3  11  19                                          0  r[19]=lineitem.L_COMMITDATE
-  13            Column         3  12  20                                          0  r[20]=lineitem.L_RECEIPTDATE
-  14            Ge            19  20  28  Binary                                  0  if r[19]>=r[20] goto 28
-  15            Column         3  10  22                                          0  r[22]=lineitem.L_SHIPDATE
-  16            Column         3  11  23                                          0  r[23]=lineitem.L_COMMITDATE
-  17            Ge            22  23  28  Binary                                  0  if r[22]>=r[23] goto 28
-  18            Column         3  12  25                                          0  r[25]=lineitem.L_RECEIPTDATE
-  19            Lt            25  26  28  Binary                                  0  if r[25]<r[26] goto 28
-  20            Column         3  12  28                                          0  r[28]=lineitem.L_RECEIPTDATE
-  21            Ge            28  29  28  Binary                                  0  if r[28]>=r[29] goto 28
-  22            Column         3   0  30                                          0  r[30]=lineitem.L_ORDERKEY
-  23            SeekRowid      2  30  28                                          0  if (r[30]!=cursor 2 for table orders.rowid) goto 28
+  12            Column         3  11  18                                          0  r[18]=lineitem.L_COMMITDATE
+  13            Column         3  12  19                                          0  r[19]=lineitem.L_RECEIPTDATE
+  14            Ge            18  19  28  Binary                                  0  if r[18]>=r[19] goto 28
+  15            Column         3  10  20                                          0  r[20]=lineitem.L_SHIPDATE
+  16            Column         3  11  21                                          0  r[21]=lineitem.L_COMMITDATE
+  17            Ge            20  21  28  Binary                                  0  if r[20]>=r[21] goto 28
+  18            Column         3  12  22                                          0  r[22]=lineitem.L_RECEIPTDATE
+  19            Lt            22  23  28  Binary                                  0  if r[22]<r[23] goto 28
+  20            Column         3  12  24                                          0  r[24]=lineitem.L_RECEIPTDATE
+  21            Ge            24  25  28  Binary                                  0  if r[24]>=r[25] goto 28
+  22            Column         3   0  26                                          0  r[26]=lineitem.L_ORDERKEY
+  23            SeekRowid      2  26  28                                          0  if (r[26]!=cursor 2 for table orders.rowid) goto 28
   24            Column         3  14  12                                          0  r[12]=lineitem.L_SHIPMODE
   25            Column         2   5  13                                          0  r[13]=orders.O_ORDERPRIORITY
   26            MakeRecord    12   2  11                                          0  r[11]=mkrec(r[12..13])
@@ -76,46 +76,46 @@ addr  opcode                  p1  p2  p3  p4                                    
   29          OpenPseudo       1  11   2                                          0  2 columns in r[11]
   30          SorterSort       0  76   0                                          0
   31            SorterData     0  11   1                                          0  r[11]=data
-  32            Column         1   0  31                                          0  r[31]=pseudo.column 0
-  33            Compare        7  31   1  k(1, Binary)                            0  r[7..7]==r[31..31]
+  32            Column         1   0  27                                          0  r[27]=pseudo.column 0
+  33            Compare        7  27   1  k(1, Binary)                            0  r[7..7]==r[27..27]
   34            Jump          35  39  35                                          0  ; start new group if comparison is not equal
   35            Gosub          4  80   0                                          0  ; check if ended group had data, and output if so
-  36            Move          31   7   1                                          0  r[7..7]=r[31..31]
+  36            Move          27   7   1                                          0  r[7..7]=r[27..27]
   37            IfPos          6  92   0                                          0  r[6]>0 -> r[6]-=0, goto 92; check abort flag
   38            Gosub         14  89   0                                          0  ; goto clear accumulator subroutine
-  39            Column         1   1  32                                          0  r[32]=pseudo.column 1
-  40            Copy          32  37   0                                          0  r[37]=r[32]
-  41            String8        0  38   0  1-URGENT                                0  r[38]='1-URGENT'
-  42            Integer        1  35   0                                          0  r[35]=1
-  43            Eq            37  38  45                                          0  if r[37]==r[38] goto 45
-  44            ZeroOrNull    37  35  38                                          0  ((r[37]=NULL)|(r[38]=NULL)) ? r[35]=NULL : r[35]=0
-  45            Copy          32  39   0                                          0  r[39]=r[32]
-  46            String8        0  40   0  2-HIGH                                  0  r[40]='2-HIGH'
-  47            Integer        1  36   0                                          0  r[36]=1
-  48            Eq            39  40  50                                          0  if r[39]==r[40] goto 50
-  49            ZeroOrNull    39  36  40                                          0  ((r[39]=NULL)|(r[40]=NULL)) ? r[36]=NULL : r[36]=0
-  50            Or            36  35  34                                          0  r[34]=(r[35] || r[36])
-  51            IfNot         34  54   1                                          0  if !r[34] goto 54
-  52            Integer        1  33   0                                          0  r[33]=1
+  39            Column         1   1  28                                          0  r[28]=pseudo.column 1
+  40            Copy          28  33   0                                          0  r[33]=r[28]
+  41            String8        0  34   0  1-URGENT                                0  r[34]='1-URGENT'
+  42            Integer        1  31   0                                          0  r[31]=1
+  43            Eq            33  34  45                                          0  if r[33]==r[34] goto 45
+  44            ZeroOrNull    33  31  34                                          0  ((r[33]=NULL)|(r[34]=NULL)) ? r[31]=NULL : r[31]=0
+  45            Copy          28  35   0                                          0  r[35]=r[28]
+  46            String8        0  36   0  2-HIGH                                  0  r[36]='2-HIGH'
+  47            Integer        1  32   0                                          0  r[32]=1
+  48            Eq            35  36  50                                          0  if r[35]==r[36] goto 50
+  49            ZeroOrNull    35  32  36                                          0  ((r[35]=NULL)|(r[36]=NULL)) ? r[32]=NULL : r[32]=0
+  50            Or            32  31  30                                          0  r[30]=(r[31] || r[32])
+  51            IfNot         30  54   1                                          0  if !r[30] goto 54
+  52            Integer        1  29   0                                          0  r[29]=1
   53            Goto           0  55   0                                          0
-  54            Integer        0  33   0                                          0  r[33]=0
-  55            AggStep        0  33   9  sum                                     0  accum=r[9] step(r[33])
-  56            Copy          32  45   0                                          0  r[45]=r[32]
-  57            String8        0  46   0  1-URGENT                                0  r[46]='1-URGENT'
-  58            Integer        1  43   0                                          0  r[43]=1
-  59            Ne            45  46  61                                          0  if r[45]!=r[46] goto 61
-  60            ZeroOrNull    45  43  46                                          0  ((r[45]=NULL)|(r[46]=NULL)) ? r[43]=NULL : r[43]=0
-  61            Copy          32  47   0                                          0  r[47]=r[32]
-  62            String8        0  48   0  2-HIGH                                  0  r[48]='2-HIGH'
-  63            Integer        1  44   0                                          0  r[44]=1
-  64            Ne            47  48  66                                          0  if r[47]!=r[48] goto 66
-  65            ZeroOrNull    47  44  48                                          0  ((r[47]=NULL)|(r[48]=NULL)) ? r[44]=NULL : r[44]=0
-  66            And           44  43  42                                          0  r[42]=(r[43] && r[44])
-  67            IfNot         42  70   1                                          0  if !r[42] goto 70
-  68            Integer        1  41   0                                          0  r[41]=1
+  54            Integer        0  29   0                                          0  r[29]=0
+  55            AggStep        0  29   9  sum                                     0  accum=r[9] step(r[29])
+  56            Copy          28  41   0                                          0  r[41]=r[28]
+  57            String8        0  42   0  1-URGENT                                0  r[42]='1-URGENT'
+  58            Integer        1  39   0                                          0  r[39]=1
+  59            Ne            41  42  61                                          0  if r[41]!=r[42] goto 61
+  60            ZeroOrNull    41  39  42                                          0  ((r[41]=NULL)|(r[42]=NULL)) ? r[39]=NULL : r[39]=0
+  61            Copy          28  43   0                                          0  r[43]=r[28]
+  62            String8        0  44   0  2-HIGH                                  0  r[44]='2-HIGH'
+  63            Integer        1  40   0                                          0  r[40]=1
+  64            Ne            43  44  66                                          0  if r[43]!=r[44] goto 66
+  65            ZeroOrNull    43  40  44                                          0  ((r[43]=NULL)|(r[44]=NULL)) ? r[40]=NULL : r[40]=0
+  66            And           40  39  38                                          0  r[38]=(r[39] && r[40])
+  67            IfNot         38  70   1                                          0  if !r[38] goto 70
+  68            Integer        1  37   0                                          0  r[37]=1
   69            Goto           0  71   0                                          0
-  70            Integer        0  41   0                                          0  r[41]=0
-  71            AggStep        0  41  10  sum                                     0  accum=r[10] step(r[41])
+  70            Integer        0  37   0                                          0  r[37]=0
+  71            AggStep        0  37  10  sum                                     0  accum=r[10] step(r[37])
   72            If             5  74   0                                          0  if r[5] goto 74; don't emit group columns if continuing existing group
   73            Column         1   0   8                                          0  r[8]=pseudo.column 0
   74            Integer        1   5   0                                          0  r[5]=1; indicate data in accumulator
@@ -140,6 +140,6 @@ addr  opcode                  p1  p2  p3  p4                                    
   93  Transaction              0   1   8                                          0  iDb=0 tx_mode=Read
   94  String8                  0  16   0  FOB                                     0  r[16]='FOB'
   95  String8                  0  17   0  SHIP                                    0  r[17]='SHIP'
-  96  String8                  0  26   0  1994-01-01                              0  r[26]='1994-01-01'
-  97  String8                  0  29   0  1995-01-01                              0  r[29]='1995-01-01'
+  96  String8                  0  23   0  1994-01-01                              0  r[23]='1994-01-01'
+  97  String8                  0  25   0  1995-01-01                              0  r[25]='1995-01-01'
   98  Goto                     0   1   0                                          0
