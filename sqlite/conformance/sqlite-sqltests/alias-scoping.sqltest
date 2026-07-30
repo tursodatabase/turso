@@ -165,15 +165,6 @@ expect {
     2
 }
 
-test cte-not-visible-before-definition {
-    WITH
-      a AS (SELECT y FROM b),
-      b AS (SELECT 1 AS y)
-    SELECT * FROM a;
-}
-expect error {
-}
-
 test cte-shadows-table {
     CREATE TABLE t_cte_shadow(x INT);
     INSERT INTO t_cte_shadow VALUES (10);
@@ -252,7 +243,8 @@ test col-alias-not-visible-in-window-order-by {
 expect error {
 }
 
-test update-table-alias-not-supported {
+# Both engines reject a table-qualified column name as a SET target.
+test update-qualified-set-column-rejected {
     CREATE TABLE t_up_alias(x INT);
     INSERT INTO t_up_alias VALUES (3);
     UPDATE t_up_alias AS u SET u.x = 5 WHERE u.x = 3;

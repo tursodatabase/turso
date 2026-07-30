@@ -4292,7 +4292,7 @@ mod tests {
                                        // the expand_stars produces empty
             let scope = BindScope::empty();
             let mut columns = vec![ast::ResultColumn::Star];
-            ctx.expand_stars(&mut columns, &scope);
+            ctx.expand_stars(&mut columns, &scope).unwrap();
             assert_eq!(columns.len(), 0);
         });
     }

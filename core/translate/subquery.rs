@@ -810,7 +810,11 @@ fn get_subquery_parser<'a>(
                     subselect,
                     resolver,
                     program,
-                    crate::translate::select::SelectBinding::Raw { outer_query_refs },
+                    crate::translate::select::SelectBinding::Raw {
+                        // get_outer_query_refs returns crate::alloc::Vec, which
+                        // uses a custom allocator under --cfg nightly.
+                        outer_query_refs: outer_query_refs.into_iter().collect(),
+                    },
                     QueryDestination::ExistsSubqueryResult { result_reg },
                     connection,
                 )?;
@@ -883,7 +887,11 @@ fn get_subquery_parser<'a>(
                     subselect,
                     resolver,
                     program,
-                    crate::translate::select::SelectBinding::Raw { outer_query_refs },
+                    crate::translate::select::SelectBinding::Raw {
+                        // get_outer_query_refs returns crate::alloc::Vec, which
+                        // uses a custom allocator under --cfg nightly.
+                        outer_query_refs: outer_query_refs.into_iter().collect(),
+                    },
                     QueryDestination::Unset,
                     connection,
                 )?;
@@ -986,7 +994,11 @@ fn get_subquery_parser<'a>(
                     rhs,
                     resolver,
                     program,
-                    crate::translate::select::SelectBinding::Raw { outer_query_refs },
+                    crate::translate::select::SelectBinding::Raw {
+                        // get_outer_query_refs returns crate::alloc::Vec, which
+                        // uses a custom allocator under --cfg nightly.
+                        outer_query_refs: outer_query_refs.into_iter().collect(),
+                    },
                     QueryDestination::Unset,
                     connection,
                 )?;
