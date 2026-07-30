@@ -70,41 +70,30 @@ fn validate_delete(
 #[allow(clippy::too_many_arguments)]
 #[turso_macros::trace_stack]
 pub fn translate_delete(
-    tbl_name: &QualifiedName,
+    binding: DeleteBinding,
     resolver: &Resolver,
     where_clause: Option<Box<Expr>>,
     limit: Option<Limit>,
     returning: Vec<ResultColumn>,
-    indexed: Option<turso_parser::ast::Indexed>,
-    with: Option<With>,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let database_id = resolver.resolve_existing_table_database_id_qualified(tbl_name)?;
-    let normalized_table_name = normalize_ident(tbl_name.name.as_str());
-    let table = validate_delete(
-        resolver,
-        &normalized_table_name,
+    let DeleteBinding {
+        bound,
         database_id,
-        program,
-        connection,
-    )?;
-
-    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie)?;
+        table,
+    } = binding;
 
     let (mut delete_plan, mut bound_subqueries) = prepare_delete_plan(
         program,
         resolver,
-        tbl_name,
         table,
         where_clause,
         limit,
         returning,
-        indexed,
-        with,
         connection,
         database_id,
+        bound,
     )?;
 
     // Plan subqueries in the WHERE clause
@@ -182,20 +171,71 @@ pub fn translate_delete(
     Ok(())
 }
 
+/// Output of the statement-level bind phase for DELETE, produced by
+/// [bind_delete_stmt] before planning starts.
+pub struct DeleteBinding {
+    pub bound: super::bind::BoundDelete,
+    pub database_id: usize,
+    pub table: Arc<Table>,
+}
+
+/// Bind a DELETE statement up front: validate the target table and resolve
+/// all names in WHERE and RETURNING. Planning consumes the result without
+/// re-resolving anything.
+#[allow(clippy::too_many_arguments)]
+pub fn bind_delete_stmt(
+    tbl_name: &QualifiedName,
+    indexed: Option<turso_parser::ast::Indexed>,
+    where_clause: &mut Option<Box<Expr>>,
+    returning: &mut Vec<ResultColumn>,
+    with: &mut Option<With>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<DeleteBinding> {
+    let database_id = resolver.resolve_existing_table_database_id_qualified(tbl_name)?;
+    let normalized_table_name = normalize_ident(tbl_name.name.as_str());
+    let table = validate_delete(
+        resolver,
+        &normalized_table_name,
+        database_id,
+        program,
+        connection,
+    )?;
+
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie)?;
+
+    // Bind phase: resolve all names in WHERE and RETURNING up front.
+    let mut binder = super::bind::BindContext::new(resolver, program);
+    let bound = binder.bind_delete(
+        tbl_name,
+        indexed,
+        where_clause,
+        returning,
+        with,
+        database_id,
+    )?;
+
+    Ok(DeleteBinding {
+        bound,
+        database_id,
+        table,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 #[turso_macros::trace_stack]
 pub fn prepare_delete_plan(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    qualified_name: &QualifiedName,
     table: Arc<Table>,
-    mut where_clause: Option<Box<Expr>>,
+    where_clause: Option<Box<Expr>>,
     limit: Option<Limit>,
     mut returning: Vec<ResultColumn>,
-    indexed: Option<turso_parser::ast::Indexed>,
-    mut with: Option<With>,
     connection: &Arc<crate::Connection>,
     database_id: usize,
+    mut bound: super::bind::BoundDelete,
 ) -> Result<(
     Plan,
     rustc_hash::FxHashMap<turso_parser::ast::TableInternalId, super::bind::BoundSubquery>,
@@ -204,17 +244,6 @@ pub fn prepare_delete_plan(
 
     let btree_table_for_triggers = table.btree();
     let indexes = schema.get_indices(table.get_name()).cloned().collect();
-
-    // Bind phase: resolve all names in WHERE and RETURNING up front.
-    let mut binder = super::bind::BindContext::new(resolver, program);
-    let mut bound = binder.bind_delete(
-        qualified_name,
-        indexed,
-        &mut where_clause,
-        &mut returning,
-        &mut with,
-        database_id,
-    )?;
 
     let cte_definitions = std::mem::take(&mut bound.cte_definitions);
     let bound_subqueries = std::mem::take(&mut bound.subquery_bindings);

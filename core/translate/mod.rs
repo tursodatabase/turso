@@ -150,7 +150,7 @@ pub fn translate(
 /// Translate SQL statement into bytecode program.
 #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
 pub fn translate_inner(
-    stmt: ast::Stmt,
+    mut stmt: ast::Stmt,
     resolver: &mut Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
@@ -191,6 +191,11 @@ pub fn translate_inner(
     }
 
     let is_select = matches!(stmt, ast::Stmt::Select { .. });
+
+    // Bind the whole statement once, up front. The per-statement translate
+    // functions consume the bound output instead of binding at their own
+    // call sites.
+    let bound_stmt = bind::bind_stmt(&mut stmt, resolver, program, connection)?;
 
     match stmt {
         ast::Stmt::AlterTable(alter) => {
@@ -289,30 +294,20 @@ pub fn translate_inner(
             translate_create_virtual_table(vtab, resolver, program, connection)?
         }
         ast::Stmt::Delete {
-            tbl_name,
             where_clause,
             limit,
             returning,
-            indexed,
-            order_by,
-            with,
+            ..
         } => {
-            if !order_by.is_empty() {
-                bail_parse_error!("ORDER BY clause is not supported in DELETE");
-            }
-            if where_clause.is_none() && connection.get_dml_require_where() {
-                bail_parse_error!(
-                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
-                );
-            }
+            let Some(bind::BoundStmt::Delete(binding)) = bound_stmt else {
+                unreachable!("bind_stmt binds every DELETE");
+            };
             translate_delete(
-                &tbl_name,
+                binding,
                 resolver,
                 where_clause,
                 limit,
                 returning,
-                indexed,
-                with,
                 program,
                 connection,
             )?
@@ -400,8 +395,12 @@ pub fn translate_inner(
         } => translate_rollback(program, tx_name, savepoint_name)?,
         ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
         ast::Stmt::Select(select) => {
+            let Some(bind::BoundStmt::Select(bound)) = bound_stmt else {
+                unreachable!("bind_stmt binds every SELECT");
+            };
             translate_select(
                 select,
+                bound,
                 resolver,
                 program,
                 plan::QueryDestination::ResultRows,
@@ -409,12 +408,10 @@ pub fn translate_inner(
             )?;
         }
         ast::Stmt::Update(update) => {
-            if update.where_clause.is_none() && connection.get_dml_require_where() {
-                bail_parse_error!(
-                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
-                );
-            }
-            translate_update(update, resolver, program, connection)?
+            let Some(bind::BoundStmt::Update(binding)) = bound_stmt else {
+                unreachable!("bind_stmt binds every UPDATE");
+            };
+            translate_update(update, binding, resolver, program, connection)?
         }
         ast::Stmt::Vacuum { name, into } => {
             vacuum::translate_vacuum(program, name.as_ref(), into.as_deref(), connection.clone())?

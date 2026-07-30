@@ -57,11 +57,20 @@ addr  opcode         p1    p2    p3    p4             p5  comment
 */
 pub fn translate_update(
     body: ast::Update,
+    binding: UpdateBinding,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
-    let plan = prepare_and_optimize_update_plan(program, resolver, body, connection, false, None)?;
+    let plan = prepare_and_optimize_update_plan(
+        program,
+        resolver,
+        body,
+        connection,
+        false,
+        None,
+        Some(binding),
+    )?;
     let Plan::Update(ref update_plan) = plan else {
         unreachable!("prepare_and_optimize_update_plan must return Plan::Update");
     };
@@ -150,11 +159,72 @@ pub fn translate_update_for_schema_change(
         connection,
         true,
         Some(ddl_query),
+        None,
     )?;
     let opts = ProgramBuilderOpts::new(1, 20, 4);
     program.extend(&opts);
     emit_program(connection, resolver, program, plan, after)?;
     Ok(())
+}
+
+/// Output of the statement-level bind phase for UPDATE, produced by
+/// [bind_update_stmt] before planning starts.
+pub struct UpdateBinding {
+    pub bound: super::bind::BoundUpdate,
+    pub database_id: usize,
+    pub table: Arc<Table>,
+    pub or_conflict: Option<ast::ResolveType>,
+}
+
+/// Bind an UPDATE statement up front: validate the target table and resolve
+/// all names in FROM/SET/WHERE/RETURNING. Planning consumes the result
+/// without re-resolving anything.
+pub fn bind_update_stmt(
+    body: &mut ast::Update,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+    is_internal_schema_change: bool,
+) -> crate::Result<UpdateBinding> {
+    let database_id = resolver.resolve_existing_table_database_id_qualified(&body.tbl_name)?;
+    let schema = resolver.schema();
+    let target_name = &body.tbl_name.name;
+    let table = match resolver.with_schema(database_id, |s| s.get_table(target_name.as_str())) {
+        Some(table) => table,
+        None => bail_parse_error!("Parse error: no such table: {}", target_name),
+    };
+    if program.trigger.is_some() && table.virtual_table().is_some() {
+        bail_parse_error!(
+            "unsafe use of virtual table \"{}\"",
+            body.tbl_name.name.as_str()
+        );
+    }
+    if table.btree().is_some_and(|bt| !bt.has_rowid) {
+        bail_parse_error!("UPDATE of WITHOUT ROWID tables is not supported");
+    }
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie)?;
+    validate_update(
+        schema,
+        body,
+        target_name.as_str(),
+        is_internal_schema_change,
+        connection,
+    )?;
+
+    // Extract the OR conflict clause before borrowing body mutably
+    let or_conflict = body.or_conflict.take();
+
+    // Bind phase: resolve all names in FROM/SET/WHERE/RETURNING up front.
+    let mut binder = super::bind::BindContext::new(resolver, program);
+    let bound = binder.bind_update(body, database_id)?;
+
+    Ok(UpdateBinding {
+        bound,
+        database_id,
+        table,
+        or_conflict,
+    })
 }
 
 fn prepare_and_optimize_update_plan(
@@ -164,6 +234,7 @@ fn prepare_and_optimize_update_plan(
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
     ddl_query_for_cdc_update: Option<&str>,
+    binding: Option<UpdateBinding>,
 ) -> crate::Result<Plan> {
     let (mut update_plan, mut bound_subqueries) = prepare_update_plan(
         program,
@@ -171,6 +242,7 @@ fn prepare_and_optimize_update_plan(
         body,
         connection,
         is_internal_schema_change,
+        binding,
     )?;
 
     if let Some(ddl_query_for_cdc_update) = ddl_query_for_cdc_update {
@@ -244,45 +316,31 @@ fn prepare_update_plan(
     mut body: ast::Update,
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
+    binding: Option<UpdateBinding>,
 ) -> crate::Result<(
     UpdatePlan,
     rustc_hash::FxHashMap<turso_parser::ast::TableInternalId, super::bind::BoundSubquery>,
 )> {
-    let database_id = resolver.resolve_existing_table_database_id_qualified(&body.tbl_name)?;
-    let schema = resolver.schema();
-    let target_name = &body.tbl_name.name;
-    let table = match resolver.with_schema(database_id, |s| s.get_table(target_name.as_str())) {
-        Some(table) => table,
-        None => bail_parse_error!("Parse error: no such table: {}", target_name),
+    // The statement path binds up front (bind_stmt); internal callers
+    // (schema-change updates) bind here.
+    let UpdateBinding {
+        mut bound,
+        database_id,
+        table,
+        or_conflict,
+    } = match binding {
+        Some(binding) => binding,
+        None => bind_update_stmt(
+            &mut body,
+            resolver,
+            program,
+            connection,
+            is_internal_schema_change,
+        )?,
     };
-    if program.trigger.is_some() && table.virtual_table().is_some() {
-        bail_parse_error!(
-            "unsafe use of virtual table \"{}\"",
-            body.tbl_name.name.as_str()
-        );
-    }
-    if table.btree().is_some_and(|bt| !bt.has_rowid) {
-        bail_parse_error!("UPDATE of WITHOUT ROWID tables is not supported");
-    }
-    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie)?;
-    validate_update(
-        schema,
-        &body,
-        target_name.as_str(),
-        is_internal_schema_change,
-        connection,
-    )?;
-
-    // Extract the OR conflict clause before borrowing body mutably
-    let or_conflict = body.or_conflict.take();
 
     let table_name = table.get_name().to_string();
     let table_name = table_name.as_str();
-
-    // Bind phase: resolve all names in FROM/SET/WHERE/RETURNING up front.
-    let mut binder = super::bind::BindContext::new(resolver, program);
-    let mut bound = binder.bind_update(&mut body, database_id)?;
 
     let cte_definitions = std::mem::take(&mut bound.cte_definitions);
     let mut bound_subqueries = std::mem::take(&mut bound.subquery_bindings);

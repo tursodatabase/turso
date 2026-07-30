@@ -578,6 +578,79 @@ impl BoundSelect {
     }
 }
 
+// ── Statement-level binding ──────────────────────────────────────────────
+
+/// A whole statement bound up front by [bind_stmt].
+///
+/// `translate_inner` binds the command once at the top and hands the result
+/// to the per-statement translate functions, so no call site constructs its
+/// own [BindContext].
+pub enum BoundStmt {
+    Select(BoundSelect),
+    Delete(crate::translate::delete::DeleteBinding),
+    Update(crate::translate::update::UpdateBinding),
+}
+
+/// Bind an entire statement before planning. Returns `None` for statements
+/// that have no statement-level bind phase: DDL and transaction statements,
+/// and INSERT, whose binding is intentionally deferred/partial (single-row
+/// VALUES and UPSERT `DO UPDATE` bind against runtime contexts, and virtual
+/// table inserts consume the unbound body).
+pub fn bind_stmt(
+    stmt: &mut ast::Stmt,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<Option<BoundStmt>> {
+    match stmt {
+        ast::Stmt::Select(select) => {
+            let bound = crate::translate::select::bind_select_stmt(select, resolver, program)?;
+            Ok(Some(BoundStmt::Select(bound)))
+        }
+        ast::Stmt::Delete {
+            tbl_name,
+            where_clause,
+            returning,
+            indexed,
+            order_by,
+            with,
+            ..
+        } => {
+            if !order_by.is_empty() {
+                crate::bail_parse_error!("ORDER BY clause is not supported in DELETE");
+            }
+            if where_clause.is_none() && connection.get_dml_require_where() {
+                crate::bail_parse_error!(
+                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
+            }
+            let binding = crate::translate::delete::bind_delete_stmt(
+                tbl_name,
+                indexed.clone(),
+                where_clause,
+                returning,
+                with,
+                resolver,
+                program,
+                connection,
+            )?;
+            Ok(Some(BoundStmt::Delete(binding)))
+        }
+        ast::Stmt::Update(update) => {
+            if update.where_clause.is_none() && connection.get_dml_require_where() {
+                crate::bail_parse_error!(
+                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
+            }
+            let binding = crate::translate::update::bind_update_stmt(
+                update, resolver, program, connection, false,
+            )?;
+            Ok(Some(BoundStmt::Update(binding)))
+        }
+        _ => Ok(None),
+    }
+}
+
 // ── BindTracking ─────────────────────────────────────────────────────────
 
 /// Records what was accessed during binding.

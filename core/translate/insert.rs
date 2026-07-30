@@ -2220,7 +2220,17 @@ fn init_source_emission<'a>(
                     coroutine_implementation_start: ctx.halt_label,
                 };
                 let num_result_cols = program.nested(|program| {
-                    translate_select(select, resolver, program, query_destination, connection)
+                    let mut select = select;
+                    let bound =
+                        crate::translate::select::bind_select_stmt(&mut select, resolver, program)?;
+                    translate_select(
+                        select,
+                        bound,
+                        resolver,
+                        program,
+                        query_destination,
+                        connection,
+                    )
                 })?;
                 if num_result_cols != required_column_count {
                     crate::bail_parse_error!(

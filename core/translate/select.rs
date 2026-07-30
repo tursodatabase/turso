@@ -83,10 +83,41 @@ pub fn bind_prepare_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
-    use crate::translate::planner::{plan_bound_ctes, plan_derived_tables};
+    let bound = bind_select_stmt(&mut select, resolver, program)?;
+    prepare_bound_select_plan(
+        select,
+        bound,
+        resolver,
+        program,
+        query_destination,
+        connection,
+    )
+}
 
+/// Bind a SELECT statement up front (the first half of
+/// [bind_prepare_select_plan]). The statement path binds once via
+/// `bind_stmt` and hands the result to [prepare_bound_select_plan].
+pub fn bind_select_stmt(
+    select: &mut ast::Select,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<super::bind::BoundSelect> {
     let mut binder = super::bind::BindContext::new(resolver, program);
-    let mut bound = binder.bind_select(&mut select)?;
+    binder.bind_select(select)
+}
+
+/// Plan an already-bound SELECT (the second half of
+/// [bind_prepare_select_plan]).
+#[turso_macros::trace_stack]
+pub fn prepare_bound_select_plan(
+    select: ast::Select,
+    mut bound: super::bind::BoundSelect,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    query_destination: QueryDestination,
+    connection: &Arc<crate::Connection>,
+) -> Result<Plan> {
+    use crate::translate::planner::{plan_bound_ctes, plan_derived_tables};
 
     // Plan CTEs using pre-bound data from the binder.
     let cte_definitions = std::mem::take(&mut bound.cte_definitions);
@@ -150,12 +181,20 @@ pub fn bind_prepare_select_plan(
 #[turso_macros::trace_stack]
 pub fn translate_select(
     select: ast::Select,
+    bound: super::bind::BoundSelect,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    let plan = bind_prepare_select_plan(select, resolver, program, query_destination, connection)?;
+    let plan = prepare_bound_select_plan(
+        select,
+        bound,
+        resolver,
+        program,
+        query_destination,
+        connection,
+    )?;
     if program.trigger.is_some() {
         if let Some(virtual_table) = plan_first_virtual_table_name(&plan) {
             crate::bail_parse_error!("unsafe use of virtual table \"{}\"", virtual_table);
