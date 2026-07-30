@@ -725,6 +725,10 @@ pub struct BindContext<'a, G: IdGenerator> {
     /// Function and schema resolver.
     pub resolver: &'a Resolver<'a>,
 
+    /// PRAGMA full_column_names && !short_column_names: star expansion names
+    /// columns as `table.column` (mirrors select_star's `long_names`).
+    long_names: bool,
+
     /// Generates unique table IDs for scope tables.
     id_gen: &'a mut G,
 
@@ -782,6 +786,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     pub fn new(resolver: &'a Resolver<'a>, id_gen: &'a mut G) -> Self {
         Self {
             resolver,
+            long_names: false,
             id_gen,
             outer_query_frames: Vec::new(),
             outer_frame_floor: 0,
@@ -795,6 +800,13 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             shared_subqueries: Vec::new(),
             derived_bindings: HashMap::default(),
         }
+    }
+
+    /// Enable `table.column` naming for star expansion
+    /// (PRAGMA full_column_names on, short_column_names off).
+    pub fn with_long_names(mut self, long_names: bool) -> Self {
+        self.long_names = long_names;
+        self
     }
 
     // ── Outer scope stack (mirrors DataFusion PlannerContext) ─────────
@@ -1381,11 +1393,88 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         self.outer_frame_floor = saved_floor;
         group_result?;
         if let Some(having) = &mut group_by.having {
+            // Before alias resolution replaces identifiers with their
+            // underlying expressions, reject identifiers inside an aggregate's
+            // arguments that resolve to an aggregate alias, matching SQLite's
+            // "misuse of aliased aggregate" (NC_AllowAgg in resolve.c).
+            self.check_aliased_aggregate_misuse(having)?;
             self.with_phase(BindPhase::AliasFirst, |ctx| {
                 ctx.try_inline_trivial_subquery(having, scope);
                 ctx.bind_expr(having, scope)
             })?;
         }
+        Ok(())
+    }
+
+    /// Reject `HAVING agg(... alias ...)` where `alias` names an aggregate
+    /// result column (e.g. `SELECT min(x) AS m ... HAVING max(m+5) < 10`).
+    fn check_aliased_aggregate_misuse(&self, expr: &ast::Expr) -> Result<()> {
+        let expr_contains_aggregate = |e: &ast::Expr| {
+            let mut found = false;
+            let _ = walk_expr(e, &mut |n: &ast::Expr| {
+                match n {
+                    ast::Expr::FunctionCall { name, args, .. } => {
+                        if matches!(
+                            Func::resolve_function(name.as_str(), args.len()),
+                            Ok(Some(Func::Agg(_)))
+                        ) {
+                            found = true;
+                            return Ok(WalkControl::SkipChildren);
+                        }
+                    }
+                    ast::Expr::FunctionCallStar { name, .. } => {
+                        if matches!(
+                            Func::resolve_function(name.as_str(), 0),
+                            Ok(Some(Func::Agg(_)))
+                        ) {
+                            found = true;
+                            return Ok(WalkControl::SkipChildren);
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(WalkControl::Continue)
+            });
+            found
+        };
+        walk_expr(expr, &mut |e: &ast::Expr| {
+            let is_agg = match e {
+                ast::Expr::FunctionCall { name, args, .. } => matches!(
+                    Func::resolve_function(name.as_str(), args.len()),
+                    Ok(Some(Func::Agg(_)))
+                ),
+                ast::Expr::FunctionCallStar { name, .. } => matches!(
+                    Func::resolve_function(name.as_str(), 0),
+                    Ok(Some(Func::Agg(_)))
+                ),
+                _ => false,
+            };
+            if !is_agg {
+                return Ok(WalkControl::Continue);
+            }
+            if let ast::Expr::FunctionCall { args, .. } = e {
+                for arg in args.iter() {
+                    walk_expr(arg, &mut |n: &ast::Expr| {
+                        if let ast::Expr::Id(id) = n {
+                            let normalized = normalize_ident(id.as_str());
+                            for bc in self.aliases().iter() {
+                                if bc.is_explicit_alias
+                                    && bc.name.eq_ignore_ascii_case(&normalized)
+                                    && expr_contains_aggregate(&bc.expr)
+                                {
+                                    crate::bail_parse_error!(
+                                        "misuse of aliased aggregate {}",
+                                        normalized
+                                    );
+                                }
+                            }
+                        }
+                        Ok(WalkControl::Continue)
+                    })?;
+                }
+            }
+            Ok(WalkControl::SkipChildren)
+        })?;
         Ok(())
     }
 
@@ -1469,7 +1558,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                                     column: col_ref.idx,
                                     is_rowid_alias: col_ref.is_rowid_alias,
                                 }),
-                                None,
+                                Some(self.star_column_alias(&st.identifier, col_ref.name)),
                             ));
                         }
                     }
@@ -1493,7 +1582,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                                     column: col_ref.idx,
                                     is_rowid_alias: col_ref.is_rowid_alias,
                                 }),
-                                None,
+                                Some(self.star_column_alias(&st.identifier, col_ref.name)),
                             ));
                         }
                     } else {
@@ -1506,6 +1595,19 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         }
         *columns = expanded;
         Ok(())
+    }
+
+    /// Alias for a star-expanded column, mirroring select_star: the bare
+    /// column name, or `table.column` under long_names. Setting the alias
+    /// keeps runtime column naming (which applies PRAGMA full_column_names to
+    /// alias-less columns) identical to the legacy path.
+    fn star_column_alias(&self, table_identifier: &str, col_name: &str) -> ast::As {
+        let name = if self.long_names {
+            format!("{table_identifier}.{col_name}")
+        } else {
+            col_name.to_string()
+        };
+        ast::As::As(ast::Name::exact(name))
     }
 
     fn bind_cte(&mut self, with: &mut ast::With) -> Result<()> {
@@ -2333,26 +2435,39 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 //   3. a=column,   b=field,  c=sub-field
                 let db_resolution = self.resolver.resolve_database_id(&qname);
                 if let Ok(database_id) = db_resolution {
-                    if let Some(resolved) =
-                        self.resolve_qualified_column(tbl_name.as_str(), col_name.as_str(), scope)?
-                    {
-                        match resolved {
-                            ast::Expr::Column {
-                                table,
-                                column,
-                                is_rowid_alias,
-                                ..
-                            } => {
-                                *expr = ast::Expr::Column {
-                                    database: Some(database_id),
+                    // The interpretation only holds if the named database
+                    // actually contains the table (mirrors bind_and_rewrite:
+                    // `temp.t1.y` must not resolve through a main-schema t1
+                    // that happens to be in the FROM clause).
+                    let table_in_db = self.resolver.with_schema(database_id, |schema| {
+                        schema
+                            .get_table(&normalize_ident(tbl_name.as_str()))
+                            .is_some()
+                    });
+                    if table_in_db {
+                        if let Some(resolved) = self.resolve_qualified_column(
+                            tbl_name.as_str(),
+                            col_name.as_str(),
+                            scope,
+                        )? {
+                            match resolved {
+                                ast::Expr::Column {
                                     table,
                                     column,
                                     is_rowid_alias,
-                                };
+                                    ..
+                                } => {
+                                    *expr = ast::Expr::Column {
+                                        database: Some(database_id),
+                                        table,
+                                        column,
+                                        is_rowid_alias,
+                                    };
+                                }
+                                other => *expr = other,
                             }
-                            other => *expr = other,
+                            return Ok(());
                         }
-                        return Ok(());
                     }
                 }
 

@@ -91,12 +91,12 @@ addr  opcode                            p1   p2   p3  p4              p5  commen
   56          Integer                    0   26    0                   0  r[26]=0; clear group by abort flag
   57          Null                       0   27    0                   0  r[27]=NULL; initialize group by comparison registers to NULL
   58          Gosub                     33   90    0                   0  ; go to clear accumulator subroutine
-  59          OpenRead                   3    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
-  60          OpenRead                   4    8    0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
-  61          Rewind                     4   77    0                   0  Rewind index idx_products_category
-  62            DeferredSeek             4    3    0                   0
-  63            Column                   4    0   31                   0  r[31]=idx_products_category.category_id
-  64            Column                   3    3   32                   0  r[32]=products.price
+  59          OpenRead                   0    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  60          OpenRead                   1    8    0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
+  61          Rewind                     1   77    0                   0  Rewind index idx_products_category
+  62            DeferredSeek             1    0    0                   0
+  63            Column                   1    0   31                   0  r[31]=idx_products_category.category_id
+  64            Column                   0    3   32                   0  r[32]=products.price
   65            RealAffinity            32    0    0                   0
   66            Compare                 27   31    1  k(1, Binary)     0  r[27..27]==r[31..31]
   67            Jump                    68   72   68                   0  ; start new group if comparison is not equal
@@ -106,9 +106,9 @@ addr  opcode                            p1   p2   p3  p4              p5  commen
   71            Gosub                   33   90    0                   0  ; goto clear accumulator subroutine
   72            AggStep                  0   32   29  avg              0  accum=r[29] step(r[32])
   73            If                      25   75    0                   0  if r[25] goto 75; don't emit group columns if continuing existing group
-  74            Column                   4    0   28                   0  r[28]=idx_products_category.category_id
+  74            Column                   1    0   28                   0  r[28]=idx_products_category.category_id
   75            Integer                  1   25    0                   0  r[25]=1; indicate data in accumulator
-  76          Next                       4   62    0                   0
+  76          Next                       1   62    0                   0
   77          Gosub                     24   81    0                   0  ; emit row for final group
   78          Goto                       0   93    0                   0  ; group by finished
   79          Integer                    1   26    0                   0  r[26]=1
@@ -125,28 +125,28 @@ addr  opcode                            p1   p2   p3  p4              p5  commen
   90    Null                             0   28   29                   0  r[28..29]=NULL; clear accumulator subroutine start
   91    Integer                          0   25    0                   0  r[25]=0
   92  Return                            33    0    0                   0
-  93  OpenRead                           5    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
-  94  OpenRead                           6    8    0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
+  93  OpenRead                           3    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  94  OpenRead                           4    8    0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
   95  Rewind                             2  116    0                   0  Rewind  ephemeral()
   96    Column                           2    0   20                   0  r[20]=ephemeral().category_id
   97    Column                           2    1   21                   0  r[21]=ephemeral().avg_price
   98    Copy                            20   39    0                   0  r[39]=r[20]
   99    IsNull                          39  115    0                   0  if (r[39]==NULL) goto 115
  100    Affinity                        39    1    0                   0  r[39..40] = C
- 101    SeekGE                           6  115   39                   0  key=[39..39]
- 102      IdxGT                          6  115   39                   0  key=[39..39]
- 103      DeferredSeek                   6    5    0                   0
- 104      Column                         5    3   41                   0  r[41]=products.price
+ 101    SeekGE                           4  115   39                   0  key=[39..39]
+ 102      IdxGT                          4  115   39                   0  key=[39..39]
+ 103      DeferredSeek                   4    3    0                   0
+ 104      Column                         3    3   41                   0  r[41]=products.price
  105      RealAffinity                  41    0    0                   0
  106      Copy                           1   43    0                   0  r[43]=r[1]
  107      Multiply                      43   44   42                   0  r[42]=r[43]*r[44]
  108      Le                            41   42  114  Binary           0  if r[41]<=r[42] goto 114
- 109      Column                         5    1   36                   0  r[36]=products.name
- 110      Column                         5    3   37                   0  r[37]=products.price
+ 109      Column                         3    1   36                   0  r[36]=products.name
+ 110      Column                         3    3   37                   0  r[37]=products.price
  111      RealAffinity                  37    0    0                   0
  112      Copy                          21   38    0                   0  r[38]=r[21]
  113      ResultRow                     36    3    0                   0  output=r[36..38]
- 114    Next                             6  102    0                   0
+ 114    Next                             4  102    0                   0
  115  Next                               2   96    0                   0
  116  Halt                               0    0    0                   0
  117  Transaction                        0    1   11                   0  iDb=0 tx_mode=Read

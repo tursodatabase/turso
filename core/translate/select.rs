@@ -86,7 +86,8 @@ pub fn bind_prepare_select_plan(
 ) -> Result<Plan> {
     use crate::translate::planner::{plan_bound_ctes, plan_derived_tables};
 
-    let mut binder = super::bind::BindContext::new(resolver, program);
+    let long_names = connection.get_full_column_names() && !connection.get_short_column_names();
+    let mut binder = super::bind::BindContext::new(resolver, program).with_long_names(long_names);
     let mut bound = binder.bind_select(&mut select)?;
 
     // Plan CTEs using pre-bound data from the binder.

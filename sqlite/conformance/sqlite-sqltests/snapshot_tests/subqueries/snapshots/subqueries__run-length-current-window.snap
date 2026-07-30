@@ -118,7 +118,7 @@ QUERY PLAN
 |           `--SCAN prior_days
 |              |--SCAN signal_days AS d1
 |              `--CORRELATED SCALAR SUBQUERY 3
-|                 `--SEARCH d2 USING INDEX ephemeral_subquery_t107 (signal_day<?)
+|                 `--SEARCH d2 USING INDEX ephemeral_subquery_t10 (signal_day<?)
 `--SCAN run_lengths
    |--SCAN run_ids
    |  `--SCAN window_subquery_0
@@ -126,5 +126,5 @@ QUERY PLAN
    |        `--SCAN prior_days
    |           |--SCAN signal_days AS d1
    |           `--CORRELATED SCALAR SUBQUERY 4
-   |              `--SEARCH d2 USING INDEX ephemeral_subquery_t81 (signal_day<?)
+   |              `--SEARCH d2 USING INDEX ephemeral_subquery_t10 (signal_day<?)
    `--USE SORTER FOR GROUP BY
