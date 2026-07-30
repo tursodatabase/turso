@@ -1448,3 +1448,75 @@ expect {
     9|integer
     5|integer
 }
+
+# A partial index whose WHERE references the converted column is
+# rebuilt so membership reflects the converted values.
+test alter-column-conversion-rebuilds-partial-index {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE INDEX pi ON t (y) WHERE x > 5;
+    INSERT INTO t VALUES ('10', 'a'), ('2', 'b');
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+    SELECT y FROM t WHERE x > 5;
+    PRAGMA integrity_check;
+}
+expect {
+    a
+    ok
+}
+
+# STRICT ANY -> TEXT must fail when a stored value (a BLOB) cannot be
+# stored under TEXT; STRICT never coerces BLOBs.
+test fail-alter-column-strict-any-to-text-with-blob {
+    CREATE TABLE s (id INTEGER PRIMARY KEY, v ANY) STRICT;
+    INSERT INTO s VALUES (1, 'abc'), (2, x'ff');
+    ALTER TABLE s ALTER COLUMN v TO v TEXT;
+}
+expect error {
+}
+
+test alter-column-strict-text-to-any {
+    CREATE TABLE s (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    INSERT INTO s VALUES (1, 'abc');
+    ALTER TABLE s ALTER COLUMN v TO v ANY;
+    INSERT INTO s VALUES (2, 42);
+    SELECT quote(v), typeof(v) FROM s ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    'abc'|text
+    42|integer
+    ok
+}
+
+test alter-column-conversion-mvcc {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (x TEXT);
+    INSERT INTO t VALUES ('123'), ('abc');
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+    SELECT quote(x), typeof(x) FROM t ORDER BY rowid;
+}
+expect {
+    mvcc
+    123|integer
+    'abc'|text
+}
+
+# The index refill machinery is not MVCC-safe, so converting an indexed
+# column errors in MVCC mode instead of corrupting the index.
+test fail-alter-column-mvcc-indexed-conversion {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (x TEXT);
+    CREATE INDEX i ON t (x);
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+}
+expect error {
+}
+
+test fail-alter-column-add-notnull-with-nulls-mvcc {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (a INTEGER, b TEXT);
+    INSERT INTO t (a) VALUES (1);
+    ALTER TABLE t ALTER COLUMN b TO b TEXT NOT NULL;
+}
+expect error {
+}
