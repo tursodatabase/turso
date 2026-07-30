@@ -1253,6 +1253,113 @@ mod tests {
     }
 
     #[test]
+    fn scan_loops_emit_the_rewind_next_shape() {
+        // scan_loop composes the eager Rewind / body / Next / done shape;
+        // the row value steers into the ResultRow pack with no copies.
+        let leaf_expr = parse_expr("x");
+        let description = combine::scan_loop(0, |builder| {
+            let row_value = builder.leaf(&leaf_expr);
+            builder.emit_row(vec![row_value]);
+            Ok(())
+        });
+        let mut builder = FuncBuilder::new();
+        description.run(&mut builder).unwrap();
+        let sentinel = builder.null();
+        builder.ret(sentinel);
+        let func = builder.finish();
+        verify(&func).unwrap();
+
+        let mut program = test_program();
+        let dest = program.alloc_register();
+        let mut leaf_emitter = stub_leaf_emitter();
+        emit::emit_function_with_leaves(&mut program, &func, dest, &mut leaf_emitter).unwrap();
+        program.resolve_labels().unwrap();
+        let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
+        // Entry consts (the sentinel NULL) precede the loop; the body
+        // reads the leaf straight into the ResultRow pack.
+        let [Insn::Null { .. }, Insn::Rewind { cursor_id: 0, .. }, Insn::Integer {
+            value: 7,
+            dest: leaf_dest,
+        }, Insn::ResultRow {
+            start_reg,
+            count: 1,
+        }, Insn::Next { cursor_id: 0, .. }] = insns[..]
+        else {
+            panic!("unexpected scan shape: {insns:?}");
+        };
+        assert_eq!(leaf_dest, start_reg);
+    }
+
+    #[test]
+    fn loop_carried_values_flow_through_body_params() {
+        // A counter carried through the loop body's block parameter: the
+        // entry edge seeds it, the back edge passes the incremented
+        // value through a trampoline (edge copies cannot ride the Next
+        // jump itself).
+        let mut builder = FuncBuilder::new();
+        let zero = builder.int(0);
+        let one = builder.int(1);
+        let body = builder.create_block();
+        let counter = builder.add_block_param(body);
+        let latch = builder.create_block();
+        let done = builder.create_block();
+        builder.rewind(
+            5,
+            JumpTarget::new(done, Vec::new()),
+            JumpTarget::new(body, vec![zero]),
+        );
+        builder.switch_to(body);
+        let incremented = builder.binary(BinOp::Add, counter, one);
+        builder.emit_row(vec![counter]);
+        builder.jump(latch, Vec::new());
+        builder.switch_to(latch);
+        builder.next_row(
+            5,
+            JumpTarget::new(body, vec![incremented]),
+            JumpTarget::new(done, Vec::new()),
+        );
+        builder.switch_to(done);
+        builder.ret(zero);
+        let func = builder.finish();
+        verify(&func).unwrap();
+
+        let mut program = test_program();
+        let dest = program.alloc_register();
+        emit::emit_function(&mut program, &func, dest).unwrap();
+        program.resolve_labels().unwrap();
+        let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
+        // The back edge carries the incremented counter: Next jumps to a
+        // trampoline that copies it into the parameter register and
+        // re-enters the body.
+        let next_position = insns
+            .iter()
+            .position(|insn| matches!(insn, Insn::Next { .. }))
+            .expect("Next emitted");
+        // After Next: the explicit done-edge Goto (fallthrough elision
+        // is off while a trampoline still follows), then the trampoline:
+        // copy the carried value into the parameter register, re-enter
+        // the body.
+        assert!(
+            matches!(insns[next_position + 1], Insn::Goto { .. }),
+            "{insns:?}"
+        );
+        assert!(
+            matches!(insns[next_position + 2], Insn::Copy { .. }),
+            "back-edge trampoline copies the loop-carried value: {insns:?}"
+        );
+        assert!(
+            matches!(insns[next_position + 3], Insn::Goto { .. }),
+            "trampoline re-enters the body: {insns:?}"
+        );
+        assert!(
+            insns
+                .iter()
+                .any(|insn| matches!(insn, Insn::ResultRow { .. })),
+            "{insns:?}"
+        );
+    }
+
+    #[test]
     fn pure_and_map_pass_values_through() {
         let description = Compiler::pure(41).map(|v| v + 1);
         let mut builder = FuncBuilder::new();

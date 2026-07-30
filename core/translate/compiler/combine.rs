@@ -257,6 +257,42 @@ impl<'a> Predicate<'a> {
     }
 }
 
+/// Describe a full scan over an externally-opened cursor: rewind, run
+/// `body` once per row, advance. The eager Rewind/Next loop shape,
+/// composed instead of hand-sequenced.
+///
+/// `body` runs with the builder positioned in the loop-body block and
+/// must leave its final block unterminated (the loop wires it to the
+/// latch). The builder is left positioned in the loop's continuation
+/// block. Loop-carried values (block parameters on the body) come with
+/// the aggregate work; today's bodies are effect-only.
+pub fn scan_loop<'a>(
+    cursor: usize,
+    body: impl FnOnce(&mut FuncBuilder) -> Result<()> + 'a,
+) -> Compiler<'a, ()> {
+    Compiler::build_with(move |builder| {
+        let body_block = builder.create_block();
+        let latch = builder.create_block();
+        let done = builder.create_block();
+        builder.rewind(
+            cursor,
+            JumpTarget::new(done, Vec::new()),
+            JumpTarget::new(body_block, Vec::new()),
+        );
+        builder.switch_to(body_block);
+        body(builder)?;
+        builder.jump(latch, Vec::new());
+        builder.switch_to(latch);
+        builder.next_row(
+            cursor,
+            JumpTarget::new(body_block, Vec::new()),
+            JumpTarget::new(done, Vec::new()),
+        );
+        builder.switch_to(done);
+        Ok(())
+    })
+}
+
 /// A value imported from a physical register owned by surrounding eager
 /// code. See [`super::ir::Inst::External`].
 pub fn external(reg: usize) -> Compiler<'static, ValueId> {

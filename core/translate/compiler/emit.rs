@@ -118,6 +118,10 @@ struct Emitter<'a> {
     /// Contiguous register pack per call site (indexed by `CallId`):
     /// `Insn::Function` requires its arguments in adjacent registers.
     call_packs: Vec<usize>,
+    /// Contiguous register pack per `EmitRow` site (indexed by the
+    /// instruction's own value id): `Insn::ResultRow` requires adjacent
+    /// registers.
+    row_packs: Vec<Option<usize>>,
     /// The label the caller binds to the first instruction after this
     /// island. Jumps to an exit bound to this label from the island's
     /// last emitted block are pure fallthrough and are elided, and
@@ -189,7 +193,10 @@ impl<'a> Emitter<'a> {
                 }
                 // External inputs, leaves, and block parameters read
                 // state the prologue cannot see.
-                Some(Inst::External { .. }) | Some(Inst::Leaf(_)) | None => false,
+                Some(Inst::External { .. })
+                | Some(Inst::Leaf(_))
+                | Some(Inst::EmitRow { .. })
+                | None => false,
             };
         }
 
@@ -212,6 +219,7 @@ impl<'a> Emitter<'a> {
                         count(rhs);
                     }
                     Inst::Call { args, .. } => args.iter().for_each(&mut count),
+                    Inst::EmitRow { values } => values.iter().for_each(&mut count),
                 }
             }
             if let Some(terminator) = &block.terminator {
@@ -224,6 +232,7 @@ impl<'a> Emitter<'a> {
                     }
                     Terminator::NullBranch { value, .. } => count(value),
                     Terminator::Ret { value } => count(value),
+                    Terminator::Rewind { .. } | Terminator::Next { .. } => {}
                 }
                 for target in terminator.targets() {
                     target.args.iter().for_each(&mut count);
@@ -238,31 +247,42 @@ impl<'a> Emitter<'a> {
         // own register and are copied into the slot at the call site.
         let mut regs: Vec<Option<usize>> = vec![None; func.num_values()];
         let mut call_packs = vec![0usize; func.num_calls()];
+        let mut row_packs: Vec<Option<usize>> = vec![None; func.num_values()];
+        let steer = |program: &mut ProgramBuilder,
+                     regs: &mut Vec<Option<usize>>,
+                     args: &[super::ir::ValueId]| {
+            let pack = program.alloc_registers(args.len());
+            for (slot, arg) in args.iter().enumerate() {
+                let bindable = matches!(
+                    inst_of[arg.index()],
+                    Some(
+                        Inst::Const(_)
+                            | Inst::Unary { .. }
+                            | Inst::Binary { .. }
+                            | Inst::Compare { .. }
+                            | Inst::NullTest { .. }
+                            | Inst::Cast { .. }
+                            | Inst::Truth { .. }
+                            | Inst::Call { .. }
+                            | Inst::Leaf(_)
+                    )
+                );
+                if use_count[arg.index()] == 1 && regs[arg.index()].is_none() && bindable {
+                    regs[arg.index()] = Some(pack + slot);
+                }
+            }
+            pack
+        };
         for &block_id in &order {
-            for (_, inst) in &func.block(block_id).insts {
-                let Inst::Call { call, args } = inst else {
-                    continue;
-                };
-                let pack = program.alloc_registers(args.len());
-                call_packs[call.index()] = pack;
-                for (slot, arg) in args.iter().enumerate() {
-                    let bindable = matches!(
-                        inst_of[arg.index()],
-                        Some(
-                            Inst::Const(_)
-                                | Inst::Unary { .. }
-                                | Inst::Binary { .. }
-                                | Inst::Compare { .. }
-                                | Inst::NullTest { .. }
-                                | Inst::Cast { .. }
-                                | Inst::Truth { .. }
-                                | Inst::Call { .. }
-                                | Inst::Leaf(_)
-                        )
-                    );
-                    if use_count[arg.index()] == 1 && regs[arg.index()].is_none() && bindable {
-                        regs[arg.index()] = Some(pack + slot);
+            for (value, inst) in &func.block(block_id).insts {
+                match inst {
+                    Inst::Call { call, args } => {
+                        call_packs[call.index()] = steer(program, &mut regs, args);
                     }
+                    Inst::EmitRow { values } => {
+                        row_packs[value.index()] = Some(steer(program, &mut regs, values));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -279,6 +299,7 @@ impl<'a> Emitter<'a> {
             leaf_emitter,
             is_const,
             call_packs,
+            row_packs,
             fallthrough_label: None,
         }
     }
@@ -456,6 +477,24 @@ impl<'a> Emitter<'a> {
                     self.program.emit_insn(jump);
                     self.program.emit_insn(Insn::Integer { value: 0, dest });
                     self.program.preassign_label_to_next_insn(label);
+                }
+                Inst::EmitRow { values } => {
+                    let pack = self.row_packs[value.index()]
+                        .expect("row packs are allocated upfront for every EmitRow");
+                    for (slot, &row_value) in values.iter().enumerate() {
+                        let src = self.reg_of(row_value);
+                        if src != pack + slot {
+                            self.program.emit_insn(Insn::Copy {
+                                src_reg: src,
+                                dst_reg: pack + slot,
+                                extra_amount: 0,
+                            });
+                        }
+                    }
+                    self.program.emit_insn(Insn::ResultRow {
+                        start_reg: pack,
+                        count: values.len(),
+                    });
                 }
                 Inst::Call { call, args } => {
                     let pack = self.call_packs[call.index()];
@@ -735,6 +774,46 @@ impl<'a> Emitter<'a> {
                 self.program.emit_insn(jump);
                 self.emit_edge(fall_target);
                 self.emit_goto_unless_next(fall_target.block, next, trampolines.is_empty());
+                for (label, target) in trampolines {
+                    self.program.preassign_label_to_next_insn(label);
+                    self.emit_edge(&target);
+                    let pc = self.jump_target_pc(target.block);
+                    self.program.emit_insn(Insn::Goto { target_pc: pc });
+                }
+            }
+            Terminator::Rewind {
+                cursor,
+                if_empty,
+                if_rows,
+            } => {
+                let mut trampolines: Vec<(BranchOffset, JumpTarget)> = Vec::new();
+                let pc_if_empty = self.edge_entry_pc(if_empty, &mut trampolines);
+                self.program.emit_insn(Insn::Rewind {
+                    cursor_id: *cursor,
+                    pc_if_empty,
+                });
+                self.emit_edge(if_rows);
+                self.emit_goto_unless_next(if_rows.block, next, trampolines.is_empty());
+                for (label, target) in trampolines {
+                    self.program.preassign_label_to_next_insn(label);
+                    self.emit_edge(&target);
+                    let pc = self.jump_target_pc(target.block);
+                    self.program.emit_insn(Insn::Goto { target_pc: pc });
+                }
+            }
+            Terminator::Next {
+                cursor,
+                if_more,
+                if_done,
+            } => {
+                let mut trampolines: Vec<(BranchOffset, JumpTarget)> = Vec::new();
+                let pc_if_next = self.edge_entry_pc(if_more, &mut trampolines);
+                self.program.emit_insn(Insn::Next {
+                    cursor_id: *cursor,
+                    pc_if_next,
+                });
+                self.emit_edge(if_done);
+                self.emit_goto_unless_next(if_done.block, next, trampolines.is_empty());
                 for (label, target) in trampolines {
                     self.program.preassign_label_to_next_insn(label);
                     self.emit_edge(&target);

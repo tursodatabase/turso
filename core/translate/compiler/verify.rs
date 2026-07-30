@@ -160,6 +160,11 @@ pub fn verify(func: &Function) -> Result<(), VerifyError> {
                         check(arg, index)?;
                     }
                 }
+                super::ir::Inst::EmitRow { values } => {
+                    for &value in values {
+                        check(value, index)?;
+                    }
+                }
             }
         }
 
@@ -184,6 +189,7 @@ pub fn verify(func: &Function) -> Result<(), VerifyError> {
             }
             Terminator::NullBranch { value, .. } => check(*value, end)?,
             Terminator::Ret { value } => check(*value, end)?,
+            Terminator::Rewind { .. } | Terminator::Next { .. } => {}
         }
         for target in terminator.targets() {
             for &arg in &target.args {

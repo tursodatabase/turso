@@ -332,13 +332,25 @@ boundary (the whole tree is constant, so the span opened by
 
 ### Phase 3 — Loops, effects, and resources
 
-- [ ] 3a. `loop_over` combinator: explicit loop headers with loop-carried
-      block parameters (the emitter's parallel-copy staging already
-      handles the swap hazard).
-- [ ] 3b. Effectful instructions: cursor open/seek/step, row reads as
-      effects with region boundaries; symbolic cursors.
-- [ ] 3c. Register packs (contiguous groups) + `Slot` (explicit mutable
-      cells) in IR and emitter; liveness-based reuse instead of
+- [x] 3a. Loop substrate: `Terminator::Rewind` and `Terminator::Next`
+      over externally-opened cursors (physical ids for now, like
+      `External` registers were the bridge before symbolic ones), the
+      `Inst::EmitRow` effect (`Insn::ResultRow` via the generalized pack
+      machinery — `steer` is now shared between call sites and row
+      sites), and the `scan_loop` combinator composing the eager
+      Rewind / body / Next / done shape. Loop-carried values work as
+      body block parameters: the entry edge seeds them inline, the back
+      edge passes them through a trampoline (edge copies cannot ride the
+      Next jump). Effects are ordered by block position, never constant,
+      never interned; the block-scoped leaf-dedup rule automatically
+      gives per-iteration column re-reads. IR-level tests only — the
+      production integration is Phase 4a.
+- [ ] 3b. IR-owned cursors: symbolic cursor declaration with open/close
+      effects (table root/type as opaque frontend payloads), seeks, and
+      the remaining cursor movement terminators (SeekGE, Last, Prev).
+- [ ] 3c. Register packs are done (calls, rows); remaining: `Slot`
+      (explicit mutable cells) for aggregate accumulators and coroutine
+      yield cells; liveness-based register reuse instead of
       fresh-register-per-value.
 
 ### Phase 4 — Row streams

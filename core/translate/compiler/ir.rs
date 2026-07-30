@@ -286,6 +286,16 @@ pub enum Inst {
     /// Opaque leaf emitted by delegating its AST expression to the eager
     /// translation path. See [`LeafId`].
     Leaf(LeafId),
+    /// Produce a result row from the given values (`Insn::ResultRow`),
+    /// which must land in adjacent registers — emission allocates a
+    /// contiguous pack per site, steering single-use argument
+    /// definitions into their slots like call arguments. This is an
+    /// effect: never constant, never interned, ordered by its position
+    /// in the block. The instruction's own value is unit-like and must
+    /// not be used.
+    EmitRow {
+        values: Vec<ValueId>,
+    },
 }
 
 /// A control-flow edge: the destination block plus the values bound to its
@@ -346,6 +356,23 @@ pub enum Terminator {
     },
     /// Leave the IR island for an external continuation. See [`ExitId`].
     Exit(ExitId),
+    /// Position `cursor` (externally opened, referenced by its physical
+    /// id like `Inst::External` references registers) at its first row:
+    /// `if_empty` when the table has no rows, `if_rows` otherwise
+    /// (`Insn::Rewind`).
+    Rewind {
+        cursor: usize,
+        if_empty: JumpTarget,
+        if_rows: JumpTarget,
+    },
+    /// Advance `cursor`: `if_more` (the loop back-edge, which may carry
+    /// loop values as block arguments) when another row exists,
+    /// `if_done` otherwise (`Insn::Next`).
+    Next {
+        cursor: usize,
+        if_more: JumpTarget,
+        if_done: JumpTarget,
+    },
 }
 
 impl Terminator {
@@ -369,6 +396,12 @@ impl Terminator {
                 if_not_null,
                 ..
             } => vec![if_null, if_not_null],
+            Terminator::Rewind {
+                if_empty, if_rows, ..
+            } => vec![if_empty, if_rows],
+            Terminator::Next {
+                if_more, if_done, ..
+            } => vec![if_more, if_done],
             Terminator::Ret { .. } | Terminator::Exit(_) => Vec::new(),
         }
     }
@@ -611,6 +644,30 @@ impl FuncBuilder {
             if_null,
             if_not_null,
         });
+    }
+
+    /// Terminate the current block by rewinding an external cursor.
+    pub fn rewind(&mut self, cursor: usize, if_empty: JumpTarget, if_rows: JumpTarget) {
+        self.terminate(Terminator::Rewind {
+            cursor,
+            if_empty,
+            if_rows,
+        });
+    }
+
+    /// Terminate the current block by advancing an external cursor.
+    pub fn next_row(&mut self, cursor: usize, if_more: JumpTarget, if_done: JumpTarget) {
+        self.terminate(Terminator::Next {
+            cursor,
+            if_more,
+            if_done,
+        });
+    }
+
+    /// Produce a result row from `values`. The returned value is
+    /// unit-like bookkeeping and must not be used.
+    pub fn emit_row(&mut self, values: Vec<ValueId>) {
+        let _ = self.push_inst(Inst::EmitRow { values });
     }
 
     pub fn binary(&mut self, op: BinOp, lhs: ValueId, rhs: ValueId) -> ValueId {
