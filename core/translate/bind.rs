@@ -1,9 +1,4 @@
-// TODO: remove once the binding phase is wired into the planner
-// (integration happens in follow-up commits on this branch).
-#![allow(dead_code)]
-
 use crate::function::Func;
-use crate::schema::ROWID_SENTINEL;
 use crate::sync::Arc;
 use crate::vdbe::builder::ProgramBuilder;
 
@@ -14,7 +9,7 @@ use turso_parser::ast::{self, JoinConstraint, TableInternalId};
 use super::emitter::Resolver;
 use super::expr::{walk_expr, walk_expr_mut, WalkControl};
 use super::plan::{JoinInfo, TableReferences};
-use super::planner::{parse_row_id, ROWID_STRS};
+use super::planner::parse_row_id;
 use crate::schema::Table;
 use crate::util::normalize_ident;
 use crate::Result;
@@ -264,7 +259,7 @@ pub struct ScopeTable {
 #[derive(Clone)]
 pub enum ScopeTableSource {
     Table(Arc<Table>),
-    Cte { name: String, cte_id: usize },
+    Cte { name: String },
     Derived {},
 }
 
@@ -480,45 +475,12 @@ impl BoundUpdate {
 
 pub struct BoundDelete {
     pub scope: BindScope,
-    pub result_columns: Vec<BoundColumn>,
     pub tracking: BindTracking,
     pub subquery_bindings: HashMap<ast::TableInternalId, BoundSubquery>,
     pub cte_definitions: Vec<(String, CteEntry)>,
 }
 
 impl BoundDelete {
-    pub fn into_table_references(
-        self,
-        planned_ctes: &mut HashMap<String, super::plan::JoinedTable>,
-    ) -> Result<TableReferences> {
-        BoundSelect::scope_to_table_references(
-            self.scope,
-            &self.tracking,
-            planned_ctes,
-            &mut HashMap::default(),
-            Vec::new(),
-        )
-    }
-}
-
-pub struct BoundInsert {
-    /// Scope with the target table (used for RETURNING).
-    pub scope: BindScope,
-    pub result_columns: Vec<BoundColumn>,
-    /// Single-row VALUES expressions (bound). Empty if multi-row/SELECT/DEFAULT.
-    #[allow(clippy::vec_box)]
-    pub values: Vec<Box<ast::Expr>>,
-    /// Resolved upsert targets + bound AST. Labels are allocated by the caller.
-    pub upsert_actions: Vec<(super::upsert::ResolvedUpsertTarget, Box<ast::Upsert>)>,
-    /// True if the INSERT source is a multi-row VALUES or a SELECT statement.
-    /// The caller should route through `translate_select` for these.
-    pub inserting_multiple_rows: bool,
-    pub tracking: BindTracking,
-    pub subquery_bindings: HashMap<ast::TableInternalId, BoundSubquery>,
-    pub cte_definitions: Vec<(String, CteEntry)>,
-}
-
-impl BoundInsert {
     pub fn into_table_references(
         self,
         planned_ctes: &mut HashMap<String, super::plan::JoinedTable>,
@@ -1654,10 +1616,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     return Ok(ScopeTable {
                         identifier,
                         internal_id: self.id_gen.next_table_id(),
-                        source: ScopeTableSource::Cte {
-                            name: table_name,
-                            cte_id: cte.cte_id,
-                        },
+                        source: ScopeTableSource::Cte { name: table_name },
                         table: cte_table,
                         join_info: None,
                         database_id: 0,
@@ -3017,116 +2976,6 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         })
     }
 
-    /// Bind SET clause expressions and resolve column names to indices.
-    fn bind_set_clauses(
-        &mut self,
-        sets: &mut [ast::Set],
-        scope: &BindScope,
-    ) -> Result<Vec<(usize, Box<ast::Expr>)>> {
-        let table = &scope.tables[0];
-        let bt: &dyn BindTable = table.table.as_ref();
-
-        // Build column name → index lookup
-        let column_lookup: HashMap<String, usize> = bt
-            .columns()
-            .map(|col| (col.name.to_lowercase(), col.idx))
-            .collect();
-
-        let mut set_clauses: Vec<(usize, Box<ast::Expr>)> = Vec::with_capacity(sets.len());
-
-        for set in sets.iter_mut() {
-            // Bind the RHS expression
-            self.with_phase(BindPhase::NoAliases, |ctx| {
-                ctx.bind_expr(&mut set.expr, scope)
-            })?;
-
-            let values = match set.expr.as_ref() {
-                ast::Expr::Parenthesized(vals) => vals.clone(),
-                expr => vec![expr.clone().into()],
-            };
-
-            if set.col_names.len() != values.len() {
-                crate::bail_parse_error!(
-                    "{} columns assigned {} values",
-                    set.col_names.len(),
-                    values.len()
-                );
-            }
-
-            for (col_name, expr) in set.col_names.iter().zip(values.iter()) {
-                let ident = normalize_ident(col_name.as_str());
-
-                let col_index = match column_lookup.get(&ident) {
-                    Some(idx) => *idx,
-                    None => {
-                        if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) {
-                            // Find the rowid alias column if it exists
-                            if let Some(idx) = bt.columns().find_map(|col| {
-                                if col.is_rowid_alias {
-                                    Some(col.idx)
-                                } else {
-                                    None
-                                }
-                            }) {
-                                match set_clauses.iter_mut().find(|(i, _)| i == &idx) {
-                                    Some((_, existing_expr)) => existing_expr.clone_from(expr),
-                                    None => set_clauses.push((idx, expr.clone())),
-                                }
-                                idx
-                            } else {
-                                // No rowid alias, use sentinel value for actual rowid
-                                match set_clauses.iter_mut().find(|(i, _)| *i == ROWID_SENTINEL) {
-                                    Some((_, existing_expr)) => existing_expr.clone_from(expr),
-                                    None => set_clauses.push((ROWID_SENTINEL, expr.clone())),
-                                }
-                                ROWID_SENTINEL
-                            }
-                        } else {
-                            let table_name = &table.identifier;
-                            crate::bail_parse_error!("no such column: {}.{}", table_name, col_name);
-                        }
-                    }
-                };
-                match set_clauses.iter_mut().find(|(idx, _)| *idx == col_index) {
-                    Some((_, existing_expr)) => {
-                        // Compose array_set_element calls for same-column assignments
-                        if let ast::Expr::FunctionCall {
-                            name,
-                            args: new_args,
-                            ..
-                        } = expr.as_ref()
-                        {
-                            if name.as_str().eq_ignore_ascii_case("array_set_element")
-                                && new_args.len() == 3
-                            {
-                                let mut composed_args = new_args.clone();
-                                composed_args[0].clone_from(existing_expr);
-                                *existing_expr = Box::new(ast::Expr::FunctionCall {
-                                    name: name.clone(),
-                                    distinctness: None,
-                                    args: composed_args,
-                                    order_by: vec![],
-                                    within_group: vec![],
-                                    filter_over: turso_parser::ast::FunctionTail {
-                                        filter_clause: None,
-                                        over_clause: None,
-                                    },
-                                });
-                            } else {
-                                existing_expr.clone_from(expr);
-                            }
-                        } else {
-                            existing_expr.clone_from(expr);
-                        }
-                    }
-                    None => set_clauses.push((col_index, expr.clone())),
-                }
-            }
-        }
-
-        Ok(set_clauses)
-    }
-
     /// Bind a RETURNING clause: expand stars, bind expressions, return bound columns.
     fn bind_returning(
         &mut self,
@@ -3198,7 +3047,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             }
 
             // 4. Bind RETURNING (expand stars, bind exprs)
-            let result_columns = ctx.bind_returning(returning, &scope)?;
+            ctx.bind_returning(returning, &scope)?;
 
             // 5. Extract CTE definitions in definition order
             let cte_definitions: Vec<(String, CteEntry)> = if let Some(with) = with.as_ref() {
@@ -3216,7 +3065,6 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
             Ok(BoundDelete {
                 scope,
-                result_columns,
                 tracking: std::mem::take(&mut ctx.tracking),
                 subquery_bindings: std::mem::take(&mut ctx.subquery_bindings),
                 cte_definitions,
@@ -3225,66 +3073,6 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     }
 
     // ── INSERT binding ──────────────────────────────────────────────────
-
-    /// Bind an INSERT statement, resolving name references in-place.
-    ///
-    /// For multi-row VALUES or SELECT sources, `inserting_multiple_rows` is set
-    /// to true and the caller should route through `translate_select` which
-    /// calls `bind_select` internally.
-    #[allow(clippy::too_many_arguments)]
-    pub fn bind_insert(
-        &mut self,
-        tbl_name: &ast::Name,
-        body: &mut ast::InsertBody,
-        on_conflict: ast::ResolveType,
-        returning: &mut Vec<ast::ResultColumn>,
-        with: &mut Option<ast::With>,
-        database_id: usize,
-    ) -> Result<BoundInsert> {
-        self.with_query(|ctx| {
-            // 1. Bind CTEs from WITH clause (for RETURNING subquery resolution)
-            if let Some(with) = with.as_mut() {
-                ctx.bind_cte(with)?;
-            }
-
-            // 2. Build scope with target table (for RETURNING)
-            let scope = ctx.build_table_scope(tbl_name, None, None, database_id)?;
-
-            // 3. Bind VALUES / detect multi-row path
-            let (values, inserting_multiple_rows) = ctx.bind_insert_values(body, &scope)?;
-
-            // 4. Bind UPSERT DO UPDATE SET/WHERE
-            let upsert_actions = ctx.bind_upsert(body, on_conflict, &scope, database_id)?;
-
-            // 5. Bind RETURNING (expand stars, bind exprs)
-            let result_columns = ctx.bind_returning(returning, &scope)?;
-
-            // 6. Extract CTE definitions in definition order
-            let cte_definitions: Vec<(String, CteEntry)> = if let Some(with) = with.as_ref() {
-                let mut ctes = std::mem::take(&mut ctx.ctes);
-                with.ctes
-                    .iter()
-                    .filter_map(|cte| {
-                        let name = normalize_ident(cte.tbl_name.as_str());
-                        ctes.remove(&name).map(|entry| (name, entry))
-                    })
-                    .collect()
-            } else {
-                vec![]
-            };
-
-            Ok(BoundInsert {
-                scope,
-                result_columns,
-                values,
-                upsert_actions,
-                inserting_multiple_rows,
-                tracking: std::mem::take(&mut ctx.tracking),
-                subquery_bindings: std::mem::take(&mut ctx.subquery_bindings),
-                cte_definitions,
-            })
-        })
-    }
 
     /// Bind an INSERT statement's RETURNING clause (with its WITH-clause CTEs
     /// for subquery resolution). The caller supplies the internal id it
@@ -3349,147 +3137,6 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
             Ok((cte_definitions, std::mem::take(&mut ctx.subquery_bindings)))
         })
-    }
-
-    #[expect(clippy::vec_box)]
-    /// Bind single-row VALUES expressions. Returns `(values, inserting_multiple_rows)`.
-    /// Multi-row VALUES and SELECT sources are left unbound (delegated to `translate_select`).
-    fn bind_insert_values(
-        &mut self,
-        body: &mut ast::InsertBody,
-        _scope: &BindScope,
-    ) -> Result<(Vec<Box<ast::Expr>>, bool)> {
-        match body {
-            ast::InsertBody::DefaultValues => {
-                // Default values are resolved later from column definitions.
-                // Nothing to bind here.
-                Ok((vec![], false))
-            }
-            ast::InsertBody::Select(select, _) => {
-                if select.body.compounds.is_empty() {
-                    if let ast::OneSelect::Values(values_expr) = &mut select.body.select {
-                        if values_expr.len() <= 1 && !values_expr.is_empty() {
-                            // Check if any VALUES expression contains a subquery.
-                            // If so, route through multi-row path which handles subqueries.
-                            let has_subquery = values_expr.iter().any(|row| {
-                                row.iter()
-                                    .any(|expr| Self::expr_contains_subquery_or_bound(expr))
-                            });
-                            if has_subquery {
-                                return Ok((vec![], true));
-                            }
-
-                            // Single-row VALUES: bind each expression with empty scope
-                            // (INSERT VALUES can't reference table columns)
-                            let empty = BindScope::empty();
-                            for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
-                                match expr.as_mut() {
-                                    ast::Expr::Id(name) => {
-                                        if name.quoted_with('"') {
-                                            *expr = ast::Expr::Literal(ast::Literal::String(
-                                                name.as_literal(),
-                                            ))
-                                            .into();
-                                            continue;
-                                        } else {
-                                            crate::bail_parse_error!("no such column: {name}");
-                                        }
-                                    }
-                                    ast::Expr::Qualified(first_name, second_name) => {
-                                        crate::bail_parse_error!(
-                                            "no such column: {first_name}.{second_name}"
-                                        );
-                                    }
-                                    _ => {}
-                                }
-                                self.bind_expr(expr, &empty)?;
-                            }
-                            let values = values_expr.pop().unwrap_or_default();
-                            return Ok((values, false));
-                        }
-                    }
-                }
-                // Multi-row VALUES or SELECT: delegate to translate_select
-                Ok((vec![], true))
-            }
-        }
-    }
-
-    /// Check if an expression contains a subquery (raw or pre-bound).
-    fn expr_contains_subquery_or_bound(expr: &ast::Expr) -> bool {
-        use super::expr::walk_expr;
-        let mut found = false;
-        let _ = walk_expr(expr, &mut |e| {
-            if matches!(
-                e,
-                ast::Expr::Subquery(_)
-                    | ast::Expr::InSelect { .. }
-                    | ast::Expr::Exists(_)
-                    | ast::Expr::SubqueryResult { .. }
-            ) {
-                found = true;
-                return Ok(WalkControl::SkipChildren);
-            }
-            Ok(WalkControl::Continue)
-        });
-        found
-    }
-
-    /// Bind UPSERT ON CONFLICT DO UPDATE SET/WHERE clauses.
-    fn bind_upsert(
-        &mut self,
-        body: &mut ast::InsertBody,
-        on_conflict: ast::ResolveType,
-        scope: &BindScope,
-        database_id: usize,
-    ) -> Result<Vec<(super::upsert::ResolvedUpsertTarget, Box<ast::Upsert>)>> {
-        let mut upsert = match body {
-            ast::InsertBody::Select(_, upsert_opt) => upsert_opt.take(),
-            _ => None,
-        };
-
-        if let ast::ResolveType::Ignore = on_conflict {
-            upsert.replace(Box::new(ast::Upsert {
-                do_clause: ast::UpsertDo::Nothing,
-                index: None,
-                next: None,
-            }));
-        }
-
-        let table = match &scope.tables[0].source {
-            ScopeTableSource::Table(t) => t.clone(),
-            _ => unreachable!("INSERT target must be a real table"),
-        };
-
-        let mut upsert_actions = Vec::new();
-        while let Some(mut upsert_opt) = upsert.take() {
-            if let ast::UpsertDo::Set {
-                ref mut sets,
-                ref mut where_clause,
-            } = &mut upsert_opt.do_clause
-            {
-                // UPSERT SET/WHERE can reference EXCLUDED pseudo-table
-                // which can't be resolved at bind time.
-                let saved = self.allow_unbound;
-                self.allow_unbound = true;
-                for set in sets.iter_mut() {
-                    self.bind_expr(&mut set.expr, scope)?;
-                }
-                if let Some(ref mut where_expr) = where_clause {
-                    self.bind_expr(where_expr, scope)?;
-                }
-                self.allow_unbound = saved;
-            }
-            let next = upsert_opt.next.take();
-            upsert_actions.push((
-                self.resolver.with_schema(database_id, |s| {
-                    super::upsert::resolve_upsert_target(s, &table, &upsert_opt)
-                })?,
-                upsert_opt,
-            ));
-            upsert = next;
-        }
-        Ok(upsert_actions)
     }
 
     /// Infer a column name from an expression (for RETURNING without alias).

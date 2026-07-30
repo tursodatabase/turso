@@ -18,7 +18,7 @@ use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
-use crate::translate::select::{emit_select_plan, prepare_select_plan};
+use crate::translate::select::emit_select_plan;
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
     escape_sql_string_literal, normalize_ident, quote_identifier,
@@ -905,13 +905,10 @@ fn derive_ctas_schema(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<(CtasInfo, Vec<ColumnDefinition>)> {
-    let plan = prepare_select_plan(
+    let plan = crate::translate::select::bind_prepare_select_plan(
         select,
         resolver,
         program,
-        crate::translate::select::SelectBinding::Raw {
-            outer_query_refs: vec![],
-        },
         QueryDestination::ResultRows,
         connection,
     )?;
