@@ -235,6 +235,7 @@ pub fn translate_insert(
         table,
         target_table_id,
         excluded_table_id,
+        bound_index_expressions,
     } = super::bind::bind_insert_stmt(
         &tbl_name,
         &columns,
@@ -292,7 +293,7 @@ pub fn translate_insert(
             database_id,
             indexed: None,
             bound_index_method_patterns: Vec::new(),
-            bound_index_expressions: Vec::new(),
+            bound_index_expressions,
         }],
         vec![],
     );
@@ -3582,18 +3583,14 @@ fn emit_replace_delete_conflicting_row(
             .with_schema(ctx.database_id, |s| s.get_index(table_name, name).cloned())
             .expect("index to exist");
         let skip_delete_label = if index.where_clause.is_some() {
-            let target_internal_id = table_references
+            let target_table = table_references
                 .joined_tables()
                 .first()
-                .expect("INSERT has a target table reference")
-                .internal_id;
-            let where_copy = crate::translate::bind::bind_schema_expr(
-                index
-                    .where_clause
-                    .as_deref()
-                    .expect("where clause to exist"),
-                target_internal_id,
-            )?;
+                .expect("INSERT has a target table reference");
+            let where_copy = target_table
+                .bound_partial_index_where(&index)
+                .expect("binder provided the partial-index predicate")
+                .clone();
             let skip_label = program.allocate_label();
             let reg = program.alloc_register();
             translate_expr_no_constant_opt(

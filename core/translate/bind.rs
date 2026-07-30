@@ -50,6 +50,39 @@ pub fn bind_schema_expr(expr: &ast::Expr, internal_id: ast::TableInternalId) -> 
     Ok(bound)
 }
 
+fn bind_table_index_expressions(
+    resolver: &Resolver,
+    database_id: usize,
+    table_name: &str,
+    internal_id: ast::TableInternalId,
+) -> Vec<super::plan::BoundIndexExpressions> {
+    resolver
+        .with_schema(database_id, |schema| {
+            schema.get_indices(table_name).cloned().collect::<Vec<_>>()
+        })
+        .into_iter()
+        .map(|index| {
+            let mut columns = index
+                .columns
+                .iter()
+                .map(|column| column.expr.clone())
+                .collect::<Vec<_>>();
+            let mut where_clause = index.where_clause.clone();
+            for expr in columns.iter_mut().flatten() {
+                rebase_schema_expr(expr, internal_id);
+            }
+            if let Some(expr) = where_clause.as_mut() {
+                rebase_schema_expr(expr, internal_id);
+            }
+            super::plan::BoundIndexExpressions {
+                index_name: index.name.clone(),
+                columns,
+                where_clause,
+            }
+        })
+        .collect()
+}
+
 /// Validate a referenced CTE's explicit column list against its SELECT's
 /// result column count. SQLite defers this check until the CTE is actually
 /// referenced, so unreferenced CTEs with mismatched counts don't error.
@@ -821,6 +854,8 @@ pub struct BoundInsert {
     pub target_table_id: ast::TableInternalId,
     /// ID used by bound references to the would-be inserted row.
     pub excluded_table_id: ast::TableInternalId,
+    /// Stored index keys and predicates bound to the target table reference.
+    pub bound_index_expressions: Vec<super::plan::BoundIndexExpressions>,
 }
 
 fn upsert_scope_table(
@@ -1034,6 +1069,7 @@ pub fn bind_insert_stmt(
             table,
             target_table_id: program.table_reference_counter.next(),
             excluded_table_id: program.table_reference_counter.next(),
+            bound_index_expressions: Vec::new(),
         });
     }
 
@@ -1164,6 +1200,8 @@ pub fn bind_insert_stmt(
         upsert_actions.push((resolved_target, action_label, bound_do));
         upsert = next;
     }
+    let bound_index_expressions =
+        bind_table_index_expressions(resolver, database_id, table.get_name(), target_table_id);
     Ok(BoundInsert {
         values,
         upsert_actions,
@@ -1172,6 +1210,7 @@ pub fn bind_insert_stmt(
         table,
         target_table_id,
         excluded_table_id,
+        bound_index_expressions,
     })
 }
 
@@ -4798,36 +4837,12 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             let ScopeTableSource::Table(table) = &scope_table.source else {
                 continue;
             };
-            let indexes = self
-                .resolver
-                .with_schema(scope_table.database_id, |schema| {
-                    schema
-                        .get_indices(table.get_name())
-                        .cloned()
-                        .collect::<Vec<_>>()
-                });
-            scope_table.bound_index_expressions = indexes
-                .into_iter()
-                .map(|index| {
-                    let mut columns = index
-                        .columns
-                        .iter()
-                        .map(|column| column.expr.clone())
-                        .collect::<Vec<_>>();
-                    let mut where_clause = index.where_clause.clone();
-                    for expr in columns.iter_mut().flatten() {
-                        rebase_schema_expr(expr, scope_table.internal_id);
-                    }
-                    if let Some(expr) = where_clause.as_mut() {
-                        rebase_schema_expr(expr, scope_table.internal_id);
-                    }
-                    super::plan::BoundIndexExpressions {
-                        index_name: index.name.clone(),
-                        columns,
-                        where_clause,
-                    }
-                })
-                .collect();
+            scope_table.bound_index_expressions = bind_table_index_expressions(
+                self.resolver,
+                scope_table.database_id,
+                table.get_name(),
+                scope_table.internal_id,
+            );
         }
     }
 
