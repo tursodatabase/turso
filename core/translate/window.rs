@@ -552,23 +552,21 @@ pub struct WindowRegisters {
     /// These registers are used to detect whether the current row is a "peer"
     /// (i.e., has identical ORDER BY values to the previous row).
     pub new_order_by_columns_start: Option<usize>,
-    /// Per-cursor "peer reference" registers — each holds the ORDER BY
-    /// values of the first row of the peer group that cursor is currently
-    /// processing. The peer-loop inside `emit_window_op` compares the
-    /// next-advanced row's values against the cursor's reg and either
-    /// loops (peer) or falls through (new group, also updates the reg).
-    ///
-    /// `peer_end_reg` doubles as the "previous source row" tracker —
-    /// it's also used by `emit_window_step`'s pre-check that skips
-    /// AggStep / RETURN_ROW when consecutive source rows are peers,
-    /// because under our supported frames AGGSTEP's peer-loop on
-    /// csr_end and the source-row peer check share the same reference.
-    ///
-    /// `peer_start_reg` is `Some` only when the window has a moving
-    /// frame start (ntile, percent_rank, cume_dist); other windows
-    /// don't allocate `csr_start` so the start peer-loop never runs.
-    ///
-    /// Mirrors SQLite's `s.start.reg` / `s.current.reg` / `s.end.reg`
+    /// ORDER BY values of the last source row that began a new peer
+    /// group. `emit_window_step` compares each incoming row against it:
+    /// same peer group means skip the frame ops, otherwise copy the new
+    /// values in. Separate from `peer_end_reg` because that one is
+    /// updated inside the frame ops, which a countdown can skip, whereas
+    /// this must advance on every non-peer source row. Mirrors SQLite's
+    /// `regPeer` (window.c:2896, updated at window.c:2984-2986).
+    pub peer_new_ref: Option<usize>,
+    /// One "peer reference" per frame cursor, each holding the ORDER BY
+    /// values of the peer group that cursor is on. The peer-loop in
+    /// `emit_window_op` compares the next row against it and either loops
+    /// (still the same group) or falls through and updates it (new
+    /// group). `peer_start_reg` is `Some` only for a moving frame start
+    /// (ntile, percent_rank, cume_dist), the only case with a `csr_start`
+    /// to loop. Mirrors SQLite's `s.{start,current,end}.reg`
     /// (window.c:2897-2899).
     pub peer_start_reg: Option<usize>,
     pub peer_current_reg: Option<usize>,
@@ -582,17 +580,21 @@ pub struct WindowRegisters {
     /// Return-address register for the `labels.row_output` Gosub. Mirrors
     /// SQLite's `regGosub` (window.c:2793).
     pub row_output_return: usize,
-    /// Rowid of the last row stepped into the frame (`AggStep` on `csr_end`).
-    /// This is the frame-end bound `first_value` / `nth_value` seek against:
-    /// under the default `RANGE UNBOUNDED PRECEDING TO CURRENT ROW` frame the
-    /// frame extends to the current row's last peer, so the *emitted* row's
-    /// own rowid would undercount it (a peer group's earlier rows would wrongly
-    /// see a truncated frame). `AggStep` peer-loops `csr_end` over the whole
-    /// group before the group's rows are returned, so capturing `csr_end`'s
-    /// rowid there yields the true frame end. Mirrors SQLite's `regApp+1`
-    /// (`window.c:1424`, maintained in `windowAggStep`). `None` unless the
-    /// window contains `first_value` / `nth_value`.
-    pub frame_end_rowid: Option<usize>,
+    /// Two counters tracking the current frame's bounds, used by
+    /// `first_value` / `nth_value` to seek a row by position:
+    ///
+    /// * `+0` — rows that have left the frame (one per AGGINVERSE), i.e.
+    ///   the frame start's buffer index minus one.
+    /// * `+1` — rows that have entered the frame (one per AGGSTEP), i.e.
+    ///   the frame end's buffer index.
+    ///
+    /// Buffer rowids run 1, 2, 3, ... within each partition, so these
+    /// indexes are also `SeekRowid` targets. One pair per window (not per
+    /// function like SQLite's `pWin->regApp`) since every function in a
+    /// window shares the same frame. `None` without first_value /
+    /// nth_value. Mirrors SQLite's `regApp` pair (window.c:1457-1459,
+    /// 1726, 2010-2013).
+    pub frame_counters: Option<usize>,
 }
 
 /// Cursors on the ephemeral "buffer" B-tree that holds rows of the current
@@ -827,11 +829,12 @@ impl EmitWindow {
         } else {
             None
         };
-        // Frame-end bound for the positional lookups; see
-        // `WindowRegisters::frame_end_rowid`. Only first_value / nth_value
-        // consult it — lag / lead seek relative to the emitted row's own
-        // rowid, not the frame end.
-        let frame_end_rowid = window
+        // Frame-index counters for the positional lookups; see
+        // `WindowRegisters::frame_counters`. Only first_value / nth_value
+        // consult them — lag / lead seek relative to the emitted row's own
+        // rowid, not the frame bounds. Zeroed per partition alongside the
+        // accumulator reset, so no init is needed here.
+        let frame_counters = window
             .functions
             .iter()
             .any(|f| {
@@ -840,7 +843,7 @@ impl EmitWindow {
                     AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue),
                 )
             })
-            .then(|| program.alloc_registers_and_init_w_null(1));
+            .then(|| program.alloc_registers(2));
         program.emit_insn(Insn::OpenEphemeral {
             cursor_id: cursor_csr_current,
             is_table: true,
@@ -922,7 +925,18 @@ impl EmitWindow {
                 src_columns_start: reg_src_columns_start,
                 result_columns_start: reg_col_start,
                 new_order_by_columns_start: alloc_optional_registers(program, order_by_len),
-                peer_start_reg: if has_moving_start {
+                // Allocated for RANGE / GROUPS only, like the per-cursor
+                // peer references — under ROWS neither the source-row
+                // pre-check nor the peer-loops run. Mirrors SQLite's
+                // `regPeer` allocation gate at window.c:2892-2896.
+                peer_new_ref: if window.frame.mode != turso_parser::ast::FrameMode::Rows {
+                    alloc_optional_registers(program, order_by_len)
+                } else {
+                    None
+                },
+                peer_start_reg: if has_moving_start
+                    && window.frame.mode != turso_parser::ast::FrameMode::Rows
+                {
                     alloc_optional_registers(program, order_by_len)
                 } else {
                     None
@@ -949,7 +963,7 @@ impl EmitWindow {
                     _ => None,
                 },
                 row_output_return: program.alloc_register(),
-                frame_end_rowid,
+                frame_counters,
             },
             cursors: WindowCursors {
                 csr_write: cursor_csr_write,
@@ -968,11 +982,12 @@ impl EmitWindow {
     /// Emits the per-source-row body for window processing.
     ///
     /// This is the Rust port of the main loop in SQLite's
-    /// `sqlite3WindowCodeStep` (`window.c:2786-3037`), restricted to the
-    /// frames our planner coerces to: ROWS / RANGE / GROUPS with
-    /// `UNBOUNDED PRECEDING` start and `CURRENT ROW` end (and the moving
-    /// variants for the as-yet-unimplemented ntile / percent_rank /
-    /// cume_dist).
+    /// `sqlite3WindowCodeStep` (`window.c:2786-3037`). The op sequence at
+    /// the tail is one of three patterns keyed on the frame bounds —
+    /// `FOLLOWING` start / `PRECEDING` end / everything else — matching
+    /// SQLite's dispatch at window.c:2987-3037; arms the planner still
+    /// rejects are marked unreachable and gain bodies as the
+    /// corresponding frame support lands.
     ///
     /// Pseudocode for the most common shape (`UNBOUNDED PRECEDING TO
     /// CURRENT ROW`):
@@ -1037,20 +1052,23 @@ impl EmitWindow {
         });
 
         // --- FIRST ROW OF PARTITION ---
-        if let Some(new_ob) = registers.new_order_by_columns_start {
-            // Seed every per-cursor peer reference with the first row's
-            // ORDER BY values. Mirrors SQLite's three-cursor init at
-            // `window.c:2973-2976` (regNewPeer → s.start.reg / current.reg
-            // / end.reg). Doubling as the source-row peer-pre-check
-            // reference (`regPeer` in SQLite), `peer_end_reg` is set
-            // here and updated by AGGSTEP's peer-loop fall-through —
-            // we don't need a separate `regPeer` because the values
-            // they would hold are always identical at any program point.
+        if let (Some(new_ob), Some(peer_new_ref)) =
+            (registers.new_order_by_columns_start, registers.peer_new_ref)
+        {
+            // Seed the source-row peer reference and every per-cursor
+            // peer reference with the first row's ORDER BY values.
+            // Mirrors SQLite's init at `window.c:2972-2976` (regNewPeer
+            // → regPeer → s.start.reg / current.reg / end.reg).
             program.add_comment(
                 program.offset(),
-                "initialize per-cursor peer-reference registers for new partition",
+                "initialize peer-reference registers for new partition",
             );
             let n = window.order_by.len() - 1;
+            program.emit_insn(Insn::Copy {
+                src_reg: new_ob,
+                dst_reg: peer_new_ref,
+                extra_amount: n,
+            });
             for &peer_reg in [
                 registers.peer_start_reg,
                 registers.peer_current_reg,
@@ -1060,7 +1078,7 @@ impl EmitWindow {
             .flatten()
             {
                 program.emit_insn(Insn::Copy {
-                    src_reg: new_ob,
+                    src_reg: peer_new_ref,
                     dst_reg: peer_reg,
                     extra_amount: n,
                 });
@@ -1071,6 +1089,18 @@ impl EmitWindow {
             dest: registers.acc_start,
             dest_end: Some(registers.acc_start + window.functions.len() - 1),
         });
+        // Zero the frame-index counters for the new partition. Mirrors
+        // `windowInitAccum`'s regApp reset (window.c:2010-2013).
+        if let Some(frame_counters) = registers.frame_counters {
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: frame_counters,
+            });
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: frame_counters + 1,
+            });
+        }
         // The offset register is reused across partitions, so re-evaluate
         // here at each partition boundary — a hoisted constant init would
         // leave the value drifted after the first partition's IfPos
@@ -1136,78 +1166,52 @@ impl EmitWindow {
             &buffer_table_name,
         );
 
-        let frame_mode = window.frame.mode;
-        let order_by_len = window.order_by.len();
-        let is_range_or_groups = frame_mode != turso_parser::ast::FrameMode::Rows;
-        if is_range_or_groups && order_by_len == 0 {
-            // RANGE/GROUPS with no ORDER BY: the entire partition is one
-            // peer group. The main body emits nothing — every step gets
-            // deferred to the flush subroutine, which drains all rows
-            // under one peer-equal loop and emits each with the same
-            // accumulated value.
-            program.emit_insn(Insn::Goto {
-                target_pc: label_step_end,
-            });
-        } else if is_range_or_groups {
-            // RANGE/GROUPS: if the new row is peer-equal with prevPeer, the
-            // frame doesn't advance yet — buffer the row and skip the step.
-            // The next non-peer row will trigger AGGSTEP, which loops
-            // through all peer-equal buffered rows in `emit_window_op`.
-            let label_step_body = program.allocate_label();
-            program.add_comment(program.offset(), "compare ORDER BY columns to detect peer");
-            let compare_key_info = build_order_by_key_info(window, &plan.table_references)?;
-            // Source-row peer pre-check — skip AGGSTEP / RETURN_ROW when
-            // the new source row is in the same peer group as the
-            // previous one. Uses `peer_end_reg` as the reference (which
-            // tracks the last AGGSTEP'd group); AGGSTEP's own peer-loop
-            // updates `peer_end_reg` so subsequent source rows see the
-            // correct comparison value.
-            //
-            // `Insn::Compare` requires `start_reg_a < start_reg_b`, so
-            // we put the earlier-allocated `new_order_by_columns_start`
-            // first. The Jump targets are symmetric on lt/gt
-            // (both go to step_body) so the operand order doesn't
-            // change the semantics.
-            program.emit_insn(Insn::Compare {
-                start_reg_a: registers
-                    .new_order_by_columns_start
-                    .expect("new_order_by_columns_start must exist"),
-                start_reg_b: registers
-                    .peer_end_reg
-                    .expect("peer_end_reg must exist under RANGE/GROUPS with ORDER BY"),
-                count: window.order_by.len(),
-                key_info: compare_key_info,
-            });
-            program.emit_insn(Insn::Jump {
-                target_pc_lt: label_step_body,
-                target_pc_eq: label_step_end,
-                target_pc_gt: label_step_body,
-            });
-            program.preassign_label_to_next_insn(label_step_body);
+        // Under RANGE / GROUPS, a row in the same peer group as the last
+        // is only buffered; the frame ops wait until the next group
+        // begins, then AGGSTEP's peer-loop walks all the buffered peers
+        // at once. With no ORDER BY the whole partition is one group, so
+        // every row defers to the flush subroutine. Mirrors SQLite's
+        // `windowIfNewPeer` call at window.c:2984-2986 (an unconditional
+        // jump when there's no ORDER BY, window.c:2076).
+        if window.frame.mode != turso_parser::ast::FrameMode::Rows {
+            program.add_comment(program.offset(), "skip frame ops when peer of previous row");
+            emit_if_new_peer(
+                program,
+                window,
+                &plan.table_references,
+                registers.new_order_by_columns_start,
+                registers.peer_new_ref,
+                label_step_end,
+            )?;
         }
 
-        emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None)?;
-        // Frames whose end is UNBOUNDED FOLLOWING (lead's and lag's
-        // coerced frames) cache the entire partition before any RETURN_ROW
-        // fires — every output row's frame depends on rows yet to be
-        // inserted, so we can only emit at flush time. SQLite's
-        // `windowCacheFrame` (`window.c:2031`) selects the same control
-        // flow when a lead/lag function is present.
-        let cache_frame = matches!(
-            window.frame.end,
-            crate::translate::plan::FrameBoundary::UnboundedFollowing
-        );
-        if !cache_frame {
-            emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, None, None)?;
-            // For `ROWS BETWEEN N PRECEDING AND CURRENT ROW` the frame
-            // slides one row per output. AGGINVERSE is gated by the
-            // start-offset countdown so the first N+1 rows accumulate
-            // without ejecting anything. Mirrors SQLite's main-loop
-            // emit at `window.c:3032-3033`.
-            if matches!(
-                window.frame.start,
-                crate::translate::plan::FrameBoundary::Preceding(_)
-            ) {
+        // The op sequence for this row, picked by frame bounds — one of
+        // SQLite's three `sqlite3WindowCodeStep` patterns
+        // (window.c:2987-3037). `unreachable!` arms are shapes the planner
+        // still rejects; they gain bodies as that frame support lands.
+        use crate::translate::plan::FrameBoundary;
+        let end_is_unbounded = matches!(window.frame.end, FrameBoundary::UnboundedFollowing);
+        if matches!(window.frame.start, FrameBoundary::Following(_)) {
+            // Pattern A — `<expr> FOLLOWING` start (window.c:2987-3002).
+            emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None)?;
+            if !end_is_unbounded {
+                unreachable!(
+                    "FOLLOWING frame starts with a bounded end are rejected by the planner"
+                );
+            }
+        } else if matches!(window.frame.end, FrameBoundary::Preceding(_)) {
+            // Pattern B — `<expr> PRECEDING` end (window.c:3004-3009).
+            unreachable!("PRECEDING frame ends are rejected by the planner");
+        } else {
+            // Pattern C — everything else (window.c:3010-3037).
+            emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None)?;
+            if !end_is_unbounded {
+                emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, None, None)?;
+                // AGGINVERSE is a structural no-op for UNBOUNDED
+                // PRECEDING starts (`emit_window_op` early-returns,
+                // window.c:2252-2257); for `N PRECEDING` starts the
+                // countdown grows the frame to width N+1 before it
+                // slides (window.c:3032-3033).
                 emit_window_op(
                     program,
                     t_ctx,
@@ -1219,16 +1223,57 @@ impl EmitWindow {
             }
         }
 
-        // No explicit peer-tracker update needed here: AGGSTEP's
-        // peer-loop fall-through copies `new` into `peer_end_reg`, and
-        // the (non-cached) RETURN_ROW peer-loop fall-through copies
-        // `new` into `peer_current_reg`. Mirrors SQLite's
-        // `windowIfNewPeer` Copy-on-fall-through (window.c:2074).
-
         program.preassign_label_to_next_insn(label_step_end);
 
         Ok(())
     }
+}
+
+/// Compare the ORDER BY values at `reg_new` against the peer reference at
+/// `reg_old`: jump to `target_if_peer` when they're equal, otherwise copy
+/// the new values into the reference and fall through. With no ORDER BY
+/// every row is a peer, so this degenerates to an unconditional jump.
+/// Mirrors SQLite's `windowIfNewPeer` (window.c:2057-2078).
+fn emit_if_new_peer(
+    program: &mut ProgramBuilder,
+    window: &Window,
+    table_references: &TableReferences,
+    reg_new: Option<usize>,
+    reg_old: Option<usize>,
+    target_if_peer: BranchOffset,
+) -> Result<()> {
+    let order_by_len = window.order_by.len();
+    if order_by_len == 0 {
+        program.emit_insn(Insn::Goto {
+            target_pc: target_if_peer,
+        });
+        return Ok(());
+    }
+    let reg_new = reg_new.expect("new_order_by_columns_start must exist when ORDER BY is present");
+    let reg_old = reg_old.expect("peer reference register must exist when ORDER BY is present");
+    let label_new_peer = program.allocate_label();
+    // `Insn::Compare` requires `start_reg_a < start_reg_b`; the Jump
+    // targets are symmetric on lt/gt so operand order doesn't change
+    // the semantics.
+    let (reg_a, reg_b) = (reg_new.min(reg_old), reg_new.max(reg_old));
+    program.emit_insn(Insn::Compare {
+        start_reg_a: reg_a,
+        start_reg_b: reg_b,
+        count: order_by_len,
+        key_info: build_order_by_key_info(window, table_references)?,
+    });
+    program.emit_insn(Insn::Jump {
+        target_pc_lt: label_new_peer,
+        target_pc_eq: target_if_peer,
+        target_pc_gt: label_new_peer,
+    });
+    program.preassign_label_to_next_insn(label_new_peer);
+    program.emit_insn(Insn::Copy {
+        src_reg: reg_new,
+        dst_reg: reg_old,
+        extra_amount: order_by_len - 1,
+    });
+    Ok(())
 }
 
 fn alloc_optional_registers(program: &mut ProgramBuilder, count: usize) -> Option<usize> {
@@ -1437,70 +1482,120 @@ enum WindowOp {
     AggInverse,
 }
 
-/// The window op after which a buffered row becomes unreachable and can be
-/// deleted from the ephemeral table. Mirrors SQLite's `s.eDelete`
-/// (`window.c:2839-2869`): the emitter deletes the row at
-/// `window.c:2346` (`if( op==p->eDelete ) OP_Delete`). `None` is SQLite's
-/// `eDelete == 0` — never delete, keep the whole partition buffered.
+/// After which op can the row a cursor just passed be deleted from the
+/// buffer? `None` keeps the whole partition until flush. Deleting early
+/// only frees buffer memory sooner — it never changes results. Mirrors
+/// SQLite's `eDelete` (window.c:2845-2869), applied at the `OP_Delete`
+/// in `emit_window_op`:
 ///
-/// Frame-caching functions (`first_value` / `nth_value` / `lag` / `lead`)
-/// seek arbitrary rows through `csr_app` at output time, so their rows must
-/// survive until the partition is flushed. SQLite gates only its
-/// `UNBOUNDED PRECEDING` arm on `windowCacheFrame`; because our positional
-/// `csr_app` lookups need every row regardless of frame start, we apply the
-/// guard to all frame shapes and never delete when a caching function is
-/// present (`has_csr_app`).
-///
-/// The remaining arms mirror SQLite's `switch(eStart)`:
-/// - `FOLLOWING` with a positive, non-RANGE offset → delete at `RETURN_ROW`
-///   (`window.c:2846-2852`). Reachable via cume_dist's coerced GROUPS
-///   `1 FOLLOWING` start.
-/// - `UNBOUNDED PRECEDING` → delete at `RETURN_ROW` (`window.c:2853-2864`).
-///   The `UNBOUNDED..N PRECEDING → AGGSTEP` sub-case has no reachable frame
-///   (no built-in or supported user frame ends at `N PRECEDING`).
-/// - `CURRENT ROW` / `N PRECEDING` → delete at `AGGINVERSE`
-///   (`window.c:2866-2868`). Covers percent_rank / ntile and the user
-///   `ROWS BETWEEN N PRECEDING AND CURRENT ROW` frame.
-///
-/// The `FOLLOWING`/`UNBOUNDED PRECEDING` split here must stay in sync with the
-/// flush loop's `AGGINVERSE` gate: a moving start (anything but
-/// `UNBOUNDED PRECEDING`) fires `AGGINVERSE` for its xInverse, but that op only
-/// *deletes* when it is the returned `eDelete`.
-fn window_delete_op(window: &Window, has_csr_app: bool) -> Option<WindowOp> {
+/// - FOLLOWING start, offset provably > 0, non-RANGE → after RETURN_ROW.
+///   The frame start trails the emit point, so an emitted row is done.
+/// - UNBOUNDED PRECEDING start:
+///   - a `csr_app` function needs every row (`window_cache_frame`) → never.
+///   - N PRECEDING end, offset provably > 0, non-RANGE → after AGGSTEP.
+///   - otherwise → after RETURN_ROW.
+/// - CURRENT ROW / N PRECEDING start → after AGGINVERSE. Safe with
+///   first_value / nth_value: only rows behind the frame start are
+///   dropped, and their lookup targets stay within the live frame.
+fn window_delete_op(window: &Window) -> Option<WindowOp> {
     use crate::translate::plan::FrameBoundary;
-    if has_csr_app {
-        return None;
-    }
+    let is_range = window.frame.mode == turso_parser::ast::FrameMode::Range;
     match &window.frame.start {
-        FrameBoundary::Following(_) if window.frame.mode != turso_parser::ast::FrameMode::Range => {
-            Some(WindowOp::ReturnRow)
+        FrameBoundary::Following(expr) => {
+            (!is_range && window_expr_gt_zero(expr)).then_some(WindowOp::ReturnRow)
         }
-        FrameBoundary::UnboundedPreceding => Some(WindowOp::ReturnRow),
+        FrameBoundary::UnboundedPreceding => {
+            if window_cache_frame(window) {
+                None
+            } else if let FrameBoundary::Preceding(expr) = &window.frame.end {
+                (!is_range && window_expr_gt_zero(expr)).then_some(WindowOp::AggStep)
+            } else {
+                Some(WindowOp::ReturnRow)
+            }
+        }
         FrameBoundary::CurrentRow | FrameBoundary::Preceding(_) => Some(WindowOp::AggInverse),
-        // A FOLLOWING start under RANGE, or an UNBOUNDED FOLLOWING start,
-        // never deletes (SQLite leaves eDelete == 0).
-        FrameBoundary::Following(_) | FrameBoundary::UnboundedFollowing => None,
+        FrameBoundary::UnboundedFollowing => {
+            unreachable!("UNBOUNDED FOLLOWING can never be a frame start")
+        }
     }
 }
 
-/// Emit one of the three frame-cursor operations, mirroring SQLite's
-/// `windowCodeOp` helper (`window.c:2229-2376`).
+/// Whether the whole partition must stay buffered until flush because a
+/// function seeks arbitrary buffered rows through `csr_app` at output
+/// time. Mirrors SQLite's `windowCacheFrame` (window.c:2031-2045).
+fn window_cache_frame(window: &Window) -> bool {
+    window.functions.iter().any(|f| {
+        matches!(
+            &f.func,
+            AccumulatorFunc::Window(
+                WindowFunc::FirstValue | WindowFunc::NthValue | WindowFunc::Lag | WindowFunc::Lead
+            ),
+        )
+    })
+}
+
+/// Whether a frame offset is a literal provably greater than zero. Only
+/// gates the buffer-delete optimization in `window_delete_op`: a
+/// `N FOLLOWING` (N > 0) start can drop emitted rows early, a
+/// `0 FOLLOWING` start can't. Returning `false` is always correct — it
+/// just keeps rows until flush — so this only frees memory sooner, never
+/// changes results. Mirrors SQLite's `windowExprGtZero`
+/// (window.c:2439-2449).
+fn window_expr_gt_zero(expr: &Expr) -> bool {
+    if let Expr::Literal(turso_parser::ast::Literal::Numeric(s)) = expr {
+        if let Ok(n) = s.parse::<i64>() {
+            return n > 0;
+        }
+        if let Ok(f) = s.parse::<f64>() {
+            // Matches sqlite3_value_int's cast-to-integer semantics:
+            // 0 < f < 1 truncates to 0, which is not > 0.
+            return f as i64 > 0;
+        }
+    }
+    false
+}
+
+/// Finalize every accumulator into its result register ahead of a
+/// RETURN_ROW. first_value / nth_value / lag / lead have no accumulator
+/// value to read — their result registers are written directly inside
+/// `emit_return_one_row` via positional lookup helpers. Mirrors SQLite's
+/// `windowAggFinal(p, 0)` (window.c:1777-1808).
+fn emit_window_agg_final(
+    program: &mut ProgramBuilder,
+    window: &Window,
+    registers: &WindowRegisters,
+) {
+    for (i, func) in window.functions.iter().enumerate() {
+        if matches!(
+            &func.func,
+            AccumulatorFunc::Window(
+                WindowFunc::FirstValue | WindowFunc::NthValue | WindowFunc::Lag | WindowFunc::Lead
+            ),
+        ) {
+            continue;
+        }
+        program.emit_insn(Insn::AggValue {
+            acc_reg: registers.acc_start + i,
+            dest_reg: registers.acc_result_start + i,
+            func: func.func.clone(),
+        });
+    }
+}
+
+/// Emit one of the three frame-cursor operations (AGGSTEP, RETURN_ROW,
+/// AGGINVERSE), mirroring SQLite's `windowCodeOp` (window.c:2229-2376).
 ///
-/// `countdown_reg` is `Some(reg)` when the caller wants the op gated by
-/// an `OP_IfPos` countdown — the op is skipped (and the register
-/// decremented) while `reg > 0`. cume_dist uses this on RETURN_ROW to
-/// defer the first emit; `ROWS BETWEEN N PRECEDING AND CURRENT ROW`
-/// uses it on AGGINVERSE to grow the frame to width N+1 before
-/// sliding. Matches SQLite's `regCountdown` parameter at `window.c:2238`.
+/// `countdown_reg`: gate the op behind an `OP_IfPos` countdown — skip it
+/// (and decrement) while the register is positive. Used to hold an op
+/// back by N rows: cume_dist gates RETURN_ROW, `ROWS BETWEEN N PRECEDING`
+/// gates AGGINVERSE so the frame reaches width N+1 before it slides.
 ///
-/// `break_on_eof` is `Some(label)` only at flush time, when the caller wants
-/// the `RETURN_ROW` loop to exit cleanly on EOF instead of falling through.
+/// `break_on_eof`: only set at flush time, to exit a RETURN_ROW loop on
+/// EOF instead of falling through.
 ///
-/// Under RANGE/GROUPS frames (`bPeer == true`), the cursor advances loop
-/// through every peer-equal row before returning — one `AggStep` call
-/// xSteps the whole previous peer group, one `RETURN_ROW` call emits the
-/// whole previous peer group with the same accumulated state. Under ROWS
-/// frames (`bPeer == false`), each call advances by exactly one row.
+/// Under RANGE / GROUPS one call walks a whole peer group (AGGSTEP steps
+/// it, RETURN_ROW emits it, all at the same accumulated state); under
+/// ROWS one call advances exactly one row.
 fn emit_window_op(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
@@ -1522,6 +1617,23 @@ fn emit_window_op(
     // loop runs to EOF.
     let b_peer = frame_mode != turso_parser::ast::FrameMode::Rows;
 
+    // AGGINVERSE is always a structural no-op when the frame starts at
+    // UNBOUNDED PRECEDING — the frame never shrinks from the left.
+    // Mirrors SQLite's early return at window.c:2252-2257, which lets
+    // every caller emit the full op sequence unconditionally.
+    if matches!(op, WindowOp::AggInverse)
+        && matches!(
+            window.frame.start,
+            crate::translate::plan::FrameBoundary::UnboundedPreceding
+        )
+    {
+        assert!(
+            countdown_reg.is_none() && break_on_eof.is_none(),
+            "an AGGINVERSE no-op cannot carry a countdown or an EOF break"
+        );
+        return Ok(());
+    }
+
     let label_done = program.allocate_label();
     // Cursor + per-cursor peer reference register for each op. Mirrors
     // SQLite's switch at `window.c:2315-2344` plus the reg pickup at
@@ -1537,11 +1649,9 @@ fn emit_window_op(
         ),
     };
 
-    // Optional `OP_IfPos` countdown — when the register is positive,
-    // decrement and skip the op body. Mirrors SQLite at `window.c:2279`.
-    // The caller decides which op gets the gate; for cume_dist's
-    // `Following(1)` start it gates RETURN_ROW, for `ROWS BETWEEN N
-    // PRECEDING` it gates AGGINVERSE.
+    // The `countdown_reg` gate: while positive, decrement and skip the
+    // op (window.c:2279). See the doc comment for which op each caller
+    // gates.
     if let Some(reg) = countdown_reg {
         program.emit_insn(Insn::IfPos {
             reg,
@@ -1551,29 +1661,9 @@ fn emit_window_op(
     }
 
     // RETURN_ROW finalizes accumulators before emitting (SQLite's
-    // windowAggFinal at window.c:2284). first_value / nth_value / lag /
-    // lead have no accumulator value to read — their result registers
-    // are written directly inside `emit_return_one_row` via positional
-    // lookup helpers.
+    // windowAggFinal at window.c:2284).
     if matches!(op, WindowOp::ReturnRow) {
-        for (i, func) in window.functions.iter().enumerate() {
-            if matches!(
-                &func.func,
-                AccumulatorFunc::Window(
-                    WindowFunc::FirstValue
-                        | WindowFunc::NthValue
-                        | WindowFunc::Lag
-                        | WindowFunc::Lead
-                ),
-            ) {
-                continue;
-            }
-            program.emit_insn(Insn::AggValue {
-                acc_reg: registers.acc_start + i,
-                dest_reg: registers.acc_result_start + i,
-                func: func.func.clone(),
-            });
-        }
+        emit_window_agg_final(program, window, &registers);
     }
 
     let label_continue = program.allocate_label();
@@ -1582,14 +1672,16 @@ fn emit_window_op(
     match op {
         WindowOp::AggStep => {
             emit_function_step(program, t_ctx, plan, cursors.csr_end)?;
-            // Record the rowid of the row just stepped into the frame. This
-            // runs once per row in the peer-loop, so after AGGSTEP has walked
-            // the whole peer group `frame_end_rowid` holds the group's last
-            // rowid — the frame end that first_value / nth_value seek against.
-            if let Some(frame_end_rowid) = registers.frame_end_rowid {
-                program.emit_insn(Insn::RowId {
-                    cursor_id: cursors.csr_end,
-                    dest: frame_end_rowid,
+            // Count the row just stepped into the frame. This runs once
+            // per row in the peer-loop, so after AGGSTEP has walked the
+            // whole peer group the counter holds the frame end's buffer
+            // index — the bound first_value / nth_value seek against.
+            // Mirrors SQLite's `OP_AddImm regApp+1` inside
+            // `windowAggStep` (window.c:1726).
+            if let Some(frame_counters) = registers.frame_counters {
+                program.emit_insn(Insn::AddImm {
+                    register: frame_counters + 1,
+                    value: 1,
                 });
             }
         }
@@ -1598,12 +1690,22 @@ fn emit_window_op(
         }
         WindowOp::AggInverse => {
             emit_function_inverse(program, t_ctx, plan)?;
+            // Count the row that just left the frame; the counter is the
+            // frame start's buffer index minus one. Mirrors SQLite's
+            // `OP_AddImm regApp+0` inside `windowAggStep`
+            // (window.c:1726, `regApp+1-bInverse`).
+            if let Some(frame_counters) = registers.frame_counters {
+                program.emit_insn(Insn::AddImm {
+                    register: frame_counters,
+                    value: 1,
+                });
+            }
         }
     }
 
     // Delete the row that just left the reachable set (SQLite window.c:2346,
     // `if( op==p->eDelete ) OP_Delete`), before advancing the cursor past it.
-    if window_delete_op(window, cursors.csr_app.is_some()) == Some(op) {
+    if window_delete_op(window) == Some(op) {
         program.emit_insn(Insn::Delete {
             cursor_id: cursor_for_op,
             table_name: buffer_table_name,
@@ -1635,59 +1737,42 @@ fn emit_window_op(
     }
     program.preassign_label_to_next_insn(label_after_next);
 
-    if b_peer && order_by_len > 0 {
-        // Peer-loop check, mirroring SQLite's `windowIfNewPeer` (which
-        // bundles the Compare + Jump-if-equal + Copy-on-fall-through
-        // at `window.c:2057-2078`). The peer reference register is
-        // per-cursor (`peer_start_reg` / `peer_current_reg` /
-        // `peer_end_reg`) so the start / current / end cursors can be
+    if b_peer {
+        // Peer-loop check: keep re-running the op body while the
+        // advanced-to row is a peer of the cursor's current group,
+        // updating the per-cursor reference (`peer_start_reg` /
+        // `peer_current_reg` / `peer_end_reg`) when a new group begins.
+        // The references are per-cursor so start / current / end can be
         // at different peer groups during flush — required for
-        // percent_rank / cume_dist.
-        let temp_start = program.alloc_registers(order_by_len);
-        for (i, (expr, _, _)) in window.order_by.iter().enumerate() {
-            if let Expr::Column { column, .. } = expr {
-                program.emit_insn(Insn::Column {
-                    cursor_id: cursor_for_op,
-                    column: *column,
-                    dest: temp_start + i,
-                    default: None,
-                });
-            } else {
-                unreachable!("expected Column in window.order_by, got {:?}", expr);
+        // percent_rank / cume_dist. Mirrors SQLite's
+        // `windowReadPeerValues` + `windowIfNewPeer` tail
+        // (window.c:2363-2369); with no ORDER BY the check degenerates
+        // to an unconditional loop-back, draining the partition-wide
+        // peer group to EOF.
+        let temp_start = (order_by_len > 0).then(|| {
+            let temp_start = program.alloc_registers(order_by_len);
+            for (i, (expr, _, _)) in window.order_by.iter().enumerate() {
+                if let Expr::Column { column, .. } = expr {
+                    program.emit_insn(Insn::Column {
+                        cursor_id: cursor_for_op,
+                        column: *column,
+                        dest: temp_start + i,
+                        default: None,
+                    });
+                } else {
+                    unreachable!("expected Column in window.order_by, got {:?}", expr);
+                }
             }
-        }
-        let key_info = build_order_by_key_info(window, &plan.table_references)?;
-        let peer_ref = peer_ref_reg.expect(
-            "per-cursor peer reference register must exist under RANGE/GROUPS with ORDER BY",
-        );
-        let label_update_peer = program.allocate_label();
-        program.emit_insn(Insn::Compare {
-            start_reg_a: peer_ref,
-            start_reg_b: temp_start,
-            count: order_by_len,
-            key_info,
+            temp_start
         });
-        program.emit_insn(Insn::Jump {
-            target_pc_lt: label_update_peer,
-            target_pc_eq: label_continue,
-            target_pc_gt: label_update_peer,
-        });
-        // Fall-through path (new peer group): copy the new row's ORDER
-        // BY values into the cursor's peer reference register so the
-        // next peer-loop iteration compares against this group.
-        program.preassign_label_to_next_insn(label_update_peer);
-        program.emit_insn(Insn::Copy {
-            src_reg: temp_start,
-            dst_reg: peer_ref,
-            extra_amount: order_by_len - 1,
-        });
-    } else if b_peer {
-        // RANGE/GROUPS with no ORDER BY: every row in the partition is
-        // peer-equal, so the loop always continues until EOF (handled by
-        // the Next/Goto pair above).
-        program.emit_insn(Insn::Goto {
-            target_pc: label_continue,
-        });
+        emit_if_new_peer(
+            program,
+            window,
+            &plan.table_references,
+            temp_start,
+            peer_ref_reg,
+            label_continue,
+        )?;
     }
 
     program.preassign_label_to_next_insn(label_done);
@@ -2103,16 +2188,12 @@ fn emit_lag_lead_lookup(
 ///     -- or --
 ///   tmp := arg[1] from csr_current           (nth_value, per-row N)
 ///   MustBeInt tmp; if tmp <= 0: error
-///   tmp := tmp + frame_start_rowid - 1       (frame_start_rowid = 1 for UB-CR)
-///   if tmp > frame_end_rowid: goto lbl       (target past frame end → NULL)
+///   tmp := tmp + frame_counters[0]           (rows that left the frame)
+///   if tmp > frame_counters[1]: goto lbl     (target past frame end → NULL)
 ///   SeekRowid(csr_app, tmp)
 ///   reg_result := Column(csr_app, arg[0])
 ///   lbl:
 /// ```
-///
-/// `frame_start_rowid` is `RowId(csr_start)` when a moving frame start
-/// is active (`ROWS BETWEEN N PRECEDING AND CURRENT ROW`) and `1`
-/// otherwise (default `RANGE UNBOUNDED PRECEDING TO CURRENT ROW`).
 fn emit_first_value_nth_value_lookup(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
@@ -2208,51 +2289,44 @@ fn emit_first_value_nth_value_lookup(
             });
         }
 
-        // Apply the frame-start offset: when the frame has a moving start
-        // (e.g. ROWS BETWEEN N PRECEDING), nth_value counts N from the frame
-        // start, so target += csr_start.rowid - 1. With an UNBOUNDED
-        // PRECEDING start there is no `csr_start` and target stays as N.
-        if let Some(csr_start) = cursors.csr_start {
-            let start_rowid_reg = program.alloc_register();
-            program.emit_insn(Insn::RowId {
-                cursor_id: csr_start,
-                dest: start_rowid_reg,
-            });
-            program.emit_insn(Insn::Add {
-                lhs: target_reg,
-                rhs: start_rowid_reg,
-                dest: target_reg,
-            });
-            program.emit_insn(Insn::AddImm {
-                register: target_reg,
-                value: -1,
-            });
-        }
+        // Apply the frame-start offset: nth_value counts N from the frame
+        // start, whose buffer index is `frame_counters + 1` rows in
+        // (`frame_counters` holds the count of rows that have left the
+        // frame — 0 for an UNBOUNDED PRECEDING start). Buffer rowids are
+        // dense from 1 per partition, so `N + frame_counters` is the
+        // target's rowid directly. Mirrors SQLite's
+        // `OP_Add tmpReg, regApp` at window.c:1949.
+        let frame_counters = registers
+            .frame_counters
+            .expect("frame_counters must exist when a window contains first_value/nth_value");
+        program.emit_insn(Insn::Add {
+            lhs: target_reg,
+            rhs: frame_counters,
+            dest: target_reg,
+        });
 
         // Two distinct "no value" outcomes, kept separate:
         //
         // * target past the frame end — a legitimate NULL (the Nth row lies
-        //   outside this row's frame). `frame_end_rowid` is the last rowid
-        //   stepped into the frame, NOT the emitted row's own rowid: under
-        //   RANGE the frame runs to the current row's last peer, so an early
-        //   row of a peer group must still see its whole group.
+        //   outside this row's frame). `frame_counters + 1` is the index of
+        //   the last row stepped into the frame, NOT the emitted row's own
+        //   rowid: under RANGE the frame runs to the current row's last
+        //   peer, so an early row of a peer group must still see its whole
+        //   group. Mirrors SQLite's `OP_Gt regApp+1, lbl, tmpReg` at
+        //   window.c:1950.
         //
         // * target within the frame but `SeekRowid` misses — impossible:
-        //   first_value/nth_value force the whole partition to stay buffered
-        //   (cache_frame ⇒ no deletion), so frame rows carry dense rowids
-        //   1..frame_end and are all present by emit time, even with a moving
-        //   frame start. Treat a miss as an invariant violation and Halt
-        //   rather than silently returning NULL. Mirrors SQLite finding its
-        //   row via csrApp unconditionally.
-        let frame_end_rowid = registers
-            .frame_end_rowid
-            .expect("frame_end_rowid must exist when a window contains first_value/nth_value");
+        //   buffered rows are only ever deleted after leaving the frame
+        //   (behind `frame_counters` rows in), and the target lies at or
+        //   past the frame start. Treat a miss as an invariant violation
+        //   and Halt rather than silently returning NULL. Mirrors SQLite
+        //   finding its row via csrApp unconditionally.
         let lbl_past_frame_end = program.allocate_label();
         let lbl_missing_row = program.allocate_label();
         let lbl_done = program.allocate_label();
         program.emit_insn(Insn::Gt {
             lhs: target_reg,
-            rhs: frame_end_rowid,
+            rhs: frame_counters + 1,
             target_pc: lbl_past_frame_end,
             flags: crate::vdbe::insn::CmpInsFlags::default(),
             collation: None,
@@ -2383,9 +2457,10 @@ fn emit_row_output_subroutine(
 /// end-of-source code that drains any remaining rows still ahead of the
 /// frame-end cursor and emits all rows still ahead of the current cursor.
 ///
-/// This is the Rust port of SQLite's flush block at `window.c:3043-3105`,
-/// restricted to the `UNBOUNDED PRECEDING TO CURRENT ROW` path
-/// (`window.c:3085-3094`):
+/// This is the Rust port of SQLite's flush block at `window.c:3043-3105`.
+/// The loop shape is one of three patterns keyed on the frame bounds,
+/// matching the main loop's dispatch. The most common shape
+/// (`UNBOUNDED PRECEDING TO CURRENT ROW`, window.c:3085-3094):
 ///
 /// ```text
 ///   Rewind csr_write → if empty, jump to label_empty
@@ -2439,151 +2514,115 @@ pub fn emit_window_flush(
         pc_if_empty: label_empty,
     });
 
-    // Drain step: the very last row inserted in the main loop hasn't had
-    // AggStep called against it (under ROWS) or its peer group might still
-    // be incomplete (under RANGE). One AGGSTEP advances csr_end through the
-    // remaining rows.
-    emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None)?;
-
-    // The flush loop shape depends on the frame's start boundary.
-    // Mirrors SQLite's three flush paths at window.c:3052-3094.
+    // The flush shape is keyed like the main loop's pattern dispatch.
+    // Mirrors SQLite's three flush paths at window.c:3052-3094. Each
+    // branch opens with the drain AGGSTEP: the very last row inserted in
+    // the main loop hasn't had AggStep called against it (under ROWS) or
+    // its peer group might still be incomplete (under RANGE / GROUPS).
     let window = plan.window.as_ref().expect("missing window");
-    match window.frame.start {
-        crate::translate::plan::FrameBoundary::Following(_) => {
-            // `N FOLLOWING` start (cume_dist's `1 FOLLOWING`). SQLite
-            // window.c:3068-3084: two-stage loop.
-            //
-            //   loop_1:
-            //     RETURN_ROW (with IfPos countdown → skips first call),
-            //                 break_on_eof = label_break
-            //     AGGINVERSE,  break_on_eof = label_after_inverse_eof
-            //     Goto loop_1
-            //   label_after_inverse_eof:
-            //   loop_2:
-            //     RETURN_ROW,  break_on_eof = label_break
-            //     Goto loop_2
-            //   label_break:
-            //
-            // The IfPos defers the first emit so AGGINVERSE fires for
-            // the first group before the first RETURN_ROW reads its
-            // value. After AGGINVERSE exhausts (csr_start EOF), the
-            // second loop drains the remaining csr_current rows with
-            // the now-final nStep.
-            let label_after_inverse_eof = program.allocate_label();
-            let label_loop_1 = program.allocate_label();
-            program.preassign_label_to_next_insn(label_loop_1);
-            emit_window_op(
-                program,
-                t_ctx,
-                plan,
-                WindowOp::ReturnRow,
-                registers.start_offset_reg,
-                Some(label_break),
-            )?;
-            emit_window_op(
-                program,
-                t_ctx,
-                plan,
-                WindowOp::AggInverse,
-                None,
-                Some(label_after_inverse_eof),
-            )?;
-            program.emit_insn(Insn::Goto {
-                target_pc: label_loop_1,
-            });
+    use crate::translate::plan::FrameBoundary;
+    if matches!(window.frame.end, FrameBoundary::Preceding(_)) {
+        // Pattern B flush (window.c:3052-3056).
+        unreachable!("PRECEDING frame ends are rejected by the planner");
+    } else if matches!(window.frame.start, FrameBoundary::Following(_)) {
+        // Pattern A flush (window.c:3057-3084): two-stage loop.
+        //
+        //   loop_1:
+        //     RETURN_ROW (with IfPos countdown → skips first call),
+        //                 break_on_eof = label_break
+        //     AGGINVERSE,  break_on_eof = label_after_inverse_eof
+        //     Goto loop_1
+        //   label_after_inverse_eof:
+        //   loop_2:
+        //     RETURN_ROW,  break_on_eof = label_break
+        //     Goto loop_2
+        //   label_break:
+        //
+        // The IfPos defers the first emit so AGGINVERSE fires for the
+        // first group before the first RETURN_ROW reads its value
+        // (cume_dist's `1 FOLLOWING` start). After AGGINVERSE exhausts
+        // (csr_start EOF), the second loop drains the remaining
+        // csr_current rows with the now-final accumulator state.
+        emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None)?;
+        if !matches!(window.frame.end, FrameBoundary::UnboundedFollowing) {
+            // The RANGE and bounded-FOLLOWING-end stage-one variants
+            // (window.c:3063-3077) land with their frame support.
+            unreachable!("FOLLOWING frame starts with a bounded end are rejected by the planner");
+        }
+        let label_after_inverse_eof = program.allocate_label();
+        let label_loop_1 = program.allocate_label();
+        program.preassign_label_to_next_insn(label_loop_1);
+        emit_window_op(
+            program,
+            t_ctx,
+            plan,
+            WindowOp::ReturnRow,
+            registers.start_offset_reg,
+            Some(label_break),
+        )?;
+        emit_window_op(
+            program,
+            t_ctx,
+            plan,
+            WindowOp::AggInverse,
+            None,
+            Some(label_after_inverse_eof),
+        )?;
+        program.emit_insn(Insn::Goto {
+            target_pc: label_loop_1,
+        });
 
-            program.preassign_label_to_next_insn(label_after_inverse_eof);
-            let label_loop_2 = program.allocate_label();
-            program.preassign_label_to_next_insn(label_loop_2);
-            emit_window_op(
-                program,
-                t_ctx,
-                plan,
-                WindowOp::ReturnRow,
-                None,
-                Some(label_break),
-            )?;
-            program.emit_insn(Insn::Goto {
-                target_pc: label_loop_2,
-            });
-        }
-        crate::translate::plan::FrameBoundary::CurrentRow => {
-            // CURRENT ROW start (ntile, percent_rank). SQLite
-            // window.c:3088-3093: paired RETURN_ROW + AGGINVERSE in a
-            // single loop. AGGINVERSE never hits EOF before RETURN_ROW
-            // (csr_start advances in lockstep with csr_current within a
-            // group), so it doesn't need its own break.
-            let label_loop_start = program.allocate_label();
-            program.preassign_label_to_next_insn(label_loop_start);
-            emit_window_op(
-                program,
-                t_ctx,
-                plan,
-                WindowOp::ReturnRow,
-                None,
-                Some(label_break),
-            )?;
-            emit_window_op(program, t_ctx, plan, WindowOp::AggInverse, None, None)?;
-            program.emit_insn(Insn::Goto {
-                target_pc: label_loop_start,
-            });
-        }
-        crate::translate::plan::FrameBoundary::UnboundedPreceding => {
-            // UNBOUNDED PRECEDING start (everything else). No
-            // AGGINVERSE — the frame never shrinks from the left.
-            // SQLite window.c:3088-3093 with the AGGINVERSE no-op gate
-            // at window.c:2254.
-            let label_loop_start = program.allocate_label();
-            program.preassign_label_to_next_insn(label_loop_start);
-            emit_window_op(
-                program,
-                t_ctx,
-                plan,
-                WindowOp::ReturnRow,
-                None,
-                Some(label_break),
-            )?;
-            program.emit_insn(Insn::Goto {
-                target_pc: label_loop_start,
-            });
-        }
-        crate::translate::plan::FrameBoundary::Preceding(_) => {
-            // `N PRECEDING` start (`ROWS BETWEEN N PRECEDING AND CURRENT
-            // ROW`). SQLite window.c:3085-3094: single loop with
-            // AGGINVERSE gated by the start-offset countdown.
-            //
-            //   loop:
-            //     RETURN_ROW (break_on_eof = label_break)
-            //     AGGINVERSE (countdown = start_offset_reg)
-            //     Goto loop
-            //
-            // The countdown ensures the frame grows to width N+1 before
-            // csr_start starts sliding.
-            let label_loop_start = program.allocate_label();
-            program.preassign_label_to_next_insn(label_loop_start);
-            emit_window_op(
-                program,
-                t_ctx,
-                plan,
-                WindowOp::ReturnRow,
-                None,
-                Some(label_break),
-            )?;
-            emit_window_op(
-                program,
-                t_ctx,
-                plan,
-                WindowOp::AggInverse,
-                registers.start_offset_reg,
-                None,
-            )?;
-            program.emit_insn(Insn::Goto {
-                target_pc: label_loop_start,
-            });
-        }
-        crate::translate::plan::FrameBoundary::UnboundedFollowing => {
-            unreachable!("UNBOUNDED FOLLOWING cannot be a coerced frame start");
-        }
+        program.preassign_label_to_next_insn(label_after_inverse_eof);
+        let label_loop_2 = program.allocate_label();
+        program.preassign_label_to_next_insn(label_loop_2);
+        emit_window_op(
+            program,
+            t_ctx,
+            plan,
+            WindowOp::ReturnRow,
+            None,
+            Some(label_break),
+        )?;
+        program.emit_insn(Insn::Goto {
+            target_pc: label_loop_2,
+        });
+    } else {
+        // Pattern C flush (window.c:3085-3094): paired RETURN_ROW +
+        // AGGINVERSE in a single loop.
+        //
+        //   loop:
+        //     RETURN_ROW (break_on_eof = label_break)
+        //     AGGINVERSE (countdown = start_offset_reg)
+        //     Goto loop
+        //
+        // One branch serves every non-FOLLOWING start, exactly as
+        // SQLite's else-arm does: for UNBOUNDED PRECEDING the AGGINVERSE
+        // is a structural no-op (window.c:2252-2257); for CURRENT ROW
+        // there is no countdown register and csr_start advances in
+        // lockstep; for `N PRECEDING` the countdown grows the frame to
+        // width N+1 before csr_start starts sliding.
+        emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None)?;
+        let label_loop_start = program.allocate_label();
+        program.preassign_label_to_next_insn(label_loop_start);
+        emit_window_op(
+            program,
+            t_ctx,
+            plan,
+            WindowOp::ReturnRow,
+            None,
+            Some(label_break),
+        )?;
+        emit_window_op(
+            program,
+            t_ctx,
+            plan,
+            WindowOp::AggInverse,
+            registers.start_offset_reg,
+            None,
+        )?;
+        program.emit_insn(Insn::Goto {
+            target_pc: label_loop_start,
+        });
     }
 
     program.preassign_label_to_next_insn(label_break);
