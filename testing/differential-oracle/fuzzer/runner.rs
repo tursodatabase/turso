@@ -574,6 +574,35 @@ impl Fuzzer {
             );
         }
 
+        let turso_triggers: std::collections::HashSet<_> = turso_schema
+            .triggers
+            .iter()
+            .map(|trigger| {
+                (
+                    trigger.qualified_name(),
+                    trigger.table_name.as_str().to_string(),
+                )
+            })
+            .collect();
+        let sqlite_triggers: std::collections::HashSet<_> = sqlite_schema
+            .triggers
+            .iter()
+            .map(|trigger| {
+                (
+                    trigger.qualified_name(),
+                    trigger.table_name.as_str().to_string(),
+                )
+            })
+            .collect();
+
+        if turso_triggers != sqlite_triggers {
+            bail!(
+                "Trigger mismatch: Turso has {:?}, SQLite has {:?}",
+                turso_triggers,
+                sqlite_triggers
+            );
+        }
+
         // Verify each table's columns and strict flags match
         for turso_table in turso_schema.tables.iter() {
             let sqlite_table = sqlite_schema
