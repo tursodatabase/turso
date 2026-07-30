@@ -797,6 +797,21 @@ impl ScalarOp {
             | Self::Logical { .. } => None,
         }
     }
+
+    /// Whether removing an unused result preserves observable SQL behavior.
+    fn can_eliminate_if_unused(&self) -> bool {
+        match self {
+            Self::Input(_)
+            | Self::Parameter(_)
+            | Self::Constant(_)
+            | Self::Add { .. }
+            | Self::Logical { .. } => true,
+            // Integer coercion can raise a datatype error. Column reads remain
+            // ordered until storage-read and corruption behavior is modeled as
+            // an explicit effect in the IR.
+            Self::MustBeInt { .. } | Self::Column { .. } => false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1449,6 +1464,7 @@ impl IrProgram {
         if self.fold_constant_branches() {
             self.remove_unreachable_blocks()?;
         }
+        self.eliminate_dead_values();
         self.verify()?;
         Ok(self)
     }
@@ -1557,6 +1573,55 @@ impl IrProgram {
         Ok(())
     }
 
+    /// Remove unused value instructions that cannot affect SQL-visible behavior.
+    fn eliminate_dead_values(&mut self) -> bool {
+        let mut dependencies = vec![SmallVec::<[ValueId; 2]>::new(); self.value_count as usize];
+        let mut roots = Vec::new();
+
+        for block in &self.blocks {
+            roots.extend(block.terminator.operands());
+            for instruction in &block.instructions {
+                match instruction {
+                    Instruction::Value { result, op } => {
+                        dependencies[result.index()].extend(op.operands());
+                        if !op.can_eliminate_if_unused() {
+                            roots.push(*result);
+                        }
+                    }
+                    Instruction::Effect(_) => roots.extend(instruction.operands()),
+                }
+            }
+        }
+
+        let mut live = vec![false; self.value_count as usize];
+        let mut worklist = Vec::new();
+        for root in roots {
+            if !live[root.index()] {
+                live[root.index()] = true;
+                worklist.push(root);
+            }
+        }
+        while let Some(value) = worklist.pop() {
+            for dependency in &dependencies[value.index()] {
+                if !live[dependency.index()] {
+                    live[dependency.index()] = true;
+                    worklist.push(*dependency);
+                }
+            }
+        }
+
+        let mut changed = false;
+        for block in &mut self.blocks {
+            let previous_len = block.instructions.len();
+            block.instructions.retain(|instruction| match instruction {
+                Instruction::Value { result, .. } => live[result.index()],
+                Instruction::Effect(_) => true,
+            });
+            changed |= block.instructions.len() != previous_len;
+        }
+        changed
+    }
+
     fn compute_dominators(predecessors: &[Vec<BlockId>]) -> Vec<Vec<bool>> {
         let block_count = predecessors.len();
         let mut dominators = vec![vec![true; block_count]; block_count];
@@ -1648,10 +1713,51 @@ impl IrProgram {
             .expect("verified compiler IR has exactly one return")
     }
 
+    fn defined_values(&self) -> Vec<bool> {
+        let mut defined = vec![false; self.value_count as usize];
+        for block in &self.blocks {
+            for parameter in &block.parameters {
+                defined[parameter.index()] = true;
+            }
+            for instruction in &block.instructions {
+                if let Instruction::Value { result, .. } = instruction {
+                    defined[result.index()] = true;
+                }
+            }
+        }
+        defined
+    }
+
+    fn required_cursors(&self) -> Vec<bool> {
+        let mut required = vec![false; self.cursor_resources.len()];
+        for block in &self.blocks {
+            for instruction in &block.instructions {
+                for cursor in [instruction.cursor_use(), instruction.cursor_definition()]
+                    .into_iter()
+                    .flatten()
+                {
+                    required[cursor.index()] = true;
+                }
+            }
+            if let Some(cursor) = block.terminator.cursor() {
+                required[cursor.index()] = true;
+            }
+        }
+        required
+    }
+
+    fn register_for(registers: &[Option<usize>], value: ValueId) -> usize {
+        registers[value.index()].expect("verified live SSA value has a physical register")
+    }
+
+    fn cursor_for(cursors: &[Option<usize>], cursor: CursorId) -> usize {
+        cursors[cursor.index()].expect("verified live cursor has a physical cursor")
+    }
+
     fn emit_edge_copies(
         &self,
         program: &mut ProgramBuilder,
-        registers: &[usize],
+        registers: &[Option<usize>],
         target: BlockId,
         arguments: &[ValueId],
     ) {
@@ -1659,8 +1765,8 @@ impl IrProgram {
             .iter()
             .zip(&self.blocks[target.index()].parameters)
         {
-            let source = registers[argument.index()];
-            let destination = registers[parameter.index()];
+            let source = Self::register_for(registers, *argument);
+            let destination = Self::register_for(registers, *parameter);
             if source != destination {
                 program.emit_insn(Insn::Copy {
                     src_reg: source,
@@ -1725,15 +1831,23 @@ impl IrProgram {
         for variable in &self.parameter_declarations {
             program.register_variable(variable);
         }
+        let required_cursors = self.required_cursors();
         let physical_cursors = self
             .cursor_resources
             .iter()
-            .map(|resource| match resource {
-                CursorResource::External(input) => cursor_ids[input.index()],
-                CursorResource::Owned(cursor_type) => program.alloc_cursor_id(cursor_type.clone()),
-            })
-            .collect::<SmallVec<[usize; 2]>>();
+            .enumerate()
+            .map(
+                |(index, resource)| match (required_cursors[index], resource) {
+                    (false, _) => None,
+                    (true, CursorResource::External(input)) => Some(cursor_ids[input.index()]),
+                    (true, CursorResource::Owned(cursor_type)) => {
+                        Some(program.alloc_cursor_id(cursor_type.clone()))
+                    }
+                },
+            )
+            .collect::<SmallVec<[Option<usize>; 2]>>();
         let output = self.output();
+        let defined_values = self.defined_values();
         let mut input_values = vec![None; self.value_count as usize];
         for block in &self.blocks {
             for instruction in &block.instructions {
@@ -1748,15 +1862,17 @@ impl IrProgram {
         }
         let registers = (0..self.value_count)
             .map(|value| {
-                if ValueId(value) == output {
-                    target_register
+                if !defined_values[value as usize] {
+                    None
+                } else if ValueId(value) == output {
+                    Some(target_register)
                 } else if let Some(input) = input_values[value as usize] {
-                    input_registers[input.index()]
+                    Some(input_registers[input.index()])
                 } else {
-                    program.alloc_register()
+                    Some(program.alloc_register())
                 }
             })
-            .collect::<SmallVec<[usize; 8]>>();
+            .collect::<SmallVec<[Option<usize>; 8]>>();
         let labels = self
             .blocks
             .iter()
@@ -1788,7 +1904,7 @@ impl IrProgram {
             for instruction in &block.instructions {
                 match instruction {
                     Instruction::Value { result, op } => {
-                        let destination = registers[result.index()];
+                        let destination = Self::register_for(&registers, *result);
                         match op {
                             ScalarOp::Input(input) => {
                                 let source = input_registers[input.index()];
@@ -1836,12 +1952,12 @@ impl IrProgram {
                                 });
                             }
                             ScalarOp::Add { lhs, rhs } => program.emit_insn(Insn::Add {
-                                lhs: registers[lhs.index()],
-                                rhs: registers[rhs.index()],
+                                lhs: Self::register_for(&registers, *lhs),
+                                rhs: Self::register_for(&registers, *rhs),
                                 dest: destination,
                             }),
                             ScalarOp::MustBeInt { value } => {
-                                let source = registers[value.index()];
+                                let source = Self::register_for(&registers, *value);
                                 if source != destination {
                                     program.emit_insn(Insn::Copy {
                                         src_reg: source,
@@ -1855,8 +1971,8 @@ impl IrProgram {
                                 });
                             }
                             ScalarOp::Logical { op, lhs, rhs } => {
-                                let lhs = registers[lhs.index()];
-                                let rhs = registers[rhs.index()];
+                                let lhs = Self::register_for(&registers, *lhs);
+                                let rhs = Self::register_for(&registers, *rhs);
                                 program.emit_insn(match op {
                                     LogicalOp::And => Insn::And {
                                         lhs,
@@ -1872,7 +1988,7 @@ impl IrProgram {
                             }
                             ScalarOp::Column { cursor, column } => {
                                 program.emit_column_or_rowid(
-                                    physical_cursors[cursor.index()],
+                                    Self::cursor_for(&physical_cursors, *cursor),
                                     *column,
                                     destination,
                                 );
@@ -1887,7 +2003,7 @@ impl IrProgram {
                     }) => {
                         program.begin_read_on_database(*db, *schema_cookie)?;
                         program.emit_insn(Insn::OpenRead {
-                            cursor_id: physical_cursors[cursor.index()],
+                            cursor_id: Self::cursor_for(&physical_cursors, *cursor),
                             root_page: *root_page,
                             db: *db,
                         });
@@ -1896,7 +2012,7 @@ impl IrProgram {
                         let start = program.alloc_registers(pack.values().len());
                         result_row_packs.push((start, pack.values().len()));
                         for (index, value) in pack.values().iter().enumerate() {
-                            let source = registers[value.index()];
+                            let source = Self::register_for(&registers, *value);
                             let destination = start + index;
                             if source != destination {
                                 program.emit_insn(Insn::Copy {
@@ -1926,7 +2042,7 @@ impl IrProgram {
                     if_false,
                 } => {
                     program.emit_insn(Insn::IfNot {
-                        reg: registers[condition.index()],
+                        reg: Self::register_for(&registers, *condition),
                         target_pc: labels[if_false.index()],
                         jump_if_null: true,
                     });
@@ -1944,8 +2060,8 @@ impl IrProgram {
                 } => {
                     // VDBE comparison affinity may rewrite both operands. Keep
                     // the registers backing immutable SSA values unchanged.
-                    let lhs_source = registers[lhs.index()];
-                    let rhs_source = registers[rhs.index()];
+                    let lhs_source = Self::register_for(&registers, *lhs);
+                    let rhs_source = Self::register_for(&registers, *rhs);
                     let lhs = program.alloc_register();
                     let rhs = program.alloc_register();
                     program.emit_insn(Insn::Copy {
@@ -2028,7 +2144,7 @@ impl IrProgram {
                         self.emit_edge_copies(program, &registers, *target, arguments);
                     }
                     program.emit_insn(Insn::Rewind {
-                        cursor_id: physical_cursors[cursor.index()],
+                        cursor_id: Self::cursor_for(&physical_cursors, *cursor),
                         pc_if_empty: labels[if_empty.index()],
                     });
                     program.emit_insn(Insn::Goto {
@@ -2045,7 +2161,7 @@ impl IrProgram {
                         self.emit_edge_copies(program, &registers, *target, arguments);
                     }
                     program.emit_insn(Insn::Next {
-                        cursor_id: physical_cursors[cursor.index()],
+                        cursor_id: Self::cursor_for(&physical_cursors, *cursor),
                         pc_if_next: labels[if_next.index()],
                     });
                     program.emit_insn(Insn::Goto {
@@ -3495,7 +3611,6 @@ mod tests {
             ir.to_string(),
             concat!(
                 "block0:\n",
-                "  %0 = constant Numeric(Integer(1))\n",
                 "  jump block1()\n",
                 "\n",
                 "block1:\n",
@@ -3506,6 +3621,103 @@ mod tests {
                 "  return %2\n",
             )
         );
+    }
+
+    #[test]
+    fn optimizer_eliminates_recursively_dead_pure_values() {
+        let discarded = constant(Value::from_i64(40))
+            .then(constant(Value::from_i64(2)))
+            .and_then(|(lhs, rhs)| add(lhs, rhs));
+        let compiler = discarded
+            .then(constant(Value::from_i64(7)))
+            .map(|(_, result)| result);
+
+        let ir = compile_scalar(compiler).unwrap().optimize().unwrap();
+
+        assert_eq!(
+            ir.to_string(),
+            concat!(
+                "block0:\n",
+                "  %3 = constant Numeric(Integer(7))\n",
+                "  return %3\n",
+            )
+        );
+    }
+
+    #[test]
+    fn dead_value_holes_do_not_allocate_registers() {
+        let discarded = constant(Value::from_i64(40))
+            .then(constant(Value::from_i64(2)))
+            .and_then(|(lhs, rhs)| add(lhs, rhs));
+        let compiler = discarded
+            .then(constant(Value::from_i64(7)))
+            .map(|(_, result)| result);
+        let ir = compile_scalar(compiler).unwrap();
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 3, 0));
+        let target = program.alloc_register();
+
+        ir.lower_into(&mut program, target).unwrap();
+
+        assert_eq!(program.peek_next_register(), target + 1);
+        assert!(matches!(
+            program.insns.as_slice(),
+            [(Insn::Integer { value: 7, dest }, _)] if *dest == target
+        ));
+    }
+
+    #[test]
+    fn dead_value_elimination_preserves_integer_coercion_errors() {
+        let compiler = constant(Value::Text("not an integer".into()))
+            .and_then(must_be_int)
+            .then(constant(Value::from_i64(7)))
+            .map(|(_, result)| result);
+        let ir = compile_scalar(compiler).unwrap();
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        let mut builder =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 8, 0));
+        let result = builder.alloc_register();
+        ir.lower_into(&mut builder, result).unwrap();
+        builder.emit_insn(Insn::ResultRow {
+            start_reg: result,
+            count: 1,
+        });
+        builder.emit_insn(Insn::Halt {
+            err_code: 0,
+            description: String::new(),
+            on_error: None,
+            description_reg: None,
+        });
+        let program = builder
+            .build(connection.clone(), false, "dead value coercion test")
+            .unwrap();
+        let mut statement = Statement::new(program, connection.get_pager(), QueryMode::Normal, 0);
+
+        let error = statement.run_collect_rows().unwrap_err();
+
+        assert!(error.to_string().contains("datatype mismatch"));
+    }
+
+    #[test]
+    fn pruned_owned_cursors_do_not_allocate_backend_resources() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE dead(a)", 2).unwrap());
+        let dead_branch = open_read_table(table, 0, 0).and_then(|cursor| column(cursor, 0));
+        let compiler =
+            constant(Value::from_i64(1)).branch(constant(Value::from_i64(10)), dead_branch);
+        let ir = compile_scalar(compiler).unwrap();
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 8, 0));
+        let target = program.alloc_register();
+
+        ir.lower_into(&mut program, target).unwrap();
+
+        assert!(program.cursor_ref.is_empty());
+        assert!(program
+            .insns
+            .iter()
+            .all(|(insn, _)| !matches!(insn, Insn::OpenRead { .. } | Insn::Column { .. })));
     }
 
     #[test]
@@ -3553,6 +3765,25 @@ mod tests {
             .insns
             .iter()
             .all(|(insn, _)| !matches!(insn, Insn::Variable { .. } | Insn::IfNot { .. })));
+    }
+
+    #[test]
+    fn eliminating_an_unused_parameter_preserves_its_bind_slot() {
+        let compiler = parameter(Variable::indexed(1.try_into().unwrap()))
+            .then(constant(Value::from_i64(7)))
+            .map(|(_, result)| result);
+        let ir = compile_scalar(compiler).unwrap();
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 3, 0));
+        let target = program.alloc_register();
+
+        ir.lower_into(&mut program, target).unwrap();
+
+        assert_eq!(program.parameters.count(), 1);
+        assert!(program
+            .insns
+            .iter()
+            .all(|(insn, _)| !matches!(insn, Insn::Variable { .. })));
     }
 
     #[test]

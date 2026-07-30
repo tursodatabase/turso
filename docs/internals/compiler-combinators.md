@@ -41,14 +41,22 @@ false. It intentionally does not evaluate comparisons, arithmetic, integer
 coercions, or other operations whose errors and SQL semantics need dedicated
 analysis.
 
+After simplifying control flow, a backwards liveness pass removes recursively
+unused pure value instructions. Constants, symbolic inputs, parameters,
+arithmetic, and logical operations are removable; integer coercions and column
+reads remain ordered roots because they can expose datatype, storage, or
+corruption behavior. Effect instructions and terminator operands are always
+live.
+
 Optimization runs before registers, cursors, labels, or instruction offsets are
 assigned. Surviving value and resource identifiers remain stable arena indices,
 so removed definitions may leave unused slots; the verifier still rejects every
 used undefined value or unopened cursor and rechecks dominance on the rewritten
-graph. Statement parameter declarations are interface metadata rather than
-runtime value instructions. A parameter occurring only in a removed branch
-therefore still creates its bind slot, while its VDBE `Variable` instruction is
-not emitted.
+graph. The allocator represents those holes explicitly and assigns no physical
+register or owned cursor to them. Statement parameter declarations and external
+input arity are interface metadata rather than runtime value instructions. A
+parameter occurring only in removed code therefore still creates its bind slot,
+while its VDBE `Variable` instruction is not emitted.
 
 ## Migration plan
 
