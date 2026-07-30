@@ -1,3 +1,7 @@
 #!/usr/bin/env bash
 
-/bin/turso_stress --nr-threads 2 --nr-iterations 10000 --tx-mode concurrent
+source "$(dirname "$0")/../random.sh"
+
+sqlite3 /tmp/stress.db 'vacuum'
+
+/bin/turso_stress --nr-threads "$(random_range 1 5)" --nr-iterations "$(random_range 1000 9999)" --tx-mode concurrent --db-file /tmp/stress.db
