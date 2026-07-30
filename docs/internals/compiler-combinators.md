@@ -161,6 +161,16 @@ already-open target. The SQL frontend expresses this directly with `then` and
 positioning remain separate compiler stages. Literal and external-cursor RHS
 producers share the same transition, and neither path can reopen the target
 inside the key loop.
+An inner join can place that transition inside its outer `flat_map`. Literal
+RHS expressions are resolved only against the outer symbolic row and compiled
+there, so a list such as `inner.id IN (outer.lo, outer.hi)` is rebuilt for every
+outer row. Its sorter open acts as a reset after the previous read phase; the
+IR verifier permits that loop-carried `Unopened|Reading` state but still rejects
+reopening while records are being inserted. Uncorrelated subquery values take
+the other path: their ephemeral cursor is produced before the outer scan and
+rewound by the nested value stream on every iteration. In both cases the inner
+table or index resource opens once before the outer loop and is only
+repositioned inside it.
 Short-circuiting consumers use an SSA `try_fold` protocol: each accepted item
 returns a state pack and a symbolic continuation value. A false continuation
 branches directly to the loop exit, while a true continuation reaches the
@@ -215,10 +225,9 @@ each `WHEN` arm. The compiler evaluates the base once, retains its `ValueId`,
 and composes each ordered arm from `then`, `and_then`, comparison, and `branch`;
 NULL comparison results follow the false arm, as required by SQLite.
 The path also falls back when SQL semantics still live in the eager frontend:
-other expression forms, outer and semi/anti joins, IN join inputs, unsupported
-index-range shapes, joins wider than two tables or spanning attached databases,
-aggregates, most subquery forms, generated values, arrays, and custom-type
-decoding.
+other expression forms, outer and semi/anti joins, unsupported index-range
+shapes, joins wider than two tables or spanning attached databases, aggregates,
+most subquery forms, generated values, arrays, and custom-type decoding.
 `EXPLAIN QUERY PLAN` also remains on the eager path until the IR models
 explain-tree effects.
 Ordinary column lowering does reuse the VDBE backend's logical-column helper, so

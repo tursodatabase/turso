@@ -12,10 +12,10 @@ use crate::{
             open_declared_ephemeral_index, open_ephemeral_index, open_index, open_table,
             pack_values, pure, result_row_pack, scan_index, scan_table, seek_index, seek_rowid,
             seek_table_range, select_pack, BoxedCompile, Compile, CompileRegion, CursorId,
-            CursorInputId, DeferredIndexBound, DeferredIndexRange, DeferredTableBound,
-            DeferredTableRange, InputProducer, InputRequirement, InputRequirements, InputSlot,
-            PhysicalInputBinding, Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId,
-            ValuePack,
+            CursorInputId, DeferredInValues, DeferredIndexBound, DeferredIndexRange,
+            DeferredTableBound, DeferredTableRange, InputProducer, InputRequirement,
+            InputRequirements, InputSlot, PhysicalInputBinding, Row, RowStream, ScanDirection,
+            SortKey, SortedRow, ValueId, ValuePack,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -403,6 +403,10 @@ enum DeclarativeInnerJoinAccess<'a> {
         index: &'a Arc<Index>,
         seek_def: &'a SeekDef,
     },
+    InValues {
+        index: Option<&'a Arc<Index>>,
+        source: DeclarativeInSource<'a>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -414,6 +418,37 @@ enum DeclarativeInSource<'a> {
     Subquery {
         cursor_id: CursorID,
     },
+}
+
+enum ResolvedInnerInValues {
+    Literal {
+        values: SmallVec<[ResolvedScalarExpr; 4]>,
+        affinity: Affinity,
+        collation: Option<CollationSeq>,
+    },
+    Cursor {
+        input: CursorInputId,
+        collation: Option<CollationSeq>,
+    },
+}
+
+impl ResolvedInnerInValues {
+    fn into_deferred(self, outer: &SymbolicRows) -> DeferredInValues {
+        match self {
+            Self::Literal {
+                values,
+                affinity,
+                collation,
+            } => {
+                let mut compilers = SmallVec::with_capacity(values.len());
+                for value in &values {
+                    compilers.push(compile_symbolic_expr(outer, value));
+                }
+                literal_values(compilers, affinity, collation)
+            }
+            Self::Cursor { input, collation } => cursor_values(input, collation),
+        }
+    }
 }
 
 enum DeclarativeSelectOutcome {
@@ -458,6 +493,48 @@ struct DeclarativeCursorBinding {
 struct DeclarativeInCursor {
     binding: DeclarativeCursorBinding,
     subquery_id: TableInternalId,
+}
+
+fn resolve_declarative_in_cursor(
+    plan: &SelectPlan,
+    cursor_id: CursorID,
+    input: CursorInputId,
+) -> Result<Option<DeclarativeInCursor>> {
+    let mut matching = plan.non_from_clause_subqueries.iter().filter(|subquery| {
+        matches!(
+            &subquery.query_type,
+            SubqueryType::In {
+                cursor_id: subquery_cursor,
+                ..
+            } if *subquery_cursor == cursor_id
+        )
+    });
+    let Some(subquery) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() {
+        return Err(LimboError::InternalError(format!(
+            "multiple IN subqueries use cursor {cursor_id}"
+        )));
+    }
+    if subquery.correlated
+        || subquery.eval_phase != SubqueryEvalPhase::BeforeLoop
+        || !matches!(
+            &subquery.state,
+            SubqueryState::Unevaluated { plan: Some(_) }
+        )
+        || subquery.get_eval_at(&plan.join_order, Some(&plan.table_references))?
+            != EvalAt::BeforeLoop
+    {
+        return Ok(None);
+    }
+    Ok(Some(DeclarativeInCursor {
+        binding: DeclarativeCursorBinding {
+            input,
+            cursor: cursor_id,
+        },
+        subquery_id: subquery.internal_id,
+    }))
 }
 
 #[derive(Clone, Copy)]
@@ -1075,50 +1152,7 @@ fn try_compile_declarative_table_scan(
         DeclarativeBtreeAccess::InValues {
             source: DeclarativeInSource::Subquery { cursor_id },
             ..
-        } => {
-            let mut matching = plan.non_from_clause_subqueries.iter().filter(|subquery| {
-                matches!(
-                    &subquery.query_type,
-                    SubqueryType::In {
-                        cursor_id: subquery_cursor,
-                        ..
-                    } if *subquery_cursor == cursor_id
-                )
-            });
-            let Some(subquery) = matching.next() else {
-                return Ok(None);
-            };
-            if matching.next().is_some() {
-                return Err(LimboError::InternalError(format!(
-                    "multiple IN subqueries use cursor {cursor_id}"
-                )));
-            }
-            if subquery.correlated
-                || subquery.eval_phase != SubqueryEvalPhase::BeforeLoop
-                || !matches!(
-                    &subquery.state,
-                    SubqueryState::Unevaluated { plan: Some(_) }
-                )
-                || !matches!(
-                    &subquery.query_type,
-                    SubqueryType::In {
-                        cursor_id: subquery_cursor,
-                        ..
-                    } if *subquery_cursor == cursor_id
-                )
-                || subquery.get_eval_at(&plan.join_order, Some(&plan.table_references))?
-                    != EvalAt::BeforeLoop
-            {
-                return Ok(None);
-            }
-            Some(DeclarativeInCursor {
-                binding: DeclarativeCursorBinding {
-                    input: external_input,
-                    cursor: cursor_id,
-                },
-                subquery_id: subquery.internal_id,
-            })
-        }
+        } => resolve_declarative_in_cursor(plan, cursor_id, external_input)?,
         _ => None,
     };
     let direction = access.direction();
@@ -1423,14 +1457,40 @@ fn try_compile_declarative_inner_join(
             index,
             seek_def,
         },
+        Operation::Search(Search::InSeek {
+            index,
+            source: InSeekSource::LiteralList { values, affinity },
+        }) => DeclarativeInnerJoinAccess::InValues {
+            index: index.as_ref(),
+            source: DeclarativeInSource::Literal {
+                values,
+                affinity: *affinity,
+            },
+        },
+        Operation::Search(Search::InSeek {
+            index,
+            source: InSeekSource::Subquery { cursor_id },
+        }) => DeclarativeInnerJoinAccess::InValues {
+            index: index.as_ref(),
+            source: DeclarativeInSource::Subquery {
+                cursor_id: *cursor_id,
+            },
+        },
         _ => return Ok(None),
     };
     let (Table::BTree(outer_table), Table::BTree(inner_table)) = (&outer.table, &inner.table)
     else {
         return Ok(None);
     };
-    let inner_covering_index = match inner_access {
-        DeclarativeInnerJoinAccess::IndexRange { index, .. } => {
+    let inner_index = match inner_access {
+        DeclarativeInnerJoinAccess::IndexRange { index, .. } => Some(index),
+        DeclarativeInnerJoinAccess::InValues { index, .. } => index,
+        DeclarativeInnerJoinAccess::Scan(_)
+        | DeclarativeInnerJoinAccess::Rowid(_)
+        | DeclarativeInnerJoinAccess::TableRange { .. } => None,
+    };
+    let inner_covering_index = match inner_index {
+        Some(index) => {
             if index.ephemeral
                 || index.index_method.is_some()
                 || resolver.with_schema(inner.database_id, |schema| {
@@ -1449,9 +1509,7 @@ fn try_compile_declarative_inner_join(
             }
             inner.utilizes_covering_index().then_some(index)
         }
-        DeclarativeInnerJoinAccess::Scan(_)
-        | DeclarativeInnerJoinAccess::Rowid(_)
-        | DeclarativeInnerJoinAccess::TableRange { .. } => None,
+        None => None,
     };
 
     let mut expr_resolver = RowExprResolver::new(
@@ -1462,6 +1520,51 @@ fn try_compile_declarative_inner_join(
         RowLayout::Table,
         &plan.table_references,
     );
+    let external_input = CursorInputId::new(u32::from(destination_index.is_some()));
+    let external_in_cursor = match inner_access {
+        DeclarativeInnerJoinAccess::InValues {
+            source: DeclarativeInSource::Subquery { cursor_id },
+            ..
+        } => resolve_declarative_in_cursor(plan, cursor_id, external_input)?,
+        _ => None,
+    };
+    let inner_in_values = match inner_access {
+        DeclarativeInnerJoinAccess::InValues {
+            source: DeclarativeInSource::Literal { values, affinity },
+            ..
+        } => {
+            let mut resolved = SmallVec::with_capacity(values.len());
+            for value in values {
+                let Some(value) = expr_resolver.resolve(value)? else {
+                    return Ok(None);
+                };
+                resolved.push(value);
+            }
+            Some(ResolvedInnerInValues::Literal {
+                values: resolved,
+                affinity,
+                collation: inner_index
+                    .and_then(|index| index.columns.first())
+                    .and_then(|column| column.collation),
+            })
+        }
+        DeclarativeInnerJoinAccess::InValues {
+            source: DeclarativeInSource::Subquery { .. },
+            ..
+        } => Some(ResolvedInnerInValues::Cursor {
+            input: external_in_cursor
+                .expect("subquery IN join access must declare its external cursor")
+                .binding
+                .input,
+            collation: inner_index
+                .and_then(|index| index.columns.first())
+                .and_then(|column| column.collation),
+        }),
+        DeclarativeInnerJoinAccess::Scan(_)
+        | DeclarativeInnerJoinAccess::Rowid(_)
+        | DeclarativeInnerJoinAccess::TableRange { .. }
+        | DeclarativeInnerJoinAccess::IndexRange { .. } => None,
+    };
     let inner_rowid = match inner_access {
         DeclarativeInnerJoinAccess::Rowid(expression) => {
             let Some(expression) = expr_resolver.resolve(expression)? else {
@@ -1471,7 +1574,8 @@ fn try_compile_declarative_inner_join(
         }
         DeclarativeInnerJoinAccess::Scan(_)
         | DeclarativeInnerJoinAccess::TableRange { .. }
-        | DeclarativeInnerJoinAccess::IndexRange { .. } => None,
+        | DeclarativeInnerJoinAccess::IndexRange { .. }
+        | DeclarativeInnerJoinAccess::InValues { .. } => None,
     };
     let inner_table_range = match inner_access {
         DeclarativeInnerJoinAccess::TableRange {
@@ -1487,7 +1591,8 @@ fn try_compile_declarative_inner_join(
         }
         DeclarativeInnerJoinAccess::Scan(_)
         | DeclarativeInnerJoinAccess::Rowid(_)
-        | DeclarativeInnerJoinAccess::IndexRange { .. } => None,
+        | DeclarativeInnerJoinAccess::IndexRange { .. }
+        | DeclarativeInnerJoinAccess::InValues { .. } => None,
     };
     let inner_index_range = match inner_access {
         DeclarativeInnerJoinAccess::IndexRange {
@@ -1503,7 +1608,8 @@ fn try_compile_declarative_inner_join(
         }
         DeclarativeInnerJoinAccess::Scan(_)
         | DeclarativeInnerJoinAccess::Rowid(_)
-        | DeclarativeInnerJoinAccess::TableRange { .. } => None,
+        | DeclarativeInnerJoinAccess::TableRange { .. }
+        | DeclarativeInnerJoinAccess::InValues { .. } => None,
     };
     expr_resolver.add_source(
         inner.database_id,
@@ -1520,7 +1626,7 @@ fn try_compile_declarative_inner_join(
     };
     let Some(dependencies) = validate_and_order_declarative_dependencies(
         plan,
-        None,
+        external_in_cursor,
         expr_resolver.into_scalar_inputs(),
     )?
     else {
@@ -1595,6 +1701,45 @@ fn try_compile_declarative_inner_join(
                     let range = range.into_row_deferred(&rows);
                     inner.seek(range).map(move |inner_rows| {
                         inner_rows
+                            .map(move |inner_row| pure(SymbolicRows::pair(outer_row, inner_row)))
+                    })
+                })
+            });
+            body.into_symbolic_compiler(rows, destination, inputs)
+        }
+        DeclarativeInnerJoinAccess::InValues { index: None, .. } => {
+            let values = inner_in_values.expect("IN join access must resolve its value source");
+            let tables =
+                outer_table.then(open_table(inner_table.clone(), database_id, schema_cookie));
+            let rows = tables.map(move |(outer, inner)| {
+                outer.scan(outer_direction).flat_map(move |outer_row| {
+                    let outer_rows = SymbolicRows::single(outer_row);
+                    values.into_deferred(&outer_rows).map(move |values| {
+                        inner
+                            .seek_each(values)
+                            .map(move |inner_row| pure(SymbolicRows::pair(outer_row, inner_row)))
+                    })
+                })
+            });
+            body.into_symbolic_compiler(rows, destination, inputs)
+        }
+        DeclarativeInnerJoinAccess::InValues {
+            index: Some(index), ..
+        } => {
+            let values = inner_in_values.expect("IN join access must resolve its value source");
+            let sources = outer_table.then(open_index(
+                inner_table.clone(),
+                index.clone(),
+                inner_covering_index.is_some(),
+                database_id,
+                schema_cookie,
+            ));
+            let rows = sources.map(move |(outer, inner)| {
+                outer.scan(outer_direction).flat_map(move |outer_row| {
+                    let outer_rows = SymbolicRows::single(outer_row);
+                    values.into_deferred(&outer_rows).map(move |values| {
+                        inner
+                            .seek_each(values)
                             .map(move |inner_row| pure(SymbolicRows::pair(outer_row, inner_row)))
                     })
                 })
@@ -5424,6 +5569,218 @@ mod tests {
                     Value::from_i64(3),
                     Value::from_text("b")
                 ],
+            ]
+        );
+    }
+
+    #[test]
+    fn dependent_in_join_rebuilds_rhs_values_for_each_outer_row() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE in_join_outer(\
+                    id INTEGER PRIMARY KEY, k1 INTEGER, k2 INTEGER, bias INTEGER\
+                )",
+            )
+            .unwrap();
+        connection
+            .execute("CREATE TABLE in_join_inner(id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO in_join_outer VALUES \
+                 (1, 1, 3, 10), (2, 2, 2, 20), (3, NULL, 4, 30)",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO in_join_inner VALUES \
+                 (1, 100), (2, 200), (3, 300), (4, 400), (5, 500)",
+            )
+            .unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT o.id, i.id, o.bias + i.value \
+                   FROM in_join_outer AS o \
+                  CROSS JOIN in_join_inner AS i \
+                  WHERE i.id IN (o.k1, o.k2, o.k1)",
+            )
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::HashDistinct { .. })));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::SorterOpen { .. })));
+        assert!(instructions
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::Once { .. })));
+        let result_row = instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 3, .. }))
+            .expect("dependent IN join must produce a three-value result pack");
+        assert!(instructions[result_row - 3..result_row]
+            .iter()
+            .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })));
+
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(1), Value::from_i64(1), Value::from_i64(110)],
+                vec![Value::from_i64(1), Value::from_i64(3), Value::from_i64(310)],
+                vec![Value::from_i64(2), Value::from_i64(2), Value::from_i64(220)],
+                vec![Value::from_i64(3), Value::from_i64(4), Value::from_i64(430)],
+            ]
+        );
+    }
+
+    #[test]
+    fn dependent_index_in_join_repositions_an_opened_index() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE index_in_outer(\
+                    id INTEGER PRIMARY KEY, k1 TEXT, k2 TEXT, bias INTEGER\
+                )",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "CREATE TABLE index_in_inner(\
+                    id INTEGER PRIMARY KEY, key TEXT, value INTEGER\
+                )",
+            )
+            .unwrap();
+        connection
+            .execute("CREATE INDEX index_in_inner_key ON index_in_inner(key)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO index_in_outer VALUES \
+                 (1, 'a', 'c', 10), (2, 'b', 'b', 20), (3, NULL, 'd', 30)",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO index_in_inner VALUES \
+                 (1, 'a', 100), (2, 'a', 101), (3, 'b', 200), \
+                 (4, 'c', 300), (5, 'd', 400), (6, 'z', 500)",
+            )
+            .unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT o.id, i.id, o.bias + i.value \
+                   FROM index_in_outer AS o \
+                  CROSS JOIN index_in_inner AS i \
+                  WHERE i.key IN (o.k1, o.k2, o.k1)",
+            )
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+        assert!(instructions.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::SeekGE {
+                is_index: true,
+                num_regs: 1,
+                ..
+            }
+        )));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::IdxGT { num_regs: 1, .. })));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::DeferredSeek { .. })));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::HashDistinct { .. })));
+        assert!(instructions
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::Once { .. })));
+
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(1), Value::from_i64(1), Value::from_i64(110)],
+                vec![Value::from_i64(1), Value::from_i64(2), Value::from_i64(111)],
+                vec![Value::from_i64(1), Value::from_i64(4), Value::from_i64(310)],
+                vec![Value::from_i64(2), Value::from_i64(3), Value::from_i64(220)],
+                vec![Value::from_i64(3), Value::from_i64(5), Value::from_i64(430)],
+            ]
+        );
+    }
+
+    #[test]
+    fn in_subquery_join_composes_one_producer_with_repeated_inner_seeks() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute("CREATE TABLE subquery_in_outer(id INTEGER PRIMARY KEY, bias INTEGER)")
+            .unwrap();
+        connection
+            .execute("CREATE TABLE subquery_in_inner(id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+        connection
+            .execute("CREATE TABLE subquery_in_keys(key)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO subquery_in_outer VALUES (1, 10), (2, 20)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO subquery_in_inner VALUES \
+                 (1, 100), (2, 200), (3, 300), (4, 400)",
+            )
+            .unwrap();
+        connection
+            .execute("INSERT INTO subquery_in_keys VALUES (3), (1), (3), (NULL)")
+            .unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT o.id, i.id, o.bias + i.value \
+                   FROM subquery_in_outer AS o \
+                  CROSS JOIN subquery_in_inner AS i \
+                  WHERE i.id IN (SELECT key FROM subquery_in_keys)",
+            )
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+        assert!(instructions.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::OpenEphemeral {
+                is_table: false,
+                ..
+            }
+        )));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::HashDistinct { .. })));
+        assert!(instructions.iter().all(|(instruction, _)| !matches!(
+            instruction,
+            Insn::SorterOpen { .. } | Insn::Once { .. }
+        )));
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::SeekRowid { .. }))
+                .count(),
+            1
+        );
+
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(1), Value::from_i64(1), Value::from_i64(110)],
+                vec![Value::from_i64(1), Value::from_i64(3), Value::from_i64(310)],
+                vec![Value::from_i64(2), Value::from_i64(1), Value::from_i64(120)],
+                vec![Value::from_i64(2), Value::from_i64(3), Value::from_i64(320)],
             ]
         );
     }

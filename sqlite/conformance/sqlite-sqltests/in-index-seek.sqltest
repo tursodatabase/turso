@@ -166,6 +166,45 @@ expect {
     5|five
 }
 
+# An IN seek on an inner join input must rebuild row-dependent RHS values for
+# every outer row rather than caching the first row's keys.
+setup dependent_join_in {
+    CREATE TABLE in_outer (
+        id INTEGER PRIMARY KEY,
+        k1 INTEGER,
+        k2 INTEGER,
+        bias INTEGER
+    );
+    CREATE TABLE in_inner (
+        id INTEGER PRIMARY KEY,
+        value INTEGER
+    );
+    INSERT INTO in_outer VALUES
+        (1, 1, 3, 10),
+        (2, 2, 2, 20),
+        (3, NULL, 4, 30);
+    INSERT INTO in_inner VALUES
+        (1, 100),
+        (2, 200),
+        (3, 300),
+        (4, 400),
+        (5, 500);
+}
+
+@setup dependent_join_in
+test dependent-join-in-values {
+    SELECT o.id, i.id, o.bias + i.value
+    FROM in_outer AS o
+    CROSS JOIN in_inner AS i
+    WHERE i.id IN (o.k1, o.k2, o.k1);
+}
+expect {
+    1|1|110
+    1|3|310
+    2|2|220
+    3|4|430
+}
+
 # Composite index - IN on first column
 setup composite {
     CREATE TABLE t2 (

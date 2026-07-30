@@ -2924,6 +2924,14 @@ impl SorterPhase {
     const fn mask(self) -> u8 {
         1 << self as u8
     }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Unopened => "Unopened",
+            Self::Filling => "Filling",
+            Self::Reading => "Reading",
+        }
+    }
 }
 
 /// A verified SSA control-flow region.
@@ -3305,10 +3313,11 @@ impl IrProgram {
             for instruction in &block.instructions {
                 match instruction {
                     Instruction::Effect(EffectOp::OpenSorter { sorter }) => {
-                        Self::require_sorter_phase(
+                        Self::require_sorter_phases(
                             &phases,
                             *sorter,
-                            SorterPhase::Unopened,
+                            SorterPhase::Unopened.mask() | SorterPhase::Reading.mask(),
+                            "Unopened or Reading",
                             "open",
                         )?;
                         phases[sorter.index()] = SorterPhase::Filling.mask();
@@ -3391,8 +3400,18 @@ impl IrProgram {
         expected: SorterPhase,
         operation: &str,
     ) -> Result<()> {
+        Self::require_sorter_phases(phases, sorter, expected.mask(), expected.name(), operation)
+    }
+
+    fn require_sorter_phases(
+        phases: &[u8],
+        sorter: SorterId,
+        expected: u8,
+        expected_description: &str,
+        operation: &str,
+    ) -> Result<()> {
         let actual = phases[sorter.index()];
-        if actual != expected.mask() {
+        if actual & !expected != 0 {
             let mut names = SmallVec::<[&str; 3]>::new();
             for phase in [
                 SorterPhase::Unopened,
@@ -3400,15 +3419,11 @@ impl IrProgram {
                 SorterPhase::Reading,
             ] {
                 if actual & phase.mask() != 0 {
-                    names.push(match phase {
-                        SorterPhase::Unopened => "Unopened",
-                        SorterPhase::Filling => "Filling",
-                        SorterPhase::Reading => "Reading",
-                    });
+                    names.push(phase.name());
                 }
             }
             return Err(LimboError::InternalError(format!(
-                "compiler IR cannot {operation} sorter {sorter:?} in phase {}; expected {expected:?}",
+                "compiler IR cannot {operation} sorter {sorter:?} in phase {}; expected {expected_description}",
                 names.join("|")
             )));
         }
@@ -9379,6 +9394,48 @@ mod tests {
         assert!(error
             .to_string()
             .contains("cannot read sorter SorterId(0) in phase Filling"));
+    }
+
+    #[test]
+    fn verifier_rejects_reopening_a_sorter_while_it_is_filling() {
+        let mut builder = IrBuilder::new();
+        let sorter = builder
+            .allocate_sorter(smallvec![SortKey::new(SortOrder::Asc, None, None, None)], 1)
+            .unwrap();
+        let condition = builder
+            .push(ScalarOp::Constant(Value::from_i64(1)))
+            .unwrap();
+        let completion = builder.push(ScalarOp::Constant(Value::Null)).unwrap();
+        let header = builder.create_block().unwrap();
+        let exit = builder.create_block().unwrap();
+        builder
+            .terminate(Terminator::Jump {
+                target: header,
+                arguments: SmallVec::new(),
+            })
+            .unwrap();
+
+        builder.switch_to(header).unwrap();
+        builder
+            .push_effect(EffectOp::OpenSorter { sorter })
+            .unwrap();
+        builder
+            .terminate(Terminator::Branch {
+                condition,
+                if_true: header,
+                if_false: exit,
+            })
+            .unwrap();
+
+        builder.switch_to(exit).unwrap();
+        let error = builder.finish(completion).unwrap_err();
+
+        assert!(
+            error.to_string().contains(
+                "cannot open sorter SorterId(0) in phase Unopened|Filling; expected Unopened or Reading"
+            ),
+            "{error}"
+        );
     }
 
     #[test]
