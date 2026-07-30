@@ -307,9 +307,9 @@ pub(crate) fn emit_returning_results<'a>(
             let record_reg = program.alloc_register();
             let eph_rowid_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
-                start_reg: crate::vdbe::insn::to_u16(result_start_reg),
-                count: crate::vdbe::insn::to_u16(result_columns.len()),
-                dest_reg: crate::vdbe::insn::to_u16(record_reg),
+                start_reg: crate::vdbe::insn::to_u32(result_start_reg),
+                count: crate::vdbe::insn::to_u32(result_columns.len()),
+                dest_reg: crate::vdbe::insn::to_u32(record_reg),
                 index_name: None,
                 affinity_str: None,
             });

@@ -33,7 +33,7 @@ use crate::translate::plan::ColumnMask;
 use crate::vdbe::{
     affinity::Affinity,
     builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
-    insn::{to_u16, InsertFlags, Insn},
+    insn::{to_u32, InsertFlags, Insn},
     BranchOffset, CursorID,
 };
 use crate::{
@@ -1068,8 +1068,12 @@ pub fn emit_program(
         Plan::Select(plan) => emit_program_for_select(program, resolver, *plan),
         Plan::Delete(plan) => emit_program_for_delete(connection, resolver, program, *plan),
         Plan::Update(plan) => emit_program_for_update(connection, resolver, program, *plan, after),
-        Plan::CompoundSelect { .. } => {
-            emit_program_for_compound_select(program, resolver, plan).map(|_| ())
+        mut plan @ Plan::CompoundSelect { .. } => {
+            emit_program_for_compound_select(program, resolver, &mut plan).map(|_| ())
+        }
+        Plan::RecursiveCte(mut recursive_cte) => {
+            super::recursive_cte::emit_recursive_cte(program, resolver, &mut recursive_cte)
+                .map(|_| ())
         }
     }
 }
@@ -1140,9 +1144,9 @@ pub fn emit_cdc_patch_record(
             .collect::<String>();
 
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(columns_reg),
-            count: to_u16(storable_count),
-            dest_reg: to_u16(record_reg),
+            start_reg: to_u32(columns_reg),
+            count: to_u32(storable_count),
+            dest_reg: to_u32(record_reg),
             index_name: None,
             affinity_str: Some(affinity_str),
         });
@@ -1171,9 +1175,9 @@ pub(super) fn emit_make_record<'a>(
         .collect();
 
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(start_reg),
-        count: to_u16(storable_count),
-        dest_reg: to_u16(dest_reg),
+        start_reg: to_u32(start_reg),
+        count: to_u32(storable_count),
+        dest_reg: to_u32(dest_reg),
         index_name: None,
         affinity_str: Some(affinity_str),
     });
@@ -1211,9 +1215,9 @@ pub fn emit_cdc_full_record(
         .collect::<String>();
 
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(columns_reg + 1),
-        count: to_u16(storable_count),
-        dest_reg: to_u16(columns_reg),
+        start_reg: to_u32(columns_reg + 1),
+        count: to_u32(storable_count),
+        dest_reg: to_u32(columns_reg),
         index_name: None,
         affinity_str: Some(affinity_str),
     });
@@ -1406,9 +1410,9 @@ fn emit_cdc_insns_v1(
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(turso_cdc_registers),
-        count: to_u16(8),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(turso_cdc_registers),
+        count: to_u32(8),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
     });
@@ -1533,9 +1537,9 @@ fn emit_cdc_insns_v2(
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(turso_cdc_registers),
-        count: to_u16(9),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(turso_cdc_registers),
+        count: to_u32(9),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
     });
@@ -1614,9 +1618,9 @@ pub fn emit_cdc_commit_insns(
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(regs),
-        count: to_u16(9),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(regs),
+        count: to_u32(9),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
     });

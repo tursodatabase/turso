@@ -28,11 +28,12 @@ use memory_benchmark::workload::{
 
 const MODES: [JournalMode; 2] = [JournalMode::Wal, JournalMode::Mvcc];
 
-const WORKLOADS: [WorkloadProfile; 6] = [
+const WORKLOADS: [WorkloadProfile; 7] = [
     WorkloadProfile::InsertHeavy,
     WorkloadProfile::ReadHeavy,
     WorkloadProfile::Mixed,
     WorkloadProfile::ScanHeavy,
+    WorkloadProfile::RecursiveCte,
     WorkloadProfile::SeriesBlob,
     WorkloadProfile::UpdateChurn,
 ];
@@ -59,6 +60,7 @@ const MVCC_CHECKPOINT_THRESHOLD_BYTES: i64 = 16 * 1024;
 fn base_workload_size(workload: WorkloadProfile) -> (usize, usize) {
     match workload {
         WorkloadProfile::ScanHeavy => (5, 2),
+        WorkloadProfile::RecursiveCte => (2, 100),
         _ => (10, 50),
     }
 }

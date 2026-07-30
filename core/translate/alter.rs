@@ -28,7 +28,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorType, DmlColumnContext, ProgramBuilder},
-        insn::{to_u16, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
+        insn::{to_u32, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
     LimboError, Numeric, Result, Value, ValueRef,
@@ -243,9 +243,9 @@ fn emit_rename_autoincrement_backing_table_entry(
 
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(rec_start),
-            count: to_u16(5),
-            dest_reg: to_u16(record_reg),
+            start_reg: to_u32(rec_start),
+            count: to_u32(5),
+            dest_reg: to_u32(record_reg),
             index_name: None,
             affinity_str: None,
         });
@@ -336,9 +336,9 @@ fn emit_rename_sqlite_sequence_entry(
             extra_amount: 0,
         });
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(record_start_reg),
-            count: to_u16(2),
-            dest_reg: to_u16(record_reg),
+            start_reg: to_u32(record_start_reg),
+            count: to_u32(2),
+            dest_reg: to_u32(record_reg),
             index_name: None,
             affinity_str: Some(affinity_str.clone()),
         });
@@ -1647,9 +1647,9 @@ pub fn translate_alter_table(
                 let record = program.alloc_register();
 
                 program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u16(out),
-                    count: to_u16(sqlite_schema_column_len),
-                    dest_reg: to_u16(record),
+                    start_reg: to_u32(out),
+                    count: to_u32(sqlite_schema_column_len),
+                    dest_reg: to_u32(record),
                     index_name: None,
                     affinity_str: None,
                 });
@@ -2093,9 +2093,9 @@ pub fn translate_alter_table(
                 let record = program.alloc_register();
 
                 program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u16(out),
-                    count: to_u16(sqlite_schema_column_len),
-                    dest_reg: to_u16(record),
+                    start_reg: to_u32(out),
+                    count: to_u32(sqlite_schema_column_len),
+                    dest_reg: to_u32(record),
                     index_name: None,
                     affinity_str: None,
                 });
@@ -2322,9 +2322,9 @@ fn emit_rewrite_table_rows(
 
         let record = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(base_dest_reg),
-            count: to_u16(non_virtual_column_count),
-            dest_reg: to_u16(record),
+            start_reg: to_u32(base_dest_reg),
+            count: to_u32(non_virtual_column_count),
+            dest_reg: to_u32(record),
             index_name: None,
             affinity_str: Some(affinity_str.clone()),
         });
@@ -2421,9 +2421,9 @@ fn translate_rename_virtual_table(
 
         let rec = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(out),
-            count: to_u16(ncols),
-            dest_reg: to_u16(rec),
+            start_reg: to_u32(out),
+            count: to_u32(ncols),
+            dest_reg: to_u32(rec),
             index_name: None,
             affinity_str: None,
         });

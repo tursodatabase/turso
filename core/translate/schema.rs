@@ -26,7 +26,7 @@ use crate::util::{
 };
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
-    to_u16, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
+    to_u32, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
 };
 use crate::{bail_parse_error, turso_assert, turso_assert_eq, CaptureDataChangesExt, Result};
 use crate::{Connection, MAIN_DB_ID};
@@ -1062,9 +1062,9 @@ fn emit_ctas_insert(
     })?;
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(result_start_reg),
-        count: to_u16(col_count),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(result_start_reg),
+        count: to_u32(col_count),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
     });
@@ -1541,9 +1541,9 @@ pub fn emit_schema_entry(
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(type_reg),
-        count: to_u16(5),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(type_reg),
+        count: to_u32(5),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
     });
@@ -1720,9 +1720,9 @@ pub fn translate_create_virtual_table(
 
         // VCreate expects an array of args as a record
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(args_start),
-            count: to_u16(args_vec.len()),
-            dest_reg: to_u16(args_record_reg),
+            start_reg: to_u32(args_start),
+            count: to_u32(args_vec.len()),
+            dest_reg: to_u32(args_record_reg),
             index_name: None,
             affinity_str: None,
         });
@@ -2092,6 +2092,7 @@ pub fn translate_drop_table(
             });
         }
         Table::FromClauseSubquery(..) => panic!("FromClauseSubquery can't be dropped"),
+        Table::RecursiveCteInput(..) => panic!("recursive CTE inputs cannot be dropped"),
     };
 
     let schema_data_register = program.alloc_register();
@@ -2230,9 +2231,9 @@ pub fn translate_drop_table(
         });
         program.emit_column_or_rowid(sqlite_schema_cursor_id_1, 4, schema_column_4_register);
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(schema_column_0_register),
-            count: to_u16(5),
-            dest_reg: to_u16(new_record_register),
+            start_reg: to_u32(schema_column_0_register),
+            count: to_u32(5),
+            dest_reg: to_u32(new_record_register),
             index_name: None,
             affinity_str: None,
         });
@@ -2585,9 +2586,9 @@ fn persist_type_definition(
     program.emit_string8_new_reg(sql.clone());
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(name_reg),
-        count: to_u16(2),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(name_reg),
+        count: to_u32(2),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
     });

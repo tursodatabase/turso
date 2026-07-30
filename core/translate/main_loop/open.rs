@@ -236,6 +236,9 @@ impl OpenLoop {
                                 }
                             }
                         }
+                        (Scan::RecursiveCteInput, Table::RecursiveCteInput(_)) => {
+                            program.preassign_label_to_next_insn(loop_start);
+                        }
                         _ => unreachable!(
                             "{:?} scan cannot be used with {:?} table",
                             scan, table.table

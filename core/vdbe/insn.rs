@@ -1,10 +1,12 @@
 use std::num::{NonZero, NonZeroUsize};
 
-/// Convert a usize to u16 for instruction fields (registers, counts).
-/// Panics if the value exceeds u16::MAX.
+/// Convert a usize to u32 for instruction fields (registers, counts).
+/// Panics if the value exceeds u32::MAX, which would require an impossible
+/// four-billion-register program; u16 was too small for real queries (e.g. a
+/// handful of CTEs at the 2000-column limit already exceed 65535 registers).
 #[inline]
-pub fn to_u16(v: usize) -> u16 {
-    v.try_into().expect("value exceeds u16::MAX")
+pub fn to_u32(v: usize) -> u32 {
+    v.try_into().expect("value exceeds u32::MAX")
 }
 
 use super::{execute, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
@@ -803,9 +805,9 @@ pub enum Insn {
 
     // Make a record and write it to destination register.
     MakeRecord {
-        start_reg: u16, // P1
-        count: u16,     // P2
-        dest_reg: u16,  // P3
+        start_reg: u32, // P1
+        count: u32,     // P2
+        dest_reg: u32,  // P3
         index_name: Option<String>,
         affinity_str: Option<String>,
     },
@@ -1000,7 +1002,7 @@ pub enum Insn {
         cursor_id: CursorID,
         record_reg: usize, // P2 the register containing the record to insert
         unpacked_start: Option<usize>, // P3 the index of the first register for the unpacked key
-        unpacked_count: Option<u16>, // P4 # of unpacked values in the key in P2
+        unpacked_count: Option<u32>, // P4 # of unpacked values in the key in P2
         flags: IdxInsertFlags, // TODO: optimization
     },
 
@@ -1853,21 +1855,21 @@ pub enum Insn {
     /// payload_dest_reg..payload_dest_reg+num_payload-1.
     /// If no matches, jump to target_pc.
     HashProbe {
-        hash_table_id: u16,
-        key_start_reg: u16,
-        num_keys: u16,
-        dest_reg: u16,
+        hash_table_id: u32,
+        key_start_reg: u32,
+        num_keys: u32,
+        dest_reg: u32,
         target_pc: BranchOffset,
         /// Starting register to write payload columns from hash entry.
-        payload_dest_reg: Option<u16>,
+        payload_dest_reg: Option<u32>,
         /// Number of payload columns expected
-        num_payload: u16,
+        num_payload: u32,
         /// Register containing probe-side rowid for grace hash join buffering.
         /// When Some and target partition is on disk, buffer the probe row
         /// instead of loading the partition on demand.
         /// When None, this instruction is running inside grace processing and
         /// the build partition must already be loaded.
-        probe_rowid_reg: Option<u16>,
+        probe_rowid_reg: Option<u32>,
     },
 
     /// Advance to next matching row in hash table bucket.
@@ -1933,14 +1935,14 @@ pub enum Insn {
     /// Finalizes probe-side spills and calls grace_begin.
     /// Jumps to target_pc if no spilling occurred or no partitions to process.
     HashGraceInit {
-        hash_table_id: u16,
+        hash_table_id: u32,
         target_pc: BranchOffset,
     },
 
     /// Load the current grace partition's build side from disk.
     /// Also loads the first probe chunk. Jumps to target_pc when all partitions done.
     HashGraceLoadPartition {
-        hash_table_id: u16,
+        hash_table_id: u32,
         target_pc: BranchOffset,
     },
 
@@ -1948,17 +1950,17 @@ pub enum Insn {
     /// Writes probe keys to key_start_reg..key_start_reg+num_keys-1 and probe rowid to probe_rowid_dest.
     /// Jumps to target_pc when probe entries exhausted.
     HashGraceNextProbe {
-        hash_table_id: u16,
-        key_start_reg: u16,
-        num_keys: u16,
-        probe_rowid_dest: u16,
+        hash_table_id: u32,
+        key_start_reg: u32,
+        num_keys: u32,
+        probe_rowid_dest: u32,
         target_pc: BranchOffset,
     },
 
     /// Evict current grace partition and advance to the next one.
     /// Jumps to target_pc when all partitions are processed.
     HashGraceAdvancePartition {
-        hash_table_id: u16,
+        hash_table_id: u32,
         target_pc: BranchOffset,
     },
 
@@ -2342,5 +2344,17 @@ mod tests {
                 variant, *variant as usize
             );
         }
+    }
+
+    #[test]
+    fn test_insn_size_does_not_grow() {
+        // Interpreter dispatch is sensitive to instruction size. Widening a
+        // variant past the current largest one silently degrades every query;
+        // grow this bound only deliberately.
+        assert!(
+            std::mem::size_of::<super::Insn>() <= 96,
+            "Insn grew to {} bytes",
+            std::mem::size_of::<super::Insn>()
+        );
     }
 }

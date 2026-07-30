@@ -3426,6 +3426,20 @@ impl PostgreSQLTranslator {
 
             let tbl_name = ast::Name::from_string(&cte.ctename);
 
+            // PostgreSQL evaluates SEARCH/CYCLE by adding computed columns to
+            // the recursion; silently dropping them would change results (and
+            // a CYCLE clause is often what makes the query terminate at all).
+            if cte.search_clause.is_some() {
+                return Err(ParseError::ParseError(
+                    "SEARCH clause on a common table expression is not supported".into(),
+                ));
+            }
+            if cte.cycle_clause.is_some() {
+                return Err(ParseError::ParseError(
+                    "CYCLE clause on a common table expression is not supported".into(),
+                ));
+            }
+
             // Translate column aliases if specified
             let columns: Vec<ast::IndexedColumn> = cte
                 .aliascolnames
@@ -7069,5 +7083,35 @@ mod tests {
             }
             other => panic!("Expected CreateSequence, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_recursive_cte_cycle_clause_rejected() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "WITH RECURSIVE walk(dst) AS (
+            SELECT 1 UNION ALL SELECT w.dst + 1 FROM walk w WHERE w.dst < 3
+        ) CYCLE dst SET is_cycle USING path
+        SELECT * FROM walk";
+        let parse_result = crate::parse(sql).unwrap();
+        let err = translator.translate(&parse_result).unwrap_err();
+        assert!(
+            err.to_string().contains("CYCLE clause"),
+            "expected CYCLE clause rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_recursive_cte_search_clause_rejected() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "WITH RECURSIVE walk(dst) AS (
+            SELECT 1 UNION ALL SELECT w.dst + 1 FROM walk w WHERE w.dst < 3
+        ) SEARCH DEPTH FIRST BY dst SET ordercol
+        SELECT * FROM walk";
+        let parse_result = crate::parse(sql).unwrap();
+        let err = translator.translate(&parse_result).unwrap_err();
+        assert!(
+            err.to_string().contains("SEARCH clause"),
+            "expected SEARCH clause rejection, got: {err}"
+        );
     }
 }

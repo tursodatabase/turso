@@ -179,7 +179,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Non-decimal integer literals | ✅ Supported | `0x`, `0o`, `0b` |
 | ORDER BY NULLS FIRST/LAST | ✅ Supported | Honored in SELECT, window, and compound SELECT ORDER BY; rejected (matching SQLite) in CREATE INDEX |
 | range_agg range type aggregation function | ❌ Not supported | |
-| Recursive queries | ❌ Not supported | WITH RECURSIVE translates but the engine rejects it ("Recursive CTEs are not yet supported") |
+| Recursive queries | 🟡 Partial | WITH RECURSIVE works with SQLite semantics (row-at-a-time recursive term, so e.g. DISTINCT in the recursive term over a multi-row anchor can differ from PG); SEARCH/CYCLE clauses are rejected |
 | regexp_count, regexp_instr, regexp_like | ❌ Not supported | Regex *operators* (`~`, `~*`, SIMILAR TO) work |
 | Return OLD and NEW values from modified rows | ❌ Not supported | |
 | Row-wise comparison | ❌ Not supported | Row constructors `(a,b) < (c,d)` fail to translate |
@@ -194,7 +194,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Window functions | 🟡 Partial | Aggregate window functions (COUNT/SUM/AVG/MIN/MAX OVER), row_number, PARTITION BY/ORDER BY, frame clauses, and named WINDOW clauses work; rank, dense_rank, lag, lead, etc. are not implemented |
 | WITHIN GROUP clause | ❌ Not supported | Silently dropped; ordered-set aggregates (percentile_cont) missing |
 | WITH ORDINALITY clause | ❌ Not supported | |
-| WITH queries (Common Table Expressions) | ✅ Supported | Non-recursive only; MATERIALIZED hints accepted |
+| WITH queries (Common Table Expressions) | ✅ Supported | Including WITH RECURSIVE; MATERIALIZED hints accepted |
 | Writable WITH queries (Common Table Expressions) | ❌ Not supported | "CTE query is not a SELECT statement" |
 
 ## Data Definition Language (DDL)
