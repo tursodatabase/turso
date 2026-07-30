@@ -2354,6 +2354,163 @@ pub fn plan_bound_subquery(
     )
 }
 
+/// Plan a recursive CTE from its pre-bound arms ([super::bind::RecursiveCteBinding]).
+///
+/// The binder resolved all names, including the self-reference: every
+/// recursive arm's reference to the CTE was bound to `binding.input_id`.
+/// Making that id resolve to the recursive input table only requires seeding
+/// the arms' planned-CTE map with the input table under the CTE's own name.
+/// Compound-operator validation, ORDER BY (queue order), and LIMIT still read
+/// the raw body in `select`, mirroring [prepare_recursive_cte_plan].
+#[allow(clippy::too_many_arguments)]
+fn prepare_bound_recursive_cte_plan(
+    name: &str,
+    select: &Select,
+    binding: super::bind::RecursiveCteBinding,
+    explicit_columns: &[String],
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+    outer_query_refs: &[OuterQueryReference],
+    inherited_ctes: &rustc_hash::FxHashMap<String, JoinedTable>,
+) -> Result<Plan> {
+    let first_recursive_query_index = binding.first_recursive_arm_index;
+
+    let recursive_compound_operator =
+        select.body.compounds[first_recursive_query_index - 1].operator;
+    let union_all = match recursive_compound_operator {
+        ast::CompoundOperator::UnionAll => true,
+        ast::CompoundOperator::Union => false,
+        ast::CompoundOperator::Except | ast::CompoundOperator::Intersect => {
+            crate::bail_parse_error!(
+                "recursive CTEs must use UNION ALL or UNION between the initial and recursive queries"
+            );
+        }
+    };
+    for compound in select
+        .body
+        .compounds
+        .iter()
+        .skip(first_recursive_query_index)
+    {
+        if compound.operator != recursive_compound_operator {
+            crate::bail_parse_error!("recursive CTE queries must use the same UNION operator");
+        }
+    }
+
+    let initial_query = plan_bound_subquery(
+        binding.initial,
+        resolver,
+        program,
+        connection,
+        outer_query_refs.to_vec(),
+        inherited_ctes,
+        QueryDestination::placeholder_for_subquery(),
+    )?;
+
+    let explicit_columns = (!explicit_columns.is_empty()).then_some(explicit_columns);
+    if let Some(columns) = explicit_columns {
+        let result_column_count = initial_query.select_result_columns().len();
+        if columns.len() != result_column_count {
+            crate::bail_parse_error!(
+                "table {} has {} values for {} columns",
+                name,
+                result_column_count,
+                columns.len()
+            );
+        }
+    }
+
+    let input_table = JoinedTable::new_recursive_cte_input(
+        name.to_string(),
+        &initial_query,
+        binding.input_id,
+        explicit_columns,
+    )?;
+    let input_table_id = input_table.internal_id;
+
+    // The self-reference in each arm is a scope table with
+    // ScopeTableSource::Cte under the CTE's own name; seeding the planned map
+    // with the input table makes scope conversion find it. All arms share
+    // input_table_id, so they all read the same recursive input cursor.
+    let mut arm_ctes = inherited_ctes.clone();
+    arm_ctes.insert(name.to_string(), input_table);
+
+    let mut arm_plans = Vec::with_capacity(binding.recursive_arms.len());
+    for arm in binding.recursive_arms {
+        let arm_plan = plan_bound_subquery(
+            arm,
+            resolver,
+            program,
+            connection,
+            outer_query_refs.to_vec(),
+            &arm_ctes,
+            QueryDestination::placeholder_for_subquery(),
+        )?;
+        let Plan::Select(arm_plan) = arm_plan else {
+            unreachable!("a single-arm SELECT plans to Plan::Select");
+        };
+        arm_plans.push(arm_plan);
+    }
+
+    let last_arm = arm_plans.pop().expect("at least one recursive arm");
+    for arm_plan in &arm_plans {
+        if arm_plan.result_columns.len() != last_arm.result_columns.len() {
+            crate::bail_parse_error!(
+                "SELECTs to the left and right of {} do not have the same number of result columns",
+                ast::CompoundOperator::UnionAll
+            );
+        }
+    }
+    let recursive_query = if arm_plans.is_empty() {
+        Plan::Select(last_arm)
+    } else {
+        Plan::CompoundSelect {
+            left: arm_plans
+                .into_iter()
+                .map(|plan| (*plan, ast::CompoundOperator::UnionAll))
+                .collect(),
+            right_most: last_arm,
+            limit: None,
+            offset: None,
+            order_by: None,
+        }
+    };
+
+    if initial_query.select_result_columns().len() != recursive_query.select_result_columns().len()
+    {
+        crate::bail_parse_error!(
+            "SELECTs to the left and right of {} do not have the same number of result columns",
+            recursive_compound_operator
+        );
+    }
+    reject_aggregates_and_windows_in_recursive_query(&recursive_query)?;
+
+    let queue_order = super::select::resolve_recursive_cte_queue_order(
+        &select.order_by,
+        &initial_query,
+        &recursive_query,
+    )?;
+    let (limit, offset) = select
+        .limit
+        .clone()
+        .map_or(Ok((None, None)), |limit| parse_limit(limit, resolver))?;
+
+    Ok(Plan::RecursiveCte(Box::new(
+        super::plan::RecursiveCtePlan {
+            name: name.to_string(),
+            initial_query: Box::new(initial_query),
+            recursive_query: Box::new(recursive_query),
+            input_table_id,
+            union_all,
+            limit,
+            offset,
+            queue_order,
+            query_destination: QueryDestination::placeholder_for_subquery(),
+        },
+    )))
+}
+
 /// Plan a single CTE using its pre-bound data from the binder.
 ///
 /// The binder already resolved all names and column references in the CTE body.
@@ -2400,56 +2557,31 @@ fn plan_one_bound_cte(
     }
 
     if cte_definitions[cte_idx].1.recursive {
-        // Recursive CTE bodies are not pre-bound: the recursive planner
-        // resolves them itself (the self-reference resolves against the
-        // recursive-table input, which only exists during that planning).
-        let entry = &cte_definitions[cte_idx].1;
-        let cte_definition = CteDefinition {
-            cte_id: entry.cte_id,
-            name: name.clone(),
-            select: entry.select.clone(),
-            explicit_columns: entry.explicit_columns.clone(),
-            referenced_cte_indices: entry.referenced_cte_indices.clone(),
-            materialize_hint: entry.materialize_hint,
-            references_itself: true,
-        };
-        // Already-planned sibling CTEs resolve through definition-only outer
-        // refs, mirroring plan_cte's sibling handling on the raw path.
-        let mut planning_outer_refs = Vec::with_capacity(planned.len() + outer_query_refs.len());
-        for (ref_name, ref_table) in planned.iter() {
-            let mut outer_ref = OuterQueryReference::cte_definition_only(
-                ref_name.clone(),
-                ref_table.internal_id,
-                ref_table.table.clone(),
-            );
-            outer_ref.using_dedup_hidden_cols = ref_table.using_dedup_hidden_cols()?;
-            outer_ref.cte_id = cte_definitions
-                .iter()
-                .find(|(n, _)| n == ref_name)
-                .map(|(_, e)| e.cte_id);
-            planning_outer_refs.push(outer_ref);
-        }
-        // Correlation refs from the enclosing scope (e.g. a recursive CTE in
-        // a correlated expression subquery referencing an outer table).
-        for oqr in outer_query_refs {
-            if planning_outer_refs
-                .iter()
-                .all(|r| r.identifier != oqr.identifier)
-            {
-                planning_outer_refs.push(oqr.clone());
-            }
-        }
-        let plan = prepare_recursive_cte_plan(
-            &cte_definition,
+        let entry = &mut cte_definitions[cte_idx].1;
+        let binding = entry
+            .recursive_binding
+            .take()
+            .expect("recursive CTE binding should be present");
+        let select = entry.select.clone();
+        let explicit_columns = entry.explicit_columns.clone();
+        let cte_id = entry.cte_id;
+        let materialize_hint = entry.materialize_hint;
+
+        let plan = prepare_bound_recursive_cte_plan(
+            &name,
+            &select,
+            binding,
+            &explicit_columns,
             resolver,
             program,
-            &planning_outer_refs,
             connection,
+            outer_query_refs,
+            planned,
         )?;
-        let explicit_cols = if cte_definition.explicit_columns.is_empty() {
+        let explicit_cols = if explicit_columns.is_empty() {
             None
         } else {
-            Some(cte_definition.explicit_columns.as_slice())
+            Some(explicit_columns.as_slice())
         };
         let cte_table = JoinedTable::new_subquery_from_plan(
             name.clone(),
@@ -2457,8 +2589,8 @@ fn plan_one_bound_cte(
             None,
             program.table_reference_counter.next(),
             explicit_cols,
-            Some(cte_definition.cte_id),
-            cte_definition.materialize_hint,
+            Some(cte_id),
+            materialize_hint,
         )?;
         planned.insert(name, cte_table);
         return Ok(());

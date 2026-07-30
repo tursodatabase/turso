@@ -370,6 +370,39 @@ pub struct BoundSubquery {
     pub inner_bound: BoundSelect,
 }
 
+/// Bound arms of a recursive CTE body, produced at bind time and consumed by
+/// the recursive-CTE planner.
+pub struct RecursiveCteBinding {
+    /// The initial (non-recursive) arms as one bound SELECT, including the
+    /// body-level WITH clause. SQLite takes the CTE's column names and arity
+    /// from the left-most arm, which cannot reference the recursive table.
+    pub initial: BoundSubquery,
+    /// Each recursive arm bound as its own single-arm SELECT. The body-level
+    /// WITH clause is cloned into each arm, matching the per-arm nested CTE
+    /// planning of compound SELECTs on the raw path.
+    pub recursive_arms: Vec<BoundSubquery>,
+    /// Index of the first recursive arm (arm 0 is the body's first SELECT),
+    /// as returned by `validate_recursive_cte_structure`.
+    pub first_recursive_arm_index: usize,
+    /// The table id every self-reference in the recursive arms was bound to.
+    /// All recursive arms read the same recursive input table, so the planner
+    /// creates that table with this id.
+    pub input_id: ast::TableInternalId,
+}
+
+/// Set while a recursive CTE's recursive arms are being bound: the CTE's own
+/// name resolves to the recursive input table instead of raising a circular
+/// reference.
+struct RecursiveSelfRef {
+    /// Identity of the CTE being bound (a shadowing nested CTE with the same
+    /// name has a different id and resolves normally).
+    cte_id: usize,
+    /// Shared id for every self-reference (see [RecursiveCteBinding::input_id]).
+    input_id: ast::TableInternalId,
+    /// Column metadata for resolving references to the recursive table.
+    table: Arc<CteTable>,
+}
+
 pub struct BoundSelect {
     pub result_columns: Arc<Vec<BoundColumn>>,
     pub main_scope: BindScope,
@@ -728,11 +761,13 @@ pub struct CteEntry {
     /// True if `AS MATERIALIZED` was specified, forcing materialization.
     pub materialize_hint: bool,
     /// True if the body references its own name (a recursive CTE, whether or
-    /// not the RECURSIVE keyword was written). Recursive bodies are stored
-    /// unbound (`select` is the raw AST, `inner_bound` is `None`): the
-    /// planner's recursive-CTE machinery resolves them itself, since the
-    /// self-reference only exists as a table during that planning.
+    /// not the RECURSIVE keyword was written). `select` keeps the raw body
+    /// (the planner reads compound operators, ORDER BY, and LIMIT from it);
+    /// the bound arms live in `recursive_binding`.
     pub recursive: bool,
+    /// Bound arms of a recursive CTE body (`recursive` is true), consumed by
+    /// the recursive-CTE planner. `None` for non-recursive entries.
+    pub recursive_binding: Option<RecursiveCteBinding>,
     /// Binding error deferred until the CTE is referenced. SQLite never
     /// resolves the body of an unused CTE, so errors in unused bodies (bad
     /// columns, circular references) must not surface eagerly.
@@ -751,6 +786,7 @@ impl Clone for CteEntry {
             referenced_cte_indices: self.referenced_cte_indices.clone(),
             materialize_hint: self.materialize_hint,
             recursive: self.recursive,
+            recursive_binding: None,
             bind_error: self.bind_error.clone(),
         }
     }
@@ -826,6 +862,11 @@ pub struct BindContext<'a, G: IdGenerator> {
     /// FROM-clause subqueries (derived tables) bound during this query,
     /// keyed by the scope table's `internal_id`.
     derived_bindings: HashMap<ast::TableInternalId, BoundSubquery>,
+
+    /// Set while binding a recursive CTE's recursive arms: the CTE's own name
+    /// resolves to the recursive input table instead of raising a circular
+    /// reference.
+    recursive_self: Option<RecursiveSelfRef>,
 }
 
 impl<'a, G: IdGenerator> BindContext<'a, G> {
@@ -845,6 +886,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             subquery_bindings: HashMap::default(),
             shared_subqueries: Vec::new(),
             derived_bindings: HashMap::default(),
+            recursive_self: None,
         }
     }
 
@@ -1767,6 +1809,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     referenced_cte_indices: SmallVec::new(),
                     materialize_hint,
                     recursive,
+                    recursive_binding: None,
                     bind_error,
                 },
             );
@@ -1792,13 +1835,24 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         // restores them — destroying inner_bound values set in prior
         // iterations.
         let mut inner_bounds: Vec<(String, BoundSelect)> = Vec::with_capacity(with.ctes.len());
+        let mut recursive_bindings: Vec<(String, RecursiveCteBinding)> = Vec::new();
         let mut done = vec![false; with.ctes.len()];
         for idx in 0..with.ctes.len() {
-            self.bind_one_cte(with, &cte_names, idx, &mut done, &mut inner_bounds)?;
+            self.bind_one_cte(
+                with,
+                &cte_names,
+                idx,
+                &mut done,
+                &mut inner_bounds,
+                &mut recursive_bindings,
+            )?;
         }
         // Assign inner_bound values after all binding is done.
         for (cte_name, bound) in inner_bounds {
             self.ctes.get_mut(&cte_name).unwrap().inner_bound = Some(bound);
+        }
+        for (cte_name, binding) in recursive_bindings {
+            self.ctes.get_mut(&cte_name).unwrap().recursive_binding = Some(binding);
         }
         Ok(())
     }
@@ -1813,6 +1867,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         idx: usize,
         done: &mut [bool],
         inner_bounds: &mut Vec<(String, BoundSelect)>,
+        recursive_bindings: &mut Vec<(String, RecursiveCteBinding)>,
     ) -> Result<()> {
         if done[idx] {
             return Ok(());
@@ -1836,40 +1891,90 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 if dep_id.is_some_and(|id| self.ctes_being_bound.iter().any(|(b, _)| *b == id)) {
                     crate::bail_parse_error!("circular reference: {}", cte_names[dep]);
                 }
-                self.bind_one_cte(with, cte_names, dep, done, inner_bounds)?;
+                self.bind_one_cte(with, cte_names, dep, done, inner_bounds, recursive_bindings)?;
             }
             let cte = &mut with.ctes[idx];
             if is_recursive {
                 // Structure errors (circular reference, multiple recursive
                 // references) match the recursive planner's exactly.
-                crate::translate::planner::validate_recursive_cte_structure(
-                    &cte_name,
-                    &cte.select,
-                )?;
-                // The recursive body stays unbound — the recursive planner
-                // resolves it. Bind a throwaway copy of the initial arm (plus
-                // the body-level WITH) to learn the result column names and
-                // arity: SQLite takes them from the left-most arm, which
+                let first_recursive_idx =
+                    crate::translate::planner::validate_recursive_cte_structure(
+                        &cte_name,
+                        &cte.select,
+                    )?;
+                // Bind the initial (non-recursive) arms as one SELECT,
+                // including the body-level WITH. SQLite takes the CTE's
+                // column names and arity from the left-most arm, which
                 // cannot reference the recursive table.
-                let mut probe = ast::Select {
+                let mut initial = ast::Select {
                     with: cte.select.with.clone(),
                     body: ast::SelectBody {
                         select: cte.select.body.select.clone(),
-                        compounds: vec![],
+                        compounds: cte.select.body.compounds[..first_recursive_idx - 1].to_vec(),
                     },
                     order_by: vec![],
                     limit: None,
                 };
-                let bound = self.bind_select(&mut probe)?;
+                let initial_bound = self.bind_select(&mut initial)?;
                 let entry = self.ctes.get_mut(&cte_name).unwrap();
-                entry.result_column_count = bound.result_columns.len();
+                entry.result_column_count = initial_bound.result_columns.len();
                 if entry.explicit_columns.is_empty() {
-                    entry.resolved_columns = bound
+                    entry.resolved_columns = initial_bound
                         .result_columns
                         .iter()
                         .map(|bc| bc.name.clone())
                         .collect();
                 }
+                let self_table = Arc::new(CteTable {
+                    columns: entry.resolved_columns.clone(),
+                });
+
+                // Bind each recursive arm as its own single-arm SELECT with
+                // the CTE's own name resolving to the recursive input table.
+                // Every self-reference shares input_id.
+                let input_id = self.id_gen.next_table_id();
+                let saved_self = self.recursive_self.replace(RecursiveSelfRef {
+                    cte_id,
+                    input_id,
+                    table: self_table,
+                });
+                let arms_result = (|| -> Result<Vec<BoundSubquery>> {
+                    let cte = &with.ctes[idx];
+                    let mut arms = Vec::with_capacity(
+                        cte.select.body.compounds.len() - (first_recursive_idx - 1),
+                    );
+                    for compound in &cte.select.body.compounds[first_recursive_idx - 1..] {
+                        let mut arm = ast::Select {
+                            with: cte.select.with.clone(),
+                            body: ast::SelectBody {
+                                select: compound.select.clone(),
+                                compounds: vec![],
+                            },
+                            order_by: vec![],
+                            limit: None,
+                        };
+                        let inner_bound = self.bind_select(&mut arm)?;
+                        arms.push(BoundSubquery {
+                            select: arm,
+                            inner_bound,
+                        });
+                    }
+                    Ok(arms)
+                })();
+                self.recursive_self = saved_self;
+                let recursive_arms = arms_result?;
+                recursive_bindings.push((
+                    cte_name.clone(),
+                    RecursiveCteBinding {
+                        initial: BoundSubquery {
+                            select: initial,
+                            inner_bound: initial_bound,
+                        },
+                        recursive_arms,
+                        first_recursive_arm_index: first_recursive_idx,
+                        input_id,
+                    },
+                ));
             } else {
                 let bound = self.bind_select(&mut cte.select)?;
                 let entry = self.ctes.get_mut(&cte_name).unwrap();
@@ -1924,12 +2029,29 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 {
                     // Referencing a CTE whose body is currently being bound is
                     // a circular reference (identity-checked by cte_id, so a
-                    // shadowing nested CTE with the same name is unaffected).
+                    // shadowing nested CTE with the same name is unaffected) —
+                    // unless we are binding that CTE's own recursive arms, where
+                    // the self-reference resolves to the recursive input table.
                     if self
                         .ctes_being_bound
                         .iter()
                         .any(|(id, _)| *id == cte.cte_id)
                     {
+                        if let Some(recursive_self) = self
+                            .recursive_self
+                            .as_ref()
+                            .filter(|recursive_self| recursive_self.cte_id == cte.cte_id)
+                        {
+                            return Ok(ScopeTable {
+                                identifier,
+                                internal_id: recursive_self.input_id,
+                                source: ScopeTableSource::Cte { name: table_name },
+                                table: recursive_self.table.clone(),
+                                join_info: None,
+                                database_id: 0,
+                                indexed: None,
+                            });
+                        }
                         crate::bail_parse_error!("circular reference: {}", table_name);
                     }
                     // Surface any binding error deferred from the (lazy) CTE
@@ -2166,6 +2288,20 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 // Call arguments on a CTE are an error (mirrors parse_table).
                 if name.db_name.is_none() && self.ctes.contains_key(&table_name) && !args.is_empty()
                 {
+                    // A recursive self-reference gets SQLite's table-valued
+                    // function message; a plain CTE reference gets the
+                    // not-a-function message.
+                    let is_recursive_self = self
+                        .recursive_self
+                        .as_ref()
+                        .zip(self.ctes.get(&table_name))
+                        .is_some_and(|(recursive_self, cte)| recursive_self.cte_id == cte.cte_id);
+                    if is_recursive_self {
+                        crate::bail_parse_error!(
+                            "too many arguments on {}() - max 0",
+                            name.name.as_str()
+                        );
+                    }
                     crate::bail_parse_error!("'{}' is not a function", name.name.as_str());
                 }
                 // 1. Look up the virtual table via resolver
