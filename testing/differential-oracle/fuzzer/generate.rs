@@ -181,12 +181,13 @@ impl SqlGenerator for PropTestBackend {
         let mut stmt = value_tree.current();
         // SQLite 3.50.2, currently bundled by rusqlite in this workspace,
         // has an ORDER BY elision regression for recursive CTEs that was
-        // fixed in later SQLite versions. In focused mode, avoid an outer
-        // LIMIT/OFFSET so that this oracle bug cannot change the compared
-        // row set. Recursive LIMIT/OFFSET and priority ordering remain fully
-        // generated inside the CTE.
-        if self.recursive_cte_focus {
-            if let sql_gen_prop::SqlStatement::Select(select) = &mut stmt {
+        // fixed in later SQLite versions. Avoid an outer LIMIT/OFFSET on any
+        // statement with a recursive CTE - the default profile generates them
+        // too - so that this oracle bug cannot change the compared row set.
+        // Recursive LIMIT/OFFSET and priority ordering remain fully generated
+        // inside the CTE.
+        if let sql_gen_prop::SqlStatement::Select(select) = &mut stmt {
+            if select.has_recursive_cte() {
                 select.limit = None;
                 select.offset = None;
             }

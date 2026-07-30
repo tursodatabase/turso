@@ -299,6 +299,14 @@ impl SelectStatement {
         }
         false
     }
+
+    /// True when this SELECT's WITH clause defines a recursive CTE, directly
+    /// or nested inside another CTE body.
+    pub fn has_recursive_cte(&self) -> bool {
+        self.with_clause
+            .as_ref()
+            .is_some_and(crate::cte::WithClause::has_recursive_cte)
+    }
 }
 
 impl fmt::Display for SelectStatement {

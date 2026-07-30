@@ -171,6 +171,17 @@ pub struct WithClause {
     pub ctes: Vec<CteDefinition>,
 }
 
+impl WithClause {
+    /// True when any CTE in this clause (or nested in one of its bodies) is
+    /// recursive.
+    pub fn has_recursive_cte(&self) -> bool {
+        self.ctes.iter().any(|cte| match &cte.query {
+            CteQuery::Recursive(_) => true,
+            CteQuery::Select(select) => select.has_recursive_cte(),
+        })
+    }
+}
+
 impl fmt::Display for WithClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.ctes.iter().any(|cte| cte.query.is_recursive()) {
