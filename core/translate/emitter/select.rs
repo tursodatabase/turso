@@ -80,7 +80,6 @@ fn try_emit_declarative_table_scan(
         || plan.group_by.is_some()
         || !plan.order_by.is_empty()
         || !plan.aggregates.is_empty()
-        || plan.offset.is_some()
         || plan.contains_constant_false_condition
         || !plan.values.is_empty()
         || plan.window.is_some()
@@ -136,6 +135,18 @@ fn try_emit_declarative_table_scan(
             Some(limit)
         }
     };
+    let offset = match plan.offset.as_deref() {
+        None => None,
+        Some(offset) => {
+            let Some(offset) = expr_resolver.resolve(offset)? else {
+                return Ok(None);
+            };
+            let Some(offset) = compile_symbolic_static_expr(&offset) else {
+                return Ok(None);
+            };
+            Some(offset)
+        }
+    };
     let mut projections =
         SmallVec::<[ResolvedScalarExpr; 4]>::with_capacity(plan.result_columns.len());
     for result_column in &plan.result_columns {
@@ -171,12 +182,13 @@ fn try_emit_declarative_table_scan(
     let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
     let compiler = scan_table(table, database_id, schema_cookie).and_then(move |rows| {
         if predicates.is_empty() {
-            compile_declarative_projection(rows, projections, limit)
+            compile_declarative_projection(rows, projections, limit, offset)
         } else {
             compile_declarative_projection(
                 rows.filter(move |row| compile_symbolic_conjunction(row, &predicates)),
                 projections,
                 limit,
+                offset,
             )
         }
     });
@@ -197,14 +209,32 @@ fn compile_declarative_projection<Stream>(
     rows: Stream,
     projections: SmallVec<[ResolvedScalarExpr; 4]>,
     limit: Option<BoxedCompile<ValueId>>,
+    offset: Option<BoxedCompile<ValueId>>,
 ) -> BoxedCompile<()>
 where
     Stream: RowStream<Item = Row> + 'static,
 {
-    let projected = rows.map(move |row| compile_symbolic_exprs(row, &projections));
-    match limit {
-        Some(limit) => projected.take(limit).for_each(result_row_pack).boxed(),
-        None => projected.for_each(result_row_pack).boxed(),
+    match (limit, offset) {
+        (Some(limit), Some(offset)) => rows
+            .skip(offset)
+            .map(move |row| compile_symbolic_exprs(row, &projections))
+            .take(limit)
+            .for_each(result_row_pack)
+            .boxed(),
+        (Some(limit), None) => rows
+            .map(move |row| compile_symbolic_exprs(row, &projections))
+            .take(limit)
+            .for_each(result_row_pack)
+            .boxed(),
+        (None, Some(offset)) => rows
+            .skip(offset)
+            .map(move |row| compile_symbolic_exprs(row, &projections))
+            .for_each(result_row_pack)
+            .boxed(),
+        (None, None) => rows
+            .map(move |row| compile_symbolic_exprs(row, &projections))
+            .for_each(result_row_pack)
+            .boxed(),
     }
 }
 
@@ -1448,6 +1478,70 @@ mod tests {
             .bind_at(1.try_into().unwrap(), Value::from_f64(1.5))
             .unwrap();
         assert!(invalid_limit.run_collect_rows().is_err());
+
+        let mut dynamic_offset = connection
+            .prepare("SELECT a FROM expressions LIMIT ?1 OFFSET ?2 + 1")
+            .unwrap();
+        assert!(dynamic_offset
+            .get_program()
+            .insns
+            .iter()
+            .all(|(instruction, _)| !matches!(
+                instruction,
+                Insn::DecrJumpZero { .. } | Insn::IfPos { .. } | Insn::OffsetLimit { .. }
+            )));
+        assert_eq!(
+            dynamic_offset
+                .get_program()
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::MustBeInt { .. }))
+                .count(),
+            2
+        );
+        dynamic_offset
+            .bind_at(1.try_into().unwrap(), Value::from_i64(2))
+            .unwrap();
+        dynamic_offset
+            .bind_at(2.try_into().unwrap(), Value::from_i64(1))
+            .unwrap();
+        assert_eq!(
+            dynamic_offset.run_collect_rows().unwrap(),
+            vec![vec![Value::Null], vec![Value::from_i64(5)]]
+        );
+        dynamic_offset.reset().unwrap();
+        dynamic_offset
+            .bind_at(1.try_into().unwrap(), Value::from_i64(2))
+            .unwrap();
+        dynamic_offset
+            .bind_at(2.try_into().unwrap(), Value::from_i64(-2))
+            .unwrap();
+        assert_eq!(
+            dynamic_offset.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+        );
+
+        let mut zero_limit_invalid_offset = connection
+            .prepare("SELECT a FROM expressions LIMIT ?1 OFFSET ?2")
+            .unwrap();
+        zero_limit_invalid_offset
+            .bind_at(1.try_into().unwrap(), Value::from_i64(0))
+            .unwrap();
+        zero_limit_invalid_offset
+            .bind_at(2.try_into().unwrap(), Value::from_f64(1.5))
+            .unwrap();
+        assert!(zero_limit_invalid_offset
+            .run_collect_rows()
+            .unwrap()
+            .is_empty());
+        zero_limit_invalid_offset.reset().unwrap();
+        zero_limit_invalid_offset
+            .bind_at(1.try_into().unwrap(), Value::from_i64(1))
+            .unwrap();
+        zero_limit_invalid_offset
+            .bind_at(2.try_into().unwrap(), Value::from_f64(1.5))
+            .unwrap();
+        assert!(zero_limit_invalid_offset.run_collect_rows().is_err());
 
         let mut control_flow_statement = connection
             .prepare(

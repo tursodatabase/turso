@@ -2007,6 +2007,11 @@ test symbolic-scalar-limit {
     SELECT a FROM limited_rows LIMIT 0;
     SELECT a FROM limited_rows LIMIT 1 + 1;
     SELECT a FROM limited_rows LIMIT '2';
+    SELECT name FROM limited_rows LIMIT 2 OFFSET 1;
+    SELECT name FROM limited_rows WHERE a + b >= 3 LIMIT 1 OFFSET 1;
+    SELECT name FROM limited_rows LIMIT 2 OFFSET -1;
+    SELECT name FROM limited_rows LIMIT 2 OFFSET '1';
+    SELECT name FROM limited_rows LIMIT 0 OFFSET 'invalid';
 }
 expect {
     2|one
@@ -2015,4 +2020,11 @@ expect {
     1
     0
     1
+    one
+    null
+    two
+    skip
+    one
+    one
+    null
 }

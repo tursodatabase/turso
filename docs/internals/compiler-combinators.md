@@ -75,10 +75,22 @@ so nested stream operators preserve their own loop state and the final accepted
 row exits without moving the cursor again. Its count is itself a deferred value:
 an SSA integer-coercion operation implements SQLite's `MustBeInt` behavior, a
 zero count branches around the source pipeline, and a negative count never
-reaches zero. The production table-scan path uses this for row-independent
-`LIMIT` expressions supported by the scalar IR, including parameters and
-searched `CASE`; column-dependent and otherwise unsupported limits, and all
-offset limits, retain the eager emitter.
+reaches zero. `skip` uses the same deferred count contract, carries its
+remaining offset through loop block parameters, and invokes its downstream
+consumer only after that value is no longer positive. This places filtering
+before offset accounting and projection after it. Nesting `skip` inside `take`
+also preserves SQLite's evaluation order: a zero limit exits before the offset
+expression is evaluated. The production table-scan path uses these operators
+for row-independent `LIMIT` and `OFFSET` expressions supported by the scalar IR,
+including parameters and searched `CASE`; column-dependent and otherwise
+unsupported counts retain the eager emitter.
+
+The authoring surface remains generically typed, but stream consumption erases
+the concrete compiler and row-callback types at every adapter boundary. This is
+the practical escape hatch used by parser-combinator libraries for large
+recursive descriptions: it bounds Rust monomorphization and generated symbol
+size without assigning registers, emitting VDBE instructions, or losing the
+typed item and result contracts visible to compiler authors.
 The production path preserves predicate and projection source order. Comparison
 affinity and collation are resolved by the SQL frontend before IR construction.
 The resulting terminator has separate true, false, and NULL successors; a

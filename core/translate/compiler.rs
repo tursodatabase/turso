@@ -2133,17 +2133,23 @@ pub(crate) struct CursorRows {
     cursor: CursorId,
 }
 
+type BoxedRowConsumer<Item> = Box<dyn FnOnce(Item) -> BoxedCompile<()>>;
+type BoxedRowFolder<Item> = Box<dyn FnOnce(Item, LoopState) -> BoxedCompile<LoopStep>>;
+
 /// A compile-time row-program algebra analogous to [`Iterator`].
 ///
 /// Stream operators compose compiler descriptions. They do not inspect rows or
 /// advance cursors while the Rust expression is being constructed.
-pub(crate) trait RowStream: Sized {
-    type Item;
+pub(crate) trait RowStream: Sized + 'static {
+    type Item: 'static;
 
-    fn for_each<BodyFn, Body>(self, body: BodyFn) -> impl Compile<Output = ()>
+    fn for_each<BodyFn, Body>(self, body: BodyFn) -> BoxedCompile<()>
     where
-        BodyFn: FnOnce(Self::Item) -> Body,
-        Body: Compile<Output = ()>;
+        BodyFn: FnOnce(Self::Item) -> Body + 'static,
+        Body: Compile<Output = ()> + 'static,
+    {
+        self.for_each_boxed(Box::new(move |item| body(item).boxed()))
+    }
 
     /// Fold symbolic state through rows until the body returns a false
     /// continuation value.
@@ -2151,16 +2157,31 @@ pub(crate) trait RowStream: Sized {
         self,
         initial: Initial,
         body: BodyFn,
-    ) -> impl Compile<Output = LoopState>
+    ) -> BoxedCompile<LoopState>
     where
-        Initial: Compile<Output = LoopState>,
-        BodyFn: FnOnce(Self::Item, LoopState) -> Body,
-        Body: Compile<Output = LoopStep>;
+        Initial: Compile<Output = LoopState> + 'static,
+        BodyFn: FnOnce(Self::Item, LoopState) -> Body + 'static,
+        Body: Compile<Output = LoopStep> + 'static,
+    {
+        self.try_fold_boxed(
+            initial.boxed(),
+            Box::new(move |item, state| body(item, state).boxed()),
+        )
+    }
+
+    fn for_each_boxed(self, body: BoxedRowConsumer<Self::Item>) -> BoxedCompile<()>;
+
+    fn try_fold_boxed(
+        self,
+        initial: BoxedCompile<LoopState>,
+        body: BoxedRowFolder<Self::Item>,
+    ) -> BoxedCompile<LoopState>;
 
     fn map<MapperFn, Mapper>(self, mapper: MapperFn) -> MapRows<Self, MapperFn, Mapper>
     where
-        MapperFn: FnOnce(Self::Item) -> Mapper,
-        Mapper: Compile,
+        MapperFn: FnOnce(Self::Item) -> Mapper + 'static,
+        Mapper: Compile + 'static,
+        Mapper::Output: 'static,
     {
         MapRows {
             source: self,
@@ -2175,8 +2196,8 @@ pub(crate) trait RowStream: Sized {
     ) -> FilterRows<Self, PredicateFn, Predicate>
     where
         Self::Item: Clone,
-        PredicateFn: FnOnce(Self::Item) -> Predicate,
-        Predicate: Compile<Output = ValueId>,
+        PredicateFn: FnOnce(Self::Item) -> Predicate + 'static,
+        Predicate: Compile<Output = ValueId> + 'static,
     {
         FilterRows {
             source: self,
@@ -2187,9 +2208,19 @@ pub(crate) trait RowStream: Sized {
 
     fn take<Count>(self, count: Count) -> TakeRows<Self, Count>
     where
-        Count: Compile<Output = ValueId>,
+        Count: Compile<Output = ValueId> + 'static,
     {
         TakeRows {
+            source: self,
+            count,
+        }
+    }
+
+    fn skip<Count>(self, count: Count) -> SkipRows<Self, Count>
+    where
+        Count: Compile<Output = ValueId> + 'static,
+    {
+        SkipRows {
             source: self,
             count,
         }
@@ -2199,34 +2230,27 @@ pub(crate) trait RowStream: Sized {
 impl RowStream for CursorRows {
     type Item = Row;
 
-    fn for_each<BodyFn, Body>(self, body: BodyFn) -> impl Compile<Output = ()>
-    where
-        BodyFn: FnOnce(Self::Item) -> Body,
-        Body: Compile<Output = ()>,
-    {
+    fn for_each_boxed(self, body: BoxedRowConsumer<Self::Item>) -> BoxedCompile<()> {
         ForEachRow {
             cursor: self.cursor,
             body,
             compiler: PhantomData,
         }
+        .boxed()
     }
 
-    fn try_fold<Initial, BodyFn, Body>(
+    fn try_fold_boxed(
         self,
-        initial: Initial,
-        body: BodyFn,
-    ) -> impl Compile<Output = LoopState>
-    where
-        Initial: Compile<Output = LoopState>,
-        BodyFn: FnOnce(Self::Item, LoopState) -> Body,
-        Body: Compile<Output = LoopStep>,
-    {
+        initial: BoxedCompile<LoopState>,
+        body: BoxedRowFolder<Self::Item>,
+    ) -> BoxedCompile<LoopState> {
         TryFoldRows {
             initial,
             cursor: self.cursor,
             body,
             compiler: PhantomData,
         }
+        .boxed()
     }
 }
 
@@ -2240,34 +2264,31 @@ pub(crate) struct MapRows<Source, MapperFn, Mapper> {
 impl<Source, MapperFn, Mapper> RowStream for MapRows<Source, MapperFn, Mapper>
 where
     Source: RowStream,
-    MapperFn: FnOnce(Source::Item) -> Mapper,
-    Mapper: Compile,
+    MapperFn: FnOnce(Source::Item) -> Mapper + 'static,
+    Mapper: Compile + 'static,
+    Mapper::Output: 'static,
 {
     type Item = Mapper::Output;
 
-    fn for_each<BodyFn, Body>(self, body: BodyFn) -> impl Compile<Output = ()>
-    where
-        BodyFn: FnOnce(Self::Item) -> Body,
-        Body: Compile<Output = ()>,
-    {
+    fn for_each_boxed(self, body: BoxedRowConsumer<Self::Item>) -> BoxedCompile<()> {
         let Self { source, mapper, .. } = self;
-        source.for_each(move |item| mapper(item).and_then(body))
+        source.for_each_boxed(Box::new(move |item| mapper(item).and_then(body).boxed()))
     }
 
-    fn try_fold<Initial, BodyFn, Body>(
+    fn try_fold_boxed(
         self,
-        initial: Initial,
-        body: BodyFn,
-    ) -> impl Compile<Output = LoopState>
-    where
-        Initial: Compile<Output = LoopState>,
-        BodyFn: FnOnce(Self::Item, LoopState) -> Body,
-        Body: Compile<Output = LoopStep>,
-    {
+        initial: BoxedCompile<LoopState>,
+        body: BoxedRowFolder<Self::Item>,
+    ) -> BoxedCompile<LoopState> {
         let Self { source, mapper, .. } = self;
-        source.try_fold(initial, move |item, state| {
-            mapper(item).and_then(move |item| body(item, state))
-        })
+        source.try_fold_boxed(
+            initial,
+            Box::new(move |item, state| {
+                mapper(item)
+                    .and_then(move |mapped| body(mapped, state))
+                    .boxed()
+            }),
+        )
     }
 }
 
@@ -2282,42 +2303,129 @@ impl<Source, PredicateFn, Predicate> RowStream for FilterRows<Source, PredicateF
 where
     Source: RowStream,
     Source::Item: Clone,
-    PredicateFn: FnOnce(Source::Item) -> Predicate,
-    Predicate: Compile<Output = ValueId>,
+    PredicateFn: FnOnce(Source::Item) -> Predicate + 'static,
+    Predicate: Compile<Output = ValueId> + 'static,
 {
     type Item = Source::Item;
 
-    fn for_each<BodyFn, Body>(self, body: BodyFn) -> impl Compile<Output = ()>
-    where
-        BodyFn: FnOnce(Self::Item) -> Body,
-        Body: Compile<Output = ()>,
-    {
+    fn for_each_boxed(self, body: BoxedRowConsumer<Self::Item>) -> BoxedCompile<()> {
         let Self {
             source, predicate, ..
         } = self;
-        source.for_each(move |item| {
-            predicate(item.clone()).and_then(move |condition| when(condition, body(item)))
-        })
+        source.for_each_boxed(Box::new(move |item| {
+            predicate(item.clone())
+                .and_then(move |condition| when(condition, body(item)))
+                .boxed()
+        }))
     }
 
-    fn try_fold<Initial, BodyFn, Body>(
+    fn try_fold_boxed(
         self,
-        initial: Initial,
-        body: BodyFn,
-    ) -> impl Compile<Output = LoopState>
-    where
-        Initial: Compile<Output = LoopState>,
-        BodyFn: FnOnce(Self::Item, LoopState) -> Body,
-        Body: Compile<Output = LoopStep>,
-    {
+        initial: BoxedCompile<LoopState>,
+        body: BoxedRowFolder<Self::Item>,
+    ) -> BoxedCompile<LoopState> {
         let Self {
             source, predicate, ..
         } = self;
-        source.try_fold(initial, move |item, state| {
-            predicate(item.clone()).and_then(move |condition| {
-                pure(condition).branch(body(item, state.clone()), continue_loop(state))
-            })
+        source.try_fold_boxed(
+            initial,
+            Box::new(move |item, state| {
+                predicate(item.clone())
+                    .and_then(move |condition| {
+                        pure(condition).branch(body(item, state.clone()), continue_loop(state))
+                    })
+                    .boxed()
+            }),
+        )
+    }
+}
+
+/// A row stream that discards a deferred number of upstream items.
+pub(crate) struct SkipRows<Source, Count> {
+    source: Source,
+    count: Count,
+}
+
+impl<Source, Count> RowStream for SkipRows<Source, Count>
+where
+    Source: RowStream,
+    Count: Compile<Output = ValueId> + 'static,
+{
+    type Item = Source::Item;
+
+    fn for_each_boxed(self, body: BoxedRowConsumer<Self::Item>) -> BoxedCompile<()> {
+        self.try_fold(pure(LoopState::empty()), move |item, state| {
+            body(item).and_then(move |()| continue_loop(state))
         })
+        .map(|_| ())
+        .boxed()
+    }
+
+    fn try_fold_boxed(
+        self,
+        initial: BoxedCompile<LoopState>,
+        body: BoxedRowFolder<Self::Item>,
+    ) -> BoxedCompile<LoopState> {
+        let Self { source, count } = self;
+        initial
+            .then(count)
+            .and_then(move |(state, count)| {
+                must_be_int(count).and_then(move |count| {
+                    let mut active_state = state;
+                    active_state.push(count);
+                    source
+                        .try_fold_boxed(
+                            pure(active_state).boxed(),
+                            Box::new(move |item, mut state| {
+                                let remaining = state
+                                    .pop()
+                                    .expect("skip loop state must include its remaining-row count");
+                                constant(Value::from_i64(0))
+                                    .and_then(move |zero| {
+                                        compare(
+                                            remaining,
+                                            zero,
+                                            resolved_comparison(
+                                                ComparisonOp::Greater,
+                                                Affinity::Numeric,
+                                                None,
+                                            ),
+                                        )
+                                        .and_then(
+                                            move |should_skip| {
+                                                let mut skipped_state = state.clone();
+                                                pure(should_skip).branch(
+                                                    constant(Value::from_i64(-1)).and_then(
+                                                        move |minus_one| {
+                                                            add(remaining, minus_one).and_then(
+                                                                move |next_remaining| {
+                                                                    skipped_state
+                                                                        .push(next_remaining);
+                                                                    continue_loop(skipped_state)
+                                                                },
+                                                            )
+                                                        },
+                                                    ),
+                                                    body(item, state).map(move |mut step| {
+                                                        step.state.push(remaining);
+                                                        step
+                                                    }),
+                                                )
+                                            },
+                                        )
+                                    })
+                                    .boxed()
+                            }),
+                        )
+                        .map(|mut state| {
+                            state
+                                .pop()
+                                .expect("skip result state must include its remaining-row count");
+                            state
+                        })
+                })
+            })
+            .boxed()
     }
 }
 
@@ -2330,87 +2438,98 @@ pub(crate) struct TakeRows<Source, Count> {
 impl<Source, Count> RowStream for TakeRows<Source, Count>
 where
     Source: RowStream,
-    Count: Compile<Output = ValueId>,
+    Count: Compile<Output = ValueId> + 'static,
 {
     type Item = Source::Item;
 
-    fn for_each<BodyFn, Body>(self, body: BodyFn) -> impl Compile<Output = ()>
-    where
-        BodyFn: FnOnce(Self::Item) -> Body,
-        Body: Compile<Output = ()>,
-    {
+    fn for_each_boxed(self, body: BoxedRowConsumer<Self::Item>) -> BoxedCompile<()> {
         self.try_fold(pure(LoopState::empty()), move |item, state| {
             body(item).and_then(move |()| continue_loop(state))
         })
         .map(|_| ())
+        .boxed()
     }
 
-    fn try_fold<Initial, BodyFn, Body>(
+    fn try_fold_boxed(
         self,
-        initial: Initial,
-        body: BodyFn,
-    ) -> impl Compile<Output = LoopState>
-    where
-        Initial: Compile<Output = LoopState>,
-        BodyFn: FnOnce(Self::Item, LoopState) -> Body,
-        Body: Compile<Output = LoopStep>,
-    {
+        initial: BoxedCompile<LoopState>,
+        body: BoxedRowFolder<Self::Item>,
+    ) -> BoxedCompile<LoopState> {
         let Self { source, count } = self;
-        initial.then(count).and_then(move |(state, count)| {
-            must_be_int(count).and_then(move |count| {
-                let mut active_state = state.clone();
-                active_state.push(count);
-                pure(count).branch(
-                    source
-                        .try_fold(pure(active_state), move |item, mut state| {
-                            let remaining = state
-                                .pop()
-                                .expect("take loop state must include its remaining-row count");
-                            body(item, state).and_then(move |step| {
-                                constant(Value::from_i64(-1)).and_then(move |minus_one| {
-                                    add(remaining, minus_one).and_then(move |next_remaining| {
-                                        constant(Value::from_i64(0)).and_then(move |zero| {
-                                            compare(
-                                                next_remaining,
-                                                zero,
-                                                resolved_comparison(
-                                                    ComparisonOp::NotEqual,
-                                                    Affinity::Numeric,
-                                                    None,
-                                                ),
-                                            )
-                                            .and_then(
-                                                move |limit_continue| {
-                                                    logical(
-                                                        LogicalOp::And,
-                                                        step.should_continue,
-                                                        limit_continue,
+        initial
+            .then(count)
+            .and_then(move |(state, count)| {
+                must_be_int(count).and_then(move |count| {
+                    let mut active_state = state.clone();
+                    active_state.push(count);
+                    pure(count).branch(
+                        source
+                            .try_fold_boxed(
+                                pure(active_state).boxed(),
+                                Box::new(move |item, mut state| {
+                                    let remaining = state.pop().expect(
+                                        "take loop state must include its remaining-row count",
+                                    );
+                                    body(item, state)
+                                        .and_then(move |step| {
+                                            constant(Value::from_i64(-1)).and_then(
+                                                move |minus_one| {
+                                                    add(remaining, minus_one).and_then(
+                                                        move |next_remaining| {
+                                                            constant(Value::from_i64(0)).and_then(
+                                                                move |zero| {
+                                                                    compare(
+                                                                        next_remaining,
+                                                                        zero,
+                                                                        resolved_comparison(
+                                                                            ComparisonOp::NotEqual,
+                                                                            Affinity::Numeric,
+                                                                            None,
+                                                                        ),
+                                                                    )
+                                                                    .and_then(
+                                                                        move |limit_continue| {
+                                                                            logical(
+                                                                                LogicalOp::And,
+                                                                                step.should_continue,
+                                                                                limit_continue,
+                                                                            )
+                                                                            .map(
+                                                                                move |should_continue| {
+                                                                                    let mut state =
+                                                                                        step.state;
+                                                                                    state.push(
+                                                                                        next_remaining,
+                                                                                    );
+                                                                                    LoopStep {
+                                                                                        state,
+                                                                                        should_continue,
+                                                                                    }
+                                                                                },
+                                                                            )
+                                                                        },
+                                                                    )
+                                                                },
+                                                            )
+                                                        },
                                                     )
-                                                    .map(move |should_continue| {
-                                                        let mut state = step.state;
-                                                        state.push(next_remaining);
-                                                        LoopStep {
-                                                            state,
-                                                            should_continue,
-                                                        }
-                                                    })
                                                 },
                                             )
                                         })
-                                    })
-                                })
-                            })
-                        })
-                        .map(|mut state| {
-                            state
-                                .pop()
-                                .expect("take result state must include its remaining-row count");
-                            state
-                        }),
-                    pure(state),
-                )
+                                        .boxed()
+                                }),
+                            )
+                            .map(|mut state| {
+                                state.pop().expect(
+                                    "take result state must include its remaining-row count",
+                                );
+                                state
+                            }),
+                        pure(state),
+                    )
+                })
             })
-        })
+            .boxed()
     }
 }
 
@@ -3120,6 +3239,38 @@ mod tests {
                 "  jump block10(%8, %14)\n",
             )
         );
+    }
+
+    #[test]
+    fn row_stream_skip_discards_items_before_projection() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE skipped(a,b)", 2).unwrap());
+        let compiler = scan_table(table, 0, 0).and_then(|rows| {
+            rows.skip(constant(Value::from_i64(2)))
+                .map(|row| row.column(1))
+                .for_each(|value| result_row([value]))
+        });
+
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+        let offset_coercion = rendered
+            .find("must_be_int")
+            .expect("skip must coerce its deferred count");
+        let rewind = rendered
+            .find("rewind $0")
+            .expect("the source cursor must be entered");
+        let skip_comparison = rendered
+            .find("compare Greater")
+            .expect("skip must discard only while its count is positive");
+        let projection = rendered
+            .find("column $0[1]")
+            .expect("an admitted item must reach projection");
+        let result_row = rendered
+            .find("result_row")
+            .expect("an admitted item must reach the terminal consumer");
+
+        assert!(offset_coercion < rewind);
+        assert!(skip_comparison < projection);
+        assert!(projection < result_row);
     }
 
     #[test]
