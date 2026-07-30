@@ -355,9 +355,22 @@ boundary (the whole tree is constant, so the span opened by
 
 ### Phase 4 — Row streams
 
-- [ ] 4a. `Compiler<RowStream>`: scan/filter/map over a table -> the
-      Rewind/Next loop, composed (`scan(t).filter(p).map(proj)
-      .consume(result_rows)`).
+- [x] 4a-1. First production row-stream integration
+      (`try_emit_scan_query`): gated whole simple scans — one forward
+      B-tree table scan, no index — compile as a composed description
+      (`scan_loop` + projection values + `EmitRow`) replacing the eager
+      OpenLoop/LoopBody/CloseLoop sequencing in `emit_query`. InitLoop
+      stays eager (cursor opening); the scan references cursors
+      externally. EXPLAIN for `SELECT a, b FROM t` is
+      instruction-identical to eager (columns steered straight into the
+      ResultRow pack, zero copies). Gates: no WHERE (next slice), joins,
+      indexes, aggregates, ORDER BY, windows, DISTINCT, LIMIT/OFFSET,
+      subqueries, virtual tables, or non-ResultRows destinations.
+      Lesson: array-typed columns need the eager bare-column decode
+      path — now refused at the leaf gate (conformance caught it).
+- [ ] 4a-2. WHERE terms in the scan gate: thread the existing Predicate
+      compiler into the loop body (filter -> latch on false). Then
+      LIMIT (needs the counter as a loop-carried value or slot).
 - [ ] 4b. Joins, aggregates, sorters, subqueries as stream operators;
       `emitter/` + `main_loop/` sequencing becomes tree lowering.
 - [ ] 4c. Shrink and remove the eager-emission fallback per construct.

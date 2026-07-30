@@ -733,6 +733,11 @@ impl FuncBuilder {
         block
     }
 
+    /// Terminate the current block by leaving the island for `exit`.
+    pub fn exit(&mut self, exit: ExitId) {
+        self.terminate(Terminator::Exit(exit));
+    }
+
     /// Terminate the current block with a comparison-driven three-way
     /// branch. `if_null` must equal `if_true` or `if_false` (VDBE
     /// comparison jumps route NULL via a flag, not a third target).

@@ -551,6 +551,12 @@ pub(crate) fn compile_value_expr<'a>(
             let Some(table_column) = table.get_column_at(*column) else {
                 return Ok(None);
             };
+            // Array-typed columns need the decode/display handling that
+            // lives on the eager paths (LoopBodyEmitter's bare-column
+            // emission); refuse them as leaves.
+            if crate::translate::expr::expr_is_array(expr, ctx.referenced_tables) {
+                return Ok(None);
+            }
             // Custom-typed columns stay on the eager path: their
             // operators can be overloaded per type, which this frontend
             // does not model. Without a resolver we cannot rule that

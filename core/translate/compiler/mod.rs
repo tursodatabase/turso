@@ -42,6 +42,124 @@ use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::BranchOffset;
 use crate::Result;
 
+/// Compile a whole simple-scan SELECT through the pipeline: one
+/// forward B-tree table scan with no index, projecting IR-representable
+/// result columns straight to result rows. This is the first row-stream
+/// integration: `scan(t).map(projection).consume(result_rows)` as a
+/// composed description replacing the eager OpenLoop/LoopBody/CloseLoop
+/// sequencing. Cursors are opened by the (still eager) InitLoop; the
+/// scan references them externally.
+///
+/// Returns false (emitting nothing) for anything outside the gate:
+/// joins, WHERE clauses (next slice), indexes, aggregates, sorting,
+/// windows, DISTINCT, LIMIT/OFFSET, subqueries, virtual tables, or
+/// non-ResultRows destinations.
+pub(crate) fn try_emit_scan_query(
+    program: &mut ProgramBuilder,
+    plan: &crate::translate::plan::SelectPlan,
+    resolver: &crate::translate::emitter::Resolver,
+) -> Result<bool> {
+    use crate::schema::Table;
+    use crate::translate::plan::{
+        Distinctness, IterationDirection, Operation, QueryDestination, Scan,
+    };
+
+    if !plan.where_clause.is_empty()
+        || !plan.aggregates.is_empty()
+        || plan.group_by.is_some()
+        || !plan.order_by.is_empty()
+        || plan.window.is_some()
+        || !matches!(plan.distinctness, Distinctness::NonDistinct)
+        || plan.limit.is_some()
+        || plan.offset.is_some()
+        || !plan.non_from_clause_subqueries.is_empty()
+        || plan.contains_constant_false_condition
+        || !matches!(plan.query_destination, QueryDestination::ResultRows)
+        || resolver.expr_to_reg_cache_enabled
+    {
+        return Ok(false);
+    }
+    let [table] = plan.table_references.joined_tables() else {
+        return Ok(false);
+    };
+    let Operation::Scan(Scan::BTreeTable {
+        iter_dir: IterationDirection::Forwards,
+        index: None,
+    }) = &table.op
+    else {
+        return Ok(false);
+    };
+    if !matches!(table.table, Table::BTree(_)) || !table.expression_index_usages.is_empty() {
+        return Ok(false);
+    }
+
+    // Describe every result column before emitting anything.
+    let build_ctx = BuildCtx {
+        referenced_tables: Some(&plan.table_references),
+        resolver: Some(resolver),
+    };
+    let mut columns = Vec::with_capacity(plan.result_columns.len());
+    let mut effect = expr::CollationEffect::Untouched;
+    for result_column in &plan.result_columns {
+        let Some(built) = compile_value_expr(&result_column.expr, &build_ctx)? else {
+            return Ok(false);
+        };
+        if let expr::CollationEffect::Sets(collation) = built.effect {
+            effect = expr::CollationEffect::Sets(collation);
+        }
+        columns.push(built.compiler);
+    }
+
+    // Cursors were opened by InitLoop; a plain scan iterates the table
+    // cursor with no index cursor in play.
+    let (table_cursor, index_cursor) =
+        table.resolve_cursors(program, crate::translate::emitter::OperationMode::SELECT)?;
+    if index_cursor.is_some() {
+        return Ok(false);
+    }
+    let Some(cursor) = table_cursor else {
+        return Ok(false);
+    };
+
+    let fallthrough = program.allocate_label();
+    let mut builder = ir::FuncBuilder::new();
+    let done = builder.declare_exit();
+    combine::scan_loop(cursor, move |builder| {
+        let mut values = Vec::with_capacity(columns.len());
+        for column in columns {
+            values.push(column.run(builder)?);
+        }
+        builder.emit_row(values);
+        Ok(())
+    })
+    .run(&mut builder)?;
+    builder.exit(done);
+    let func = builder.finish();
+
+    let mut emit_leaf =
+        |program: &mut ProgramBuilder, leaf: &turso_parser::ast::Expr, dest: usize| {
+            crate::translate::expr::translate_expr(
+                program,
+                Some(&plan.table_references),
+                leaf,
+                dest,
+                resolver,
+            )
+            .map(|_| ())
+        };
+    emit::emit_condition_function(
+        program,
+        &func,
+        &[fallthrough],
+        Some(fallthrough),
+        Some(&mut emit_leaf),
+    )?;
+    program.preassign_label_to_next_insn(fallthrough);
+    // The collation post-state the eager body would have left behind.
+    effect.apply(program);
+    Ok(true)
+}
+
 /// Run a described value through build → verify → emit, leaving the
 /// result in `dest`. `leaf_emitter` is required when the description
 /// contains opaque leaves (column/rowid reads).
