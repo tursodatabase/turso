@@ -2645,8 +2645,8 @@ impl Connection {
             return Ok(());
         };
 
-        self.page_size.store(size.get_raw(), Ordering::SeqCst);
         self.pager.load().set_initial_page_size(size)?;
+        self.page_size.store(size.get_raw(), Ordering::SeqCst);
         // MvStore caches a copy of the database header in `global_header`, captured from the
         // pager during bootstrap (before any PRAGMA page_size can run). Propagate the new
         // page size so subsequent transactions and any header lookups see the same value the

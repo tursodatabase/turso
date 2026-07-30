@@ -4788,6 +4788,7 @@ mod database_tests {
             // otherwise the engine creates a database it refuses to reopen.
             let err = conn.execute("PRAGMA page_size = 512").unwrap_err();
             assert!(err.to_string().contains("usable bytes"));
+            assert_eq!(conn.get_page_size().get(), 4096);
             // The database must remain usable at a compatible page size.
             conn.execute("create table test(id integer primary key, value text)")
                 .unwrap();
