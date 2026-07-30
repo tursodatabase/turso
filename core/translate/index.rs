@@ -353,6 +353,7 @@ fn emit_refill_index(
             database_id,
             indexed: None,
             bound_index_method_patterns: Vec::new(),
+            bound_index_expressions: Vec::new(),
         }],
         vec![],
     );

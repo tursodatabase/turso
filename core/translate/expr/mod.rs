@@ -18,9 +18,7 @@ use crate::schema::{
     BTreeTable, ColDef, Column, ColumnLayout, GeneratedType, Table, Type, TypeDef,
 };
 use crate::sync::Arc;
-use crate::translate::expression_index::{
-    normalize_expr_for_index_matching, single_table_column_usage,
-};
+use crate::translate::expression_index::single_table_column_usage;
 use crate::translate::plan::{ColumnMask, Operation, ResultSetColumn, Search};
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;

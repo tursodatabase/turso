@@ -4,7 +4,6 @@ use crate::{
     translate::{
         collate::get_collseq_from_expr,
         expr::{as_binary_components, comparison_affinity, get_expr_affinity, unwrap_parens},
-        expression_index::normalize_expr_for_index_matching,
         plan::{JoinOrderMember, JoinedTable, NonFromClauseSubquery, TableReferences, WhereTerm},
         planner::{
             break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
@@ -906,11 +905,10 @@ pub fn constraints_from_where_clause(
             {
                 if let Some(position_in_index) = match constraint.table_col_pos {
                     Some(pos) => index.column_table_pos_to_index_pos(pos),
-                    None => constraint.expr.as_ref().and_then(|e| {
-                        let normalized =
-                            normalize_expr_for_index_matching(e, table_reference, table_references);
-                        index.expression_to_index_pos(&normalized)
-                    }),
+                    None => constraint
+                        .expr
+                        .as_ref()
+                        .and_then(|expr| table_reference.bound_expression_index_pos(index, expr)),
                 } {
                     turso_assert!(
                         constraint.usable,
@@ -1279,10 +1277,10 @@ pub(super) fn partial_index_predicate_terms(
     table_reference: &JoinedTable,
     query_where_clause: &[WhereTerm],
 ) -> Option<SmallVec<[usize; 4]>> {
-    let index_where = index
-        .where_clause
-        .as_ref()
-        .expect("partial_index_predicate_terms requires a partial index");
+    assert!(
+        index.where_clause.is_some(),
+        "partial_index_predicate_terms requires a partial index"
+    );
     let can_use_query_term = |term: &WhereTerm| -> bool {
         let Some(join_info) = &table_reference.join_info else {
             return true;
@@ -1295,12 +1293,9 @@ pub(super) fn partial_index_predicate_terms(
         }
         true
     };
-    // Bind the index WHERE expression's column references to this query's
-    // table reference so it can be compared symmetrically against bound query
-    // WHERE terms. Each conjunct of the index WHERE must match some query
-    // WHERE term for the partial index to be safe to use.
-    let mut bound = (**index_where).clone();
-    bind_partial_index_columns(&mut bound, table_reference);
+    // The binder rebased the schema predicate to this query's table id. Each
+    // conjunct must match some query WHERE term for the partial index to be safe.
+    let mut bound = table_reference.bound_partial_index_where(index)?.to_owned();
     rewrite_between_exprs(&mut bound).ok()?;
     let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
     break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
@@ -1336,28 +1331,21 @@ pub(super) fn can_use_partial_index(
     partial_index_predicate_terms(index, table_reference, query_where_clause).is_some()
 }
 
-/// Rewrite the pre-resolved `SELF_TABLE` references in a partial-index WHERE
-/// expression to `table_reference`'s id, making the expression directly
-/// comparable to a bound query expression via `exprs_are_equivalent`.
-fn bind_partial_index_columns(expr: &mut ast::Expr, table_reference: &JoinedTable) {
-    crate::schema::bind_self_table_expr(expr, table_reference.internal_id);
-}
-
 /// Estimate the selectivity of a partial index's WHERE clause, i.e. what
 /// fraction of the table's rows pass the predicate (and therefore appear in
-/// the partial index). The expression is bound to the table's column space
-/// first so that leaf comparisons can dispatch through the standard
-/// `estimate_selectivity` path — picking up ANALYZE stats when available.
+/// the partial index). Binding already rebased the expression to the table's
+/// column space, so leaf comparisons can use the standard ANALYZE-aware path.
 pub fn estimate_partial_index_where_selectivity(
-    where_expr: &ast::Expr,
+    index: &Index,
     table_reference: &JoinedTable,
     schema: &Schema,
     available_indexes: &AvailableIndexes,
     params: &CostModelParams,
 ) -> f64 {
-    let mut bound = where_expr.clone();
-    bind_partial_index_columns(&mut bound, table_reference);
-    estimate_bound_expr_selectivity(&bound, table_reference, schema, available_indexes, params)
+    let bound = table_reference
+        .bound_partial_index_where(index)
+        .expect("partial index predicate must be bound before optimization");
+    estimate_bound_expr_selectivity(bound, table_reference, schema, available_indexes, params)
 }
 
 fn estimate_bound_expr_selectivity(

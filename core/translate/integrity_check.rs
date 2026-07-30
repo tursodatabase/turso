@@ -282,6 +282,7 @@ fn translate_integrity_check_impl(
                 database_id,
                 indexed: None,
                 bound_index_method_patterns: Vec::new(),
+                bound_index_expressions: Vec::new(),
             }],
             vec![],
         );

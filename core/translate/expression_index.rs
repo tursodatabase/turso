@@ -1,42 +1,8 @@
-use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
-use crate::translate::plan::{ColumnUsedMask, JoinedTable, TableReferences};
+use crate::translate::expr::{walk_expr, WalkControl};
+use crate::translate::plan::ColumnUsedMask;
 use crate::Result;
 use turso_parser::ast;
 use turso_parser::ast::TableInternalId;
-
-/// Normalize a query expression so it can be compared with an
-/// expression stored on an index definition.
-///
-/// Index expressions are stored with their column references pre-resolved to
-/// `SELF_TABLE` positional form at schema load. A bound query expression uses
-/// the query's table ids, so rewriting `table_reference`'s id back to
-/// `SELF_TABLE` makes both sides directly comparable:
-///
-/// - `CREATE INDEX idx ON t(a + b);` stores `Column(SELF, 0) + Column(SELF, 1)`
-/// - `SELECT * FROM t WHERE a + b = 10;` binds to `Column(t, 0) + Column(t, 1)`
-///
-/// After normalization, both sides look like `Column(SELF, 0) + Column(SELF, 1)`.
-/// Columns of other tables keep their real ids and can never match.
-pub fn normalize_expr_for_index_matching(
-    expr: &ast::Expr,
-    table_reference: &JoinedTable,
-    _table_references: &TableReferences,
-) -> ast::Expr {
-    let mut expr = expr.clone();
-    let mut normalize = |e: &mut ast::Expr| -> Result<WalkControl> {
-        match e {
-            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. }
-                if *table == table_reference.internal_id =>
-            {
-                *table = TableInternalId::SELF_TABLE;
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    };
-    let _ = walk_expr_mut(&mut expr, &mut normalize);
-    expr
-}
 
 /// Determine whether an expression references columns from exactly one table
 /// and, if so, which specific columns are used.

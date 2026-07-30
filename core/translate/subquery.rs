@@ -642,6 +642,7 @@ fn prepare_bound_subquery_plan(
                     database_id: 0,
                     indexed: None,
                     bound_index_method_patterns: Vec::new(),
+                    bound_index_expressions: Vec::new(),
                 },
             );
         }

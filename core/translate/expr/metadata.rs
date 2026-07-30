@@ -276,8 +276,7 @@ pub(super) fn try_emit_expression_index_value(
     let Some(index) = table_reference.op.index() else {
         return Ok(false);
     };
-    let normalized = normalize_expr_for_index_matching(expr, table_reference, referenced_tables);
-    let Some(expr_pos) = index.expression_to_index_pos(&normalized) else {
+    let Some(expr_pos) = table_reference.bound_expression_index_pos(index, expr) else {
         return Ok(false);
     };
     let Some(cursor_id) =

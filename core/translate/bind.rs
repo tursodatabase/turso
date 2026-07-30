@@ -20,6 +20,20 @@ fn take_expr(expr: &mut ast::Expr) -> ast::Expr {
     std::mem::replace(expr, ast::Expr::Literal(ast::Literal::Null))
 }
 
+fn rebase_self_table_expr(expr: &mut ast::Expr, internal_id: ast::TableInternalId) {
+    let _ = walk_expr_mut(expr, &mut |expr| {
+        match expr {
+            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. }
+                if table.is_self_table() =>
+            {
+                *table = internal_id;
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+}
+
 /// Validate a referenced CTE's explicit column list against its SELECT's
 /// result column count. SQLite defers this check until the CTE is actually
 /// referenced, so unreferenced CTEs with mismatched counts don't error.
@@ -249,6 +263,8 @@ pub struct ScopeTable {
     pub indexed: Option<ast::Indexed>,
     /// Custom index-method patterns bound to `internal_id`.
     pub bound_index_method_patterns: Vec<super::plan::BoundIndexMethodPattern>,
+    /// Schema index expressions rebound to `internal_id`.
+    pub bound_index_expressions: Vec<super::plan::BoundIndexExpressions>,
 }
 
 #[derive(Clone)]
@@ -806,6 +822,7 @@ fn upsert_scope_table(
         database_id,
         indexed: None,
         bound_index_method_patterns: Vec::new(),
+        bound_index_expressions: Vec::new(),
     }
 }
 
@@ -1335,6 +1352,7 @@ impl BoundSelect {
                     database_id: scope_table.database_id,
                     indexed: scope_table.indexed,
                     bound_index_method_patterns: scope_table.bound_index_method_patterns,
+                    bound_index_expressions: scope_table.bound_index_expressions,
                 }),
                 ScopeTableSource::Cte { name, .. } => {
                     // Clone rather than remove: the same CTE may be referenced
@@ -2849,6 +2867,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                                 database_id: 0,
                                 indexed: None,
                                 bound_index_method_patterns: Vec::new(),
+                                bound_index_expressions: Vec::new(),
                             });
                         }
                         crate::bail_parse_error!("circular reference: {}", table_name);
@@ -2874,6 +2893,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         database_id: 0,
                         indexed: None,
                         bound_index_method_patterns: Vec::new(),
+                        bound_index_expressions: Vec::new(),
                     });
                 }
 
@@ -2946,6 +2966,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         database_id: 0,
                         indexed: None,
                         bound_index_method_patterns: Vec::new(),
+                        bound_index_expressions: Vec::new(),
                     });
                 }
 
@@ -2997,6 +3018,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         database_id,
                         indexed: None,
                         bound_index_method_patterns: Vec::new(),
+                        bound_index_expressions: Vec::new(),
                     });
                 }
 
@@ -3043,6 +3065,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     database_id,
                     indexed: indexed.clone(),
                     bound_index_method_patterns: Vec::new(),
+                    bound_index_expressions: Vec::new(),
                 })
             }
             // Inline subquery in FROM: SELECT ... FROM (SELECT ...)
@@ -3084,6 +3107,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     database_id: 0,
                     indexed: None,
                     bound_index_method_patterns: Vec::new(),
+                    bound_index_expressions: Vec::new(),
                 })
             }
             // Virtual table function call: SELECT ... FROM table_func(args)
@@ -3151,6 +3175,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     database_id: 0, // Virtual tables are always in main schema
                     indexed: None,
                     bound_index_method_patterns: Vec::new(),
+                    bound_index_expressions: Vec::new(),
                 })
             }
             // Parenthesized FROM subclause: SELECT ... FROM (t1 JOIN t2 ON ...)
@@ -3186,6 +3211,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     database_id: 0,
                     indexed: None,
                     bound_index_method_patterns: Vec::new(),
+                    bound_index_expressions: Vec::new(),
                 })
             }
         }
@@ -4115,6 +4141,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             right_join_swapped,
         };
         self.bind_index_method_patterns(&mut scope)?;
+        self.bind_index_expressions(&mut scope);
 
         // Bind ON expressions against the complete scope
         for join in &mut from.joins {
@@ -4184,6 +4211,44 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             scope_table.bound_index_method_patterns = bound_patterns;
         }
         Ok(())
+    }
+
+    fn bind_index_expressions(&self, scope: &mut BindScope) {
+        for scope_table in &mut scope.tables {
+            let ScopeTableSource::Table(table) = &scope_table.source else {
+                continue;
+            };
+            let indexes = self
+                .resolver
+                .with_schema(scope_table.database_id, |schema| {
+                    schema
+                        .get_indices(table.get_name())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                });
+            scope_table.bound_index_expressions = indexes
+                .into_iter()
+                .map(|index| {
+                    let mut columns = index
+                        .columns
+                        .iter()
+                        .map(|column| column.expr.clone())
+                        .collect::<Vec<_>>();
+                    let mut where_clause = index.where_clause.clone();
+                    for expr in columns.iter_mut().flatten() {
+                        rebase_self_table_expr(expr, scope_table.internal_id);
+                    }
+                    if let Some(expr) = where_clause.as_mut() {
+                        rebase_self_table_expr(expr, scope_table.internal_id);
+                    }
+                    super::plan::BoundIndexExpressions {
+                        index_name: index.name.clone(),
+                        columns,
+                        where_clause,
+                    }
+                })
+                .collect();
+        }
     }
 
     fn bind_index_method_pattern(
@@ -4435,10 +4500,12 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 database_id,
                 indexed,
                 bound_index_method_patterns: Vec::new(),
+                bound_index_expressions: Vec::new(),
             }],
             right_join_swapped: false,
         };
         self.bind_index_method_patterns(&mut scope)?;
+        self.bind_index_expressions(&mut scope);
         Ok(scope)
     }
 
@@ -4618,6 +4685,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     database_id,
                     indexed: None,
                     bound_index_method_patterns: Vec::new(),
+                    bound_index_expressions: Vec::new(),
                 }],
                 right_join_swapped: false,
             };

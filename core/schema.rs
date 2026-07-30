@@ -6043,9 +6043,9 @@ impl Index {
     }
 
     /// Given an expression, return the position in the index if it matches an expression index column.
-    /// Index expressions are stored with column references pre-resolved to `SELF_TABLE` form, so the
-    /// caller should normalize the query expression the same way
-    /// (see `normalize_expr_for_index_matching`). Generated-column-backed index columns also carry
+    /// Index expressions are stored with column references pre-resolved to `SELF_TABLE` form.
+    /// The binder rebases them to each query table id before planning. Generated-column-backed
+    /// index columns also carry
     /// an expression (the column's defining expression) but are matched by column position, not here.
     pub fn expression_to_index_pos(&self, expr: &Expr) -> Option<usize> {
         self.columns.iter().position(|c| {
