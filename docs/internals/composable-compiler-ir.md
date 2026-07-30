@@ -385,8 +385,23 @@ boundary (the whole tree is constant, so the span opened by
       negated comparison to Next, constants hoisted to the prologue);
       multi-term AND is correct but lays mid blocks after the latch
       (trampoline Gotos) — accepted as different-but-correct.
-- [ ] 4a-3. LIMIT in the scan gate (needs the counter as a
-      loop-carried value or slot).
+- [x] 4a-3. LIMIT in the scan gate: no loop-carried value or slot was
+      needed after all — the counter register is an external mutable
+      resource (allocated, initialized, MustBeInt-checked, and
+      LIMIT-0-guarded by the still-eager `init_limit` before the hook
+      runs, exactly like cursors from InitLoop), and the loop counts it
+      down with a new fused `Terminator::DecrJumpZero { counter_reg,
+      if_zero, if_more }` after each produced row (`if_zero` -> the
+      bypassed done exit). Mutating an interned constant would be
+      unsound, which is precisely why the counter stays an external
+      physical register rather than an IR value for now; a loop-carried
+      counter value becomes interesting only when init_limit itself
+      moves into the IR. EXPLAIN for WHERE + LIMIT scans is
+      instruction-identical to eager (ResultRow / DecrJumpZero / Next).
+      OFFSET stays gated out (needs the IfPos row-skip before the
+      projection).
+- [ ] 4a-4. OFFSET in the scan gate (IfPos skip-and-decrement before
+      the projection, same external-counter pattern).
 - [ ] 4b. Joins, aggregates, sorters, subqueries as stream operators;
       `emitter/` + `main_loop/` sequencing becomes tree lowering.
 - [ ] 4c. Shrink and remove the eager-emission fallback per construct.

@@ -44,21 +44,25 @@ use crate::Result;
 
 /// Compile a whole simple-scan SELECT through the pipeline: one
 /// forward B-tree table scan with no index, filtering rows with
-/// IR-representable WHERE terms and projecting IR-representable result
-/// columns straight to result rows. This is the first row-stream
-/// integration: `scan(t).filter(where).map(projection).consume(rows)`
-/// as a composed description replacing the eager
+/// IR-representable WHERE terms, projecting IR-representable result
+/// columns straight to result rows, and counting down LIMIT. This is
+/// the first row-stream integration:
+/// `scan(t).filter(where).map(projection).limit(n).consume(rows)` as a
+/// composed description replacing the eager
 /// OpenLoop/LoopBody/CloseLoop sequencing. Cursors are opened by the
-/// (still eager) InitLoop; the scan references them externally.
+/// (still eager) InitLoop and the LIMIT counter register is
+/// initialized by the (still eager) `init_limit`; the scan references
+/// both externally.
 ///
 /// Returns false (emitting nothing) for anything outside the gate:
-/// joins, indexes, aggregates, sorting, windows, DISTINCT,
-/// LIMIT/OFFSET, subqueries, virtual tables, WHERE terms the condition
-/// frontend cannot describe, or non-ResultRows destinations.
+/// joins, indexes, aggregates, sorting, windows, DISTINCT, OFFSET,
+/// subqueries, virtual tables, WHERE terms the condition frontend
+/// cannot describe, or non-ResultRows destinations.
 pub(crate) fn try_emit_scan_query(
     program: &mut ProgramBuilder,
     plan: &crate::translate::plan::SelectPlan,
     resolver: &crate::translate::emitter::Resolver,
+    limit_ctx: Option<crate::translate::emitter::LimitCtx>,
 ) -> Result<bool> {
     use crate::schema::Table;
     use crate::translate::plan::{
@@ -70,7 +74,6 @@ pub(crate) fn try_emit_scan_query(
         || !plan.order_by.is_empty()
         || plan.window.is_some()
         || !matches!(plan.distinctness, Distinctness::NonDistinct)
-        || plan.limit.is_some()
         || plan.offset.is_some()
         || !plan.non_from_clause_subqueries.is_empty()
         || plan.contains_constant_false_condition
@@ -159,12 +162,23 @@ pub(crate) fn try_emit_scan_query(
         return Ok(false);
     };
 
+    // LIMIT's counter register was allocated, initialized, and
+    // zero-checked by the (still eager) init_limit; the loop only
+    // counts it down after each produced row.
+    let limit_counter = match (&plan.limit, limit_ctx) {
+        (Some(_), Some(limit_ctx)) => Some(limit_ctx.reg_limit),
+        (Some(_), None) => return Ok(false),
+        (None, _) => None,
+    };
+
     // The scan_loop shape with an optional filter stage spliced between
     // the scan and the projection: rows failing (or NULLing) the filter
     // jump straight to the latch, exactly the eager per-loop
-    // ConditionMetadata contract (false == NULL == next row). The done
-    // continuation is an empty exit block, bypassed at emission, so the
-    // loop needs no trailing block of its own.
+    // ConditionMetadata contract (false == NULL == next row). With a
+    // LIMIT, each produced row counts the external counter down and
+    // leaves the loop at zero. The done continuation is an empty exit
+    // block, bypassed at emission, so the loop needs no trailing block
+    // of its own.
     let fallthrough = program.allocate_label();
     let mut builder = ir::FuncBuilder::new();
     let done_exit = builder.declare_exit();
@@ -195,7 +209,14 @@ pub(crate) fn try_emit_scan_query(
         values.push(column.run(&mut builder)?);
     }
     builder.emit_row(values);
-    builder.jump(latch, Vec::new());
+    match limit_counter {
+        Some(counter_reg) => builder.decr_jump_zero(
+            counter_reg,
+            ir::JumpTarget::new(done, Vec::new()),
+            ir::JumpTarget::new(latch, Vec::new()),
+        ),
+        None => builder.jump(latch, Vec::new()),
+    }
     builder.switch_to(latch);
     builder.next_row(
         cursor,
@@ -1550,6 +1571,62 @@ mod tests {
             panic!("unexpected filtered scan shape: {insns:?}");
         };
         assert_eq!(leaf_dest, start_reg);
+    }
+
+    #[test]
+    fn limited_scans_count_down_through_the_external_counter() {
+        // scan(t).map(x).limit(n), the shape try_emit_scan_query builds
+        // for LIMIT: after each ResultRow the external counter register
+        // (initialized by the still-eager init_limit) is decremented,
+        // leaving the loop through the bypassed exit at zero — the
+        // eager ResultRow / DecrJumpZero / Next sequence.
+        let column_leaf = parse_expr("x");
+        let mut builder = FuncBuilder::new();
+        let done_exit = builder.declare_exit();
+        let done = builder.exit_block(done_exit);
+        let body = builder.create_block();
+        let latch = builder.create_block();
+        builder.rewind(
+            0,
+            JumpTarget::new(done, Vec::new()),
+            JumpTarget::new(body, Vec::new()),
+        );
+        builder.switch_to(body);
+        let projected = builder.leaf(&column_leaf);
+        builder.emit_row(vec![projected]);
+        builder.decr_jump_zero(
+            9,
+            JumpTarget::new(done, Vec::new()),
+            JumpTarget::new(latch, Vec::new()),
+        );
+        builder.switch_to(latch);
+        builder.next_row(
+            0,
+            JumpTarget::new(body, Vec::new()),
+            JumpTarget::new(done, Vec::new()),
+        );
+        let func = builder.finish();
+        verify(&func).unwrap();
+
+        let mut program = test_program();
+        let fallthrough = program.allocate_label();
+        let mut leaf_emitter = stub_leaf_emitter();
+        emit::emit_condition_function(
+            &mut program,
+            &func,
+            &[fallthrough],
+            Some(fallthrough),
+            Some(&mut leaf_emitter),
+        )
+        .unwrap();
+        program.preassign_label_to_next_insn(fallthrough);
+        program.resolve_labels().unwrap();
+        let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
+        let [Insn::Rewind { cursor_id: 0, .. }, Insn::Integer { value: 7, .. }, Insn::ResultRow { count: 1, .. }, Insn::DecrJumpZero { reg: 9, .. }, Insn::Next { cursor_id: 0, .. }] =
+            insns[..]
+        else {
+            panic!("unexpected limited scan shape: {insns:?}");
+        };
     }
 
     #[test]

@@ -189,7 +189,9 @@ pub fn verify(func: &Function) -> Result<(), VerifyError> {
             }
             Terminator::NullBranch { value, .. } => check(*value, end)?,
             Terminator::Ret { value } => check(*value, end)?,
-            Terminator::Rewind { .. } | Terminator::Next { .. } => {}
+            Terminator::Rewind { .. }
+            | Terminator::Next { .. }
+            | Terminator::DecrJumpZero { .. } => {}
         }
         for target in terminator.targets() {
             for &arg in &target.args {

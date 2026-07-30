@@ -373,6 +373,16 @@ pub enum Terminator {
         if_more: JumpTarget,
         if_done: JumpTarget,
     },
+    /// Decrement an external counter register in place (owned and
+    /// initialized by surrounding eager code, referenced by its
+    /// physical register like `Rewind` cursors): `if_zero` when the
+    /// counter reaches zero, `if_more` otherwise
+    /// (`Insn::DecrJumpZero`). The LIMIT countdown.
+    DecrJumpZero {
+        counter_reg: usize,
+        if_zero: JumpTarget,
+        if_more: JumpTarget,
+    },
 }
 
 impl Terminator {
@@ -402,6 +412,9 @@ impl Terminator {
             Terminator::Next {
                 if_more, if_done, ..
             } => vec![if_more, if_done],
+            Terminator::DecrJumpZero {
+                if_zero, if_more, ..
+            } => vec![if_zero, if_more],
             Terminator::Ret { .. } | Terminator::Exit(_) => Vec::new(),
         }
     }
@@ -661,6 +674,16 @@ impl FuncBuilder {
             cursor,
             if_more,
             if_done,
+        });
+    }
+
+    /// Terminate the current block by decrementing an external counter
+    /// register, leaving for `if_zero` when it reaches zero.
+    pub fn decr_jump_zero(&mut self, counter_reg: usize, if_zero: JumpTarget, if_more: JumpTarget) {
+        self.terminate(Terminator::DecrJumpZero {
+            counter_reg,
+            if_zero,
+            if_more,
         });
     }
 
