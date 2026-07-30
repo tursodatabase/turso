@@ -239,6 +239,27 @@ expect {
     2|
 }
 
+@cross-check-integrity
+test subquery-scalar-sibling-values-and-exists {
+    create table outer_values(id, value);
+    create table scalar_left(value);
+    create table scalar_right(value);
+    create table scalar_exists(value);
+    insert into outer_values values (1, 2), (2, 3);
+    insert into scalar_left values (40), (99);
+    insert into scalar_right values (7), (8);
+    insert into scalar_exists values (1);
+    select id,
+           value + (select value from scalar_left)
+                 + (select value from scalar_right)
+      from outer_values
+     where exists (select value from scalar_exists);
+}
+expect {
+    1|49
+    2|50
+}
+
 # LIMIT and OFFSET are applied before the scalar subquery chooses its first row.
 @cross-check-integrity
 test subquery-scalar-limit-offset-first-row {
