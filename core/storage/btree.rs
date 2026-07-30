@@ -9936,6 +9936,15 @@ fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: usize) -> Re
         page.write_fragmented_bytes_count(0);
     }
     page.write_cell_count(page.cell_count() as u16 - 1);
+
+    for overflow_cell in page.overflow_cells.iter() {
+        turso_debug_assert!(
+            overflow_cell.index <= cell_idx,
+            "drop_cell: pending overflow cell positioned after dropped cell",
+            { "overflow_index": overflow_cell.index, "cell_idx": cell_idx }
+        );
+    }
+
     debug_validate_cells!(page, usable_space);
     Ok(())
 }
