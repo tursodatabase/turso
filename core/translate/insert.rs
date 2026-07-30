@@ -3587,9 +3587,13 @@ fn emit_replace_delete_conflicting_row(
                 .first()
                 .expect("INSERT has a target table reference")
                 .internal_id;
-            let where_copy = index
-                .bind_where_expr(target_internal_id)
-                .expect("where clause to exist");
+            let where_copy = crate::translate::bind::bind_schema_expr(
+                index
+                    .where_clause
+                    .as_deref()
+                    .expect("where clause to exist"),
+                target_internal_id,
+            )?;
             let skip_label = program.allocate_label();
             let reg = program.alloc_register();
             translate_expr_no_constant_opt(

@@ -22,7 +22,10 @@ fn take_expr(expr: &mut ast::Expr) -> ast::Expr {
     std::mem::replace(expr, ast::Expr::Literal(ast::Literal::Null))
 }
 
-fn rebase_self_table_expr(expr: &mut ast::Expr, internal_id: ast::TableInternalId) {
+/// Point SELF_TABLE references in a stored schema expression at a concrete
+/// table reference. This does not reject unresolved identifiers because ALTER
+/// validation may deliberately bind them through an expression register cache.
+pub fn rebase_schema_expr(expr: &mut ast::Expr, internal_id: ast::TableInternalId) {
     let _ = walk_expr_mut(expr, &mut |expr| {
         match expr {
             ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. }
@@ -43,7 +46,7 @@ pub fn bind_schema_expr(expr: &ast::Expr, internal_id: ast::TableInternalId) -> 
     if let Some(name) = crate::schema::first_unresolved_identifier(&bound) {
         crate::bail_parse_error!("no such column: {}", name);
     }
-    rebase_self_table_expr(&mut bound, internal_id);
+    rebase_schema_expr(&mut bound, internal_id);
     Ok(bound)
 }
 
@@ -4813,10 +4816,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         .collect::<Vec<_>>();
                     let mut where_clause = index.where_clause.clone();
                     for expr in columns.iter_mut().flatten() {
-                        rebase_self_table_expr(expr, scope_table.internal_id);
+                        rebase_schema_expr(expr, scope_table.internal_id);
                     }
                     if let Some(expr) = where_clause.as_mut() {
-                        rebase_self_table_expr(expr, scope_table.internal_id);
+                        rebase_schema_expr(expr, scope_table.internal_id);
                     }
                     super::plan::BoundIndexExpressions {
                         index_name: index.name.clone(),

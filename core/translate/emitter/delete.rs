@@ -706,9 +706,13 @@ fn emit_delete_row_common(
 
         for (index, index_cursor_id) in indexes_to_delete {
             let skip_delete_label = if index.where_clause.is_some() {
-                let where_copy = index
-                    .bind_where_expr(internal_id)
-                    .expect("where clause to exist");
+                let where_copy = crate::translate::bind::bind_schema_expr(
+                    index
+                        .where_clause
+                        .as_deref()
+                        .expect("where clause to exist"),
+                    internal_id,
+                )?;
                 let skip_label = program.allocate_label();
                 let reg = program.alloc_register();
                 translate_expr_no_constant_opt(

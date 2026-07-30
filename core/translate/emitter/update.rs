@@ -1783,11 +1783,13 @@ fn emit_update_insns<'a>(
     let mut seen_replace = false;
     for (index, (idx_cursor_id, record_reg)) in indexes_to_update.iter().zip(index_cursors) {
         let (old_satisfies_where, new_satisfies_where) = if index.where_clause.is_some() {
-            // This means that we need to bind the column references to a copy of the index Expr,
-            // so we can emit Insn::Column instructions and refer to the old values.
-            let where_clause = index
-                .bind_where_expr(internal_id)
-                .expect("where clause to exist");
+            let where_clause = crate::translate::bind::bind_schema_expr(
+                index
+                    .where_clause
+                    .as_deref()
+                    .expect("where clause to exist"),
+                internal_id,
+            )?;
             let old_satisfied_reg = program.alloc_register();
             translate_expr_no_constant_opt(
                 program,

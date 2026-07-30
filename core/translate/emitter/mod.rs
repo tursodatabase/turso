@@ -1949,10 +1949,7 @@ pub(crate) fn emit_index_column_value_old_image(
     dest_reg: usize,
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
-        // Index expressions are stored pre-resolved to SELF_TABLE form;
-        // point them at this statement's table reference.
-        let mut expr = expr.as_ref().clone();
-        crate::schema::bind_self_table_expr(&mut expr, table_internal_id);
+        let expr = crate::translate::bind::bind_schema_expr(expr, table_internal_id)?;
 
         let self_table_context = SelfTableContext::ForSelect {
             table_ref_id: table_internal_id,
@@ -2108,7 +2105,10 @@ fn emit_check_constraint_bytecode(
         if let Some(joined_table) =
             referenced_tables.and_then(|tables| tables.joined_tables().first())
         {
-            crate::schema::bind_self_table_expr(&mut rewritten_expr, joined_table.internal_id);
+            crate::translate::bind::rebase_schema_expr(
+                &mut rewritten_expr,
+                joined_table.internal_id,
+            );
         }
 
         translate_expr_no_constant_opt(

@@ -4204,22 +4204,6 @@ fn resolve_self_table_leaf(name: &str, table: &BTreeTable) -> Option<Expr> {
     None
 }
 
-/// Rewrite `SELF_TABLE` positional references in a schema expression (index
-/// key expression, partial-index WHERE, generated column) to a real table id
-/// so the expression can be translated or compared against bound query
-/// expressions.
-pub fn bind_self_table_expr(expr: &mut Expr, internal_id: TableInternalId) {
-    let _ = walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
-        match e {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } if table.is_self_table() => {
-                *table = internal_id;
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    });
-}
-
 /// Decrement `SELF_TABLE` column positions greater than the dropped
 /// column's position in a stored schema expression (index key,
 /// partial-index WHERE, CHECK constraint).
@@ -4233,12 +4217,6 @@ pub fn shift_self_table_positions_after_drop(expr: &mut Expr, dropped_index: usi
         Ok(WalkControl::Continue)
     })?;
     Ok(())
-}
-
-/// True if the expression still contains unresolved identifier leaves
-/// (names that lenient schema-load resolution could not map to a column).
-pub fn expr_has_unresolved_identifiers(expr: &Expr) -> bool {
-    first_unresolved_identifier(expr).is_some()
 }
 
 /// Returns the first unresolved identifier leaf in the expression, if any
@@ -6139,20 +6117,6 @@ impl Index {
             })
         });
         ok
-    }
-
-    /// Return the partial-index WHERE clause with its `SELF_TABLE`
-    /// references bound to `internal_id`. Returns `None` for indexes without
-    /// a WHERE clause, or when the stored clause still contains identifiers
-    /// that lenient schema-load resolution could not map to columns.
-    pub fn bind_where_expr(&self, internal_id: TableInternalId) -> Option<ast::Expr> {
-        let where_clause = self.where_clause.as_ref()?;
-        if expr_has_unresolved_identifiers(where_clause) {
-            return None;
-        }
-        let mut expr = where_clause.clone();
-        bind_self_table_expr(&mut expr, internal_id);
-        Some(*expr)
     }
 }
 

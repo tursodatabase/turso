@@ -357,7 +357,11 @@ fn emit_refill_index(
         }],
         vec![],
     );
-    let where_clause = idx.bind_where_expr(table_ref);
+    let where_clause = idx
+        .where_clause
+        .as_deref()
+        .map(|expr| crate::translate::bind::bind_schema_expr(expr, table_ref))
+        .transpose()?;
 
     if idx
         .index_method
@@ -1133,10 +1137,12 @@ fn emit_index_column_value_from_cursor(
     if let Some(expr) = &idx_col.expr {
         // Index expressions are stored pre-resolved to SELF_TABLE form;
         // point them at this statement's table reference.
-        let mut expr = expr.as_ref().clone();
-        if let Some(jt) = table_references.joined_tables().first() {
-            crate::schema::bind_self_table_expr(&mut expr, jt.internal_id);
-        }
+        let table_internal_id = table_references
+            .joined_tables()
+            .first()
+            .expect("index creation has a target table reference")
+            .internal_id;
+        let expr = crate::translate::bind::bind_schema_expr(expr, table_internal_id)?;
         let self_table_context =
             table_references
                 .joined_tables()
