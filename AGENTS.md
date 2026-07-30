@@ -122,6 +122,22 @@ complete example.
 5. **Own your regressions.** If tests fail after your change, they are your regressions. Debug them directly. Never stash/revert to "check if they fail on main" — that wastes time and is categorically banned.
 6. **Validate your hypotheses.**: If you suspect a given cause for a bug, validate it and provide incontrovertible evidence. NEVER make unearned assumptions.
 
+## Always use plain language instead of complex jargon
+
+OOGA BOOGA! Programming already complex! Use simple word! Say what you mean! Examples:
+
+```diff
+-    /// Number of generated statements outside the engines' shared executable domain.
++    /// Number of statements skipped because EXPLAIN failed in at least one engine.
+
+...
+
+-    fn empty_schema_only_selects_bootstrap_safe_statements() {
++    fn empty_schema_never_chooses_a_statement_that_needs_a_table() {
+```
+
+No-one knows what the hell a bootstrap-safe statement is. Everyone knows what "a statement that needs a table" is.
+
 ## CI Note
 
 Running in GitHub Action? Max-turns limit in `.github/workflows/claude.yml`. OK to push WIP and continue in another action. Stay focused, avoid rabbit holes.
