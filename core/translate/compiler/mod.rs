@@ -43,17 +43,18 @@ use crate::vdbe::BranchOffset;
 use crate::Result;
 
 /// Compile a whole simple-scan SELECT through the pipeline: one
-/// forward B-tree table scan with no index, projecting IR-representable
-/// result columns straight to result rows. This is the first row-stream
-/// integration: `scan(t).map(projection).consume(result_rows)` as a
-/// composed description replacing the eager OpenLoop/LoopBody/CloseLoop
-/// sequencing. Cursors are opened by the (still eager) InitLoop; the
-/// scan references them externally.
+/// forward B-tree table scan with no index, filtering rows with
+/// IR-representable WHERE terms and projecting IR-representable result
+/// columns straight to result rows. This is the first row-stream
+/// integration: `scan(t).filter(where).map(projection).consume(rows)`
+/// as a composed description replacing the eager
+/// OpenLoop/LoopBody/CloseLoop sequencing. Cursors are opened by the
+/// (still eager) InitLoop; the scan references them externally.
 ///
 /// Returns false (emitting nothing) for anything outside the gate:
-/// joins, WHERE clauses (next slice), indexes, aggregates, sorting,
-/// windows, DISTINCT, LIMIT/OFFSET, subqueries, virtual tables, or
-/// non-ResultRows destinations.
+/// joins, indexes, aggregates, sorting, windows, DISTINCT,
+/// LIMIT/OFFSET, subqueries, virtual tables, WHERE terms the condition
+/// frontend cannot describe, or non-ResultRows destinations.
 pub(crate) fn try_emit_scan_query(
     program: &mut ProgramBuilder,
     plan: &crate::translate::plan::SelectPlan,
@@ -64,8 +65,7 @@ pub(crate) fn try_emit_scan_query(
         Distinctness, IterationDirection, Operation, QueryDestination, Scan,
     };
 
-    if !plan.where_clause.is_empty()
-        || !plan.aggregates.is_empty()
+    if !plan.aggregates.is_empty()
         || plan.group_by.is_some()
         || !plan.order_by.is_empty()
         || plan.window.is_some()
@@ -93,13 +93,51 @@ pub(crate) fn try_emit_scan_query(
         return Ok(false);
     }
 
-    // Describe every result column before emitting anything.
+    // Describe every WHERE term and result column before emitting
+    // anything. Collation effects fold in eager emission order:
+    // conditions run in the loop body before the projection.
     let build_ctx = BuildCtx {
         referenced_tables: Some(&plan.table_references),
         resolver: Some(resolver),
     };
-    let mut columns = Vec::with_capacity(plan.result_columns.len());
     let mut effect = expr::CollationEffect::Untouched;
+    let mut filter: Option<combine::Predicate<'_>> = None;
+    for term in &plan.where_clause {
+        if term.consumed {
+            continue;
+        }
+        if term.from_outer_join.is_some() {
+            return Ok(false);
+        }
+        if !term.should_eval_at_loop(
+            0,
+            &plan.join_order,
+            &plan.non_from_clause_subqueries,
+            Some(&plan.table_references),
+        ) {
+            // The (still eager) InitLoop already emitted before-loop
+            // terms; anything else is out of scope for a single scan.
+            if term.should_eval_before_loop(
+                &plan.join_order,
+                &plan.non_from_clause_subqueries,
+                Some(&plan.table_references),
+            ) {
+                continue;
+            }
+            return Ok(false);
+        }
+        let Some(built) = compile_condition_expr(&term.expr, &build_ctx)? else {
+            return Ok(false);
+        };
+        if let expr::CollationEffect::Sets(collation) = built.effect {
+            effect = expr::CollationEffect::Sets(collation);
+        }
+        filter = Some(match filter {
+            Some(previous) => previous.and(built.predicate),
+            None => built.predicate,
+        });
+    }
+    let mut columns = Vec::with_capacity(plan.result_columns.len());
     for result_column in &plan.result_columns {
         let Some(built) = compile_value_expr(&result_column.expr, &build_ctx)? else {
             return Ok(false);
@@ -121,19 +159,49 @@ pub(crate) fn try_emit_scan_query(
         return Ok(false);
     };
 
+    // The scan_loop shape with an optional filter stage spliced between
+    // the scan and the projection: rows failing (or NULLing) the filter
+    // jump straight to the latch, exactly the eager per-loop
+    // ConditionMetadata contract (false == NULL == next row). The done
+    // continuation is an empty exit block, bypassed at emission, so the
+    // loop needs no trailing block of its own.
     let fallthrough = program.allocate_label();
     let mut builder = ir::FuncBuilder::new();
-    let done = builder.declare_exit();
-    combine::scan_loop(cursor, move |builder| {
-        let mut values = Vec::with_capacity(columns.len());
-        for column in columns {
-            values.push(column.run(builder)?);
-        }
-        builder.emit_row(values);
-        Ok(())
-    })
-    .run(&mut builder)?;
-    builder.exit(done);
+    let done_exit = builder.declare_exit();
+    let done = builder.exit_block(done_exit);
+    let body = builder.create_block();
+    let row = filter.as_ref().map(|_| builder.create_block());
+    let latch = builder.create_block();
+    builder.rewind(
+        cursor,
+        ir::JumpTarget::new(done, Vec::new()),
+        ir::JumpTarget::new(body, Vec::new()),
+    );
+    builder.switch_to(body);
+    if let Some(filter) = filter {
+        let row = row.expect("row block created alongside the filter");
+        filter.run(
+            &mut builder,
+            combine::CondTargets {
+                if_true: row,
+                if_false: latch,
+                if_null: latch,
+            },
+        )?;
+        builder.switch_to(row);
+    }
+    let mut values = Vec::with_capacity(columns.len());
+    for column in columns {
+        values.push(column.run(&mut builder)?);
+    }
+    builder.emit_row(values);
+    builder.jump(latch, Vec::new());
+    builder.switch_to(latch);
+    builder.next_row(
+        cursor,
+        ir::JumpTarget::new(body, Vec::new()),
+        ir::JumpTarget::new(done, Vec::new()),
+    );
     let func = builder.finish();
 
     let mut emit_leaf =
@@ -1404,6 +1472,82 @@ mod tests {
         }, Insn::Next { cursor_id: 0, .. }] = insns[..]
         else {
             panic!("unexpected scan shape: {insns:?}");
+        };
+        assert_eq!(leaf_dest, start_reg);
+    }
+
+    #[test]
+    fn filtered_scans_splice_the_condition_before_the_projection() {
+        use super::ir::CmpOp;
+        use crate::vdbe::affinity::Affinity;
+        // scan(t).filter(x > 5).map(y), the shape try_emit_scan_query
+        // builds for WHERE: the filter emits as one negated comparison
+        // jumping to the latch (NULL included via jump_if_null, the
+        // eager per-loop contract where false == NULL == next row);
+        // passing rows fall straight into the projection. The done
+        // continuation is an empty exit block, bypassed at emission.
+        let filter_leaf = parse_expr("x");
+        let column_leaf = parse_expr("y");
+        let mut builder = FuncBuilder::new();
+        let done_exit = builder.declare_exit();
+        let done = builder.exit_block(done_exit);
+        let body = builder.create_block();
+        let row = builder.create_block();
+        let latch = builder.create_block();
+        builder.rewind(
+            0,
+            JumpTarget::new(done, Vec::new()),
+            JumpTarget::new(body, Vec::new()),
+        );
+        builder.switch_to(body);
+        let probe = builder.leaf(&filter_leaf);
+        let five = builder.int(5);
+        builder.cmp_branch(
+            CmpOp::Gt,
+            Some(Affinity::Numeric),
+            None,
+            probe,
+            five,
+            JumpTarget::new(row, Vec::new()),
+            JumpTarget::new(latch, Vec::new()),
+            JumpTarget::new(latch, Vec::new()),
+        );
+        builder.switch_to(row);
+        let projected = builder.leaf(&column_leaf);
+        builder.emit_row(vec![projected]);
+        builder.jump(latch, Vec::new());
+        builder.switch_to(latch);
+        builder.next_row(
+            0,
+            JumpTarget::new(body, Vec::new()),
+            JumpTarget::new(done, Vec::new()),
+        );
+        let func = builder.finish();
+        verify(&func).unwrap();
+
+        let mut program = test_program();
+        let fallthrough = program.allocate_label();
+        let mut leaf_emitter = stub_leaf_emitter();
+        emit::emit_condition_function(
+            &mut program,
+            &func,
+            &[fallthrough],
+            Some(fallthrough),
+            Some(&mut leaf_emitter),
+        )
+        .unwrap();
+        program.preassign_label_to_next_insn(fallthrough);
+        program.resolve_labels().unwrap();
+        let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
+        let [Insn::Integer { value: 5, .. }, Insn::Rewind { cursor_id: 0, .. }, Insn::Integer { value: 7, .. }, Insn::Le { .. }, Insn::Integer {
+            value: 7,
+            dest: leaf_dest,
+        }, Insn::ResultRow {
+            start_reg,
+            count: 1,
+        }, Insn::Next { cursor_id: 0, .. }] = insns[..]
+        else {
+            panic!("unexpected filtered scan shape: {insns:?}");
         };
         assert_eq!(leaf_dest, start_reg);
     }

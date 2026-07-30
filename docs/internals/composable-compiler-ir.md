@@ -363,14 +363,30 @@ boundary (the whole tree is constant, so the span opened by
       stays eager (cursor opening); the scan references cursors
       externally. EXPLAIN for `SELECT a, b FROM t` is
       instruction-identical to eager (columns steered straight into the
-      ResultRow pack, zero copies). Gates: no WHERE (next slice), joins,
-      indexes, aggregates, ORDER BY, windows, DISTINCT, LIMIT/OFFSET,
-      subqueries, virtual tables, or non-ResultRows destinations.
+      ResultRow pack, zero copies). Gates: joins, indexes, aggregates,
+      ORDER BY, windows, DISTINCT, LIMIT/OFFSET, subqueries, virtual
+      tables, or non-ResultRows destinations.
       Lesson: array-typed columns need the eager bare-column decode
       path — now refused at the leaf gate (conformance caught it).
-- [ ] 4a-2. WHERE terms in the scan gate: thread the existing Predicate
-      compiler into the loop body (filter -> latch on false). Then
-      LIMIT (needs the counter as a loop-carried value or slot).
+- [x] 4a-2. WHERE terms in the scan gate: the Predicate compiler runs
+      as a filter stage spliced between the scan and the projection —
+      rows failing (or NULLing) the filter jump to the latch, the eager
+      per-loop `ConditionMetadata` contract (false == NULL == next
+      row). Loop-position terms compile through
+      `compile_condition_expr` and AND-fold; before-loop terms stay
+      with the eager InitLoop; consumed terms skip; anything else
+      (outer-join terms, undescribable shapes) falls back whole.
+      Collation effects fold in eager emission order (conditions before
+      projection). The loop is now built inline in
+      `try_emit_scan_query` (rewind -> body -> [filter -> row] ->
+      latch -> empty exit block, bypassed at emission) rather than via
+      `scan_loop`, so the filter targets the latch directly.
+      Single-term EXPLAIN is instruction-identical to eager (one
+      negated comparison to Next, constants hoisted to the prologue);
+      multi-term AND is correct but lays mid blocks after the latch
+      (trampoline Gotos) — accepted as different-but-correct.
+- [ ] 4a-3. LIMIT in the scan gate (needs the counter as a
+      loop-carried value or slot).
 - [ ] 4b. Joins, aggregates, sorters, subqueries as stream operators;
       `emitter/` + `main_loop/` sequencing becomes tree lowering.
 - [ ] 4c. Shrink and remove the eager-emission fallback per construct.
