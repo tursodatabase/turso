@@ -1233,6 +1233,18 @@ fn wire_integer_literal_reports_int4() {
     });
 }
 
+/// Clients decode values off the OID, so FROM-position scalars must
+/// report their result type rather than bytea.
+#[test]
+fn wire_from_position_scalar_reports_text() {
+    with_pg_client(|c| {
+        assert_eq!(
+            c.query_column_oids("SELECT * FROM current_schema()"),
+            vec![OID_TEXT]
+        );
+    });
+}
+
 /// `SELECT 3.14` reports FLOAT8. PG normally returns NUMERIC for unannotated
 /// numeric literals; FLOAT8 is the tursopg choice because Turso stores
 /// reals as 64-bit floats and the client decodes the wire bytes directly.
