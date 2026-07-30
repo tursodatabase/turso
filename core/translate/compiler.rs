@@ -19,7 +19,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u16, CmpInsFlags, HashDistinctData, Insn, SortComparatorType},
+        insn::{to_u16, CmpInsFlags, HashDistinctData, IdxInsertFlags, Insn, SortComparatorType},
         PageIdx,
     },
     LimboError, Result,
@@ -984,6 +984,17 @@ impl LoweredRegion {
             ))),
         }
     }
+
+    pub(crate) fn expect_no_result_rows(&self) -> Result<()> {
+        if self.result_row_packs.is_empty() {
+            Ok(())
+        } else {
+            Err(LimboError::InternalError(format!(
+                "compiler IR destination expected no result rows, lowered {}",
+                self.result_row_packs.len()
+            )))
+        }
+    }
 }
 
 /// A symbolic value supplied when an IR region is lowered.
@@ -1127,6 +1138,12 @@ enum EffectOp {
     ResultRow {
         pack: ValuePack,
     },
+    IndexInsert {
+        cursor: CursorId,
+        pack: ValuePack,
+        index_name: String,
+        affinity: Option<String>,
+    },
     OpenSorter {
         sorter: SorterId,
     },
@@ -1225,9 +1242,11 @@ impl Instruction {
                 | EffectOp::SorterData { .. }
                 | EffectOp::OpenDistinctSet { .. },
             ) => (None, &[][..]),
-            Self::Effect(EffectOp::ResultRow { pack } | EffectOp::SorterInsert { pack, .. }) => {
-                (None, pack.values())
-            }
+            Self::Effect(
+                EffectOp::ResultRow { pack }
+                | EffectOp::IndexInsert { pack, .. }
+                | EffectOp::SorterInsert { pack, .. },
+            ) => (None, pack.values()),
         };
         scalar.into_iter().flatten().chain(values.iter().copied())
     }
@@ -1236,6 +1255,7 @@ impl Instruction {
         let cursors = match self {
             Self::Value { op, .. } => op.cursor().into_iter().collect(),
             Self::Effect(EffectOp::DeferredSeek { index, table }) => smallvec![*index, *table],
+            Self::Effect(EffectOp::IndexInsert { cursor, .. }) => smallvec![*cursor],
             Self::Effect(
                 EffectOp::OpenRead { .. }
                 | EffectOp::ResultRow { .. }
@@ -1255,6 +1275,7 @@ impl Instruction {
             | Self::Effect(
                 EffectOp::DeferredSeek { .. }
                 | EffectOp::ResultRow { .. }
+                | EffectOp::IndexInsert { .. }
                 | EffectOp::OpenSorter { .. }
                 | EffectOp::SorterInsert { .. }
                 | EffectOp::SorterData { .. }
@@ -1273,6 +1294,7 @@ impl Instruction {
                 EffectOp::OpenRead { .. }
                 | EffectOp::DeferredSeek { .. }
                 | EffectOp::ResultRow { .. }
+                | EffectOp::IndexInsert { .. }
                 | EffectOp::OpenSorter { .. }
                 | EffectOp::OpenDistinctSet { .. },
             ) => None,
@@ -1287,6 +1309,7 @@ impl Instruction {
                 EffectOp::OpenRead { .. }
                 | EffectOp::DeferredSeek { .. }
                 | EffectOp::ResultRow { .. }
+                | EffectOp::IndexInsert { .. }
                 | EffectOp::SorterInsert { .. }
                 | EffectOp::SorterData { .. }
                 | EffectOp::OpenDistinctSet { .. },
@@ -1302,6 +1325,7 @@ impl Instruction {
                 EffectOp::OpenRead { .. }
                 | EffectOp::DeferredSeek { .. }
                 | EffectOp::ResultRow { .. }
+                | EffectOp::IndexInsert { .. }
                 | EffectOp::OpenSorter { .. }
                 | EffectOp::SorterInsert { .. }
                 | EffectOp::SorterData { .. },
@@ -2070,6 +2094,7 @@ impl IrBuilder {
         let cursors: SmallVec<[CursorId; 2]> = match &op {
             EffectOp::OpenRead { cursor, .. } => smallvec![*cursor],
             EffectOp::DeferredSeek { index, table } => smallvec![*index, *table],
+            EffectOp::IndexInsert { cursor, .. } => smallvec![*cursor],
             EffectOp::ResultRow { .. }
             | EffectOp::OpenSorter { .. }
             | EffectOp::SorterInsert { .. }
@@ -2086,6 +2111,7 @@ impl IrBuilder {
             EffectOp::OpenRead { .. }
             | EffectOp::DeferredSeek { .. }
             | EffectOp::ResultRow { .. }
+            | EffectOp::IndexInsert { .. }
             | EffectOp::OpenDistinctSet { .. } => None,
         };
         if let Some(sorter) = sorter {
@@ -2288,10 +2314,12 @@ impl IrProgram {
             for (instruction_index, instruction) in block.instructions.iter().enumerate() {
                 if matches!(
                     instruction,
-                    Instruction::Effect(EffectOp::ResultRow { pack }) if pack.values().is_empty()
+                    Instruction::Effect(
+                        EffectOp::ResultRow { pack } | EffectOp::IndexInsert { pack, .. }
+                    ) if pack.values().is_empty()
                 ) {
                     return Err(LimboError::InternalError(
-                        "compiler IR result row must contain at least one value".to_owned(),
+                        "compiler IR row effect must contain at least one value".to_owned(),
                     ));
                 }
                 if let Instruction::Effect(EffectOp::SorterInsert { sorter, pack }) = instruction {
@@ -2597,6 +2625,7 @@ impl IrProgram {
                         EffectOp::OpenRead { .. }
                         | EffectOp::DeferredSeek { .. }
                         | EffectOp::ResultRow { .. }
+                        | EffectOp::IndexInsert { .. }
                         | EffectOp::OpenDistinctSet { .. },
                     ) => {}
                 }
@@ -3865,6 +3894,40 @@ impl IrProgram {
                             count: pack.values().len(),
                         });
                     }
+                    Instruction::Effect(EffectOp::IndexInsert {
+                        cursor,
+                        pack,
+                        index_name,
+                        affinity,
+                    }) => {
+                        let start = program.alloc_registers(pack.values().len());
+                        for (index, value) in pack.values().iter().enumerate() {
+                            let source = Self::register_for(&registers, *value);
+                            let destination = start + index;
+                            if source != destination {
+                                program.emit_insn(Insn::Copy {
+                                    src_reg: source,
+                                    dst_reg: destination,
+                                    extra_amount: 0,
+                                });
+                            }
+                        }
+                        let record = program.alloc_register();
+                        program.emit_insn(Insn::MakeRecord {
+                            start_reg: to_u16(start),
+                            count: to_u16(pack.values().len()),
+                            dest_reg: to_u16(record),
+                            index_name: Some(index_name.clone()),
+                            affinity_str: affinity.clone(),
+                        });
+                        program.emit_insn(Insn::IdxInsert {
+                            cursor_id: Self::cursor_for(&physical_cursors, *cursor),
+                            record_reg: record,
+                            unpacked_start: None,
+                            unpacked_count: None,
+                            flags: IdxInsertFlags::new().no_op_duplicate(),
+                        });
+                    }
                     Instruction::Effect(EffectOp::OpenSorter { sorter }) => {
                         let physical = Self::sorter_for(&physical_sorters, *sorter);
                         let resource = &self.sorter_resources[sorter.index()];
@@ -4580,6 +4643,11 @@ impl fmt::Display for IrProgram {
                     }
                     Instruction::Effect(EffectOp::ResultRow { pack }) => {
                         write!(f, "  result_row [")?;
+                        Self::fmt_arguments(f, pack.values())?;
+                        writeln!(f, "]")?;
+                    }
+                    Instruction::Effect(EffectOp::IndexInsert { cursor, pack, .. }) => {
+                        write!(f, "  index_insert ${} [", cursor.0)?;
                         Self::fmt_arguments(f, pack.values())?;
                         writeln!(f, "]")?;
                     }
@@ -6717,6 +6785,13 @@ pub(crate) struct ResultRow {
     pack: ValuePack,
 }
 
+pub(crate) struct InsertIndex {
+    input: CursorInputId,
+    pack: ValuePack,
+    index_name: String,
+    affinity: Option<String>,
+}
+
 /// Compiles an ordered set of independently composed values into one pack.
 pub(crate) struct PackValues {
     values: SmallVec<[BoxedCompile<ValueId>; 4]>,
@@ -6738,6 +6813,20 @@ pub(crate) fn result_row<const N: usize>(values: [ValueId; N]) -> ResultRow {
 
 pub(crate) fn result_row_pack(pack: ValuePack) -> ResultRow {
     ResultRow { pack }
+}
+
+pub(crate) fn insert_index_pack(
+    input: CursorInputId,
+    pack: ValuePack,
+    index_name: String,
+    affinity: Option<String>,
+) -> InsertIndex {
+    InsertIndex {
+        input,
+        pack,
+        index_name,
+        affinity,
+    }
 }
 
 pub(crate) fn pack_values(values: SmallVec<[BoxedCompile<ValueId>; 4]>) -> PackValues {
@@ -6798,6 +6887,25 @@ impl Compile for ResultRow {
             ));
         }
         builder.push_effect(EffectOp::ResultRow { pack: self.pack })
+    }
+}
+
+impl Compile for InsertIndex {
+    type Output = ();
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        if self.pack.values().is_empty() {
+            return Err(LimboError::InternalError(
+                "compiler IR index insert must contain at least one value".to_owned(),
+            ));
+        }
+        let cursor = builder.external_cursor(self.input)?;
+        builder.push_effect(EffectOp::IndexInsert {
+            cursor,
+            pack: self.pack,
+            index_name: self.index_name,
+            affinity: self.affinity,
+        })
     }
 }
 
@@ -7351,6 +7459,58 @@ mod tests {
             .insns
             .iter()
             .all(|(instruction, _)| !matches!(instruction, Insn::SorterOpen { .. })));
+    }
+
+    #[test]
+    fn index_insert_binds_an_external_cursor_without_opening_it() {
+        let compiler =
+            pack_values(smallvec![constant(Value::from_i64(7)).boxed()]).and_then(|pack| {
+                insert_index_pack(
+                    CursorInputId::new(0),
+                    pack,
+                    "in_keys".to_owned(),
+                    Some("D".to_owned()),
+                )
+            });
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+
+        assert!(rendered.contains("cursor $0 = input &0"));
+        assert!(rendered.contains("index_insert $0 [%0]"));
+        assert!(!rendered.contains("open_read $0"));
+
+        let table = BTreeTable::from_sql("CREATE TABLE pointed(a,b)", 2).unwrap();
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 2, 0));
+        let bound_cursor =
+            program.alloc_cursor_id(CursorType::BTreeIndex(test_index(&table, "in_keys", 3)));
+        let target = program.alloc_register();
+        let lowered = ir
+            .lower_into_with_resources(&mut program, target, &[], &[bound_cursor])
+            .unwrap();
+        lowered.expect_no_result_rows().unwrap();
+
+        assert!(program.insns.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::MakeRecord {
+                index_name: Some(name),
+                affinity_str: Some(affinity),
+                ..
+            } if name == "in_keys" && affinity == "D"
+        )));
+        assert!(program.insns.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::IdxInsert {
+                cursor_id,
+                flags,
+                ..
+            } if *cursor_id == bound_cursor && flags.has(IdxInsertFlags::NO_OP_DUPLICATE)
+        )));
+        assert!(program.insns.iter().all(|(instruction, _)| !matches!(
+            instruction,
+            Insn::OpenRead { cursor_id, .. } | Insn::OpenEphemeral { cursor_id, .. }
+                if *cursor_id == bound_cursor
+        )));
     }
 
     #[test]

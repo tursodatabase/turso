@@ -7,11 +7,11 @@ use crate::{
         aggregation::emit_ungrouped_aggregation,
         collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         compiler::{
-            compile_effect, cursor_values, literal_values, pack_values, result_row_pack,
-            scan_index, scan_table, seek_in_values, seek_index, seek_rowid, seek_table_range,
-            select_pack, BoxedCompile, Compile, CursorInputId, DeferredIndexBound,
-            DeferredIndexRange, DeferredTableBound, DeferredTableRange, IrProgram, Row, RowStream,
-            ScanDirection, SortKey, SortedRow, ValueId,
+            compile_effect, cursor_values, insert_index_pack, literal_values, pack_values,
+            result_row_pack, scan_index, scan_table, seek_in_values, seek_index, seek_rowid,
+            seek_table_range, select_pack, BoxedCompile, Compile, CursorInputId,
+            DeferredIndexBound, DeferredIndexRange, DeferredTableBound, DeferredTableRange,
+            IrProgram, Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId, ValuePack,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -61,13 +61,15 @@ pub fn emit_program_for_select_with_resolver(
     resolver: Resolver,
     mut plan: SelectPlan,
 ) -> Result<()> {
-    let declarative_result_cols_start = program.with_scoped_result_cols_start(|program| {
+    let declarative_outcome = program.with_scoped_result_cols_start(|program| {
         try_emit_declarative_table_scan(program, &resolver, &mut plan)
     })?;
-    if let Some(result_cols_start) = declarative_result_cols_start {
+    if let Some(outcome) = declarative_outcome {
         program.result_columns = plan.result_columns;
         program.table_references.extend(plan.table_references);
-        program.reg_result_cols_start = Some(result_cols_start);
+        if let DeclarativeSelectOutcome::ResultRows { result_cols_start } = outcome {
+            program.reg_result_cols_start = Some(result_cols_start);
+        }
         return Ok(());
     }
 
@@ -153,6 +155,33 @@ enum DeclarativeInSource<'a> {
     },
 }
 
+enum DeclarativeSelectOutcome {
+    ResultRows { result_cols_start: usize },
+    Consumed,
+}
+
+enum DeclarativePackSink {
+    ResultRows,
+    EphemeralIndex {
+        input: CursorInputId,
+        index_name: String,
+        affinity: Option<String>,
+    },
+}
+
+impl DeclarativePackSink {
+    fn consume(self, pack: ValuePack) -> BoxedCompile<()> {
+        match self {
+            Self::ResultRows => result_row_pack(pack).boxed(),
+            Self::EphemeralIndex {
+                input,
+                index_name,
+                affinity,
+            } => insert_index_pack(input, pack, index_name, affinity).boxed(),
+        }
+    }
+}
+
 impl<'a> DeclarativeBtreeAccess<'a> {
     const fn direction(self) -> ScanDirection {
         match self {
@@ -177,9 +206,8 @@ fn try_emit_declarative_table_scan(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     plan: &mut SelectPlan,
-) -> Result<Option<usize>> {
+) -> Result<Option<DeclarativeSelectOutcome>> {
     if matches!(program.get_query_mode(), QueryMode::ExplainQueryPlan)
-        || !matches!(plan.query_destination, QueryDestination::ResultRows)
         || plan.group_by.is_some()
         || !plan.aggregates.is_empty()
         || plan.contains_constant_false_condition
@@ -192,6 +220,34 @@ fn try_emit_declarative_table_scan(
     {
         return Ok(None);
     }
+
+    let (sink, destination_cursor) = match &plan.query_destination {
+        QueryDestination::ResultRows => (DeclarativePackSink::ResultRows, None),
+        // The first producer migration covers the identity-shaped index used by
+        // scalar IN subqueries. Wider/reordered keys and generated rowids retain
+        // the eager destination code until those policies are explicit IR data.
+        QueryDestination::EphemeralIndex {
+            cursor_id,
+            index,
+            affinity_str,
+            is_delete: false,
+        } if plan.result_columns.len() == 1
+            && index.ephemeral
+            && !index.has_rowid
+            && index.columns.len() == 1
+            && index.columns[0].pos_in_table == 0 =>
+        {
+            (
+                DeclarativePackSink::EphemeralIndex {
+                    input: CursorInputId::new(0),
+                    index_name: index.name.clone(),
+                    affinity: affinity_str.as_ref().map(|value| (**value).clone()),
+                },
+                Some(*cursor_id),
+            )
+        }
+        _ => return Ok(None),
+    };
 
     let [joined] = plan.table_references.joined_tables() else {
         return Ok(None);
@@ -290,6 +346,9 @@ fn try_emit_declarative_table_scan(
         _ if !plan.non_from_clause_subqueries.is_empty() => return Ok(None),
         _ => None,
     };
+    if destination_cursor.is_some() && external_in_cursor.is_some() {
+        return Ok(None);
+    }
     let direction = access.direction();
     let index = access.index();
     let Table::BTree(table) = &joined.table else {
@@ -575,47 +634,63 @@ fn try_emit_declarative_table_scan(
         slice: DeclarativeSlice { limit, offset },
     };
     let ir = match access {
-        DeclarativeBtreeAccess::RowidEq(_) => body.compile(seek_rowid(
-            table,
-            database_id,
-            schema_cookie,
-            rowid_eq.expect("rowid equality access must compile a key"),
-        )),
-        DeclarativeBtreeAccess::TableRange { .. } => body.compile(seek_table_range(
-            table,
-            database_id,
-            schema_cookie,
-            table_range.expect("table range access must compile a range"),
-        )),
-        DeclarativeBtreeAccess::IndexRange { index, .. } => body.compile(seek_index(
-            table,
-            index.clone(),
-            covering_index.is_some(),
-            database_id,
-            schema_cookie,
-            index_range.expect("index range access must compile a range"),
-        )),
-        DeclarativeBtreeAccess::InValues { index, .. } => body.compile(seek_in_values(
-            table,
-            index.cloned(),
-            covering_index.is_some(),
-            database_id,
-            schema_cookie,
-            in_values.expect("IN access must compile its value source"),
-        )),
+        DeclarativeBtreeAccess::RowidEq(_) => body.compile(
+            seek_rowid(
+                table,
+                database_id,
+                schema_cookie,
+                rowid_eq.expect("rowid equality access must compile a key"),
+            ),
+            sink,
+        ),
+        DeclarativeBtreeAccess::TableRange { .. } => body.compile(
+            seek_table_range(
+                table,
+                database_id,
+                schema_cookie,
+                table_range.expect("table range access must compile a range"),
+            ),
+            sink,
+        ),
+        DeclarativeBtreeAccess::IndexRange { index, .. } => body.compile(
+            seek_index(
+                table,
+                index.clone(),
+                covering_index.is_some(),
+                database_id,
+                schema_cookie,
+                index_range.expect("index range access must compile a range"),
+            ),
+            sink,
+        ),
+        DeclarativeBtreeAccess::InValues { index, .. } => body.compile(
+            seek_in_values(
+                table,
+                index.cloned(),
+                covering_index.is_some(),
+                database_id,
+                schema_cookie,
+                in_values.expect("IN access must compile its value source"),
+            ),
+            sink,
+        ),
         DeclarativeBtreeAccess::Scan {
             index: Some(index), ..
-        } => body.compile(scan_index(
-            table,
-            index.clone(),
-            covering_index.is_some(),
-            database_id,
-            schema_cookie,
-            direction,
-        )),
-        DeclarativeBtreeAccess::Scan { index: None, .. } => {
-            body.compile(scan_table(table, database_id, schema_cookie, direction))
-        }
+        } => body.compile(
+            scan_index(
+                table,
+                index.clone(),
+                covering_index.is_some(),
+                database_id,
+                schema_cookie,
+                direction,
+            ),
+            sink,
+        ),
+        DeclarativeBtreeAccess::Scan { index: None, .. } => body.compile(
+            scan_table(table, database_id, schema_cookie, direction),
+            sink,
+        ),
     }?;
     let target_register = program.alloc_register();
     let lowered = if let Some((cursor_id, subquery_id)) = external_in_cursor {
@@ -629,22 +704,36 @@ fn try_emit_declarative_table_scan(
             |subquery| subquery.internal_id == subquery_id,
         )?;
         ir.lower_into_with_resources(program, target_register, &[], &[cursor_id])?
+    } else if let Some(cursor_id) = destination_cursor {
+        ir.lower_into_with_resources(program, target_register, &[], &[cursor_id])?
     } else {
         ir.lower_into(program, target_register)?
     };
-    let (result_cols_start, result_column_count) = lowered.single_result_row_pack()?;
-    if result_column_count != plan.result_columns.len() {
-        return Err(LimboError::InternalError(format!(
-            "compiler IR lowered {result_column_count} result columns for a {}-column SELECT",
-            plan.result_columns.len()
-        )));
+    if destination_cursor.is_some() {
+        lowered.expect_no_result_rows()?;
+        Ok(Some(DeclarativeSelectOutcome::Consumed))
+    } else {
+        let (result_cols_start, result_column_count) = lowered.single_result_row_pack()?;
+        if result_column_count != plan.result_columns.len() {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR lowered {result_column_count} result columns for a {}-column SELECT",
+                plan.result_columns.len()
+            )));
+        }
+        Ok(Some(DeclarativeSelectOutcome::ResultRows {
+            result_cols_start,
+        }))
     }
-    Ok(Some(result_cols_start))
 }
 
 struct DeclarativeSlice {
     limit: Option<BoxedCompile<ValueId>>,
     offset: Option<BoxedCompile<ValueId>>,
+}
+
+struct DeclarativeTerminal {
+    slice: DeclarativeSlice,
+    sink: DeclarativePackSink,
 }
 
 struct DeclarativeSelectBody {
@@ -658,7 +747,7 @@ struct DeclarativeSelectBody {
 }
 
 impl DeclarativeSelectBody {
-    fn compile<Scan, Rows>(self, scan: Scan) -> Result<IrProgram>
+    fn compile<Scan, Rows>(self, scan: Scan, sink: DeclarativePackSink) -> Result<IrProgram>
     where
         Scan: Compile<Output = Rows>,
         Rows: RowStream<Item = Row> + 'static,
@@ -672,6 +761,7 @@ impl DeclarativeSelectBody {
             distinct_collations,
             slice,
         } = self;
+        let terminal = DeclarativeTerminal { slice, sink };
         compile_effect(scan.and_then(move |rows| {
             if predicates.is_empty() {
                 compile_declarative_rows(
@@ -681,7 +771,7 @@ impl DeclarativeSelectBody {
                     sort_keys,
                     result_column_count,
                     distinct_collations,
-                    slice,
+                    terminal,
                 )
             } else {
                 compile_declarative_rows(
@@ -691,7 +781,7 @@ impl DeclarativeSelectBody {
                     sort_keys,
                     result_column_count,
                     distinct_collations,
-                    slice,
+                    terminal,
                 )
             }
         }))
@@ -705,17 +795,27 @@ fn compile_declarative_rows<Stream>(
     sort_keys: SmallVec<[SortKey; 4]>,
     result_column_count: usize,
     distinct_collations: Option<SmallVec<[CollationSeq; 4]>>,
-    slice: DeclarativeSlice,
+    terminal: DeclarativeTerminal,
 ) -> BoxedCompile<()>
 where
     Stream: RowStream<Item = Row> + 'static,
 {
-    let DeclarativeSlice { limit, offset } = slice;
     if sort_keys.is_empty() {
+        let DeclarativeTerminal {
+            slice: DeclarativeSlice { limit, offset },
+            sink,
+        } = terminal;
         if let Some(collations) = distinct_collations {
-            compile_declarative_distinct_projection(rows, projections, collations, limit, offset)
+            compile_declarative_distinct_projection(
+                rows,
+                projections,
+                collations,
+                limit,
+                offset,
+                sink,
+            )
         } else {
-            compile_declarative_projection(rows, projections, limit, offset)
+            compile_declarative_projection(rows, projections, limit, offset, sink)
         }
     } else {
         sort_expressions.extend(projections);
@@ -725,8 +825,7 @@ where
             sort_keys,
             result_column_count,
             distinct_collations,
-            limit,
-            offset,
+            terminal,
         )
     }
 }
@@ -737,6 +836,7 @@ fn compile_declarative_distinct_projection<Stream>(
     collations: SmallVec<[CollationSeq; 4]>,
     limit: Option<BoxedCompile<ValueId>>,
     offset: Option<BoxedCompile<ValueId>>,
+    sink: DeclarativePackSink,
 ) -> BoxedCompile<()>
 where
     Stream: RowStream<Item = Row> + 'static,
@@ -748,11 +848,17 @@ where
         (Some(limit), Some(offset)) => rows
             .skip(offset)
             .take(limit)
-            .for_each(result_row_pack)
+            .for_each(move |pack| sink.consume(pack))
             .boxed(),
-        (Some(limit), None) => rows.take(limit).for_each(result_row_pack).boxed(),
-        (None, Some(offset)) => rows.skip(offset).for_each(result_row_pack).boxed(),
-        (None, None) => rows.for_each(result_row_pack).boxed(),
+        (Some(limit), None) => rows
+            .take(limit)
+            .for_each(move |pack| sink.consume(pack))
+            .boxed(),
+        (None, Some(offset)) => rows
+            .skip(offset)
+            .for_each(move |pack| sink.consume(pack))
+            .boxed(),
+        (None, None) => rows.for_each(move |pack| sink.consume(pack)).boxed(),
     }
 }
 
@@ -762,8 +868,7 @@ fn compile_declarative_sorted_projection<Stream>(
     sort_keys: SmallVec<[SortKey; 4]>,
     result_column_count: usize,
     distinct_collations: Option<SmallVec<[CollationSeq; 4]>>,
-    limit: Option<BoxedCompile<ValueId>>,
-    offset: Option<BoxedCompile<ValueId>>,
+    terminal: DeclarativeTerminal,
 ) -> BoxedCompile<()>
 where
     Stream: RowStream<Item = Row> + 'static,
@@ -779,16 +884,14 @@ where
             .sort(sort_keys, record_width),
             key_count,
             result_column_count,
-            limit,
-            offset,
+            terminal,
         )
     } else {
         compile_declarative_sorted_stream(
             rows.sort(sort_keys, record_width),
             key_count,
             result_column_count,
-            limit,
-            offset,
+            terminal,
         )
     }
 }
@@ -797,32 +900,35 @@ fn compile_declarative_sorted_stream<Stream>(
     rows: Stream,
     key_count: usize,
     result_column_count: usize,
-    limit: Option<BoxedCompile<ValueId>>,
-    offset: Option<BoxedCompile<ValueId>>,
+    terminal: DeclarativeTerminal,
 ) -> BoxedCompile<()>
 where
     Stream: RowStream<Item = SortedRow> + 'static,
 {
+    let DeclarativeTerminal {
+        slice: DeclarativeSlice { limit, offset },
+        sink,
+    } = terminal;
     match (limit, offset) {
         (Some(limit), Some(offset)) => rows
             .skip(offset)
             .take(limit)
             .map(move |row| sorted_result_pack(row, key_count, result_column_count))
-            .for_each(result_row_pack)
+            .for_each(move |pack| sink.consume(pack))
             .boxed(),
         (Some(limit), None) => rows
             .take(limit)
             .map(move |row| sorted_result_pack(row, key_count, result_column_count))
-            .for_each(result_row_pack)
+            .for_each(move |pack| sink.consume(pack))
             .boxed(),
         (None, Some(offset)) => rows
             .skip(offset)
             .map(move |row| sorted_result_pack(row, key_count, result_column_count))
-            .for_each(result_row_pack)
+            .for_each(move |pack| sink.consume(pack))
             .boxed(),
         (None, None) => rows
             .map(move |row| sorted_result_pack(row, key_count, result_column_count))
-            .for_each(result_row_pack)
+            .for_each(move |pack| sink.consume(pack))
             .boxed(),
     }
 }
@@ -844,6 +950,7 @@ fn compile_declarative_projection<Stream>(
     projections: SmallVec<[ResolvedScalarExpr; 4]>,
     limit: Option<BoxedCompile<ValueId>>,
     offset: Option<BoxedCompile<ValueId>>,
+    sink: DeclarativePackSink,
 ) -> BoxedCompile<()>
 where
     Stream: RowStream<Item = Row> + 'static,
@@ -853,21 +960,21 @@ where
             .skip(offset)
             .map(move |row| compile_symbolic_exprs(row, &projections))
             .take(limit)
-            .for_each(result_row_pack)
+            .for_each(move |pack| sink.consume(pack))
             .boxed(),
         (Some(limit), None) => rows
             .map(move |row| compile_symbolic_exprs(row, &projections))
             .take(limit)
-            .for_each(result_row_pack)
+            .for_each(move |pack| sink.consume(pack))
             .boxed(),
         (None, Some(offset)) => rows
             .skip(offset)
             .map(move |row| compile_symbolic_exprs(row, &projections))
-            .for_each(result_row_pack)
+            .for_each(move |pack| sink.consume(pack))
             .boxed(),
         (None, None) => rows
             .map(move |row| compile_symbolic_exprs(row, &projections))
-            .for_each(result_row_pack)
+            .for_each(move |pack| sink.consume(pack))
             .boxed(),
     }
 }
@@ -1948,7 +2055,7 @@ mod tests {
     }
 
     #[test]
-    fn uncorrelated_in_subquery_binds_its_materialized_cursor_to_the_nested_stream() {
+    fn uncorrelated_in_subquery_composes_declarative_producer_and_consumer() {
         let io = Arc::new(MemoryIO::new());
         let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let connection = database.connect().unwrap();
@@ -1991,6 +2098,22 @@ mod tests {
         assert!(instructions
             .iter()
             .all(|(instruction, _)| !matches!(instruction, Insn::SorterOpen { .. })));
+        let materialize_record = instructions
+            .iter()
+            .position(|(instruction, _)| {
+                matches!(
+                    instruction,
+                    Insn::MakeRecord {
+                        index_name: Some(name),
+                        ..
+                    } if name.starts_with("ephemeral_index_where_sub_")
+                )
+            })
+            .expect("declarative subquery producer must materialize its projected pack");
+        assert!(matches!(
+            instructions[materialize_record + 1].0,
+            Insn::IdxInsert { .. }
+        ));
         let result_row = instructions
             .iter()
             .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 2, .. }))
@@ -2017,6 +2140,22 @@ mod tests {
             )
             .unwrap();
         let correlated_instructions = &correlated.get_program().insns;
+        let materialize_record = correlated_instructions
+            .iter()
+            .position(|(instruction, _)| {
+                matches!(
+                    instruction,
+                    Insn::MakeRecord {
+                        index_name: Some(name),
+                        ..
+                    } if name.starts_with("ephemeral_index_where_sub_")
+                )
+            })
+            .expect("correlated eager fallback must materialize its projected row");
+        assert!(!matches!(
+            correlated_instructions[materialize_record - 1].0,
+            Insn::Copy { .. }
+        ));
         let result_row = correlated_instructions
             .iter()
             .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. }))
