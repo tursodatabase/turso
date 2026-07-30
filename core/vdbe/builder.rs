@@ -244,6 +244,9 @@ pub struct ProgramBuilder {
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
     pub id_register_overrides: HashMap<String, usize>,
+    /// Names of user-defined functions currently being inlined, used to
+    /// reject recursive calls and bound inlining depth.
+    pub udf_inline_stack: Vec<String>,
     /// Hash join build signatures keyed by hash table id.
     hash_build_signatures: HashMap<usize, HashBuildSignature>,
     /// Hash tables to keep open across subplans (e.g. materialization).
@@ -688,6 +691,7 @@ impl ProgramBuilder {
             trigger_conflict_override: None,
             cursor_overrides: HashMap::default(),
             id_register_overrides: HashMap::default(),
+            udf_inline_stack: Vec::new(),
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
             subquery_result_regs: HashMap::default(),

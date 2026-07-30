@@ -143,7 +143,8 @@ impl TempDatabaseBuilder {
         opts = opts
             .with_vacuum(true)
             .with_without_rowid(true)
-            .with_custom_types(true);
+            .with_custom_types(true)
+            .with_udfs(true);
 
         if self.enable_views {
             opts = opts.with_views(true);

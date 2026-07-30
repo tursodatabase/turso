@@ -227,6 +227,12 @@ enum ReparsePhase {
         stmt: Box<Statement>,
         type_rows: Vec<String>,
     },
+    /// Loading user-defined function definitions from the internal functions
+    /// table.
+    LoadFunctions {
+        stmt: Box<Statement>,
+        function_rows: Vec<String>,
+    },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
@@ -591,6 +597,7 @@ impl Connection {
             .with_vacuum(self.db.experimental_vacuum_enabled())
             .with_generated_columns(self.db.experimental_generated_columns_enabled())
             .with_without_rowid(self.db.experimental_without_rowid_enabled())
+            .with_udfs(self.db.experimental_udfs_enabled())
     }
 
     fn effective_temp_store(&self) -> crate::TempStore {
@@ -1537,9 +1544,7 @@ impl Connection {
                             type_rows: Vec::new(),
                         };
                     } else {
-                        inner.phase = ReparsePhase::RefreshStats {
-                            stats: Default::default(),
-                        };
+                        inner.phase = self.reparse_phase_after_types(inner)?;
                     }
                 }
                 ReparsePhase::LoadTypes { stmt, type_rows } => {
@@ -1558,12 +1563,39 @@ impl Connection {
                             if let Err(e) = inner.fresh.load_type_definitions(&type_rows) {
                                 tracing::warn!("Failed to load custom types: {}", e);
                             }
+                            inner.phase = self.reparse_phase_after_types(inner)?;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to load custom types: {}", e);
+                            inner.phase = self.reparse_phase_after_types(inner)?;
+                        }
+                    }
+                }
+                ReparsePhase::LoadFunctions {
+                    stmt,
+                    function_rows,
+                } => {
+                    // Function loading is best-effort: log and continue on error.
+                    let scan = (|| -> Result<IOResult<()>> {
+                        crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                            function_rows.push(row.get::<&str>(1)?.to_string());
+                            Ok(())
+                        }));
+                        Ok(IOResult::Done(()))
+                    })();
+                    match scan {
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Ok(IOResult::Done(())) => {
+                            let function_rows = std::mem::take(function_rows);
+                            if let Err(e) = inner.fresh.load_function_definitions(&function_rows) {
+                                tracing::warn!("Failed to load user-defined functions: {}", e);
+                            }
                             inner.phase = ReparsePhase::RefreshStats {
                                 stats: Default::default(),
                             };
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to load custom types: {}", e);
+                            tracing::warn!("Failed to load user-defined functions: {}", e);
                             inner.phase = ReparsePhase::RefreshStats {
                                 stats: Default::default(),
                             };
@@ -1890,6 +1922,62 @@ impl Connection {
             Ok(())
         })?;
         Ok(type_rows)
+    }
+
+    /// Query the CREATE FUNCTION SQL definitions stored in
+    /// __turso_internal_functions. Returns an empty Vec if the functions
+    /// table does not exist.
+    pub(crate) fn query_stored_function_definitions(self: &Arc<Connection>) -> Result<Vec<String>> {
+        let has_functions_table = {
+            let s = self.schema.read();
+            s.tables
+                .contains_key(crate::schema::TURSO_FUNCTIONS_TABLE_NAME)
+        };
+        if !has_functions_table {
+            return Ok(Vec::new());
+        }
+        let mut function_stmt = self.prepare_internal(format!(
+            "SELECT name, sql FROM {}",
+            crate::schema::TURSO_FUNCTIONS_TABLE_NAME
+        ))?;
+        let mut function_rows = Vec::new();
+        function_stmt.run_with_row_callback(|row| {
+            function_rows.push(row.get::<&str>(1)?.to_string());
+            Ok(())
+        })?;
+        Ok(function_rows)
+    }
+
+    /// Decide the reparse phase that follows type loading: read stored
+    /// user-defined functions when enabled and present, else refresh stats.
+    fn reparse_phase_after_types(
+        self: &Arc<Connection>,
+        inner: &mut ReparseSchemaInner,
+    ) -> Result<ReparsePhase> {
+        if self.experimental_udfs_enabled()
+            && inner
+                .fresh
+                .tables
+                .contains_key(crate::schema::TURSO_FUNCTIONS_TABLE_NAME)
+        {
+            // Temporarily install the schema so we can query against it.
+            self.with_schema_mut(|schema| {
+                *schema = inner.fresh.try_clone()?;
+                Ok::<_, crate::alloc::TryReserveError>(())
+            })??;
+            let stmt = self.prepare_internal(format!(
+                "SELECT name, sql FROM {}",
+                crate::schema::TURSO_FUNCTIONS_TABLE_NAME
+            ))?;
+            Ok(ReparsePhase::LoadFunctions {
+                stmt: Box::new(stmt),
+                function_rows: Vec::new(),
+            })
+        } else {
+            Ok(ReparsePhase::RefreshStats {
+                stats: Default::default(),
+            })
+        }
     }
 
     pub fn maybe_update_schema(&self) {
@@ -2908,6 +2996,10 @@ impl Connection {
         self.db.experimental_without_rowid_enabled()
     }
 
+    pub fn experimental_udfs_enabled(&self) -> bool {
+        self.db.experimental_udfs_enabled()
+    }
+
     pub fn mvcc_enabled(&self) -> bool {
         self.db.mvcc_enabled()
     }
@@ -3365,7 +3457,8 @@ impl Connection {
                         .with_index_method(self.db.experimental_index_method_enabled())
                         .with_vacuum(self.db.experimental_vacuum_enabled())
                         .with_generated_columns(self.db.experimental_generated_columns_enabled())
-                        .with_without_rowid(self.db.experimental_without_rowid_enabled());
+                        .with_without_rowid(self.db.experimental_without_rowid_enabled())
+                        .with_udfs(self.db.experimental_udfs_enabled());
                     let is_memory_db = is_memory_like(path);
                     let io: Arc<dyn IO> = if is_memory_db {
                         Arc::new(MemoryIO::new())

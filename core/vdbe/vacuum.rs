@@ -191,6 +191,7 @@ pub(crate) fn vacuum_target_opts_from_source(source_db: &Database) -> DatabaseOp
         .with_attach(source_db.experimental_attach_enabled())
         .with_generated_columns(source_db.experimental_generated_columns_enabled())
         .with_without_rowid(source_db.experimental_without_rowid_enabled())
+        .with_udfs(source_db.experimental_udfs_enabled())
 }
 
 pub(crate) fn reject_unsupported_vacuum_auto_vacuum_mode(mode: AutoVacuumMode) -> Result<()> {

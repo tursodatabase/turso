@@ -666,6 +666,24 @@ pub fn translate_expr(
             let func_type = resolver.resolve_function(name.as_str(), args_count)?;
 
             if func_type.is_none() {
+                // Not a built-in or extension function: try user-defined
+                // functions, which are compiled inline at the call site.
+                if let Some(udf) = resolver.schema().get_function(name.as_str()) {
+                    if filter_over.filter_clause.is_some() || filter_over.over_clause.is_some() {
+                        crate::bail_parse_error!(
+                            "misuse of user-defined function {}()",
+                            name.as_str()
+                        );
+                    }
+                    return crate::translate::udf::emit_udf_call(
+                        program,
+                        referenced_tables,
+                        resolver,
+                        &udf,
+                        args,
+                        target_register,
+                    );
+                }
                 crate::bail_parse_error!("no such function: {}", name.as_str());
             }
 

@@ -2,7 +2,7 @@ use crate::ast::{
     check::ColumnCount, AlterTable, AlterTableBody, As, Cmd, ColumnConstraint, ColumnDefinition,
     CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateTypeBody,
     CreateVirtualTable, DeferSubclause, Distinctness, DomainConstraint, Expr, ForeignKeyClause,
-    FrameBound, FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail,
+    FrameBound, FrameClause, FrameExclude, FrameMode, FromClause, FunctionParam, FunctionTail,
     GeneratedColumnType, GroupBy, Indexed, IndexedColumn, InitDeferredPred, InsertBody,
     JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, LikeOperator, Limit, Literal,
     Materialized, Name, NamedColumnConstraint, NamedTableConstraint, NullsOrder, OneSelect,
@@ -990,6 +990,7 @@ impl<'a> Parser<'a> {
             TK_TRIGGER,
             TK_MATERIALIZED,
             TK_TYPE,
+            TK_OR,
             TK_ID
         );
         let mut temp = false;
@@ -997,6 +998,18 @@ impl<'a> Parser<'a> {
             eat_assert!(self, TK_TEMP);
             temp = true;
             first_tok = peek_expect!(self, TK_TABLE, TK_VIEW, TK_TRIGGER);
+        } else if first_tok.token_type == TK_OR {
+            // `CREATE OR REPLACE FUNCTION` is the only OR REPLACE form supported.
+            eat_assert!(self, TK_OR);
+            eat_expect!(self, TK_REPLACE);
+            let func_tok = peek_expect!(self, TK_ID);
+            if !func_tok.to_utf8().eq_ignore_ascii_case("FUNCTION") {
+                return Err(Error::ParseError(format!(
+                    "unexpected token: {}",
+                    func_tok.to_utf8()
+                )));
+            }
+            return self.parse_create_function(true);
         }
 
         match first_tok.token_type {
@@ -1012,6 +1025,9 @@ impl<'a> Parser<'a> {
             }
             TK_ID if first_tok.to_utf8().eq_ignore_ascii_case("SEQUENCE") => {
                 self.parse_create_sequence()
+            }
+            TK_ID if first_tok.to_utf8().eq_ignore_ascii_case("FUNCTION") => {
+                self.parse_create_function(false)
             }
             _ => Err(Error::ParseError(format!(
                 "unexpected token: {}",
@@ -5103,6 +5119,218 @@ impl<'a> Parser<'a> {
         Ok(sign * val)
     }
 
+    fn parse_create_function(&mut self, or_replace: bool) -> Result<Stmt> {
+        eat_assert!(self, TK_ID); // eat FUNCTION
+        let func_name = self.parse_fullname(false)?;
+
+        eat_expect!(self, TK_LP);
+        let mut params = Vec::new();
+        if self.peek_no_eof()?.token_type == TK_RP {
+            eat_assert!(self, TK_RP);
+        } else {
+            loop {
+                let name = self.parse_nm()?;
+                let ty = self.parse_type()?;
+                params.push(FunctionParam { name, ty });
+                let tok = peek_expect!(self, TK_COMMA, TK_RP);
+                if tok.token_type == TK_COMMA {
+                    eat_assert!(self, TK_COMMA);
+                } else {
+                    eat_assert!(self, TK_RP);
+                    break;
+                }
+            }
+        }
+
+        // RETURNS / LANGUAGE / AS may appear in any order, as in PostgreSQL.
+        let mut returns = None;
+        let mut language: Option<Name> = None;
+        let mut body: Option<String> = None;
+        loop {
+            match self.peek()? {
+                Some(tok) if tok.token_type == TK_AS => {
+                    eat_assert!(self, TK_AS);
+                    if body.is_some() {
+                        return Err(Error::ParseError(
+                            "duplicate AS clause in CREATE FUNCTION".to_owned(),
+                        ));
+                    }
+                    body = Some(self.parse_function_body()?);
+                }
+                Some(tok) if tok.token_type == TK_ID => {
+                    let kw = tok.to_utf8().to_uppercase();
+                    match kw.as_str() {
+                        "RETURNS" => {
+                            eat_assert!(self, TK_ID);
+                            if returns.is_some() {
+                                return Err(Error::ParseError(
+                                    "duplicate RETURNS clause in CREATE FUNCTION".to_owned(),
+                                ));
+                            }
+                            match self.parse_function_returns_type()? {
+                                Some(ty) => returns = Some(ty),
+                                None => {
+                                    return Err(Error::ParseError(
+                                        "expected type after RETURNS".to_owned(),
+                                    ))
+                                }
+                            }
+                        }
+                        "LANGUAGE" => {
+                            eat_assert!(self, TK_ID);
+                            if language.is_some() {
+                                return Err(Error::ParseError(
+                                    "duplicate LANGUAGE clause in CREATE FUNCTION".to_owned(),
+                                ));
+                            }
+                            language = Some(self.parse_nm()?);
+                        }
+                        _ => break,
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        let Some(language) = language else {
+            return Err(Error::ParseError(
+                "CREATE FUNCTION requires a LANGUAGE clause".to_owned(),
+            ));
+        };
+        let Some(body) = body else {
+            return Err(Error::ParseError(
+                "CREATE FUNCTION requires an AS clause with the function body".to_owned(),
+            ));
+        };
+
+        Ok(Stmt::CreateFunction {
+            or_replace,
+            func_name,
+            params,
+            returns,
+            language,
+            body,
+        })
+    }
+
+    /// Parse the type after `RETURNS`. Unlike [`Self::parse_type`], word
+    /// accumulation for multi-word type names (e.g. `DOUBLE PRECISION`) stops
+    /// before a `LANGUAGE` clause keyword, which would otherwise be swallowed
+    /// into the type name.
+    fn parse_function_returns_type(&mut self) -> Result<Option<Type>> {
+        let is_clause_kw = |tok: &Token| -> bool {
+            tok.to_utf8().eq_ignore_ascii_case("LANGUAGE")
+                || tok.to_utf8().eq_ignore_ascii_case("RETURNS")
+        };
+        let mut type_name = match self.peek()? {
+            Some(tok)
+                if matches!(tok.token_type.fallback_id_if_ok(), TK_ID | TK_STRING)
+                    && !is_clause_kw(tok) =>
+            {
+                let tok = eat_assert!(self, TK_ID, TK_STRING);
+                from_bytes(tok.as_bytes())
+            }
+            _ => return Ok(None),
+        };
+        while let Some(tok) = self.peek()? {
+            match tok.token_type.fallback_id_if_ok() {
+                TK_ID | TK_STRING if !is_clause_kw(tok) => {
+                    let tok = eat_assert!(self, TK_ID, TK_STRING);
+                    type_name.push(' ');
+                    type_name.push_str(from_bytes_as_str(tok.value));
+                }
+                _ => break,
+            }
+        }
+        let size = if matches!(self.peek()?, Some(tok) if tok.token_type == TK_LP) {
+            eat_assert!(self, TK_LP);
+            let first_size = self.parse_signed()?;
+            let tok = eat_expect!(self, TK_RP, TK_COMMA);
+            match tok.token_type {
+                TK_RP => Some(TypeSize::MaxSize(first_size)),
+                TK_COMMA => {
+                    let second_size = self.parse_signed()?;
+                    eat_expect!(self, TK_RP);
+                    Some(TypeSize::TypeSize(first_size, second_size))
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            None
+        };
+        Ok(Some(Type {
+            name: type_name,
+            size,
+            array_dimensions: 0,
+        }))
+    }
+
+    /// Parse the body of `CREATE FUNCTION ... AS`: either a plain string
+    /// literal or a PostgreSQL-style dollar-quoted string (`$$...$$` or
+    /// `$tag$...$tag$`).
+    fn parse_function_body(&mut self) -> Result<String> {
+        debug_assert!(
+            !self.peekable,
+            "AS must have been consumed before parsing the function body"
+        );
+        // A dollar-quoted body must be captured from the raw input before the
+        // lexer sees `$`: the lexer would otherwise tokenize it as a variable.
+        let input = self.lexer.input;
+        let mut i = self.lexer.offset;
+        while i < input.len() && input[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if input.get(i) == Some(&b'$') {
+            self.lexer.offset = i;
+            return self.parse_dollar_quoted_body();
+        }
+        let tok = eat_expect!(self, TK_STRING);
+        let raw = from_bytes(tok.as_bytes());
+        debug_assert!(raw.len() >= 2 && raw.starts_with('\'') && raw.ends_with('\''));
+        Ok(raw[1..raw.len() - 1].replace("''", "'"))
+    }
+
+    /// Scan a dollar-quoted string starting at `self.lexer.offset` (which must
+    /// point at the opening `$`) and leave the lexer positioned right after the
+    /// closing tag. The tag follows PostgreSQL rules: `$$` or `$tag$` where the
+    /// tag is an identifier.
+    fn parse_dollar_quoted_body(&mut self) -> Result<String> {
+        let input = self.lexer.input;
+        let start = self.lexer.offset;
+        debug_assert_eq!(input.get(start), Some(&b'$'));
+        let mut tag_end = start + 1;
+        while tag_end < input.len()
+            && (input[tag_end] == b'_' || input[tag_end].is_ascii_alphanumeric())
+        {
+            tag_end += 1;
+        }
+        let tag_starts_with_digit = input[start + 1..tag_end]
+            .first()
+            .is_some_and(|b| b.is_ascii_digit());
+        if input.get(tag_end) != Some(&b'$') || tag_starts_with_digit {
+            return Err(Error::ParseError(
+                "malformed dollar-quoted string in CREATE FUNCTION body".to_owned(),
+            ));
+        }
+        let tag = &input[start..=tag_end];
+        let body_start = tag_end + 1;
+        let mut pos = body_start;
+        loop {
+            if pos + tag.len() > input.len() {
+                return Err(Error::ParseError(
+                    "unterminated dollar-quoted string in CREATE FUNCTION body".to_owned(),
+                ));
+            }
+            if input[pos] == b'$' && &input[pos..pos + tag.len()] == tag {
+                break;
+            }
+            pos += 1;
+        }
+        let body = from_bytes(&input[body_start..pos]);
+        self.lexer.offset = pos + tag.len();
+        Ok(body)
+    }
+
     fn parse_drop_stmt(&mut self) -> Result<Stmt> {
         eat_assert!(self, TK_DROP);
         let tok = peek_expect!(self, TK_TABLE, TK_INDEX, TK_TRIGGER, TK_VIEW, TK_TYPE, TK_ID);
@@ -5177,6 +5405,15 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::DropSequence {
                     if_exists,
                     seq_name,
+                })
+            }
+            TK_ID if tok.to_utf8().eq_ignore_ascii_case("FUNCTION") => {
+                eat_assert!(self, TK_ID);
+                let if_exists = self.parse_if_exists()?;
+                let func_name = self.parse_fullname(false)?;
+                Ok(Stmt::DropFunction {
+                    if_exists,
+                    func_name,
                 })
             }
             _ => Err(Error::ParseError(format!(
@@ -13165,6 +13402,137 @@ mod tests {
                 assert!(if_exists);
             }
             _ => panic!("expected DropSequence"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_function_dollar_quoted() {
+        let sql = b"CREATE FUNCTION myadd(a INTEGER, b INTEGER)\nRETURNS INTEGER\nLANGUAGE starlark\nAS $$\nreturn a + b\n$$";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        match cmd {
+            Cmd::Stmt(Stmt::CreateFunction {
+                or_replace,
+                func_name,
+                params,
+                returns,
+                language,
+                body,
+            }) => {
+                assert!(!or_replace);
+                assert_eq!(func_name.name.as_str(), "myadd");
+                assert_eq!(params.len(), 2);
+                assert_eq!(params[0].name.as_str(), "a");
+                assert_eq!(params[0].ty.as_ref().unwrap().name, "INTEGER");
+                assert_eq!(params[1].name.as_str(), "b");
+                assert_eq!(returns.unwrap().name, "INTEGER");
+                assert_eq!(language.as_str(), "starlark");
+                assert_eq!(body, "\nreturn a + b\n");
+            }
+            _ => panic!("expected CreateFunction"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_function_tagged_dollar_quote_and_semicolons() {
+        // The body contains `;`, `'` and `$$`, none of which may terminate a
+        // tagged dollar-quoted string. A second statement follows.
+        let sql = b"CREATE FUNCTION f() LANGUAGE starlark AS $fn$x = '1'; $$ y\n$fn$; SELECT 1";
+        let mut parser = Parser::new(sql);
+        let cmd = parser.next().unwrap().unwrap();
+        match cmd {
+            Cmd::Stmt(Stmt::CreateFunction { params, body, .. }) => {
+                assert!(params.is_empty());
+                assert_eq!(body, "x = '1'; $$ y\n");
+            }
+            _ => panic!("expected CreateFunction"),
+        }
+        let cmd = parser.next().unwrap().unwrap();
+        assert!(matches!(cmd, Cmd::Stmt(Stmt::Select(_))));
+    }
+
+    #[test]
+    fn test_parse_create_function_string_body_and_clause_order() {
+        // LANGUAGE after AS, single-quoted body with escaped quote.
+        let sql = b"CREATE OR REPLACE FUNCTION greet(name TEXT) AS 'return ''hi ''+name' LANGUAGE starlark";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        match cmd {
+            Cmd::Stmt(Stmt::CreateFunction {
+                or_replace,
+                returns,
+                language,
+                body,
+                ..
+            }) => {
+                assert!(or_replace);
+                assert!(returns.is_none());
+                assert_eq!(language.as_str(), "starlark");
+                assert_eq!(body, "return 'hi '+name");
+            }
+            _ => panic!("expected CreateFunction"),
+        }
+    }
+
+    #[test]
+    fn test_create_function_roundtrip() {
+        // AST -> SQL -> AST must preserve the body exactly.
+        let sql = b"CREATE FUNCTION f(a INTEGER) RETURNS TEXT LANGUAGE starlark AS $$\nif a > 1:\n    return 'big'\nreturn 'small'\n$$";
+        let cmd = Parser::new(sql.as_slice()).next().unwrap().unwrap();
+        let rendered = cmd.to_string();
+        let reparsed = Parser::new(rendered.as_bytes()).next().unwrap().unwrap();
+        match (&cmd, &reparsed) {
+            (
+                Cmd::Stmt(Stmt::CreateFunction { body: b1, .. }),
+                Cmd::Stmt(Stmt::CreateFunction { body: b2, .. }),
+            ) => assert_eq!(b1, b2),
+            _ => panic!("expected CreateFunction on both sides"),
+        }
+        assert_eq!(cmd, reparsed);
+    }
+
+    #[test]
+    fn test_parse_drop_function() {
+        let sql = b"DROP FUNCTION IF EXISTS myadd";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        match cmd {
+            Cmd::Stmt(Stmt::DropFunction {
+                if_exists,
+                func_name,
+            }) => {
+                assert!(if_exists);
+                assert_eq!(func_name.name.as_str(), "myadd");
+            }
+            _ => panic!("expected DropFunction"),
+        }
+    }
+
+    #[test]
+    fn test_create_function_parse_errors() {
+        let cases: Vec<&str> = vec![
+            // missing LANGUAGE
+            "CREATE FUNCTION f() AS 'return 1'",
+            // missing AS
+            "CREATE FUNCTION f() LANGUAGE starlark",
+            // unterminated dollar quote
+            "CREATE FUNCTION f() LANGUAGE starlark AS $$return 1",
+            // mismatched dollar-quote tags
+            "CREATE FUNCTION f() LANGUAGE starlark AS $a$return 1$b$",
+            // tag may not start with a digit
+            "CREATE FUNCTION f() LANGUAGE starlark AS $1$return 1$1$",
+            // trailing comma in parameter list
+            "CREATE FUNCTION f(a,) LANGUAGE starlark AS 'return 1'",
+            // OR REPLACE only applies to FUNCTION
+            "CREATE OR REPLACE TABLE t (x)",
+            // duplicate clauses
+            "CREATE FUNCTION f() LANGUAGE starlark LANGUAGE starlark AS 'return 1'",
+            "CREATE FUNCTION f() RETURNS INT RETURNS INT LANGUAGE starlark AS 'return 1'",
+            "CREATE FUNCTION f() LANGUAGE starlark AS 'return 1' AS 'return 2'",
+        ];
+        for sql in cases {
+            let mut parser = Parser::new(sql.as_bytes());
+            assert!(
+                parser.next_cmd().is_err(),
+                "expected parse failure for: {sql}"
+            );
         }
     }
 

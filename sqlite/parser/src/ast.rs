@@ -357,6 +357,38 @@ pub enum Stmt {
         /// sequence name
         seq_name: QualifiedName,
     },
+    /// `CREATE FUNCTION`
+    CreateFunction {
+        /// `OR REPLACE`
+        or_replace: bool,
+        /// function name
+        func_name: QualifiedName,
+        /// parameters
+        params: Vec<FunctionParam>,
+        /// `RETURNS` type
+        returns: Option<Type>,
+        /// `LANGUAGE` name (e.g. `starlark`)
+        language: Name,
+        /// `AS` body source text (without quoting)
+        body: String,
+    },
+    /// `DROP FUNCTION`
+    DropFunction {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// function name
+        func_name: QualifiedName,
+    },
+}
+
+/// `CREATE FUNCTION` parameter
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FunctionParam {
+    /// parameter name
+    pub name: Name,
+    /// declared parameter type
+    pub ty: Option<Type>,
 }
 
 #[repr(transparent)]

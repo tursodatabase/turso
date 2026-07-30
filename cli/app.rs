@@ -100,6 +100,11 @@ pub struct Opts {
     pub experimental_without_rowid: bool,
     #[clap(
         long,
+        help = "Enable experimental user-defined functions (CREATE FUNCTION / DROP FUNCTION)"
+    )]
+    pub experimental_udfs: bool,
+    #[clap(
+        long,
         help = "Enable experimental multiprocess WAL coordination (on Windows, use --vfs experimental_win_iocp)"
     )]
     pub experimental_multiprocess_wal: bool,
@@ -250,6 +255,7 @@ impl Limbo {
             .with_attach(opts.experimental_attach)
             .with_generated_columns(opts.experimental_generated_columns)
             .with_without_rowid(opts.experimental_without_rowid)
+            .with_udfs(opts.experimental_udfs)
             .with_multiprocess_wal(opts.experimental_multiprocess_wal)
             .with_experimental_mvcc_passive_checkpoint(opts.experimental_mvcc_passive_checkpoint)
             .with_unsafe_testing(opts.unsafe_testing);
@@ -1813,6 +1819,9 @@ impl Limbo {
         // Emit CREATE TYPE statements from __turso_internal_types before table DDL,
         // so that tables referencing custom types can be restored correctly.
         Self::dump_custom_types(&conn, out)?;
+        // Emit CREATE FUNCTION statements from __turso_internal_functions so
+        // user-defined functions survive a dump/restore.
+        Self::dump_functions(&conn, out)?;
         let q_tables = r#"
         SELECT name, sql
         FROM sqlite_schema
@@ -1822,8 +1831,11 @@ impl Limbo {
         if let Some(mut rows) = conn.query(q_tables)? {
             rows.run_with_row_callback(|row| {
                 let name: &str = row.get::<&str>(0)?;
-                // Skip sqlite_sequence and internal types metadata table
-                if name == "sqlite_sequence" || name == turso_core::schema::TURSO_TYPES_TABLE_NAME {
+                // Skip sqlite_sequence and internal metadata tables
+                if name == "sqlite_sequence"
+                    || name == turso_core::schema::TURSO_TYPES_TABLE_NAME
+                    || name == turso_core::schema::TURSO_FUNCTIONS_TABLE_NAME
+                {
                     return Ok(());
                 }
                 let ddl: &str = row.get::<&str>(1)?;
@@ -1916,6 +1928,36 @@ impl Limbo {
         let q = format!(
             "SELECT sql FROM {} ORDER BY rowid",
             turso_core::schema::TURSO_TYPES_TABLE_NAME
+        );
+        if let Some(mut rows) = conn.query(&q)? {
+            rows.run_with_row_callback(|row| {
+                let sql: &str = row.get::<&str>(0)?;
+                writeln!(out, "{sql};").map_err(|e| io_error(e, "write"))?;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn dump_functions<W: Write>(conn: &Arc<Connection>, out: &mut W) -> anyhow::Result<()> {
+        // Check if the internal functions table exists before querying it.
+        let check = format!(
+            "SELECT 1 FROM sqlite_schema WHERE name='{}' AND type='table'",
+            turso_core::schema::TURSO_FUNCTIONS_TABLE_NAME
+        );
+        let mut has_functions = false;
+        if let Some(mut rows) = conn.query(&check)? {
+            rows.run_with_row_callback(|_| {
+                has_functions = true;
+                Ok(())
+            })?;
+        }
+        if !has_functions {
+            return Ok(());
+        }
+        let q = format!(
+            "SELECT sql FROM {} ORDER BY rowid",
+            turso_core::schema::TURSO_FUNCTIONS_TABLE_NAME
         );
         if let Some(mut rows) = conn.query(&q)? {
             rows.run_with_row_callback(|row| {
