@@ -8,8 +8,8 @@ use super::{
         update::emit_program_for_update,
     },
     expr::{
-        bind_and_rewrite_expr, emit_table_column, translate_expr, translate_expr_no_constant_opt,
-        walk_expr, ExprAffinityInfo, NoConstantOptReason, WalkControl,
+        emit_table_column, translate_expr, translate_expr_no_constant_opt, walk_expr,
+        ExprAffinityInfo, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
@@ -28,6 +28,7 @@ use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
     EXPR_INDEX_SENTINEL,
 };
+use crate::translate::bind::bind_fixed_scope_expr;
 use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::ColumnMask;
 use crate::vdbe::{
@@ -1951,7 +1952,7 @@ pub(crate) fn emit_index_column_value_old_image(
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
         let mut expr = expr.as_ref().clone();
-        bind_and_rewrite_expr(&mut expr, Some(table_references), resolver, false)?;
+        bind_fixed_scope_expr(&mut expr, Some(table_references), resolver, false)?;
 
         let self_table_context = SelfTableContext::ForSelect {
             table_ref_id: table_internal_id,
@@ -2108,7 +2109,7 @@ fn emit_check_constraint_bytecode(
                 // even when the query references the table through an alias.
                 joined_table.identifier = table_name.to_string();
             }
-            bind_and_rewrite_expr(
+            bind_fixed_scope_expr(
                 &mut rewritten_expr,
                 Some(&mut binding_tables),
                 resolver,

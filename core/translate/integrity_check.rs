@@ -1,3 +1,4 @@
+use crate::translate::bind::bind_fixed_scope_expr;
 use crate::translate::expr::emit_table_column;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::SelfTableContext;
@@ -6,8 +7,8 @@ use crate::{
     translate::{
         emitter::Resolver,
         expr::{
-            bind_and_rewrite_expr, translate_condition_expr, translate_expr_no_constant_opt,
-            ConditionMetadata, NoConstantOptReason,
+            translate_condition_expr, translate_expr_no_constant_opt, ConditionMetadata,
+            NoConstantOptReason,
         },
         plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
     },
@@ -139,7 +140,7 @@ fn bind_expr_for_table(
     resolver: &Resolver,
 ) -> crate::Result<ast::Expr> {
     let mut out = expr.clone();
-    bind_and_rewrite_expr(&mut out, Some(table_references), resolver, false)?;
+    bind_fixed_scope_expr(&mut out, Some(table_references), resolver, false)?;
     Ok(out)
 }
 

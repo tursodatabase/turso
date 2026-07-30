@@ -28,7 +28,7 @@ use crate::{
 };
 use crate::{
     function::{AccumulatorFunc, AggFunc, ExtFunc},
-    translate::expr::bind_and_rewrite_expr,
+    translate::bind::bind_fixed_scope_expr,
 };
 use crate::{
     translate::plan::{Window, WindowFunction},
@@ -2216,9 +2216,9 @@ pub fn parse_limit(
     mut limit: Limit,
     resolver: &Resolver,
 ) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
-    bind_and_rewrite_expr(&mut limit.expr, None, resolver, false)?;
+    bind_fixed_scope_expr(&mut limit.expr, None, resolver, false)?;
     if let Some(ref mut off_expr) = limit.offset {
-        bind_and_rewrite_expr(off_expr, None, resolver, false)?;
+        bind_fixed_scope_expr(off_expr, None, resolver, false)?;
     }
     Ok((Some(limit.expr), limit.offset))
 }

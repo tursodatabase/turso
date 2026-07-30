@@ -5,6 +5,7 @@ use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
 use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
 use crate::sync::Arc;
+use crate::translate::bind::bind_fixed_scope_expr;
 use crate::translate::{
     collate::CollationSeq,
     emitter::{
@@ -12,8 +13,8 @@ use crate::translate::{
         OperationMode, Resolver,
     },
     expr::{
-        bind_and_rewrite_expr, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
-        ConditionMetadata, WalkControl,
+        translate_condition_expr, translate_expr, unwrap_parens, walk_expr, ConditionMetadata,
+        WalkControl,
     },
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
@@ -1120,7 +1121,7 @@ fn emit_index_column_value_from_cursor(
 ) -> crate::Result<()> {
     if let Some(expr) = &idx_col.expr {
         let mut expr = expr.as_ref().clone();
-        bind_and_rewrite_expr(&mut expr, Some(table_references), resolver, false)?;
+        bind_fixed_scope_expr(&mut expr, Some(table_references), resolver, false)?;
         let self_table_context =
             table_references
                 .joined_tables()

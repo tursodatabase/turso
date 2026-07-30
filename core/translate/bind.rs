@@ -65,6 +65,140 @@ pub trait BindTable {
     fn column_is_hidden(&self, idx: usize) -> bool;
 }
 
+/// Id generator for fixed-scope expression binding: such binding never
+/// creates tables (no FROM clause, no subquery rewriting), so allocating an
+/// id is a bug.
+struct NoNewIds;
+
+impl IdGenerator for NoNewIds {
+    fn next_table_id(&mut self) -> ast::TableInternalId {
+        unreachable!("fixed-scope expression binding does not create tables")
+    }
+    fn next_cte_id(&mut self) -> usize {
+        unreachable!("fixed-scope expression binding does not create CTEs")
+    }
+}
+
+/// Bind the identifier leaves of a standalone expression against the tables
+/// of `table_references` (or against nothing when `None`). This is for
+/// expressions outside a query context — index/CHECK/DEFAULT expressions,
+/// recursive-body LIMIT, integrity checks, emission-time rebinds — where the
+/// tables are already resolved and no subquery or BETWEEN rewriting must
+/// happen. Column/rowid usage is marked directly on `table_references`.
+///
+/// With `allow_unbound`, unresolved identifiers are left as-is (UPSERT's
+/// EXCLUDED references bind later) instead of erroring.
+pub fn bind_fixed_scope_expr(
+    expr: &mut ast::Expr,
+    mut table_references: Option<&mut TableReferences>,
+    resolver: &Resolver,
+    allow_unbound: bool,
+) -> Result<()> {
+    // Without tables there is nothing to resolve against: identifiers are an
+    // error (no double-quoted-string fallback — DQS never applied to
+    // scopeless expressions) unless the caller allows unbound identifiers.
+    let Some(refs) = table_references.as_deref_mut() else {
+        walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
+            match expr {
+                ast::Expr::Id(id) => {
+                    if !allow_unbound {
+                        crate::bail_parse_error!("no such column: {}", id.as_str());
+                    }
+                }
+                ast::Expr::Qualified(tbl, id) => {
+                    if !allow_unbound {
+                        crate::bail_parse_error!(
+                            "no such column: {}.{}",
+                            tbl.as_str(),
+                            id.as_str()
+                        );
+                    }
+                }
+                ast::Expr::DoublyQualified(db, tbl, id) => {
+                    if !allow_unbound {
+                        crate::bail_parse_error!(
+                            "no such column: {}.{}.{}",
+                            db.as_str(),
+                            tbl.as_str(),
+                            id.as_str()
+                        );
+                    }
+                }
+                ast::Expr::FunctionCall { name, args, .. } => {
+                    super::expr::validate_custom_type_function_call(name.as_str(), args, resolver)?;
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        return Ok(());
+    };
+
+    let mut id_gen = NoNewIds;
+    let mut ctx = BindContext::new(resolver, &mut id_gen);
+    ctx.allow_unbound = allow_unbound;
+    let scope = BindScope {
+        tables: refs
+            .joined_tables()
+            .iter()
+            .map(|jt| {
+                let table = Arc::new(jt.table.clone());
+                ScopeTable {
+                    identifier: jt.identifier.clone(),
+                    internal_id: jt.internal_id,
+                    source: ScopeTableSource::Table(table.clone()),
+                    table,
+                    join_info: jt.join_info.clone(),
+                    database_id: jt.database_id,
+                    indexed: None,
+                }
+            })
+            .collect(),
+        right_join_swapped: false,
+    };
+    // Real (non-definition-only) outer references stay resolvable, with the
+    // nearest scope depth winning — e.g. the UPDATE write phase reads index
+    // expressions against an ephemeral scratch table joined with the target
+    // table as an outer reference.
+    {
+        let mut depths: Vec<usize> = refs
+            .outer_query_refs()
+            .iter()
+            .filter(|r| !r.cte_definition_only)
+            .map(|r| r.scope_depth)
+            .collect();
+        depths.sort_unstable();
+        depths.dedup();
+        for depth in depths.into_iter().rev() {
+            let frame = BindScope {
+                tables: refs
+                    .outer_query_refs()
+                    .iter()
+                    .filter(|r| !r.cte_definition_only && r.scope_depth == depth)
+                    .map(|r| {
+                        let table = Arc::new(r.table.clone());
+                        ScopeTable {
+                            identifier: r.identifier.clone(),
+                            internal_id: r.internal_id,
+                            source: ScopeTableSource::Table(table.clone()),
+                            table,
+                            join_info: None,
+                            database_id: 0,
+                            indexed: None,
+                        }
+                    })
+                    .collect(),
+                right_join_swapped: false,
+            };
+            #[expect(clippy::arc_with_non_send_sync)]
+            ctx.append_outer_query_scope(Arc::new(frame), Arc::new(Vec::new()));
+        }
+    }
+    ctx.bind_expr_leaves(expr, &scope)?;
+    ctx.tracking.flush(refs);
+    Ok(())
+}
+
 impl dyn BindTable {
     /// Create a column iterator for any `dyn BindTable`.
     pub fn columns(&self) -> BindColumnIter<'_, Self> {
@@ -91,22 +225,25 @@ impl<'a, T: BindTable + ?Sized> Iterator for BindColumnIter<'a, T> {
     type Item = BindColumnRef<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.idx >= self.table.column_count() {
-            return None;
+        // Unnamed columns (e.g. unaliased expressions in an ephemeral scratch
+        // table) cannot be referenced by name and are skipped.
+        while self.idx < self.table.column_count() {
+            let i = self.idx;
+            self.idx += 1;
+            if let Some(name) = self.table.column_name(i) {
+                return Some(BindColumnRef {
+                    idx: i,
+                    name,
+                    is_rowid_alias: self.table.column_is_rowid_alias(i),
+                    is_hidden: self.table.column_is_hidden(i),
+                });
+            }
         }
-        let i = self.idx;
-        self.idx += 1;
-        Some(BindColumnRef {
-            idx: i,
-            name: self.table.column_name(i).unwrap(),
-            is_rowid_alias: self.table.column_is_rowid_alias(i),
-            is_hidden: self.table.column_is_hidden(i),
-        })
+        None
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.table.column_count() - self.idx;
-        (remaining, Some(remaining))
+        (0, Some(self.table.column_count() - self.idx))
     }
 }
 
@@ -3127,40 +3264,80 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         self.resolver,
                     )?;
                 }
-                ast::Expr::FunctionCallStar { name, filter_over } => {
-                    if let Ok(Some(func)) = Func::resolve_function(name.as_str(), 0) {
-                        if func.needs_star_expansion() && !scope.tables.is_empty() {
-                            let mut args: Vec<Box<ast::Expr>> = Vec::new();
-                            for st in &scope.tables {
-                                for col_ref in st.table.columns() {
-                                    if col_ref.is_hidden {
-                                        continue;
-                                    }
-                                    // Column name as string literal
-                                    let quoted = format!("'{}'", col_ref.name);
-                                    args.push(Box::new(ast::Expr::Literal(ast::Literal::String(
-                                        quoted,
-                                    ))));
-                                    // Column reference
-                                    args.push(Box::new(ast::Expr::Column {
-                                        database: None,
-                                        table: st.internal_id,
-                                        column: col_ref.idx,
-                                        is_rowid_alias: col_ref.is_rowid_alias,
-                                    }));
-                                    self.tracking.record_column(st.internal_id, col_ref.idx);
-                                }
-                            }
-                            *expr = ast::Expr::FunctionCall {
-                                name: name.clone(),
-                                distinctness: None,
-                                args,
-                                filter_over: filter_over.clone(),
-                                order_by: vec![],
-                                within_group: vec![],
-                            };
-                        }
-                    }
+                ast::Expr::FunctionCallStar { .. } => {
+                    self.expand_star_function(expr, scope);
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        Ok(())
+    }
+
+    /// Expand `f(*)` for functions that need star expansion (json_object,
+    /// jsonb_object) into alternating column-name / column-reference
+    /// arguments over the scope's tables. Leaves the call untouched when the
+    /// scope has no tables so translation can report the error.
+    fn expand_star_function(&mut self, expr: &mut ast::Expr, scope: &BindScope) {
+        let ast::Expr::FunctionCallStar { name, filter_over } = expr else {
+            return;
+        };
+        let Ok(Some(func)) = Func::resolve_function(name.as_str(), 0) else {
+            return;
+        };
+        if !func.needs_star_expansion() || scope.tables.is_empty() {
+            return;
+        }
+        let mut args: Vec<Box<ast::Expr>> = Vec::new();
+        for st in &scope.tables {
+            for col_ref in st.table.columns() {
+                if col_ref.is_hidden {
+                    continue;
+                }
+                // Column name as string literal
+                let quoted = format!("'{}'", col_ref.name);
+                args.push(Box::new(ast::Expr::Literal(ast::Literal::String(quoted))));
+                // Column reference
+                args.push(Box::new(ast::Expr::Column {
+                    database: None,
+                    table: st.internal_id,
+                    column: col_ref.idx,
+                    is_rowid_alias: col_ref.is_rowid_alias,
+                }));
+                self.tracking.record_column(st.internal_id, col_ref.idx);
+            }
+        }
+        *expr = ast::Expr::FunctionCall {
+            name: name.clone(),
+            distinctness: None,
+            args,
+            filter_over: filter_over.clone(),
+            order_by: vec![],
+            within_group: vec![],
+        };
+    }
+
+    /// Bind only the identifier leaves of an expression against a fixed
+    /// scope (see [bind_fixed_scope_expr]): Id / Qualified / DoublyQualified
+    /// resolution, star-expanding functions, and custom-type call
+    /// validation. Subquery bodies and BETWEEN are left untouched.
+    fn bind_expr_leaves(&mut self, expr: &mut ast::Expr, scope: &BindScope) -> Result<()> {
+        walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
+            match expr {
+                ast::Expr::Id(_)
+                | ast::Expr::Qualified(_, _)
+                | ast::Expr::DoublyQualified(_, _, _) => {
+                    self.bind_identifier(expr, scope)?;
+                }
+                ast::Expr::FunctionCall { name, args, .. } => {
+                    super::expr::validate_custom_type_function_call(
+                        name.as_str(),
+                        args,
+                        self.resolver,
+                    )?;
+                }
+                ast::Expr::FunctionCallStar { .. } => {
+                    self.expand_star_function(expr, scope);
                 }
                 _ => {}
             }
