@@ -3,10 +3,9 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::schema::{EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
-use crate::translate::plan::{ColumnMask, Operation};
-use crate::translate::planner::{parse_limit, ROWID_STRS};
+use crate::translate::plan::ColumnMask;
+use crate::translate::planner::ROWID_STRS;
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
@@ -22,7 +21,7 @@ use super::optimizer::optimize_plan;
 use super::plan::{
     ColumnUsedMask, DmlSafety, JoinedTable, Plan, TableReferences, UpdatePlan, UpdateSetClause,
 };
-use super::planner::{append_vtab_predicates_to_where_clause, parse_from, parse_where};
+use super::planner::append_vtab_predicates_to_where_clause;
 use super::subquery::{
     mark_shared_cte_materialization_requirements, plan_subqueries_from_returning,
     plan_subqueries_from_update_sets, plan_subqueries_from_where_clause,
@@ -166,7 +165,7 @@ fn prepare_and_optimize_update_plan(
     is_internal_schema_change: bool,
     ddl_query_for_cdc_update: Option<&str>,
 ) -> crate::Result<Plan> {
-    let mut update_plan = prepare_update_plan(
+    let (mut update_plan, mut bound_subqueries) = prepare_update_plan(
         program,
         resolver,
         body,
@@ -187,7 +186,7 @@ fn prepare_and_optimize_update_plan(
         &mut update_plan.where_clause,
         resolver,
         connection,
-        &mut rustc_hash::FxHashMap::default(),
+        &mut bound_subqueries,
     )?;
     mark_shared_cte_materialization_requirements(
         &mut read_scope_tables,
@@ -245,7 +244,10 @@ fn prepare_update_plan(
     mut body: ast::Update,
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
-) -> crate::Result<UpdatePlan> {
+) -> crate::Result<(
+    UpdatePlan,
+    rustc_hash::FxHashMap<turso_parser::ast::TableInternalId, super::bind::BoundSubquery>,
+)> {
     let database_id = resolver.resolve_existing_table_database_id_qualified(&body.tbl_name)?;
     let schema = resolver.schema();
     let target_name = &body.tbl_name.name;
@@ -272,39 +274,63 @@ fn prepare_update_plan(
         connection,
     )?;
 
-    // Extract WITH, OR conflict clause, and INDEXED BY before borrowing body mutably
-    let with = body.with.take();
+    // Extract the OR conflict clause before borrowing body mutably
     let or_conflict = body.or_conflict.take();
-    let indexed = body.indexed.take();
 
-    let table_name = table.get_name();
+    let table_name = table.get_name().to_string();
+    let table_name = table_name.as_str();
 
-    let target_table = JoinedTable {
-        table: table.as_ref().clone(),
-        identifier: body.tbl_name.identifier(),
-        internal_id: program.table_reference_counter.next(),
-        op: Operation::default_scan_for(&table),
-        join_info: None,
-        col_used_mask: ColumnUsedMask::default(),
-        column_use_counts: Vec::new(),
-        expression_index_usages: Vec::new(),
-        database_id,
-        indexed,
-    };
-    let mut from_tables = TableReferences::new_empty();
-    let mut where_clause = vec![];
-    let mut vtab_predicates = vec![];
-    parse_from(
-        body.from.take(),
+    // Bind phase: resolve all names in FROM/SET/WHERE/RETURNING up front.
+    let mut binder = super::bind::BindContext::new(resolver, program);
+    let mut bound = binder.bind_update(&mut body, database_id)?;
+
+    let cte_definitions = std::mem::take(&mut bound.cte_definitions);
+    let mut bound_subqueries = std::mem::take(&mut bound.subquery_bindings);
+    let derived_bindings = std::mem::take(&mut bound.derived_bindings);
+
+    // Plan CTEs and FROM-clause derived tables from the pre-bound data.
+    let mut planned_ctes =
+        super::planner::plan_bound_ctes(cte_definitions, resolver, program, connection)?;
+    let mut planned_derived = super::planner::plan_derived_tables(
+        derived_bindings,
+        &mut planned_ctes,
         resolver,
         program,
-        with,
-        true,
-        &mut where_clause,
-        &mut vtab_predicates,
-        &mut from_tables,
         connection,
     )?;
+
+    let target_table = {
+        let mut target_refs = bound.target_table_references(&mut planned_ctes)?;
+        target_refs.joined_tables_mut().remove(0)
+    };
+    let mut from_tables = bound.from_table_references(&mut planned_ctes, &mut planned_derived)?;
+
+    // Add planned CTEs as definition-only outer query refs so subqueries in
+    // ON/SET/WHERE/RETURNING can reference them.
+    for (name, jt) in &planned_ctes {
+        from_tables.add_outer_query_reference(super::plan::OuterQueryReference {
+            identifier: name.clone(),
+            internal_id: jt.internal_id,
+            table: jt.table.clone(),
+            using_dedup_hidden_cols: super::plan::ColumnMask::default(),
+            col_used_mask: ColumnUsedMask::default(),
+            cte_select: None,
+            cte_explicit_columns: vec![],
+            cte_id: None,
+            cte_definition_only: true,
+            rowid_referenced: false,
+            scope_depth: 0,
+        });
+    }
+
+    // Fold pre-bound JOIN ON/USING constraints and vtab arguments from the
+    // FROM clause into WHERE terms.
+    let mut where_clause = vec![];
+    let mut vtab_predicates = vec![];
+    if let Some(ref from_ast) = body.from {
+        super::planner::fold_join_constraints(from_ast, &mut from_tables, &mut where_clause)?;
+        super::planner::collect_vtab_predicates(from_ast, &from_tables, &mut vtab_predicates)?;
+    }
 
     // SQLite rejects UPDATE FROM when a NATURAL JOIN (or explicit USING) introduces
     // a column name that already appears in another FROM-side table without being
@@ -346,7 +372,7 @@ fn prepare_update_plan(
         &mut where_clause,
         resolver,
         connection,
-        &mut rustc_hash::FxHashMap::default(),
+        &mut bound_subqueries,
     )?;
 
     let mut read_scope_tables = TableReferences::new(vec![target_table], vec![]);
@@ -355,16 +381,6 @@ fn prepare_update_plan(
     }
     read_scope_tables.extend(from_tables);
 
-    for set in &mut body.sets {
-        bind_and_rewrite_expr(
-            &mut set.expr,
-            Some(&mut read_scope_tables),
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
-    }
-
     plan_subqueries_from_update_sets(
         program,
         &mut non_from_clause_subqueries,
@@ -372,6 +388,7 @@ fn prepare_update_plan(
         &mut body.sets,
         resolver,
         connection,
+        &mut bound_subqueries,
     )?;
 
     let set_clauses = collect_update_set_clauses(&mut body.sets, &table, table_name)?;
@@ -396,14 +413,14 @@ fn prepare_update_plan(
             &mut body.returning,
             resolver,
             connection,
-            &mut rustc_hash::FxHashMap::default(),
+            &mut bound_subqueries,
         )?;
 
         process_returning_clause(
             &mut body.returning,
             &mut returning_table_references,
             resolver,
-            false,
+            true,
         )?
     } else {
         vec![]
@@ -416,19 +433,14 @@ fn prepare_update_plan(
         &result_columns,
         &mut where_clause,
         resolver,
-        false,
+        true,
     )?;
-    parse_where(
-        body.where_clause.as_deref(),
-        &mut read_scope_tables,
-        Some(&result_columns),
-        &mut where_clause,
-        resolver,
-    )?;
+    super::planner::parse_where_bound(body.where_clause.as_deref(), &mut where_clause)?;
 
+    // LIMIT/OFFSET identifiers were already resolved by the binder.
     let (limit, offset) = body
         .limit
-        .map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
+        .map_or((None, None), |l| (Some(l.expr), l.offset));
 
     let indexes_to_update = collect_indexes_to_update(
         &table,
@@ -445,22 +457,25 @@ fn prepare_update_plan(
     let target_table = read_scope_tables.joined_tables_mut().remove(0);
     let from_tables = read_scope_tables;
 
-    Ok(UpdatePlan {
-        target_table,
-        from_tables,
-        or_conflict,
-        set_clauses,
-        where_clause,
-        returning: (!result_columns.is_empty()).then_some(result_columns),
-        limit,
-        offset,
-        contains_constant_false_condition: false,
-        indexes_to_update,
-        write_set_plan: None,
-        cdc_update_alter_statement: None,
-        non_from_clause_subqueries,
-        safety: DmlSafety::default(),
-    })
+    Ok((
+        UpdatePlan {
+            target_table,
+            from_tables,
+            or_conflict,
+            set_clauses,
+            where_clause,
+            returning: (!result_columns.is_empty()).then_some(result_columns),
+            limit,
+            offset,
+            contains_constant_false_condition: false,
+            indexes_to_update,
+            write_set_plan: None,
+            cdc_update_alter_statement: None,
+            non_from_clause_subqueries,
+            safety: DmlSafety::default(),
+        },
+        bound_subqueries,
+    ))
 }
 
 fn collect_update_set_clauses(

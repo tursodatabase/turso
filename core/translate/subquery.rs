@@ -482,9 +482,8 @@ pub fn plan_subqueries_from_update_sets(
     sets: &mut [ast::Set],
     resolver: &Resolver,
     connection: &Arc<Connection>,
+    bound_subqueries: &mut HashMap<ast::TableInternalId, crate::translate::bind::BoundSubquery>,
 ) -> Result<()> {
-    let mut bound_subqueries: HashMap<ast::TableInternalId, crate::translate::bind::BoundSubquery> =
-        HashMap::default();
     plan_subqueries_with_outer_query_access(
         program,
         non_from_clause_subqueries,
@@ -497,7 +496,7 @@ pub fn plan_subqueries_from_update_sets(
         SubqueryPosition::ResultColumn.allow_correlated(),
         &mut Vec::new(),
         &[],
-        &mut bound_subqueries,
+        bound_subqueries,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;

@@ -433,24 +433,46 @@ pub struct BoundSelect {
 }
 
 pub struct BoundUpdate {
-    pub scope: BindScope,
-    pub result_columns: Vec<BoundColumn>,
-    pub set_clauses: Vec<(usize, Box<ast::Expr>)>,
+    /// Scope containing only the target table (with alias/INDEXED BY).
+    pub target_scope: BindScope,
+    /// Scope for the UPDATE ... FROM clause tables, if present.
+    pub from_scope: Option<BindScope>,
     pub tracking: BindTracking,
     pub subquery_bindings: HashMap<ast::TableInternalId, BoundSubquery>,
+    pub derived_bindings: HashMap<ast::TableInternalId, BoundSubquery>,
     pub cte_definitions: Vec<(String, CteEntry)>,
 }
 
 impl BoundUpdate {
-    pub fn into_table_references(
-        self,
+    /// Convert the target scope into a single-table `TableReferences`.
+    pub fn target_table_references(
+        &self,
         planned_ctes: &mut HashMap<String, super::plan::JoinedTable>,
     ) -> Result<TableReferences> {
         BoundSelect::scope_to_table_references(
-            self.scope,
+            self.target_scope.clone(),
             &self.tracking,
             planned_ctes,
             &mut HashMap::default(),
+            Vec::new(),
+        )
+    }
+
+    /// Convert the FROM-clause scope (if any) into `TableReferences`.
+    #[allow(clippy::wrong_self_convention)]
+    pub fn from_table_references(
+        &mut self,
+        planned_ctes: &mut HashMap<String, super::plan::JoinedTable>,
+        planned_derived: &mut HashMap<ast::TableInternalId, super::plan::JoinedTable>,
+    ) -> Result<TableReferences> {
+        let Some(scope) = self.from_scope.take() else {
+            return Ok(TableReferences::new_empty());
+        };
+        BoundSelect::scope_to_table_references(
+            scope,
+            &self.tracking,
+            planned_ctes,
+            planned_derived,
             Vec::new(),
         )
     }
@@ -2871,32 +2893,58 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             }
 
             // 2. Build scope with target table
-            let scope = ctx.build_table_scope(
+            let target_scope = ctx.build_table_scope(
                 &update.tbl_name.name,
                 update.tbl_name.alias.as_ref(),
                 update.indexed.clone(),
                 database_id,
             )?;
 
-            // 3. Bind SET expressions + resolve column names to indices
-            let set_clauses = ctx.bind_set_clauses(&mut update.sets, &scope)?;
+            // 3. Bind the UPDATE ... FROM clause (if present). Its JOIN ON
+            //    constraints bind against the FROM tables only — they cannot
+            //    reference the target table.
+            let from_scope = match update.from.as_mut() {
+                Some(from) => Some(ctx.bind_from(from)?),
+                None => None,
+            };
 
-            // 4. Bind WHERE clause
+            // 4. Merge target + FROM tables into the read scope used by SET
+            //    and WHERE expressions.
+            let mut read_scope = target_scope.clone();
+            if let Some(fs) = &from_scope {
+                read_scope.tables.extend(fs.tables.iter().cloned());
+                read_scope.right_join_swapped = fs.right_join_swapped;
+            }
+
+            // 5. Bind SET expressions (column-name → index mapping stays in
+            //    the planner via collect_update_set_clauses).
+            ctx.with_phase(BindPhase::NoAliases, |ctx| {
+                for set in update.sets.iter_mut() {
+                    ctx.bind_expr(&mut set.expr, &read_scope)?;
+                }
+                Ok(())
+            })?;
+
+            // 6. Bind WHERE clause against the merged scope
             if let Some(where_expr) = &mut update.where_clause {
                 ctx.with_phase(BindPhase::NoAliases, |ctx| {
-                    ctx.bind_expr(where_expr, &scope)
+                    ctx.bind_expr(where_expr, &read_scope)
                 })?;
             }
 
-            // 5. Bind RETURNING (expand stars, bind exprs)
-            let result_columns = ctx.bind_returning(&mut update.returning, &scope)?;
+            // 7. Bind RETURNING. SQLite resolves RETURNING columns for an
+            //    aliased UPDATE target through the base table name, not the
+            //    alias, and FROM tables are not visible.
+            let mut returning_scope = target_scope.clone();
+            returning_scope.tables[0].identifier = normalize_ident(update.tbl_name.name.as_str());
+            ctx.bind_returning(&mut update.returning, &returning_scope)?;
 
-            // 6. Bind ORDER BY
+            // 8. Bind ORDER BY
             for sort_col in &mut update.order_by {
-                ctx.bind_expr(&mut sort_col.expr, &scope)?;
+                ctx.bind_expr(&mut sort_col.expr, &read_scope)?;
             }
 
-            // 7. Bind LIMIT/OFFSET
+            // 9. Bind LIMIT/OFFSET
             if let Some(limit) = update.limit.as_mut() {
                 let empty = BindScope::empty();
                 ctx.bind_expr(&mut limit.expr, &empty)?;
@@ -2905,8 +2953,8 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 }
             }
 
-            // 8. Extract CTE definitions in definition order (critical for
-            //    referenced_cte_indices correctness).
+            // 10. Extract CTE definitions in definition order (critical for
+            //     referenced_cte_indices correctness).
             let cte_definitions: Vec<(String, CteEntry)> = if let Some(with) = &update.with {
                 let mut ctes = std::mem::take(&mut ctx.ctes);
                 with.ctes
@@ -2921,11 +2969,11 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             };
 
             Ok(BoundUpdate {
-                scope,
-                result_columns,
-                set_clauses,
+                target_scope,
+                from_scope,
                 tracking: std::mem::take(&mut ctx.tracking),
                 subquery_bindings: std::mem::take(&mut ctx.subquery_bindings),
+                derived_bindings: std::mem::take(&mut ctx.derived_bindings),
                 cte_definitions,
             })
         })
