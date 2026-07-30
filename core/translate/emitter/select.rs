@@ -1302,6 +1302,46 @@ mod tests {
             .prepare("SELECT a COLLATE missing_collation FROM expressions")
             .is_err());
 
+        let mut parameter_statement = connection
+            .prepare(
+                "SELECT a + ?1, a >= ?2, :name FROM expressions \
+                 WHERE a + b >= ?2 AND name = :name",
+            )
+            .unwrap();
+        assert_eq!(parameter_statement.parameters_count(), 3);
+        assert_eq!(
+            parameter_statement.parameter_index(":name").unwrap().get(),
+            3
+        );
+        assert!(
+            parameter_statement
+                .get_program()
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::Variable { .. }))
+                .count()
+                >= 5,
+            "each symbolic parameter use must lower through the VDBE variable instruction"
+        );
+        parameter_statement
+            .bind_at(1.try_into().unwrap(), Value::from_i64(10))
+            .unwrap();
+        parameter_statement
+            .bind_at(2.try_into().unwrap(), Value::from_i64(4))
+            .unwrap();
+        let name_parameter = parameter_statement.parameter_index(":name").unwrap();
+        parameter_statement
+            .bind_at(name_parameter, Value::from_text("BETA"))
+            .unwrap();
+        assert_eq!(
+            parameter_statement.run_collect_rows().unwrap(),
+            vec![vec![
+                Value::from_i64(12),
+                Value::from_i64(0),
+                Value::from_text("BETA"),
+            ]]
+        );
+
         let mut control_flow_statement = connection
             .prepare(
                 "SELECT CASE \

@@ -1,13 +1,14 @@
 use smallvec::SmallVec;
-use turso_parser::ast::{Expr, Literal, Operator, TableInternalId};
+use turso_parser::ast::{Expr, Literal, Operator, TableInternalId, Variable};
 
 use crate::{
     schema::BTreeTable,
     translate::{
         alter::literal_default_value,
         compiler::{
-            add, compare, constant, logical, pack_values, resolved_comparison, BoxedCompile,
-            ComparisonOp, Compile, LogicalOp, PackValues, ResolvedComparison, Row, ValueId,
+            add, compare, constant, logical, pack_values, parameter, resolved_comparison,
+            BoxedCompile, ComparisonOp, Compile, LogicalOp, PackValues, ResolvedComparison, Row,
+            ValueId,
         },
         emitter::Resolver,
         plan::TableReferences,
@@ -25,6 +26,7 @@ use super::{comparison_affinity, comparison_collation};
 /// Compiling it later only needs the symbolic row that supplies its columns.
 pub(crate) enum ResolvedScalarExpr {
     Column(usize),
+    Parameter(Variable),
     Constant(Value),
     Add(Box<Self>, Box<Self>),
     Logical {
@@ -79,6 +81,7 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
                 self.resolve(inner)
             }
             Expr::Column { table, column, .. } => self.resolve_column(*table, *column),
+            Expr::Variable(variable) => Ok(Some(ResolvedScalarExpr::Parameter(variable.clone()))),
             Expr::Literal(literal) => self.resolve_literal(literal),
             Expr::Binary(lhs, operator, rhs) => self.resolve_binary(lhs, *operator, rhs),
             Expr::Case {
@@ -240,6 +243,7 @@ const fn comparison_op(operator: Operator) -> Option<ComparisonOp> {
 pub(crate) fn compile_expr(row: Row, expr: &ResolvedScalarExpr) -> BoxedCompile<ValueId> {
     match expr {
         ResolvedScalarExpr::Column(column) => row.column(*column).boxed(),
+        ResolvedScalarExpr::Parameter(variable) => parameter(variable.clone()).boxed(),
         ResolvedScalarExpr::Constant(value) => constant(value.clone()).boxed(),
         ResolvedScalarExpr::Add(lhs, rhs) => compile_expr(row, lhs)
             .then(compile_expr(row, rhs))

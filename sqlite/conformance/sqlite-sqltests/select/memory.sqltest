@@ -1986,3 +1986,13 @@ expect {
     eq|1|0
     0||1|
 }
+
+@cross-check-integrity
+test symbolic-scalar-parameters {
+    CREATE TABLE parameter_row(a INTEGER);
+    INSERT INTO parameter_row VALUES (1);
+    SELECT ?1, a + ?1, ?2 OR a FROM parameter_row;
+}
+expect {
+    ||1
+}

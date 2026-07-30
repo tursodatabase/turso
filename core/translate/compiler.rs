@@ -7,6 +7,7 @@
 use std::{fmt, marker::PhantomData};
 
 use smallvec::{smallvec, SmallVec};
+use turso_parser::ast::Variable;
 
 use crate::{
     numeric::Numeric,
@@ -564,6 +565,7 @@ impl BlockId {
 #[derive(Debug)]
 enum ScalarOp {
     Input(InputId),
+    Parameter(Variable),
     Constant(Value),
     Add {
         lhs: ValueId,
@@ -596,7 +598,9 @@ enum EffectOp {
 impl ScalarOp {
     fn operands(&self) -> impl Iterator<Item = ValueId> + '_ {
         let operands = match self {
-            Self::Input(_) | Self::Constant(_) | Self::Column { .. } => [None, None],
+            Self::Input(_) | Self::Parameter(_) | Self::Constant(_) | Self::Column { .. } => {
+                [None, None]
+            }
             Self::Add { lhs, rhs } | Self::Logical { lhs, rhs, .. } => [Some(*lhs), Some(*rhs)],
         };
         operands.into_iter().flatten()
@@ -605,7 +609,11 @@ impl ScalarOp {
     fn cursor(&self) -> Option<CursorId> {
         match self {
             Self::Column { cursor, .. } => Some(*cursor),
-            Self::Input(_) | Self::Constant(_) | Self::Add { .. } | Self::Logical { .. } => None,
+            Self::Input(_)
+            | Self::Parameter(_)
+            | Self::Constant(_)
+            | Self::Add { .. }
+            | Self::Logical { .. } => None,
         }
     }
 }
@@ -1470,6 +1478,13 @@ impl IrProgram {
                                     });
                                 }
                             }
+                            ScalarOp::Parameter(variable) => {
+                                let index = program.register_variable(variable);
+                                program.emit_insn(Insn::Variable {
+                                    index,
+                                    dest: destination,
+                                });
+                            }
                             ScalarOp::Constant(Value::Null) => program.emit_insn(Insn::Null {
                                 dest: destination,
                                 dest_end: None,
@@ -1756,6 +1771,13 @@ impl fmt::Display for IrProgram {
                         write!(f, "  %{} = ", result.0)?;
                         match op {
                             ScalarOp::Input(input) => writeln!(f, "input @{}", input.0)?,
+                            ScalarOp::Parameter(variable) => {
+                                if let Some(name) = variable.name.as_deref() {
+                                    writeln!(f, "parameter {name} @{}", variable.index)?;
+                                } else {
+                                    writeln!(f, "parameter ?{}", variable.index)?;
+                                }
+                            }
                             ScalarOp::Constant(value) => writeln!(f, "constant {value:?}")?,
                             ScalarOp::Add { lhs, rhs } => {
                                 writeln!(f, "add %{}, %{}", lhs.0, rhs.0)?;
@@ -2065,6 +2087,20 @@ impl Compile for Input {
     }
 }
 
+pub(crate) struct ParameterValue(Variable);
+
+pub(crate) const fn parameter(variable: Variable) -> ParameterValue {
+    ParameterValue(variable)
+}
+
+impl Compile for ParameterValue {
+    type Output = ValueId;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        builder.push(ScalarOp::Parameter(self.0))
+    }
+}
+
 pub(crate) fn constant(value: Value) -> Constant {
     Constant(value)
 }
@@ -2311,6 +2347,57 @@ mod tests {
                 "  return %2\n",
             )
         );
+    }
+
+    #[test]
+    fn parameters_register_bind_slots_only_during_lowering() {
+        let compiler = parameter(Variable::named(":offset", 2.try_into().unwrap()))
+            .then(parameter(Variable::indexed(1.try_into().unwrap())))
+            .and_then(|(lhs, rhs)| add(lhs, rhs));
+        let ir = compile_scalar(compiler).unwrap();
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 3, 0));
+
+        assert_eq!(program.parameters.count(), 0);
+        assert_eq!(
+            ir.to_string(),
+            concat!(
+                "block0:\n",
+                "  %0 = parameter :offset @2\n",
+                "  %1 = parameter ?1\n",
+                "  %2 = add %0, %1\n",
+                "  return %2\n",
+            )
+        );
+
+        ir.lower_into(&mut program, 7).unwrap();
+
+        assert_eq!(program.parameters.count(), 2);
+        assert_eq!(
+            program.parameters.name(1.try_into().unwrap()).as_deref(),
+            Some("?1")
+        );
+        assert_eq!(
+            program.parameters.name(2.try_into().unwrap()).as_deref(),
+            Some(":offset")
+        );
+        assert_eq!(program.insns.len(), 3);
+        assert!(matches!(
+            program.insns[0].0,
+            Insn::Variable { index, dest: 1 } if index.get() == 2
+        ));
+        assert!(matches!(
+            program.insns[1].0,
+            Insn::Variable { index, dest: 2 } if index.get() == 1
+        ));
+        assert!(matches!(
+            program.insns[2].0,
+            Insn::Add {
+                lhs: 1,
+                rhs: 2,
+                dest: 7,
+            }
+        ));
     }
 
     #[test]

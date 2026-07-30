@@ -11,6 +11,12 @@ dependent sequencing. Constructing a compiler must not mutate `ProgramBuilder`.
 Running the outermost compiler interprets the description into an intermediate
 representation.
 
+SQL parameters are symbolic values in that representation. Their stable parser
+identity is retained without allocating a register or changing the statement's
+bind table. Lowering registers each named or indexed slot with `ProgramBuilder`
+and emits the corresponding VDBE `Variable` instruction into the allocated SSA
+result register.
+
 ## Invariants
 
 - A compiler has one typed output.
