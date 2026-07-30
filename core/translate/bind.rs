@@ -1,3 +1,4 @@
+use crate::alloc::TursoVecExt;
 use crate::function::Func;
 use crate::sync::Arc;
 use crate::vdbe::builder::ProgramBuilder;
@@ -6,13 +7,16 @@ use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::num::NonZero;
-use turso_parser::ast::{self, JoinConstraint, TableInternalId};
+use turso_parser::ast::{self, JoinConstraint, SortOrder, SortedColumn, TableInternalId};
 
 use super::emitter::Resolver;
-use super::expr::{walk_expr, walk_expr_mut, WalkControl};
+use super::expr::{unwrap_parens, walk_expr, walk_expr_mut, WalkControl};
 use super::plan::{JoinInfo, TableReferences};
 use super::planner::parse_row_id;
-use crate::schema::{BTreeTable, Column, Schema, Table};
+use crate::schema::{
+    is_deterministic_schema_function_call, BTreeTable, Column, GeneratedType, IndexColumn, Schema,
+    Table, EXPR_INDEX_SENTINEL,
+};
 use crate::util::normalize_ident;
 use crate::Result;
 
@@ -146,6 +150,196 @@ pub fn bind_index_schema_expr(expr: &mut ast::Expr, table: &BTreeTable) {
         }
         Ok(WalkControl::Continue)
     });
+}
+
+/// Bind CREATE INDEX key expressions to columns of the indexed table.
+pub fn bind_index_columns(
+    table: &BTreeTable,
+    columns: &[SortedColumn],
+    resolver: Option<&Resolver>,
+) -> Result<crate::alloc::Vec<IndexColumn>> {
+    super::index::reject_explicit_nulls(columns)?;
+    let mut bound =
+        <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
+            columns.len(),
+        )?;
+    for sorted_column in columns {
+        let order = sorted_column.order.unwrap_or(SortOrder::Asc);
+        let (explicit_collation, base_expr) =
+            extract_index_collation(sorted_column.expr.as_ref(), resolver)?;
+        let unwrapped_expr = unwrap_parens(base_expr)?;
+        if let Some((position, column_name, column)) = bind_index_column(unwrapped_expr, table) {
+            let collation = explicit_collation.or_else(|| column.collation_opt());
+            let expr = match column.generated_type() {
+                GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
+                GeneratedType::NotGenerated => None,
+            };
+            bound
+                .push_within_capacity(IndexColumn {
+                    name: column_name,
+                    order,
+                    pos_in_table: position,
+                    collation,
+                    default: column.default.clone(),
+                    expr,
+                })
+                .expect("bound index columns vector was preallocated to columns.len()");
+            continue;
+        }
+        if !is_valid_index_expression(unwrapped_expr, table) {
+            crate::bail_parse_error!(
+                "Error: invalid expression in CREATE INDEX: {}",
+                sorted_column.expr
+            );
+        }
+        let mut key_expr = sorted_column.expr.clone();
+        bind_index_schema_expr(&mut key_expr, table);
+        bound
+            .push_within_capacity(IndexColumn {
+                name: sorted_column.expr.to_string(),
+                order,
+                pos_in_table: EXPR_INDEX_SENTINEL,
+                collation: explicit_collation,
+                default: None,
+                expr: Some(key_expr),
+            })
+            .expect("bound index columns vector was preallocated to columns.len()");
+    }
+    Ok(bound)
+}
+
+fn extract_index_collation<'a>(
+    expr: &'a ast::Expr,
+    resolver: Option<&Resolver>,
+) -> Result<(Option<super::collate::CollationSeq>, &'a ast::Expr)> {
+    let mut current = expr;
+    let mut collation = None;
+    loop {
+        current = unwrap_parens(current)?;
+        match current {
+            ast::Expr::Collate(inner, name) => {
+                if collation.is_none() {
+                    let resolved = match resolver {
+                        Some(resolver) => resolver.resolve_collation(name.as_str())?,
+                        None => super::collate::CollationSeq::new(name.as_str())?,
+                    };
+                    if resolved.is_custom() {
+                        crate::bail_parse_error!("custom collations are not supported in indexes");
+                    }
+                    collation = Some(resolved);
+                }
+                current = inner.as_ref();
+            }
+            _ => return Ok((collation, current)),
+        }
+    }
+}
+
+fn bind_index_column<'a>(
+    expr: &'a ast::Expr,
+    table: &'a BTreeTable,
+) -> Option<(usize, String, &'a Column)> {
+    let (position, column) = match expr {
+        ast::Expr::Id(column_name) | ast::Expr::Name(column_name) => {
+            table.get_column(column_name.as_str())?
+        }
+        // SQLite keeps this backwards-compatibility behavior for a bare string key.
+        ast::Expr::Literal(ast::Literal::String(column_name)) => {
+            table.get_column(column_name.trim_matches('\''))?
+        }
+        ast::Expr::Qualified(_, column) | ast::Expr::DoublyQualified(_, _, column) => {
+            table.get_column(column.as_str())?
+        }
+        ast::Expr::RowId { .. } => table.get_rowid_alias_column()?,
+        _ => return None,
+    };
+    let column_name = column
+        .name
+        .as_ref()
+        .expect("indexed column must have a name")
+        .clone();
+    Some((position, column_name, column))
+}
+
+fn is_valid_index_expression(expr: &ast::Expr, table: &BTreeTable) -> bool {
+    if matches!(expr, ast::Expr::Literal(ast::Literal::String(_))) {
+        return false;
+    }
+
+    let table_name = normalize_ident(table.name.as_str());
+    let has_column = |name: &str| {
+        let name = normalize_ident(name);
+        table.columns().iter().any(|column| {
+            column
+                .name
+                .as_ref()
+                .is_some_and(|column_name| normalize_ident(column_name) == name)
+        })
+    };
+    let is_table = |name: &str| normalize_ident(name).eq_ignore_ascii_case(&table_name);
+    let is_deterministic_function = |name: &str, args: &[Box<ast::Expr>]| {
+        let name = normalize_ident(name);
+        Func::resolve_function(&name, args.len()).is_ok_and(|function| {
+            function.is_some_and(|function| is_deterministic_schema_function_call(&function, args))
+        })
+    };
+
+    let mut valid = true;
+    let _ = walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        if !valid {
+            return Ok(WalkControl::SkipChildren);
+        }
+        match expr {
+            ast::Expr::Literal(
+                ast::Literal::CurrentDate
+                | ast::Literal::CurrentTime
+                | ast::Literal::CurrentTimestamp,
+            ) => valid = false,
+            ast::Expr::Literal(_) | ast::Expr::RowId { .. } => {}
+            ast::Expr::Id(name) | ast::Expr::Name(name) => {
+                if !has_column(name.as_str()) {
+                    valid = false;
+                }
+            }
+            ast::Expr::Qualified(namespace, column)
+            | ast::Expr::DoublyQualified(_, namespace, column) => {
+                if !is_table(namespace.as_str()) || !has_column(column.as_str()) {
+                    valid = false;
+                }
+            }
+            ast::Expr::FunctionCall {
+                name, filter_over, ..
+            }
+            | ast::Expr::FunctionCallStar {
+                name, filter_over, ..
+            } => {
+                if filter_over.over_clause.is_some() {
+                    valid = false;
+                } else {
+                    let args = match expr {
+                        ast::Expr::FunctionCall { args, .. } => args.as_slice(),
+                        ast::Expr::FunctionCallStar { .. } => &[] as &[Box<ast::Expr>],
+                        _ => unreachable!(),
+                    };
+                    if !is_deterministic_function(name.as_str(), args) {
+                        valid = false;
+                    }
+                }
+            }
+            ast::Expr::Exists(_)
+            | ast::Expr::InSelect { .. }
+            | ast::Expr::Subquery(_)
+            | ast::Expr::Raise { .. }
+            | ast::Expr::Variable(_) => valid = false,
+            _ => {}
+        }
+        Ok(if valid {
+            WalkControl::Continue
+        } else {
+            WalkControl::SkipChildren
+        })
+    });
+    valid
 }
 
 fn bind_self_table_leaf(name: &str, table: &BTreeTable) -> Option<ast::Expr> {

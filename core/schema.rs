@@ -10,9 +10,7 @@ use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
-use crate::translate::index::{
-    reject_explicit_nulls, resolve_index_method_parameters, resolve_sorted_columns,
-};
+use crate::translate::index::{reject_explicit_nulls, resolve_index_method_parameters};
 use crate::translate::planner::ROWID_STRS;
 use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -5737,7 +5735,8 @@ impl Index {
                 ..
             })) => {
                 let index_name = normalize_ident(idx_name.name.as_str());
-                let index_columns = resolve_sorted_columns(table, &columns)?;
+                let index_columns =
+                    crate::translate::bind::bind_index_columns(table, &columns, None)?;
                 if let Some(using) = using {
                     if where_clause.is_some() {
                         bail_parse_error!("custom index module do not support partial indices");
