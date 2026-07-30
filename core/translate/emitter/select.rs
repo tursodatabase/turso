@@ -9,7 +9,7 @@ use crate::{
         compiler::{
             bind_cursor_input, constant, cursor_input, cursor_values, declare_ephemeral_index,
             initialize_cursor_once, insert_index_pack, literal_values,
-            open_declared_ephemeral_index, open_ephemeral_index, pack_values, pure,
+            open_declared_ephemeral_index, open_ephemeral_index, open_table, pack_values, pure,
             result_row_pack, scan_index, scan_table, seek_in_values, seek_index, seek_rowid,
             seek_table_range, select_pack, BoxedCompile, Compile, CompileRegion, CursorId,
             CursorInputId, DeferredIndexBound, DeferredIndexRange, DeferredTableBound,
@@ -147,6 +147,12 @@ enum DeclarativeBtreeAccess<'a> {
         index: Option<&'a Arc<Index>>,
         source: DeclarativeInSource<'a>,
     },
+}
+
+#[derive(Clone, Copy)]
+enum DeclarativeInnerJoinAccess<'a> {
+    Scan(ScanDirection),
+    Rowid(&'a Expr),
 }
 
 #[derive(Clone, Copy)]
@@ -1181,26 +1187,27 @@ fn try_compile_declarative_inner_join(
         return Ok(None);
     }
 
-    let (outer_direction, inner_direction) = match (&outer.op, &inner.op) {
-        (
-            Operation::Scan(Scan::BTreeTable {
-                iter_dir: outer_direction,
-                index: None,
-            }),
-            Operation::Scan(Scan::BTreeTable {
-                iter_dir: inner_direction,
-                index: None,
-            }),
-        ) => (
-            match outer_direction {
-                IterationDirection::Forwards => ScanDirection::Forward,
-                IterationDirection::Backwards => ScanDirection::Reverse,
-            },
-            match inner_direction {
-                IterationDirection::Forwards => ScanDirection::Forward,
-                IterationDirection::Backwards => ScanDirection::Reverse,
-            },
-        ),
+    let outer_direction = match &outer.op {
+        Operation::Scan(Scan::BTreeTable {
+            iter_dir,
+            index: None,
+        }) => match iter_dir {
+            IterationDirection::Forwards => ScanDirection::Forward,
+            IterationDirection::Backwards => ScanDirection::Reverse,
+        },
+        _ => return Ok(None),
+    };
+    let inner_access = match &inner.op {
+        Operation::Scan(Scan::BTreeTable {
+            iter_dir,
+            index: None,
+        }) => DeclarativeInnerJoinAccess::Scan(match iter_dir {
+            IterationDirection::Forwards => ScanDirection::Forward,
+            IterationDirection::Backwards => ScanDirection::Reverse,
+        }),
+        Operation::Search(Search::RowidEq { cmp_expr }) => {
+            DeclarativeInnerJoinAccess::Rowid(cmp_expr)
+        }
         _ => return Ok(None),
     };
     let (Table::BTree(outer_table), Table::BTree(inner_table)) = (&outer.table, &inner.table)
@@ -1216,6 +1223,15 @@ fn try_compile_declarative_inner_join(
         RowLayout::Table,
         &plan.table_references,
     );
+    let inner_rowid = match inner_access {
+        DeclarativeInnerJoinAccess::Rowid(expression) => {
+            let Some(expression) = expr_resolver.resolve(expression)? else {
+                return Ok(None);
+            };
+            Some(expression)
+        }
+        DeclarativeInnerJoinAccess::Scan(_) => None,
+    };
     expr_resolver.add_source(
         inner.database_id,
         inner.internal_id,
@@ -1241,24 +1257,39 @@ fn try_compile_declarative_inner_join(
 
     let database_id = outer.database_id;
     let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
-    let scans = scan_table(
-        outer_table.clone(),
-        database_id,
-        schema_cookie,
-        outer_direction,
-    )
-    .then(scan_table(
+    let tables = open_table(outer_table.clone(), database_id, schema_cookie).then(open_table(
         inner_table.clone(),
         database_id,
         schema_cookie,
-        inner_direction,
-    ))
-    .map(|(outer_rows, inner_rows)| {
-        outer_rows.flat_map(move |outer_row| {
-            pure(inner_rows.map(move |inner_row| pure(SymbolicRows::pair(outer_row, inner_row))))
-        })
-    });
-    let compiler = body.into_symbolic_compiler(scans, destination, inputs);
+    ));
+    let compiler = match inner_access {
+        DeclarativeInnerJoinAccess::Scan(inner_direction) => {
+            let rows = tables.map(move |(outer, inner)| {
+                outer.scan(outer_direction).flat_map(move |outer_row| {
+                    pure(
+                        inner
+                            .scan(inner_direction)
+                            .map(move |inner_row| pure(SymbolicRows::pair(outer_row, inner_row))),
+                    )
+                })
+            });
+            body.into_symbolic_compiler(rows, destination, inputs)
+        }
+        DeclarativeInnerJoinAccess::Rowid(_) => {
+            let inner_rowid = inner_rowid.expect("rowid join access must resolve its key");
+            let rows = tables.map(move |(outer, inner)| {
+                outer.scan(outer_direction).flat_map(move |outer_row| {
+                    let rows = SymbolicRows::single(outer_row);
+                    compile_symbolic_expr(&rows, &inner_rowid).map(move |rowid| {
+                        inner
+                            .seek_rowid(rowid)
+                            .map(move |inner_row| pure(SymbolicRows::pair(outer_row, inner_row)))
+                    })
+                })
+            });
+            body.into_symbolic_compiler(rows, destination, inputs)
+        }
+    };
     Ok(Some(DeclarativeSelectProgram {
         compiler,
         destination_index,
@@ -4822,6 +4853,81 @@ mod tests {
             vec![
                 vec![Value::from_i64(2), Value::from_i64(24), Value::from_i64(4),],
                 vec![Value::from_i64(1), Value::from_i64(13), Value::from_i64(3),],
+            ]
+        );
+    }
+
+    #[test]
+    fn dependent_rowid_join_crosses_the_declarative_compiler_boundary() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute("CREATE TABLE parent_rows(id INTEGER PRIMARY KEY, a INTEGER)")
+            .unwrap();
+        connection
+            .execute("CREATE TABLE child_rows(id INTEGER, parent_id INTEGER, b INTEGER)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO parent_rows VALUES (1, 10), (2, 20), (3, NULL)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO child_rows VALUES \
+                 (1, 1, 2), (2, 1, 3), (3, 2, 4), (4, 2, 5), (5, 3, 1)",
+            )
+            .unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT p.id, p.a + c.b, c.b \
+                   FROM parent_rows AS p JOIN child_rows AS c ON c.parent_id = p.id \
+                  WHERE p.a >= c.b",
+            )
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+        let open_positions = instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(position, (instruction, _))| {
+                matches!(instruction, Insn::OpenRead { .. }).then_some(position)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(open_positions.len(), 2);
+        let first_positioning = instructions
+            .iter()
+            .position(|(instruction, _)| {
+                matches!(instruction, Insn::Rewind { .. } | Insn::SeekRowid { .. })
+            })
+            .expect("dependent join must position one of its table cursors");
+        assert!(open_positions
+            .iter()
+            .all(|position| *position < first_positioning));
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::SeekRowid { .. }))
+                .count(),
+            1
+        );
+        let result_row = instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 3, .. }))
+            .expect("dependent declarative join must produce a three-value result pack");
+        assert!(
+            instructions[result_row - 3..result_row]
+                .iter()
+                .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })),
+            "dependent join projections must remain symbolic until pack lowering"
+        );
+
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(1), Value::from_i64(12), Value::from_i64(2),],
+                vec![Value::from_i64(1), Value::from_i64(13), Value::from_i64(3),],
+                vec![Value::from_i64(2), Value::from_i64(24), Value::from_i64(4),],
+                vec![Value::from_i64(2), Value::from_i64(25), Value::from_i64(5),],
             ]
         );
     }

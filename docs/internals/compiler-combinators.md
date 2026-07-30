@@ -133,6 +133,14 @@ construction, so join predicates and projections can reference either row
 without leaking SQL identifiers into the compiler IR. Filtering, sorting,
 distinctness, slicing, and destinations then consume the joined stream through
 the same operators as a single-table scan.
+Table resource acquisition is separate from stream positioning. `open_table`
+produces a non-cloneable symbolic `OpenedTable`; consuming that handle with
+`scan` or `seek_rowid` produces the row stream. A dependent join can therefore
+open both tables in its entry block, compile a rowid key from the outer
+symbolic row, and turn the already-open inner table into a point stream inside
+`flat_map`. The inner cursor is repositioned per outer row without emitting an
+`OpenRead` in the loop. The `scan_table` and `seek_rowid` entry points are
+convenience compositions over this same resource API.
 Short-circuiting consumers use an SSA `try_fold` protocol: each accepted item
 returns a state pack and a symbolic continuation value. A false continuation
 branches directly to the loop exit, while a true continuation reaches the
@@ -188,7 +196,7 @@ and composes each ordered arm from `then`, `and_then`, comparison, and `branch`;
 NULL comparison results follow the false arm, as required by SQLite.
 The path also falls back when SQL semantics still live in the eager frontend:
 other expression forms, outer and semi/anti joins, join inputs selected through
-indexes or dependent seeks, joins wider than two tables or spanning attached
+indexes or range seeks, joins wider than two tables or spanning attached
 databases, aggregates, most subquery forms, generated values, arrays, and
 custom-type decoding.
 `EXPLAIN QUERY PLAN` also remains on the eager path until the IR models

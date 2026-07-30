@@ -5772,6 +5772,41 @@ pub(crate) struct OpenReadCursor {
     schema_cookie: u32,
 }
 
+/// Compiler operation that opens a table resource without choosing how it will
+/// be positioned.
+pub(crate) struct OpenTable {
+    cursor: OpenReadCursor,
+}
+
+/// An opened symbolic table resource that can be consumed into one positioned
+/// row stream.
+///
+/// Keeping this handle non-cloneable makes the positioning choice explicit at
+/// the resource-to-stream boundary.
+pub(crate) struct OpenedTable {
+    cursor: CursorId,
+}
+
+impl OpenedTable {
+    pub(crate) const fn scan(self, direction: ScanDirection) -> CursorRows {
+        CursorRows {
+            cursor: self.cursor,
+            row_cursor: self.cursor,
+            deferred_seek: None,
+            source: CursorRowSource::Scan(direction),
+        }
+    }
+
+    pub(crate) const fn seek_rowid(self, rowid: ValueId) -> CursorRows {
+        CursorRows {
+            cursor: self.cursor,
+            row_cursor: self.cursor,
+            deferred_seek: None,
+            source: CursorRowSource::Rowid(rowid),
+        }
+    }
+}
+
 pub(crate) struct OpenEphemeralIndex {
     index: Arc<Index>,
 }
@@ -7174,7 +7209,6 @@ impl RowStream for InSeekRows {
 
 enum ScanBtreeStart {
     Full(ScanDirection),
-    Rowid(BoxedCompile<ValueId>),
     TableRange(DeferredTableRange),
     IndexRange(DeferredIndexRange),
 }
@@ -7368,11 +7402,8 @@ pub(crate) fn scan_table(
     db: usize,
     schema_cookie: u32,
     direction: ScanDirection,
-) -> ScanBtree {
-    ScanBtree {
-        source: ScanBtreeSource::Table(open_read_table(table, db, schema_cookie)),
-        start: ScanBtreeStart::Full(direction),
-    }
+) -> impl Compile<Output = CursorRows> {
+    open_table(table, db, schema_cookie).map(move |table| table.scan(direction))
 }
 
 pub(crate) fn seek_rowid(
@@ -7380,11 +7411,10 @@ pub(crate) fn seek_rowid(
     db: usize,
     schema_cookie: u32,
     rowid: BoxedCompile<ValueId>,
-) -> ScanBtree {
-    ScanBtree {
-        source: ScanBtreeSource::Table(open_read_table(table, db, schema_cookie)),
-        start: ScanBtreeStart::Rowid(rowid),
-    }
+) -> impl Compile<Output = CursorRows> {
+    open_table(table, db, schema_cookie)
+        .then(rowid)
+        .map(|(table, rowid)| table.seek_rowid(rowid))
 }
 
 pub(crate) fn seek_table_range(
@@ -7480,7 +7510,6 @@ impl Compile for ScanBtree {
         let opened = self.source.open(builder)?;
         let source = match self.start {
             ScanBtreeStart::Full(direction) => CursorRowSource::Scan(direction),
-            ScanBtreeStart::Rowid(rowid) => CursorRowSource::Rowid(rowid.compile(builder)?),
             ScanBtreeStart::TableRange(range) => {
                 CursorRowSource::TableRange(range.compile(builder)?)
             }
@@ -7533,6 +7562,12 @@ pub(crate) fn open_read_table(
     }
 }
 
+pub(crate) fn open_table(table: Arc<BTreeTable>, db: usize, schema_cookie: u32) -> OpenTable {
+    OpenTable {
+        cursor: open_read_table(table, db, schema_cookie),
+    }
+}
+
 pub(crate) fn open_ephemeral_index(index: Arc<Index>) -> OpenEphemeralIndex {
     OpenEphemeralIndex { index }
 }
@@ -7569,6 +7604,16 @@ impl Compile for OpenReadCursor {
             schema_cookie: self.schema_cookie,
         })?;
         Ok(cursor)
+    }
+}
+
+impl Compile for OpenTable {
+    type Output = OpenedTable;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        self.cursor
+            .compile(builder)
+            .map(|cursor| OpenedTable { cursor })
     }
 }
 
@@ -8530,6 +8575,46 @@ mod tests {
             instruction,
             Insn::Rewind { .. } | Insn::Last { .. } | Insn::Next { .. } | Insn::Prev { .. }
         )));
+    }
+
+    #[test]
+    fn opened_table_resource_can_feed_a_dependent_seek_stream() {
+        let outer = Arc::new(BTreeTable::from_sql("CREATE TABLE outer_rows(key)", 2).unwrap());
+        let inner = Arc::new(BTreeTable::from_sql("CREATE TABLE inner_rows(value)", 3).unwrap());
+        let compiler = open_table(outer, 0, 0)
+            .then(open_table(inner, 0, 0))
+            .and_then(|(outer, inner)| {
+                outer
+                    .scan(ScanDirection::Forward)
+                    .flat_map(move |outer_row| {
+                        outer_row.column(0).map(move |key| inner.seek_rowid(key))
+                    })
+                    .for_each(|inner_row| {
+                        pack_values(smallvec![inner_row.column(0).boxed()])
+                            .and_then(result_row_pack)
+                    })
+            });
+
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+        let outer_open = rendered
+            .find("open_read $0")
+            .expect("outer table must be opened");
+        let inner_open = rendered
+            .find("open_read $1")
+            .expect("inner table must be opened");
+        let outer_scan = rendered
+            .find("cursor_start Forward $0")
+            .expect("outer table must produce a scan stream");
+        let inner_seek = rendered
+            .find("cursor_seek_rowid $1")
+            .expect("inner table must produce a rowid stream");
+
+        assert!(outer_open < outer_scan);
+        assert!(inner_open < outer_scan);
+        assert!(outer_scan < inner_seek);
+        assert_eq!(rendered.matches("open_read").count(), 2);
+        assert_eq!(rendered.matches("cursor_seek_rowid").count(), 1);
     }
 
     #[test]

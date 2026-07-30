@@ -2108,3 +2108,21 @@ expect {
     2|24|4
     1|13|3
 }
+
+@cross-check-integrity
+test symbolic-dependent-rowid-join-stream {
+    CREATE TABLE parent_rows(id INTEGER PRIMARY KEY, a INTEGER);
+    CREATE TABLE child_rows(id INTEGER, parent_id INTEGER, b INTEGER);
+    INSERT INTO parent_rows VALUES (1, 10), (2, 20), (3, NULL);
+    INSERT INTO child_rows VALUES
+        (1, 1, 2), (2, 1, 3), (3, 2, 4), (4, 2, 5), (5, 3, 1);
+    SELECT p.id, p.a + c.b, c.b
+      FROM parent_rows AS p JOIN child_rows AS c ON c.parent_id = p.id
+     WHERE p.a >= c.b;
+}
+expect {
+    1|12|2
+    1|13|3
+    2|24|4
+    2|25|5
+}
