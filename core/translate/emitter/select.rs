@@ -9,10 +9,10 @@ use crate::{
         compiler::{
             bind_cursor_input, constant, cursor_input, cursor_values, declare_ephemeral_index,
             initialize_cursor_once, insert_index_pack, literal_values,
-            open_declared_ephemeral_index, open_ephemeral_index, open_table, pack_values, pure,
-            result_row_pack, scan_index, scan_table, seek_in_values, seek_index, seek_rowid,
-            seek_table_range, select_pack, BoxedCompile, Compile, CompileRegion, CursorId,
-            CursorInputId, DeferredIndexBound, DeferredIndexRange, DeferredTableBound,
+            open_declared_ephemeral_index, open_ephemeral_index, open_index, open_table,
+            pack_values, pure, result_row_pack, scan_index, scan_table, seek_in_values, seek_index,
+            seek_rowid, seek_table_range, select_pack, BoxedCompile, Compile, CompileRegion,
+            CursorId, CursorInputId, DeferredIndexBound, DeferredIndexRange, DeferredTableBound,
             DeferredTableRange, InputProducer, InputRequirement, InputRequirements, InputSlot,
             PhysicalInputBinding, Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId,
             ValuePack,
@@ -82,18 +82,89 @@ pub fn emit_program_for_select_with_resolver(
     emit_program_for_select_with_inputs(program, &resolver, plan, materialized_build_inputs)
 }
 
-fn compile_deferred_index_bound(
+struct ResolvedIndexBound {
+    suffix: ResolvedIndexSuffix,
+    op: SeekOp,
+}
+
+enum ResolvedIndexSuffix {
+    None,
+    Null,
+    Expression {
+        expression: ResolvedScalarExpr,
+        affinity: Affinity,
+    },
+}
+
+impl ResolvedIndexBound {
+    fn into_deferred<F>(self, compile: &mut F) -> Option<DeferredIndexBound>
+    where
+        F: FnMut(&ResolvedScalarExpr) -> Option<BoxedCompile<ValueId>>,
+    {
+        Some(match self.suffix {
+            ResolvedIndexSuffix::None => DeferredIndexBound::prefix(self.op),
+            ResolvedIndexSuffix::Null => DeferredIndexBound::null(self.op),
+            ResolvedIndexSuffix::Expression {
+                expression,
+                affinity,
+            } => DeferredIndexBound::expression(compile(&expression)?, affinity, self.op),
+        })
+    }
+}
+
+struct ResolvedIndexRange {
+    prefix_values: SmallVec<[ResolvedScalarExpr; 4]>,
+    prefix_affinities: SmallVec<[Affinity; 4]>,
+    start: ResolvedIndexBound,
+    end: ResolvedIndexBound,
+    direction: ScanDirection,
+}
+
+impl ResolvedIndexRange {
+    fn into_deferred<F>(self, mut compile: F) -> Option<DeferredIndexRange>
+    where
+        F: FnMut(&ResolvedScalarExpr) -> Option<BoxedCompile<ValueId>>,
+    {
+        let mut prefix_values = SmallVec::with_capacity(self.prefix_values.len());
+        for expression in self.prefix_values {
+            prefix_values.push(compile(&expression)?);
+        }
+        let start = self.start.into_deferred(&mut compile)?;
+        let end = self.end.into_deferred(&mut compile)?;
+        Some(DeferredIndexRange::new(
+            prefix_values,
+            self.prefix_affinities,
+            start,
+            end,
+            self.direction,
+        ))
+    }
+
+    fn into_static_deferred(self) -> Option<DeferredIndexRange> {
+        self.into_deferred(compile_symbolic_static_expr)
+    }
+
+    fn into_row_deferred(self, rows: &SymbolicRows) -> DeferredIndexRange {
+        self.into_deferred(|expression| Some(compile_symbolic_expr(rows, expression)))
+            .expect("row-backed resolved index expressions must compile")
+    }
+}
+
+fn resolve_index_bound(
     key: &SeekKey,
     expr_resolver: &mut RowExprResolver<'_, '_>,
-) -> Result<Option<DeferredIndexBound>> {
+) -> Result<Option<ResolvedIndexBound>> {
     Ok(Some(match &key.last_component {
-        SeekKeyComponent::None => DeferredIndexBound::prefix(key.op),
-        SeekKeyComponent::Null => DeferredIndexBound::null(key.op),
+        SeekKeyComponent::None => ResolvedIndexBound {
+            suffix: ResolvedIndexSuffix::None,
+            op: key.op,
+        },
+        SeekKeyComponent::Null => ResolvedIndexBound {
+            suffix: ResolvedIndexSuffix::Null,
+            op: key.op,
+        },
         SeekKeyComponent::Expr(expression) => {
             let Some(resolved) = expr_resolver.resolve(expression)? else {
-                return Ok(None);
-            };
-            let Some(value) = compile_symbolic_static_expr(&resolved) else {
                 return Ok(None);
             };
             let affinity = if key.affinity.expr_needs_no_affinity_change(expression) {
@@ -101,8 +172,97 @@ fn compile_deferred_index_bound(
             } else {
                 key.affinity
             };
-            DeferredIndexBound::expression(value, affinity, key.op)
+            ResolvedIndexBound {
+                suffix: ResolvedIndexSuffix::Expression {
+                    expression: resolved,
+                    affinity,
+                },
+                op: key.op,
+            }
         }
+    }))
+}
+
+fn resolve_index_range(
+    direction: ScanDirection,
+    index: &Index,
+    seek_def: &SeekDef,
+    expr_resolver: &mut RowExprResolver<'_, '_>,
+) -> Result<Option<ResolvedIndexRange>> {
+    if !seek_def
+        .prefix
+        .iter()
+        .all(|constraint| constraint.eq.is_some())
+    {
+        return Ok(None);
+    }
+
+    let mut prefix_values = SmallVec::with_capacity(seek_def.prefix.len());
+    let mut prefix_affinities = SmallVec::with_capacity(seek_def.prefix.len());
+    for constraint in &seek_def.prefix {
+        let (_, expression, affinity) = constraint
+            .eq
+            .as_ref()
+            .expect("exact index seek prefix must contain only equalities");
+        let Some(resolved) = expr_resolver.resolve(expression)? else {
+            return Ok(None);
+        };
+        prefix_values.push(resolved);
+        prefix_affinities.push(if affinity.expr_needs_no_affinity_change(expression) {
+            Affinity::Blob
+        } else {
+            *affinity
+        });
+    }
+    let Some(mut start) = resolve_index_bound(&seek_def.start, expr_resolver)? else {
+        return Ok(None);
+    };
+    let Some(mut end) = resolve_index_bound(&seek_def.end, expr_resolver)? else {
+        return Ok(None);
+    };
+
+    // An unconstrained physical edge can include NULL keys that SQL range
+    // predicates must skip. Resolve that SQL policy before handing the range
+    // to the SQL-agnostic compiler IR.
+    let first_index_order = index
+        .columns
+        .first()
+        .expect("planner index range must use a non-empty index")
+        .order;
+    if seek_def.prefix.is_empty() && matches!(seek_def.start.last_component, SeekKeyComponent::None)
+    {
+        start = match (seek_def.iter_dir, first_index_order) {
+            (IterationDirection::Forwards, SortOrder::Asc) => ResolvedIndexBound {
+                suffix: ResolvedIndexSuffix::Null,
+                op: SeekOp::GT,
+            },
+            (IterationDirection::Backwards, SortOrder::Desc) => ResolvedIndexBound {
+                suffix: ResolvedIndexSuffix::Null,
+                op: SeekOp::LT,
+            },
+            _ => start,
+        };
+    }
+    if seek_def.prefix.is_empty() && matches!(seek_def.end.last_component, SeekKeyComponent::None) {
+        end = match (seek_def.iter_dir, first_index_order) {
+            (IterationDirection::Forwards, SortOrder::Desc) => ResolvedIndexBound {
+                suffix: ResolvedIndexSuffix::Null,
+                op: SeekOp::GE { eq_only: false },
+            },
+            (IterationDirection::Backwards, SortOrder::Asc) => ResolvedIndexBound {
+                suffix: ResolvedIndexSuffix::Null,
+                op: SeekOp::LE { eq_only: false },
+            },
+            _ => end,
+        };
+    }
+
+    Ok(Some(ResolvedIndexRange {
+        prefix_values,
+        prefix_affinities,
+        start,
+        end,
+        direction,
     }))
 }
 
@@ -153,6 +313,11 @@ enum DeclarativeBtreeAccess<'a> {
 enum DeclarativeInnerJoinAccess<'a> {
     Scan(ScanDirection),
     Rowid(&'a Expr),
+    IndexRange {
+        direction: ScanDirection,
+        index: &'a Arc<Index>,
+        seek_def: &'a SeekDef,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -987,75 +1152,16 @@ fn try_compile_declarative_table_scan(
             direction,
             index,
             seek_def,
-        } if seek_def
-            .prefix
-            .iter()
-            .all(|constraint| constraint.eq.is_some()) =>
-        {
-            let mut values = SmallVec::with_capacity(seek_def.prefix.len());
-            let mut affinities = SmallVec::with_capacity(seek_def.prefix.len());
-            for constraint in &seek_def.prefix {
-                let (_, expression, affinity) = constraint
-                    .eq
-                    .as_ref()
-                    .expect("exact index seek prefix must contain only equalities");
-                let Some(resolved) = expr_resolver.resolve(expression)? else {
-                    return Ok(None);
-                };
-                let Some(value) = compile_symbolic_static_expr(&resolved) else {
-                    return Ok(None);
-                };
-                values.push(value);
-                affinities.push(if affinity.expr_needs_no_affinity_change(expression) {
-                    crate::vdbe::affinity::Affinity::Blob
-                } else {
-                    *affinity
-                });
-            }
-            let Some(mut start) =
-                compile_deferred_index_bound(&seek_def.start, &mut expr_resolver)?
+        } => {
+            let Some(range) = resolve_index_range(direction, index, seek_def, &mut expr_resolver)?
             else {
                 return Ok(None);
             };
-            let Some(mut end) = compile_deferred_index_bound(&seek_def.end, &mut expr_resolver)?
-            else {
+            let Some(range) = range.into_static_deferred() else {
                 return Ok(None);
             };
-            // An unconstrained physical edge can include NULL keys that SQL
-            // range predicates must skip. Make that boundary explicit before
-            // handing the range to the SQL-agnostic compiler IR.
-            let first_index_order = index.columns[0].order;
-            if seek_def.prefix.is_empty()
-                && matches!(seek_def.start.last_component, SeekKeyComponent::None)
-            {
-                start = match (seek_def.iter_dir, first_index_order) {
-                    (IterationDirection::Forwards, SortOrder::Asc) => {
-                        DeferredIndexBound::null(SeekOp::GT)
-                    }
-                    (IterationDirection::Backwards, SortOrder::Desc) => {
-                        DeferredIndexBound::null(SeekOp::LT)
-                    }
-                    _ => start,
-                };
-            }
-            if seek_def.prefix.is_empty()
-                && matches!(seek_def.end.last_component, SeekKeyComponent::None)
-            {
-                end = match (seek_def.iter_dir, first_index_order) {
-                    (IterationDirection::Forwards, SortOrder::Desc) => {
-                        DeferredIndexBound::null(SeekOp::GE { eq_only: false })
-                    }
-                    (IterationDirection::Backwards, SortOrder::Asc) => {
-                        DeferredIndexBound::null(SeekOp::LE { eq_only: false })
-                    }
-                    _ => end,
-                };
-            }
-            Some(DeferredIndexRange::new(
-                values, affinities, start, end, direction,
-            ))
+            Some(range)
         }
-        DeclarativeBtreeAccess::IndexRange { .. } => return Ok(None),
         _ => None,
     };
     let Some(body) =
@@ -1208,11 +1314,44 @@ fn try_compile_declarative_inner_join(
         Operation::Search(Search::RowidEq { cmp_expr }) => {
             DeclarativeInnerJoinAccess::Rowid(cmp_expr)
         }
+        Operation::Search(Search::Seek {
+            index: Some(index),
+            seek_def,
+        }) => DeclarativeInnerJoinAccess::IndexRange {
+            direction: match seek_def.iter_dir {
+                IterationDirection::Forwards => ScanDirection::Forward,
+                IterationDirection::Backwards => ScanDirection::Reverse,
+            },
+            index,
+            seek_def,
+        },
         _ => return Ok(None),
     };
     let (Table::BTree(outer_table), Table::BTree(inner_table)) = (&outer.table, &inner.table)
     else {
         return Ok(None);
+    };
+    let inner_covering_index = match inner_access {
+        DeclarativeInnerJoinAccess::IndexRange { index, .. } => {
+            if index.ephemeral
+                || index.index_method.is_some()
+                || resolver.with_schema(inner.database_id, |schema| {
+                    index.columns.iter().any(|index_column| {
+                        inner_table
+                            .columns()
+                            .get(index_column.pos_in_table)
+                            .and_then(|column| {
+                                schema.get_type_def(&column.ty_str, inner_table.is_strict)
+                            })
+                            .is_some_and(|type_def| type_def.encode().is_some())
+                    })
+                })
+            {
+                return Ok(None);
+            }
+            inner.utilizes_covering_index().then_some(index)
+        }
+        DeclarativeInnerJoinAccess::Scan(_) | DeclarativeInnerJoinAccess::Rowid(_) => None,
     };
 
     let mut expr_resolver = RowExprResolver::new(
@@ -1230,13 +1369,29 @@ fn try_compile_declarative_inner_join(
             };
             Some(expression)
         }
-        DeclarativeInnerJoinAccess::Scan(_) => None,
+        DeclarativeInnerJoinAccess::Scan(_) | DeclarativeInnerJoinAccess::IndexRange { .. } => None,
+    };
+    let inner_index_range = match inner_access {
+        DeclarativeInnerJoinAccess::IndexRange {
+            direction,
+            index,
+            seek_def,
+        } => {
+            let Some(range) = resolve_index_range(direction, index, seek_def, &mut expr_resolver)?
+            else {
+                return Ok(None);
+            };
+            Some(range)
+        }
+        DeclarativeInnerJoinAccess::Scan(_) | DeclarativeInnerJoinAccess::Rowid(_) => None,
     };
     expr_resolver.add_source(
         inner.database_id,
         inner.internal_id,
         inner_table,
-        RowLayout::Table,
+        inner_covering_index
+            .map(|index| RowLayout::CoveringIndex(index.as_ref()))
+            .unwrap_or(RowLayout::Table),
     );
     let Some(body) =
         resolve_declarative_select_body(plan, resolver, &mut expr_resolver, outer.database_id, 1)?
@@ -1257,13 +1412,11 @@ fn try_compile_declarative_inner_join(
 
     let database_id = outer.database_id;
     let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
-    let tables = open_table(outer_table.clone(), database_id, schema_cookie).then(open_table(
-        inner_table.clone(),
-        database_id,
-        schema_cookie,
-    ));
+    let outer_table = open_table(outer_table.clone(), database_id, schema_cookie);
     let compiler = match inner_access {
         DeclarativeInnerJoinAccess::Scan(inner_direction) => {
+            let tables =
+                outer_table.then(open_table(inner_table.clone(), database_id, schema_cookie));
             let rows = tables.map(move |(outer, inner)| {
                 outer.scan(outer_direction).flat_map(move |outer_row| {
                     pure(
@@ -1277,12 +1430,35 @@ fn try_compile_declarative_inner_join(
         }
         DeclarativeInnerJoinAccess::Rowid(_) => {
             let inner_rowid = inner_rowid.expect("rowid join access must resolve its key");
+            let tables =
+                outer_table.then(open_table(inner_table.clone(), database_id, schema_cookie));
             let rows = tables.map(move |(outer, inner)| {
                 outer.scan(outer_direction).flat_map(move |outer_row| {
                     let rows = SymbolicRows::single(outer_row);
                     compile_symbolic_expr(&rows, &inner_rowid).map(move |rowid| {
                         inner
                             .seek_rowid(rowid)
+                            .map(move |inner_row| pure(SymbolicRows::pair(outer_row, inner_row)))
+                    })
+                })
+            });
+            body.into_symbolic_compiler(rows, destination, inputs)
+        }
+        DeclarativeInnerJoinAccess::IndexRange { index, .. } => {
+            let range = inner_index_range.expect("index join access must resolve its range");
+            let sources = outer_table.then(open_index(
+                inner_table.clone(),
+                index.clone(),
+                inner_covering_index.is_some(),
+                database_id,
+                schema_cookie,
+            ));
+            let rows = sources.map(move |(outer, inner)| {
+                outer.scan(outer_direction).flat_map(move |outer_row| {
+                    let rows = SymbolicRows::single(outer_row);
+                    let range = range.into_row_deferred(&rows);
+                    inner.seek(range).map(move |inner_rows| {
+                        inner_rows
                             .map(move |inner_row| pure(SymbolicRows::pair(outer_row, inner_row)))
                     })
                 })
@@ -4928,6 +5104,117 @@ mod tests {
                 vec![Value::from_i64(1), Value::from_i64(13), Value::from_i64(3),],
                 vec![Value::from_i64(2), Value::from_i64(24), Value::from_i64(4),],
                 vec![Value::from_i64(2), Value::from_i64(25), Value::from_i64(5),],
+            ]
+        );
+    }
+
+    #[test]
+    fn dependent_index_join_crosses_the_declarative_compiler_boundary() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute("CREATE TABLE join_keys(id INTEGER PRIMARY KEY, key TEXT, bonus INTEGER)")
+            .unwrap();
+        connection
+            .execute("CREATE TABLE join_values(id INTEGER PRIMARY KEY, key TEXT, amount INTEGER)")
+            .unwrap();
+        connection
+            .execute("CREATE INDEX join_values_key ON join_values(key)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO join_keys VALUES (1, 'a', 10), (2, 'b', 20), (3, 'x', 30)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO join_values VALUES \
+                 (1, 'a', 2), (2, 'a', 3), (3, 'b', 4), (4, 'c', 5)",
+            )
+            .unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT k.id, v.id, k.bonus + v.amount \
+                   FROM join_keys AS k \
+                   JOIN join_values AS v INDEXED BY join_values_key ON v.key = k.key \
+                  WHERE k.bonus >= v.amount",
+            )
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+        assert!(instructions.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::SeekGE {
+                is_index: true,
+                eq_only: true,
+                num_regs: 1,
+                ..
+            }
+        )));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::IdxGT { num_regs: 1, .. })));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::DeferredSeek { .. })));
+        let result_row = instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 3, .. }))
+            .expect("dependent index join must produce a three-value result pack");
+        assert!(
+            instructions[result_row - 3..result_row]
+                .iter()
+                .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })),
+            "dependent index join projections must remain symbolic until pack lowering"
+        );
+
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(1), Value::from_i64(1), Value::from_i64(12)],
+                vec![Value::from_i64(1), Value::from_i64(2), Value::from_i64(13)],
+                vec![Value::from_i64(2), Value::from_i64(3), Value::from_i64(24)],
+            ]
+        );
+
+        let mut covering = connection
+            .prepare(
+                "SELECT k.id, v.id, v.key \
+                   FROM join_keys AS k \
+                   JOIN join_values AS v INDEXED BY join_values_key ON v.key = k.key",
+            )
+            .unwrap();
+        let covering_instructions = &covering.get_program().insns;
+        assert!(covering_instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::IdxRowId { .. })));
+        assert!(covering_instructions
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::DeferredSeek { .. })));
+        let covering_result = covering_instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 3, .. }))
+            .expect("covering dependent index join must produce a three-value result pack");
+        assert!(covering_instructions[covering_result - 3..covering_result]
+            .iter()
+            .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })));
+        assert_eq!(
+            covering.run_collect_rows().unwrap(),
+            vec![
+                vec![
+                    Value::from_i64(1),
+                    Value::from_i64(1),
+                    Value::from_text("a")
+                ],
+                vec![
+                    Value::from_i64(1),
+                    Value::from_i64(2),
+                    Value::from_text("a")
+                ],
+                vec![
+                    Value::from_i64(2),
+                    Value::from_i64(3),
+                    Value::from_text("b")
+                ],
             ]
         );
     }

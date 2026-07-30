@@ -141,6 +141,15 @@ symbolic row, and turn the already-open inner table into a point stream inside
 `flat_map`. The inner cursor is repositioned per outer row without emitting an
 `OpenRead` in the loop. The `scan_table` and `seek_rowid` entry points are
 convenience compositions over this same resource API.
+Index acquisition follows the same contract. `open_index` produces an
+`OpenedIndex` that owns the index cursor and, for a non-covering access, its
+table cursor and deferred-seek relationship. `scan` or `seek` consumes the
+resource into a stream. A dependent index join resolves SQL affinity, NULL,
+and boundary policy in the frontend, then compiles the range key from the
+outer symbolic row inside `flat_map`. All physical cursors still open before
+the outer loop; only index positioning and deferred table lookup repeat for
+each outer row. `scan_index` and `seek_index` are convenience compositions over
+this resource API.
 Short-circuiting consumers use an SSA `try_fold` protocol: each accepted item
 returns a state pack and a symbolic continuation value. A false continuation
 branches directly to the loop exit, while a true continuation reaches the
@@ -195,10 +204,10 @@ each `WHEN` arm. The compiler evaluates the base once, retains its `ValueId`,
 and composes each ordered arm from `then`, `and_then`, comparison, and `branch`;
 NULL comparison results follow the false arm, as required by SQLite.
 The path also falls back when SQL semantics still live in the eager frontend:
-other expression forms, outer and semi/anti joins, join inputs selected through
-indexes or range seeks, joins wider than two tables or spanning attached
-databases, aggregates, most subquery forms, generated values, arrays, and
-custom-type decoding.
+other expression forms, outer and semi/anti joins, table-range and IN join
+inputs, unsupported index-range shapes, joins wider than two tables or spanning
+attached databases, aggregates, most subquery forms, generated values, arrays,
+and custom-type decoding.
 `EXPLAIN QUERY PLAN` also remains on the eager path until the IR models
 explain-tree effects.
 Ordinary column lowering does reuse the VDBE backend's logical-column helper, so

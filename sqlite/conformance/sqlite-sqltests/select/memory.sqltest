@@ -2126,3 +2126,23 @@ expect {
     2|24|4
     2|25|5
 }
+
+@cross-check-integrity
+test symbolic-dependent-index-join-stream {
+    CREATE TABLE join_keys(id INTEGER PRIMARY KEY, key TEXT, bonus INTEGER);
+    CREATE TABLE join_values(id INTEGER PRIMARY KEY, key TEXT, amount INTEGER);
+    CREATE INDEX join_values_key ON join_values(key);
+    INSERT INTO join_keys VALUES
+        (1, 'a', 10), (2, 'b', 20), (3, 'x', 30);
+    INSERT INTO join_values VALUES
+        (1, 'a', 2), (2, 'a', 3), (3, 'b', 4), (4, 'c', 5);
+    SELECT k.id, v.id, k.bonus + v.amount
+      FROM join_keys AS k
+      JOIN join_values AS v INDEXED BY join_values_key ON v.key = k.key
+     WHERE k.bonus >= v.amount;
+}
+expect {
+    1|1|12
+    1|2|13
+    2|3|24
+}

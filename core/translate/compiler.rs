@@ -5807,6 +5807,44 @@ impl OpenedTable {
     }
 }
 
+/// Compiler operation that opens an index, and its table cursor when required,
+/// without choosing how the index will be positioned.
+pub(crate) struct OpenIndex {
+    source: ScanBtreeSource,
+}
+
+/// An opened symbolic index resource that can be consumed into one positioned
+/// row stream.
+pub(crate) struct OpenedIndex {
+    cursor: CursorId,
+    row_cursor: CursorId,
+    deferred_seek: Option<DeferredSeekCursors>,
+}
+
+impl OpenedIndex {
+    fn rows(self, source: CursorRowSource) -> CursorRows {
+        CursorRows {
+            cursor: self.cursor,
+            row_cursor: self.row_cursor,
+            deferred_seek: self.deferred_seek,
+            source,
+        }
+    }
+
+    pub(crate) fn scan(self, direction: ScanDirection) -> CursorRows {
+        self.rows(CursorRowSource::Scan(direction))
+    }
+
+    pub(crate) const fn seek(self, range: DeferredIndexRange) -> SeekOpenedIndex {
+        SeekOpenedIndex { index: self, range }
+    }
+}
+
+pub(crate) struct SeekOpenedIndex {
+    index: OpenedIndex,
+    range: DeferredIndexRange,
+}
+
 pub(crate) struct OpenEphemeralIndex {
     index: Arc<Index>,
 }
@@ -7208,9 +7246,7 @@ impl RowStream for InSeekRows {
 }
 
 enum ScanBtreeStart {
-    Full(ScanDirection),
     TableRange(DeferredTableRange),
-    IndexRange(DeferredIndexRange),
 }
 
 pub(crate) struct DeferredTableBound {
@@ -7463,12 +7499,8 @@ pub(crate) fn scan_index(
     db: usize,
     schema_cookie: u32,
     direction: ScanDirection,
-) -> ScanBtree {
-    let source = index_source(table, index, covering, db, schema_cookie);
-    ScanBtree {
-        source,
-        start: ScanBtreeStart::Full(direction),
-    }
+) -> impl Compile<Output = CursorRows> {
+    open_index(table, index, covering, db, schema_cookie).map(move |index| index.scan(direction))
 }
 
 pub(crate) fn seek_index(
@@ -7478,10 +7510,19 @@ pub(crate) fn seek_index(
     db: usize,
     schema_cookie: u32,
     range: DeferredIndexRange,
-) -> ScanBtree {
-    ScanBtree {
+) -> impl Compile<Output = CursorRows> {
+    open_index(table, index, covering, db, schema_cookie).and_then(move |index| index.seek(range))
+}
+
+pub(crate) fn open_index(
+    table: Arc<BTreeTable>,
+    index: Arc<Index>,
+    covering: bool,
+    db: usize,
+    schema_cookie: u32,
+) -> OpenIndex {
+    OpenIndex {
         source: index_source(table, index, covering, db, schema_cookie),
-        start: ScanBtreeStart::IndexRange(range),
     }
 }
 
@@ -7509,12 +7550,8 @@ impl Compile for ScanBtree {
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
         let opened = self.source.open(builder)?;
         let source = match self.start {
-            ScanBtreeStart::Full(direction) => CursorRowSource::Scan(direction),
             ScanBtreeStart::TableRange(range) => {
                 CursorRowSource::TableRange(range.compile(builder)?)
-            }
-            ScanBtreeStart::IndexRange(range) => {
-                CursorRowSource::IndexRange(range.compile(builder)?)
             }
         };
         Ok(CursorRows {
@@ -7614,6 +7651,28 @@ impl Compile for OpenTable {
         self.cursor
             .compile(builder)
             .map(|cursor| OpenedTable { cursor })
+    }
+}
+
+impl Compile for OpenIndex {
+    type Output = OpenedIndex;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let opened = self.source.open(builder)?;
+        Ok(OpenedIndex {
+            cursor: opened.cursor,
+            row_cursor: opened.row_cursor,
+            deferred_seek: opened.deferred_seek,
+        })
+    }
+}
+
+impl Compile for SeekOpenedIndex {
+    type Output = CursorRows;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let range = self.range.compile(builder)?;
+        Ok(self.index.rows(CursorRowSource::IndexRange(range)))
     }
 }
 
@@ -8615,6 +8674,60 @@ mod tests {
         assert!(outer_scan < inner_seek);
         assert_eq!(rendered.matches("open_read").count(), 2);
         assert_eq!(rendered.matches("cursor_seek_rowid").count(), 1);
+    }
+
+    #[test]
+    fn opened_index_resource_can_feed_a_dependent_seek_stream() {
+        let outer = Arc::new(BTreeTable::from_sql("CREATE TABLE outer_rows(key)", 2).unwrap());
+        let inner =
+            Arc::new(BTreeTable::from_sql("CREATE TABLE inner_rows(key,value)", 3).unwrap());
+        let index = test_index(&inner, "inner_rows_key", 4);
+        let compiler = open_table(outer, 0, 0)
+            .then(open_index(inner, index, false, 0, 0))
+            .and_then(|(outer, inner)| {
+                outer
+                    .scan(ScanDirection::Forward)
+                    .flat_map(move |outer_row| {
+                        let range = DeferredIndexRange::new(
+                            smallvec![outer_row.column(0).boxed()],
+                            smallvec![Affinity::Blob],
+                            DeferredIndexBound::prefix(SeekOp::GE { eq_only: true }),
+                            DeferredIndexBound::prefix(SeekOp::GT),
+                            ScanDirection::Forward,
+                        );
+                        inner.seek(range)
+                    })
+                    .for_each(|inner_row| {
+                        pack_values(smallvec![inner_row.column(1).boxed()])
+                            .and_then(result_row_pack)
+                    })
+            });
+
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+        let outer_open = rendered
+            .find("open_read $0")
+            .expect("outer table must be opened");
+        let inner_table_open = rendered
+            .find("open_read $1")
+            .expect("inner table must be opened");
+        let inner_index_open = rendered
+            .find("open_read $2")
+            .expect("inner index must be opened");
+        let outer_scan = rendered
+            .find("cursor_start Forward $0")
+            .expect("outer table must produce a scan stream");
+        let inner_seek = rendered
+            .find("index_seek GE { eq_only: true } $2")
+            .expect("inner index must produce a dependent seek stream");
+
+        assert!(outer_open < outer_scan);
+        assert!(inner_table_open < outer_scan);
+        assert!(inner_index_open < outer_scan);
+        assert!(outer_scan < inner_seek);
+        assert!(rendered.contains("deferred_seek $2 -> $1"));
+        assert_eq!(rendered.matches("open_read").count(), 3);
+        assert_eq!(rendered.matches("index_seek").count(), 1);
     }
 
     #[test]
