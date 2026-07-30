@@ -319,41 +319,64 @@ fn compose_declarative_in_subquery(
     };
     let cursor_id = external.binding.cursor;
     let subquery_id = external.subquery_id;
-    let Some(subquery) = plan
+    let Some(subquery_index) = plan
         .non_from_clause_subqueries
         .iter()
-        .find(|subquery| subquery.internal_id == subquery_id)
+        .position(|subquery| subquery.internal_id == subquery_id)
     else {
         return Err(LimboError::InternalError(format!(
             "declarative IN references missing subquery {subquery_id:?}",
         )));
     };
-    let SubqueryState::Unevaluated {
-        plan: Some(subquery_plan),
-    } = &subquery.state
-    else {
-        return Err(LimboError::InternalError(format!(
-            "declarative IN subquery {subquery_id:?} has no unevaluated plan",
-        )));
+    let (inner, inner_destination, index, inner_table_references) = {
+        let subquery = &mut plan.non_from_clause_subqueries[subquery_index];
+        let SubqueryState::Unevaluated {
+            plan: Some(subquery_plan),
+        } = &mut subquery.state
+        else {
+            return Err(LimboError::InternalError(format!(
+                "declarative IN subquery {subquery_id:?} has no unevaluated plan",
+            )));
+        };
+        let Plan::Select(select_plan) = subquery_plan.as_mut() else {
+            return Ok(outer);
+        };
+        let Some(inner) = try_compile_declarative_table_scan(query_mode, resolver, select_plan)?
+        else {
+            return Ok(outer);
+        };
+        let Some(inner_destination) = inner.destination_cursor else {
+            return Ok(outer);
+        };
+        if inner_destination.cursor != cursor_id {
+            return Ok(outer);
+        }
+        let Some(index) = inner.destination_index.clone() else {
+            return Err(LimboError::InternalError(format!(
+                "declarative IN producer {subquery_id:?} has no ephemeral destination index",
+            )));
+        };
+
+        // Compose the deepest producer first. Each successful recursive frame
+        // consumes only its own child while unwinding, so an unsupported child
+        // leaves the entire outer chain available to the eager fallback.
+        let inner = compose_declarative_in_subquery(
+            query_mode,
+            resolver,
+            select_plan,
+            inner,
+            initialize_once,
+        )?;
+        if inner.external_in_cursor.is_some() {
+            return Ok(outer);
+        }
+        (
+            inner,
+            inner_destination,
+            index,
+            select_plan.table_references.clone(),
+        )
     };
-    let Plan::Select(select_plan) = subquery_plan.as_ref() else {
-        return Ok(outer);
-    };
-    let Some(inner) = try_compile_declarative_table_scan(query_mode, resolver, select_plan)? else {
-        return Ok(outer);
-    };
-    let Some(inner_destination) = inner.destination_cursor else {
-        return Ok(outer);
-    };
-    if inner_destination.cursor != cursor_id || inner.external_in_cursor.is_some() {
-        return Ok(outer);
-    }
-    let Some(index) = inner.destination_index.clone() else {
-        return Err(LimboError::InternalError(format!(
-            "declarative IN producer {subquery_id:?} has no ephemeral destination index",
-        )));
-    };
-    let inner_table_references = select_plan.table_references.clone();
 
     let outer_input = external.binding.input;
     let producer_input = inner_destination.input;
@@ -379,11 +402,8 @@ fn compose_declarative_in_subquery(
             .boxed()
     };
 
-    let subquery = plan
-        .non_from_clause_subqueries
-        .iter_mut()
-        .find(|subquery| subquery.internal_id == subquery_id)
-        .expect("declarative IN subquery must remain present while it is composed");
+    let subquery = &mut plan.non_from_clause_subqueries[subquery_index];
+    assert_eq!(subquery.internal_id, subquery_id);
     drop(subquery.consume_plan(EvalAt::BeforeLoop));
     plan.table_references.extend(inner_table_references);
 
@@ -2380,14 +2400,9 @@ mod tests {
             )
             .unwrap();
         let nested_instructions = &nested.get_program().insns;
-        let once_positions = nested_instructions
+        assert!(nested_instructions
             .iter()
-            .enumerate()
-            .filter_map(|(position, (instruction, _))| {
-                matches!(instruction, Insn::Once { .. }).then_some(position)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(once_positions.len(), 2);
+            .all(|(instruction, _)| !matches!(instruction, Insn::Once { .. })));
         let ephemeral_cursors = nested_instructions
             .iter()
             .filter_map(|(instruction, _)| match instruction {
@@ -2401,6 +2416,15 @@ mod tests {
         assert_eq!(ephemeral_cursors.len(), 2);
         let destination_cursor = ephemeral_cursors[0];
         let source_cursor = ephemeral_cursors[1];
+        let destination_open = nested_instructions
+            .iter()
+            .position(|(instruction, _)| {
+                matches!(
+                    instruction,
+                    Insn::OpenEphemeral { cursor_id, .. } if *cursor_id == destination_cursor
+                )
+            })
+            .unwrap();
         let source_open = nested_instructions
             .iter()
             .position(|(instruction, _)| {
@@ -2416,50 +2440,21 @@ mod tests {
                 matches!(instruction, Insn::IdxInsert { cursor_id, .. } if *cursor_id == source_cursor)
             })
             .expect("nested producer must fill its source index");
-        let source_scan = nested_instructions
-            .iter()
-            .enumerate()
-            .find_map(|(position, (instruction, _))| {
-                matches!(instruction, Insn::Rewind { cursor_id, .. } if *cursor_id == source_cursor)
-                    .then_some(position)
-            })
-            .expect("nested declarative producer must scan its distinct source cursor");
+        assert!(nested_instructions.iter().any(|(instruction, _)| {
+            matches!(instruction, Insn::Rewind { cursor_id, .. } if *cursor_id == source_cursor)
+        }));
         let destination_insert = nested_instructions
             .iter()
             .enumerate()
-            .skip(source_scan + 1)
             .find_map(|(position, (instruction, _))| {
                 matches!(instruction, Insn::IdxInsert { cursor_id, .. } if *cursor_id == destination_cursor)
                     .then_some(position)
             })
             .expect("nested declarative producer must fill its distinct destination cursor");
-        let destination_scan = nested_instructions
-            .iter()
-            .enumerate()
-            .skip(destination_insert + 1)
-            .find_map(|(position, (instruction, _))| {
-                matches!(instruction, Insn::Rewind { cursor_id, .. } if *cursor_id == destination_cursor)
-                    .then_some(position)
-            })
-            .expect("outer declarative consumer must scan the nested destination cursor");
-
-        let inner_once = once_positions[1];
-        let Insn::Once {
-            target_pc_when_reentered,
-        } = &nested_instructions[inner_once].0
-        else {
-            unreachable!();
-        };
-        let Insn::Goto { target_pc } = &nested_instructions[inner_once + 1].0 else {
-            panic!("compiler Once must explicitly enter its initializer");
-        };
-        assert_eq!(target_pc.as_offset_int() as usize, source_open);
-        assert!(target_pc_when_reentered.as_offset_int() as usize <= source_scan);
-        assert!(
-            source_open < source_insert
-                && source_insert < destination_insert
-                && destination_insert < destination_scan
-        );
+        assert!(nested_instructions.iter().any(|(instruction, _)| {
+            matches!(instruction, Insn::Rewind { cursor_id, .. } if *cursor_id == destination_cursor)
+        }));
+        assert!(source_open < source_insert && destination_open < destination_insert);
         assert_eq!(
             nested.run_collect_rows().unwrap(),
             vec![
@@ -2467,6 +2462,68 @@ mod tests {
                 vec![Value::from_i64(3)],
                 vec![Value::from_i64(5)],
             ]
+        );
+
+        let mut recursively_nested = connection
+            .prepare(
+                "SELECT id FROM subquery_rows WHERE id IN (\
+                     SELECT id FROM subquery_rows WHERE id IN (\
+                         SELECT id FROM subquery_rows WHERE id IN (\
+                             SELECT id FROM subquery_keys\
+                         )\
+                     )\
+                 ) ORDER BY id",
+            )
+            .unwrap();
+        let recursive_instructions = &recursively_nested.get_program().insns;
+        assert!(recursive_instructions
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::Once { .. })));
+        let recursive_ephemeral_cursors = recursive_instructions
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::OpenEphemeral {
+                    cursor_id,
+                    is_table: false,
+                } => Some(*cursor_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recursive_ephemeral_cursors.len(), 3);
+        for cursor in recursive_ephemeral_cursors {
+            assert!(recursive_instructions.iter().any(|(instruction, _)| {
+                matches!(instruction, Insn::IdxInsert { cursor_id, .. } if *cursor_id == cursor)
+            }));
+            assert!(recursive_instructions.iter().any(|(instruction, _)| {
+                matches!(instruction, Insn::Rewind { cursor_id, .. } if *cursor_id == cursor)
+            }));
+        }
+        assert_eq!(
+            recursively_nested.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(1)],
+                vec![Value::from_i64(3)],
+                vec![Value::from_i64(5)],
+            ]
+        );
+
+        let mut partially_supported = connection
+            .prepare(
+                "SELECT id FROM subquery_rows WHERE id IN (\
+                     SELECT id FROM subquery_rows WHERE id IN (\
+                         SELECT max(id) FROM subquery_keys\
+                     )\
+                 ) ORDER BY id",
+            )
+            .unwrap();
+        assert!(partially_supported
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Once { .. })));
+        assert_eq!(
+            partially_supported.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(5)]]
         );
 
         let mut correlated = connection

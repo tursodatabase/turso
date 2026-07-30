@@ -212,6 +212,11 @@ CFG, while cursor-open checks omit only the stateful re-entry edge. A value
 defined inside the initializer therefore still cannot escape it. Nested
 uncorrelated `IN` materialization uses this region to compose its producer and
 consumer as one deferred program while preserving once-per-statement behavior.
+Composition recursively descends through fully declarative `IN` chains before
+unwinding their cursor bindings. At the top level, the resulting producers are
+ordinary ordered stages in one IR graph and need no `Once` guard at all. If an
+unsupported ancestor leaves the region behind a nested eager boundary, the
+guarded initializer preserves the standalone subquery's re-entry semantics.
 
 Row production is an effect over a symbolic `ValuePack`, not an eagerly chosen
 register range. Each pack member remains an ordinary SSA value and must dominate
