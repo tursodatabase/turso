@@ -444,6 +444,73 @@ snapshot query-plan-by-name {
 
 For detailed information about working with snapshots (update modes, commands, CI integration), see [Snapshot Testing Guide](./snapshot-testing.md).
 
+## Matrix Cases
+
+A matrix case expands one SQL template over the cross-product of `@var`
+decorators, generating an individual case per combination. Use it when the
+same query shape must be pinned across many parameter combinations (frame
+clauses, type affinities, collations) without writing each case by hand.
+
+> **Note:** Like snapshots, matrix cases only run on the **Rust backend**
+> and use the first `@database` declaration.
+
+### Basic Syntax
+
+```
+@var <name> { <value> | <value> | ... }
+@var <other> { ... }
+matrix <name> {
+    <sql template referencing $name and $other>
+}
+```
+
+Each `@var` value may be any text (including the empty string, written as
+an empty list entry). The template must reference every declared variable
+as `$name`, contain exactly one SQL statement, and take no `expect` blocks.
+Expansions are named `<matrix>[<slug>]...[<slug>]` with one slug per
+variable in declaration order (lowercased, non-alphanumerics dashed,
+empty values become `none`). A matrix may expand to at most 20,000 cases.
+
+### Expected Results
+
+Matrix cases have no stored expectations at all. Every expansion runs its
+setups and statement against an in-process **bundled SQLite oracle**
+(rusqlite) in addition to Turso, and the assertion is agreement: the same
+rows in the same order, or both engines rejecting the statement (error
+messages are not compared). A failure report shows a unified diff of the
+two engines' rows.
+
+Both engines' values are rendered through the same formatter (including
+SQLite's `%!.15g` for reals), so the comparison is effectively typed —
+incidental float-formatting differences cannot produce false failures.
+
+The oracle's SQLite version is pinned by `Cargo.lock`; when SQLite's own
+behavior changes across versions, updating the oracle is a deliberate,
+reviewable dependency bump rather than silent drift.
+
+### Example
+
+```sql
+@database :memory:
+
+setup t {
+    CREATE TABLE t(p INT, k INT);
+    INSERT INTO t VALUES (1,1),(1,2),(2,3);
+}
+
+@setup t
+@var mode { ROWS | GROUPS | RANGE }
+@var end { CURRENT ROW | UNBOUNDED FOLLOWING }
+matrix frame-sums {
+    SELECT p, k, sum(k) OVER (PARTITION BY p ORDER BY k
+        $mode BETWEEN UNBOUNDED PRECEDING AND $end)
+    FROM t ORDER BY p, k;
+}
+```
+
+This expands to six cases (`frame-sums[rows][current-row]`, ...), each
+asserting that Turso and the bundled SQLite return identical rows.
+
 ## Grammar (EBNF-like)
 
 ```ebnf

@@ -6266,6 +6266,7 @@ dependencies = [
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",

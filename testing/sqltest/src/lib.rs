@@ -1,6 +1,7 @@
 pub mod backends;
 pub mod comparison;
 pub mod generator;
+pub mod matrix_oracle;
 pub mod output;
 pub mod parser;
 pub mod runner;

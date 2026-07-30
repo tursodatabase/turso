@@ -10,10 +10,11 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 
-/// Helper enum for parsing test or snapshot blocks with decorators
+/// Helper enum for parsing test, snapshot or matrix blocks with decorators
 enum TestOrSnapshot {
     Test(TestCase),
     Snapshot(SnapshotCase),
+    Matrix(MatrixCase),
 }
 
 /// Parse a `.sqltest` file from source
@@ -100,6 +101,7 @@ impl Parser {
         let mut setups = HashMap::new();
         let mut tests = Vec::new();
         let mut snapshots = Vec::new();
+        let mut matrices = Vec::new();
         let mut global_skip = Vec::new();
         let mut global_requires = Vec::new();
 
@@ -139,15 +141,18 @@ impl Parser {
                     | Token::AtRequires
                     | Token::AtBackend
                     | Token::AtCrossCheckIntegrity
+                    | Token::AtVar
                     | Token::Test
                     | Token::Snapshot
-                    | Token::SnapshotEqp,
+                    | Token::SnapshotEqp
+                    | Token::Matrix,
                 ) => {
-                    // Could be test or snapshot with decorators, peek ahead
+                    // Could be test, snapshot or matrix with decorators
                     let item = self.parse_test_or_snapshot()?;
                     match item {
                         TestOrSnapshot::Test(t) => tests.push(t),
                         TestOrSnapshot::Snapshot(s) => snapshots.push(s),
+                        TestOrSnapshot::Matrix(m) => matrices.push(m),
                     }
                 }
                 Some(token) => {
@@ -162,6 +167,7 @@ impl Parser {
             setups,
             tests,
             snapshots,
+            matrices,
             global_skip,
             global_requires,
         };
@@ -267,10 +273,23 @@ impl Parser {
         let mut backend = None;
         let mut requires = Vec::new();
         let mut cross_check_integrity = false;
+        let mut matrix_vars: Vec<MatrixVar> = Vec::new();
 
         // Parse decorators
         loop {
             match self.peek() {
+                Some(Token::AtVar) => {
+                    self.advance();
+                    let name = self.expect_identifier()?;
+                    if matrix_vars.iter().any(|v| v.name == name) {
+                        return Err(self.error(format!("duplicate @var name: {name}")));
+                    }
+                    let content = self.expect_block_content()?;
+                    let values: Vec<String> =
+                        content.split('|').map(|v| v.trim().to_string()).collect();
+                    matrix_vars.push(MatrixVar { name, values });
+                    self.skip_newlines_and_comments();
+                }
                 Some(Token::AtSetup) => {
                     let at_setup_span_start = self.current_span().start;
                     self.advance();
@@ -326,8 +345,43 @@ impl Parser {
             }
         }
 
-        // Now check if it's a test or snapshot
+        // Now check if it's a test, snapshot or matrix
+        if !matrix_vars.is_empty() && !matches!(self.peek(), Some(Token::Matrix)) {
+            return Err(self.error("@var decorators are only valid before a matrix".to_string()));
+        }
         match self.peek() {
+            Some(Token::Matrix) => {
+                self.advance();
+                let (name, name_span) = self.expect_identifier_with_span()?;
+                let sql_template = self.expect_block_content()?.trim().to_string();
+
+                self.skip_newlines_and_comments();
+
+                if matches!(self.peek(), Some(Token::Expect)) {
+                    return Err(self.error(
+                        "matrix cases take no expect blocks — every expansion is \
+                         verified against the bundled SQLite oracle at run time"
+                            .to_string(),
+                    ));
+                }
+                if matrix_vars.is_empty() {
+                    return Err(self.error("matrix requires at least one @var".to_string()));
+                }
+
+                Ok(TestOrSnapshot::Matrix(MatrixCase {
+                    name,
+                    name_span,
+                    sql_template,
+                    vars: matrix_vars,
+                    modifiers: CaseModifiers {
+                        setups: test_setups,
+                        skip,
+                        backend,
+                        requires,
+                        cross_check_integrity,
+                    },
+                }))
+            }
             Some(Token::Snapshot | Token::SnapshotEqp) => {
                 let eqp_only = matches!(self.peek(), Some(Token::SnapshotEqp));
                 self.advance();
@@ -422,12 +476,11 @@ impl Parser {
                 }))
             }
             Some(token) => Err(self.error(format!(
-                "expected 'test' or 'snapshot' after decorators, got {token}"
+                "expected 'test', 'snapshot' or 'matrix' after decorators, got {token}"
             ))),
-            None => {
-                Err(self
-                    .error("expected 'test' or 'snapshot' after decorators, got EOF".to_string()))
-            }
+            None => Err(self.error(
+                "expected 'test', 'snapshot' or 'matrix' after decorators, got EOF".to_string(),
+            )),
         }
     }
 
@@ -754,6 +807,100 @@ impl Parser {
                 });
             }
             seen_snapshot_names.insert(&snapshot.name, snapshot.name_span.clone());
+        }
+
+        // Rule 8: Matrix invariants — unique names, defined setups, every
+        // variable both non-empty and actually referenced by the template,
+        // no unknown $vars, and a sane expansion count.
+        let mut seen_matrix_names: std::collections::HashMap<&str, Range<usize>> =
+            std::collections::HashMap::new();
+        for matrix in &file.matrices {
+            let err = |message: String, help: Option<String>| ParseError::ValidationError {
+                message,
+                span: Some(SourceSpan::new(
+                    matrix.name_span.start.into(),
+                    matrix.name_span.len(),
+                )),
+                help,
+            };
+            if seen_matrix_names
+                .insert(&matrix.name, matrix.name_span.clone())
+                .is_some()
+            {
+                return Err(err(format!("duplicate matrix name: {}", matrix.name), None));
+            }
+            for setup_ref in &matrix.modifiers.setups {
+                if !file.setups.contains_key(&setup_ref.name) {
+                    return Err(err(
+                        format!(
+                            "matrix '{}' references undefined setup '{}'",
+                            matrix.name, setup_ref.name
+                        ),
+                        None,
+                    ));
+                }
+            }
+            for var in &matrix.vars {
+                if var.values.iter().all(|v| v.is_empty()) {
+                    return Err(err(
+                        format!(
+                            "matrix '{}' variable '{}' has no non-empty values",
+                            matrix.name, var.name
+                        ),
+                        Some("List values separated by | inside the @var block".to_string()),
+                    ));
+                }
+                if !matrix.sql_template.contains(&format!("${}", var.name)) {
+                    return Err(err(
+                        format!(
+                            "matrix '{}' variable '{}' is never referenced in the SQL template",
+                            matrix.name, var.name
+                        ),
+                        Some(format!("Reference it as ${} or remove the @var", var.name)),
+                    ));
+                }
+            }
+            // Any $ident left in a fully-substituted template is an unknown
+            // variable (values themselves could reintroduce '$', so check
+            // the template directly against the declared names).
+            let mut rest = matrix.sql_template.as_str();
+            while let Some(pos) = rest.find('$') {
+                let ident: String = rest[pos + 1..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !ident.is_empty() && !matrix.vars.iter().any(|v| v.name == ident) {
+                    return Err(err(
+                        format!(
+                            "matrix '{}' references undeclared variable '${ident}'",
+                            matrix.name
+                        ),
+                        Some("Declare it with @var before the matrix".to_string()),
+                    ));
+                }
+                rest = &rest[pos + 1..];
+            }
+            const MAX_EXPANSIONS: usize = 20_000;
+            let count = matrix.expansion_count();
+            if count > MAX_EXPANSIONS {
+                return Err(err(
+                    format!(
+                        "matrix '{}' expands to {count} cases (limit {MAX_EXPANSIONS})",
+                        matrix.name
+                    ),
+                    Some("Split the matrix or reduce variable values".to_string()),
+                ));
+            }
+            let statement_count = count_sql_statements(&matrix.sql_template);
+            if statement_count != 1 {
+                return Err(err(
+                    format!(
+                        "matrix '{}' must contain exactly one SQL statement, found {statement_count}",
+                        matrix.name
+                    ),
+                    None,
+                ));
+            }
         }
 
         // Rule 7: Snapshots must contain exactly one SQL statement
