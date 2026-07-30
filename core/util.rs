@@ -2236,35 +2236,7 @@ pub fn check_expr_references_column(expr: &ast::Expr, col_name_normalized: &str)
     found
 }
 
-/// Rewrite column name references; used in e.g. ALTER TABLE RENAME COLUMN
-/// to rewrite references to the old column name to the new column name.
-/// Replaces `Id(old)` and `Name(old)` with `Id(new)`, and updates the
-/// column name in `Qualified(tbl, old)` references.
-pub fn rename_identifiers(expr: &mut ast::Expr, from: &str, to: &str) {
-    // The closure is infallible, so walk_expr_mut cannot fail.
-    let _ = walk_expr_mut(
-        expr,
-        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-            match e {
-                ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
-                    if name.as_str().eq_ignore_ascii_case(from) =>
-                {
-                    *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
-                }
-                ast::Expr::Qualified(ref tbl, ref col_name)
-                    if col_name.as_str().eq_ignore_ascii_case(from) =>
-                {
-                    let tbl = tbl.clone();
-                    *e = ast::Expr::Qualified(tbl, ast::Name::exact(to.to_owned()));
-                }
-                _ => {}
-            }
-            Ok(WalkControl::Continue)
-        },
-    );
-}
-
-/// Like `rename_identifiers` but scope-aware: only renames qualified refs
+/// Scope-aware identifier rename: only renames qualified refs
 /// (e.g. `t1.b`) when the qualifier matches the target table or is NEW/OLD
 /// (which always refer to the trigger's owning table). Unqualified refs
 /// are renamed unconditionally (caller must ensure they're in the right scope).
@@ -3453,10 +3425,10 @@ pub fn rewrite_column_references_if_needed(
                 rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
             }
             ast::ColumnConstraint::Check(expr) => {
-                rename_identifiers(expr, from, to);
+                crate::translate::bind::rename_schema_expr_identifiers(expr, from, to);
             }
             ast::ColumnConstraint::Generated { expr, .. } => {
-                rename_identifiers(expr, from, to);
+                crate::translate::bind::rename_schema_expr_identifiers(expr, from, to);
             }
             _ => {}
         }

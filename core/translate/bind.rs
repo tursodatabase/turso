@@ -162,6 +162,24 @@ pub fn render_schema_expr(expr: &ast::Expr, columns: &[Column]) -> Result<String
     Ok(unbound.to_string())
 }
 
+/// Rename raw column identifiers left in a leniently loaded schema expression.
+pub fn rename_schema_expr_identifiers(expr: &mut ast::Expr, from: &str, to: &str) {
+    let _ = walk_expr_mut(expr, &mut |expr| {
+        match expr {
+            ast::Expr::Id(name) | ast::Expr::Name(name)
+                if name.as_str().eq_ignore_ascii_case(from) =>
+            {
+                *expr = ast::Expr::Id(ast::Name::exact(to.to_owned()));
+            }
+            ast::Expr::Qualified(table, column) if column.as_str().eq_ignore_ascii_case(from) => {
+                *expr = ast::Expr::Qualified(table.clone(), ast::Name::exact(to.to_owned()));
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+}
+
 /// Point SELF_TABLE references in a stored schema expression at a concrete
 /// table reference. This does not reject unresolved identifiers because ALTER
 /// validation may deliberately bind them through an expression register cache.
