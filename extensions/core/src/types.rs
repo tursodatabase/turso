@@ -194,11 +194,12 @@ impl TextValue {
 
     fn new_boxed(s: String, sub: TextSubtype) -> Box<Self> {
         let len = s.len();
-        let buffer = s.into_boxed_str();
-        let strbox = Box::into_raw(buffer);
+        let mut buf = s.into_bytes();
+        buf.push(0); // NUL-terminate so sqlite3_value_text satisfies the C API contract
+        let text = Box::into_raw(buf.into_boxed_slice()).cast();
         Box::new(Self {
             _type: sub,
-            text: strbox as *const u8,
+            text,
             len: len as u32,
         })
     }
@@ -206,7 +207,9 @@ impl TextValue {
     #[cfg(feature = "core_only")]
     fn free(self) {
         if !self.text.is_null() {
-            let ptr = std::ptr::slice_from_raw_parts_mut(self.text as *mut u8, self.len as usize);
+            // +1 matches new_boxed's NUL byte; len field stays content-only
+            let ptr =
+                std::ptr::slice_from_raw_parts_mut(self.text as *mut u8, self.len as usize + 1);
             let _ = unsafe { Box::from_raw(ptr) };
         }
     }

@@ -3745,4 +3745,71 @@ mod tests {
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn test_sqlite3_value_text_nul_terminated() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static NUL_FOUND: AtomicBool = AtomicBool::new(false);
+
+        unsafe extern "C" fn check_nul(
+            _ctx: *mut libc::c_void,
+            _argc: i32,
+            argv: *mut *mut libc::c_void,
+        ) {
+            let val = *argv;
+            let ptr = sqlite3_value_text(val);
+            if ptr.is_null() {
+                return;
+            }
+            let len = sqlite3_value_bytes(val) as usize;
+            // SQLite contract: sqlite3_value_text returns a NUL-terminated string.
+            // The byte at ptr[len] must be '\0'
+            let nul = unsafe { *ptr.add(len) };
+            NUL_FOUND.store(nul == 0, Ordering::SeqCst);
+        }
+
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("nul_test.db");
+            let path_cstr = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path_cstr.as_ptr(), &mut db), SQLITE_OK);
+
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"check_nul".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    Some(check_nul),
+                    None,
+                    None,
+                    None,
+                ),
+                SQLITE_OK
+            );
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT check_nul('hello')".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+
+        assert!(
+            NUL_FOUND.load(Ordering::SeqCst),
+            "sqlite3_value_text must return a NUL-terminated string"
+        );
+    }
 }
