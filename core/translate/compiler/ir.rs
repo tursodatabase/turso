@@ -225,11 +225,6 @@ impl CallId {
 #[derive(Debug, Clone)]
 pub struct CallData {
     pub func: FuncCtx,
-    /// Whether the whole call expression is constant (deterministic
-    /// function over constant arguments, per `Expr::is_constant`). Set by
-    /// the frontend at description time; emission uses it to keep
-    /// constant calls eligible for hoisting into the prologue.
-    pub constant: bool,
     /// `Insn::Function`'s P1: a bitmask of constant arguments the
     /// runtime may cache across invocations (e.g. a LIKE pattern
     /// compiled once). Zero for most calls.
@@ -783,22 +778,16 @@ impl FuncBuilder {
         self.push_inst(Inst::Binary { op, lhs, rhs })
     }
 
-    /// A scalar function call. `constant` marks calls that are
-    /// deterministic over constant arguments (hoistable); calls are never
-    /// deduplicated, so two identical calls run twice. Argument order is
-    /// pack-slot order, which may differ from evaluation order (the
-    /// frontend controls evaluation by when it runs each operand).
-    pub fn call(
-        &mut self,
-        func: FuncCtx,
-        constant: bool,
-        constant_mask: i32,
-        args: Vec<ValueId>,
-    ) -> ValueId {
+    /// A scalar function call. Calls are never deduplicated (two
+    /// identical calls run twice) and never hoisted into the prologue
+    /// (they may throw, so they must run exactly where control flow
+    /// places them). Argument order is pack-slot order, which may differ
+    /// from evaluation order (the frontend controls evaluation by when
+    /// it runs each operand).
+    pub fn call(&mut self, func: FuncCtx, constant_mask: i32, args: Vec<ValueId>) -> ValueId {
         let id = CallId(u32::try_from(self.calls.len()).expect("call count fits in u32"));
         self.calls.push(CallData {
             func,
-            constant,
             constant_mask,
         });
         self.push_inst(Inst::Call { call: id, args })

@@ -1103,7 +1103,7 @@ mod tests {
         // into the pack slot — no Copy, exactly the eager shape.
         let mut builder = FuncBuilder::new();
         let five = builder.int(5);
-        let call = builder.call(abs_ctx(), true, 0, vec![five]);
+        let call = builder.call(abs_ctx(), 0, vec![five]);
         builder.ret(call);
         let func = builder.finish();
 
@@ -1124,8 +1124,59 @@ mod tests {
         };
         assert_eq!(arg_reg, start_reg, "argument lands in the pack slot");
         assert_eq!(*fdest, dest);
-        // The whole call is constant: one span covering both insns.
-        assert_eq!(program.constant_spans, vec![(0, 1)]);
+        // The constant argument is span-covered, but the call itself is
+        // not: calls may throw, so they are never hoisted into the
+        // prologue — they run exactly where control flow places them
+        // (the eager path draws the same line and never marks
+        // Insn::Function constant).
+        assert_eq!(program.constant_spans, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn calls_in_branch_arms_are_never_hoisted() {
+        // A call in a conditionally-executed arm (CASE WHEN b=2 THEN
+        // 'x' LIKE 'x' ESCAPE 'yy' ...): covering it with a constant
+        // span would hoist it into the prologue and evaluate it
+        // unconditionally — for throwing calls that turns a dead arm
+        // into a runtime error. The Function insn must stay outside
+        // every constant span even when its arguments are constants.
+        let mut builder = FuncBuilder::new();
+        let zero = builder.int(0);
+        let five = builder.int(5);
+        let two = builder.int(2);
+        let then_block = builder.create_block();
+        let join = builder.create_block();
+        let result = builder.add_block_param(join);
+        builder.branch(
+            zero,
+            JumpTarget::new(then_block, Vec::new()),
+            JumpTarget::new(join, vec![two]),
+            JumpTarget::new(join, vec![two]),
+        );
+        builder.switch_to(then_block);
+        let call = builder.call(abs_ctx(), 0, vec![five]);
+        builder.jump(join, vec![call]);
+        builder.switch_to(join);
+        builder.ret(result);
+        let func = builder.finish();
+        verify(&func).unwrap();
+
+        let mut program = test_program();
+        let dest = program.alloc_register();
+        emit::emit_function(&mut program, &func, dest).unwrap();
+        let call_at = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::Function { .. }))
+            .expect("call emitted");
+        assert!(
+            !program
+                .constant_spans
+                .iter()
+                .any(|&(start, end)| start <= call_at && call_at <= end),
+            "call covered by a constant span would hoist into the prologue: {:?}",
+            program.constant_spans
+        );
     }
 
     #[test]
@@ -1138,7 +1189,7 @@ mod tests {
             func: crate::function::Func::Scalar(crate::function::ScalarFunc::Instr),
             arg_count: 2,
         };
-        let call = builder.call(ctx, true, 0, vec![seven, seven]);
+        let call = builder.call(ctx, 0, vec![seven, seven]);
         builder.ret(call);
         let func = builder.finish();
 
@@ -1169,8 +1220,8 @@ mod tests {
         // into the outer call's pack slot — no intermediate Copy.
         let mut builder = FuncBuilder::new();
         let x = builder.int(3);
-        let inner = builder.call(abs_ctx(), true, 0, vec![x]);
-        let outer = builder.call(abs_ctx(), true, 0, vec![inner]);
+        let inner = builder.call(abs_ctx(), 0, vec![x]);
+        let outer = builder.call(abs_ctx(), 0, vec![inner]);
         builder.ret(outer);
         let func = builder.finish();
 
@@ -1198,7 +1249,7 @@ mod tests {
         // inside a constant span even when its argument is constant.
         let mut builder = FuncBuilder::new();
         let n = builder.int(8);
-        let call = builder.call(abs_ctx(), false, 0, vec![n]);
+        let call = builder.call(abs_ctx(), 0, vec![n]);
         builder.ret(call);
         let func = builder.finish();
 

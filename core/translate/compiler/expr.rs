@@ -21,7 +21,6 @@ use crate::function::{Func, FuncCtx, ScalarFunc};
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::sanitize_string;
-use crate::translate::optimizer::Optimizable;
 use crate::translate::plan::TableReferences;
 use crate::util::{exprs_are_equivalent, parse_numeric_literal};
 use crate::{Numeric, Result, Value, ValueBlob};
@@ -384,7 +383,6 @@ pub(crate) fn compile_value_expr<'a>(
                     CollationEffect::Sets(collation) => CollationEffect::Sets(collation),
                     CollationEffect::Untouched => acc,
                 });
-            let constant = expr.is_constant(resolver);
             let func_ctx = FuncCtx {
                 func,
                 arg_count: args.len(),
@@ -397,7 +395,7 @@ pub(crate) fn compile_value_expr<'a>(
                     for arg in arg_compilers {
                         values.push(arg.run(builder)?);
                     }
-                    Ok(builder.call(func_ctx, constant, 0, values))
+                    Ok(builder.call(func_ctx, 0, values))
                 }),
                 effect,
             })
@@ -734,9 +732,11 @@ pub(crate) fn compile_value_expr<'a>(
                 ast::LikeOperator::Glob => ScalarFunc::Glob,
                 _ => return Ok(None),
             };
-            let Some(resolver) = ctx.resolver else {
+            // Same gate as before the constant flag was dropped: LIKE
+            // only compiles in resolver-bearing contexts.
+            if ctx.resolver.is_none() {
                 return Ok(None);
-            };
+            }
             let Some(haystack) = compile_value_expr(lhs.as_ref(), ctx)? else {
                 return Ok(None);
             };
@@ -772,7 +772,6 @@ pub(crate) fn compile_value_expr<'a>(
             } else {
                 0
             };
-            let constant = expr.is_constant(resolver);
             let arg_count = if escape_built.is_some() { 3 } else { 2 };
             let negated = *not;
             let (haystack_c, pattern_c) = (haystack.compiler, pattern.compiler);
@@ -789,7 +788,7 @@ pub(crate) fn compile_value_expr<'a>(
                         func: Func::Scalar(scalar),
                         arg_count,
                     };
-                    let like = builder.call(func_ctx, constant, constant_mask, args);
+                    let like = builder.call(func_ctx, constant_mask, args);
                     Ok(if negated {
                         builder.unary(UnaryOp::Not, like)
                     } else {

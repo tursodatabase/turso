@@ -247,13 +247,13 @@ impl<'a> Emitter<'a> {
                 Some(Inst::Binary { lhs, rhs, .. }) | Some(Inst::Compare { lhs, rhs, .. }) => {
                     is_const[lhs.index()] && is_const[rhs.index()]
                 }
-                // Constant only when the frontend proved the whole call
-                // constant (deterministic function); the argument check
-                // guards against hoisting a call whose inputs are not in
-                // the same constant run.
-                Some(Inst::Call { call, args }) => {
-                    func.call_data(*call).constant && args.iter().all(|arg| is_const[arg.index()])
-                }
+                // Never constant: hoisting a call into the prologue would
+                // evaluate it unconditionally, and calls can throw (LIKE
+                // with a malformed ESCAPE, abs(i64::MIN)) — a call guarded
+                // by a CASE arm or AND short-circuit must not run early.
+                // The eager path draws the same line: it marks leaf
+                // constants hoistable, never Insn::Function.
+                Some(Inst::Call { .. }) => false,
                 // External inputs, leaves, and block parameters read
                 // state the prologue cannot see.
                 Some(Inst::External { .. })
