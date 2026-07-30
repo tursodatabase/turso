@@ -288,6 +288,7 @@ pub fn translate_insert(
             expression_index_usages: Vec::new(),
             database_id,
             indexed: None,
+            bound_index_method_patterns: Vec::new(),
         }],
         vec![],
     );

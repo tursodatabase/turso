@@ -1188,6 +1188,24 @@ pub struct JoinedTable {
     pub database_id: usize,
     /// INDEXED BY / NOT INDEXED hint from the SQL statement.
     pub indexed: Option<ast::Indexed>,
+    /// Custom index-method patterns resolved to this table's internal id.
+    /// The optimizer only matches these bound expressions; it never resolves
+    /// names from an index method's raw SQL pattern.
+    pub bound_index_method_patterns: Vec<BoundIndexMethodPattern>,
+}
+
+/// A custom index-method query pattern after name resolution.
+///
+/// The binder removes the pattern's FROM clause after validating it and keeps
+/// only the expressions the optimizer compares with the query plan.
+#[derive(Debug, Clone)]
+pub struct BoundIndexMethodPattern {
+    pub index_name: String,
+    pub pattern_idx: usize,
+    pub columns: Vec<ast::ResultColumn>,
+    pub where_clause: Option<Box<ast::Expr>>,
+    pub order_by: Vec<ast::SortedColumn>,
+    pub limit: Option<ast::Limit>,
 }
 
 impl JoinedTable {
@@ -2471,6 +2489,7 @@ impl JoinedTable {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            bound_index_method_patterns: Vec::new(),
         })
     }
 
@@ -2517,6 +2536,7 @@ impl JoinedTable {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            bound_index_method_patterns: Vec::new(),
         })
     }
 
@@ -2549,6 +2569,7 @@ impl JoinedTable {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            bound_index_method_patterns: Vec::new(),
         })
     }
 
