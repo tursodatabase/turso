@@ -7,13 +7,13 @@ use crate::{
         aggregation::emit_ungrouped_aggregation,
         collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         compiler::{
-            bind_cursor_input, bind_input, compile_effect, constant, cursor_input, cursor_values,
-            declare_ephemeral_index, initialize_cursor_once, insert_index_pack, literal_values,
-            open_declared_ephemeral_index, open_ephemeral_index, pack_values, result_row_pack,
-            scan_index, scan_table, seek_in_values, seek_index, seek_rowid, seek_table_range,
-            select_pack, BoxedCompile, Compile, CursorId, CursorInputId, DeferredIndexBound,
-            DeferredIndexRange, DeferredTableBound, DeferredTableRange, InputId, Row, RowStream,
-            ScanDirection, SortKey, SortedRow, ValueId, ValuePack,
+            bind_cursor_input, bind_input_producers, compile_effect, constant, cursor_input,
+            cursor_values, declare_ephemeral_index, initialize_cursor_once, insert_index_pack,
+            literal_values, open_declared_ephemeral_index, open_ephemeral_index, pack_values,
+            result_row_pack, scan_index, scan_table, seek_in_values, seek_index, seek_rowid,
+            seek_table_range, select_pack, BoxedCompile, Compile, CursorId, CursorInputId,
+            DeferredIndexBound, DeferredIndexRange, DeferredTableBound, DeferredTableRange,
+            InputProducer, Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId, ValuePack,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -203,24 +203,10 @@ impl DeclarativeDependency {
     }
 }
 
-enum DeclarativeDependencyProducer {
-    InCursor {
-        index: Arc<Index>,
-        producer_input: CursorInputId,
-        consumer_input: CursorInputId,
-        compiler: BoxedCompile<()>,
-        initialize_once: bool,
-    },
-    Scalar {
-        input: InputId,
-        compiler: BoxedCompile<ValueId>,
-    },
-}
-
 struct CompiledDeclarativeDependency {
     subquery_id: TableInternalId,
     subquery_index: usize,
-    producer: DeclarativeDependencyProducer,
+    producer: InputProducer,
     table_references: TableReferences,
 }
 
@@ -499,10 +485,7 @@ fn compose_declarative_dependencies(
             (
                 DeclarativeDependency::Scalar(external),
                 DeclarativeSelectCompiler::Scalar(compiler),
-            ) => DeclarativeDependencyProducer::Scalar {
-                input: external.input,
-                compiler,
-            },
+            ) => InputProducer::value(external.input, compiler),
             (DeclarativeDependency::Scalar(_), DeclarativeSelectCompiler::Effect(_)) => {
                 return Ok(outer);
             }
@@ -521,13 +504,15 @@ fn compose_declarative_dependencies(
                         "declarative IN producer {subquery_id:?} has no ephemeral destination index",
                     )));
                 };
-                DeclarativeDependencyProducer::InCursor {
-                    index,
-                    producer_input: destination.input,
-                    consumer_input: external.binding.input,
-                    compiler,
-                    initialize_once,
-                }
+                InputProducer::cursor(
+                    external.binding.input,
+                    compile_declarative_in_producer(
+                        index,
+                        destination.input,
+                        compiler,
+                        initialize_once,
+                    ),
+                )
             }
             (DeclarativeDependency::InCursor(_), DeclarativeSelectCompiler::Scalar(_)) => {
                 return Ok(outer);
@@ -549,12 +534,15 @@ fn compose_declarative_dependencies(
             .extend(producer.table_references.clone());
     }
 
-    let compiler = producers
-        .into_iter()
-        .rev()
-        .fold(outer.compiler, |consumer, producer| {
-            bind_declarative_dependency(producer.producer, consumer)
-        });
+    let producers = producers.into_iter().map(|producer| producer.producer);
+    let compiler = match outer.compiler {
+        DeclarativeSelectCompiler::Effect(consumer) => {
+            DeclarativeSelectCompiler::Effect(bind_input_producers(producers, consumer))
+        }
+        DeclarativeSelectCompiler::Scalar(consumer) => {
+            DeclarativeSelectCompiler::Scalar(bind_input_producers(producers, consumer))
+        }
+    };
 
     Ok(DeclarativeSelectProgram {
         compiler,
@@ -565,14 +553,12 @@ fn compose_declarative_dependencies(
     })
 }
 
-fn compose_declarative_in_compiler<Output: 'static>(
+fn compile_declarative_in_producer(
     index: Arc<Index>,
     producer_input: CursorInputId,
-    consumer_input: CursorInputId,
     producer: BoxedCompile<()>,
-    consumer: BoxedCompile<Output>,
     initialize_once: bool,
-) -> BoxedCompile<Output> {
+) -> BoxedCompile<CursorId> {
     if initialize_once {
         declare_ephemeral_index(index)
             .and_then(move |unopened| {
@@ -581,74 +567,14 @@ fn compose_declarative_in_compiler<Output: 'static>(
                         bind_cursor_input(producer_input, cursor, producer).map(move |()| cursor)
                     },
                 ))
-                .and_then(move |cursor| bind_cursor_input(consumer_input, cursor, consumer))
             })
             .boxed()
     } else {
         open_ephemeral_index(index)
             .and_then(move |cursor| {
-                bind_cursor_input(producer_input, cursor, producer)
-                    .and_then(move |()| bind_cursor_input(consumer_input, cursor, consumer))
+                bind_cursor_input(producer_input, cursor, producer).map(move |()| cursor)
             })
             .boxed()
-    }
-}
-
-fn bind_declarative_dependency(
-    producer: DeclarativeDependencyProducer,
-    consumer: DeclarativeSelectCompiler,
-) -> DeclarativeSelectCompiler {
-    match (producer, consumer) {
-        (
-            DeclarativeDependencyProducer::Scalar { input, compiler },
-            DeclarativeSelectCompiler::Effect(consumer),
-        ) => DeclarativeSelectCompiler::Effect(
-            compiler
-                .and_then(move |value| bind_input(input, value, consumer))
-                .boxed(),
-        ),
-        (
-            DeclarativeDependencyProducer::Scalar { input, compiler },
-            DeclarativeSelectCompiler::Scalar(consumer),
-        ) => DeclarativeSelectCompiler::Scalar(
-            compiler
-                .and_then(move |value| bind_input(input, value, consumer))
-                .boxed(),
-        ),
-        (
-            DeclarativeDependencyProducer::InCursor {
-                index,
-                producer_input,
-                consumer_input,
-                compiler,
-                initialize_once,
-            },
-            DeclarativeSelectCompiler::Effect(consumer),
-        ) => DeclarativeSelectCompiler::Effect(compose_declarative_in_compiler(
-            index,
-            producer_input,
-            consumer_input,
-            compiler,
-            consumer,
-            initialize_once,
-        )),
-        (
-            DeclarativeDependencyProducer::InCursor {
-                index,
-                producer_input,
-                consumer_input,
-                compiler,
-                initialize_once,
-            },
-            DeclarativeSelectCompiler::Scalar(consumer),
-        ) => DeclarativeSelectCompiler::Scalar(compose_declarative_in_compiler(
-            index,
-            producer_input,
-            consumer_input,
-            compiler,
-            consumer,
-            initialize_once,
-        )),
     }
 }
 

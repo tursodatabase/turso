@@ -249,7 +249,11 @@ are discarded before that subtree is treated as one external value.
 An input slot can also be scoped to another compiler output before IR is built.
 In that case every use resolves directly to the producer's `ValueId`, no
 external input remains at lowering, and ordinary dominance verification covers
-the composed value. Simple uncorrelated `EXISTS` children compile to `has_rows`;
+the composed value. The compiler-layer `InputProducer` pairs either a value or
+cursor slot with its deferred producer and owns scoped binding plus ordered
+composition. SQL frontends retain dependency discovery, source ordering, and
+producer-specific policy, but do not need to reproduce value dominance or
+cursor lifetime rules. Simple uncorrelated `EXISTS` children compile to `has_rows`;
 simple uncorrelated single-column scalar children compile to `first_or(NULL)`.
 Symbolic expression resolution declares and deduplicates these scalar inputs as
 it encounters `SubqueryResult` nodes, including when they are nested inside a

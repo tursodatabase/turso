@@ -221,6 +221,85 @@ pub(crate) struct BindInput<Compiler> {
     compiler: Compiler,
 }
 
+/// A deferred producer paired with the symbolic input it satisfies.
+///
+/// Binding keeps producer and consumer in one IR graph, so ordinary SSA
+/// dominance and cursor-open verification cover the resulting composition.
+pub(crate) struct InputProducer {
+    binding: InputProducerBinding,
+}
+
+enum InputProducerBinding {
+    Value {
+        input: InputId,
+        producer: BoxedCompile<ValueId>,
+    },
+    Cursor {
+        input: CursorInputId,
+        producer: BoxedCompile<CursorId>,
+    },
+}
+
+impl InputProducer {
+    pub(crate) fn value<Producer>(input: InputId, producer: Producer) -> Self
+    where
+        Producer: Compile<Output = ValueId> + 'static,
+    {
+        Self {
+            binding: InputProducerBinding::Value {
+                input,
+                producer: producer.boxed(),
+            },
+        }
+    }
+
+    pub(crate) fn cursor<Producer>(input: CursorInputId, producer: Producer) -> Self
+    where
+        Producer: Compile<Output = CursorId> + 'static,
+    {
+        Self {
+            binding: InputProducerBinding::Cursor {
+                input,
+                producer: producer.boxed(),
+            },
+        }
+    }
+
+    fn bind<Consumer>(self, consumer: Consumer) -> BoxedCompile<Consumer::Output>
+    where
+        Consumer: Compile + 'static,
+        Consumer::Output: 'static,
+    {
+        match self.binding {
+            InputProducerBinding::Value { input, producer } => producer
+                .and_then(move |value| bind_input(input, value, consumer))
+                .boxed(),
+            InputProducerBinding::Cursor { input, producer } => producer
+                .and_then(move |cursor| bind_cursor_input(input, cursor, consumer))
+                .boxed(),
+        }
+    }
+}
+
+/// Compose source-ordered producers around a consumer.
+///
+/// The reverse construction fold preserves producer execution order while
+/// keeping every binding in scope for all later producers and the consumer.
+pub(crate) fn bind_input_producers<Output, Producers>(
+    producers: Producers,
+    consumer: BoxedCompile<Output>,
+) -> BoxedCompile<Output>
+where
+    Output: 'static,
+    Producers: IntoIterator<Item = InputProducer>,
+    Producers::IntoIter: DoubleEndedIterator,
+{
+    producers
+        .into_iter()
+        .rev()
+        .fold(consumer, |consumer, producer| producer.bind(consumer))
+}
+
 pub(crate) fn bind_input<Compiler>(
     input: InputId,
     value: ValueId,
@@ -9594,29 +9673,27 @@ mod tests {
     }
 
     #[test]
-    fn cursor_input_binding_composes_descriptions_over_one_owned_cursor() {
+    fn typed_cursor_producer_composes_descriptions_over_one_owned_cursor() {
         let index = test_ephemeral_index("bound_ephemeral");
         let input = CursorInputId::new(0);
-        let compiler = open_ephemeral_index(index).and_then(move |cursor| {
-            let producer = cursor_input(input)
-                .then(pack_values(smallvec![constant(Value::from_i64(7)).boxed()]))
-                .and_then(|(destination, pack)| {
+        let producer = open_ephemeral_index(index).and_then(move |cursor| {
+            pack_values(smallvec![constant(Value::from_i64(7)).boxed()])
+                .and_then(move |pack| {
                     insert_index_pack(
-                        destination,
+                        cursor,
                         pack,
                         "bound_ephemeral".to_owned(),
                         Some("D".to_owned()),
                     )
-                });
-            let consumer = producer
-                .and_then(move |()| cursor_input(input))
-                .and_then(|source| {
-                    scan_cursor(source, ScanDirection::Forward).for_each(|row| {
-                        pack_values(smallvec![row.column(0).boxed()]).and_then(result_row_pack)
-                    })
-                });
-            bind_cursor_input(input, cursor, consumer)
+                })
+                .map(move |()| cursor)
         });
+        let consumer = cursor_input(input).and_then(|source| {
+            scan_cursor(source, ScanDirection::Forward).for_each(|row| {
+                pack_values(smallvec![row.column(0).boxed()]).and_then(result_row_pack)
+            })
+        });
+        let compiler = InputProducer::cursor(input, producer).bind(consumer);
         let ir = compile_effect(compiler).unwrap();
         let rendered = ir.to_string();
 
@@ -9635,17 +9712,12 @@ mod tests {
     }
 
     #[test]
-    fn scalar_input_binding_composes_descriptions_without_a_lowering_input() {
+    fn typed_value_producer_composes_descriptions_without_a_lowering_input() {
         let input_id = InputId::new(0);
-        let compiler = constant(Value::from_i64(7)).and_then(move |value| {
-            bind_input(
-                input_id,
-                value,
-                input(input_id)
-                    .then(constant(Value::from_i64(1)))
-                    .and_then(|(lhs, rhs)| add(lhs, rhs)),
-            )
-        });
+        let consumer = input(input_id)
+            .then(constant(Value::from_i64(1)))
+            .and_then(|(lhs, rhs)| add(lhs, rhs));
+        let compiler = InputProducer::value(input_id, constant(Value::from_i64(7))).bind(consumer);
 
         let ir = compile_scalar(compiler).unwrap();
 
@@ -9653,6 +9725,57 @@ mod tests {
         let mut program =
             ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 1, 0));
         ir.lower_into(&mut program, 1).unwrap();
+    }
+
+    #[test]
+    fn ordered_input_producers_keep_earlier_cursor_bindings_in_scope() {
+        let cursor_input_id = CursorInputId::new(0);
+        let value_input_id = InputId::new(0);
+        let cursor_producer = open_ephemeral_index(test_ephemeral_index("ordered_dependencies"))
+            .and_then(move |cursor| {
+                pack_values(smallvec![constant(Value::from_i64(7)).boxed()])
+                    .and_then(move |pack| {
+                        insert_index_pack(
+                            cursor,
+                            pack,
+                            "ordered_dependencies".to_owned(),
+                            Some("D".to_owned()),
+                        )
+                    })
+                    .map(move |()| cursor)
+            });
+        let value_producer = cursor_input(cursor_input_id).and_then(|cursor| {
+            scan_cursor(cursor, ScanDirection::Forward)
+                .map(|row| row.column(0))
+                .first_or(constant(Value::Null))
+        });
+        let consumer = input(value_input_id)
+            .then(constant(Value::from_i64(1)))
+            .and_then(|(lhs, rhs)| add(lhs, rhs))
+            .boxed();
+        let compiler = bind_input_producers(
+            [
+                InputProducer::cursor(cursor_input_id, cursor_producer),
+                InputProducer::value(value_input_id, value_producer),
+            ],
+            consumer,
+        );
+
+        let ir = compile_scalar(compiler).unwrap();
+        let rendered = ir.to_string();
+
+        assert!(!rendered.contains("external_cursor"));
+        assert!(!rendered.contains("input @0"));
+        let open = rendered.find("open_ephemeral_index").unwrap();
+        let insert = rendered.find("index_insert").unwrap();
+        let scan = rendered.find("cursor_start Forward").unwrap();
+        let add = rendered.find(" = add ").unwrap();
+        assert!(open < insert && insert < scan && scan < add);
+
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 2, 0));
+        ir.lower_into(&mut program, 1).unwrap();
+        assert_eq!(program.cursor_ref.len(), 1);
     }
 
     #[test]
