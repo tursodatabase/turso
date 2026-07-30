@@ -908,3 +908,57 @@ test fail-insert-after-alter-column-strict-type-change {
 }
 expect error {
 }
+
+# The old column name matches case-insensitively; same-name means same
+# column regardless of case, not a collision.
+test alter-column-case-insensitive-old-name {
+    CREATE TABLE t (x INT);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ALTER COLUMN X TO x TEXT;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT x, typeof(x) FROM t;
+}
+expect {
+    CREATE TABLE t (x TEXT)
+    1|text
+}
+
+# A case-only rename changes the stored name, like SQLite.
+test rename-column-case-only {
+    CREATE TABLE t (x INT);
+    ALTER TABLE t RENAME COLUMN x TO X;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t (X INT)
+}
+
+# Renaming a column to itself is a no-op, like SQLite.
+test rename-column-to-self-noop {
+    CREATE TABLE t (x INT);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t RENAME COLUMN x TO x;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT x FROM t;
+}
+expect {
+    CREATE TABLE t (x INT)
+    1
+}
+
+# Quoted identifiers: keywords and names with spaces work as old and
+# new column names.
+test alter-column-quoted-identifiers {
+    CREATE TABLE t ("select" INT, "a b" TEXT);
+    INSERT INTO t VALUES (1, 'x');
+    ALTER TABLE t ALTER COLUMN "select" TO "order" TEXT;
+    ALTER TABLE t ALTER COLUMN "a b" TO "a b" INTEGER DEFAULT 3;
+    INSERT INTO t ("order") VALUES ('2');
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT "order", "a b" FROM t ORDER BY rowid;
+}
+expect {
+    CREATE TABLE t ("order" TEXT, "a b" INTEGER DEFAULT 3)
+    1|x
+    2|3
+}
