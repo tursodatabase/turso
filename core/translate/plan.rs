@@ -26,8 +26,7 @@ use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
 use turso_parser::ast::{
-    self, Expr, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder,
-    SubqueryType,
+    self, Expr, FrameBound, FrameClause, FrameMode, ResolveType, SortOrder, SubqueryType,
 };
 
 use turso_parser::ast::TableInternalId;
@@ -3157,13 +3156,6 @@ pub fn validate_frame_clause(
         exclude,
     } = clause;
 
-    // EXCLUDE other than NO OTHERS isn't supported yet.
-    if let Some(exclude) = exclude {
-        if *exclude != FrameExclude::NoOthers {
-            crate::bail_parse_error!("EXCLUDE clauses are not supported");
-        }
-    }
-
     let start_bound = translate_frame_bound(start, /* is_start = */ true, *mode)?;
     let end_bound = match end {
         Some(b) => translate_frame_bound(b, /* is_start = */ false, *mode)?,
@@ -3208,6 +3200,7 @@ pub fn validate_frame_clause(
         mode: *mode,
         start: start_bound,
         end: end_bound,
+        exclude: exclude.clone(),
     }))
 }
 
@@ -3322,6 +3315,11 @@ pub struct Frame {
     pub mode: ast::FrameMode,
     pub start: FrameBoundary,
     pub end: FrameBoundary,
+    /// An explicit EXCLUDE clause. `None` differs from
+    /// `Some(FrameExclude::NoOthers)`: although their SQL results are
+    /// equivalent, SQLite uses the explicit form to select its full-frame
+    /// rescan path.
+    pub exclude: Option<ast::FrameExclude>,
 }
 
 impl Default for Frame {
@@ -3330,6 +3328,7 @@ impl Default for Frame {
             mode: ast::FrameMode::Range,
             start: FrameBoundary::UnboundedPreceding,
             end: FrameBoundary::CurrentRow,
+            exclude: None,
         }
     }
 }

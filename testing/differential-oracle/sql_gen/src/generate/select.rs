@@ -5,7 +5,7 @@ use crate::ast::{
     BinOp, CompoundOperator, CompoundSelectArm, CteDefinition, CteMaterialization, Expr,
     FromClause, GroupByClause, JoinClause, JoinConstraint, JoinType, Literal, NullsOrder,
     OrderByItem, OrderDirection, SelectColumn, SelectStmt, WindowFrame, WindowFrameBoundary,
-    WindowFrameMode, WithClause,
+    WindowFrameExclude, WindowFrameMode, WithClause,
 };
 use crate::capabilities::Capabilities;
 use crate::context::Context;
@@ -835,6 +835,22 @@ fn generate_window_frame(ctx: &mut Context, frame_policy: WindowFramePolicy) -> 
             2 => generate_offset_frame(ctx, WindowFrameMode::Range),
             _ => unreachable!("range is limited to three frame modes"),
         },
+        WindowFramePolicy::Exclude => {
+            let mut frame = match ctx.gen_range(3) {
+                0 => generate_offset_frame(ctx, WindowFrameMode::Rows),
+                1 => generate_offset_frame(ctx, WindowFrameMode::Groups),
+                2 => generate_offset_frame(ctx, WindowFrameMode::Range),
+                _ => unreachable!("range is limited to three frame modes"),
+            };
+            frame.exclude = Some(match ctx.gen_range(4) {
+                0 => WindowFrameExclude::NoOthers,
+                1 => WindowFrameExclude::CurrentRow,
+                2 => WindowFrameExclude::Group,
+                3 => WindowFrameExclude::Ties,
+                _ => unreachable!("range is limited to four exclusion variants"),
+            });
+            frame
+        }
     }
 }
 
@@ -883,7 +899,12 @@ fn generate_offset_frame(ctx: &mut Context, mode: WindowFrameMode) -> WindowFram
         ),
         _ => unreachable!("range is limited to 13 offset frame shapes"),
     };
-    WindowFrame { mode, start, end }
+    WindowFrame {
+        mode,
+        start,
+        end,
+        exclude: None,
+    }
 }
 
 /// Generate one of the four structurally valid RANGE frames without a
@@ -901,6 +922,7 @@ fn generate_offset_free_range_frame(ctx: &mut Context) -> WindowFrame {
         mode: WindowFrameMode::Range,
         start,
         end,
+        exclude: None,
     }
 }
 
@@ -1834,6 +1856,68 @@ mod tests {
             }
         }
         panic!("RANGE-offset policy should generate a numeric RANGE boundary");
+    }
+
+    #[test]
+    fn test_exclude_policy_generates_all_variants() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            select_star_weight: 0,
+            column_list_weight: 0,
+            expression_list_weight: 1,
+            expression_count_range: 1..=1,
+            group_by_probability: 0.0,
+            cte_probability: 0.0,
+            compound_probability: 0.0,
+            window_function_probability: 1.0,
+            window_frame_policy: WindowFramePolicy::Exclude,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("v", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut saw_no_others = false;
+        let mut saw_current_row = false;
+        let mut saw_group = false;
+        let mut saw_ties = false;
+        let mut saw_offset_range = false;
+
+        for seed in 0..2000 {
+            let mut ctx = Context::new_with_seed(seed);
+            let select = generate_select_impl(&generator, &mut ctx, SelectMode::Full).unwrap();
+            let sql = select.to_string();
+
+            saw_no_others |= sql.contains(" EXCLUDE NO OTHERS");
+            saw_current_row |= sql.contains(" EXCLUDE CURRENT ROW");
+            saw_group |= sql.contains(" EXCLUDE GROUP");
+            saw_ties |= sql.contains(" EXCLUDE TIES");
+
+            let is_offset_range = sql.contains(" RANGE BETWEEN ")
+                && (sql.contains(" PRECEDING") || sql.contains(" FOLLOWING"));
+            if is_offset_range && sql.contains(" EXCLUDE ") {
+                assert!(
+                    sql.contains("ORDER BY "),
+                    "RANGE offsets require exactly one ORDER BY expression: {sql}"
+                );
+                saw_offset_range = true;
+            }
+
+            if saw_no_others && saw_current_row && saw_group && saw_ties && saw_offset_range {
+                return;
+            }
+        }
+
+        panic!(
+            "EXCLUDE policy coverage incomplete: no_others={saw_no_others}, \
+             current_row={saw_current_row}, group={saw_group}, ties={saw_ties}, \
+             offset_range={saw_offset_range}"
+        );
     }
 
     #[test]

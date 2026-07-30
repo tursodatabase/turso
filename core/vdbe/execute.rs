@@ -6883,6 +6883,83 @@ fn op_window_step(
             };
             *pending = 1;
         }
+        // With an explicit EXCLUDE clause, first_value() is evaluated by
+        // rescanning the live frame for each output row. The second payload
+        // slot distinguishes "captured NULL" from "no row stepped".
+        WindowFunc::FirstValue => {
+            if let Register::Value(Value::Null) = state.registers[acc_reg] {
+                state.registers[acc_reg] =
+                    Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![
+                        Value::Null,
+                        Value::from_i64(0),
+                    ]?));
+            }
+            let [arg_slot, acc_slot] = state
+                .registers
+                .get_disjoint_mut([arg_reg, acc_reg])
+                .map_err(|_| {
+                    LimboError::InternalError(format!(
+                        "first_value: argument register {arg_reg} and accumulator register {acc_reg} must be distinct"
+                    ))
+                })?;
+            let Register::Aggregate(AggContext::Builtin(payload)) = acc_slot else {
+                unreachable!("first_value accumulator must be a Builtin payload");
+            };
+            let Value::Numeric(Numeric::Integer(seen)) = &payload[1] else {
+                unreachable!("first_value seen flag must be Integer");
+            };
+            if *seen == 0 {
+                payload[0].try_clone_from(arg_slot.get_value())?;
+                payload[1] = Value::from_i64(1);
+            }
+        }
+        // Slow-scan nth_value() counts included rows after EXCLUDE filtering.
+        // SQLite validates the current output row's N for every included row
+        // that reaches xStep and captures the argument whenever N equals the
+        // 1-based scan position.
+        WindowFunc::NthValue => {
+            if !coerce_register_to_integer(state, arg_reg + 1) {
+                return Err(LimboError::InvalidArgument(
+                    "second argument to nth_value must be a positive integer".into(),
+                ));
+            }
+            let Value::Numeric(Numeric::Integer(n)) = state.registers[arg_reg + 1].get_value()
+            else {
+                unreachable!("coerce_register_to_integer must store an Integer");
+            };
+            let n = *n;
+            if n <= 0 {
+                return Err(LimboError::InvalidArgument(
+                    "second argument to nth_value must be a positive integer".into(),
+                ));
+            }
+            if let Register::Value(Value::Null) = state.registers[acc_reg] {
+                state.registers[acc_reg] =
+                    Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![
+                        Value::Null,
+                        Value::from_i64(0),
+                    ]?));
+            }
+            let [arg_slot, acc_slot] = state
+                .registers
+                .get_disjoint_mut([arg_reg, acc_reg])
+                .map_err(|_| {
+                    LimboError::InternalError(format!(
+                        "nth_value: argument register {arg_reg} and accumulator register {acc_reg} must be distinct"
+                    ))
+                })?;
+            let Register::Aggregate(AggContext::Builtin(payload)) = acc_slot else {
+                unreachable!("nth_value accumulator must be a Builtin payload");
+            };
+            let Value::Numeric(Numeric::Integer(step)) = &payload[1] else {
+                unreachable!("nth_value step count must be Integer");
+            };
+            let step = step.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+            payload[1] = Value::from_i64(step);
+            if step == n {
+                payload[0].try_clone_from(arg_slot.get_value())?;
+            }
+        }
         // last_value(expr) — mirrors SQLite's LastValueCtx {pVal, nVal}
         // (window.c:478-497): payload[0] holds the value of the most
         // recently stepped row, payload[1] counts the rows currently in
@@ -7044,17 +7121,20 @@ fn op_window_value(
             }
             Value::from_i64(*value_slot)
         }
-        WindowFunc::FirstValue => {
+        WindowFunc::FirstValue | WindowFunc::NthValue => {
             // Keep the saved value because every later row in this partition
-            // may need the same answer.
-            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
-            else {
-                return Err(LimboError::InternalError(format!(
-                    "{func} accumulator in unexpected register state: {:?}",
-                    state.registers[acc_reg]
-                )));
-            };
-            payload[0].clone()
+            // may need the same answer. In slow EXCLUDE mode the accumulator
+            // is reset and rebuilt for each output row; an empty included set
+            // leaves it NULL.
+            match &state.registers[acc_reg] {
+                Register::Aggregate(AggContext::Builtin(payload)) => payload[0].clone(),
+                Register::Value(Value::Null) => Value::Null,
+                other => {
+                    return Err(LimboError::InternalError(format!(
+                        "{func} accumulator in unexpected register state: {other:?}"
+                    )));
+                }
+            }
         }
         WindowFunc::LastValue => {
             // xValue must not consume the accumulator: under a frame whose
