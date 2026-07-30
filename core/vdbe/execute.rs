@@ -12821,7 +12821,7 @@ pub fn op_reset_sorter(
     let cursor = state.get_cursor(*cursor_id);
 
     match cursor_type {
-        CursorType::BTreeTable(_) => {
+        CursorType::BTreeTable(_) | CursorType::BTreeIndex(_) => {
             let cursor = cursor.as_btree_mut();
             return_if_io!(cursor.clear_btree());
         }

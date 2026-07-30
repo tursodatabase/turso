@@ -357,14 +357,17 @@ expect {
     5|90
 }
 
-# min / max / group_concat aren't invertible; using them with a
-# moving-start frame errors at runtime.
-@skip-if sqlite "sqlite supports min() over a sliding frame; turso rejects non-invertible aggregates on moving frames"
+# Moving min/max use an ephemeral sorted index instead of xInverse.
 @setup base
-test rows-min-moving-frame-not-invertible {
+test rows-min-moving-frame {
     SELECT id, min(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
 }
-expect error {
+expect {
+    1|10
+    2|10
+    3|20
+    4|30
+    5|40
 }
 
 # Bound combinations that can never describe a real frame. SQLite

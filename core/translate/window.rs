@@ -1,6 +1,6 @@
 use crate::alloc::TursoSliceExt;
-use crate::function::{AccumulatorFunc, WindowFunc};
-use crate::schema::{BTreeCharacteristics, BTreeTable, Table};
+use crate::function::{AccumulatorFunc, AggFunc, WindowFunc};
+use crate::schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, Table};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
 use crate::translate::collate::{get_collseq_from_expr, CollationSeq};
@@ -21,7 +21,7 @@ use crate::types::KeyInfo;
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
-    to_u32, {InsertFlags, Insn},
+    to_u32, {IdxInsertFlags, InsertFlags, Insn},
 };
 use crate::vdbe::{BranchOffset, CursorID};
 use crate::Connection;
@@ -510,6 +510,93 @@ pub struct WindowMetadata<'a> {
     /// to their corresponding column indexes in the subquery’s result.
     pub expressions_referencing_subquery: Vec<(&'a Expr, usize)>,
     pub buffer_table_name: String,
+    /// Per-function sorted indexes used by min/max when the frame has a
+    /// moving start. SQLite implements these aggregates without xInverse:
+    /// step inserts `(value, sequence)`, inverse removes the oldest matching
+    /// value, and value reads column 0 from the last index entry.
+    pub minmax: Vec<Option<WindowMinMax>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WindowMinMax {
+    pub cursor: CursorID,
+    /// Three consecutive registers: argument, sequence, packed record.
+    pub registers: usize,
+}
+
+/// Allocate SQLite's per-function ephemeral index for min/max over a frame
+/// whose start can move. The first key is the aggregate argument; the second
+/// is a monotonically increasing sequence that makes duplicate values unique.
+/// `min` reverses the first key so `Last` returns the minimum for both funcs.
+fn allocate_window_minmax(
+    program: &mut ProgramBuilder,
+    window: &Window,
+    table_references: &TableReferences,
+) -> Result<Vec<Option<WindowMinMax>>> {
+    let moving_start = !matches!(
+        window.frame.start,
+        crate::translate::plan::FrameBoundary::UnboundedPreceding
+    );
+    let mut states = Vec::with_capacity(window.functions.len());
+
+    for (i, func) in window.functions.iter().enumerate() {
+        let agg = match &func.func {
+            AccumulatorFunc::Agg(agg @ (AggFunc::Min | AggFunc::Max))
+                if moving_start && window.frame.exclude.is_none() =>
+            {
+                agg
+            }
+            _ => {
+                states.push(None);
+                continue;
+            }
+        };
+        let Expr::FunctionCall { args, .. } = func.current_expr() else {
+            unreachable!("min/max window calls must have one argument");
+        };
+        let arg = args
+            .first()
+            .expect("min/max window calls must have one argument");
+        let collation = get_collseq_from_expr(arg, table_references)?;
+        let index = Arc::new(Index {
+            name: format!("window_minmax_{}_{}", program.offset().as_offset_int(), i),
+            table_name: String::new(),
+            root_page: 0,
+            columns: crate::alloc::vec![
+                IndexColumn {
+                    name: "0".to_string(),
+                    order: if matches!(agg, AggFunc::Min) {
+                        SortOrder::Desc
+                    } else {
+                        SortOrder::Asc
+                    },
+                    pos_in_table: 0,
+                    collation,
+                    default: None,
+                    expr: None,
+                },
+                IndexColumn::new("1", 1),
+            ],
+            unique: false,
+            ephemeral: true,
+            has_rowid: false,
+            where_clause: None,
+            index_method: None,
+            on_conflict: None,
+        });
+        let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index));
+        let registers = program.alloc_registers(3);
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id: cursor,
+            is_table: false,
+        });
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: registers + 1,
+        });
+        states.push(Some(WindowMinMax { cursor, registers }));
+    }
+    Ok(states)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -926,6 +1013,7 @@ impl EmitWindow {
                 new_cursor_id: csr_app,
             });
         }
+        let minmax = allocate_window_minmax(program, window, &plan.table_references)?;
 
         // Window function processing is similar to aggregation processing in how results are mapped
         // to registers. Each function expression is stored in `expr_to_reg_cache` along with its
@@ -1042,6 +1130,7 @@ impl EmitWindow {
             src_column_count,
             expressions_referencing_subquery,
             buffer_table_name: buffer_table.name.clone(),
+            minmax,
         });
 
         Ok(())
@@ -1103,6 +1192,7 @@ impl EmitWindow {
         let cursors = meta.cursors;
         let src_column_count = meta.src_column_count;
         let buffer_table_name = meta.buffer_table_name.clone();
+        let minmax = meta.minmax.clone();
 
         emit_load_order_by_columns(program, window, &registers);
         emit_flush_buffer_if_new_partition(program, &labels, &registers, window, plan)?;
@@ -1156,6 +1246,17 @@ impl EmitWindow {
             dest: registers.acc_start,
             dest_end: Some(registers.acc_start + window.functions.len() - 1),
         });
+        // Reset every min/max index and its insertion sequence at a partition
+        // boundary. Mirrors windowInitAccum (window.c:2000-2009).
+        for state in minmax.iter().flatten() {
+            program.emit_insn(Insn::ResetSorter {
+                cursor_id: state.cursor,
+            });
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: state.registers + 1,
+            });
+        }
         // Zero the frame-index counters for the new partition. Mirrors
         // `windowInitAccum`'s regApp reset (window.c:2010-2013).
         if let Some(frame_counters) = registers.frame_counters {
@@ -1271,7 +1372,7 @@ impl EmitWindow {
                 });
             }
             if window.frame.exclude.is_none() {
-                emit_window_agg_final(program, window, &registers, false);
+                emit_window_agg_final(program, window, &registers, &minmax, false);
             }
             // The row was just inserted, so the empty branch of this
             // Rewind is unreachable — the label lands on the next
@@ -1889,6 +1990,7 @@ fn emit_window_agg_final(
     program: &mut ProgramBuilder,
     window: &Window,
     registers: &WindowRegisters,
+    minmax: &[Option<WindowMinMax>],
     finalize: bool,
 ) {
     for (i, func) in window.functions.iter().enumerate() {
@@ -1905,6 +2007,26 @@ fn emit_window_agg_final(
         }
         let acc_reg = registers.acc_start + i;
         let result_reg = registers.acc_result_start + i;
+        if let Some(state) = minmax[i] {
+            debug_assert!(!finalize, "EXCLUDE frames do not use min/max indexes");
+            let label_empty = program.allocate_label();
+            program.emit_insn(Insn::Null {
+                dest: result_reg,
+                dest_end: None,
+            });
+            program.emit_insn(Insn::Last {
+                cursor_id: state.cursor,
+                pc_if_empty: label_empty,
+            });
+            program.emit_insn(Insn::Column {
+                cursor_id: state.cursor,
+                column: 0,
+                dest: result_reg,
+                default: None,
+            });
+            program.preassign_label_to_next_insn(label_empty);
+            continue;
+        }
         if finalize {
             program.emit_insn(Insn::AggFinal {
                 register: acc_reg,
@@ -1942,6 +2064,7 @@ fn emit_window_full_scan(
     let window = plan.window.as_ref().expect("missing window");
     let registers = meta.registers;
     let cursors = meta.cursors;
+    let minmax = meta.minmax.clone();
     let exclude = window
         .frame
         .exclude
@@ -2082,7 +2205,7 @@ fn emit_window_full_scan(
         pc_if_next: label_loop,
     });
     program.preassign_label_to_next_insn(label_break);
-    emit_window_agg_final(program, window, &registers, true);
+    emit_window_agg_final(program, window, &registers, &minmax, true);
     Ok(())
 }
 
@@ -2321,6 +2444,7 @@ fn emit_window_op(
     let registers = meta.registers;
     let cursors = meta.cursors;
     let buffer_table_name = meta.buffer_table_name.clone();
+    let minmax = meta.minmax.clone();
     let order_by_len = window.order_by.len();
     let frame_mode = window.frame.mode;
     // bPeer mirrors SQLite's `WindowCodeArg.eFrmType != TK_ROWS` test
@@ -2424,7 +2548,7 @@ fn emit_window_op(
     // RETURN_ROW finalizes accumulators before emitting (SQLite's
     // windowAggFinal at window.c:2284).
     if matches!(op, WindowOp::ReturnRow) && window.frame.exclude.is_none() {
-        emit_window_agg_final(program, window, &registers, false);
+        emit_window_agg_final(program, window, &registers, &minmax, false);
     }
 
     let label_continue = program.allocate_label();
@@ -2685,6 +2809,7 @@ fn emit_function_step(
     let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
     let window = plan.window.as_ref().expect("missing window");
     let acc_start = meta.registers.acc_start;
+    let minmax = meta.minmax.clone();
 
     // Save cache state so the per-arg overrides we push below don't leak
     // out to other parts of the emit pipeline (e.g. emit_return_one_row).
@@ -2768,21 +2893,55 @@ fn emit_function_step(
                     })
                     .transpose()?;
 
-                translate_aggregation_step(
-                    program,
-                    &plan.table_references,
-                    AggArgumentSource::new_from_expression(
-                        agg_func,
-                        &args,
-                        &Distinctness::NonDistinct,
-                    ),
-                    acc_reg,
-                    &t_ctx.resolver,
-                    None,
-                )?;
+                if let Some(state) = minmax[i] {
+                    let label_skip = filter_skip_label.unwrap_or_else(|| program.allocate_label());
+                    translate_expr(
+                        program,
+                        Some(&plan.table_references),
+                        &args[0],
+                        state.registers,
+                        &t_ctx.resolver,
+                    )?;
+                    program.emit_insn(Insn::IsNull {
+                        reg: state.registers,
+                        target_pc: label_skip,
+                    });
+                    program.emit_insn(Insn::AddImm {
+                        register: state.registers + 1,
+                        value: 1,
+                    });
+                    program.emit_insn(Insn::MakeRecord {
+                        start_reg: to_u32(state.registers),
+                        count: 2,
+                        dest_reg: to_u32(state.registers + 2),
+                        index_name: None,
+                        affinity_str: None,
+                    });
+                    program.emit_insn(Insn::IdxInsert {
+                        cursor_id: state.cursor,
+                        record_reg: state.registers + 2,
+                        unpacked_start: Some(state.registers),
+                        unpacked_count: Some(2),
+                        flags: IdxInsertFlags::new(),
+                    });
+                    program.preassign_label_to_next_insn(label_skip);
+                } else {
+                    translate_aggregation_step(
+                        program,
+                        &plan.table_references,
+                        AggArgumentSource::new_from_expression(
+                            agg_func,
+                            &args,
+                            &Distinctness::NonDistinct,
+                        ),
+                        acc_reg,
+                        &t_ctx.resolver,
+                        None,
+                    )?;
 
-                if let Some(label) = filter_skip_label {
-                    program.preassign_label_to_next_insn(label);
+                    if let Some(label) = filter_skip_label {
+                        program.preassign_label_to_next_insn(label);
+                    }
                 }
             }
             AccumulatorFunc::Window(win_func) => {
@@ -2828,6 +2987,7 @@ fn emit_function_inverse(
     let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
     let window = plan.window.as_ref().expect("missing window");
     let acc_start = meta.registers.acc_start;
+    let minmax = meta.minmax.clone();
     let csr_start = meta.cursors.csr_start.expect(
         "emit_function_inverse: csr_start must be allocated when any AGGINVERSE is emitted",
     );
@@ -2876,16 +3036,44 @@ fn emit_function_inverse(
             })
             .transpose()?;
 
-        program.emit_insn(Insn::AggInverse {
-            acc_reg,
-            col: arg_load_start.unwrap_or(0),
-            delimiter: 0,
-            func: func.func.clone(),
-            comparator: None,
-        });
+        if let Some(state) = minmax[i] {
+            let label_skip = filter_skip_label.unwrap_or_else(|| program.allocate_label());
+            let arg_reg = arg_load_start.expect("min/max has one argument");
+            program.emit_insn(Insn::Copy {
+                src_reg: arg_reg,
+                dst_reg: state.registers,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::IsNull {
+                reg: state.registers,
+                target_pc: label_skip,
+            });
+            program.emit_insn(Insn::SeekGE {
+                is_index: true,
+                cursor_id: state.cursor,
+                start_reg: state.registers,
+                num_regs: 1,
+                target_pc: label_skip,
+                eq_only: false,
+            });
+            program.emit_insn(Insn::Delete {
+                cursor_id: state.cursor,
+                table_name: String::new(),
+                is_part_of_update: false,
+            });
+            program.preassign_label_to_next_insn(label_skip);
+        } else {
+            program.emit_insn(Insn::AggInverse {
+                acc_reg,
+                col: arg_load_start.unwrap_or(0),
+                delimiter: 0,
+                func: func.func.clone(),
+                comparator: None,
+            });
 
-        if let Some(label) = filter_skip_label {
-            program.preassign_label_to_next_insn(label);
+            if let Some(label) = filter_skip_label {
+                program.preassign_label_to_next_insn(label);
+            }
         }
     }
     Ok(())

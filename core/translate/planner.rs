@@ -899,7 +899,7 @@ fn resolve_effective_frame(
             exclude: None,
         });
     };
-    // min/max still need SQLite's per-function sorted-index strategy.
+    // min/max use SQLite's per-function sorted-index strategy.
     // group_concat and json_group_* maintain removable-prefix state in
     // their aggregate payloads, matching their SQLite xInverse behavior.
     // first_value / nth_value don't need xInverse — they're WINDOWFUNCNOOP
@@ -915,6 +915,8 @@ fn resolve_effective_frame(
                 | AggFunc::Count
                 | AggFunc::Count0
                 | AggFunc::Avg
+                | AggFunc::Min
+                | AggFunc::Max
                 | AggFunc::GroupConcat
                 | AggFunc::StringAgg,
         ) | AccumulatorFunc::Window(
