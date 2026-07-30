@@ -962,3 +962,65 @@ expect {
     1|x
     2|3
 }
+
+test alter-column-replace-default {
+    CREATE TABLE t (a INTEGER, b TEXT DEFAULT 'old');
+    ALTER TABLE t ALTER COLUMN b TO b TEXT DEFAULT 'new';
+    INSERT INTO t (a) VALUES (1);
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT b FROM t;
+}
+expect {
+    CREATE TABLE t (a INTEGER, b TEXT DEFAULT 'new')
+    new
+}
+
+test alter-column-drop-default {
+    CREATE TABLE t (a INTEGER, b TEXT DEFAULT 'x');
+    ALTER TABLE t ALTER COLUMN b TO b TEXT;
+    INSERT INTO t (a) VALUES (1);
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT a, b IS NULL FROM t;
+}
+expect {
+    CREATE TABLE t (a INTEGER, b TEXT)
+    1|1
+}
+
+# Inserting the default applies the column's affinity, like CREATE TABLE.
+test alter-column-default-applies-column-affinity {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    ALTER TABLE t ALTER COLUMN b TO b INTEGER DEFAULT '42';
+    INSERT INTO t (a) VALUES (1);
+    SELECT b, typeof(b) FROM t;
+}
+expect {
+    42|integer
+}
+
+# Non-constant defaults are allowed: existing rows already have values,
+# so nothing is applied retroactively (unlike ADD COLUMN, which
+# restricts these to empty tables).
+test alter-column-current-timestamp-default {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    INSERT INTO t (a) VALUES (1);
+    ALTER TABLE t ALTER COLUMN b TO b TEXT DEFAULT CURRENT_TIMESTAMP;
+    INSERT INTO t (a) VALUES (2);
+    SELECT a, b IS NULL FROM t WHERE a = 1;
+    SELECT a, length(b) >= 19, b LIKE '20%' FROM t WHERE a = 2;
+}
+expect {
+    1|1
+    2|1|1
+}
+
+# Double-quoted strings resolve as string literals in the new default.
+test alter-column-double-quoted-default {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    ALTER TABLE t ALTER COLUMN b TO b TEXT DEFAULT "foo";
+    INSERT INTO t (a) VALUES (1);
+    SELECT b FROM t;
+}
+expect {
+    foo
+}
