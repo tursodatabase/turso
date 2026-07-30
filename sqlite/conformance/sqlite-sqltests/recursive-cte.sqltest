@@ -1733,3 +1733,19 @@ expect {
     2|1,3
     3|1,3
 }
+
+test recursive-cte-left-join-recursive-ref-on-inner-side {
+    CREATE TABLE lj(a);
+    INSERT INTO lj VALUES(1),(2),(3);
+    WITH RECURSIVE c(x) AS (
+        SELECT 1
+        UNION
+        SELECT lj.a FROM lj LEFT JOIN c ON 0
+    )
+    SELECT * FROM c;
+}
+expect {
+    1
+    2
+    3
+}
