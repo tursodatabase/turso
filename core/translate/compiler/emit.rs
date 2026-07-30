@@ -38,7 +38,7 @@ pub type LeafEmitter<'e> = dyn FnMut(&mut ProgramBuilder, &ast::Expr, usize) -> 
 pub fn emit_function(program: &mut ProgramBuilder, func: &Function, dest: usize) -> Result<()> {
     verify(func)
         .map_err(|e| LimboError::InternalError(format!("compiler IR failed verification: {e}")))?;
-    Emitter::new(program, func, dest, None).emit()
+    Emitter::new(program, func, Some(dest), &[], None).emit()
 }
 
 /// [`emit_function`] with a leaf emitter for functions whose values
@@ -51,13 +51,54 @@ pub fn emit_function_with_leaves(
 ) -> Result<()> {
     verify(func)
         .map_err(|e| LimboError::InternalError(format!("compiler IR failed verification: {e}")))?;
-    Emitter::new(program, func, dest, Some(leaf_emitter)).emit()
+    Emitter::new(program, func, Some(dest), &[], Some(leaf_emitter)).emit()
+}
+
+/// Emit a condition island: a function whose control flow leaves through
+/// declared exits rather than a `Ret` value. `exit_labels[i]` is the
+/// label bound to `ExitId(i)`; empty exit blocks are bypassed entirely
+/// (jumps go straight to the bound label).
+pub fn emit_condition_function(
+    program: &mut ProgramBuilder,
+    func: &Function,
+    exit_labels: &[BranchOffset],
+    fallthrough_label: Option<BranchOffset>,
+    leaf_emitter: Option<&mut LeafEmitter<'_>>,
+) -> Result<()> {
+    verify(func)
+        .map_err(|e| LimboError::InternalError(format!("compiler IR failed verification: {e}")))?;
+    if exit_labels.len() != func.num_exits() {
+        return Err(LimboError::InternalError(format!(
+            "compiler IR: {} exit labels bound but {} exits declared",
+            exit_labels.len(),
+            func.num_exits()
+        )));
+    }
+    // Explicit reborrow: `Option<&mut dyn ...>` is invariant, so shorten
+    // the emitter borrow to this call's lifetime by hand.
+    match leaf_emitter {
+        Some(leaf_emitter) => {
+            let mut emitter =
+                Emitter::new(program, func, None, exit_labels, Some(&mut *leaf_emitter));
+            emitter.fallthrough_label = fallthrough_label;
+            emitter.emit()
+        }
+        None => {
+            let mut emitter = Emitter::new(program, func, None, exit_labels, None);
+            emitter.fallthrough_label = fallthrough_label;
+            emitter.emit()
+        }
+    }
 }
 
 struct Emitter<'a> {
     program: &'a mut ProgramBuilder,
     func: &'a Function,
-    dest: usize,
+    /// Destination register for `Ret` values; `None` for condition
+    /// islands, whose control flow leaves through exits instead.
+    dest: Option<usize>,
+    /// Labels bound to declared exits, indexed by `ExitId`.
+    exit_labels: &'a [BranchOffset],
     /// Physical register per value, assigned at definition.
     regs: Vec<Option<usize>>,
     /// Emission order: entry first, reachable blocks only.
@@ -77,19 +118,28 @@ struct Emitter<'a> {
     /// Contiguous register pack per call site (indexed by `CallId`):
     /// `Insn::Function` requires its arguments in adjacent registers.
     call_packs: Vec<usize>,
+    /// The label the caller binds to the first instruction after this
+    /// island. Jumps to an exit bound to this label from the island's
+    /// last emitted block are pure fallthrough and are elided, and
+    /// branch directions prefer falling into it — matching the eager
+    /// jump-on-the-opposite-condition shape.
+    fallthrough_label: Option<BranchOffset>,
 }
 
 impl<'a> Emitter<'a> {
     fn new(
         program: &'a mut ProgramBuilder,
         func: &'a Function,
-        dest: usize,
+        dest: Option<usize>,
+        exit_labels: &'a [BranchOffset],
         leaf_emitter: Option<&'a mut LeafEmitter<'a>>,
     ) -> Self {
         // Emission order: creation order restricted to reachable blocks.
         // Creation order keeps combinator-generated CFGs readable (arms
         // appear where they were described) and is trivially
-        // deterministic.
+        // deterministic. Bypassable exit blocks (empty, no params) are
+        // excluded: every reference to them jumps straight to the bound
+        // external label, so they would be dead code.
         let mut reachable = vec![false; func.blocks.len()];
         let mut stack = vec![BlockId::ENTRY];
         reachable[BlockId::ENTRY.index()] = true;
@@ -108,6 +158,7 @@ impl<'a> Emitter<'a> {
             .enumerate()
             .filter(|(_, &reachable)| reachable)
             .map(|(index, _)| BlockId::from_index(index))
+            .filter(|&block| Self::bypass_exit(func, exit_labels, block).is_none())
             .collect();
 
         // Transitive constness per value. Operand values are always
@@ -159,8 +210,12 @@ impl<'a> Emitter<'a> {
             }
             if let Some(terminator) = &block.terminator {
                 match terminator {
-                    Terminator::Jump(_) => {}
+                    Terminator::Jump(_) | Terminator::Exit(_) => {}
                     Terminator::Branch { cond, .. } => count(cond),
+                    Terminator::CmpBranch { lhs, rhs, .. } => {
+                        count(lhs);
+                        count(rhs);
+                    }
                     Terminator::Ret { value } => count(value),
                 }
                 for target in terminator.targets() {
@@ -206,6 +261,7 @@ impl<'a> Emitter<'a> {
             program,
             func,
             dest,
+            exit_labels,
             regs,
             labels: vec![None; func.blocks.len()],
             order,
@@ -213,6 +269,33 @@ impl<'a> Emitter<'a> {
             leaf_emitter,
             is_const,
             call_packs,
+            fallthrough_label: None,
+        }
+    }
+
+    /// Whether `block` is an exit bound to the island's fallthrough
+    /// label: control arriving there from the island's last emitted
+    /// block needs no jump at all.
+    fn exits_to_fallthrough(&self, block: BlockId) -> bool {
+        self.fallthrough_label.is_some()
+            && Self::bypass_exit(self.func, self.exit_labels, block) == self.fallthrough_label
+    }
+
+    /// The external label a jump to `block` should use instead, when
+    /// `block` is an empty parameterless exit block. Bypassing avoids a
+    /// chain of `Goto`s through trivial exit trampolines.
+    fn bypass_exit(
+        func: &Function,
+        exit_labels: &[BranchOffset],
+        block: BlockId,
+    ) -> Option<BranchOffset> {
+        let block = func.block(block);
+        if !block.insts.is_empty() || !block.params.is_empty() {
+            return None;
+        }
+        match block.terminator {
+            Some(Terminator::Exit(exit)) => exit_labels.get(exit.index()).copied(),
+            _ => None,
         }
     }
 
@@ -427,14 +510,19 @@ impl<'a> Emitter<'a> {
         match terminator {
             Terminator::Jump(target) => {
                 self.emit_edge(target);
-                self.emit_goto_unless_next(target.block, next);
+                self.emit_goto_unless_next(target.block, next, true);
             }
             Terminator::Ret { value } => {
+                let dest = self.dest.ok_or_else(|| {
+                    LimboError::InternalError(
+                        "compiler IR: Ret in a function emitted without a destination".to_string(),
+                    )
+                })?;
                 let reg = self.reg_of(*value);
-                if reg != self.dest {
+                if reg != dest {
                     self.program.emit_insn(Insn::Copy {
                         src_reg: reg,
-                        dst_reg: self.dest,
+                        dst_reg: dest,
                         extra_amount: 0,
                     });
                 }
@@ -445,6 +533,101 @@ impl<'a> Emitter<'a> {
                     self.program.emit_insn(Insn::Goto { target_pc: exit });
                 }
             }
+            Terminator::Exit(exit) => {
+                let label = self.exit_labels.get(exit.index()).copied().ok_or_else(|| {
+                    LimboError::InternalError(
+                        "compiler IR: Exit terminator without a bound exit label".to_string(),
+                    )
+                })?;
+                self.program.emit_insn(Insn::Goto { target_pc: label });
+            }
+            Terminator::CmpBranch {
+                cmp,
+                lhs,
+                rhs,
+                if_true,
+                if_false,
+                if_null,
+            } => {
+                let lhs = self.reg_of(*lhs);
+                let rhs = self.reg_of(*rhs);
+                let data = self.func.cmp_data(*cmp);
+                let base_flags = CmpInsFlags::default().with_affinity(data.affinity);
+                let collation = data.collation;
+                let mut trampolines: Vec<(BranchOffset, JumpTarget)> = Vec::new();
+                // Pick the jump direction so the other side falls
+                // through, mirroring the eager opposite-op selection
+                // (`WHERE x = 1` jumps on `Ne`). NULL routing rides the
+                // jump_if_null flag: set it when the NULL target is the
+                // jumped-to side; otherwise NULL falls through.
+                let true_falls_through = next == Some(if_true.block)
+                    || (next.is_none() && self.exits_to_fallthrough(if_true.block));
+                let (op, jump_target, fall_target, null_jumps) = if true_falls_through {
+                    (data.op.negated(), if_false, if_true, if_null == if_false)
+                } else {
+                    (data.op, if_true, if_false, if_null == if_true)
+                };
+                let flags = if null_jumps {
+                    base_flags.jump_if_null()
+                } else {
+                    base_flags
+                };
+                let target_pc = self.edge_entry_pc(jump_target, &mut trampolines);
+                let insn = match op {
+                    CmpOp::Eq => Insn::Eq {
+                        lhs,
+                        rhs,
+                        target_pc,
+                        flags,
+                        collation,
+                    },
+                    CmpOp::Ne => Insn::Ne {
+                        lhs,
+                        rhs,
+                        target_pc,
+                        flags,
+                        collation,
+                    },
+                    CmpOp::Lt => Insn::Lt {
+                        lhs,
+                        rhs,
+                        target_pc,
+                        flags,
+                        collation,
+                    },
+                    CmpOp::Le => Insn::Le {
+                        lhs,
+                        rhs,
+                        target_pc,
+                        flags,
+                        collation,
+                    },
+                    CmpOp::Gt => Insn::Gt {
+                        lhs,
+                        rhs,
+                        target_pc,
+                        flags,
+                        collation,
+                    },
+                    CmpOp::Ge => Insn::Ge {
+                        lhs,
+                        rhs,
+                        target_pc,
+                        flags,
+                        collation,
+                    },
+                };
+                self.program.emit_insn(insn);
+                // The not-jumped side continues here.
+                self.emit_edge(fall_target);
+                self.emit_goto_unless_next(fall_target.block, next, trampolines.is_empty());
+                for (label, target) in trampolines {
+                    self.program.preassign_label_to_next_insn(label);
+                    self.emit_edge(&target);
+                    let pc = self.jump_target_pc(target.block);
+                    self.program.emit_insn(Insn::Goto { target_pc: pc });
+                }
+            }
             Terminator::Branch {
                 cond,
                 if_true,
@@ -452,6 +635,25 @@ impl<'a> Emitter<'a> {
                 if_null,
             } => {
                 let cond = self.reg_of(*cond);
+                // Truthiness with the true side falling through (into
+                // the next block, or out of the island): a single IfNot
+                // with NULL jumping false — the eager emit_cond_jump
+                // shape.
+                let true_falls_through = next == Some(if_true.block)
+                    || (next.is_none() && self.exits_to_fallthrough(if_true.block));
+                if if_false == if_null
+                    && if_true.args.is_empty()
+                    && if_false.args.is_empty()
+                    && true_falls_through
+                {
+                    let false_pc = self.jump_target_pc(if_false.block);
+                    self.program.emit_insn(Insn::IfNot {
+                        reg: cond,
+                        target_pc: false_pc,
+                        jump_if_null: true,
+                    });
+                    return Ok(());
+                }
                 // Truthy first. Arg-carrying edges need their copies to
                 // happen on the edge, so they go through a local
                 // trampoline; bare edges jump straight to the target.
@@ -466,11 +668,7 @@ impl<'a> Emitter<'a> {
                     // False and NULL share the edge: falsy or NULL both
                     // fall through here.
                     self.emit_edge(if_false);
-                    // Fallthrough elision is only safe when no trampoline
-                    // code will be emitted between here and the next
-                    // block.
-                    let fallthrough = if trampolines.is_empty() { next } else { None };
-                    self.emit_goto_unless_next(if_false.block, fallthrough);
+                    self.emit_goto_unless_next(if_false.block, next, trampolines.is_empty());
                 } else {
                     let false_pc = self.edge_entry_pc(if_false, &mut trampolines);
                     self.program.emit_insn(Insn::IfNot {
@@ -480,15 +678,13 @@ impl<'a> Emitter<'a> {
                     });
                     // Neither truthy nor falsy: NULL falls through.
                     self.emit_edge(if_null);
-                    let fallthrough = if trampolines.is_empty() { next } else { None };
-                    self.emit_goto_unless_next(if_null.block, fallthrough);
+                    self.emit_goto_unless_next(if_null.block, next, trampolines.is_empty());
                 }
                 for (label, target) in trampolines {
                     self.program.preassign_label_to_next_insn(label);
                     self.emit_edge(&target);
-                    self.program.emit_insn(Insn::Goto {
-                        target_pc: self.block_label(target.block),
-                    });
+                    let pc = self.jump_target_pc(target.block);
+                    self.program.emit_insn(Insn::Goto { target_pc: pc });
                 }
             }
         }
@@ -504,12 +700,19 @@ impl<'a> Emitter<'a> {
         trampolines: &mut Vec<(BranchOffset, JumpTarget)>,
     ) -> BranchOffset {
         if target.args.is_empty() {
-            self.block_label(target.block)
+            self.jump_target_pc(target.block)
         } else {
             let label = self.program.allocate_label();
             trampolines.push((label, target.clone()));
             label
         }
+    }
+
+    /// Where a jump to `block` should land: the bound external label when
+    /// `block` is a bypassable exit block, its own label otherwise.
+    fn jump_target_pc(&self, block: BlockId) -> BranchOffset {
+        Self::bypass_exit(self.func, self.exit_labels, block)
+            .unwrap_or_else(|| self.block_label(block))
     }
 
     /// Copy edge arguments into the target's block-parameter registers.
@@ -559,14 +762,22 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn emit_goto_unless_next(&mut self, target: BlockId, next: Option<BlockId>) {
-        if next == Some(target) {
-            // Fallthrough: the target is emitted immediately after. Its
-            // label may still be referenced by other edges; that label is
-            // preassigned when the block is emitted.
-            return;
+    /// Emit the goto ending a block's straight-line path to `target`,
+    /// elided (when `may_elide`) if control would arrive there anyway:
+    /// the target is the next emitted block, or this is the island's
+    /// last emitted code and the target exits to the label bound right
+    /// after the island. `may_elide` must be false when more code (edge
+    /// trampolines) follows within the same block.
+    fn emit_goto_unless_next(&mut self, target: BlockId, next: Option<BlockId>, may_elide: bool) {
+        if may_elide {
+            if next == Some(target) {
+                return;
+            }
+            if next.is_none() && self.exits_to_fallthrough(target) {
+                return;
+            }
         }
-        let label = self.block_label(target);
+        let label = self.jump_target_pc(target);
         self.program.emit_insn(Insn::Goto { target_pc: label });
     }
 
@@ -583,10 +794,9 @@ impl<'a> Emitter<'a> {
         // register. External values never reach here: they are bound
         // when their defining pseudo-instruction is visited, which
         // dominates (hence precedes in emission) every use.
-        let reg = if self.is_ret_value(value) && !self.dest_taken() {
-            self.dest
-        } else {
-            self.program.alloc_register()
+        let reg = match self.dest {
+            Some(dest) if self.is_ret_value(value) && !self.dest_taken() => dest,
+            _ => self.program.alloc_register(),
         };
         self.regs[value.index()] = Some(reg);
         reg
@@ -602,6 +812,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn dest_taken(&self) -> bool {
-        self.regs.iter().flatten().any(|&reg| reg == self.dest)
+        self.dest
+            .is_some_and(|dest| self.regs.iter().flatten().any(|&reg| reg == dest))
     }
 }

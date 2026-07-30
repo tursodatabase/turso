@@ -35,9 +35,11 @@ pub(crate) mod ir;
 pub(crate) mod verify;
 
 pub(crate) use emit::LeafEmitter;
-pub(crate) use expr::{compile_value_expr, BuildCtx};
+pub(crate) use expr::{compile_condition_expr, compile_value_expr, BuildCtx};
 
+use crate::translate::expr::ConditionMetadata;
 use crate::vdbe::builder::ProgramBuilder;
+use crate::vdbe::BranchOffset;
 use crate::Result;
 
 /// Run a described value through build → verify → emit, leaving the
@@ -59,11 +61,80 @@ pub(crate) fn emit_value(
     }
 }
 
+/// Run a described predicate as a condition island honoring the eager
+/// [`ConditionMetadata`] contract: one side jumps to its metadata label,
+/// the other falls through to the code emitted after this call.
+///
+/// The NULL continuation is honored when it coincides with the jumped-to
+/// side (the eager `jump_if_null` flag selection); otherwise NULL takes
+/// the fallthrough side, exactly as eager comparison terminals behave.
+pub(crate) fn emit_condition(
+    program: &mut ProgramBuilder,
+    predicate: combine::Predicate<'_>,
+    metadata: &ConditionMetadata,
+    leaf_emitter: Option<&mut LeafEmitter<'_>>,
+) -> Result<()> {
+    let fallthrough = program.allocate_label();
+    let (true_label, false_label) = if metadata.jump_if_condition_is_true {
+        (metadata.jump_target_when_true, fallthrough)
+    } else {
+        (fallthrough, metadata.jump_target_when_false)
+    };
+    let null_label = if metadata.jump_if_condition_is_true {
+        if metadata.jump_target_when_null == metadata.jump_target_when_true {
+            true_label
+        } else {
+            false_label
+        }
+    } else if metadata.jump_target_when_null == metadata.jump_target_when_false {
+        false_label
+    } else {
+        true_label
+    };
+
+    let mut builder = ir::FuncBuilder::new();
+    // One exit block per distinct label, so terminals can detect NULL
+    // joining the true or false side by block equality.
+    let mut exit_labels: Vec<BranchOffset> = Vec::new();
+    let mut exit_blocks: Vec<ir::BlockId> = Vec::new();
+    let mut block_for = |builder: &mut ir::FuncBuilder, label: BranchOffset| -> ir::BlockId {
+        if let Some(position) = exit_labels.iter().position(|&l| l == label) {
+            return exit_blocks[position];
+        }
+        let exit = builder.declare_exit();
+        exit_labels.push(label);
+        let block = builder.exit_block(exit);
+        exit_blocks.push(block);
+        block
+    };
+    let if_true = block_for(&mut builder, true_label);
+    let if_false = block_for(&mut builder, false_label);
+    let if_null = block_for(&mut builder, null_label);
+    predicate.run(
+        &mut builder,
+        combine::CondTargets {
+            if_true,
+            if_false,
+            if_null,
+        },
+    )?;
+    let func = builder.finish();
+    emit::emit_condition_function(
+        program,
+        &func,
+        &exit_labels,
+        Some(fallthrough),
+        leaf_emitter,
+    )?;
+    program.preassign_label_to_next_insn(fallthrough);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use turso_parser::ast;
 
-    use super::combine::{self, Compiler};
+    use super::combine::{self, Compiler, Predicate};
     use super::ir::{BinOp, FuncBuilder, JumpTarget, UnaryOp};
     use super::verify::{verify, VerifyError};
     use super::*;
@@ -293,13 +364,14 @@ mod tests {
         emit::emit_function(&mut program, &func, dest).unwrap();
         let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
 
-        // Constants intern in the entry block; the branch selects an arm
-        // and each arm copies its value into the join's block parameter,
-        // which is bound to `dest`.
+        // Constants intern in the entry block; the branch tests the
+        // condition once (IfNot to the false arm, true arm falls
+        // through) and each arm copies its value into the join's block
+        // parameter, which is bound to `dest`.
         let [Insn::Integer {
             value: 1,
             dest: cond,
-        }, Insn::Integer { value: 2, dest: t }, Insn::Integer { value: 3, dest: f }, Insn::If { reg, .. }, Insn::Goto { .. }, Insn::Copy {
+        }, Insn::Integer { value: 2, dest: t }, Insn::Integer { value: 3, dest: f }, Insn::IfNot { reg, .. }, Insn::Copy {
             src_reg: true_src,
             dst_reg: true_dst,
             ..
@@ -749,6 +821,119 @@ mod tests {
         emit::emit_function(&mut program, &func, dest).unwrap();
         // Only the Integer argument is in a span; the Function is not.
         assert_eq!(program.constant_spans, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn leaf_dedup_respects_dominance() {
+        // A leaf read placed in a non-entry block must not be reused
+        // from a sibling block it does not dominate (the partial-index
+        // `(a>10 AND b>10) OR (a<2 AND b<2)` shape). Entry-block reads
+        // are reusable from anywhere.
+        let leaf_expr = parse_expr("b");
+        let mut builder = FuncBuilder::new();
+        let entry_read = builder.leaf(&leaf_expr);
+        let sibling_a = builder.create_block();
+        let sibling_b = builder.create_block();
+        builder.branch(
+            entry_read,
+            JumpTarget::new(sibling_a, Vec::new()),
+            JumpTarget::new(sibling_b, Vec::new()),
+            JumpTarget::new(sibling_b, Vec::new()),
+        );
+        builder.switch_to(sibling_a);
+        // Entry read dominates: reused.
+        assert_eq!(builder.leaf(&leaf_expr), entry_read);
+        let other_expr = parse_expr("c");
+        let read_in_a = builder.leaf(&other_expr);
+        builder.ret(read_in_a);
+        builder.switch_to(sibling_b);
+        // sibling_a does not dominate sibling_b: fresh read.
+        let read_in_b = builder.leaf(&other_expr);
+        assert_ne!(read_in_a, read_in_b);
+        builder.ret(read_in_b);
+        verify(&builder.finish()).unwrap();
+    }
+
+    #[test]
+    fn condition_predicates_emit_branching_islands() {
+        use crate::translate::expr::ConditionMetadata;
+        // external(3) AND external(4), standard WHERE contract: jump to
+        // `false_label` when false/null, fall through when true.
+        let mut program = test_program();
+        let false_label = program.allocate_label();
+        let metadata = ConditionMetadata {
+            jump_if_condition_is_true: false,
+            jump_target_when_true: program.allocate_label(),
+            jump_target_when_false: false_label,
+            jump_target_when_null: false_label,
+        };
+        let predicate = Predicate::from_bool(combine::external(3))
+            .and(Predicate::from_bool(combine::external(4)));
+        emit_condition(&mut program, predicate, &metadata, None).unwrap();
+        program.preassign_label_to_next_insn(metadata.jump_target_when_true);
+        program.preassign_label_to_next_insn(false_label);
+        program.resolve_labels().unwrap();
+
+        let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
+        // Both truthiness terminals take the eager IfNot shape: jump to
+        // the false exit (NULL included), fall through on true — the
+        // left into the right, the right out of the island.
+        let [Insn::IfNot {
+            reg: 3,
+            jump_if_null: true,
+            ..
+        }, Insn::IfNot {
+            reg: 4,
+            jump_if_null: true,
+            ..
+        }] = insns[..]
+        else {
+            panic!("expected two IfNot terminals, got {insns:?}");
+        };
+    }
+
+    #[test]
+    fn comparison_conditions_branch_without_materializing() {
+        use super::ir::CmpOp;
+        use crate::translate::expr::ConditionMetadata;
+        use crate::vdbe::affinity::Affinity;
+        // external(1) < external(2) as a WHERE terminal: one comparison
+        // jump, no Integer/ZeroOrNull boolean materialization.
+        let mut program = test_program();
+        let false_label = program.allocate_label();
+        let metadata = ConditionMetadata {
+            jump_if_condition_is_true: false,
+            jump_target_when_true: program.allocate_label(),
+            jump_target_when_false: false_label,
+            jump_target_when_null: false_label,
+        };
+        let predicate = Predicate::build_with(|builder, targets| {
+            let lhs = builder.external(1);
+            let rhs = builder.external(2);
+            builder.cmp_branch(
+                CmpOp::Lt,
+                Affinity::Numeric,
+                None,
+                lhs,
+                rhs,
+                JumpTarget::new(targets.if_true, Vec::new()),
+                JumpTarget::new(targets.if_false, Vec::new()),
+                JumpTarget::new(targets.if_null, Vec::new()),
+            );
+            Ok(())
+        });
+        emit_condition(&mut program, predicate, &metadata, None).unwrap();
+        program.preassign_label_to_next_insn(metadata.jump_target_when_true);
+        program.preassign_label_to_next_insn(false_label);
+        program.resolve_labels().unwrap();
+
+        let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
+        // The eager shape: one negated comparison jumping to the false
+        // exit (NULL included via jump_if_null), true falls through out
+        // of the island. No boolean is materialized.
+        let [Insn::Ge { lhs: 1, rhs: 2, .. }] = insns[..] else {
+            panic!("expected a single negated comparison, got {insns:?}");
+        };
     }
 
     #[test]

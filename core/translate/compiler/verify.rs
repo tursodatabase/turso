@@ -36,6 +36,9 @@ pub enum VerifyError {
         block: BlockId,
         value: ValueId,
     },
+    CmpBranchNullTarget {
+        block: BlockId,
+    },
 }
 
 impl fmt::Display for VerifyError {
@@ -65,6 +68,10 @@ impl fmt::Display for VerifyError {
             VerifyError::UseNotDominatedByDef { block, value } => write!(
                 f,
                 "value {value:?} is used in block {block:?} but its definition does not dominate the use"
+            ),
+            VerifyError::CmpBranchNullTarget { block } => write!(
+                f,
+                "CmpBranch in block {block:?} has a NULL target distinct from both the true and false targets; VDBE comparison jumps route NULL via a flag"
             ),
         }
     }
@@ -156,8 +163,22 @@ pub fn verify(func: &Function) -> Result<(), VerifyError> {
         let end = block.insts.len();
         let terminator = block.terminator.as_ref().expect("checked above");
         match terminator {
-            Terminator::Jump(_) => {}
+            Terminator::Jump(_) | Terminator::Exit(_) => {}
             Terminator::Branch { cond, .. } => check(*cond, end)?,
+            Terminator::CmpBranch {
+                lhs,
+                rhs,
+                if_true,
+                if_false,
+                if_null,
+                ..
+            } => {
+                check(*lhs, end)?;
+                check(*rhs, end)?;
+                if if_null != if_true && if_null != if_false {
+                    return Err(VerifyError::CmpBranchNullTarget { block: block_id });
+                }
+            }
             Terminator::Ret { value } => check(*value, end)?,
         }
         for target in terminator.targets() {

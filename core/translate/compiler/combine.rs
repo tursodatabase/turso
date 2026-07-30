@@ -20,7 +20,7 @@
 
 use crate::Result;
 
-use super::ir::{FuncBuilder, JumpTarget, ValueId};
+use super::ir::{BlockId, FuncBuilder, JumpTarget, ValueId};
 
 /// The deferred build step at the heart of a [`Compiler`].
 type BuildFn<'a, T> = Box<dyn FnOnce(&mut FuncBuilder) -> Result<T> + 'a>;
@@ -155,6 +155,104 @@ impl<'a> Compiler<'a, ValueId> {
             builder.jump(join, vec![false_value]);
             builder.switch_to(join);
             Ok(result)
+        })
+    }
+}
+
+/// The three continuations of a predicate: where control goes when the
+/// condition is true, false, or NULL. Composition rewires these blocks
+/// the way the eager path threads `ConditionMetadata` labels — but
+/// symbolically, with the backend inventing every physical label.
+#[derive(Debug, Clone, Copy)]
+pub struct CondTargets {
+    pub if_true: BlockId,
+    pub if_false: BlockId,
+    pub if_null: BlockId,
+}
+
+/// The deferred build step at the heart of a [`Predicate`].
+type PredicateFn<'a> = Box<dyn FnOnce(&mut FuncBuilder, CondTargets) -> Result<()> + 'a>;
+
+/// A deferred predicate: when run, it appends control flow to the
+/// function under construction that leaves for one of the three targets.
+/// The block the builder is positioned in when `run` is called is the
+/// predicate's entry; every path out of the predicate ends in a
+/// terminator (there is no fallthrough).
+pub struct Predicate<'a> {
+    build: PredicateFn<'a>,
+}
+
+impl<'a> Predicate<'a> {
+    pub fn build_with(f: impl FnOnce(&mut FuncBuilder, CondTargets) -> Result<()> + 'a) -> Self {
+        Self { build: Box::new(f) }
+    }
+
+    pub fn run(self, builder: &mut FuncBuilder, targets: CondTargets) -> Result<()> {
+        (self.build)(builder, targets)
+    }
+
+    /// Logical AND: the left predicate's true edge continues into the
+    /// right predicate; false short-circuits to the outer target. A NULL
+    /// left side short-circuits only when the outer NULL and false
+    /// continuations coincide; otherwise it continues into the right
+    /// predicate — exactly the eager behavior, where the left terminal's
+    /// jump_if_null flag is set only when the NULL label equals the
+    /// false label it jumps to.
+    pub fn and(self, rhs: Predicate<'a>) -> Predicate<'a> {
+        Predicate::build_with(move |builder, targets| {
+            let mid = builder.create_block();
+            let lhs_null = if targets.if_null == targets.if_false {
+                targets.if_false
+            } else {
+                mid
+            };
+            self.run(
+                builder,
+                CondTargets {
+                    if_true: mid,
+                    if_null: lhs_null,
+                    ..targets
+                },
+            )?;
+            builder.switch_to(mid);
+            rhs.run(builder, targets)
+        })
+    }
+
+    /// Logical OR: the left predicate's false AND NULL edges continue
+    /// into the right predicate (a NULL left side must still evaluate the
+    /// right side); true short-circuits to the outer target. Mirrors the
+    /// eager OR label threading.
+    pub fn or(self, rhs: Predicate<'a>) -> Predicate<'a> {
+        Predicate::build_with(move |builder, targets| {
+            let mid = builder.create_block();
+            self.run(
+                builder,
+                CondTargets {
+                    if_false: mid,
+                    if_null: mid,
+                    ..targets
+                },
+            )?;
+            builder.switch_to(mid);
+            rhs.run(builder, targets)
+        })
+    }
+
+    /// A truthiness test over a computed value: truthy takes the true
+    /// edge, falsy and NULL take the false edge. NULL joining false —
+    /// regardless of the NULL target — matches the eager
+    /// `emit_cond_jump` in both of its jump directions.
+    pub fn from_bool(value: Compiler<'a, ValueId>) -> Predicate<'a> {
+        Predicate::build_with(move |builder, targets| {
+            let cond = value.run(builder)?;
+            builder.branch(
+                cond,
+                JumpTarget::new(targets.if_true, Vec::new()),
+                JumpTarget::new(targets.if_false, Vec::new()),
+                JumpTarget::new(targets.if_false, Vec::new()),
+            );
+            Ok(())
         })
     }
 }

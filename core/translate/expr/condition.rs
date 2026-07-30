@@ -217,6 +217,39 @@ pub fn translate_condition_expr(
     condition_metadata: ConditionMetadata,
     resolver: &Resolver,
 ) -> Result<()> {
+    // Composable compiler path: conditions the new pipeline can fully
+    // represent (AND/OR over comparisons and truthiness terminals) are
+    // described as predicates, built into verified IR, and emitted in
+    // one pass. Anything else falls back to eager emission below. Gated
+    // like the value-expression hook: decomposing trees is incorrect
+    // while the expression→register cache or expression indexes are
+    // active.
+    let has_expression_indexes = referenced_tables
+        .joined_tables()
+        .iter()
+        .any(|t| !t.expression_index_usages.is_empty());
+    if !has_expression_indexes && !resolver.expr_to_reg_cache_enabled {
+        let build_ctx = crate::translate::compiler::BuildCtx {
+            referenced_tables: Some(referenced_tables),
+            resolver: Some(resolver),
+        };
+        if let Some(built) = crate::translate::compiler::compile_condition_expr(expr, &build_ctx)? {
+            let mut emit_leaf = |program: &mut ProgramBuilder, leaf: &ast::Expr, dest: usize| {
+                translate_expr(program, Some(referenced_tables), leaf, dest, resolver).map(|_| ())
+            };
+            crate::translate::compiler::emit_condition(
+                program,
+                built.predicate,
+                &condition_metadata,
+                Some(&mut emit_leaf),
+            )?;
+            // Restore the collation post-state the eager path would have
+            // left behind (that of the last-emitted terminal).
+            built.effect.apply(program);
+            return Ok(());
+        }
+    }
+
     match expr {
         ast::Expr::SubqueryResult { query_type, .. } => match query_type {
             SubqueryType::Exists { result_reg } => {

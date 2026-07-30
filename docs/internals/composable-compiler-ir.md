@@ -226,11 +226,30 @@ boundary (the whole tree is constant, so the span opened by
 
 ### Phase 2 — Conditions and short-circuit control
 
-- [ ] 2a. `Compiler<Predicate>` for condition position: three-valued
-      branch targets instead of a materialized boolean;
-      `translate_condition_expr` callers migrate terminal-by-terminal.
-- [ ] 2b. AND/OR/CASE/COALESCE/IFNULL as `branch`/`branch3` compositions
-      (this is where block parameters start paying for themselves).
+- [x] 2a. Condition position: `Predicate` combinators (`and`, `or`,
+      `from_bool`, comparison terminals) with `CondTargets` block
+      triples replacing `ConditionMetadata` label threading. New IR:
+      `Terminator::Exit(ExitId)` (symbolic external continuations, bound
+      to labels at emission; empty exit blocks are bypassed so jumps go
+      straight to the external label) and `Terminator::CmpBranch`
+      (three-way comparison branch; the verifier requires the NULL
+      target to coincide with true or false, since VDBE encodes NULL
+      routing as `jump_if_null`). The integration hook at the top of
+      `translate_condition_expr` covers AND/OR trees over comparison and
+      truthiness terminals; IS/IS NOT, BETWEEN, IN, LIKE, CASE, and
+      subqueries fall back. Emission is shape-identical to eager for
+      WHERE terminals: a fallthrough-label hint drives opposite-op
+      selection (`WHERE x=1` emits `Ne -> false` with `jump_if_null`)
+      and the single-`IfNot` truthiness form. AND rewires the left NULL
+      edge to continue into the right side unless NULL and false labels
+      coincide; OR routes left false AND NULL into the right side —
+      both exactly the eager flag semantics. Lesson recorded: leaf dedup
+      across blocks must be dominance-safe (entry-or-current-block rule)
+      — the verifier caught the sibling-branch reuse on the partial-index
+      corpus before it became corrupt bytecode.
+- [ ] 2b. CASE/COALESCE/IFNULL in value position as `branch`/`branch3`
+      compositions (block parameters carrying the result); IS/IS NOT and
+      IS NULL/NOT NULL terminals in condition position.
 - [ ] 2c. Constant hoisting as an IR transform (move constant-only
       instructions to the entry block) so IR islands stop depending on
       the constant-span machinery; then start deleting

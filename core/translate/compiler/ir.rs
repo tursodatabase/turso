@@ -106,6 +106,12 @@ pub enum BinOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeafId(u32);
 
+impl LeafId {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// A SQL comparison operator with three-valued result semantics: the
 /// value form produces 1, 0, or NULL (NULL when either operand is NULL).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -116,6 +122,22 @@ pub enum CmpOp {
     Le,
     Gt,
     Ge,
+}
+
+impl CmpOp {
+    /// The comparison whose truth is exactly this one's falsity (SQL
+    /// three-valued: both are NULL together). Used by emission to jump on
+    /// the false side and fall through on the true side.
+    pub fn negated(self) -> CmpOp {
+        match self {
+            CmpOp::Eq => CmpOp::Ne,
+            CmpOp::Ne => CmpOp::Eq,
+            CmpOp::Lt => CmpOp::Ge,
+            CmpOp::Le => CmpOp::Gt,
+            CmpOp::Gt => CmpOp::Le,
+            CmpOp::Ge => CmpOp::Lt,
+        }
+    }
 }
 
 /// Handle to a comparison payload ([`CmpData`]). `Affinity` is not
@@ -138,6 +160,19 @@ pub struct CmpData {
     pub op: CmpOp,
     pub affinity: Affinity,
     pub collation: Option<CollationSeq>,
+}
+
+/// A symbolic external continuation: control flow that leaves the IR
+/// island for a label owned by surrounding eager code. Like
+/// [`Inst::External`] for registers, exits keep the IR free of physical
+/// labels — each is bound to a `BranchOffset` only at emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExitId(u32);
+
+impl ExitId {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
 }
 
 /// Handle to a function-call payload ([`CallData`]). `FuncCtx` is neither
@@ -235,12 +270,28 @@ pub enum Terminator {
         if_false: JumpTarget,
         if_null: JumpTarget,
     },
+    /// A comparison-driven three-way branch (condition position): the
+    /// comparison's truth picks `if_true`/`if_false`, NULL results take
+    /// `if_null` — which must coincide with one of the other two targets,
+    /// because VDBE comparison jumps encode NULL routing as a
+    /// `jump_if_null` flag, not a third destination. The verifier
+    /// enforces this.
+    CmpBranch {
+        cmp: CmpId,
+        lhs: ValueId,
+        rhs: ValueId,
+        if_true: JumpTarget,
+        if_false: JumpTarget,
+        if_null: JumpTarget,
+    },
     /// Leave the function, yielding `value` as its result. A function may
     /// have multiple `Ret` sites; emission funnels them into one
     /// destination register.
     Ret {
         value: ValueId,
     },
+    /// Leave the IR island for an external continuation. See [`ExitId`].
+    Exit(ExitId),
 }
 
 impl Terminator {
@@ -252,8 +303,14 @@ impl Terminator {
                 if_false,
                 if_null,
                 ..
+            }
+            | Terminator::CmpBranch {
+                if_true,
+                if_false,
+                if_null,
+                ..
             } => vec![if_true, if_false, if_null],
-            Terminator::Ret { .. } => Vec::new(),
+            Terminator::Ret { .. } | Terminator::Exit(_) => Vec::new(),
         }
     }
 }
@@ -284,6 +341,8 @@ pub struct Function {
     calls: Vec<CallData>,
     /// Payloads backing [`Inst::Compare`] instructions.
     cmps: Vec<CmpData>,
+    /// Number of declared external exits ([`ExitId`]s are dense).
+    num_exits: usize,
 }
 
 impl Function {
@@ -314,6 +373,10 @@ impl Function {
     pub fn cmp_data(&self, id: CmpId) -> &CmpData {
         &self.cmps[id.0 as usize]
     }
+
+    pub fn num_exits(&self) -> usize {
+        self.num_exits
+    }
 }
 
 /// Builds a [`Function`] one block at a time. The builder has a *current*
@@ -326,8 +389,11 @@ pub struct FuncBuilder {
     current: BlockId,
     interned: HashMap<Inst, ValueId>,
     leaves: Vec<ast::Expr>,
+    /// Placed leaf reads, for dominance-safe dedup in [`Self::leaf`].
+    placed_leaves: Vec<(LeafId, ValueId)>,
     calls: Vec<CallData>,
     cmps: Vec<CmpData>,
+    num_exits: usize,
 }
 
 impl FuncBuilder {
@@ -338,8 +404,10 @@ impl FuncBuilder {
             current: BlockId::ENTRY,
             interned: HashMap::new(),
             leaves: Vec::new(),
+            placed_leaves: Vec::new(),
             calls: Vec::new(),
             cmps: Vec::new(),
+            num_exits: 0,
         }
     }
 
@@ -402,8 +470,23 @@ impl FuncBuilder {
     /// An opaque leaf backed by `expr`, emitted by delegation to the
     /// eager translation path. Structurally equal leaves dedup (linear
     /// scan — leaves per expression are few), so repeated reads of the
-    /// same column within one island share a value.
+    /// same column share a value — but only when the earlier read surely
+    /// dominates this one: it was placed in the entry block or in the
+    /// current block. Reads placed in other blocks may sit on sibling
+    /// branches (e.g. the two AND-continuations of an OR), where reuse
+    /// would be a dominance violation; those re-read the leaf instead,
+    /// exactly like eager translation re-reads a column per terminal.
     pub fn leaf(&mut self, expr: &ast::Expr) -> ValueId {
+        for &(leaf, value) in &self.placed_leaves {
+            if self.leaves[leaf.index()] == *expr {
+                let DefSite::Inst { block, .. } = self.defs[value.index()] else {
+                    unreachable!("leaves are defined by instructions");
+                };
+                if block == BlockId::ENTRY || block == self.current {
+                    return value;
+                }
+            }
+        }
         let id = match self.leaves.iter().position(|e| e == expr) {
             Some(index) => LeafId(u32::try_from(index).expect("leaf table bounded by values")),
             None => {
@@ -412,11 +495,8 @@ impl FuncBuilder {
                 id
             }
         };
-        if let Some(&value) = self.interned.get(&Inst::Leaf(id)) {
-            return value;
-        }
         let value = self.push_inst(Inst::Leaf(id));
-        self.interned.insert(Inst::Leaf(id), value);
+        self.placed_leaves.push((id, value));
         value
     }
 
@@ -457,6 +537,55 @@ impl FuncBuilder {
         self.push_inst(Inst::Compare { cmp: id, lhs, rhs })
     }
 
+    /// Declare an external continuation, bound to a physical label at
+    /// emission time (`emit` receives one label per declared exit).
+    pub fn declare_exit(&mut self) -> ExitId {
+        let id = ExitId(u32::try_from(self.num_exits).expect("exit count fits in u32"));
+        self.num_exits += 1;
+        id
+    }
+
+    /// A block that immediately leaves the island for `exit`. Jumping to
+    /// it is how in-island control flow reaches external continuations;
+    /// emission bypasses the block entirely, jumping straight to the
+    /// bound label.
+    pub fn exit_block(&mut self, exit: ExitId) -> BlockId {
+        let block = self.create_block();
+        self.blocks[block.index()].terminator = Some(Terminator::Exit(exit));
+        block
+    }
+
+    /// Terminate the current block with a comparison-driven three-way
+    /// branch. `if_null` must equal `if_true` or `if_false` (VDBE
+    /// comparison jumps route NULL via a flag, not a third target).
+    #[allow(clippy::too_many_arguments)] // op + payloads + operands + three targets
+    pub fn cmp_branch(
+        &mut self,
+        op: CmpOp,
+        affinity: Affinity,
+        collation: Option<CollationSeq>,
+        lhs: ValueId,
+        rhs: ValueId,
+        if_true: JumpTarget,
+        if_false: JumpTarget,
+        if_null: JumpTarget,
+    ) {
+        let id = CmpId(u32::try_from(self.cmps.len()).expect("cmp count fits in u32"));
+        self.cmps.push(CmpData {
+            op,
+            affinity,
+            collation,
+        });
+        self.terminate(Terminator::CmpBranch {
+            cmp: id,
+            lhs,
+            rhs,
+            if_true,
+            if_false,
+            if_null,
+        });
+    }
+
     pub fn jump(&mut self, block: BlockId, args: Vec<ValueId>) {
         self.terminate(Terminator::Jump(JumpTarget::new(block, args)));
     }
@@ -487,6 +616,7 @@ impl FuncBuilder {
             leaves: self.leaves,
             calls: self.calls,
             cmps: self.cmps,
+            num_exits: self.num_exits,
         }
     }
 

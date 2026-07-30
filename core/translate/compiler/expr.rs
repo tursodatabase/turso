@@ -26,8 +26,8 @@ use crate::translate::plan::TableReferences;
 use crate::util::{exprs_are_equivalent, parse_numeric_literal};
 use crate::{Numeric, Result, Value, ValueBlob};
 
-use super::combine::{self, Compiler};
-use super::ir::{BinOp, CmpOp, UnaryOp, ValueId};
+use super::combine::{self, Compiler, Predicate};
+use super::ir::{BinOp, CmpOp, JumpTarget, UnaryOp, ValueId};
 
 /// Static context the frontend needs to admit effectful leaves. Column
 /// and rowid reads are only representable when the table reference
@@ -431,6 +431,106 @@ fn compile_numeric(value: &str) -> Result<Compiler<'static, ValueId>> {
         Value::Numeric(Numeric::Integer(int_value)) => combine::int(int_value),
         Value::Numeric(Numeric::Float(real_value)) => combine::real(f64::from(real_value)),
         _ => unreachable!(),
+    })
+}
+
+/// A successfully described condition plus its collation effect (the
+/// effect of the *last-emitted* terminal, since collation is
+/// compile-time state threaded in emission order).
+pub(crate) struct CondBuilt<'a> {
+    pub predicate: Predicate<'a>,
+    pub effect: CollationEffect,
+}
+
+/// Try to describe `expr` in condition position: control flow that
+/// leaves for a true/false/NULL continuation instead of materializing a
+/// boolean. AND/OR compose predicates the way the eager path threads
+/// `ConditionMetadata` labels; comparison terminals branch directly;
+/// anything value-representable becomes a truthiness test (NULL treated
+/// as false, as `emit_cond_jump` does). Everything else — IS/IS NOT,
+/// BETWEEN, IN, LIKE, CASE, subqueries — falls back to the eager path.
+pub(crate) fn compile_condition_expr<'a>(
+    expr: &'a ast::Expr,
+    ctx: &BuildCtx<'_>,
+) -> Result<Option<CondBuilt<'a>>> {
+    Ok(match expr {
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            compile_condition_expr(exprs[0].as_ref(), ctx)?
+        }
+        ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
+            let Some(lhs) = compile_condition_expr(lhs.as_ref(), ctx)? else {
+                return Ok(None);
+            };
+            let Some(rhs) = compile_condition_expr(rhs.as_ref(), ctx)? else {
+                return Ok(None);
+            };
+            Some(CondBuilt {
+                predicate: lhs.predicate.and(rhs.predicate),
+                effect: rhs.effect,
+            })
+        }
+        ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
+            let Some(lhs) = compile_condition_expr(lhs.as_ref(), ctx)? else {
+                return Ok(None);
+            };
+            let Some(rhs) = compile_condition_expr(rhs.as_ref(), ctx)? else {
+                return Ok(None);
+            };
+            Some(CondBuilt {
+                predicate: lhs.predicate.or(rhs.predicate),
+                effect: rhs.effect,
+            })
+        }
+        ast::Expr::Binary(lhs_expr, op, rhs_expr) if cmp_binop(op).is_some() => {
+            let op = cmp_binop(op).expect("guarded by match arm");
+            // Array comparisons need array_cmp flags; leave them eager.
+            if crate::translate::expr::expr_is_array(lhs_expr, ctx.referenced_tables)
+                || crate::translate::expr::expr_is_array(rhs_expr, ctx.referenced_tables)
+            {
+                return Ok(None);
+            }
+            let Some(lhs) = compile_value_expr(lhs_expr.as_ref(), ctx)? else {
+                return Ok(None);
+            };
+            let Some(rhs) = compile_value_expr(rhs_expr.as_ref(), ctx)? else {
+                return Ok(None);
+            };
+            // Same payload capture as value-position comparisons.
+            let affinity = crate::translate::expr::comparison_affinity(
+                lhs_expr,
+                rhs_expr,
+                ctx.referenced_tables,
+                ctx.resolver,
+            );
+            let collation = merge_collation(lhs.effect.contribution(), rhs.effect.contribution())
+                .map(|(collation, _)| collation);
+            let operands = lhs.compiler.then(rhs.compiler);
+            Some(CondBuilt {
+                predicate: Predicate::build_with(move |builder, targets| {
+                    let (lhs, rhs) = operands.run(builder)?;
+                    builder.cmp_branch(
+                        op,
+                        affinity,
+                        collation,
+                        lhs,
+                        rhs,
+                        JumpTarget::new(targets.if_true, Vec::new()),
+                        JumpTarget::new(targets.if_false, Vec::new()),
+                        JumpTarget::new(targets.if_null, Vec::new()),
+                    );
+                    Ok(())
+                }),
+                effect: CollationEffect::Sets(None),
+            })
+        }
+        // Any value-representable expression is a truthiness terminal in
+        // condition position, exactly the set the eager path routes
+        // through translate_expr + emit_cond_jump (or the non-comparison
+        // BinaryEmitMode::Condition tail).
+        _ => compile_value_expr(expr, ctx)?.map(|built| CondBuilt {
+            predicate: Predicate::from_bool(built.compiler),
+            effect: built.effect,
+        }),
     })
 }
 
