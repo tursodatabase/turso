@@ -1557,3 +1557,13 @@ test cte-nested-in-derived-table-shadows-outer-cte {
 expect {
     11
 }
+
+# An unused CTE body is never resolved, even when the statement body is a
+# bare VALUES clause.
+test cte-unused-broken-body-over-values-is-lazy {
+    CREATE TABLE lazy_t(a);
+    WITH bad AS (SELECT nonexistent FROM lazy_t) VALUES (1);
+}
+expect {
+    1
+}

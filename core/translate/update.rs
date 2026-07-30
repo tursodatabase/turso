@@ -478,10 +478,7 @@ fn prepare_update_plan(
     append_vtab_predicates_to_where_clause(
         &mut vtab_predicates,
         &mut read_scope_tables,
-        &result_columns,
         &mut where_clause,
-        resolver,
-        true,
     )?;
     super::planner::parse_where_bound(body.where_clause.as_deref(), &mut where_clause)?;
 
