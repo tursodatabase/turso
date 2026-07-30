@@ -1996,3 +1996,16 @@ test symbolic-scalar-parameters {
 expect {
     ||1
 }
+
+@cross-check-integrity
+test symbolic-scalar-limit {
+    CREATE TABLE limited_rows(a INTEGER, b INTEGER, name TEXT);
+    INSERT INTO limited_rows VALUES
+        (0, 0, 'skip'), (1, 2, 'one'), (NULL, 4, 'null'),
+        (2, 2, 'two'), (7, 0, 'tail');
+    SELECT a + 1, name FROM limited_rows WHERE a + b >= 3 LIMIT 2;
+}
+expect {
+    2|one
+    3|two
+}

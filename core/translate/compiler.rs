@@ -4,7 +4,7 @@
 //! completed description is first interpreted into symbolic SSA IR and only
 //! then lowered into physical VDBE registers, labels, and instructions.
 
-use std::{fmt, marker::PhantomData};
+use std::{fmt, marker::PhantomData, num::NonZeroI64};
 
 use smallvec::{smallvec, SmallVec};
 use turso_parser::ast::Variable;
@@ -323,6 +323,37 @@ pub(crate) struct ForEachRow<BodyFn, Body> {
     compiler: PhantomData<fn() -> Body>,
 }
 
+/// Folds a symbolic state pack over rows until the consumer asks to stop.
+pub(crate) struct TryFoldRows<Initial, BodyFn, Body> {
+    initial: Initial,
+    cursor: CursorId,
+    body: BodyFn,
+    compiler: PhantomData<fn() -> Body>,
+}
+
+/// Selects one of two loop steps and joins both state packs in SSA form.
+pub(crate) struct SelectLoopStep<IfTrue, IfFalse> {
+    condition: ValueId,
+    if_true: IfTrue,
+    if_false: IfFalse,
+}
+
+pub(crate) const fn select_loop_step<IfTrue, IfFalse>(
+    condition: ValueId,
+    if_true: IfTrue,
+    if_false: IfFalse,
+) -> SelectLoopStep<IfTrue, IfFalse>
+where
+    IfTrue: Compile<Output = LoopStep>,
+    IfFalse: Compile<Output = LoopStep>,
+{
+    SelectLoopStep {
+        condition,
+        if_true,
+        if_false,
+    }
+}
+
 /// Executes an effectful compiler only when an SSA condition is truthy.
 pub(crate) struct When<Body> {
     condition: ValueId,
@@ -396,6 +427,131 @@ where
     }
 }
 
+impl<Initial, BodyFn, Body> Compile for TryFoldRows<Initial, BodyFn, Body>
+where
+    Initial: Compile<Output = LoopState>,
+    BodyFn: FnOnce(Row, LoopState) -> Body,
+    Body: Compile<Output = LoopStep>,
+{
+    type Output = LoopState;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let initial = self.initial.compile(builder)?;
+        let row = builder.create_block()?;
+        let advance = builder.create_block()?;
+        let stop = builder.create_block()?;
+        let exit = builder.create_block()?;
+        let mut row_state = SmallVec::with_capacity(initial.len());
+        let mut result_state = SmallVec::with_capacity(initial.len());
+        for _ in 0..initial.len() {
+            row_state.push(builder.add_block_parameter(row)?);
+            result_state.push(builder.add_block_parameter(exit)?);
+        }
+
+        builder.terminate(Terminator::CursorRewind {
+            cursor: self.cursor,
+            if_non_empty: row,
+            if_empty: exit,
+            arguments: initial.values,
+        })?;
+
+        builder.switch_to(row)?;
+        let step = (self.body)(
+            Row {
+                cursor: self.cursor,
+            },
+            LoopState { values: row_state },
+        )
+        .compile(builder)?;
+        if step.state.len() != result_state.len() {
+            return Err(LimboError::InternalError(format!(
+                "row stream loop body changed state arity from {} to {}",
+                result_state.len(),
+                step.state.len()
+            )));
+        }
+        builder.terminate(Terminator::Branch {
+            condition: step.should_continue,
+            if_true: advance,
+            if_false: stop,
+        })?;
+
+        builder.switch_to(advance)?;
+        builder.terminate(Terminator::CursorNext {
+            cursor: self.cursor,
+            if_next: row,
+            if_done: exit,
+            arguments: step.state.values.clone(),
+        })?;
+
+        builder.switch_to(stop)?;
+        builder.terminate(Terminator::Jump {
+            target: exit,
+            arguments: step.state.values,
+        })?;
+
+        builder.switch_to(exit)?;
+        Ok(LoopState {
+            values: result_state,
+        })
+    }
+}
+
+impl<IfTrue, IfFalse> Compile for SelectLoopStep<IfTrue, IfFalse>
+where
+    IfTrue: Compile<Output = LoopStep>,
+    IfFalse: Compile<Output = LoopStep>,
+{
+    type Output = LoopStep;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let if_true = builder.create_block()?;
+        let if_false = builder.create_block()?;
+        let merge = builder.create_block()?;
+        builder.terminate(Terminator::Branch {
+            condition: self.condition,
+            if_true,
+            if_false,
+        })?;
+
+        builder.switch_to(if_true)?;
+        let true_step = self.if_true.compile(builder)?;
+        let mut state = SmallVec::with_capacity(true_step.state.len());
+        for _ in 0..true_step.state.len() {
+            state.push(builder.add_block_parameter(merge)?);
+        }
+        let should_continue = builder.add_block_parameter(merge)?;
+        let mut true_arguments = true_step.state.values;
+        true_arguments.push(true_step.should_continue);
+        builder.terminate(Terminator::Jump {
+            target: merge,
+            arguments: true_arguments,
+        })?;
+
+        builder.switch_to(if_false)?;
+        let false_step = self.if_false.compile(builder)?;
+        if false_step.state.len() != state.len() {
+            return Err(LimboError::InternalError(format!(
+                "row stream branch changed state arity from {} to {}",
+                state.len(),
+                false_step.state.len()
+            )));
+        }
+        let mut false_arguments = false_step.state.values;
+        false_arguments.push(false_step.should_continue);
+        builder.terminate(Terminator::Jump {
+            target: merge,
+            arguments: false_arguments,
+        })?;
+
+        builder.switch_to(merge)?;
+        Ok(LoopStep {
+            state: LoopState { values: state },
+            should_continue,
+        })
+    }
+}
+
 impl<Initial, BodyFn, Body> Compile for CursorFold<Initial, BodyFn, Body>
 where
     Initial: Compile<Output = ValueId>,
@@ -439,6 +595,54 @@ pub(crate) struct ValueId(u32);
 impl ValueId {
     fn index(self) -> usize {
         self.0 as usize
+    }
+}
+
+/// SSA values carried together across a row-stream loop backedge.
+#[derive(Clone, Debug)]
+pub(crate) struct LoopState {
+    values: SmallVec<[ValueId; 2]>,
+}
+
+impl LoopState {
+    pub(crate) fn empty() -> Self {
+        Self {
+            values: SmallVec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn push(&mut self, value: ValueId) {
+        self.values.push(value);
+    }
+
+    fn pop(&mut self) -> Option<ValueId> {
+        self.values.pop()
+    }
+}
+
+/// The next loop-carried state and whether the producer should advance.
+pub(crate) struct LoopStep {
+    state: LoopState,
+    should_continue: ValueId,
+}
+
+/// A statically known, positive row count for [`RowStream::take`].
+#[derive(Clone, Copy)]
+pub(crate) struct TakeCount(NonZeroI64);
+
+impl TakeCount {
+    pub(crate) fn new(count: i64) -> Option<Self> {
+        NonZeroI64::new(count)
+            .filter(|count| count.get() > 0)
+            .map(Self)
+    }
+
+    const fn get(self) -> i64 {
+        self.0.get()
     }
 }
 
@@ -1947,6 +2151,18 @@ pub(crate) trait RowStream: Sized {
         BodyFn: FnOnce(Self::Item) -> Body,
         Body: Compile<Output = ()>;
 
+    /// Fold symbolic state through rows until the body returns a false
+    /// continuation value.
+    fn try_fold<Initial, BodyFn, Body>(
+        self,
+        initial: Initial,
+        body: BodyFn,
+    ) -> impl Compile<Output = LoopState>
+    where
+        Initial: Compile<Output = LoopState>,
+        BodyFn: FnOnce(Self::Item, LoopState) -> Body,
+        Body: Compile<Output = LoopStep>;
+
     fn map<MapperFn, Mapper>(self, mapper: MapperFn) -> MapRows<Self, MapperFn, Mapper>
     where
         MapperFn: FnOnce(Self::Item) -> Mapper,
@@ -1974,6 +2190,13 @@ pub(crate) trait RowStream: Sized {
             compiler: PhantomData,
         }
     }
+
+    fn take(self, count: TakeCount) -> TakeRows<Self> {
+        TakeRows {
+            source: self,
+            count,
+        }
+    }
 }
 
 impl RowStream for CursorRows {
@@ -1985,6 +2208,24 @@ impl RowStream for CursorRows {
         Body: Compile<Output = ()>,
     {
         ForEachRow {
+            cursor: self.cursor,
+            body,
+            compiler: PhantomData,
+        }
+    }
+
+    fn try_fold<Initial, BodyFn, Body>(
+        self,
+        initial: Initial,
+        body: BodyFn,
+    ) -> impl Compile<Output = LoopState>
+    where
+        Initial: Compile<Output = LoopState>,
+        BodyFn: FnOnce(Self::Item, LoopState) -> Body,
+        Body: Compile<Output = LoopStep>,
+    {
+        TryFoldRows {
+            initial,
             cursor: self.cursor,
             body,
             compiler: PhantomData,
@@ -2014,6 +2255,22 @@ where
     {
         let Self { source, mapper, .. } = self;
         source.for_each(move |item| mapper(item).and_then(body))
+    }
+
+    fn try_fold<Initial, BodyFn, Body>(
+        self,
+        initial: Initial,
+        body: BodyFn,
+    ) -> impl Compile<Output = LoopState>
+    where
+        Initial: Compile<Output = LoopState>,
+        BodyFn: FnOnce(Self::Item, LoopState) -> Body,
+        Body: Compile<Output = LoopStep>,
+    {
+        let Self { source, mapper, .. } = self;
+        source.try_fold(initial, move |item, state| {
+            mapper(item).and_then(move |item| body(item, state))
+        })
     }
 }
 
@@ -2045,6 +2302,117 @@ where
             predicate(item.clone()).and_then(move |condition| when(condition, body(item)))
         })
     }
+
+    fn try_fold<Initial, BodyFn, Body>(
+        self,
+        initial: Initial,
+        body: BodyFn,
+    ) -> impl Compile<Output = LoopState>
+    where
+        Initial: Compile<Output = LoopState>,
+        BodyFn: FnOnce(Self::Item, LoopState) -> Body,
+        Body: Compile<Output = LoopStep>,
+    {
+        let Self {
+            source, predicate, ..
+        } = self;
+        source.try_fold(initial, move |item, state| {
+            predicate(item.clone()).and_then(move |condition| {
+                select_loop_step(condition, body(item, state.clone()), continue_loop(state))
+            })
+        })
+    }
+}
+
+/// A row stream that stops after a fixed number of downstream items.
+pub(crate) struct TakeRows<Source> {
+    source: Source,
+    count: TakeCount,
+}
+
+impl<Source> RowStream for TakeRows<Source>
+where
+    Source: RowStream,
+{
+    type Item = Source::Item;
+
+    fn for_each<BodyFn, Body>(self, body: BodyFn) -> impl Compile<Output = ()>
+    where
+        BodyFn: FnOnce(Self::Item) -> Body,
+        Body: Compile<Output = ()>,
+    {
+        self.try_fold(pure(LoopState::empty()), move |item, state| {
+            body(item).and_then(move |()| continue_loop(state))
+        })
+        .map(|_| ())
+    }
+
+    fn try_fold<Initial, BodyFn, Body>(
+        self,
+        initial: Initial,
+        body: BodyFn,
+    ) -> impl Compile<Output = LoopState>
+    where
+        Initial: Compile<Output = LoopState>,
+        BodyFn: FnOnce(Self::Item, LoopState) -> Body,
+        Body: Compile<Output = LoopStep>,
+    {
+        let Self { source, count } = self;
+        let initial =
+            initial
+                .then(constant(Value::from_i64(count.get())))
+                .map(|(mut state, remaining)| {
+                    state.push(remaining);
+                    state
+                });
+        source
+            .try_fold(initial, move |item, mut state| {
+                let remaining = state
+                    .pop()
+                    .expect("take loop state must include its remaining-row count");
+                body(item, state).and_then(move |step| {
+                    constant(Value::from_i64(-1)).and_then(move |minus_one| {
+                        add(remaining, minus_one).and_then(move |next_remaining| {
+                            constant(Value::from_i64(0)).and_then(move |zero| {
+                                compare(
+                                    next_remaining,
+                                    zero,
+                                    resolved_comparison(
+                                        ComparisonOp::Greater,
+                                        Affinity::Numeric,
+                                        None,
+                                    ),
+                                )
+                                .and_then(move |limit_continue| {
+                                    logical(LogicalOp::And, step.should_continue, limit_continue)
+                                        .map(move |should_continue| {
+                                            let mut state = step.state;
+                                            state.push(next_remaining);
+                                            LoopStep {
+                                                state,
+                                                should_continue,
+                                            }
+                                        })
+                                })
+                            })
+                        })
+                    })
+                })
+            })
+            .map(|mut state| {
+                state
+                    .pop()
+                    .expect("take result state must include its remaining-row count");
+                state
+            })
+    }
+}
+
+fn continue_loop(state: LoopState) -> impl Compile<Output = LoopStep> {
+    constant(Value::from_i64(1)).map(move |should_continue| LoopStep {
+        state,
+        should_continue,
+    })
 }
 
 /// One row yielded by a [`RowStream`].
@@ -2647,6 +3015,79 @@ mod tests {
                 "\n",
                 "block6:\n",
                 "  jump block4()\n",
+            )
+        );
+    }
+
+    #[test]
+    fn row_stream_take_short_circuits_before_cursor_advance() {
+        assert!(TakeCount::new(0).is_none());
+        assert!(TakeCount::new(-1).is_none());
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE limited(a,b)", 2).unwrap());
+        let compiler = scan_table(table, 0, 0).and_then(|rows| {
+            rows.filter(|row| row.column(0))
+                .map(|row| row.column(1))
+                .take(TakeCount::new(2).unwrap())
+                .for_each(|value| result_row([value]))
+        });
+
+        let ir = compile_effect(compiler).unwrap();
+
+        assert_eq!(
+            ir.to_string(),
+            concat!(
+                "cursor $0 = btree_table \"limited\" root 2\n",
+                "\n",
+                "block0:\n",
+                "  open_read $0 root 2 db 0 schema 0\n",
+                "  %0 = constant Numeric(Integer(2))\n",
+                "  rewind $0, block1(%0), block4(%0)\n",
+                "\n",
+                "block1(%1):\n",
+                "  %3 = column $0[0]\n",
+                "  branch %3, block5, block6\n",
+                "\n",
+                "block2:\n",
+                "  next $0, block1(%14), block4(%14)\n",
+                "\n",
+                "block3:\n",
+                "  jump block4(%14)\n",
+                "\n",
+                "block4(%2):\n",
+                "  %17 = constant Null\n",
+                "  return %17\n",
+                "\n",
+                "block5:\n",
+                "  %4 = column $0[1]\n",
+                "  result_row [%4]\n",
+                "  %5 = constant Numeric(Integer(1))\n",
+                "  %6 = constant Numeric(Integer(-1))\n",
+                "  %7 = add %1, %6\n",
+                "  %8 = constant Numeric(Integer(0))\n",
+                "  compare Greater %7, %8 affinity Numeric collation None, block8, block9, block10\n",
+                "\n",
+                "block6:\n",
+                "  %16 = constant Numeric(Integer(1))\n",
+                "  jump block7(%1, %16)\n",
+                "\n",
+                "block7(%14, %15):\n",
+                "  branch %15, block2, block3\n",
+                "\n",
+                "block8:\n",
+                "  %10 = constant Numeric(Integer(1))\n",
+                "  jump block11(%10)\n",
+                "\n",
+                "block9:\n",
+                "  %11 = constant Numeric(Integer(0))\n",
+                "  jump block11(%11)\n",
+                "\n",
+                "block10:\n",
+                "  %12 = constant Null\n",
+                "  jump block11(%12)\n",
+                "\n",
+                "block11(%9):\n",
+                "  %13 = and %5, %9\n",
+                "  jump block7(%7, %13)\n",
             )
         );
     }

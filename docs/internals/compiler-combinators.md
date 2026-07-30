@@ -67,6 +67,15 @@ consumer; false and NULL rows proceed directly to cursor advance. A map runs a
 deferred compiler and changes the item type, so SELECT projection is expressed
 as `filter(...).map(...).for_each(result_row)` rather than being embedded in the
 terminal consumer.
+Short-circuiting consumers use an SSA `try_fold` protocol: each accepted item
+returns a state pack and a symbolic continuation value. A false continuation
+branches directly to the loop exit, while a true continuation reaches the
+cursor-advance block. `take` layers a remaining-row value onto that state pack,
+so nested stream operators preserve their own loop state and the final accepted
+row exits without moving the cursor again. The production table-scan path uses
+this for positive integer literal `LIMIT`; zero, negative, floating-point,
+parameterized, and offset limits retain the eager emitter until their complete
+SQLite coercion and initialization semantics are modeled.
 The production path preserves predicate and projection source order. Comparison
 affinity and collation are resolved by the SQL frontend before IR construction.
 The resulting terminator has separate true, false, and NULL successors; a

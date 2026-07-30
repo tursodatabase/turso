@@ -5,7 +5,10 @@ use crate::{
     sync::Arc,
     translate::{
         aggregation::emit_ungrouped_aggregation,
-        compiler::{compile_effect, result_row_pack, scan_table, Compile, RowStream},
+        compiler::{
+            compile_effect, result_row_pack, scan_table, BoxedCompile, Compile, Row, RowStream,
+            TakeCount,
+        },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
             MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
@@ -30,13 +33,14 @@ use crate::{
         window::{emit_window_flush, EmitWindow},
         ProgramBuilder, Resolver,
     },
+    util::parse_numeric_literal,
     vdbe::{builder::QueryMode, insn::Insn},
-    HashMap, HashSet, LimboError, Result,
+    HashMap, HashSet, LimboError, Numeric, Result, Value,
 };
 use smallvec::SmallVec;
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
-use turso_parser::ast::Expr;
+use turso_parser::ast::{Expr, Literal};
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_select(
@@ -77,7 +81,6 @@ fn try_emit_declarative_table_scan(
         || plan.group_by.is_some()
         || !plan.order_by.is_empty()
         || !plan.aggregates.is_empty()
-        || plan.limit.is_some()
         || plan.offset.is_some()
         || plan.contains_constant_false_condition
         || !plan.values.is_empty()
@@ -90,6 +93,19 @@ fn try_emit_declarative_table_scan(
     {
         return Ok(None);
     }
+
+    let limit = match plan.limit.as_deref() {
+        None => None,
+        Some(Expr::Literal(Literal::Numeric(value))) => match parse_numeric_literal(value)? {
+            Value::Numeric(Numeric::Integer(value)) => match TakeCount::new(value) {
+                Some(count) => Some(count),
+                None => return Ok(None),
+            },
+            Value::Numeric(Numeric::Float(_)) => return Ok(None),
+            _ => unreachable!("numeric literal parser only returns numeric values"),
+        },
+        Some(_) => return Ok(None),
+    };
 
     let [joined] = plan.table_references.joined_tables() else {
         return Ok(None);
@@ -157,14 +173,13 @@ fn try_emit_declarative_table_scan(
     let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
     let compiler = scan_table(table, database_id, schema_cookie).and_then(move |rows| {
         if predicates.is_empty() {
-            rows.map(move |row| compile_symbolic_exprs(row, &projections))
-                .for_each(result_row_pack)
-                .boxed()
+            compile_declarative_projection(rows, projections, limit)
         } else {
-            rows.filter(move |row| compile_symbolic_conjunction(row, &predicates))
-                .map(move |row| compile_symbolic_exprs(row, &projections))
-                .for_each(result_row_pack)
-                .boxed()
+            compile_declarative_projection(
+                rows.filter(move |row| compile_symbolic_conjunction(row, &predicates)),
+                projections,
+                limit,
+            )
         }
     });
     let ir = compile_effect(compiler)?;
@@ -178,6 +193,21 @@ fn try_emit_declarative_table_scan(
         )));
     }
     Ok(Some(result_cols_start))
+}
+
+fn compile_declarative_projection<Stream>(
+    rows: Stream,
+    projections: SmallVec<[ResolvedScalarExpr; 4]>,
+    limit: Option<TakeCount>,
+) -> BoxedCompile<()>
+where
+    Stream: RowStream<Item = Row> + 'static,
+{
+    let projected = rows.map(move |row| compile_symbolic_exprs(row, &projections));
+    match limit {
+        Some(limit) => projected.take(limit).for_each(result_row_pack).boxed(),
+        None => projected.for_each(result_row_pack).boxed(),
+    }
 }
 
 fn emit_program_for_select_with_inputs(
@@ -1258,7 +1288,8 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO expressions VALUES \
-                 (1, 2, 'alpha'), (2, 2, 'beta'), (NULL, 4, 'BETA'), (5, -1, NULL)",
+                 (1, 2, 'alpha'), (2, 2, 'beta'), (NULL, 4, 'BETA'), (5, -1, NULL), \
+                 (7, 0, 'tail')",
             )
             .unwrap();
         let mut expression_statement = connection
@@ -1339,6 +1370,31 @@ mod tests {
                 Value::from_text("BETA"),
             ]]
         );
+
+        let mut limited_statement = connection
+            .prepare(
+                "SELECT a + 1, name FROM expressions \
+                 WHERE a + b >= 4 LIMIT 2",
+            )
+            .unwrap();
+        assert!(limited_statement
+            .get_program()
+            .insns
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::DecrJumpZero { .. })));
+        assert_eq!(
+            limited_statement.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(3), Value::from_text("beta")],
+                vec![Value::from_i64(6), Value::Null],
+            ]
+        );
+        assert!(connection
+            .prepare("SELECT a FROM expressions LIMIT 0")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .is_empty());
 
         let mut control_flow_statement = connection
             .prepare(
