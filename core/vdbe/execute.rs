@@ -10,7 +10,7 @@ use crate::mvcc::database::{BootstrapState, CheckpointStateMachine, TxID};
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{
-    render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
+    render_gencol_expr_sql_with_new_names, Schema, Table, SCHEMA_TABLE_NAME,
     SQLITE_SEQUENCE_TABLE_NAME,
 };
 use crate::state_machine::StateMachine;
@@ -15136,12 +15136,16 @@ pub fn op_drop_column(
                 .is_none_or(|col| normalize_ident(col) != normalize_ident(&col_name))
         });
 
-        btree.shift_generated_column_indices_after_drop(*column_index)?;
+        crate::translate::bind::shift_generated_columns_after_drop(btree, *column_index)?;
         // Shift SELF_TABLE positional references in surviving CHECK
         // constraints (constraints referencing the dropped column itself were
         // rejected during translation).
         for check in &mut btree.check_constraints {
-            crate::schema::shift_self_table_positions_after_drop(&mut check.expr, *column_index)?;
+            crate::translate::bind::shift_schema_expr_after_drop(
+                &mut check.expr,
+                *column_index,
+                false,
+            )?;
         }
         Ok(())
     })??;
@@ -15170,21 +15174,7 @@ pub fn op_drop_column(
         if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
             for index in indexes {
                 let index = Arc::get_mut(index).expect("this should be the only strong reference");
-                for index_column in index.columns.iter_mut() {
-                    if index_column.pos_in_table != EXPR_INDEX_SENTINEL
-                        && index_column.pos_in_table > *column_index
-                    {
-                        index_column.pos_in_table -= 1;
-                    }
-                    if let Some(ref mut expr) = index_column.expr {
-                        crate::schema::shift_self_table_positions_after_drop(expr, *column_index)?;
-                    }
-                }
-                // Partial-index WHERE clauses also store SELF_TABLE
-                // positional references.
-                if let Some(ref mut wc) = index.where_clause {
-                    crate::schema::shift_self_table_positions_after_drop(wc, *column_index)?;
-                }
+                crate::translate::bind::shift_index_after_drop(index, *column_index)?;
             }
         }
         Ok(())

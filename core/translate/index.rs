@@ -199,7 +199,7 @@ pub fn translate_create_index(
     }
     // Pre-resolve the WHERE clause's column references to SELF_TABLE form.
     // Resolution is lenient: names that don't resolve stay as identifiers,
-    // and validate_where_expr below rejects them.
+    // and predicate validation below rejects them.
     let resolved_where_clause = where_clause.clone().map(|mut wc| {
         crate::translate::bind::bind_index_schema_expr(&mut wc, &tbl);
         wc

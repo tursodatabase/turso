@@ -3828,43 +3828,6 @@ impl BTreeTable {
         Ok(())
     }
 
-    pub fn shift_generated_column_indices_after_drop(
-        &mut self,
-        dropped_index: usize,
-    ) -> Result<()> {
-        if !self.has_virtual_columns {
-            return Ok(());
-        }
-
-        for column in &mut self.columns {
-            let Some(expr) = column.generated_expr_mut() else {
-                continue;
-            };
-
-            walk_expr_mut(expr, &mut |e| match e {
-                Expr::Column {
-                    table,
-                    column,
-                    is_rowid_alias: _,
-                    ..
-                } if table.is_self_table() => {
-                    if *column == dropped_index {
-                        return Err(LimboError::InternalError(
-                            "dropped column remained referenced by generated column".to_string(),
-                        ));
-                    }
-                    if *column > dropped_index {
-                        *column -= 1;
-                    }
-                    Ok(WalkControl::Continue)
-                }
-                _ => Ok(WalkControl::Continue),
-            })?;
-        }
-
-        Ok(())
-    }
-
     fn column_graph(&self) -> Result<&GeneratedColGraph> {
         if let Some(graph) = self.column_dependencies.0.get() {
             return Ok(graph);
@@ -4109,21 +4072,6 @@ fn find_column_index_by_name(columns: &[Column], col_name: &str) -> Option<usize
             .filter(|name| name.eq_ignore_ascii_case(col_name))
             .map(|_| i)
     })
-}
-
-/// Decrement `SELF_TABLE` column positions greater than the dropped
-/// column's position in a stored schema expression (index key,
-/// partial-index WHERE, CHECK constraint).
-pub fn shift_self_table_positions_after_drop(expr: &mut Expr, dropped_index: usize) -> Result<()> {
-    walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
-        if let Expr::Column { table, column, .. } = e {
-            if table.is_self_table() && *column > dropped_index {
-                *column -= 1;
-            }
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(())
 }
 
 /// Re-render the SQL text of a generated-column expression using current column names. The input

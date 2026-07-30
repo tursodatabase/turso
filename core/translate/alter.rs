@@ -1105,9 +1105,10 @@ pub fn translate_alter_table(
             // constraints so the regenerated schema SQL renders the right
             // column names.
             for check in &mut btree.check_constraints {
-                crate::schema::shift_self_table_positions_after_drop(
+                crate::translate::bind::shift_schema_expr_after_drop(
                     &mut check.expr,
                     dropped_index,
+                    false,
                 )?;
             }
 

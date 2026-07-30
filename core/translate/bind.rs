@@ -81,6 +81,67 @@ pub fn bind_domain_check(expr: &ast::Expr, column_name: &str) -> Box<ast::Expr> 
     Box::new(bound)
 }
 
+/// Shift stored generated-column bindings after a table column is removed.
+pub fn shift_generated_columns_after_drop(
+    table: &mut BTreeTable,
+    dropped_column: usize,
+) -> Result<()> {
+    if !table.has_virtual_columns {
+        return Ok(());
+    }
+
+    let mut columns = table.columns_mut();
+    for column in columns.iter_mut() {
+        let Some(expr) = column.generated_expr_mut() else {
+            continue;
+        };
+        shift_schema_expr_after_drop(expr, dropped_column, true)?;
+    }
+    Ok(())
+}
+
+/// Shift a stored schema expression's bound column positions after DROP COLUMN.
+pub fn shift_schema_expr_after_drop(
+    expr: &mut ast::Expr,
+    dropped_column: usize,
+    reject_dropped_reference: bool,
+) -> Result<()> {
+    walk_expr_mut(expr, &mut |expr| {
+        if let ast::Expr::Column { table, column, .. } = expr {
+            if table.is_self_table() {
+                if reject_dropped_reference && *column == dropped_column {
+                    return Err(crate::LimboError::InternalError(
+                        "dropped column remained referenced by generated column".to_string(),
+                    ));
+                }
+                if *column > dropped_column {
+                    *column -= 1;
+                }
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+/// Shift an index's bound keys and predicate after DROP COLUMN.
+pub fn shift_index_after_drop(index: &mut Index, dropped_column: usize) -> Result<()> {
+    for index_column in index.columns.iter_mut() {
+        if index_column.pos_in_table != EXPR_INDEX_SENTINEL
+            && index_column.pos_in_table > dropped_column
+        {
+            index_column.pos_in_table -= 1;
+        }
+        if let Some(expr) = &mut index_column.expr {
+            shift_schema_expr_after_drop(expr, dropped_column, false)?;
+        }
+    }
+    if let Some(predicate) = &mut index.where_clause {
+        shift_schema_expr_after_drop(predicate, dropped_column, false)?;
+    }
+    Ok(())
+}
+
 /// Point SELF_TABLE references in a stored schema expression at a concrete
 /// table reference. This does not reject unresolved identifiers because ALTER
 /// validation may deliberately bind them through an expression register cache.
