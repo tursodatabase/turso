@@ -103,9 +103,9 @@ fn bench_prepare(bencher: Bencher, sql: &str) {
     // The database must outlive every prepare call, so bind it even though
     // only the connection is touched.
     let (_db, conn) = setup();
-    // Statements must compile; a bench that silently measures error paths is
-    // worthless.
-    conn.prepare(sql).unwrap();
+    // Fail fast on SQL that no longer compiles, and keep first-prepare
+    // one-time lazy costs out of the measured samples.
+    let _warmup = conn.prepare(sql).unwrap();
     bencher.bench_local(|| {
         black_box(conn.prepare(black_box(sql)).unwrap());
     });
@@ -179,7 +179,7 @@ fn select_star_wide_table(bencher: Bencher, cols: usize) {
     ddl.push(')');
     execute(&db, &conn, &ddl);
     let sql = "SELECT * FROM wide WHERE id = ?";
-    conn.prepare(sql).unwrap();
+    let _warmup = conn.prepare(sql).unwrap();
     bencher.bench_local(|| {
         black_box(conn.prepare(black_box(sql)).unwrap());
     });
@@ -521,7 +521,7 @@ fn corpus_tpch(bencher: Bencher, q: usize) {
         execute(&db, &conn, ddl);
     }
     let sql = tpch_sql(q);
-    conn.prepare(sql).unwrap();
+    let _warmup = conn.prepare(sql).unwrap();
     bencher.bench_local(|| {
         black_box(conn.prepare(black_box(sql)).unwrap());
     });
@@ -548,7 +548,7 @@ fn corpus_clickbench(bencher: Bencher, q: usize) {
     let (db, conn) = open_db();
     execute(&db, &conn, include_str!("../../perf/clickbench/create.sql"));
     let sql = clickbench_sql(q);
-    conn.prepare(sql).unwrap();
+    let _warmup = conn.prepare(sql).unwrap();
     bencher.bench_local(|| {
         black_box(conn.prepare(black_box(sql)).unwrap());
     });
@@ -560,7 +560,9 @@ fn bench_corpus_query(bencher: Bencher, schema: &str, sql: &str) {
     for stmt in schema.split(';').map(str::trim).filter(|s| !s.is_empty()) {
         execute(&db, &conn, stmt);
     }
-    conn.prepare(sql).unwrap();
+    // Fail fast on SQL that no longer compiles, and keep first-prepare
+    // one-time lazy costs out of the measured samples.
+    let _warmup = conn.prepare(sql).unwrap();
     bencher.bench_local(|| {
         black_box(conn.prepare(black_box(sql)).unwrap());
     });
