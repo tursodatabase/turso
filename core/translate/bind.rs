@@ -1244,6 +1244,15 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     /// the name ONLY matches an alias and NOT a source column (SQLite gives
     /// source columns priority inside subquery context).
     fn try_inline_trivial_subquery(&self, expr: &mut ast::Expr, scope: &BindScope) {
+        // Inline at any depth: e.g. `HAVING (SELECT s) > 15` wraps the trivial
+        // subquery inside a comparison.
+        let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| {
+            self.try_inline_trivial_subquery_at(e, scope);
+            Ok(WalkControl::Continue)
+        });
+    }
+
+    fn try_inline_trivial_subquery_at(&self, expr: &mut ast::Expr, scope: &BindScope) {
         if let ast::Expr::Subquery(select) = expr {
             // Only inline if there's no FROM, no WHERE, no compounds, no LIMIT
             if select.with.is_none()
@@ -3872,17 +3881,15 @@ mod tests {
             let mut having_select = parse_select(
                 "SELECT a % 2 AS g, SUM(b) AS s FROM t GROUP BY g HAVING (SELECT s) > 15 ORDER BY g",
             );
-            let bound = ctx.bind_select(&mut having_select).unwrap();
+            ctx.bind_select(&mut having_select).unwrap();
             let ast::Expr::Binary(lhs, ast::Operator::Greater, rhs) = having_expr(&having_select)
             else {
                 panic!("expected bound HAVING binary expression");
             };
-            let sq_id = subquery_id_from_expr(lhs);
-            let having_subquery = &bound.subquery_bindings[&sq_id].select;
-            assert_eq!(
-                select_expr(having_subquery, 0),
-                select_expr(&having_select, 1)
-            );
+            // The trivial subquery `(SELECT s)` is inlined to the aggregate
+            // alias expression, matching SQLite semantics (the HAVING clause
+            // reads the outer aggregate value, not a nested query).
+            assert_eq!(lhs.as_ref(), select_expr(&having_select, 1));
             assert_eq!(
                 rhs.as_ref(),
                 &ast::Expr::Literal(ast::Literal::Numeric("15".into()))

@@ -1,0 +1,19 @@
+@database :memory:
+
+test alias-qualified-column-resolves {
+    CREATE TABLE t(x INT);
+    INSERT INTO t VALUES(1);
+    SELECT u.x FROM t AS u;
+}
+expect {
+    1
+}
+
+test base-name-hidden-when-aliased {
+    CREATE TABLE t(x INT);
+    INSERT INTO t VALUES(1);
+    SELECT t.x FROM t AS u;
+}
+expect error {
+    no such table: t
+}
