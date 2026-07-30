@@ -46,7 +46,7 @@ use crate::{
 use smallvec::SmallVec;
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
-use turso_parser::ast::{Expr, SortOrder, SubqueryType};
+use turso_parser::ast::{Expr, SortOrder, SubqueryType, TableInternalId};
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_select(
@@ -161,6 +161,13 @@ enum DeclarativeSelectOutcome {
     Consumed,
 }
 
+struct DeclarativeSelectProgram {
+    compiler: BoxedCompile<()>,
+    destination_cursor: Option<CursorID>,
+    external_in_cursor: Option<(CursorID, TableInternalId)>,
+    result_column_count: usize,
+}
+
 enum DeclarativeSelectDestination {
     ResultRows,
     EphemeralIndex {
@@ -216,7 +223,57 @@ fn try_emit_declarative_table_scan(
     resolver: &Resolver,
     plan: &mut SelectPlan,
 ) -> Result<Option<DeclarativeSelectOutcome>> {
-    if matches!(program.get_query_mode(), QueryMode::ExplainQueryPlan)
+    let Some(compilation) =
+        try_compile_declarative_table_scan(program.get_query_mode(), resolver, plan)?
+    else {
+        return Ok(None);
+    };
+    let DeclarativeSelectProgram {
+        compiler,
+        destination_cursor,
+        external_in_cursor,
+        result_column_count,
+    } = compilation;
+    let ir = compile_effect(compiler)?;
+    let target_register = program.alloc_register();
+    let lowered = if let Some((cursor_id, subquery_id)) = external_in_cursor {
+        emit_non_from_clause_subqueries_for_eval_at(
+            program,
+            resolver,
+            &mut plan.non_from_clause_subqueries,
+            &plan.join_order,
+            Some(&plan.table_references),
+            EvalAt::BeforeLoop,
+            |subquery| subquery.internal_id == subquery_id,
+        )?;
+        ir.lower_into_with_resources(program, target_register, &[], &[cursor_id])?
+    } else if let Some(cursor_id) = destination_cursor {
+        ir.lower_into_with_resources(program, target_register, &[], &[cursor_id])?
+    } else {
+        ir.lower_into(program, target_register)?
+    };
+    if destination_cursor.is_some() {
+        lowered.expect_no_result_rows()?;
+        Ok(Some(DeclarativeSelectOutcome::Consumed))
+    } else {
+        let (result_cols_start, lowered_result_column_count) = lowered.single_result_row_pack()?;
+        if lowered_result_column_count != result_column_count {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR lowered {lowered_result_column_count} result columns for a {result_column_count}-column SELECT",
+            )));
+        }
+        Ok(Some(DeclarativeSelectOutcome::ResultRows {
+            result_cols_start,
+        }))
+    }
+}
+
+fn try_compile_declarative_table_scan(
+    query_mode: QueryMode,
+    resolver: &Resolver,
+    plan: &SelectPlan,
+) -> Result<Option<DeclarativeSelectProgram>> {
+    if matches!(query_mode, QueryMode::ExplainQueryPlan)
         || plan.group_by.is_some()
         || !plan.aggregates.is_empty()
         || plan.contains_constant_false_condition
@@ -700,39 +757,12 @@ fn try_emit_declarative_table_scan(
             destination,
         ),
     };
-    let ir = compile_effect(compiler)?;
-    let target_register = program.alloc_register();
-    let lowered = if let Some((cursor_id, subquery_id)) = external_in_cursor {
-        emit_non_from_clause_subqueries_for_eval_at(
-            program,
-            resolver,
-            &mut plan.non_from_clause_subqueries,
-            &plan.join_order,
-            Some(&plan.table_references),
-            EvalAt::BeforeLoop,
-            |subquery| subquery.internal_id == subquery_id,
-        )?;
-        ir.lower_into_with_resources(program, target_register, &[], &[cursor_id])?
-    } else if let Some(cursor_id) = destination_cursor {
-        ir.lower_into_with_resources(program, target_register, &[], &[cursor_id])?
-    } else {
-        ir.lower_into(program, target_register)?
-    };
-    if destination_cursor.is_some() {
-        lowered.expect_no_result_rows()?;
-        Ok(Some(DeclarativeSelectOutcome::Consumed))
-    } else {
-        let (result_cols_start, result_column_count) = lowered.single_result_row_pack()?;
-        if result_column_count != plan.result_columns.len() {
-            return Err(LimboError::InternalError(format!(
-                "compiler IR lowered {result_column_count} result columns for a {}-column SELECT",
-                plan.result_columns.len()
-            )));
-        }
-        Ok(Some(DeclarativeSelectOutcome::ResultRows {
-            result_cols_start,
-        }))
-    }
+    Ok(Some(DeclarativeSelectProgram {
+        compiler,
+        destination_cursor,
+        external_in_cursor,
+        result_column_count: plan.result_columns.len(),
+    }))
 }
 
 struct DeclarativeSlice {
