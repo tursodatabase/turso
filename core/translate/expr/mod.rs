@@ -86,7 +86,7 @@ pub use affinity::{comparison_affinity, get_expr_affinity};
 pub(crate) use arrays::{
     emit_array_decode, emit_custom_type_decode_columns, emit_custom_type_encode_columns,
 };
-pub(crate) use binary::expr_is_array;
+pub(crate) use binary::{comparison_collation, expr_is_array};
 pub use binding::{bind_and_rewrite_expr, BindingBehavior};
 pub use columns::{emit_table_column, emit_table_column_for_dml};
 pub use condition::translate_condition_expr;

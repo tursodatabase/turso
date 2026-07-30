@@ -12,10 +12,12 @@ use crate::{
     numeric::Numeric,
     schema::BTreeTable,
     sync::Arc,
+    translate::collate::CollationSeq,
     types::Value,
     vdbe::{
+        affinity::Affinity,
         builder::{CursorType, ProgramBuilder},
-        insn::Insn,
+        insn::{CmpInsFlags, Insn},
         PageIdx,
     },
     LimboError, Result,
@@ -439,6 +441,37 @@ impl ValueId {
     }
 }
 
+/// A comparison operation after the SQL frontend has resolved its semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComparisonOp {
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+}
+
+/// SQLite comparison metadata resolved before symbolic IR construction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ResolvedComparison {
+    op: ComparisonOp,
+    affinity: Affinity,
+    collation: Option<CollationSeq>,
+}
+
+pub(crate) const fn resolved_comparison(
+    op: ComparisonOp,
+    affinity: Affinity,
+    collation: Option<CollationSeq>,
+) -> ResolvedComparison {
+    ResolvedComparison {
+        op,
+        affinity,
+        collation,
+    }
+}
+
 /// An ordered set of SSA values that must occupy consecutive VDBE registers.
 #[derive(Debug)]
 pub(crate) struct ValuePack(SmallVec<[ValueId; 4]>);
@@ -601,6 +634,14 @@ enum Terminator {
         if_true: BlockId,
         if_false: BlockId,
     },
+    Compare {
+        lhs: ValueId,
+        rhs: ValueId,
+        comparison: ResolvedComparison,
+        if_true: BlockId,
+        if_false: BlockId,
+        if_null: BlockId,
+    },
     CursorRewind {
         cursor: CursorId,
         if_non_empty: BlockId,
@@ -623,10 +664,20 @@ impl Terminator {
 
     fn edges(&self) -> impl Iterator<Item = (BlockId, &[ValueId])> {
         let edges = match self {
-            Self::Jump { target, arguments } => [Some((*target, arguments.as_slice())), None],
+            Self::Jump { target, arguments } => [Some((*target, arguments.as_slice())), None, None],
             Self::Branch {
                 if_true, if_false, ..
-            } => [Some((*if_true, &[][..])), Some((*if_false, &[][..]))],
+            } => [Some((*if_true, &[][..])), Some((*if_false, &[][..])), None],
+            Self::Compare {
+                if_true,
+                if_false,
+                if_null,
+                ..
+            } => [
+                Some((*if_true, &[][..])),
+                Some((*if_false, &[][..])),
+                Some((*if_null, &[][..])),
+            ],
             Self::CursorRewind {
                 if_non_empty,
                 if_empty,
@@ -635,6 +686,7 @@ impl Terminator {
             } => [
                 Some((*if_non_empty, arguments.as_slice())),
                 Some((*if_empty, arguments.as_slice())),
+                None,
             ],
             Self::CursorNext {
                 if_next,
@@ -644,27 +696,33 @@ impl Terminator {
             } => [
                 Some((*if_next, arguments.as_slice())),
                 Some((*if_done, arguments.as_slice())),
+                None,
             ],
-            Self::Return(_) => [None, None],
+            Self::Return(_) => [None, None, None],
         };
         edges.into_iter().flatten()
     }
 
     fn operands(&self) -> impl Iterator<Item = ValueId> + '_ {
-        let (first, rest) = match self {
-            Self::Jump { arguments, .. } => (None, arguments.as_slice()),
-            Self::Branch { condition, .. } | Self::Return(condition) => (Some(*condition), &[][..]),
+        let (first, second, rest) = match self {
+            Self::Jump { arguments, .. } => (None, None, arguments.as_slice()),
+            Self::Branch { condition, .. } | Self::Return(condition) => {
+                (Some(*condition), None, &[][..])
+            }
+            Self::Compare { lhs, rhs, .. } => (Some(*lhs), Some(*rhs), &[][..]),
             Self::CursorRewind { arguments, .. } | Self::CursorNext { arguments, .. } => {
-                (None, arguments.as_slice())
+                (None, None, arguments.as_slice())
             }
         };
-        first.into_iter().chain(rest.iter().copied())
+        first.into_iter().chain(second).chain(rest.iter().copied())
     }
 
     fn cursor(&self) -> Option<CursorId> {
         match self {
             Self::CursorRewind { cursor, .. } | Self::CursorNext { cursor, .. } => Some(*cursor),
-            Self::Jump { .. } | Self::Branch { .. } | Self::Return(_) => None,
+            Self::Jump { .. } | Self::Branch { .. } | Self::Compare { .. } | Self::Return(_) => {
+                None
+            }
         }
     }
 }
@@ -1491,6 +1549,90 @@ impl IrProgram {
                         target_pc: labels[if_true.index()],
                     });
                 }
+                Terminator::Compare {
+                    lhs,
+                    rhs,
+                    comparison,
+                    if_true,
+                    if_false,
+                    if_null,
+                } => {
+                    // VDBE comparison affinity may rewrite both operands. Keep
+                    // the registers backing immutable SSA values unchanged.
+                    let lhs_source = registers[lhs.index()];
+                    let rhs_source = registers[rhs.index()];
+                    let lhs = program.alloc_register();
+                    let rhs = program.alloc_register();
+                    program.emit_insn(Insn::Copy {
+                        src_reg: lhs_source,
+                        dst_reg: lhs,
+                        extra_amount: 0,
+                    });
+                    program.emit_insn(Insn::Copy {
+                        src_reg: rhs_source,
+                        dst_reg: rhs,
+                        extra_amount: 0,
+                    });
+                    program.emit_insn(Insn::IsNull {
+                        reg: lhs,
+                        target_pc: labels[if_null.index()],
+                    });
+                    program.emit_insn(Insn::IsNull {
+                        reg: rhs,
+                        target_pc: labels[if_null.index()],
+                    });
+                    let flags = CmpInsFlags::default().with_affinity(comparison.affinity);
+                    let target_pc = labels[if_true.index()];
+                    let collation = comparison.collation;
+                    let instruction = match comparison.op {
+                        ComparisonOp::Equal => Insn::Eq {
+                            lhs,
+                            rhs,
+                            target_pc,
+                            flags,
+                            collation,
+                        },
+                        ComparisonOp::NotEqual => Insn::Ne {
+                            lhs,
+                            rhs,
+                            target_pc,
+                            flags,
+                            collation,
+                        },
+                        ComparisonOp::Less => Insn::Lt {
+                            lhs,
+                            rhs,
+                            target_pc,
+                            flags,
+                            collation,
+                        },
+                        ComparisonOp::LessEqual => Insn::Le {
+                            lhs,
+                            rhs,
+                            target_pc,
+                            flags,
+                            collation,
+                        },
+                        ComparisonOp::Greater => Insn::Gt {
+                            lhs,
+                            rhs,
+                            target_pc,
+                            flags,
+                            collation,
+                        },
+                        ComparisonOp::GreaterEqual => Insn::Ge {
+                            lhs,
+                            rhs,
+                            target_pc,
+                            flags,
+                            collation,
+                        },
+                    };
+                    program.emit_insn(instruction);
+                    program.emit_insn(Insn::Goto {
+                        target_pc: labels[if_false.index()],
+                    });
+                }
                 Terminator::CursorRewind {
                     cursor,
                     if_non_empty,
@@ -1626,6 +1768,25 @@ impl fmt::Display for IrProgram {
                     f,
                     "branch %{}, block{}, block{}",
                     condition.0, if_true.0, if_false.0
+                )?,
+                Terminator::Compare {
+                    lhs,
+                    rhs,
+                    comparison,
+                    if_true,
+                    if_false,
+                    if_null,
+                } => writeln!(
+                    f,
+                    "compare {:?} %{}, %{} affinity {:?} collation {:?}, block{}, block{}, block{}",
+                    comparison.op,
+                    lhs.0,
+                    rhs.0,
+                    comparison.affinity,
+                    comparison.collation,
+                    if_true.0,
+                    if_false.0,
+                    if_null.0,
                 )?,
                 Terminator::CursorRewind {
                     cursor,
@@ -1879,6 +2040,57 @@ pub(crate) struct Add {
     rhs: ValueId,
 }
 
+pub(crate) struct Compare {
+    lhs: ValueId,
+    rhs: ValueId,
+    comparison: ResolvedComparison,
+}
+
+pub(crate) const fn compare(lhs: ValueId, rhs: ValueId, comparison: ResolvedComparison) -> Compare {
+    Compare {
+        lhs,
+        rhs,
+        comparison,
+    }
+}
+
+impl Compile for Compare {
+    type Output = ValueId;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        let if_true = builder.create_block()?;
+        let if_false = builder.create_block()?;
+        let if_null = builder.create_block()?;
+        let merge = builder.create_block()?;
+        let result = builder.add_block_parameter(merge)?;
+
+        builder.terminate(Terminator::Compare {
+            lhs: self.lhs,
+            rhs: self.rhs,
+            comparison: self.comparison,
+            if_true,
+            if_false,
+            if_null,
+        })?;
+
+        for (block, value) in [
+            (if_true, Value::from_i64(1)),
+            (if_false, Value::from_i64(0)),
+            (if_null, Value::Null),
+        ] {
+            builder.switch_to(block)?;
+            let value = builder.push(ScalarOp::Constant(value))?;
+            builder.terminate(Terminator::Jump {
+                target: merge,
+                arguments: smallvec![value],
+            })?;
+        }
+
+        builder.switch_to(merge)?;
+        Ok(result)
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Column {
     cursor: CursorId,
@@ -2020,6 +2232,87 @@ mod tests {
                 "  %2 = add %0, %1\n",
                 "  return %2\n",
             )
+        );
+    }
+
+    #[test]
+    fn comparisons_expose_sql_three_valued_control_flow() {
+        let compiler = constant(Value::from_text("10"))
+            .then(constant(Value::from_i64(2)))
+            .and_then(|(lhs, rhs)| {
+                compare(
+                    lhs,
+                    rhs,
+                    resolved_comparison(
+                        ComparisonOp::Greater,
+                        Affinity::Numeric,
+                        Some(CollationSeq::Binary),
+                    ),
+                )
+            });
+
+        let ir = compile_scalar(compiler).unwrap();
+
+        assert_eq!(
+            ir.to_string(),
+            concat!(
+                "block0:\n",
+                "  %0 = constant Text(Text { value: \"10\", subtype: Text })\n",
+                "  %1 = constant Numeric(Integer(2))\n",
+                "  compare Greater %0, %1 affinity Numeric collation Some(Binary), block1, block2, block3\n",
+                "\n",
+                "block1:\n",
+                "  %3 = constant Numeric(Integer(1))\n",
+                "  jump block4(%3)\n",
+                "\n",
+                "block2:\n",
+                "  %4 = constant Numeric(Integer(0))\n",
+                "  jump block4(%4)\n",
+                "\n",
+                "block3:\n",
+                "  %5 = constant Null\n",
+                "  jump block4(%5)\n",
+                "\n",
+                "block4(%2):\n",
+                "  return %2\n",
+            )
+        );
+    }
+
+    #[test]
+    fn comparison_lowering_preserves_immutable_ssa_operands() {
+        let compiler = constant(Value::from_text("10"))
+            .then(constant(Value::from_i64(2)))
+            .and_then(|(lhs, rhs)| {
+                compare(
+                    lhs,
+                    rhs,
+                    resolved_comparison(ComparisonOp::Greater, Affinity::Numeric, None),
+                )
+                .and_then(move |result| result_row([lhs, result]).map(move |()| result))
+            });
+        let ir = compile_scalar(compiler).unwrap();
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        let mut builder =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 8, 2));
+        let result = builder.alloc_register();
+        ir.lower_into(&mut builder, result).unwrap();
+        builder.emit_insn(Insn::Halt {
+            err_code: 0,
+            description: String::new(),
+            on_error: None,
+            description_reg: None,
+        });
+        let program = builder
+            .build(connection.clone(), false, "comparison compiler test")
+            .unwrap();
+        let mut statement = Statement::new(program, connection.get_pager(), QueryMode::Normal, 0);
+
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![vec![Value::from_text("10"), Value::from_i64(1)]]
         );
     }
 

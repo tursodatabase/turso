@@ -446,7 +446,7 @@ pub(super) fn explicit_collation(
     Ok(found)
 }
 
-pub(super) fn comparison_collation(
+pub(crate) fn comparison_collation(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
     referenced_tables: Option<&TableReferences>,

@@ -5,22 +5,24 @@ use crate::{
     sync::Arc,
     translate::{
         aggregation::emit_ungrouped_aggregation,
+        alter::literal_default_value,
         compiler::{
-            compile_effect, constant, result_row_pack, scan_table, BoxedCompile, Compile, Row,
-            RowStream, ValueId,
+            compare, compile_effect, constant, resolved_comparison, result_row_pack, scan_table,
+            BoxedCompile, ComparisonOp, Compile, ResolvedComparison, Row, RowStream, ValueId,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
             MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
             OperationMode, ResultSetColumn, TableMask, TranslateCtx,
         },
+        expr::{comparison_affinity, comparison_collation},
         group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
         order_by::EmitOrderBy,
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, IterationDirection,
             JoinOrderMember, Operation, QueryDestination, Scan, Search, SeekKeyComponent,
-            SelectPlan, SimpleAggregate,
+            SelectPlan, SimpleAggregate, TableReferences,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -36,7 +38,22 @@ use crate::{
 use smallvec::SmallVec;
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
-use turso_parser::ast::{Expr, TableInternalId};
+use turso_parser::ast::{Expr, Literal, Operator, TableInternalId};
+
+#[derive(Clone)]
+enum DeclarativeOperand {
+    Column(usize),
+    Constant(Value),
+}
+
+enum DeclarativePredicate {
+    TruthyColumn(usize),
+    Comparison {
+        lhs: DeclarativeOperand,
+        rhs: DeclarativeOperand,
+        comparison: ResolvedComparison,
+    },
+}
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_select(
@@ -130,7 +147,7 @@ fn try_emit_declarative_table_scan(
         columns.push(column);
     }
 
-    let mut predicate_columns = SmallVec::<[usize; 2]>::new();
+    let mut predicates = SmallVec::<[DeclarativePredicate; 2]>::new();
     for predicate in &plan.where_clause {
         if predicate.consumed {
             continue;
@@ -145,17 +162,18 @@ fn try_emit_declarative_table_scan(
         {
             return Ok(None);
         }
-        let Some(column) = direct_scan_column(
+        let Some(predicate) = declarative_predicate(
             resolver,
             joined.database_id,
             joined.internal_id,
             table,
             &predicate.expr,
+            &plan.table_references,
         )?
         else {
             return Ok(None);
         };
-        predicate_columns.push(column);
+        predicates.push(predicate);
     }
 
     let table = table.clone();
@@ -163,10 +181,10 @@ fn try_emit_declarative_table_scan(
     let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
     let compiler = scan_table(table, database_id, schema_cookie).and_then(move |rows| {
         let emit = move |row: Row| row.project(columns).and_then(result_row_pack);
-        if predicate_columns.is_empty() {
+        if predicates.is_empty() {
             rows.for_each(emit).boxed()
         } else {
-            rows.filter(move |row| truthy_columns(row, &predicate_columns))
+            rows.filter(move |row| declarative_predicates(row, &predicates))
                 .for_each(emit)
                 .boxed()
         }
@@ -218,12 +236,132 @@ fn direct_scan_column(
     Ok((!requires_frontend_decoding).then_some(*column))
 }
 
-fn truthy_columns(row: Row, columns: &[usize]) -> BoxedCompile<ValueId> {
-    let Some((&column, remaining)) = columns.split_first() else {
+fn declarative_predicate(
+    resolver: &Resolver,
+    database_id: usize,
+    table_id: TableInternalId,
+    table: &BTreeTable,
+    expr: &Expr,
+    referenced_tables: &TableReferences,
+) -> Result<Option<DeclarativePredicate>> {
+    if let Some(column) = direct_scan_column(resolver, database_id, table_id, table, expr)? {
+        return Ok(Some(DeclarativePredicate::TruthyColumn(column)));
+    }
+
+    let expr = unwrap_single_parentheses(expr);
+    let Expr::Binary(lhs, operator, rhs) = expr else {
+        return Ok(None);
+    };
+    let Some(op) = declarative_comparison_op(*operator) else {
+        return Ok(None);
+    };
+    let Some(lhs_operand) = declarative_operand(resolver, database_id, table_id, table, lhs)?
+    else {
+        return Ok(None);
+    };
+    let Some(rhs_operand) = declarative_operand(resolver, database_id, table_id, table, rhs)?
+    else {
+        return Ok(None);
+    };
+    let affinity = comparison_affinity(lhs, rhs, Some(referenced_tables), Some(resolver));
+    let collation = comparison_collation(lhs, rhs, Some(referenced_tables), Some(resolver))?;
+
+    Ok(Some(DeclarativePredicate::Comparison {
+        lhs: lhs_operand,
+        rhs: rhs_operand,
+        comparison: resolved_comparison(op, affinity, collation),
+    }))
+}
+
+fn unwrap_single_parentheses(mut expr: &Expr) -> &Expr {
+    while let Expr::Parenthesized(expressions) = expr {
+        let [inner] = expressions.as_slice() else {
+            break;
+        };
+        expr = inner;
+    }
+    expr
+}
+
+fn declarative_operand(
+    resolver: &Resolver,
+    database_id: usize,
+    table_id: TableInternalId,
+    table: &BTreeTable,
+    expr: &Expr,
+) -> Result<Option<DeclarativeOperand>> {
+    let expr = unwrap_single_parentheses(expr);
+    if let Expr::Collate(inner, _) = expr {
+        return declarative_operand(resolver, database_id, table_id, table, inner);
+    }
+    if let Some(column) = direct_scan_column(resolver, database_id, table_id, table, expr)? {
+        return Ok(Some(DeclarativeOperand::Column(column)));
+    }
+    let Expr::Literal(literal) = expr else {
+        return Ok(None);
+    };
+    if matches!(
+        literal,
+        Literal::Keyword(_)
+            | Literal::CurrentDate
+            | Literal::CurrentTime
+            | Literal::CurrentTimestamp
+    ) {
+        return Ok(None);
+    }
+    Ok(Some(DeclarativeOperand::Constant(literal_default_value(
+        literal,
+    )?)))
+}
+
+const fn declarative_comparison_op(operator: Operator) -> Option<ComparisonOp> {
+    match operator {
+        Operator::Equals => Some(ComparisonOp::Equal),
+        Operator::NotEquals => Some(ComparisonOp::NotEqual),
+        Operator::Less => Some(ComparisonOp::Less),
+        Operator::LessEquals => Some(ComparisonOp::LessEqual),
+        Operator::Greater => Some(ComparisonOp::Greater),
+        Operator::GreaterEquals => Some(ComparisonOp::GreaterEqual),
+        _ => None,
+    }
+}
+
+fn compile_declarative_operand(row: Row, operand: &DeclarativeOperand) -> BoxedCompile<ValueId> {
+    match operand {
+        DeclarativeOperand::Column(column) => row.column(*column).boxed(),
+        DeclarativeOperand::Constant(value) => constant(value.clone()).boxed(),
+    }
+}
+
+fn compile_declarative_predicate(
+    row: Row,
+    predicate: &DeclarativePredicate,
+) -> BoxedCompile<ValueId> {
+    match predicate {
+        DeclarativePredicate::TruthyColumn(column) => row.column(*column).boxed(),
+        DeclarativePredicate::Comparison {
+            lhs,
+            rhs,
+            comparison,
+        } => compile_declarative_operand(row, lhs)
+            .then(compile_declarative_operand(row, rhs))
+            .and_then({
+                let comparison = *comparison;
+                move |(lhs, rhs)| compare(lhs, rhs, comparison)
+            })
+            .boxed(),
+    }
+}
+
+fn declarative_predicates(row: Row, predicates: &[DeclarativePredicate]) -> BoxedCompile<ValueId> {
+    let Some((predicate, remaining)) = predicates.split_first() else {
         return constant(Value::from_i64(1)).boxed();
     };
-    row.column(column)
-        .branch(truthy_columns(row, remaining), constant(Value::from_i64(0)))
+    compile_declarative_predicate(row, predicate)
+        .branch(
+            declarative_predicates(row, remaining),
+            constant(Value::from_i64(0)),
+        )
         .boxed()
 }
 
@@ -1259,6 +1397,44 @@ mod tests {
                 vec![Value::Text("one".into())],
                 vec![Value::Text("two".into())],
             ]
+        );
+
+        connection
+            .execute("CREATE TABLE compared(n NUMERIC, name TEXT COLLATE NOCASE)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO compared VALUES \
+                 (2, 'Alpha'), (10, 'beta'), (NULL, 'BETA'), (20, NULL)",
+            )
+            .unwrap();
+        let mut compared_statement = connection
+            .prepare("SELECT name FROM compared WHERE n >= '10' AND name = 'BETA'")
+            .unwrap();
+        let compared_instructions = &compared_statement.get_program().insns;
+        assert!(compared_instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Ge { .. })));
+        assert!(compared_instructions
+            .iter()
+            .any(|(instruction, _)| matches!(
+                instruction,
+                Insn::Eq {
+                    collation: Some(crate::translate::collate::CollationSeq::NoCase),
+                    ..
+                }
+            )));
+        assert!(
+            compared_instructions
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::IsNull { .. }))
+                .count()
+                >= 4,
+            "each symbolic comparison must retain an explicit NULL edge"
+        );
+        assert_eq!(
+            compared_statement.run_collect_rows().unwrap(),
+            vec![vec![Value::Text("beta".into())]]
         );
     }
 }

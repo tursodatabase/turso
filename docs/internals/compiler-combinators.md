@@ -44,8 +44,8 @@ representation.
 
 The current IR supports straight-line scalar operations, conditional diamonds,
 explicit loops with block parameters, and effectful cursor folds and row
-production. A first production SELECT path uses these pieces for an unfiltered,
-forward scan of one B-tree table whose result expressions are direct columns.
+production. A production SELECT path uses these pieces for a forward scan of
+one B-tree table whose result expressions are direct columns.
 It composes `scan_table`, row-stream operators, column projection, and
 `result_row`, then builds and verifies the complete IR before touching
 `ProgramBuilder`.
@@ -54,8 +54,12 @@ The row stream can wrap its consumer with chainable `filter` operators. A filter
 compiles its predicate in the row block and emits an SSA branch around the
 downstream consumer; false and NULL rows proceed directly to cursor advance.
 The production path currently admits direct-column truthiness predicates and
-preserves their source order. It falls back when SQL semantics still live in the
-eager frontend: general expressions and comparisons, ordering, limits, joins,
+ordinary comparisons between eligible columns and literals, preserving source
+order. Comparison affinity and collation are resolved by the SQL frontend before
+IR construction. The resulting terminator has separate true, false, and NULL
+successors; a comparison used as a value joins `1`, `0`, or `NULL` through a
+block parameter. It falls back when SQL semantics still live in the eager
+frontend: general expressions, `IS` comparisons, ordering, limits, joins,
 aggregates, subqueries, generated values, arrays, and custom-type decoding.
 `EXPLAIN QUERY PLAN` also remains on the eager path until the IR models
 explain-tree effects.

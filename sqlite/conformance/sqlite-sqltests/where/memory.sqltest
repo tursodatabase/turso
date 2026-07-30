@@ -16,6 +16,28 @@ expect {
     negative
 }
 
+@cross-check-integrity
+test where-declarative-comparisons {
+    CREATE TABLE declarative_cmp(id INTEGER, n NUMERIC, name TEXT COLLATE NOCASE);
+    INSERT INTO declarative_cmp VALUES
+        (1, 2, 'Alpha'),
+        (2, 10, 'beta'),
+        (3, 15, 'BETA'),
+        (4, 20, 'gamma'),
+        (5, NULL, 'BETA');
+    SELECT id FROM declarative_cmp
+    WHERE n = '10'
+      AND n != 11
+      AND n < 11
+      AND n <= '10'
+      AND n > 9
+      AND n >= '10'
+      AND name = 'BETA';
+}
+expect {
+    2
+}
+
 # in WHERE clauses, column aliases do not take precedence when resolving identifiers to columns.
 @cross-check-integrity
 test where_alias_precedence {
