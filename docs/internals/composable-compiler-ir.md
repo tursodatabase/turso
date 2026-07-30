@@ -264,11 +264,23 @@ boundary (the whole tree is constant, so the span opened by
       wholesale, span machinery handles the internal control flow). The
       integration hook is shared (`try_compiler_value_expr`) and now
       covers both the Binary and Case arms of `translate_expr`.
-- [ ] 2b-2. COALESCE/IFNULL in value position — needs a null-test
-      branch terminator (`IsNull`/`NotNull` jumps; truthiness `Branch`
-      cannot express "0 is a keeper"). Same terminator unlocks
-      IS NULL / NOT NULL terminals in condition position and the
-      IS/IS NOT null-equality comparisons.
+- [x] 2b-2. Nullness in the IR: `Terminator::NullBranch` (two-way
+      NULL/not-NULL branch; direction selection honors fallthrough and
+      prefers jumping to the argless side so arg-carrying edges get
+      inline copies instead of trampolines) and `Inst::NullTest`
+      (value-position IS [NOT] NULL, the eager assume-true idiom, result
+      never NULL). Coverage: COALESCE (>=2 args) and IFNULL (2 args) as
+      nullness-branch chains joining in a block parameter — control
+      flow, not calls; IS NULL / IS NOT NULL / ISNULL / NOTNULL in value
+      position; and condition terminals in both AST spellings (postfix
+      and `Binary(e, Is/IsNot, NULL)`), emitting the exact eager
+      single-jump shapes (`NotNull -> false` / `IsNull -> true`).
+      Root-level integration hooks added to the FunctionCall, IsNull,
+      and NotNull arms of `translate_expr` (previously only Binary/Case
+      roots reached the pipeline).
+- [ ] 2b-3. Remaining short-circuit value forms: AND/OR in value
+      position, BETWEEN, IN-list, LIKE/GLOB, IS TRUE/FALSE, CAST.
+      Parameter/variable references (`Expr::Variable`) as leaves.
 - [ ] 2c. Constant hoisting as an IR transform (move constant-only
       instructions to the entry block) so IR islands stop depending on
       the constant-span machinery; then start deleting

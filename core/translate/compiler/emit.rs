@@ -173,7 +173,9 @@ impl<'a> Emitter<'a> {
         for id in 0..func.num_values() {
             is_const[id] = match inst_of[id] {
                 Some(Inst::Const(_)) => true,
-                Some(Inst::Unary { operand, .. }) => is_const[operand.index()],
+                Some(Inst::Unary { operand, .. }) | Some(Inst::NullTest { operand, .. }) => {
+                    is_const[operand.index()]
+                }
                 Some(Inst::Binary { lhs, rhs, .. }) | Some(Inst::Compare { lhs, rhs, .. }) => {
                     is_const[lhs.index()] && is_const[rhs.index()]
                 }
@@ -200,7 +202,7 @@ impl<'a> Emitter<'a> {
             for (_, inst) in &block.insts {
                 match inst {
                     Inst::Const(_) | Inst::External { .. } | Inst::Leaf(_) => {}
-                    Inst::Unary { operand, .. } => count(operand),
+                    Inst::Unary { operand, .. } | Inst::NullTest { operand, .. } => count(operand),
                     Inst::Binary { lhs, rhs, .. } | Inst::Compare { lhs, rhs, .. } => {
                         count(lhs);
                         count(rhs);
@@ -216,6 +218,7 @@ impl<'a> Emitter<'a> {
                         count(lhs);
                         count(rhs);
                     }
+                    Terminator::NullBranch { value, .. } => count(value),
                     Terminator::Ret { value } => count(value),
                 }
                 for target in terminator.targets() {
@@ -246,6 +249,7 @@ impl<'a> Emitter<'a> {
                                 | Inst::Unary { .. }
                                 | Inst::Binary { .. }
                                 | Inst::Compare { .. }
+                                | Inst::NullTest { .. }
                                 | Inst::Call { .. }
                                 | Inst::Leaf(_)
                         )
@@ -424,6 +428,28 @@ impl<'a> Emitter<'a> {
                         dest,
                     });
                     self.program.preassign_label_to_next_insn(if_true_label);
+                }
+                Inst::NullTest { operand, negated } => {
+                    // The eager assume-true idiom: 1, then correct to 0
+                    // when the test fails. The result is never NULL.
+                    let reg = self.reg_of(*operand);
+                    let dest = self.reg_of(value);
+                    let label = self.program.allocate_label();
+                    self.program.emit_insn(Insn::Integer { value: 1, dest });
+                    let jump = if *negated {
+                        Insn::NotNull {
+                            reg,
+                            target_pc: label,
+                        }
+                    } else {
+                        Insn::IsNull {
+                            reg,
+                            target_pc: label,
+                        }
+                    };
+                    self.program.emit_insn(jump);
+                    self.program.emit_insn(Insn::Integer { value: 0, dest });
+                    self.program.preassign_label_to_next_insn(label);
                 }
                 Inst::Call { call, args } => {
                     let pack = self.call_packs[call.index()];
@@ -625,6 +651,50 @@ impl<'a> Emitter<'a> {
                 };
                 self.program.emit_insn(insn);
                 // The not-jumped side continues here.
+                self.emit_edge(fall_target);
+                self.emit_goto_unless_next(fall_target.block, next, trampolines.is_empty());
+                for (label, target) in trampolines {
+                    self.program.preassign_label_to_next_insn(label);
+                    self.emit_edge(&target);
+                    let pc = self.jump_target_pc(target.block);
+                    self.program.emit_insn(Insn::Goto { target_pc: pc });
+                }
+            }
+            Terminator::NullBranch {
+                value,
+                if_null,
+                if_not_null,
+            } => {
+                let reg = self.reg_of(*value);
+                let mut trampolines: Vec<(BranchOffset, JumpTarget)> = Vec::new();
+                let null_falls = next == Some(if_null.block)
+                    || (next.is_none() && self.exits_to_fallthrough(if_null.block));
+                let not_null_falls = next == Some(if_not_null.block)
+                    || (next.is_none() && self.exits_to_fallthrough(if_not_null.block));
+                // Direction: honor natural fallthrough when the jumped
+                // side is argless (a trampoline would defeat the point);
+                // otherwise prefer jumping to an argless side so the
+                // arg-carrying edge gets inline copies instead of a
+                // trampoline.
+                let (jump_on_null, jump_target, fall_target) =
+                    if not_null_falls && if_null.args.is_empty() {
+                        (true, if_null, if_not_null)
+                    } else if null_falls && if_not_null.args.is_empty() {
+                        (false, if_not_null, if_null)
+                    } else if if_null.args.is_empty() {
+                        (true, if_null, if_not_null)
+                    } else if if_not_null.args.is_empty() {
+                        (false, if_not_null, if_null)
+                    } else {
+                        (true, if_null, if_not_null)
+                    };
+                let target_pc = self.edge_entry_pc(jump_target, &mut trampolines);
+                let jump = if jump_on_null {
+                    Insn::IsNull { reg, target_pc }
+                } else {
+                    Insn::NotNull { reg, target_pc }
+                };
+                self.program.emit_insn(jump);
                 self.emit_edge(fall_target);
                 self.emit_goto_unless_next(fall_target.block, next, trampolines.is_empty());
                 for (label, target) in trampolines {

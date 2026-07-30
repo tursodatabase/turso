@@ -732,6 +732,22 @@ pub fn translate_expr(
             order_by: _,
             within_group: _,
         } => {
+            // Composable compiler path; falls back to eager emission
+            // below for anything the pipeline cannot represent yet.
+            if try_compiler_value_expr(
+                program,
+                referenced_tables,
+                expr,
+                target_register,
+                resolver,
+                has_expression_indexes,
+            )? {
+                if let Some(span) = constant_span {
+                    program.constant_span_end(span);
+                }
+                return Ok(target_register);
+            }
+
             let args_count = args.len();
             let func_type = resolver.resolve_function(name.as_str(), args_count)?;
 
@@ -2854,9 +2870,25 @@ pub fn translate_expr(
         ast::Expr::InTable { .. } => {
             crate::bail_parse_error!("Table expression is not supported in this position")
         }
-        ast::Expr::IsNull(expr) => {
+        ast::Expr::IsNull(operand) => {
+            // Composable compiler path; falls back to eager emission
+            // below for anything the pipeline cannot represent yet.
+            if try_compiler_value_expr(
+                program,
+                referenced_tables,
+                expr,
+                target_register,
+                resolver,
+                has_expression_indexes,
+            )? {
+                if let Some(span) = constant_span {
+                    program.constant_span_end(span);
+                }
+                return Ok(target_register);
+            }
+
             let reg = program.alloc_register();
-            translate_expr(program, referenced_tables, expr, reg, resolver)?;
+            translate_expr(program, referenced_tables, operand, reg, resolver)?;
             program.emit_insn(Insn::Integer {
                 value: 1,
                 dest: target_register,
@@ -2892,9 +2924,25 @@ pub fn translate_expr(
         ast::Expr::Name(_) => {
             crate::bail_parse_error!("ast::Expr::Name is not supported in this position")
         }
-        ast::Expr::NotNull(expr) => {
+        ast::Expr::NotNull(operand) => {
+            // Composable compiler path; falls back to eager emission
+            // below for anything the pipeline cannot represent yet.
+            if try_compiler_value_expr(
+                program,
+                referenced_tables,
+                expr,
+                target_register,
+                resolver,
+                has_expression_indexes,
+            )? {
+                if let Some(span) = constant_span {
+                    program.constant_span_end(span);
+                }
+                return Ok(target_register);
+            }
+
             let reg = program.alloc_register();
-            translate_expr(program, referenced_tables, expr, reg, resolver)?;
+            translate_expr(program, referenced_tables, operand, reg, resolver)?;
             program.emit_insn(Insn::Integer {
                 value: 1,
                 dest: target_register,

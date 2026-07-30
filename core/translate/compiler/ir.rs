@@ -232,6 +232,13 @@ pub enum Inst {
         lhs: ValueId,
         rhs: ValueId,
     },
+    /// `IS NULL` (`negated: false`) / `IS NOT NULL` (`negated: true`) in
+    /// value position: result is always 1 or 0, never NULL. Emission
+    /// expands to the eager assume-true idiom over `IsNull`/`NotNull`.
+    NullTest {
+        operand: ValueId,
+        negated: bool,
+    },
     /// A value that already lives in a physical register owned by code
     /// outside this function (the eager translation surrounding an IR
     /// island). Emission binds the value to that register directly; no
@@ -286,6 +293,15 @@ pub enum Terminator {
         if_false: JumpTarget,
         if_null: JumpTarget,
     },
+    /// A two-way branch on nullness: NULL values take `if_null`,
+    /// everything else (including 0 and '') takes `if_not_null`. This is
+    /// what truthiness `Branch` cannot express — the backbone of
+    /// COALESCE/IFNULL and IS NULL conditions.
+    NullBranch {
+        value: ValueId,
+        if_null: JumpTarget,
+        if_not_null: JumpTarget,
+    },
     /// Leave the function, yielding `value` as its result. A function may
     /// have multiple `Ret` sites; emission funnels them into one
     /// destination register.
@@ -312,6 +328,11 @@ impl Terminator {
                 if_null,
                 ..
             } => vec![if_true, if_false, if_null],
+            Terminator::NullBranch {
+                if_null,
+                if_not_null,
+                ..
+            } => vec![if_null, if_not_null],
             Terminator::Ret { .. } | Terminator::Exit(_) => Vec::new(),
         }
     }
@@ -504,6 +525,20 @@ impl FuncBuilder {
 
     pub fn unary(&mut self, op: UnaryOp, operand: ValueId) -> ValueId {
         self.push_inst(Inst::Unary { op, operand })
+    }
+
+    /// `IS NULL` / `IS NOT NULL` in value position (result 1/0).
+    pub fn null_test(&mut self, operand: ValueId, negated: bool) -> ValueId {
+        self.push_inst(Inst::NullTest { operand, negated })
+    }
+
+    /// Terminate the current block with a nullness branch.
+    pub fn null_branch(&mut self, value: ValueId, if_null: JumpTarget, if_not_null: JumpTarget) {
+        self.terminate(Terminator::NullBranch {
+            value,
+            if_null,
+            if_not_null,
+        });
     }
 
     pub fn binary(&mut self, op: BinOp, lhs: ValueId, rhs: ValueId) -> ValueId {

@@ -146,7 +146,8 @@ pub fn verify(func: &Function) -> Result<(), VerifyError> {
                 super::ir::Inst::Const(_)
                 | super::ir::Inst::External { .. }
                 | super::ir::Inst::Leaf(_) => {}
-                super::ir::Inst::Unary { operand, .. } => check(*operand, index)?,
+                super::ir::Inst::Unary { operand, .. }
+                | super::ir::Inst::NullTest { operand, .. } => check(*operand, index)?,
                 super::ir::Inst::Binary { lhs, rhs, .. }
                 | super::ir::Inst::Compare { lhs, rhs, .. } => {
                     check(*lhs, index)?;
@@ -179,6 +180,7 @@ pub fn verify(func: &Function) -> Result<(), VerifyError> {
                     return Err(VerifyError::CmpBranchNullTarget { block: block_id });
                 }
             }
+            Terminator::NullBranch { value, .. } => check(*value, end)?,
             Terminator::Ret { value } => check(*value, end)?,
         }
         for target in terminator.targets() {

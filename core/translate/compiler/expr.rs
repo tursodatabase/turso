@@ -283,6 +283,58 @@ pub(crate) fn compile_value_expr<'a>(
             let Func::Scalar(scalar) = &func else {
                 return Ok(None);
             };
+            // COALESCE/IFNULL are control flow, not calls: a chain of
+            // nullness branches joining in a block parameter, each
+            // argument evaluated only until one is non-NULL. Arity gates
+            // match the eager checks (violations fall back to the eager
+            // errors).
+            let coalesce_like = matches!(scalar, ScalarFunc::Coalesce if args.len() >= 2)
+                || matches!(scalar, ScalarFunc::IfNull if args.len() == 2);
+            if coalesce_like {
+                let mut arg_builds = Vec::with_capacity(args.len());
+                for arg in args {
+                    let Some(built) = compile_value_expr(arg, ctx)? else {
+                        return Ok(None);
+                    };
+                    arg_builds.push(built);
+                }
+                let effect =
+                    arg_builds
+                        .iter()
+                        .fold(CollationEffect::Untouched, |acc, arg| match arg.effect {
+                            CollationEffect::Sets(collation) => CollationEffect::Sets(collation),
+                            CollationEffect::Untouched => acc,
+                        });
+                let arg_compilers: Vec<Compiler<'a, ValueId>> =
+                    arg_builds.into_iter().map(|built| built.compiler).collect();
+                return Ok(Some(Built {
+                    compiler: Compiler::build_with(move |builder| {
+                        let count = arg_compilers.len();
+                        // Blocks for arguments 2..n, then the join, so
+                        // emission order follows the argument order.
+                        let arm_blocks: Vec<super::ir::BlockId> =
+                            (1..count).map(|_| builder.create_block()).collect();
+                        let join = builder.create_block();
+                        let result = builder.add_block_param(join);
+                        for (index, arg) in arg_compilers.into_iter().enumerate() {
+                            let value = arg.run(builder)?;
+                            if index + 1 < count {
+                                builder.null_branch(
+                                    value,
+                                    JumpTarget::new(arm_blocks[index], Vec::new()),
+                                    JumpTarget::new(join, vec![value]),
+                                );
+                                builder.switch_to(arm_blocks[index]);
+                            } else {
+                                builder.jump(join, vec![value]);
+                            }
+                        }
+                        builder.switch_to(join);
+                        Ok(result)
+                    }),
+                    effect,
+                }));
+            }
             if !scalar_call_is_generic(scalar, args.len()) {
                 return Ok(None);
             }
@@ -320,6 +372,18 @@ pub(crate) fn compile_value_expr<'a>(
                 effect,
             })
         }
+        ast::Expr::IsNull(operand) => compile_value_expr(operand, ctx)?.map(|operand| Built {
+            compiler: operand
+                .compiler
+                .map_with(|builder, value| Ok(builder.null_test(value, false))),
+            effect: operand.effect,
+        }),
+        ast::Expr::NotNull(operand) => compile_value_expr(operand, ctx)?.map(|operand| Built {
+            compiler: operand
+                .compiler
+                .map_with(|builder, value| Ok(builder.null_test(value, true))),
+            effect: operand.effect,
+        }),
         ast::Expr::Case {
             base,
             when_then_pairs,
@@ -641,6 +705,20 @@ pub(crate) fn compile_condition_expr<'a>(
                 effect: CollationEffect::Sets(None),
             })
         }
+        // IS NULL / IS NOT NULL terminals, in both AST spellings. These
+        // use nullness jumps, not equality (matching the eager arms).
+        ast::Expr::IsNull(operand) => null_test_predicate(operand, ctx, false)?,
+        ast::Expr::NotNull(operand) => null_test_predicate(operand, ctx, true)?,
+        ast::Expr::Binary(lhs, ast::Operator::Is, rhs)
+            if matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+        {
+            null_test_predicate(lhs, ctx, false)?
+        }
+        ast::Expr::Binary(lhs, ast::Operator::IsNot, rhs)
+            if matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+        {
+            null_test_predicate(lhs, ctx, true)?
+        }
         // Any value-representable expression is a truthiness terminal in
         // condition position, exactly the set the eager path routes
         // through translate_expr + emit_cond_jump (or the non-comparison
@@ -650,6 +728,37 @@ pub(crate) fn compile_condition_expr<'a>(
             effect: built.effect,
         }),
     })
+}
+
+/// An `IS [NOT] NULL` condition terminal: a nullness branch to the
+/// true/false continuations. The result is never NULL, so the NULL
+/// continuation is irrelevant — exactly like the eager `IsNull`/`NotNull`
+/// jump arms, which ignore the metadata NULL target.
+fn null_test_predicate<'a>(
+    operand: &'a ast::Expr,
+    ctx: &BuildCtx<'_>,
+    negated: bool,
+) -> Result<Option<CondBuilt<'a>>> {
+    Ok(compile_value_expr(operand, ctx)?.map(|built| {
+        let Built { compiler, effect } = built;
+        CondBuilt {
+            predicate: Predicate::build_with(move |builder, targets| {
+                let value = compiler.run(builder)?;
+                let (null_target, not_null_target) = if negated {
+                    (targets.if_false, targets.if_true)
+                } else {
+                    (targets.if_true, targets.if_false)
+                };
+                builder.null_branch(
+                    value,
+                    JumpTarget::new(null_target, Vec::new()),
+                    JumpTarget::new(not_null_target, Vec::new()),
+                );
+                Ok(())
+            }),
+            effect,
+        }
+    }))
 }
 
 /// Scalar functions whose eager translation is exactly the generic shape

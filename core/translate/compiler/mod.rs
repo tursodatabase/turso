@@ -987,6 +987,105 @@ mod tests {
     }
 
     #[test]
+    fn null_tests_produce_boolean_values() {
+        // NULL ISNULL: the eager assume-true idiom, result never NULL.
+        let insns = pipeline("NULL ISNULL").unwrap();
+        let [Insn::Null { .. }, Insn::Integer { value: 1, dest: d1 }, Insn::IsNull { .. }, Insn::Integer { value: 0, dest: d0 }] =
+            insns[..]
+        else {
+            panic!("unexpected NullTest shape: {insns:?}");
+        };
+        assert_eq!(d1, d0);
+        assert!(matches!(
+            pipeline("5 NOTNULL").unwrap()[2],
+            Insn::NotNull { .. }
+        ));
+    }
+
+    #[test]
+    fn null_branches_chain_coalesce_style() {
+        // coalesce(v1, 5): keep v1 unless NULL, else 5 — the join block
+        // parameter carries whichever side won.
+        let mut builder = FuncBuilder::new();
+        let first = builder.null();
+        let fallback_block = builder.create_block();
+        let join = builder.create_block();
+        let result = builder.add_block_param(join);
+        builder.null_branch(
+            first,
+            JumpTarget::new(fallback_block, Vec::new()),
+            JumpTarget::new(join, vec![first]),
+        );
+        builder.switch_to(fallback_block);
+        let five = builder.int(5);
+        builder.jump(join, vec![five]);
+        builder.switch_to(join);
+        builder.ret(result);
+        let func = builder.finish();
+        verify(&func).unwrap();
+
+        let mut program = test_program();
+        let dest = program.alloc_register();
+        emit::emit_function(&mut program, &func, dest).unwrap();
+        let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
+        // Argless-side preference: IsNull jumps to the fallback arm, the
+        // non-null side copies into the join parameter inline. The
+        // constant 5 interns into the entry block.
+        let [Insn::Null { dest: v, .. }, Insn::Integer {
+            value: 5,
+            dest: fb_src,
+        }, Insn::IsNull { reg, .. }, Insn::Copy {
+            src_reg: keep_src,
+            dst_reg: keep_dst,
+            ..
+        }, Insn::Goto { .. }, Insn::Copy {
+            src_reg: fb_copy_src,
+            dst_reg: fb_dst,
+            ..
+        }] = insns[..]
+        else {
+            panic!("unexpected coalesce shape: {insns:?}");
+        };
+        assert_eq!(reg, v);
+        assert_eq!(keep_src, v);
+        assert_eq!(fb_copy_src, fb_src);
+        assert_eq!(keep_dst, fb_dst);
+        assert_eq!(*keep_dst, dest);
+    }
+
+    #[test]
+    fn is_null_conditions_use_nullness_jumps() {
+        use crate::translate::expr::ConditionMetadata;
+        // WHERE external(3) IS NULL, standard contract: matches the
+        // eager single NotNull -> false shape.
+        let mut program = test_program();
+        let false_label = program.allocate_label();
+        let metadata = ConditionMetadata {
+            jump_if_condition_is_true: false,
+            jump_target_when_true: program.allocate_label(),
+            jump_target_when_false: false_label,
+            jump_target_when_null: false_label,
+        };
+        let predicate = Predicate::build_with(|builder, targets| {
+            let value = builder.external(3);
+            builder.null_branch(
+                value,
+                JumpTarget::new(targets.if_true, Vec::new()),
+                JumpTarget::new(targets.if_false, Vec::new()),
+            );
+            Ok(())
+        });
+        emit_condition(&mut program, predicate, &metadata, None).unwrap();
+        program.preassign_label_to_next_insn(metadata.jump_target_when_true);
+        program.preassign_label_to_next_insn(false_label);
+        program.resolve_labels().unwrap();
+        let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
+        let [Insn::NotNull { reg: 3, .. }] = insns[..] else {
+            panic!("expected a single NotNull jump, got {insns:?}");
+        };
+    }
+
+    #[test]
     fn pure_and_map_pass_values_through() {
         let description = Compiler::pure(41).map(|v| v + 1);
         let mut builder = FuncBuilder::new();
