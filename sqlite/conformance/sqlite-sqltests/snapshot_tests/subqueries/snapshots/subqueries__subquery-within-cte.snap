@@ -64,7 +64,7 @@ addr  opcode             p1  p2  p3  p4              p5  comment
   30  InitCoroutine       1   0   2                   0
   31    Yield             1  39   0                   0
   32    Copy              7  13   0                   0  r[13]=r[7]
-  33    Le               13  14  38  Binary           0  if r[13]<=r[14] goto 38
+  33    Le               13  14  31  Binary           0  if r[13]<=r[14] goto 31
   34    Copy              7  15   0                   0  r[15]=r[7]
   35    Copy              6  16   0                   0  r[16]=r[6]
   36    MakeRecord       15   2  11                   0  r[11]=mkrec(r[15..16])
