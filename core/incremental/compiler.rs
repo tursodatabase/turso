@@ -9,8 +9,9 @@ use crate::incremental::aggregate_operator::AggregateOperator;
 use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::incremental::expr_compiler::CompiledExpression;
 use crate::incremental::operator::{
-    create_dbsp_state_index, DbspStateCursors, EvalState, FilterOperator, FilterPredicate,
-    IncrementalOperator, InputOperator, JoinOperator, JoinType, ProjectOperator,
+    create_dbsp_state_index, install_dbsp_yield_context, DbspStateCursors, EvalState,
+    FilterOperator, FilterPredicate, IncrementalOperator, InputOperator, JoinOperator, JoinType,
+    ProjectOperator,
 };
 use crate::schema::Type;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
@@ -32,12 +33,19 @@ use std::fmt::{self, Display, Formatter};
 const OPERATOR_COLUMNS: usize = 5;
 
 /// State machine for writing rows to simple materialized views (table-only, no index)
+///
+/// Each arm issues exactly one cursor op and advances only after it returns `Done`:
+/// `IOResult::IO` means "call me again", so advancing first abandons an in-flight
+/// balance. The seek therefore gets its own arm.
 #[derive(Debug, Default)]
 pub enum WriteRowView {
     #[default]
     GetRecord,
     Delete,
     Insert {
+        final_weight: isize,
+    },
+    InsertRow {
         final_weight: isize,
     },
     Done,
@@ -106,13 +114,16 @@ impl WriteRowView {
                     }
                 }
                 WriteRowView::Delete => {
-                    // Mark as Done before delete to avoid retry on I/O
-                    *self = WriteRowView::Done;
                     return_if_io!(cursor.delete());
+                    *self = WriteRowView::Done;
                 }
                 WriteRowView::Insert { final_weight } => {
                     return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
-
+                    *self = WriteRowView::InsertRow {
+                        final_weight: *final_weight,
+                    };
+                }
+                WriteRowView::InsertRow { final_weight } => {
                     // Extract the row ID from the key
                     let key_i64 = match key {
                         SeekKey::TableRowId(id) => id,
@@ -131,9 +142,8 @@ impl WriteRowView {
                         ImmutableRecord::from_values(&record_values, record_values.len())?;
                     let btree_key = BTreeKey::new_table_rowid(key_i64, Some(&immutable_record));
 
-                    // Mark as Done before insert to avoid retry on I/O
-                    *self = WriteRowView::Done;
                     return_if_io!(cursor.insert(&btree_key));
+                    *self = WriteRowView::Done;
                 }
                 WriteRowView::Done => {
                     return Ok(IOResult::Done(()));
@@ -197,7 +207,6 @@ impl std::fmt::Debug for CommitState {
 
 /// State machine for circuit execution across I/O operations
 /// Similar to EvalState but for tracking execution state through the circuit
-#[derive(Debug)]
 pub enum ExecuteState {
     /// Empty state so we can allocate the space without executing
     Uninitialized,
@@ -216,6 +225,11 @@ pub enum ExecuteState {
         current_index: usize,
         /// Collected deltas from processed inputs
         input_deltas: Vec<Delta>,
+        /// Cursors for the child nodes' operator state, owned by this state
+        /// rather than built per poll: a btree write's balance state lives in
+        /// the cursor, so a child resuming a yielded write must resume on the
+        /// *same* cursor (as `CommitState::CommitOperators::state_cursors`).
+        state_cursors: Box<DbspStateCursors>,
     },
 
     /// Processing a specific node in the circuit
@@ -223,6 +237,33 @@ pub enum ExecuteState {
         /// Node's evaluation state (includes the delta in its Init state)
         eval_state: Box<EvalState>,
     },
+}
+
+impl std::fmt::Debug for ExecuteState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Uninitialized => write!(f, "Uninitialized"),
+            Self::Init { input_data } => f
+                .debug_struct("Init")
+                .field("input_data", input_data)
+                .finish(),
+            Self::ProcessingInputs {
+                input_states,
+                current_index,
+                input_deltas,
+                ..
+            } => f
+                .debug_struct("ProcessingInputs")
+                .field("input_states", input_states)
+                .field("current_index", current_index)
+                .field("input_deltas", input_deltas)
+                .finish_non_exhaustive(),
+            Self::ProcessingNode { eval_state } => f
+                .debug_struct("ProcessingNode")
+                .field("eval_state", eval_state)
+                .finish(),
+        }
+    }
 }
 
 /// A set of deltas for multiple tables/operators
@@ -462,6 +503,33 @@ impl DbspCircuit {
         id
     }
 
+    /// Build a cursor pair over the circuit's internal DBSP state btrees.
+    ///
+    /// Every caller must keep the returned pair alive for as long as the state
+    /// machine that drives it: a yielded btree write can only be re-driven on
+    /// the cursor that started it.
+    fn new_dbsp_state_cursors(&self, pager: &Arc<Pager>) -> Result<DbspStateCursors> {
+        let mut table_cursor =
+            BTreeCursor::new_table(pager.clone(), self.internal_state_root, OPERATOR_COLUMNS);
+        install_dbsp_yield_context(&mut table_cursor, pager);
+        let index_def = create_dbsp_state_index(self.internal_state_index_root);
+        let mut index_cursor = BTreeCursor::new_index(
+            pager.clone(),
+            self.internal_state_index_root,
+            &index_def,
+            3, // Index on first 3 columns
+        )?;
+        install_dbsp_yield_context(&mut index_cursor, pager);
+        Ok(DbspStateCursors::new(table_cursor, index_cursor))
+    }
+
+    /// Cursor over the materialized view's own data btree.
+    fn new_view_cursor(&self, pager: &Arc<Pager>, num_columns: usize) -> BTreeCursor {
+        let mut cursor = BTreeCursor::new_table(pager.clone(), self.main_data_root, num_columns);
+        install_dbsp_yield_context(&mut cursor, pager);
+        cursor
+    }
+
     pub fn run_circuit(
         &mut self,
         execute_state: &mut ExecuteState,
@@ -496,17 +564,11 @@ impl DbspCircuit {
         execute_state: &mut ExecuteState,
     ) -> Result<IOResult<Delta>> {
         if let Some(root_id) = self.root {
-            // Create temporary cursors for execute (non-commit) operations
-            let table_cursor =
-                BTreeCursor::new_table(pager.clone(), self.internal_state_root, OPERATOR_COLUMNS);
-            let index_def = create_dbsp_state_index(self.internal_state_index_root);
-            let index_cursor = BTreeCursor::new_index(
-                pager.clone(),
-                self.internal_state_index_root,
-                &index_def,
-                3,
-            )?;
-            let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+            // Read-only path: no operator writes state here, so this pair may be
+            // rebuilt per poll. It is only sound because every read in the eval
+            // path re-derives its position from a key on each re-entry — see the
+            // contract note on `IncrementalOperator::eval`.
+            let mut cursors = self.new_dbsp_state_cursors(&pager)?;
             self.execute_node(root_id, pager, execute_state, false, &mut cursors)
         } else {
             Err(LimboError::ParseError(
@@ -531,9 +593,6 @@ impl DbspCircuit {
             return Ok(IOResult::Done(Delta::new()));
         }
 
-        // Get btree root pages
-        let main_data_root = self.main_data_root;
-
         // Add 1 for the weight column that we store in the btree
         let num_columns = self.output_schema.columns.len() + 1;
 
@@ -548,23 +607,7 @@ impl DbspCircuit {
             match &mut state {
                 CommitState::Init => {
                     // Create state cursors when entering CommitOperators state
-                    let state_table_cursor = BTreeCursor::new_table(
-                        pager.clone(),
-                        self.internal_state_root,
-                        OPERATOR_COLUMNS,
-                    );
-                    let index_def = create_dbsp_state_index(self.internal_state_index_root);
-                    let state_index_cursor = BTreeCursor::new_index(
-                        pager.clone(),
-                        self.internal_state_index_root,
-                        &index_def,
-                        3, // Index on first 3 columns
-                    )?;
-
-                    let state_cursors = Box::new(DbspStateCursors::new(
-                        state_table_cursor,
-                        state_index_cursor,
-                    ));
+                    let state_cursors = Box::new(self.new_dbsp_state_cursors(&pager)?);
 
                     self.commit_state = CommitState::CommitOperators {
                         execute_state: Box::new(ExecuteState::Init {
@@ -584,11 +627,7 @@ impl DbspCircuit {
                     );
 
                     // Create view cursor when entering UpdateView state
-                    let view_cursor = Box::new(BTreeCursor::new_table(
-                        pager.clone(),
-                        main_data_root,
-                        num_columns,
-                    ));
+                    let view_cursor = Box::new(self.new_view_cursor(&pager, num_columns));
 
                     self.commit_state = CommitState::UpdateView {
                         delta,
@@ -613,11 +652,7 @@ impl DbspCircuit {
                         // If we're starting a new row (GetRecord state), we need a fresh cursor
                         // due to btree cursor state machine limitations
                         if matches!(write_row_state, WriteRowView::GetRecord) {
-                            *view_cursor = Box::new(BTreeCursor::new_table(
-                                pager.clone(),
-                                main_data_root,
-                                num_columns,
-                            ));
+                            *view_cursor = Box::new(self.new_view_cursor(&pager, num_columns));
                         }
 
                         // Build the view row format: row values + weight
@@ -640,11 +675,7 @@ impl DbspCircuit {
                         // Take ownership of view_cursor - we'll create a new one for next row if needed
                         let view_cursor = std::mem::replace(
                             view_cursor,
-                            Box::new(BTreeCursor::new_table(
-                                pager.clone(),
-                                main_data_root,
-                                num_columns,
-                            )),
+                            Box::new(self.new_view_cursor(&pager, num_columns)),
                         );
 
                         self.commit_state = CommitState::UpdateView {
@@ -707,10 +738,13 @@ impl DbspCircuit {
                                 })
                                 .collect();
 
+                            let state_cursors = Box::new(self.new_dbsp_state_cursors(&pager)?);
+
                             *execute_state = ExecuteState::ProcessingInputs {
                                 input_states,
                                 current_index: 0,
                                 input_deltas: Vec::new(),
+                                state_cursors,
                             };
                         }
                     }
@@ -719,6 +753,7 @@ impl DbspCircuit {
                     input_states,
                     current_index,
                     input_deltas,
+                    state_cursors,
                 } => {
                     if *current_index >= input_states.len() {
                         // All inputs processed
@@ -734,28 +769,14 @@ impl DbspCircuit {
                         // Get the (node_id, state) pair for the current index
                         let (input_node_id, input_state) = &mut input_states[*current_index];
 
-                        // Create temporary cursors for the recursive call
-                        let temp_table_cursor = BTreeCursor::new_table(
-                            pager.clone(),
-                            self.internal_state_root,
-                            OPERATOR_COLUMNS,
-                        );
-                        let index_def = create_dbsp_state_index(self.internal_state_index_root);
-                        let temp_index_cursor = BTreeCursor::new_index(
-                            pager.clone(),
-                            self.internal_state_index_root,
-                            &index_def,
-                            3,
-                        )?;
-                        let mut temp_cursors =
-                            DbspStateCursors::new(temp_table_cursor, temp_index_cursor);
-
+                        // Must be the state-owned pair: a yielded child write
+                        // resumes on the cursor that started it.
                         let delta = return_if_io!(self.execute_node(
                             *input_node_id,
                             pager.clone(),
                             input_state,
                             commit_operators,
-                            &mut temp_cursors
+                            state_cursors
                         ));
                         input_deltas.push(delta);
                         *current_index += 1;
@@ -6158,5 +6179,90 @@ mod tests {
         assert_eq!(left_idx, 0);
         assert_eq!(actual_right.name, "right_id");
         assert_eq!(right_idx, 0);
+    }
+
+    mod write_row_view_repoll {
+        use super::super::WriteRowView;
+        use crate::incremental::yield_test_support::OneShotYieldInjector;
+        use crate::mvcc::yield_hooks::YieldPointMarker;
+        use crate::storage::btree::{
+            BTreeCursor, BTreeWriteYieldPoint, CursorTrait, BTREE_WRITE_YIELD_FAMILY,
+        };
+        use crate::storage::pager::CreateBTreeFlags;
+        use crate::sync::Arc;
+        use crate::types::{SeekKey, SeekOp, SeekResult};
+        use crate::util::IOExt;
+        use crate::{Connection, Database, MemoryIO, SqliteDialect, Value, IO};
+
+        fn setup() -> (Arc<Connection>, Arc<crate::Pager>, i64) {
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect().unwrap();
+            let pager = conn.pager.load().clone();
+            let _ = pager.io.block(|| pager.allocate_page1());
+            let root = pager
+                .io
+                .block(|| pager.btree_create(&CreateBTreeFlags::new_table()))
+                .unwrap() as i64;
+            (conn, pager, root)
+        }
+
+        /// Same re-poll contract as `persistence::WriteRow`, for the per-row view cursor:
+        /// a mid-balance yield must not lose the matview row.
+        #[test]
+        fn write_row_view_completes_yielded_overflowing_insert() {
+            let (conn, pager, root) = setup();
+
+            let injector = OneShotYieldInjector::new(
+                BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance.point(),
+                BTREE_WRITE_YIELD_FAMILY ^ root as u64,
+            );
+            conn.set_yield_injector(Some(injector.clone()));
+
+            // ~1200-byte on-page cells fill leaves; the insert that overflows a page
+            // triggers the mid-balance yield. Fresh per-row cursor, as in UpdateView.
+            let mut victim_rowid = None;
+            for rowid in 1i64..=200 {
+                let mut cursor = BTreeCursor::new_table(pager.clone(), root, 2);
+                cursor.install_yield_context(&conn);
+
+                let key = SeekKey::TableRowId(rowid);
+                let build = move |final_weight: isize| -> Vec<Value> {
+                    vec![
+                        Value::from_slice(&[0xcd_u8; 1200]).unwrap(),
+                        Value::from_i64(final_weight as i64),
+                    ]
+                };
+
+                let mut wr = WriteRowView::new();
+                pager
+                    .io
+                    .block(|| wr.write_row(&mut cursor, key.clone(), build, 1))
+                    .unwrap();
+
+                if injector.fired() {
+                    victim_rowid = Some(rowid);
+                    break;
+                }
+            }
+            let victim_rowid = victim_rowid
+                .expect("no insert ever overflowed a page; test does not exercise the bug");
+            conn.set_yield_injector(None);
+
+            let mut verify = BTreeCursor::new_table(pager.clone(), root, 2);
+            let found = pager
+                .io
+                .block(|| {
+                    verify.seek(
+                        SeekKey::TableRowId(victim_rowid),
+                        SeekOp::GE { eq_only: true },
+                    )
+                })
+                .unwrap();
+            assert!(
+                matches!(found, SeekResult::Found),
+                "matview row {victim_rowid} lost: WriteRowView advanced to Done past a yielded insert"
+            );
+        }
     }
 }
