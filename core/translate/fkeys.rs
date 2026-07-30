@@ -1728,8 +1728,16 @@ fn emit_fk_action_subprogram(
         );
         let entry = compile_stack.push(foreign_key, parent_change);
         subprogram_builder.prologue();
+        let mut stmt = stmt;
+        let bound_stmt = crate::translate::bind::bind_stmt(
+            &mut stmt,
+            resolver,
+            &mut subprogram_builder,
+            connection,
+        )?;
         translate_inner(
             stmt,
+            bound_stmt,
             resolver,
             &mut subprogram_builder,
             connection,

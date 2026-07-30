@@ -600,10 +600,17 @@ fn execute_trigger_commands(
     resolver.set_trigger_context(trigger_database_id, trigger.name.clone());
     let compile_result = (|| -> Result<()> {
         for command in trigger.commands.iter() {
-            let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
+            let mut stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
             subprogram_builder.prologue();
+            let bound_stmt = crate::translate::bind::bind_stmt(
+                &mut stmt,
+                resolver,
+                &mut subprogram_builder,
+                connection,
+            )?;
             translate_inner(
                 stmt,
+                bound_stmt,
                 resolver,
                 &mut subprogram_builder,
                 connection,

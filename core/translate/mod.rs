@@ -137,7 +137,20 @@ pub fn translate(
                 &mut program,
             )?;
         }
-        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
+        mut stmt => {
+            // Bind the whole statement once, up front. The per-statement
+            // translate functions consume the bound output instead of
+            // binding at their own call sites.
+            let bound_stmt = bind::bind_stmt(&mut stmt, &resolver, &mut program, &connection)?;
+            translate_inner(
+                stmt,
+                bound_stmt,
+                &mut resolver,
+                &mut program,
+                &connection,
+                input,
+            )?
+        }
     };
 
     program.epilogue(schema);
@@ -150,7 +163,8 @@ pub fn translate(
 /// Translate SQL statement into bytecode program.
 #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
 pub fn translate_inner(
-    mut stmt: ast::Stmt,
+    stmt: ast::Stmt,
+    bound_stmt: Option<bind::BoundStmt>,
     resolver: &mut Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
@@ -191,11 +205,6 @@ pub fn translate_inner(
     }
 
     let is_select = matches!(stmt, ast::Stmt::Select { .. });
-
-    // Bind the whole statement once, up front. The per-statement translate
-    // functions consume the bound output instead of binding at their own
-    // call sites.
-    let bound_stmt = bind::bind_stmt(&mut stmt, resolver, program, connection)?;
 
     match stmt {
         ast::Stmt::AlterTable(alter) => {

@@ -43,10 +43,13 @@ const SQLITE_MAX_COLUMN: usize = 2000;
 /// one [TableReferences] per SELECT core (main + compounds, in order) and the
 /// pre-bound subqueries keyed by their [ast::Expr::SubqueryResult] id.
 ///
-/// The `Raw` variant is transitional and will be removed once every statement
-/// path goes through the binder.
-// TODO(bind-integration): `Bound` is constructed once the binder is wired in.
-#[allow(dead_code)]
+/// `Raw` is NOT dead code: trigger WHEN-clause subqueries
+/// (plan_subqueries_from_trigger_when_clause) and recursive CTE bodies
+/// (prepare_recursive_cte_plan) still resolve names during planning, since
+/// neither has a bind-time scope (NEW/OLD contexts, and the recursive table
+/// that only exists while the recursive plan is built). It goes away when
+/// those two migrate into the binder, together with bind_and_rewrite_expr
+/// and the by-name outer-reference resolution.
 pub enum SelectBinding {
     Raw {
         outer_query_refs: Vec<OuterQueryReference>,
