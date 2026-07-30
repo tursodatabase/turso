@@ -383,6 +383,15 @@ pub enum Terminator {
         if_zero: JumpTarget,
         if_more: JumpTarget,
     },
+    /// Take `if_pos`, decrementing the external counter register in
+    /// place, while the counter is still positive; `if_rest` once it
+    /// has run out (`Insn::IfPos` with decrement 1). The OFFSET
+    /// row-skip.
+    IfPos {
+        counter_reg: usize,
+        if_pos: JumpTarget,
+        if_rest: JumpTarget,
+    },
 }
 
 impl Terminator {
@@ -415,6 +424,9 @@ impl Terminator {
             Terminator::DecrJumpZero {
                 if_zero, if_more, ..
             } => vec![if_zero, if_more],
+            Terminator::IfPos {
+                if_pos, if_rest, ..
+            } => vec![if_pos, if_rest],
             Terminator::Ret { .. } | Terminator::Exit(_) => Vec::new(),
         }
     }
@@ -684,6 +696,17 @@ impl FuncBuilder {
             counter_reg,
             if_zero,
             if_more,
+        });
+    }
+
+    /// Terminate the current block by testing an external counter
+    /// register: `if_pos` (decrementing it) while positive, `if_rest`
+    /// once it has run out.
+    pub fn if_pos(&mut self, counter_reg: usize, if_pos: JumpTarget, if_rest: JumpTarget) {
+        self.terminate(Terminator::IfPos {
+            counter_reg,
+            if_pos,
+            if_rest,
         });
     }
 

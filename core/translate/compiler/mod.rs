@@ -44,25 +44,26 @@ use crate::Result;
 
 /// Compile a whole simple-scan SELECT through the pipeline: one
 /// forward B-tree table scan with no index, filtering rows with
-/// IR-representable WHERE terms, projecting IR-representable result
-/// columns straight to result rows, and counting down LIMIT. This is
-/// the first row-stream integration:
-/// `scan(t).filter(where).map(projection).limit(n).consume(rows)` as a
-/// composed description replacing the eager
+/// IR-representable WHERE terms, skipping OFFSET rows, projecting
+/// IR-representable result columns straight to result rows, and
+/// counting down LIMIT. This is the first row-stream integration:
+/// `scan(t).filter(where).offset(m).map(projection).limit(n)` consumed
+/// into result rows as a composed description replacing the eager
 /// OpenLoop/LoopBody/CloseLoop sequencing. Cursors are opened by the
-/// (still eager) InitLoop and the LIMIT counter register is
+/// (still eager) InitLoop and the LIMIT/OFFSET counter registers are
 /// initialized by the (still eager) `init_limit`; the scan references
-/// both externally.
+/// all of them externally.
 ///
 /// Returns false (emitting nothing) for anything outside the gate:
-/// joins, indexes, aggregates, sorting, windows, DISTINCT, OFFSET,
-/// subqueries, virtual tables, WHERE terms the condition frontend
-/// cannot describe, or non-ResultRows destinations.
+/// joins, indexes, aggregates, sorting, windows, DISTINCT, subqueries,
+/// virtual tables, WHERE terms the condition frontend cannot describe,
+/// or non-ResultRows destinations.
 pub(crate) fn try_emit_scan_query(
     program: &mut ProgramBuilder,
     plan: &crate::translate::plan::SelectPlan,
     resolver: &crate::translate::emitter::Resolver,
     limit_ctx: Option<crate::translate::emitter::LimitCtx>,
+    reg_offset: Option<usize>,
 ) -> Result<bool> {
     use crate::schema::Table;
     use crate::translate::plan::{
@@ -74,7 +75,6 @@ pub(crate) fn try_emit_scan_query(
         || !plan.order_by.is_empty()
         || plan.window.is_some()
         || !matches!(plan.distinctness, Distinctness::NonDistinct)
-        || plan.offset.is_some()
         || !plan.non_from_clause_subqueries.is_empty()
         || plan.contains_constant_false_condition
         || !matches!(plan.query_destination, QueryDestination::ResultRows)
@@ -162,29 +162,43 @@ pub(crate) fn try_emit_scan_query(
         return Ok(false);
     };
 
-    // LIMIT's counter register was allocated, initialized, and
-    // zero-checked by the (still eager) init_limit; the loop only
-    // counts it down after each produced row.
+    // The LIMIT and OFFSET counter registers were allocated,
+    // initialized, and zero-checked by the (still eager) init_limit;
+    // the loop only counts them down — OFFSET per surviving row before
+    // the projection, LIMIT per produced row after it.
     let limit_counter = match (&plan.limit, limit_ctx) {
         (Some(_), Some(limit_ctx)) => Some(limit_ctx.reg_limit),
         (Some(_), None) => return Ok(false),
         (None, _) => None,
     };
+    let offset_counter = match (&plan.offset, reg_offset) {
+        (Some(_), Some(reg)) => Some(reg),
+        (Some(_), None) => return Ok(false),
+        (None, _) => None,
+    };
 
-    // The scan_loop shape with an optional filter stage spliced between
-    // the scan and the projection: rows failing (or NULLing) the filter
-    // jump straight to the latch, exactly the eager per-loop
-    // ConditionMetadata contract (false == NULL == next row). With a
-    // LIMIT, each produced row counts the external counter down and
-    // leaves the loop at zero. The done continuation is an empty exit
-    // block, bypassed at emission, so the loop needs no trailing block
-    // of its own.
+    // The scan_loop shape with optional filter and offset stages
+    // spliced between the scan and the projection: rows failing (or
+    // NULLing) the filter jump straight to the latch, exactly the
+    // eager per-loop ConditionMetadata contract (false == NULL == next
+    // row), and surviving rows drain the OFFSET counter toward the
+    // latch before anything is projected. With a LIMIT, each produced
+    // row counts the external counter down and leaves the loop at
+    // zero. The done continuation is an empty exit block, bypassed at
+    // emission, so the loop needs no trailing block of its own.
     let fallthrough = program.allocate_label();
     let mut builder = ir::FuncBuilder::new();
     let done_exit = builder.declare_exit();
     let done = builder.exit_block(done_exit);
     let body = builder.create_block();
-    let row = filter.as_ref().map(|_| builder.create_block());
+    // The offset check needs a block of its own only when a filter
+    // must jump into it; the projection needs one whenever any stage
+    // precedes it.
+    let offset_check = match (&filter, offset_counter) {
+        (Some(_), Some(_)) => Some(builder.create_block()),
+        _ => None,
+    };
+    let row = (filter.is_some() || offset_counter.is_some()).then(|| builder.create_block());
     let latch = builder.create_block();
     builder.rewind(
         cursor,
@@ -193,15 +207,26 @@ pub(crate) fn try_emit_scan_query(
     );
     builder.switch_to(body);
     if let Some(filter) = filter {
-        let row = row.expect("row block created alongside the filter");
+        let pass = offset_check
+            .or(row)
+            .expect("filter stage always has a successor block");
         filter.run(
             &mut builder,
             combine::CondTargets {
-                if_true: row,
+                if_true: pass,
                 if_false: latch,
                 if_null: latch,
             },
         )?;
+        builder.switch_to(pass);
+    }
+    if let Some(counter_reg) = offset_counter {
+        let row = row.expect("offset stage always has a projection block");
+        builder.if_pos(
+            counter_reg,
+            ir::JumpTarget::new(latch, Vec::new()),
+            ir::JumpTarget::new(row, Vec::new()),
+        );
         builder.switch_to(row);
     }
     let mut values = Vec::with_capacity(columns.len());
@@ -1626,6 +1651,69 @@ mod tests {
             insns[..]
         else {
             panic!("unexpected limited scan shape: {insns:?}");
+        };
+    }
+
+    #[test]
+    fn offset_scans_drain_the_counter_before_projecting() {
+        // scan(t).offset(m).map(x), the shape try_emit_scan_query
+        // builds for OFFSET: while the external counter (initialized
+        // by the still-eager init_limit) is positive, IfPos decrements
+        // it and skips to the latch; only then does the projection
+        // run — the eager IfPos-before-columns sequence.
+        let column_leaf = parse_expr("x");
+        let mut builder = FuncBuilder::new();
+        let done_exit = builder.declare_exit();
+        let done = builder.exit_block(done_exit);
+        let body = builder.create_block();
+        let row = builder.create_block();
+        let latch = builder.create_block();
+        builder.rewind(
+            0,
+            JumpTarget::new(done, Vec::new()),
+            JumpTarget::new(body, Vec::new()),
+        );
+        builder.switch_to(body);
+        builder.if_pos(
+            9,
+            JumpTarget::new(latch, Vec::new()),
+            JumpTarget::new(row, Vec::new()),
+        );
+        builder.switch_to(row);
+        let projected = builder.leaf(&column_leaf);
+        builder.emit_row(vec![projected]);
+        builder.jump(latch, Vec::new());
+        builder.switch_to(latch);
+        builder.next_row(
+            0,
+            JumpTarget::new(body, Vec::new()),
+            JumpTarget::new(done, Vec::new()),
+        );
+        let func = builder.finish();
+        verify(&func).unwrap();
+
+        let mut program = test_program();
+        let fallthrough = program.allocate_label();
+        let mut leaf_emitter = stub_leaf_emitter();
+        emit::emit_condition_function(
+            &mut program,
+            &func,
+            &[fallthrough],
+            Some(fallthrough),
+            Some(&mut leaf_emitter),
+        )
+        .unwrap();
+        program.preassign_label_to_next_insn(fallthrough);
+        program.resolve_labels().unwrap();
+        let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
+        let [Insn::Rewind { cursor_id: 0, .. }, Insn::IfPos {
+            reg: 9,
+            decrement_by: 1,
+            ..
+        }, Insn::Integer { value: 7, .. }, Insn::ResultRow { count: 1, .. }, Insn::Next { cursor_id: 0, .. }] =
+            insns[..]
+        else {
+            panic!("unexpected offset scan shape: {insns:?}");
         };
     }
 

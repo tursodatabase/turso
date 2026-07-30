@@ -234,7 +234,8 @@ impl<'a> Emitter<'a> {
                     Terminator::Ret { value } => count(value),
                     Terminator::Rewind { .. }
                     | Terminator::Next { .. }
-                    | Terminator::DecrJumpZero { .. } => {}
+                    | Terminator::DecrJumpZero { .. }
+                    | Terminator::IfPos { .. } => {}
                 }
                 for target in terminator.targets() {
                     target.args.iter().for_each(&mut count);
@@ -836,6 +837,27 @@ impl<'a> Emitter<'a> {
                 });
                 self.emit_edge(if_more);
                 self.emit_goto_unless_next(if_more.block, next, trampolines.is_empty());
+                for (label, target) in trampolines {
+                    self.program.preassign_label_to_next_insn(label);
+                    self.emit_edge(&target);
+                    let pc = self.jump_target_pc(target.block);
+                    self.program.emit_insn(Insn::Goto { target_pc: pc });
+                }
+            }
+            Terminator::IfPos {
+                counter_reg,
+                if_pos,
+                if_rest,
+            } => {
+                let mut trampolines: Vec<(BranchOffset, JumpTarget)> = Vec::new();
+                let target_pc = self.edge_entry_pc(if_pos, &mut trampolines);
+                self.program.emit_insn(Insn::IfPos {
+                    reg: *counter_reg,
+                    target_pc,
+                    decrement_by: 1,
+                });
+                self.emit_edge(if_rest);
+                self.emit_goto_unless_next(if_rest.block, next, trampolines.is_empty());
                 for (label, target) in trampolines {
                     self.program.preassign_label_to_next_insn(label);
                     self.emit_edge(&target);

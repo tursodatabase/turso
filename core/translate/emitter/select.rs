@@ -247,6 +247,7 @@ pub fn emit_query<'a>(
         plan,
         &t_ctx.resolver,
         t_ctx.limit_ctx,
+        t_ctx.reg_offset,
     )? {
         program.preassign_label_to_next_insn(after_main_loop_label);
         return Ok(t_ctx.reg_result_cols_start.unwrap());

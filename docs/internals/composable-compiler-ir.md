@@ -400,8 +400,18 @@ boundary (the whole tree is constant, so the span opened by
       instruction-identical to eager (ResultRow / DecrJumpZero / Next).
       OFFSET stays gated out (needs the IfPos row-skip before the
       projection).
-- [ ] 4a-4. OFFSET in the scan gate (IfPos skip-and-decrement before
-      the projection, same external-counter pattern).
+- [x] 4a-4. OFFSET in the scan gate: `Terminator::IfPos { counter_reg,
+      if_pos, if_rest }` drains the external offset counter (also
+      init_limit-owned) toward the latch before the projection —
+      filter and offset are now optional stages in the inline loop
+      (body -> [filter] -> [offset check] -> row -> latch), each
+      getting its own block only when a preceding stage must jump into
+      it. WHERE + LIMIT + OFFSET scans emit instruction-identical
+      bytecode to eager (Le -> Next, IfPos -> Next, projection,
+      ResultRow, DecrJumpZero). The simple-scan gate is now
+      structurally complete for single-table forward scans; what
+      remains outside it is plan-shaped (indexes, joins, aggregates,
+      ORDER BY, DISTINCT, subqueries, non-ResultRows destinations).
 - [ ] 4b. Joins, aggregates, sorters, subqueries as stream operators;
       `emitter/` + `main_loop/` sequencing becomes tree lowering.
 - [ ] 4c. Shrink and remove the eager-emission fallback per construct.
