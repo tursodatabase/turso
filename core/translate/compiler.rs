@@ -932,6 +932,55 @@ impl Terminator {
             }
         }
     }
+
+    fn remap_blocks(&mut self, remap: &[Option<BlockId>]) -> Result<()> {
+        let remap_target = |target: &mut BlockId| -> Result<()> {
+            *target = remap
+                .get(target.index())
+                .copied()
+                .flatten()
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "reachable compiler IR block targets removed block {target:?}"
+                    ))
+                })?;
+            Ok(())
+        };
+        match self {
+            Self::Jump { target, .. } => remap_target(target),
+            Self::Branch {
+                if_true, if_false, ..
+            } => {
+                remap_target(if_true)?;
+                remap_target(if_false)
+            }
+            Self::Compare {
+                if_true,
+                if_false,
+                if_null,
+                ..
+            } => {
+                remap_target(if_true)?;
+                remap_target(if_false)?;
+                remap_target(if_null)
+            }
+            Self::CursorRewind {
+                if_non_empty,
+                if_empty,
+                ..
+            } => {
+                remap_target(if_non_empty)?;
+                remap_target(if_empty)
+            }
+            Self::CursorNext {
+                if_next, if_done, ..
+            } => {
+                remap_target(if_next)?;
+                remap_target(if_done)
+            }
+            Self::Return(_) => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -957,6 +1006,7 @@ pub(crate) struct IrBuilder {
     input_count: u32,
     cursor_input_count: u32,
     cursor_resources: SmallVec<[CursorResource; 2]>,
+    parameter_declarations: SmallVec<[Variable; 2]>,
 }
 
 impl IrBuilder {
@@ -973,6 +1023,7 @@ impl IrBuilder {
             input_count: 0,
             cursor_input_count: 0,
             cursor_resources: SmallVec::new(),
+            parameter_declarations: SmallVec::new(),
         }
     }
 
@@ -1018,6 +1069,9 @@ impl IrBuilder {
         }
         if let Some(cursor) = op.cursor() {
             self.ensure_cursor_declared(cursor)?;
+        }
+        if let ScalarOp::Parameter(variable) = &op {
+            self.parameter_declarations.push(variable.clone());
         }
         let result = self.allocate_value()?;
         self.blocks[self.current.index()]
@@ -1131,6 +1185,7 @@ impl IrBuilder {
             input_count: self.input_count,
             cursor_input_count: self.cursor_input_count,
             cursor_resources: self.cursor_resources,
+            parameter_declarations: self.parameter_declarations,
         };
         program.verify()?;
         Ok(program)
@@ -1151,6 +1206,7 @@ pub(crate) struct IrProgram {
     input_count: u32,
     cursor_input_count: u32,
     cursor_resources: SmallVec<[CursorResource; 2]>,
+    parameter_declarations: SmallVec<[Variable; 2]>,
 }
 
 impl IrProgram {
@@ -1163,21 +1219,17 @@ impl IrProgram {
 
         let block_count = self.blocks.len();
         let mut definitions = vec![None; self.value_count as usize];
-        let mut inputs = vec![false; self.input_count as usize];
-        let mut cursor_inputs = vec![false; self.cursor_input_count as usize];
         let mut cursor_definitions = vec![None; self.cursor_resources.len()];
-        let mut cursor_uses = vec![false; self.cursor_resources.len()];
         let mut predecessors = vec![Vec::new(); block_count];
         let mut return_count = 0;
 
         for (index, resource) in self.cursor_resources.iter().enumerate() {
             if let CursorResource::External(input) = resource {
-                let Some(used) = cursor_inputs.get_mut(input.index()) else {
+                if input.index() >= self.cursor_input_count as usize {
                     return Err(LimboError::InternalError(format!(
                         "compiler IR references out-of-range cursor input {input:?}"
                     )));
-                };
-                *used = true;
+                }
                 cursor_definitions[index] = Some(Definition {
                     block: BlockId(0),
                     instruction: None,
@@ -1213,12 +1265,11 @@ impl IrProgram {
                 }
                 if let Instruction::Value { result, op } = instruction {
                     if let ScalarOp::Input(input) = op {
-                        let Some(used) = inputs.get_mut(input.index()) else {
+                        if input.index() >= self.input_count as usize {
                             return Err(LimboError::InternalError(format!(
                                 "compiler IR references out-of-range input {input:?}"
                             )));
-                        };
-                        *used = true;
+                        }
                     }
                     Self::record_definition(
                         &mut definitions,
@@ -1230,12 +1281,11 @@ impl IrProgram {
                     )?;
                 }
                 if let Some(cursor) = instruction.cursor_use() {
-                    let Some(used) = cursor_uses.get_mut(cursor.index()) else {
+                    if cursor.index() >= self.cursor_resources.len() {
                         return Err(LimboError::InternalError(format!(
                             "compiler IR references out-of-range cursor {cursor:?}"
                         )));
-                    };
-                    *used = true;
+                    }
                 }
                 if let Some(cursor) = instruction.cursor_definition() {
                     let Some(resource) = self.cursor_resources.get(cursor.index()) else {
@@ -1276,43 +1326,17 @@ impl IrProgram {
                 predecessors[target.id.index()].push(block.id);
             }
             if let Some(cursor) = block.terminator.cursor() {
-                let Some(used) = cursor_uses.get_mut(cursor.index()) else {
+                if cursor.index() >= self.cursor_resources.len() {
                     return Err(LimboError::InternalError(format!(
                         "compiler IR references out-of-range cursor {cursor:?}"
                     )));
-                };
-                *used = true;
+                }
             }
             if matches!(block.terminator, Terminator::Return(_)) {
                 return_count += 1;
             }
         }
 
-        if let Some(missing) = definitions.iter().position(Option::is_none) {
-            return Err(LimboError::InternalError(format!(
-                "compiler IR value %{missing} has no definition"
-            )));
-        }
-        if let Some(missing) = inputs.iter().position(|used| !used) {
-            return Err(LimboError::InternalError(format!(
-                "compiler IR input @{missing} is not referenced"
-            )));
-        }
-        if let Some(missing) = cursor_inputs.iter().position(|used| !used) {
-            return Err(LimboError::InternalError(format!(
-                "compiler IR cursor input &{missing} is not referenced"
-            )));
-        }
-        if let Some(missing) = cursor_definitions.iter().position(Option::is_none) {
-            return Err(LimboError::InternalError(format!(
-                "compiler IR cursor ${missing} is not opened"
-            )));
-        }
-        if let Some(missing) = cursor_uses.iter().position(|used| !used) {
-            return Err(LimboError::InternalError(format!(
-                "compiler IR cursor ${missing} is not used"
-            )));
-        }
         if return_count != 1 {
             return Err(LimboError::InternalError(format!(
                 "compiler IR must have exactly one return, found {return_count}"
@@ -1417,6 +1441,120 @@ impl IrProgram {
             stack.extend(self.blocks[block.index()].terminator.successors());
         }
         reachable
+    }
+
+    /// Optimize a verified symbolic program before assigning physical resources.
+    fn optimize(mut self) -> Result<Self> {
+        self.verify()?;
+        if self.fold_constant_branches() {
+            self.remove_unreachable_blocks()?;
+        }
+        self.verify()?;
+        Ok(self)
+    }
+
+    /// Replace branches on direct constants with an unconditional edge.
+    ///
+    /// Deliberately do not evaluate other scalar operations here: doing so
+    /// requires preserving their coercion and error behavior exactly.
+    fn fold_constant_branches(&mut self) -> bool {
+        let mut constant_truth = vec![None; self.value_count as usize];
+        for block in &self.blocks {
+            for instruction in &block.instructions {
+                if let Instruction::Value {
+                    result,
+                    op: ScalarOp::Constant(value),
+                } = instruction
+                {
+                    constant_truth[result.index()] =
+                        Some(Numeric::from_value(value).is_some_and(|numeric| numeric.to_bool()));
+                }
+            }
+        }
+
+        let replacements = self
+            .blocks
+            .iter()
+            .map(|block| match &block.terminator {
+                Terminator::Branch {
+                    condition,
+                    if_true,
+                    if_false,
+                } => constant_truth[condition.index()].map(|condition| {
+                    if condition {
+                        *if_true
+                    } else {
+                        *if_false
+                    }
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if replacements.iter().all(Option::is_none) {
+            return false;
+        }
+
+        // A scalar region promises one eventual result. If folding every known
+        // branch would make that return unreachable (for example, a constant
+        // true loop), retain the original control flow rather than turning a
+        // valid region into IR that cannot be lowered.
+        let return_block = self
+            .blocks
+            .iter()
+            .position(|block| matches!(block.terminator, Terminator::Return(_)))
+            .expect("verified compiler IR has exactly one return");
+        let mut reachable = vec![false; self.blocks.len()];
+        let mut stack = vec![BlockId(0)];
+        while let Some(block) = stack.pop() {
+            if reachable[block.index()] {
+                continue;
+            }
+            reachable[block.index()] = true;
+            if let Some(target) = replacements[block.index()] {
+                stack.push(target);
+            } else {
+                stack.extend(self.blocks[block.index()].terminator.successors());
+            }
+        }
+        if !reachable[return_block] {
+            return false;
+        }
+
+        for (block, replacement) in self.blocks.iter_mut().zip(replacements) {
+            if let Some(target) = replacement {
+                block.terminator = Terminator::Jump {
+                    target,
+                    arguments: SmallVec::new(),
+                };
+            }
+        }
+        true
+    }
+
+    /// Remove blocks no longer reachable from the entry block and canonicalize
+    /// the remaining block identifiers. Value and resource identifiers remain
+    /// stable arena indices, so optimization is allowed to leave unused slots.
+    fn remove_unreachable_blocks(&mut self) -> Result<()> {
+        let reachable = self.reachable_blocks();
+        if reachable.iter().all(|reachable| *reachable) {
+            return Ok(());
+        }
+
+        let mut remap = vec![None; self.blocks.len()];
+        let mut next_block = 0;
+        for block in &self.blocks {
+            if reachable[block.id.index()] {
+                remap[block.id.index()] = Some(BlockId(next_block));
+                next_block += 1;
+            }
+        }
+
+        self.blocks.retain(|block| reachable[block.id.index()]);
+        for block in &mut self.blocks {
+            block.id = remap[block.id.index()].expect("retained block has a remapped id");
+            block.terminator.remap_blocks(&remap)?;
+        }
+        Ok(())
     }
 
     fn compute_dominators(predecessors: &[Vec<BlockId>]) -> Vec<Vec<bool>> {
@@ -1554,13 +1692,13 @@ impl IrProgram {
 
     /// Bind symbolic values and cursors, then lower the region.
     pub(crate) fn lower_into_with_resources(
-        self,
+        mut self,
         program: &mut ProgramBuilder,
         target_register: usize,
         input_registers: &[usize],
         cursor_ids: &[usize],
     ) -> Result<LoweredRegion> {
-        self.verify()?;
+        self = self.optimize()?;
         if input_registers.len() != self.input_count as usize {
             return Err(LimboError::InternalError(format!(
                 "compiler IR expects {} inputs, received {}",
@@ -1583,6 +1721,9 @@ impl IrProgram {
             return Err(LimboError::InternalError(format!(
                 "compiler IR physical cursor {cursor} is not allocated"
             )));
+        }
+        for variable in &self.parameter_declarations {
+            program.register_variable(variable);
         }
         let physical_cursors = self
             .cursor_resources
@@ -3344,6 +3485,111 @@ mod tests {
     }
 
     #[test]
+    fn optimizer_folds_constant_branches_and_removes_unreachable_blocks() {
+        let compiler = constant(Value::from_i64(1))
+            .branch(constant(Value::from_i64(10)), constant(Value::from_i64(20)));
+
+        let ir = compile_scalar(compiler).unwrap().optimize().unwrap();
+
+        assert_eq!(
+            ir.to_string(),
+            concat!(
+                "block0:\n",
+                "  %0 = constant Numeric(Integer(1))\n",
+                "  jump block1()\n",
+                "\n",
+                "block1:\n",
+                "  %1 = constant Numeric(Integer(10))\n",
+                "  jump block2(%1)\n",
+                "\n",
+                "block2(%2):\n",
+                "  return %2\n",
+            )
+        );
+    }
+
+    #[test]
+    fn constant_branch_folding_uses_vdbe_truthiness() {
+        for (condition, expected_target) in [
+            (Value::Null, BlockId(2)),
+            (Value::Text("0".into()), BlockId(2)),
+            (Value::Text("2".into()), BlockId(1)),
+        ] {
+            let compiler = constant(condition).branch(constant(Value::Null), constant(Value::Null));
+            let mut ir = compile_scalar(compiler).unwrap();
+
+            assert!(ir.fold_constant_branches());
+            assert!(matches!(
+                ir.blocks[0].terminator,
+                Terminator::Jump { target, .. } if target == expected_target
+            ));
+        }
+    }
+
+    #[test]
+    fn optimizer_retains_a_constant_branch_that_guards_the_only_return() {
+        let compiler =
+            constant(Value::from_i64(0)).loop_while(|_| constant(Value::from_i64(1)), pure);
+
+        let ir = compile_scalar(compiler).unwrap().optimize().unwrap();
+
+        assert!(ir.to_string().contains("branch"));
+    }
+
+    #[test]
+    fn lowering_pruned_parameter_branches_preserves_bind_slots() {
+        let compiler = constant(Value::from_i64(1)).branch(
+            constant(Value::from_i64(10)),
+            parameter(Variable::indexed(1.try_into().unwrap())),
+        );
+        let ir = compile_scalar(compiler).unwrap();
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 3, 0));
+
+        ir.lower_into(&mut program, 7).unwrap();
+
+        assert_eq!(program.parameters.count(), 1);
+        assert!(program
+            .insns
+            .iter()
+            .all(|(insn, _)| !matches!(insn, Insn::Variable { .. } | Insn::IfNot { .. })));
+    }
+
+    #[test]
+    fn optimization_preserves_external_input_bindings() {
+        let compiler = constant(Value::from_i64(1))
+            .branch(constant(Value::from_i64(10)), input(InputId::new(0)));
+        let ir = compile_scalar(compiler).unwrap();
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 3, 0));
+
+        let error = ir.lower_into(&mut program, 7).unwrap_err();
+
+        assert!(error.to_string().contains("expects 1 inputs, received 0"));
+        assert!(program.insns.is_empty());
+    }
+
+    #[test]
+    fn optimizer_keeps_parameter_control_flow_dynamic() {
+        let compiler = parameter(Variable::indexed(1.try_into().unwrap()))
+            .branch(constant(Value::from_i64(10)), constant(Value::from_i64(20)));
+        let ir = compile_scalar(compiler).unwrap();
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 3, 0));
+
+        ir.lower_into(&mut program, 7).unwrap();
+
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Variable { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::IfNot { .. })));
+    }
+
+    #[test]
     fn loop_carries_a_value_through_a_header_parameter() {
         let compiler = constant(Value::from_i64(3)).loop_while(pure, |state| {
             constant(Value::from_i64(-1)).and_then(move |step| add(state, step))
@@ -3598,7 +3844,11 @@ mod tests {
             .iter()
             .filter(|(insn, _)| matches!(insn, Insn::Goto { .. }))
             .count();
-        assert_eq!(goto_count, 7);
+        assert_eq!(goto_count, 5);
+        assert!(program
+            .insns
+            .iter()
+            .all(|(insn, _)| !matches!(insn, Insn::IfNot { .. })));
     }
 
     #[test]
@@ -3710,10 +3960,37 @@ mod tests {
             input_count: 0,
             cursor_input_count: 0,
             cursor_resources: SmallVec::new(),
+            parameter_declarations: SmallVec::new(),
         };
 
         let error = ir.verify().unwrap_err();
         assert!(error.to_string().contains("does not dominate"));
+    }
+
+    #[test]
+    fn verifier_rejects_a_used_hole_in_the_value_arena() {
+        let ir = IrProgram {
+            blocks: smallvec![BasicBlock {
+                id: BlockId(0),
+                parameters: SmallVec::new(),
+                instructions: smallvec![Instruction::Value {
+                    result: ValueId(0),
+                    op: ScalarOp::Constant(Value::Null),
+                }],
+                terminator: Terminator::Return(ValueId(1)),
+            }],
+            value_count: 2,
+            input_count: 0,
+            cursor_input_count: 0,
+            cursor_resources: SmallVec::new(),
+            parameter_declarations: SmallVec::new(),
+        };
+
+        let error = ir.verify().unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("uses undefined value ValueId(1)"));
     }
 
     #[test]
@@ -3767,6 +4044,7 @@ mod tests {
             input_count: 0,
             cursor_input_count: 0,
             cursor_resources: SmallVec::new(),
+            parameter_declarations: SmallVec::new(),
         };
 
         let error = ir.verify().unwrap_err();
@@ -3876,6 +4154,7 @@ mod tests {
             input_count: 0,
             cursor_input_count: 0,
             cursor_resources: SmallVec::new(),
+            parameter_declarations: SmallVec::new(),
         };
 
         let error = ir.verify().unwrap_err();

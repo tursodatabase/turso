@@ -31,6 +31,25 @@ result register.
 - Optimizations must preserve SQL evaluation frequency, error ordering,
   volatility, and three-valued boolean semantics.
 
+## Optimization boundary
+
+Lowering consumes optimized, re-verified IR rather than the graph produced
+directly by compiler combinators. The initial pass folds branches whose
+condition is a direct constant and removes blocks that become unreachable. It
+uses the same numeric coercion as VDBE `IfNot`, including treating `NULL` as
+false. It intentionally does not evaluate comparisons, arithmetic, integer
+coercions, or other operations whose errors and SQL semantics need dedicated
+analysis.
+
+Optimization runs before registers, cursors, labels, or instruction offsets are
+assigned. Surviving value and resource identifiers remain stable arena indices,
+so removed definitions may leave unused slots; the verifier still rejects every
+used undefined value or unopened cursor and rechecks dominance on the rewritten
+graph. Statement parameter declarations are interface metadata rather than
+runtime value instructions. A parameter occurring only in a removed branch
+therefore still creates its bind slot, while its VDBE `Variable` instruction is
+not emitted.
+
 ## Migration plan
 
 1. Introduce the deferred compiler interface and a straight-line scalar IR.
