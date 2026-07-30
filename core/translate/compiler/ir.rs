@@ -17,6 +17,8 @@ use std::collections::HashMap;
 use turso_parser::ast;
 
 use crate::function::FuncCtx;
+use crate::translate::collate::CollationSeq;
+use crate::vdbe::affinity::Affinity;
 
 /// A symbolic SSA value. Defined exactly once, either by an instruction or
 /// as a block parameter; mapped to a physical register only at emission.
@@ -104,6 +106,40 @@ pub enum BinOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeafId(u32);
 
+/// A SQL comparison operator with three-valued result semantics: the
+/// value form produces 1, 0, or NULL (NULL when either operand is NULL).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// Handle to a comparison payload ([`CmpData`]). `Affinity` is not
+/// `Eq`/`Hash`, so comparison payloads live in a side table like call
+/// payloads do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CmpId(u32);
+
+impl CmpId {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Payload of an [`Inst::Compare`]: affinity and collation are part of
+/// the operation, captured at description time — never read from ambient
+/// state during emission.
+#[derive(Debug, Clone)]
+pub struct CmpData {
+    pub op: CmpOp,
+    pub affinity: Affinity,
+    pub collation: Option<CollationSeq>,
+}
+
 /// Handle to a function-call payload ([`CallData`]). `FuncCtx` is neither
 /// `Eq` nor `Hash`, so call payloads live in a side table and each call
 /// site gets a fresh id — calls are never interned or deduplicated.
@@ -150,6 +186,14 @@ pub enum Inst {
     Call {
         call: CallId,
         args: Vec<ValueId>,
+    },
+    /// A three-valued comparison in value position (result 1/0/NULL).
+    /// Emission expands it to the eager idiom: assume-true, conditional
+    /// jump, `ZeroOrNull` — with labels invented by the backend.
+    Compare {
+        cmp: CmpId,
+        lhs: ValueId,
+        rhs: ValueId,
     },
     /// A value that already lives in a physical register owned by code
     /// outside this function (the eager translation surrounding an IR
@@ -238,6 +282,8 @@ pub struct Function {
     leaves: Vec<ast::Expr>,
     /// Payloads backing [`Inst::Call`] instructions.
     calls: Vec<CallData>,
+    /// Payloads backing [`Inst::Compare`] instructions.
+    cmps: Vec<CmpData>,
 }
 
 impl Function {
@@ -264,6 +310,10 @@ impl Function {
     pub fn num_calls(&self) -> usize {
         self.calls.len()
     }
+
+    pub fn cmp_data(&self, id: CmpId) -> &CmpData {
+        &self.cmps[id.0 as usize]
+    }
 }
 
 /// Builds a [`Function`] one block at a time. The builder has a *current*
@@ -277,6 +327,7 @@ pub struct FuncBuilder {
     interned: HashMap<Inst, ValueId>,
     leaves: Vec<ast::Expr>,
     calls: Vec<CallData>,
+    cmps: Vec<CmpData>,
 }
 
 impl FuncBuilder {
@@ -288,6 +339,7 @@ impl FuncBuilder {
             interned: HashMap::new(),
             leaves: Vec::new(),
             calls: Vec::new(),
+            cmps: Vec::new(),
         }
     }
 
@@ -385,6 +437,26 @@ impl FuncBuilder {
         self.push_inst(Inst::Call { call: id, args })
     }
 
+    /// A three-valued comparison in value position. Affinity and
+    /// collation are payloads of the operation, fixed at description
+    /// time.
+    pub fn compare(
+        &mut self,
+        op: CmpOp,
+        affinity: Affinity,
+        collation: Option<CollationSeq>,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> ValueId {
+        let id = CmpId(u32::try_from(self.cmps.len()).expect("cmp count fits in u32"));
+        self.cmps.push(CmpData {
+            op,
+            affinity,
+            collation,
+        });
+        self.push_inst(Inst::Compare { cmp: id, lhs, rhs })
+    }
+
     pub fn jump(&mut self, block: BlockId, args: Vec<ValueId>) {
         self.terminate(Terminator::Jump(JumpTarget::new(block, args)));
     }
@@ -414,6 +486,7 @@ impl FuncBuilder {
             defs: self.defs,
             leaves: self.leaves,
             calls: self.calls,
+            cmps: self.cmps,
         }
     }
 

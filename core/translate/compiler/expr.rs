@@ -27,7 +27,7 @@ use crate::util::{exprs_are_equivalent, parse_numeric_literal};
 use crate::{Numeric, Result, Value, ValueBlob};
 
 use super::combine::{self, Compiler};
-use super::ir::{BinOp, UnaryOp, ValueId};
+use super::ir::{BinOp, CmpOp, UnaryOp, ValueId};
 
 /// Static context the frontend needs to admit effectful leaves. Column
 /// and rowid reads are only representable when the table reference
@@ -180,12 +180,20 @@ pub(crate) fn compile_value_expr<'a>(
             }
         },
         ast::Expr::Binary(lhs_expr, op, rhs_expr) => {
-            let Some(op) = value_binop(op) else {
+            enum Kind {
+                Value(BinOp),
+                Cmp(CmpOp),
+            }
+            let kind = if let Some(op) = value_binop(op) {
+                Kind::Value(op)
+            } else if let Some(op) = cmp_binop(op) {
+                Kind::Cmp(op)
+            } else {
                 return Ok(None);
             };
-            // Array concatenation emits ArrayConcat, not Concat; leave
-            // any array-typed operand to the eager path.
-            if matches!(op, BinOp::Concat)
+            // Array operands change instruction selection (ArrayConcat,
+            // array_cmp flags); leave both shapes to the eager path.
+            if matches!(kind, Kind::Value(BinOp::Concat) | Kind::Cmp(_))
                 && (crate::translate::expr::expr_is_array(lhs_expr, ctx.referenced_tables)
                     || crate::translate::expr::expr_is_array(rhs_expr, ctx.referenced_tables))
             {
@@ -197,24 +205,54 @@ pub(crate) fn compile_value_expr<'a>(
             let Some(rhs) = compile_value_expr(rhs_expr.as_ref(), ctx)? else {
                 return Ok(None);
             };
-            // The eager equivalent-operand branch translates the shared
-            // operand once and never writes the collation state; the
-            // general branch always overwrites it with the merge result.
-            let effect = if exprs_are_equivalent(lhs_expr, rhs_expr) {
-                lhs.effect
-            } else {
-                CollationEffect::Sets(merge_collation(
-                    lhs.effect.contribution(),
-                    rhs.effect.contribution(),
-                ))
-            };
-            Some(Built {
-                compiler: lhs
-                    .compiler
-                    .then(rhs.compiler)
-                    .map_with(move |builder, (lhs, rhs)| Ok(builder.binary(op, lhs, rhs))),
-                effect,
-            })
+            match kind {
+                Kind::Value(op) => {
+                    // The eager equivalent-operand branch translates the
+                    // shared operand once and never writes the collation
+                    // state; the general branch always overwrites it with
+                    // the merge result.
+                    let effect = if exprs_are_equivalent(lhs_expr, rhs_expr) {
+                        lhs.effect
+                    } else {
+                        CollationEffect::Sets(merge_collation(
+                            lhs.effect.contribution(),
+                            rhs.effect.contribution(),
+                        ))
+                    };
+                    Some(Built {
+                        compiler: lhs
+                            .compiler
+                            .then(rhs.compiler)
+                            .map_with(move |builder, (lhs, rhs)| Ok(builder.binary(op, lhs, rhs))),
+                        effect,
+                    })
+                }
+                Kind::Cmp(op) => {
+                    // Affinity and collation are payloads of the
+                    // comparison, resolved here at description time the
+                    // same way the eager path resolves them at emission
+                    // time (`comparison_affinity` + the operand collation
+                    // merge). Comparisons consume the collation context:
+                    // the eager path resets it after emitting.
+                    let affinity = crate::translate::expr::comparison_affinity(
+                        lhs_expr,
+                        rhs_expr,
+                        ctx.referenced_tables,
+                        ctx.resolver,
+                    );
+                    let collation =
+                        merge_collation(lhs.effect.contribution(), rhs.effect.contribution())
+                            .map(|(collation, _)| collation);
+                    Some(Built {
+                        compiler: lhs.compiler.then(rhs.compiler).map_with(
+                            move |builder, (lhs, rhs)| {
+                                Ok(builder.compare(op, affinity, collation, lhs, rhs))
+                            },
+                        ),
+                        effect: CollationEffect::Sets(None),
+                    })
+                }
+            }
         }
         ast::Expr::FunctionCall {
             name,
@@ -442,6 +480,20 @@ const fn value_binop(op: &ast::Operator) -> Option<BinOp> {
         ast::Operator::LeftShift => BinOp::ShiftLeft,
         ast::Operator::RightShift => BinOp::ShiftRight,
         ast::Operator::Concat => BinOp::Concat,
+        _ => return None,
+    })
+}
+
+/// The six ordinary comparisons. IS/IS NOT (null-equality semantics) and
+/// LIKE/GLOB (function calls in disguise) stay on the eager path.
+const fn cmp_binop(op: &ast::Operator) -> Option<CmpOp> {
+    Some(match op {
+        ast::Operator::Equals => CmpOp::Eq,
+        ast::Operator::NotEquals => CmpOp::Ne,
+        ast::Operator::Less => CmpOp::Lt,
+        ast::Operator::LessEquals => CmpOp::Le,
+        ast::Operator::Greater => CmpOp::Gt,
+        ast::Operator::GreaterEquals => CmpOp::Ge,
         _ => return None,
     })
 }

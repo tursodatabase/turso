@@ -14,11 +14,11 @@ use std::collections::HashSet;
 use turso_parser::ast;
 
 use crate::vdbe::builder::ProgramBuilder;
-use crate::vdbe::insn::Insn;
+use crate::vdbe::insn::{CmpInsFlags, Insn};
 use crate::vdbe::BranchOffset;
 use crate::{LimboError, Result};
 
-use super::ir::{BinOp, BlockId, Const, Function, Inst, JumpTarget, Terminator, UnaryOp};
+use super::ir::{BinOp, BlockId, CmpOp, Const, Function, Inst, JumpTarget, Terminator, UnaryOp};
 use super::verify::verify;
 
 /// Callback that emits an opaque leaf ([`Inst::Leaf`]) by materializing
@@ -123,7 +123,7 @@ impl<'a> Emitter<'a> {
             is_const[id] = match inst_of[id] {
                 Some(Inst::Const(_)) => true,
                 Some(Inst::Unary { operand, .. }) => is_const[operand.index()],
-                Some(Inst::Binary { lhs, rhs, .. }) => {
+                Some(Inst::Binary { lhs, rhs, .. }) | Some(Inst::Compare { lhs, rhs, .. }) => {
                     is_const[lhs.index()] && is_const[rhs.index()]
                 }
                 // Constant only when the frontend proved the whole call
@@ -150,7 +150,7 @@ impl<'a> Emitter<'a> {
                 match inst {
                     Inst::Const(_) | Inst::External { .. } | Inst::Leaf(_) => {}
                     Inst::Unary { operand, .. } => count(operand),
-                    Inst::Binary { lhs, rhs, .. } => {
+                    Inst::Binary { lhs, rhs, .. } | Inst::Compare { lhs, rhs, .. } => {
                         count(lhs);
                         count(rhs);
                     }
@@ -190,6 +190,7 @@ impl<'a> Emitter<'a> {
                             Inst::Const(_)
                                 | Inst::Unary { .. }
                                 | Inst::Binary { .. }
+                                | Inst::Compare { .. }
                                 | Inst::Call { .. }
                                 | Inst::Leaf(_)
                         )
@@ -272,6 +273,71 @@ impl<'a> Emitter<'a> {
                         )
                     })?;
                     emitter(self.program, expr, dest)?;
+                }
+                Inst::Compare { cmp, lhs, rhs } => {
+                    let lhs = self.reg_of(*lhs);
+                    let rhs = self.reg_of(*rhs);
+                    let dest = self.reg_of(value);
+                    let data = self.func.cmp_data(*cmp);
+                    let flags = CmpInsFlags::default().with_affinity(data.affinity);
+                    let collation = data.collation;
+                    let if_true_label = self.program.allocate_label();
+                    let jump = match data.op {
+                        CmpOp::Eq => Insn::Eq {
+                            lhs,
+                            rhs,
+                            target_pc: if_true_label,
+                            flags,
+                            collation,
+                        },
+                        CmpOp::Ne => Insn::Ne {
+                            lhs,
+                            rhs,
+                            target_pc: if_true_label,
+                            flags,
+                            collation,
+                        },
+                        CmpOp::Lt => Insn::Lt {
+                            lhs,
+                            rhs,
+                            target_pc: if_true_label,
+                            flags,
+                            collation,
+                        },
+                        CmpOp::Le => Insn::Le {
+                            lhs,
+                            rhs,
+                            target_pc: if_true_label,
+                            flags,
+                            collation,
+                        },
+                        CmpOp::Gt => Insn::Gt {
+                            lhs,
+                            rhs,
+                            target_pc: if_true_label,
+                            flags,
+                            collation,
+                        },
+                        CmpOp::Ge => Insn::Ge {
+                            lhs,
+                            rhs,
+                            target_pc: if_true_label,
+                            flags,
+                            collation,
+                        },
+                    };
+                    // The eager wrap_eval_jump_expr_zero_or_null idiom:
+                    // assume true, jump past the correction when the
+                    // comparison holds, otherwise 0 — or NULL when either
+                    // operand is NULL.
+                    self.program.emit_insn(Insn::Integer { value: 1, dest });
+                    self.program.emit_insn(jump);
+                    self.program.emit_insn(Insn::ZeroOrNull {
+                        rg1: lhs,
+                        rg2: rhs,
+                        dest,
+                    });
+                    self.program.preassign_label_to_next_insn(if_true_label);
                 }
                 Inst::Call { call, args } => {
                     let pack = self.call_packs[call.index()];

@@ -140,7 +140,8 @@ pub fn verify(func: &Function) -> Result<(), VerifyError> {
                 | super::ir::Inst::External { .. }
                 | super::ir::Inst::Leaf(_) => {}
                 super::ir::Inst::Unary { operand, .. } => check(*operand, index)?,
-                super::ir::Inst::Binary { lhs, rhs, .. } => {
+                super::ir::Inst::Binary { lhs, rhs, .. }
+                | super::ir::Inst::Compare { lhs, rhs, .. } => {
                     check(*lhs, index)?;
                     check(*rhs, index)?;
                 }

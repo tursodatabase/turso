@@ -211,9 +211,18 @@ boundary (the whole tree is constant, so the span opened by
       it, possibly with None" (columns, non-equivalent binaries, calls
       fold their args' effects in order); the integration hook just
       applies the effect.
-- [ ] 1e. Comparisons with affinity + collation payloads in value
-      position (`Insn::Eq/Ne/Lt/...`), `CmpInsFlags` captured at build
-      time.
+- [x] 1e. Comparisons in value position (`Inst::Compare` + `CmpData`
+      side table — `Affinity` is not `Eq`/`Hash`). Affinity
+      (`comparison_affinity`) and collation (operand contribution merge)
+      are captured into the payload at description time, never read from
+      ambient state at emission. The emitter expands each comparison to
+      the eager `wrap_eval_jump_expr_zero_or_null` idiom (assume-true,
+      conditional jump, `ZeroOrNull`) with backend-invented labels, and
+      constant comparisons hoist (the span machinery already supports
+      internal jumps). Comparisons set the collation effect to
+      `Sets(None)` (the eager post-comparison reset). Gates: IS/IS NOT
+      (null-equality), LIKE/GLOB, and array-typed operands stay eager.
+      Coverage: `=`, `<>`, `<`, `<=`, `>`, `>=`.
 
 ### Phase 2 — Conditions and short-circuit control
 

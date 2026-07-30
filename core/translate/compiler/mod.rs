@@ -235,11 +235,47 @@ mod tests {
     #[test]
     fn unsupported_shapes_fall_back_to_eager() {
         assert!(pipeline("x + 1").is_none());
-        assert!(pipeline("1 = 2").is_none());
+        // IS/IS NOT carry null-equality semantics; not in the IR yet.
+        assert!(pipeline("1 IS 2").is_none());
+        // Function calls need a resolver; NO_TABLES has none.
         assert!(pipeline("abs(-1)").is_none());
         assert!(pipeline("CURRENT_TIMESTAMP").is_none());
         assert!(pipeline("1 AND 2").is_none());
         assert!(pipeline("CAST(1 AS TEXT)").is_none());
+    }
+
+    #[test]
+    fn comparisons_expand_to_the_zero_or_null_idiom() {
+        let insns = pipeline("1 < 2").unwrap();
+        let [Insn::Integer {
+            value: 1,
+            dest: lhs_reg,
+        }, Insn::Integer {
+            value: 2,
+            dest: rhs_reg,
+        }, Insn::Integer {
+            value: 1,
+            dest: result,
+        }, Insn::Lt { lhs, rhs, .. }, Insn::ZeroOrNull {
+            rg1,
+            rg2,
+            dest: zdest,
+        }] = insns[..]
+        else {
+            panic!("expected comparison idiom, got {insns:?}");
+        };
+        assert_eq!((lhs, rhs), (lhs_reg, rhs_reg));
+        assert_eq!((rg1, rg2), (lhs_reg, rhs_reg));
+        assert_eq!(zdest, result);
+        // The whole comparison is constant and sits in one span.
+        assert!(matches!(
+            pipeline("1 = 2").unwrap()[..],
+            [.., Insn::ZeroOrNull { .. }]
+        ));
+        assert!(matches!(
+            pipeline("'a' >= 'b'").unwrap()[3],
+            Insn::Ge { .. }
+        ));
     }
 
     #[test]
