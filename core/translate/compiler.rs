@@ -1411,6 +1411,7 @@ pub(crate) struct ResolvedComparison {
     op: ComparisonOp,
     affinity: Affinity,
     collation: Option<CollationSeq>,
+    nulls_equal: bool,
 }
 
 pub(crate) const fn resolved_comparison(
@@ -1422,6 +1423,20 @@ pub(crate) const fn resolved_comparison(
         op,
         affinity,
         collation,
+        nulls_equal: false,
+    }
+}
+
+impl ResolvedComparison {
+    /// Compare NULL as an ordinary value, as required by SQL `IS` and
+    /// `IS NOT`, instead of producing a third NULL result.
+    pub(crate) fn with_null_equality(mut self) -> Self {
+        assert!(
+            matches!(self.op, ComparisonOp::Equal | ComparisonOp::NotEqual),
+            "NULL equality is valid only for equality comparisons"
+        );
+        self.nulls_equal = true;
+        self
     }
 }
 
@@ -1912,7 +1927,7 @@ enum Terminator {
         comparison: ResolvedComparison,
         if_true: BlockId,
         if_false: BlockId,
-        if_null: BlockId,
+        if_null: Option<BlockId>,
     },
     CursorStart {
         cursor: CursorId,
@@ -2011,7 +2026,7 @@ impl Terminator {
             } => [
                 Some((*if_true, &[][..])),
                 Some((*if_false, &[][..])),
-                Some((*if_null, &[][..])),
+                if_null.map(|if_null| (if_null, &[][..])),
             ],
             Self::CursorStart {
                 if_non_empty,
@@ -2256,7 +2271,10 @@ impl Terminator {
             } => {
                 remap_target(if_true)?;
                 remap_target(if_false)?;
-                remap_target(if_null)
+                if let Some(if_null) = if_null {
+                    remap_target(if_null)?;
+                }
+                Ok(())
             }
             Self::CursorStart {
                 if_non_empty,
@@ -3044,6 +3062,26 @@ impl IrProgram {
                             instruction: Some(instruction_index),
                         },
                     )?;
+                }
+            }
+            if let Terminator::Compare {
+                comparison,
+                if_null,
+                ..
+            } = &block.terminator
+            {
+                if comparison.nulls_equal != if_null.is_none() {
+                    return Err(LimboError::InternalError(
+                        "compiler IR comparison NULL policy disagrees with its control-flow edges"
+                            .to_owned(),
+                    ));
+                }
+                if comparison.nulls_equal
+                    && !matches!(comparison.op, ComparisonOp::Equal | ComparisonOp::NotEqual)
+                {
+                    return Err(LimboError::InternalError(
+                        "compiler IR NULL equality requires an equality comparison".to_owned(),
+                    ));
                 }
             }
             for (successor, arguments) in block.terminator.edges() {
@@ -4744,15 +4782,22 @@ impl IrProgram {
                         dst_reg: rhs,
                         extra_amount: 0,
                     });
-                    program.emit_insn(Insn::IsNull {
-                        reg: lhs,
-                        target_pc: labels[if_null.index()],
-                    });
-                    program.emit_insn(Insn::IsNull {
-                        reg: rhs,
-                        target_pc: labels[if_null.index()],
-                    });
-                    let flags = CmpInsFlags::default().with_affinity(comparison.affinity);
+                    if let Some(if_null) = if_null {
+                        program.emit_insn(Insn::IsNull {
+                            reg: lhs,
+                            target_pc: labels[if_null.index()],
+                        });
+                        program.emit_insn(Insn::IsNull {
+                            reg: rhs,
+                            target_pc: labels[if_null.index()],
+                        });
+                    }
+                    let flags = if comparison.nulls_equal {
+                        CmpInsFlags::default().null_eq()
+                    } else {
+                        CmpInsFlags::default()
+                    }
+                    .with_affinity(comparison.affinity);
                     let target_pc = labels[if_true.index()];
                     let collation = comparison.collation;
                     let instruction = match comparison.op {
@@ -5399,18 +5444,31 @@ impl fmt::Display for IrProgram {
                     if_true,
                     if_false,
                     if_null,
-                } => writeln!(
-                    f,
-                    "compare {:?} %{}, %{} affinity {:?} collation {:?}, block{}, block{}, block{}",
-                    comparison.op,
-                    lhs.0,
-                    rhs.0,
-                    comparison.affinity,
-                    comparison.collation,
-                    if_true.0,
-                    if_false.0,
-                    if_null.0,
-                )?,
+                } => match if_null {
+                    Some(if_null) => writeln!(
+                        f,
+                        "compare {:?} %{}, %{} affinity {:?} collation {:?}, block{}, block{}, block{}",
+                        comparison.op,
+                        lhs.0,
+                        rhs.0,
+                        comparison.affinity,
+                        comparison.collation,
+                        if_true.0,
+                        if_false.0,
+                        if_null.0,
+                    )?,
+                    None => writeln!(
+                        f,
+                        "compare {:?} %{}, %{} affinity {:?} collation {:?} nulls_equal, block{}, block{}",
+                        comparison.op,
+                        lhs.0,
+                        rhs.0,
+                        comparison.affinity,
+                        comparison.collation,
+                        if_true.0,
+                        if_false.0,
+                    )?,
+                },
                 Terminator::CursorStart {
                     cursor,
                     direction,
@@ -7553,7 +7611,11 @@ impl Compile for Compare {
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
         let if_true = builder.create_block()?;
         let if_false = builder.create_block()?;
-        let if_null = builder.create_block()?;
+        let if_null = if self.comparison.nulls_equal {
+            None
+        } else {
+            Some(builder.create_block()?)
+        };
         let merge = builder.create_block()?;
         let result = builder.add_block_parameter(merge)?;
 
@@ -7569,10 +7631,17 @@ impl Compile for Compare {
         for (block, value) in [
             (if_true, Value::from_i64(1)),
             (if_false, Value::from_i64(0)),
-            (if_null, Value::Null),
         ] {
             builder.switch_to(block)?;
             let value = builder.push(ScalarOp::Constant(value))?;
+            builder.terminate(Terminator::Jump {
+                target: merge,
+                arguments: smallvec![value],
+            })?;
+        }
+        if let Some(if_null) = if_null {
+            builder.switch_to(if_null)?;
+            let value = builder.push(ScalarOp::Constant(Value::Null))?;
             builder.terminate(Terminator::Jump {
                 target: merge,
                 arguments: smallvec![value],
@@ -7999,6 +8068,80 @@ mod tests {
                 "  return %2\n",
             )
         );
+    }
+
+    #[test]
+    fn null_safe_comparisons_have_no_third_control_flow_edge() {
+        let compiler = constant(Value::Null)
+            .then(constant(Value::Null))
+            .and_then(|(lhs, rhs)| {
+                compare(
+                    lhs,
+                    rhs,
+                    resolved_comparison(ComparisonOp::Equal, Affinity::Blob, None)
+                        .with_null_equality(),
+                )
+            });
+        let ir = compile_scalar(compiler).unwrap();
+
+        assert_eq!(
+            ir.to_string(),
+            concat!(
+                "block0:\n",
+                "  %0 = constant Null\n",
+                "  %1 = constant Null\n",
+                "  compare Equal %0, %1 affinity Blob collation None nulls_equal, block1, block2\n",
+                "\n",
+                "block1:\n",
+                "  %3 = constant Numeric(Integer(1))\n",
+                "  jump block3(%3)\n",
+                "\n",
+                "block2:\n",
+                "  %4 = constant Numeric(Integer(0))\n",
+                "  jump block3(%4)\n",
+                "\n",
+                "block3(%2):\n",
+                "  return %2\n",
+            )
+        );
+
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 3, 0));
+        ir.lower_into(&mut program, 7).unwrap();
+
+        assert!(program
+            .insns
+            .iter()
+            .all(|(insn, _)| !matches!(insn, Insn::IsNull { .. })));
+        assert!(program.insns.iter().any(|(insn, _)| matches!(
+            insn,
+            Insn::Eq { flags, .. } if flags.has_nulleq()
+        )));
+    }
+
+    #[test]
+    fn verifier_rejects_comparison_null_policy_edge_mismatches() {
+        let compiler = constant(Value::Null)
+            .then(constant(Value::Null))
+            .and_then(|(lhs, rhs)| {
+                compare(
+                    lhs,
+                    rhs,
+                    resolved_comparison(ComparisonOp::Equal, Affinity::Blob, None)
+                        .with_null_equality(),
+                )
+            });
+        let mut ir = compile_scalar(compiler).unwrap();
+        let Terminator::Compare { if_null, .. } = &mut ir.blocks[0].terminator else {
+            panic!("comparison compiler must terminate its entry with a comparison");
+        };
+        *if_null = Some(BlockId(1));
+
+        let error = ir.verify().unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("comparison NULL policy disagrees with its control-flow edges"));
     }
 
     #[test]

@@ -302,7 +302,11 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
         Ok(Some(ResolvedScalarExpr::Compare {
             lhs: Box::new(lhs_resolved),
             rhs: Box::new(rhs_resolved),
-            comparison: resolved_comparison(op, affinity, collation),
+            comparison: if matches!(operator, Operator::Is | Operator::IsNot) {
+                resolved_comparison(op, affinity, collation).with_null_equality()
+            } else {
+                resolved_comparison(op, affinity, collation)
+            },
         }))
     }
 
@@ -355,6 +359,8 @@ const fn comparison_op(operator: Operator) -> Option<ComparisonOp> {
     match operator {
         Operator::Equals => Some(ComparisonOp::Equal),
         Operator::NotEquals => Some(ComparisonOp::NotEqual),
+        Operator::Is => Some(ComparisonOp::Equal),
+        Operator::IsNot => Some(ComparisonOp::NotEqual),
         Operator::Less => Some(ComparisonOp::Less),
         Operator::LessEquals => Some(ComparisonOp::LessEqual),
         Operator::Greater => Some(ComparisonOp::Greater),

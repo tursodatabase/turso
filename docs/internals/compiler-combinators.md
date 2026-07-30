@@ -158,17 +158,20 @@ recursive descriptions: it bounds Rust monomorphization and generated symbol
 size without assigning registers, emitting VDBE instructions, or losing the
 typed item and result contracts visible to compiler authors.
 The production path preserves predicate and projection source order. Comparison
-affinity and collation are resolved by the SQL frontend before IR construction.
-The resulting terminator has separate true, false, and NULL successors; a
-comparison used as a value joins `1`, `0`, or `NULL` through a block parameter.
+affinity, collation, and NULL policy are resolved by the SQL frontend before IR
+construction. Ordinary comparison terminators have separate true, false, and
+NULL successors; a comparison used as a value joins `1`, `0`, or `NULL` through
+a block parameter. NULL-safe `IS` and `IS NOT` comparisons have only true and
+false successors and lower with the VDBE `NULL_EQ` policy, so `NULL IS NULL`
+produces true without inventing an unreachable third SSA edge.
 An ordered compiler combinator collects independently composed scalar values
 into a symbolic `ValuePack`; contiguous result registers are still chosen only
 during lowering. Searched `CASE` builds nested SSA diamonds, so only the chosen
 result arm executes and every arm joins as one value. Base-expression `CASE`
 still falls back until its per-`WHEN` affinity and collation rules are resolved.
 The path also falls back when SQL semantics still live in the eager frontend:
-other expression forms, `IS` comparisons, joins, aggregates, most subquery
-forms, generated values, arrays, and custom-type decoding.
+other expression forms, joins, aggregates, most subquery forms, generated
+values, arrays, and custom-type decoding.
 `EXPLAIN QUERY PLAN` also remains on the eager path until the IR models
 explain-tree effects.
 Ordinary column lowering does reuse the VDBE backend's logical-column helper, so

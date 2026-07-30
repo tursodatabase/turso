@@ -4159,6 +4159,50 @@ mod tests {
             vec![vec![Value::Text("beta".into())]]
         );
 
+        let mut null_safe_statement = connection
+            .prepare(
+                "SELECT n IS NULL, n IS NOT NULL, name FROM compared \
+                 WHERE name IS NULL OR n IS NULL",
+            )
+            .unwrap();
+        let null_safe_instructions = &null_safe_statement.get_program().insns;
+        let null_safe_result_row = null_safe_instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 3, .. }))
+            .expect("NULL-safe declarative projection must produce its row");
+        assert!(
+            null_safe_instructions[null_safe_result_row - 3..null_safe_result_row]
+                .iter()
+                .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })),
+            "NULL-safe expressions must remain symbolic until result-pack lowering"
+        );
+        assert!(null_safe_instructions
+            .iter()
+            .any(|(instruction, _)| matches!(
+                instruction,
+                Insn::Eq { flags, .. } if flags.has_nulleq()
+            )));
+        assert!(null_safe_instructions
+            .iter()
+            .any(|(instruction, _)| matches!(
+                instruction,
+                Insn::Ne { flags, .. } if flags.has_nulleq()
+            )));
+        assert!(null_safe_instructions
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::IsNull { .. })));
+        assert_eq!(
+            null_safe_statement.run_collect_rows().unwrap(),
+            vec![
+                vec![
+                    Value::from_i64(1),
+                    Value::from_i64(0),
+                    Value::Text("BETA".into()),
+                ],
+                vec![Value::from_i64(0), Value::from_i64(1), Value::Null],
+            ]
+        );
+
         connection
             .execute("CREATE TABLE expressions(a NUMERIC, b NUMERIC, name TEXT COLLATE NOCASE)")
             .unwrap();
