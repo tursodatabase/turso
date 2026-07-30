@@ -826,3 +826,45 @@ test alter-column-add-check-existing-rows-pass {
 expect {
     CREATE TABLE t (x INTEGER CHECK (x > 0))
 }
+
+# A CHECK added via ALTER COLUMN must be enforced on later writes.
+test fail-insert-check-violation-after-alter-column-add-check {
+    CREATE TABLE t (x INTEGER);
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER CHECK (x > 0);
+    INSERT INTO t VALUES (-1);
+}
+expect error {
+}
+
+test fail-update-check-violation-after-alter-column-add-check {
+    CREATE TABLE t (x INTEGER);
+    INSERT INTO t VALUES (5);
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER CHECK (x > 0);
+    UPDATE t SET x = -1;
+}
+expect error {
+}
+
+# Omitting the CHECK in the new definition drops it.
+test alter-column-drop-check {
+    CREATE TABLE t (x INTEGER CHECK (x > 0));
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+    INSERT INTO t VALUES (-1);
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT x FROM t;
+}
+expect {
+    CREATE TABLE t (x INTEGER)
+    -1
+}
+
+# A table-level CHECK does not belong to the column definition and must
+# survive an ALTER COLUMN on the column it references.
+test fail-alter-column-keeps-table-level-check {
+    CREATE TABLE t (x INTEGER, CHECK (x > 0));
+    INSERT INTO t VALUES (5);
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER DEFAULT 7;
+    INSERT INTO t VALUES (-1);
+}
+expect error {
+}

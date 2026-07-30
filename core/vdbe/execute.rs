@@ -15407,6 +15407,26 @@ pub fn op_alter_column(
             }
         } else {
             btree.columns_mut()[*column_index] = new_column.clone();
+
+            // The new definition replaces the old one completely, so drop the
+            // old column-level CHECK constraints and add the new ones.
+            btree.check_constraints.retain(|check| {
+                check
+                    .column
+                    .as_ref()
+                    .is_none_or(|col| !col.eq_ignore_ascii_case(&old_column_name))
+            });
+            for constraint in &definition.constraints {
+                if let ast::ColumnConstraint::Check(expr) = &constraint.constraint {
+                    btree
+                        .check_constraints
+                        .push(crate::schema::CheckConstraint::new(
+                            constraint.name.as_ref(),
+                            expr,
+                            new_column.name.as_deref(),
+                        ));
+                }
+            }
         }
 
         btree.prepare_generated_columns()?;
