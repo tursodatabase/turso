@@ -1098,7 +1098,10 @@ fn plan_cte(
                 cte_select: None,
                 cte_explicit_columns: vec![],
                 cte_id: Some(cte_definitions[referenced_cte_index].cte_id),
-                cte_definition_only: false,
+                // This entry only lets the body's FROM clause find the sibling
+                // CTE by name; its columns become visible when a FROM clause
+                // actually adds the table.
+                cte_definition_only: true,
                 rowid_referenced: false,
                 scope_depth: 0,
             });

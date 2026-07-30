@@ -1855,6 +1855,22 @@ expect error {
     multiple recursive references: w
 }
 
+# An unqualified column in a correlated subquery resolves against the
+# recursive self-reference like any other outer table.
+test recursive-cte-unqualified-correlated-ref-in-exists {
+    WITH RECURSIVE c(x) AS (
+        SELECT 1
+        UNION ALL
+        SELECT x + 1 FROM c WHERE x < 3 AND EXISTS (SELECT 1 WHERE x > 0)
+    )
+    SELECT * FROM c;
+}
+expect {
+    1
+    2
+    3
+}
+
 # GROUP BY makes the recursive term an aggregate query even without aggregate
 # functions; SQLite rejects it rather than producing non-monotonic results.
 test recursive-cte-group-by-in-recursive-term-rejected {
