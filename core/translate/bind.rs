@@ -67,6 +67,20 @@ fn rewrite_between_expressions(expr: &mut ast::Expr) {
     });
 }
 
+/// Bind the synthetic `value` name in a domain CHECK to its concrete column.
+pub fn bind_domain_check(expr: &ast::Expr, column_name: &str) -> Box<ast::Expr> {
+    let mut bound = expr.clone();
+    let _ = walk_expr_mut(&mut bound, &mut |expr| {
+        if let ast::Expr::Id(name) = expr {
+            if name.as_str().eq_ignore_ascii_case("value") {
+                *expr = ast::Expr::Id(ast::Name::exact(column_name.to_string()));
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+    Box::new(bound)
+}
+
 /// Point SELF_TABLE references in a stored schema expression at a concrete
 /// table reference. This does not reject unresolved identifiers because ALTER
 /// validation may deliberately bind them through an expression register cache.

@@ -748,7 +748,7 @@ fn emit_add_column_check_validation(
             for td in &resolved.chain {
                 for dc in &td.domain_checks {
                     let rewritten =
-                        crate::schema::rewrite_value_to_column(&dc.check, new_column_name);
+                        crate::translate::bind::bind_domain_check(&dc.check, new_column_name);
                     all_checks.push((dc.name.clone(), rewritten));
                 }
             }

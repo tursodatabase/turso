@@ -204,20 +204,6 @@ struct SequenceMetadata {
 
 use crate::util::quote_identifier as quote_ident;
 
-/// Recursively rewrite `Expr::Id("value")` (case-insensitive) to `Expr::Id(col_name)`.
-pub fn rewrite_value_to_column(expr: &ast::Expr, col_name: &str) -> Box<ast::Expr> {
-    let mut cloned = expr.clone();
-    let _ = walk_expr_mut(&mut cloned, &mut |e| {
-        if let ast::Expr::Id(name) = e {
-            if name.as_str().eq_ignore_ascii_case("value") {
-                *e = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
-            }
-        }
-        Ok(WalkControl::Continue)
-    });
-    Box::new(cloned)
-}
-
 /// Field definition within a StructDef.
 #[derive(Debug, Clone)]
 pub struct StructFieldDef {
@@ -3495,7 +3481,7 @@ impl BTreeTable {
                     notnull_cols.try_push(col_idx)?;
                 }
                 for (i, dc) in td.domain_checks.iter().enumerate() {
-                    let rewritten = rewrite_value_to_column(&dc.check, &col_name);
+                    let rewritten = crate::translate::bind::bind_domain_check(&dc.check, &col_name);
                     let name = dc
                         .name
                         .clone()
