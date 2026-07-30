@@ -12,7 +12,7 @@ use turso_parser::ast::{NullsOrder, SortOrder, Variable};
 
 use crate::{
     numeric::Numeric,
-    schema::{BTreeTable, PseudoCursorType},
+    schema::{BTreeTable, Index, PseudoCursorType},
     sync::Arc,
     translate::collate::CollationSeq,
     types::Value,
@@ -332,6 +332,8 @@ pub(crate) struct CursorFold<Initial, BodyFn, Body> {
 /// arguments.
 pub(crate) struct ForEachRow<BodyFn, Body> {
     cursor: CursorId,
+    row_cursor: CursorId,
+    deferred_seek: Option<DeferredSeekCursors>,
     direction: ScanDirection,
     body: BodyFn,
     compiler: PhantomData<fn() -> Body>,
@@ -341,6 +343,8 @@ pub(crate) struct ForEachRow<BodyFn, Body> {
 pub(crate) struct TryFoldRows<Initial, BodyFn, Body> {
     initial: Initial,
     cursor: CursorId,
+    row_cursor: CursorId,
+    deferred_seek: Option<DeferredSeekCursors>,
     direction: ScanDirection,
     body: BodyFn,
     compiler: PhantomData<fn() -> Body>,
@@ -405,8 +409,14 @@ where
         })?;
 
         builder.switch_to(row)?;
+        if let Some(seek) = self.deferred_seek {
+            builder.push_effect(EffectOp::DeferredSeek {
+                index: seek.index,
+                table: seek.table,
+            })?;
+        }
         (self.body)(Row {
-            cursor: self.cursor,
+            cursor: self.row_cursor,
         })
         .compile(builder)?;
         builder.terminate(Terminator::CursorAdvance {
@@ -451,9 +461,15 @@ where
         })?;
 
         builder.switch_to(row)?;
+        if let Some(seek) = self.deferred_seek {
+            builder.push_effect(EffectOp::DeferredSeek {
+                index: seek.index,
+                table: seek.table,
+            })?;
+        }
         let step = (self.body)(
             Row {
-                cursor: self.cursor,
+                cursor: self.row_cursor,
             },
             LoopState { values: row_state },
         )
@@ -838,6 +854,12 @@ enum ScalarOp {
         cursor: CursorId,
         column: usize,
     },
+    RowId {
+        cursor: CursorId,
+    },
+    IndexRowId {
+        cursor: CursorId,
+    },
     SorterColumn {
         sorter: SorterId,
         column: usize,
@@ -851,6 +873,10 @@ enum EffectOp {
         root_page: PageIdx,
         db: usize,
         schema_cookie: u32,
+    },
+    DeferredSeek {
+        index: CursorId,
+        table: CursorId,
     },
     ResultRow {
         pack: ValuePack,
@@ -877,6 +903,8 @@ impl ScalarOp {
             | Self::Parameter(_)
             | Self::Constant(_)
             | Self::Column { .. }
+            | Self::RowId { .. }
+            | Self::IndexRowId { .. }
             | Self::SorterColumn { .. } => [None, None],
             Self::MustBeInt { value } => [Some(*value), None],
             Self::Add { lhs, rhs } | Self::Logical { lhs, rhs, .. } => [Some(*lhs), Some(*rhs)],
@@ -886,7 +914,9 @@ impl ScalarOp {
 
     fn cursor(&self) -> Option<CursorId> {
         match self {
-            Self::Column { cursor, .. } => Some(*cursor),
+            Self::Column { cursor, .. } | Self::RowId { cursor } | Self::IndexRowId { cursor } => {
+                Some(*cursor)
+            }
             Self::Input(_)
             | Self::Parameter(_)
             | Self::Constant(_)
@@ -906,7 +936,9 @@ impl ScalarOp {
             | Self::Add { .. }
             | Self::MustBeInt { .. }
             | Self::Logical { .. }
-            | Self::Column { .. } => None,
+            | Self::Column { .. }
+            | Self::RowId { .. }
+            | Self::IndexRowId { .. } => None,
         }
     }
 
@@ -921,7 +953,11 @@ impl ScalarOp {
             // Integer coercion can raise a datatype error. Column reads remain
             // ordered until storage-read and corruption behavior is modeled as
             // an explicit effect in the IR.
-            Self::MustBeInt { .. } | Self::Column { .. } | Self::SorterColumn { .. } => false,
+            Self::MustBeInt { .. }
+            | Self::Column { .. }
+            | Self::RowId { .. }
+            | Self::IndexRowId { .. }
+            | Self::SorterColumn { .. } => false,
         }
     }
 }
@@ -938,6 +974,7 @@ impl Instruction {
             Self::Value { op, .. } => (Some(op.operands()), &[][..]),
             Self::Effect(
                 EffectOp::OpenRead { .. }
+                | EffectOp::DeferredSeek { .. }
                 | EffectOp::OpenSorter { .. }
                 | EffectOp::SorterData { .. }
                 | EffectOp::OpenDistinctSet { .. },
@@ -949,9 +986,10 @@ impl Instruction {
         scalar.into_iter().flatten().chain(values.iter().copied())
     }
 
-    fn cursor_use(&self) -> Option<CursorId> {
-        match self {
-            Self::Value { op, .. } => op.cursor(),
+    fn cursor_uses(&self) -> smallvec::IntoIter<[CursorId; 2]> {
+        let cursors = match self {
+            Self::Value { op, .. } => op.cursor().into_iter().collect(),
+            Self::Effect(EffectOp::DeferredSeek { index, table }) => smallvec![*index, *table],
             Self::Effect(
                 EffectOp::OpenRead { .. }
                 | EffectOp::ResultRow { .. }
@@ -959,8 +997,9 @@ impl Instruction {
                 | EffectOp::SorterInsert { .. }
                 | EffectOp::SorterData { .. }
                 | EffectOp::OpenDistinctSet { .. },
-            ) => None,
-        }
+            ) => SmallVec::new(),
+        };
+        cursors.into_iter()
     }
 
     fn cursor_definition(&self) -> Option<CursorId> {
@@ -968,7 +1007,8 @@ impl Instruction {
             Self::Effect(EffectOp::OpenRead { cursor, .. }) => Some(*cursor),
             Self::Value { .. }
             | Self::Effect(
-                EffectOp::ResultRow { .. }
+                EffectOp::DeferredSeek { .. }
+                | EffectOp::ResultRow { .. }
                 | EffectOp::OpenSorter { .. }
                 | EffectOp::SorterInsert { .. }
                 | EffectOp::SorterData { .. }
@@ -985,6 +1025,7 @@ impl Instruction {
             ) => Some(*sorter),
             Self::Effect(
                 EffectOp::OpenRead { .. }
+                | EffectOp::DeferredSeek { .. }
                 | EffectOp::ResultRow { .. }
                 | EffectOp::OpenSorter { .. }
                 | EffectOp::OpenDistinctSet { .. },
@@ -998,6 +1039,7 @@ impl Instruction {
             Self::Value { .. }
             | Self::Effect(
                 EffectOp::OpenRead { .. }
+                | EffectOp::DeferredSeek { .. }
                 | EffectOp::ResultRow { .. }
                 | EffectOp::SorterInsert { .. }
                 | EffectOp::SorterData { .. }
@@ -1012,6 +1054,7 @@ impl Instruction {
             Self::Value { .. }
             | Self::Effect(
                 EffectOp::OpenRead { .. }
+                | EffectOp::DeferredSeek { .. }
                 | EffectOp::ResultRow { .. }
                 | EffectOp::OpenSorter { .. }
                 | EffectOp::SorterInsert { .. }
@@ -1529,15 +1572,16 @@ impl IrBuilder {
     }
 
     fn push_effect(&mut self, op: EffectOp) -> Result<()> {
-        let cursor = match &op {
-            EffectOp::OpenRead { cursor, .. } => Some(*cursor),
+        let cursors: SmallVec<[CursorId; 2]> = match &op {
+            EffectOp::OpenRead { cursor, .. } => smallvec![*cursor],
+            EffectOp::DeferredSeek { index, table } => smallvec![*index, *table],
             EffectOp::ResultRow { .. }
             | EffectOp::OpenSorter { .. }
             | EffectOp::SorterInsert { .. }
             | EffectOp::SorterData { .. }
-            | EffectOp::OpenDistinctSet { .. } => None,
+            | EffectOp::OpenDistinctSet { .. } => SmallVec::new(),
         };
-        if let Some(cursor) = cursor {
+        for cursor in cursors {
             self.ensure_cursor_declared(cursor)?;
         }
         let sorter = match &op {
@@ -1545,6 +1589,7 @@ impl IrBuilder {
             | EffectOp::SorterInsert { sorter, .. }
             | EffectOp::SorterData { sorter } => Some(*sorter),
             EffectOp::OpenRead { .. }
+            | EffectOp::DeferredSeek { .. }
             | EffectOp::ResultRow { .. }
             | EffectOp::OpenDistinctSet { .. } => None,
         };
@@ -1793,7 +1838,7 @@ impl IrProgram {
                         },
                     )?;
                 }
-                if let Some(cursor) = instruction.cursor_use() {
+                for cursor in instruction.cursor_uses() {
                     if cursor.index() >= self.cursor_resources.len() {
                         return Err(LimboError::InternalError(format!(
                             "compiler IR references out-of-range cursor {cursor:?}"
@@ -1933,7 +1978,7 @@ impl IrProgram {
                         instruction_index,
                     )?;
                 }
-                if let Some(cursor) = instruction.cursor_use() {
+                for cursor in instruction.cursor_uses() {
                     Self::verify_cursor_use(
                         &cursor_definitions,
                         &dominators,
@@ -2035,6 +2080,7 @@ impl IrProgram {
                     Instruction::Value { .. }
                     | Instruction::Effect(
                         EffectOp::OpenRead { .. }
+                        | EffectOp::DeferredSeek { .. }
                         | EffectOp::ResultRow { .. }
                         | EffectOp::OpenDistinctSet { .. },
                     ) => {}
@@ -2784,9 +2830,9 @@ impl IrProgram {
         let mut required = vec![false; self.cursor_resources.len()];
         for block in &self.blocks {
             for instruction in &block.instructions {
-                for cursor in [instruction.cursor_use(), instruction.cursor_definition()]
-                    .into_iter()
-                    .flatten()
+                for cursor in instruction
+                    .cursor_uses()
+                    .chain(instruction.cursor_definition())
                 {
                     required[cursor.index()] = true;
                 }
@@ -3140,6 +3186,16 @@ impl IrProgram {
                                     destination,
                                 );
                             }
+                            ScalarOp::RowId { cursor } => program.emit_insn(Insn::RowId {
+                                cursor_id: Self::cursor_for(&physical_cursors, *cursor),
+                                dest: destination,
+                            }),
+                            ScalarOp::IndexRowId { cursor } => {
+                                program.emit_insn(Insn::IdxRowId {
+                                    cursor_id: Self::cursor_for(&physical_cursors, *cursor),
+                                    dest: destination,
+                                });
+                            }
                             ScalarOp::SorterColumn { sorter, column } => {
                                 let sorter = Self::sorter_for(&physical_sorters, *sorter);
                                 program.emit_column_or_rowid(
@@ -3161,6 +3217,12 @@ impl IrProgram {
                             cursor_id: Self::cursor_for(&physical_cursors, *cursor),
                             root_page: *root_page,
                             db: *db,
+                        });
+                    }
+                    Instruction::Effect(EffectOp::DeferredSeek { index, table }) => {
+                        program.emit_insn(Insn::DeferredSeek {
+                            index_cursor_id: Self::cursor_for(&physical_cursors, *index),
+                            table_cursor_id: Self::cursor_for(&physical_cursors, *table),
                         });
                     }
                     Instruction::Effect(EffectOp::ResultRow { pack }) => {
@@ -3506,6 +3568,11 @@ impl fmt::Display for IrProgram {
                     "cursor ${index} = btree_table {:?} root {}",
                     table.name, table.root_page
                 )?,
+                CursorResource::Owned(CursorType::BTreeIndex(index_resource)) => writeln!(
+                    f,
+                    "cursor ${index} = btree_index {:?} root {}",
+                    index_resource.name, index_resource.root_page
+                )?,
                 CursorResource::Owned(cursor_type) => {
                     writeln!(f, "cursor ${index} = {cursor_type:?}")?;
                 }
@@ -3598,6 +3665,12 @@ impl fmt::Display for IrProgram {
                             ScalarOp::Column { cursor, column } => {
                                 writeln!(f, "column ${}[{column}]", cursor.0)?;
                             }
+                            ScalarOp::RowId { cursor } => {
+                                writeln!(f, "rowid ${}", cursor.0)?;
+                            }
+                            ScalarOp::IndexRowId { cursor } => {
+                                writeln!(f, "index_rowid ${}", cursor.0)?;
+                            }
                             ScalarOp::SorterColumn { sorter, column } => {
                                 writeln!(f, "sorter_column #{}[{column}]", sorter.0)?;
                             }
@@ -3613,6 +3686,9 @@ impl fmt::Display for IrProgram {
                         "  open_read ${} root {root_page} db {db} schema {schema_cookie}",
                         cursor.0
                     )?,
+                    Instruction::Effect(EffectOp::DeferredSeek { index, table }) => {
+                        writeln!(f, "  deferred_seek ${} -> ${}", index.0, table.0)?;
+                    }
                     Instruction::Effect(EffectOp::ResultRow { pack }) => {
                         write!(f, "  result_row [")?;
                         Self::fmt_arguments(f, pack.values())?;
@@ -3785,8 +3861,9 @@ impl Compile for CursorInput {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct OpenReadTable {
-    table: Arc<BTreeTable>,
+pub(crate) struct OpenReadCursor {
+    resource: CursorType,
+    root_page: PageIdx,
     db: usize,
     schema_cookie: u32,
 }
@@ -3795,7 +3872,15 @@ pub(crate) struct OpenReadTable {
 #[derive(Clone, Copy)]
 pub(crate) struct CursorRows {
     cursor: CursorId,
+    row_cursor: CursorId,
+    deferred_seek: Option<DeferredSeekCursors>,
     direction: ScanDirection,
+}
+
+#[derive(Clone, Copy)]
+struct DeferredSeekCursors {
+    index: CursorId,
+    table: CursorId,
 }
 
 type BoxedRowConsumer<Item> = Box<dyn FnOnce(Item) -> BoxedCompile<()>>;
@@ -3937,6 +4022,8 @@ impl RowStream for CursorRows {
     fn for_each_boxed(self, body: BoxedRowConsumer<Self::Item>) -> BoxedCompile<()> {
         ForEachRow {
             cursor: self.cursor,
+            row_cursor: self.row_cursor,
+            deferred_seek: self.deferred_seek,
             direction: self.direction,
             body,
             compiler: PhantomData,
@@ -3952,6 +4039,8 @@ impl RowStream for CursorRows {
         TryFoldRows {
             initial,
             cursor: self.cursor,
+            row_cursor: self.row_cursor,
+            deferred_seek: self.deferred_seek,
             direction: self.direction,
             body,
             compiler: PhantomData,
@@ -4638,11 +4727,32 @@ impl Row {
     pub(crate) const fn column(self, column_index: usize) -> Column {
         column(self.cursor, column_index)
     }
+
+    pub(crate) const fn rowid(self) -> RowId {
+        RowId {
+            cursor: self.cursor,
+        }
+    }
+
+    pub(crate) const fn index_rowid(self) -> IndexRowId {
+        IndexRowId {
+            cursor: self.cursor,
+        }
+    }
 }
 
-/// Opens a table when compiled and returns its symbolic row stream.
-pub(crate) struct ScanTable {
-    table: OpenReadTable,
+enum ScanBtreeSource {
+    Table(OpenReadCursor),
+    CoveringIndex(OpenReadCursor),
+    IndexLookup {
+        table: OpenReadCursor,
+        index: OpenReadCursor,
+    },
+}
+
+/// Opens a B-tree source when compiled and returns its symbolic row stream.
+pub(crate) struct ScanBtree {
+    source: ScanBtreeSource,
     direction: ScanDirection,
 }
 
@@ -4651,19 +4761,56 @@ pub(crate) fn scan_table(
     db: usize,
     schema_cookie: u32,
     direction: ScanDirection,
-) -> ScanTable {
-    ScanTable {
-        table: open_read_table(table, db, schema_cookie),
+) -> ScanBtree {
+    ScanBtree {
+        source: ScanBtreeSource::Table(open_read_table(table, db, schema_cookie)),
         direction,
     }
 }
 
-impl Compile for ScanTable {
+pub(crate) fn scan_index(
+    table: Arc<BTreeTable>,
+    index: Arc<Index>,
+    covering: bool,
+    db: usize,
+    schema_cookie: u32,
+    direction: ScanDirection,
+) -> ScanBtree {
+    let index = open_read_index(index, db, schema_cookie);
+    let source = if covering {
+        ScanBtreeSource::CoveringIndex(index)
+    } else {
+        ScanBtreeSource::IndexLookup {
+            table: open_read_table(table, db, schema_cookie),
+            index,
+        }
+    };
+    ScanBtree { source, direction }
+}
+
+impl Compile for ScanBtree {
     type Output = CursorRows;
 
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
-        self.table.compile(builder).map(|cursor| CursorRows {
+        let (cursor, row_cursor, deferred_seek) = match self.source {
+            ScanBtreeSource::Table(table) => {
+                let cursor = table.compile(builder)?;
+                (cursor, cursor, None)
+            }
+            ScanBtreeSource::CoveringIndex(index) => {
+                let cursor = index.compile(builder)?;
+                (cursor, cursor, None)
+            }
+            ScanBtreeSource::IndexLookup { table, index } => {
+                let table = table.compile(builder)?;
+                let index = index.compile(builder)?;
+                (index, table, Some(DeferredSeekCursors { index, table }))
+            }
+        };
+        Ok(CursorRows {
             cursor,
+            row_cursor,
+            deferred_seek,
             direction: self.direction,
         })
     }
@@ -4674,24 +4821,34 @@ pub(crate) fn open_read_table(
     table: Arc<BTreeTable>,
     db: usize,
     schema_cookie: u32,
-) -> OpenReadTable {
-    OpenReadTable {
-        table,
+) -> OpenReadCursor {
+    let root_page = table.root_page;
+    OpenReadCursor {
+        resource: CursorType::BTreeTable(table),
+        root_page,
         db,
         schema_cookie,
     }
 }
 
-impl Compile for OpenReadTable {
+fn open_read_index(index: Arc<Index>, db: usize, schema_cookie: u32) -> OpenReadCursor {
+    let root_page = index.root_page;
+    OpenReadCursor {
+        resource: CursorType::BTreeIndex(index),
+        root_page,
+        db,
+        schema_cookie,
+    }
+}
+
+impl Compile for OpenReadCursor {
     type Output = CursorId;
 
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
-        let root_page = self.table.root_page;
-        let cursor =
-            builder.allocate_cursor(CursorResource::Owned(CursorType::BTreeTable(self.table)))?;
+        let cursor = builder.allocate_cursor(CursorResource::Owned(self.resource))?;
         builder.push_effect(EffectOp::OpenRead {
             cursor,
-            root_page,
+            root_page: self.root_page,
             db: self.db,
             schema_cookie: self.schema_cookie,
         })?;
@@ -4825,6 +4982,14 @@ pub(crate) struct Column {
     column: usize,
 }
 
+pub(crate) struct RowId {
+    cursor: CursorId,
+}
+
+pub(crate) struct IndexRowId {
+    cursor: CursorId,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ResultRow {
     pack: ValuePack,
@@ -4930,6 +5095,26 @@ impl Compile for Column {
     }
 }
 
+impl Compile for RowId {
+    type Output = ValueId;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        builder.push(ScalarOp::RowId {
+            cursor: self.cursor,
+        })
+    }
+}
+
+impl Compile for IndexRowId {
+    type Output = ValueId;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        builder.push(ScalarOp::IndexRowId {
+            cursor: self.cursor,
+        })
+    }
+}
+
 pub(crate) fn add(lhs: ValueId, rhs: ValueId) -> Add {
     Add { lhs, rhs }
 }
@@ -4997,7 +5182,27 @@ where
 mod tests {
     use super::*;
     use crate::vdbe::builder::{CursorType, ProgramBuilderOpts, QueryMode};
-    use crate::{io::MemoryIO, schema::BTreeTable, sync::Arc, Database, SqliteDialect, Statement};
+    use crate::{
+        io::MemoryIO,
+        schema::{BTreeTable, IndexColumn},
+        sync::Arc,
+        Database, SqliteDialect, Statement,
+    };
+
+    fn test_index(table: &BTreeTable, name: &str, root_page: i64) -> Arc<Index> {
+        Arc::new(Index {
+            name: name.to_owned(),
+            table_name: table.name.clone(),
+            root_page,
+            columns: vec![IndexColumn::new("b", 1)],
+            unique: false,
+            ephemeral: false,
+            has_rowid: table.has_rowid,
+            where_clause: None,
+            index_method: None,
+            on_conflict: None,
+        })
+    }
 
     #[test]
     fn combinators_build_symbolic_ssa_before_lowering() {
@@ -5281,6 +5486,71 @@ mod tests {
             instruction,
             Insn::Rewind { .. } | Insn::Next { .. }
         )));
+    }
+
+    #[test]
+    fn index_lookup_stream_seeks_the_table_before_reading_each_row() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE indexed(a,b)", 2).unwrap());
+        let index = test_index(&table, "indexed_b", 3);
+        let compiler =
+            scan_index(table, index, false, 0, 0, ScanDirection::Forward).and_then(|rows| {
+                rows.for_each(|row| {
+                    pack_values(smallvec![row.column(0).boxed()]).and_then(result_row_pack)
+                })
+            });
+
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+        assert!(rendered.contains("cursor $0 = btree_table \"indexed\" root 2"));
+        assert!(rendered.contains("cursor $1 = btree_index \"indexed_b\" root 3"));
+        assert!(rendered.contains("cursor_start Forward $1"));
+        let seek = rendered.find("deferred_seek $1 -> $0").unwrap();
+        let column = rendered.find("column $0[0]").unwrap();
+        assert!(seek < column);
+        assert!(rendered.contains("cursor_advance Forward $1"));
+
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 2, 0));
+        let target = program.alloc_register();
+        ir.lower_into(&mut program, target).unwrap();
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::DeferredSeek { .. })));
+    }
+
+    #[test]
+    fn covering_index_stream_reads_columns_and_rowid_from_the_index() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE indexed(a,b)", 2).unwrap());
+        let index = test_index(&table, "indexed_b", 3);
+        let compiler =
+            scan_index(table, index, true, 0, 0, ScanDirection::Reverse).and_then(|rows| {
+                rows.for_each(|row| {
+                    pack_values(smallvec![row.column(0).boxed(), row.index_rowid().boxed(),])
+                        .and_then(result_row_pack)
+                })
+            });
+
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+        assert!(!rendered.contains("btree_table"));
+        assert!(rendered.contains("cursor $0 = btree_index \"indexed_b\" root 3"));
+        assert!(rendered.contains("column $0[0]"));
+        assert!(rendered.contains("index_rowid $0"));
+        assert!(!rendered.contains("deferred_seek"));
+
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 2, 0));
+        let target = program.alloc_register();
+        ir.lower_into(&mut program, target).unwrap();
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::IdxRowId { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::DeferredSeek { .. })));
     }
 
     #[test]
@@ -6917,6 +7187,40 @@ mod tests {
         assert!(error
             .to_string()
             .contains("cursor CursorId(0) is not open on every path to BlockId(3)"));
+    }
+
+    #[test]
+    fn verifier_checks_both_deferred_seek_cursors() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE t(a,b)", 2).unwrap());
+        let index = test_index(&table, "t_b", 3);
+        let mut builder = IrBuilder::new();
+        let table_cursor = builder
+            .allocate_cursor(CursorResource::Owned(CursorType::BTreeTable(table)))
+            .unwrap();
+        let index_cursor = builder
+            .allocate_cursor(CursorResource::Owned(CursorType::BTreeIndex(index)))
+            .unwrap();
+        builder
+            .push_effect(EffectOp::OpenRead {
+                cursor: index_cursor,
+                root_page: 3,
+                db: 0,
+                schema_cookie: 0,
+            })
+            .unwrap();
+        builder
+            .push_effect(EffectOp::DeferredSeek {
+                index: index_cursor,
+                table: table_cursor,
+            })
+            .unwrap();
+        let value = builder.push(ScalarOp::Constant(Value::Null)).unwrap();
+
+        let error = builder.finish(value).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("uses unopened cursor CursorId(0)"));
     }
 
     #[test]

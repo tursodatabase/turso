@@ -248,3 +248,35 @@ test order-by-zero {
 expect error {
     1st ORDER BY term out of range - should be between 1 and 2
 }
+
+@cross-check-integrity
+test order-by-covering-index-reverse-scan {
+    CREATE TABLE indexed(id INTEGER PRIMARY KEY, key TEXT, payload TEXT);
+    CREATE INDEX indexed_key ON indexed(key);
+    INSERT INTO indexed VALUES
+        (1, 'charlie', 'third'),
+        (2, 'alpha', 'first'),
+        (3, 'bravo', 'second');
+    SELECT rowid, key FROM indexed ORDER BY key DESC;
+}
+expect {
+    1|charlie
+    3|bravo
+    2|alpha
+}
+
+@cross-check-integrity
+test order-by-non-covering-index-forward-scan {
+    CREATE TABLE indexed(id INTEGER PRIMARY KEY, key TEXT, payload TEXT);
+    CREATE INDEX indexed_key ON indexed(key);
+    INSERT INTO indexed VALUES
+        (1, 'charlie', 'third'),
+        (2, 'alpha', 'first'),
+        (3, 'bravo', 'second');
+    SELECT payload FROM indexed ORDER BY key;
+}
+expect {
+    first
+    second
+    third
+}

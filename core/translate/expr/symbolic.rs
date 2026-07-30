@@ -2,7 +2,7 @@ use smallvec::SmallVec;
 use turso_parser::ast::{Expr, Literal, Operator, TableInternalId, Variable};
 
 use crate::{
-    schema::BTreeTable,
+    schema::{BTreeTable, Index},
     translate::{
         alter::literal_default_value,
         compiler::{
@@ -26,6 +26,8 @@ use super::{comparison_affinity, comparison_collation};
 /// Compiling it later only needs the symbolic row that supplies its columns.
 pub(crate) enum ResolvedScalarExpr {
     Column(usize),
+    RowId,
+    IndexRowId,
     Parameter(Variable),
     Constant(Value),
     Add(Box<Self>, Box<Self>),
@@ -45,12 +47,20 @@ pub(crate) enum ResolvedScalarExpr {
     },
 }
 
+/// Physical source used to read one logical table row.
+#[derive(Clone, Copy)]
+pub(crate) enum RowLayout<'a> {
+    Table,
+    CoveringIndex(&'a Index),
+}
+
 /// Resolves expressions for one symbolic B-tree row without emitting bytecode.
 pub(crate) struct RowExprResolver<'a, 'schema> {
     resolver: &'a Resolver<'schema>,
     database_id: usize,
     table_id: TableInternalId,
     table: &'a BTreeTable,
+    layout: RowLayout<'a>,
     referenced_tables: &'a TableReferences,
 }
 
@@ -60,6 +70,7 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
         database_id: usize,
         table_id: TableInternalId,
         table: &'a BTreeTable,
+        layout: RowLayout<'a>,
         referenced_tables: &'a TableReferences,
     ) -> Self {
         Self {
@@ -67,6 +78,7 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
             database_id,
             table_id,
             table,
+            layout,
             referenced_tables,
         }
     }
@@ -80,7 +92,13 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
                 self.resolver.resolve_collation(collation.as_str())?;
                 self.resolve(inner)
             }
-            Expr::Column { table, column, .. } => self.resolve_column(*table, *column),
+            Expr::Column {
+                table,
+                column,
+                is_rowid_alias,
+                ..
+            } => self.resolve_column(*table, *column, *is_rowid_alias),
+            Expr::RowId { table, .. } => self.resolve_rowid(*table),
             Expr::Variable(variable) => Ok(Some(ResolvedScalarExpr::Parameter(variable.clone()))),
             Expr::Literal(literal) => self.resolve_literal(literal),
             Expr::Binary(lhs, operator, rhs) => self.resolve_binary(lhs, *operator, rhs),
@@ -97,6 +115,7 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
         &self,
         expr_table: TableInternalId,
         column: usize,
+        is_rowid_alias: bool,
     ) -> Result<Option<ResolvedScalarExpr>> {
         if expr_table != self.table_id {
             return Ok(None);
@@ -114,7 +133,41 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
                     .get_type_def_unchecked(&column_definition.ty_str)
                     .is_some()
             });
-        Ok((!requires_frontend_decoding).then_some(ResolvedScalarExpr::Column(column)))
+        if requires_frontend_decoding {
+            return Ok(None);
+        }
+        if is_rowid_alias {
+            return self.resolve_rowid(expr_table);
+        }
+        match self.layout {
+            RowLayout::Table => Ok(Some(ResolvedScalarExpr::Column(column))),
+            RowLayout::CoveringIndex(index) => {
+                let index_column =
+                    index.column_table_pos_to_index_pos(column).ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "covering index {} does not contain column {column} of table {}",
+                            index.name, self.table.name
+                        ))
+                    })?;
+                Ok(Some(ResolvedScalarExpr::Column(index_column)))
+            }
+        }
+    }
+
+    fn resolve_rowid(&self, expr_table: TableInternalId) -> Result<Option<ResolvedScalarExpr>> {
+        if expr_table != self.table_id || !self.table.has_rowid {
+            return Ok(None);
+        }
+        match self.layout {
+            RowLayout::Table => Ok(Some(ResolvedScalarExpr::RowId)),
+            RowLayout::CoveringIndex(index) if index.has_rowid => {
+                Ok(Some(ResolvedScalarExpr::IndexRowId))
+            }
+            RowLayout::CoveringIndex(index) => Err(LimboError::InternalError(format!(
+                "covering index {} cannot supply rowid for table {}",
+                index.name, self.table.name
+            ))),
+        }
     }
 
     fn resolve_literal(&self, literal: &Literal) -> Result<Option<ResolvedScalarExpr>> {
@@ -253,6 +306,8 @@ pub(crate) fn compile_static_expr(expr: &ResolvedScalarExpr) -> Option<BoxedComp
 fn try_compile_expr(row: Option<Row>, expr: &ResolvedScalarExpr) -> Option<BoxedCompile<ValueId>> {
     match expr {
         ResolvedScalarExpr::Column(column) => Some(row?.column(*column).boxed()),
+        ResolvedScalarExpr::RowId => Some(row?.rowid().boxed()),
+        ResolvedScalarExpr::IndexRowId => Some(row?.index_rowid().boxed()),
         ResolvedScalarExpr::Parameter(variable) => Some(parameter(variable.clone()).boxed()),
         ResolvedScalarExpr::Constant(value) => Some(constant(value.clone()).boxed()),
         ResolvedScalarExpr::Add(lhs, rhs) => Some(

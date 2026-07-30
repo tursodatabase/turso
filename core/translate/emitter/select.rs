@@ -7,8 +7,8 @@ use crate::{
         aggregation::emit_ungrouped_aggregation,
         collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         compiler::{
-            compile_effect, pack_values, result_row_pack, scan_table, select_pack, BoxedCompile,
-            Compile, Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId,
+            compile_effect, pack_values, result_row_pack, scan_index, scan_table, select_pack,
+            BoxedCompile, Compile, Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -17,7 +17,7 @@ use crate::{
         },
         expr::{
             compile_symbolic_conjunction, compile_symbolic_exprs, compile_symbolic_static_expr,
-            ResolvedScalarExpr, RowExprResolver,
+            ResolvedScalarExpr, RowExprResolver, RowLayout,
         },
         group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
@@ -104,11 +104,7 @@ fn try_emit_declarative_table_scan(
     {
         return Ok(None);
     }
-    let Operation::Scan(Scan::BTreeTable {
-        iter_dir,
-        index: None,
-    }) = joined.op
-    else {
+    let Operation::Scan(Scan::BTreeTable { iter_dir, index }) = &joined.op else {
         return Ok(None);
     };
     let direction = match iter_dir {
@@ -118,12 +114,25 @@ fn try_emit_declarative_table_scan(
     let Table::BTree(table) = &joined.table else {
         return Ok(None);
     };
+    if index
+        .as_ref()
+        .is_some_and(|index| index.ephemeral || index.index_method.is_some())
+    {
+        return Ok(None);
+    }
+    let covering_index = index
+        .as_deref()
+        .filter(|_| joined.utilizes_covering_index());
+    let row_layout = covering_index
+        .map(RowLayout::CoveringIndex)
+        .unwrap_or(RowLayout::Table);
 
     let expr_resolver = RowExprResolver::new(
         resolver,
         joined.database_id,
         joined.internal_id,
         table,
+        row_layout,
         &plan.table_references,
     );
     let mut sort_keys = SmallVec::<[SortKey; 4]>::with_capacity(plan.order_by.len());
@@ -219,7 +228,18 @@ fn try_emit_declarative_table_scan(
     let database_id = joined.database_id;
     let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
     let result_column_count = projections.len();
-    let compiler = scan_table(table, database_id, schema_cookie, direction).and_then(move |rows| {
+    let scan = match index {
+        Some(index) => scan_index(
+            table,
+            index.clone(),
+            covering_index.is_some(),
+            database_id,
+            schema_cookie,
+            direction,
+        ),
+        None => scan_table(table, database_id, schema_cookie, direction),
+    };
+    let compiler = scan.and_then(move |rows| {
         if predicates.is_empty() {
             compile_declarative_rows(
                 rows,
@@ -1823,6 +1843,102 @@ mod tests {
             vec![
                 vec![Value::Text("two".into()), Value::from_i64(1)],
                 vec![Value::Text("one".into()), Value::from_i64(1)],
+            ]
+        );
+    }
+
+    #[test]
+    fn full_index_scans_cross_the_declarative_compiler_boundary() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute("CREATE TABLE indexed(id INTEGER PRIMARY KEY, key TEXT, payload TEXT)")
+            .unwrap();
+        connection
+            .execute("CREATE INDEX indexed_key ON indexed(key)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO indexed VALUES \
+                 (1, 'charlie', 'third'), (2, 'alpha', 'first'), (3, 'bravo', 'second')",
+            )
+            .unwrap();
+
+        let mut covering = connection
+            .prepare("SELECT rowid, key FROM indexed ORDER BY key DESC")
+            .unwrap();
+        let covering_instructions = &covering.get_program().insns;
+        assert!(covering_instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::IdxRowId { .. })));
+        assert!(covering_instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Last { .. })));
+        assert!(covering_instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Prev { .. })));
+        assert!(covering_instructions
+            .iter()
+            .all(|(instruction, _)| !matches!(
+                instruction,
+                Insn::DeferredSeek { .. } | Insn::SorterOpen { .. }
+            )));
+        let covering_result = covering_instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 2, .. }))
+            .expect("covering declarative scan must produce one symbolic row pack");
+        assert!(covering_instructions[covering_result - 2..covering_result]
+            .iter()
+            .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })));
+        assert_eq!(
+            covering.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(1), Value::Text("charlie".into())],
+                vec![Value::from_i64(3), Value::Text("bravo".into())],
+                vec![Value::from_i64(2), Value::Text("alpha".into())],
+            ]
+        );
+
+        let mut non_covering = connection
+            .prepare("SELECT payload FROM indexed ORDER BY key")
+            .unwrap();
+        let non_covering_instructions = &non_covering.get_program().insns;
+        let deferred_seek = non_covering_instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::DeferredSeek { .. }))
+            .expect("non-covering symbolic index scan must seek its table row");
+        let column = non_covering_instructions
+            .iter()
+            .enumerate()
+            .skip(deferred_seek + 1)
+            .find(|(_, (instruction, _))| matches!(instruction, Insn::Column { column: 2, .. }))
+            .map(|(index, _)| index)
+            .expect("payload must be read from the table after DeferredSeek");
+        assert!(deferred_seek < column);
+        assert!(non_covering_instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Rewind { .. })));
+        assert!(non_covering_instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Next { .. })));
+        assert!(non_covering_instructions
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::SorterOpen { .. })));
+        let non_covering_result = non_covering_instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. }))
+            .expect("non-covering declarative scan must produce one symbolic row pack");
+        assert!(matches!(
+            non_covering_instructions[non_covering_result - 1].0,
+            Insn::Copy { .. }
+        ));
+        assert_eq!(
+            non_covering.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::Text("first".into())],
+                vec![Value::Text("second".into())],
+                vec![Value::Text("third".into())],
             ]
         );
     }
