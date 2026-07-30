@@ -1318,3 +1318,57 @@ test alter-column-separate-unique-index-conversion {
 }
 expect error {
 }
+
+# Renaming a column through ALTER COLUMN must update triggers and views
+# like RENAME COLUMN does.
+test alter-column-rename-updates-trigger-and-view {
+    CREATE TABLE src (a INT, b TEXT);
+    CREATE VIEW v AS SELECT b FROM src;
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN UPDATE src SET b = new.b WHERE a = new.a; END;
+    ALTER TABLE src ALTER COLUMN b TO name TEXT;
+    INSERT INTO src VALUES (1, 'x');
+    SELECT * FROM v;
+    SELECT sql LIKE '%new.name%' FROM sqlite_schema WHERE name = 'tr';
+}
+expect {
+    x
+    1
+}
+
+# A foreign key added via ALTER COLUMN is enforced right away.
+test fail-alter-column-add-fk-enforced {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (cid INTEGER, pid INTEGER);
+    INSERT INTO parent VALUES (1);
+    ALTER TABLE child ALTER COLUMN pid TO pid INTEGER REFERENCES parent(id);
+    INSERT INTO child VALUES (1, 1);
+    INSERT INTO child VALUES (2, 99);
+}
+expect error {
+}
+
+# Omitting the REFERENCES clause drops the foreign key.
+test alter-column-drop-fk-stops-enforcement {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (cid INTEGER, pid INTEGER REFERENCES parent(id));
+    ALTER TABLE child ALTER COLUMN pid TO pid INTEGER;
+    INSERT INTO child VALUES (1, 99);
+    SELECT count(*) FROM child;
+}
+expect {
+    1
+}
+
+# A table-level foreign key does not belong to the column definition and
+# must survive the alter.
+test fail-alter-column-keeps-table-level-fk {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (cid INTEGER, pid INTEGER, FOREIGN KEY (pid) REFERENCES parent(id));
+    ALTER TABLE child ALTER COLUMN pid TO pid INTEGER DEFAULT 7;
+    INSERT INTO child VALUES (1, 99);
+}
+expect error {
+}

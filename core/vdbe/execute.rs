@@ -15292,7 +15292,9 @@ pub fn op_alter_column(
     let new_column = crate::schema::Column::try_from(definition.as_ref())?;
     let new_name = definition.col_name.as_str().to_owned();
 
-    let view_rewrites: Vec<(usize, String, RewrittenView)> = if *rename {
+    let column_name_changed = *rename
+        || !normalize_ident(&old_column_name).eq_ignore_ascii_case(&normalize_ident(&new_name));
+    let view_rewrites: Vec<(usize, String, RewrittenView)> = if column_name_changed {
         let target_db_name = conn.get_database_name_by_index(*db).ok_or_else(|| {
             LimboError::InternalError(format!("unknown database id {} during ALTER TABLE", *db))
         })?;
@@ -15430,6 +15432,81 @@ pub fn op_alter_column(
                 }
             }
 
+            // The new definition also replaces any column-level foreign key.
+            // Table-level FOREIGN KEY constraints stay.
+            btree.foreign_keys.retain(|fk| {
+                !(fk.declared_on_column
+                    && fk
+                        .child_columns
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(&old_column_name)))
+            });
+            for constraint in &definition.constraints {
+                let ast::ColumnConstraint::ForeignKey {
+                    clause,
+                    defer_clause,
+                } = &constraint.constraint
+                else {
+                    continue;
+                };
+                if clause.columns.len() > 1 {
+                    return Err(LimboError::ParseError(format!(
+                        "foreign key on {new_name} should reference only one column of table {}",
+                        clause.tbl_name.as_str()
+                    )));
+                }
+                let decl_order = btree
+                    .foreign_keys
+                    .iter()
+                    .map(|fk| fk.decl_order)
+                    .max()
+                    .map_or(0, |order| order + 1);
+                btree.foreign_keys.push(Arc::new(crate::schema::ForeignKey {
+                    parent_table: normalize_ident(clause.tbl_name.as_str()),
+                    parent_columns: clause
+                        .columns
+                        .iter()
+                        .map(|c| normalize_ident(c.col_name.as_str()))
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                    on_delete: clause
+                        .args
+                        .iter()
+                        .find_map(|arg| {
+                            if let ast::RefArg::OnDelete(act) = arg {
+                                Some(*act)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(ast::RefAct::NoAction),
+                    on_update: clause
+                        .args
+                        .iter()
+                        .find_map(|arg| {
+                            if let ast::RefArg::OnUpdate(act) = arg {
+                                Some(*act)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(ast::RefAct::NoAction),
+                    child_columns: Box::from([normalize_ident(&new_name)]),
+                    deferred: match defer_clause {
+                        Some(d) => {
+                            d.deferrable
+                                && matches!(
+                                    d.init_deferred,
+                                    Some(ast::InitDeferredPred::InitiallyDeferred)
+                                )
+                        }
+                        None => false,
+                    },
+                    decl_order,
+                    declared_on_column: true,
+                }));
+            }
+
             // Indexes whose collation was inherited from the column follow it
             // to the new collation, like a fresh parse of the schema would.
             if old_collation != new_column.collation() {
@@ -15531,7 +15608,7 @@ pub fn op_alter_column(
         Ok(())
     })??;
 
-    if *rename {
+    if column_name_changed {
         // Update in-memory trigger objects for the renamed column in both the
         // altered schema and temp, since temp triggers may reference main/attached tables.
         with_relevant_trigger_schemas_mut(&conn, *db, |schema| {

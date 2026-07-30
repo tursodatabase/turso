@@ -1386,6 +1386,7 @@ pub fn translate_alter_table(
                                 None => false,
                             },
                             decl_order,
+                            declared_on_column: true,
                         };
                         btree.foreign_keys.push(Arc::new(fk));
                     }
@@ -1960,11 +1961,14 @@ pub fn translate_alter_table(
                 None => None,
             };
 
-            // If renaming, rewrite trigger SQL for all triggers that reference this column
-            // We'll collect the triggers to rewrite and update them in sqlite_schema
+            // If the column name changes (RENAME COLUMN, or ALTER COLUMN with a
+            // new name), rewrite trigger SQL for all triggers that reference
+            // this column. We'll collect the triggers to rewrite and update
+            // them in sqlite_schema.
+            let column_name_changed = rename || normalize_ident(from) != normalize_ident(col_name);
             let mut triggers_to_rewrite: Vec<(usize, String, String)> = Vec::new();
             let mut views_to_rewrite: Vec<(usize, String, String)> = Vec::new();
-            if rename {
+            if column_name_changed {
                 // Try to rewrite every trigger's SQL for the column rename.
                 // If the rewritten SQL differs from the original, include it
                 // in the update list. This matches SQLite's approach and avoids

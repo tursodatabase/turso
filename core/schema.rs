@@ -4566,6 +4566,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             .unwrap_or(RefAct::NoAction),
                         deferred,
                         decl_order: table_fk_order,
+                        declared_on_column: false,
                     };
                     foreign_keys.try_push(Arc::new(fk))?;
                     table_fk_order += 1;
@@ -4766,6 +4767,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     None => false,
                                 },
                                 decl_order: column_fk_order,
+                                declared_on_column: true,
                             };
                             foreign_keys.try_push(Arc::new(fk))?;
                             column_fk_order += 1;
@@ -5033,6 +5035,11 @@ pub struct ForeignKey {
     ///
     /// SQLite reports PRAGMA foreign_key_list rows in reverse declaration order.
     pub decl_order: usize,
+    /// True when the constraint was written inline on a column definition
+    /// (rather than as a table-level FOREIGN KEY constraint). ALTER COLUMN
+    /// replaces the column definition completely, so only these follow the
+    /// column definition.
+    pub declared_on_column: bool,
 }
 #[inline]
 fn fk_mismatch_err(child: &str, parent: &str) -> crate::LimboError {
