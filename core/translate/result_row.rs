@@ -328,12 +328,10 @@ pub fn emit_columns_to_destination(
         } => {
             let skip_seen_row = seen_rows.as_ref().map(|(cursor_id, index)| {
                 let skip_seen_row = program.allocate_label();
-                program.emit_insn(Insn::Found {
-                    cursor_id: *cursor_id,
-                    target_pc: skip_seen_row,
-                    record_reg: start_reg,
-                    num_regs: num_columns,
-                });
+                // Build the probe record once and reuse it for the insert.
+                // The failed Found leaves the cursor at the insertion point
+                // (both run the same eq-only GE seek), so the insert can skip
+                // its own descent via USE_SEEK, as SQLite does.
                 let record_reg = program.alloc_register();
                 program.emit_insn(Insn::MakeRecord {
                     start_reg: to_u32(start_reg),
@@ -342,12 +340,18 @@ pub fn emit_columns_to_destination(
                     index_name: Some(index.name.clone()),
                     affinity_str: None,
                 });
+                program.emit_insn(Insn::Found {
+                    cursor_id: *cursor_id,
+                    target_pc: skip_seen_row,
+                    record_reg,
+                    num_regs: 0,
+                });
                 program.emit_insn(Insn::IdxInsert {
                     cursor_id: *cursor_id,
                     record_reg,
                     unpacked_start: Some(start_reg),
                     unpacked_count: Some(to_u32(num_columns)),
-                    flags: IdxInsertFlags::new().no_op_duplicate(),
+                    flags: IdxInsertFlags::new().no_op_duplicate().use_seek(true),
                 });
                 skip_seen_row
             });
