@@ -594,24 +594,48 @@ impl<'a> LogicalPlanBuilder<'a> {
     fn build_select_table(&mut self, table: &ast::SelectTable) -> Result<LogicalPlan> {
         match table {
             ast::SelectTable::Table(name, alias, _indexed) => {
-                let table_name = Self::name_to_string(&name.name);
-                // Check if it's a CTE reference
-                if let Some(cte_plan) = self.ctes.get(&table_name) {
-                    return Ok(LogicalPlan::CTERef(CTERef {
-                        name: table_name.clone(),
-                        schema: cte_plan.schema().clone(),
-                    }));
-                }
-
-                // Regular table scan
                 let table_alias = alias.as_ref().map(|a| Self::name_to_string(a.name()));
-                let table_schema = self.get_table_schema(&table_name, table_alias.as_deref())?;
-                Ok(LogicalPlan::TableScan(TableScan {
-                    table_name,
-                    alias: table_alias,
-                    schema: table_schema,
-                    projection: None,
-                }))
+                match crate::translate::bind::bind_logical_source(
+                    name,
+                    self.ctes.keys().map(String::as_str),
+                    self.schema,
+                )? {
+                    crate::translate::bind::BoundLogicalSource::CommonTableExpression { name } => {
+                        let cte_plan = self
+                            .ctes
+                            .get(&name)
+                            .expect("bound CTE name must identify a visible CTE");
+                        Ok(LogicalPlan::CTERef(CTERef {
+                            name,
+                            schema: cte_plan.schema().clone(),
+                        }))
+                    }
+                    crate::translate::bind::BoundLogicalSource::Table {
+                        database,
+                        name,
+                        table,
+                    } => {
+                        let columns = table
+                            .columns()
+                            .iter()
+                            .filter_map(|column| {
+                                column.name.as_ref().map(|name| ColumnInfo {
+                                    name: name.clone(),
+                                    ty: column.ty(),
+                                    database: database.clone(),
+                                    table: Some(table.get_name().to_string()),
+                                    table_alias: table_alias.clone(),
+                                })
+                            })
+                            .collect();
+                        Ok(LogicalPlan::TableScan(TableScan {
+                            table_name: name,
+                            alias: table_alias,
+                            schema: Arc::new(LogicalSchema::new(columns)),
+                            projection: None,
+                        }))
+                    }
+                }
             }
             ast::SelectTable::Select(subquery, _alias) => self.build_select(subquery),
             ast::SelectTable::TableCall(_, _, _) => Err(LimboError::ParseError(
@@ -2275,38 +2299,6 @@ impl<'a> LogicalPlanBuilder<'a> {
             }
             _ => "expr".to_string(),
         }
-    }
-
-    // Get table schema
-    fn get_table_schema(&self, table_name: &str, alias: Option<&str>) -> Result<SchemaRef> {
-        // Look up table in schema
-        let table = self
-            .schema
-            .get_table(table_name)
-            .ok_or_else(|| LimboError::ParseError(format!("Table '{table_name}' not found")))?;
-
-        // Parse table_name which might be "db.table" for attached databases
-        let (database, actual_table) = if table_name.contains('.') {
-            let parts: Vec<&str> = table_name.splitn(2, '.').collect();
-            (Some(parts[0].to_string()), parts[1].to_string())
-        } else {
-            (None, table_name.to_string())
-        };
-
-        let mut columns = Vec::new();
-        for col in table.columns() {
-            if let Some(ref name) = col.name {
-                columns.push(ColumnInfo {
-                    name: name.clone(),
-                    ty: col.ty(),
-                    database: database.clone(),
-                    table: Some(actual_table.clone()),
-                    table_alias: alias.map(|s| s.to_string()),
-                });
-            }
-        }
-
-        Ok(Arc::new(LogicalSchema::new(columns)))
     }
 
     // Infer expression type

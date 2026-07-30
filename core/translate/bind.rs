@@ -12,7 +12,7 @@ use super::emitter::Resolver;
 use super::expr::{walk_expr, walk_expr_mut, WalkControl};
 use super::plan::{JoinInfo, TableReferences};
 use super::planner::parse_row_id;
-use crate::schema::{BTreeTable, Column, Table};
+use crate::schema::{BTreeTable, Column, Schema, Table};
 use crate::util::normalize_ident;
 use crate::Result;
 
@@ -201,6 +201,50 @@ pub struct LogicalScopeColumn<'a> {
 pub struct BoundLogicalColumn {
     pub name: String,
     pub table: Option<String>,
+}
+
+pub enum BoundLogicalSource {
+    CommonTableExpression {
+        name: String,
+    },
+    Table {
+        database: Option<String>,
+        name: String,
+        table: Arc<Table>,
+    },
+}
+
+/// Bind a logical-planner table source against visible CTEs and the schema.
+pub fn bind_logical_source<'a>(
+    source: &ast::QualifiedName,
+    cte_names: impl IntoIterator<Item = &'a str>,
+    schema: &Schema,
+) -> Result<BoundLogicalSource> {
+    let database = source.db_name.as_ref().map(|name| name.as_str());
+    let name = source.name.as_str();
+
+    if database.is_none() {
+        if let Some(cte_name) = cte_names
+            .into_iter()
+            .find(|cte_name| cte_name.eq_ignore_ascii_case(name))
+        {
+            return Ok(BoundLogicalSource::CommonTableExpression {
+                name: cte_name.to_string(),
+            });
+        }
+    }
+
+    let Some(table) = schema.get_table(name) else {
+        let qualified_name =
+            database.map_or_else(|| name.to_string(), |database| format!("{database}.{name}"));
+        crate::bail_parse_error!("no such table: {}", qualified_name);
+    };
+    let name = table.get_name().to_string();
+    Ok(BoundLogicalSource::Table {
+        database: database.map(str::to_string),
+        name,
+        table,
+    })
 }
 
 /// Bind a raw logical-planner column expression against its input schema.
