@@ -11,6 +11,25 @@ expect {
     4|3
 }
 
+@cross-check-integrity
+test orderby-declarative-reverse-scan {
+    CREATE TABLE reverse_stream(id INTEGER PRIMARY KEY, flag, name);
+    INSERT INTO reverse_stream VALUES
+        (1, 1, 'one'),
+        (2, 1, 'two'),
+        (3, 0, 'three'),
+        (4, 1, 'four');
+    SELECT name, flag
+    FROM reverse_stream
+    WHERE flag
+    ORDER BY id DESC
+    LIMIT 2 OFFSET 1;
+}
+expect {
+    two|1
+    one|1
+}
+
 # In ORDER BY clauses, column aliases take precedence when resolving identifiers to columns.
 @cross-check-integrity
 test orderby_alias_precedence {
@@ -229,4 +248,3 @@ test order-by-zero {
 expect error {
     1st ORDER BY term out of range - should be between 1 and 2
 }
-

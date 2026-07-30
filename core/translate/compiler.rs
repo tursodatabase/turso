@@ -332,6 +332,7 @@ pub(crate) struct CursorFold<Initial, BodyFn, Body> {
 /// arguments.
 pub(crate) struct ForEachRow<BodyFn, Body> {
     cursor: CursorId,
+    direction: ScanDirection,
     body: BodyFn,
     compiler: PhantomData<fn() -> Body>,
 }
@@ -340,6 +341,7 @@ pub(crate) struct ForEachRow<BodyFn, Body> {
 pub(crate) struct TryFoldRows<Initial, BodyFn, Body> {
     initial: Initial,
     cursor: CursorId,
+    direction: ScanDirection,
     body: BodyFn,
     compiler: PhantomData<fn() -> Body>,
 }
@@ -394,8 +396,9 @@ where
         let row = builder.create_block()?;
         let exit = builder.create_block()?;
 
-        builder.terminate(Terminator::CursorRewind {
+        builder.terminate(Terminator::CursorStart {
             cursor: self.cursor,
+            direction: self.direction,
             if_non_empty: row,
             if_empty: exit,
             arguments: SmallVec::new(),
@@ -406,8 +409,9 @@ where
             cursor: self.cursor,
         })
         .compile(builder)?;
-        builder.terminate(Terminator::CursorNext {
+        builder.terminate(Terminator::CursorAdvance {
             cursor: self.cursor,
+            direction: self.direction,
             if_next: row,
             if_done: exit,
             arguments: SmallVec::new(),
@@ -438,8 +442,9 @@ where
             result_state.push(builder.add_block_parameter(exit)?);
         }
 
-        builder.terminate(Terminator::CursorRewind {
+        builder.terminate(Terminator::CursorStart {
             cursor: self.cursor,
+            direction: self.direction,
             if_non_empty: row,
             if_empty: exit,
             arguments: initial.values,
@@ -467,8 +472,9 @@ where
         })?;
 
         builder.switch_to(advance)?;
-        builder.terminate(Terminator::CursorNext {
+        builder.terminate(Terminator::CursorAdvance {
             cursor: self.cursor,
+            direction: self.direction,
             if_next: row,
             if_done: exit,
             arguments: step.state.values.clone(),
@@ -502,8 +508,9 @@ where
         let state = builder.add_block_parameter(row)?;
         let result = builder.add_block_parameter(exit)?;
 
-        builder.terminate(Terminator::CursorRewind {
+        builder.terminate(Terminator::CursorStart {
             cursor: self.cursor,
+            direction: ScanDirection::Forward,
             if_non_empty: row,
             if_empty: exit,
             arguments: smallvec![initial],
@@ -511,8 +518,9 @@ where
 
         builder.switch_to(row)?;
         let next = (self.body)(state).compile(builder)?;
-        builder.terminate(Terminator::CursorNext {
+        builder.terminate(Terminator::CursorAdvance {
             cursor: self.cursor,
+            direction: ScanDirection::Forward,
             if_next: row,
             if_done: exit,
             arguments: smallvec![next],
@@ -754,6 +762,13 @@ impl CursorId {
     fn index(self) -> usize {
         self.0 as usize
     }
+}
+
+/// Logical traversal order for a symbolic cursor row stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScanDirection {
+    Forward,
+    Reverse,
 }
 
 /// A symbolic sorter resource, distinct from cursors that can be scanned.
@@ -1025,14 +1040,16 @@ enum Terminator {
         if_false: BlockId,
         if_null: BlockId,
     },
-    CursorRewind {
+    CursorStart {
         cursor: CursorId,
+        direction: ScanDirection,
         if_non_empty: BlockId,
         if_empty: BlockId,
         arguments: SmallVec<[ValueId; 2]>,
     },
-    CursorNext {
+    CursorAdvance {
         cursor: CursorId,
+        direction: ScanDirection,
         if_next: BlockId,
         if_done: BlockId,
         arguments: SmallVec<[ValueId; 2]>,
@@ -1079,7 +1096,7 @@ impl Terminator {
                 Some((*if_false, &[][..])),
                 Some((*if_null, &[][..])),
             ],
-            Self::CursorRewind {
+            Self::CursorStart {
                 if_non_empty,
                 if_empty,
                 arguments,
@@ -1089,7 +1106,7 @@ impl Terminator {
                 Some((*if_empty, arguments.as_slice())),
                 None,
             ],
-            Self::CursorNext {
+            Self::CursorAdvance {
                 if_next,
                 if_done,
                 arguments,
@@ -1136,8 +1153,8 @@ impl Terminator {
                 (Some(*condition), None, &[][..])
             }
             Self::Compare { lhs, rhs, .. } => (Some(*lhs), Some(*rhs), &[][..]),
-            Self::CursorRewind { arguments, .. }
-            | Self::CursorNext { arguments, .. }
+            Self::CursorStart { arguments, .. }
+            | Self::CursorAdvance { arguments, .. }
             | Self::SorterSort { arguments, .. }
             | Self::SorterNext { arguments, .. } => (None, None, arguments.as_slice()),
             Self::DistinctCheck { pack, .. } => (None, None, pack.values()),
@@ -1151,8 +1168,8 @@ impl Terminator {
             Self::Compare { lhs, rhs, .. } => smallvec![*lhs, *rhs],
             Self::DistinctCheck { pack, .. } => pack.values().iter().copied().collect(),
             Self::Jump { .. }
-            | Self::CursorRewind { .. }
-            | Self::CursorNext { .. }
+            | Self::CursorStart { .. }
+            | Self::CursorAdvance { .. }
             | Self::SorterSort { .. }
             | Self::SorterNext { .. } => SmallVec::new(),
         };
@@ -1161,7 +1178,7 @@ impl Terminator {
 
     fn cursor(&self) -> Option<CursorId> {
         match self {
-            Self::CursorRewind { cursor, .. } | Self::CursorNext { cursor, .. } => Some(*cursor),
+            Self::CursorStart { cursor, .. } | Self::CursorAdvance { cursor, .. } => Some(*cursor),
             Self::Jump { .. } | Self::Branch { .. } | Self::Compare { .. } | Self::Return(_) => {
                 None
             }
@@ -1175,8 +1192,8 @@ impl Terminator {
             Self::Jump { .. }
             | Self::Branch { .. }
             | Self::Compare { .. }
-            | Self::CursorRewind { .. }
-            | Self::CursorNext { .. }
+            | Self::CursorStart { .. }
+            | Self::CursorAdvance { .. }
             | Self::DistinctCheck { .. }
             | Self::Return(_) => None,
         }
@@ -1188,8 +1205,8 @@ impl Terminator {
             Self::Jump { .. }
             | Self::Branch { .. }
             | Self::Compare { .. }
-            | Self::CursorRewind { .. }
-            | Self::CursorNext { .. }
+            | Self::CursorStart { .. }
+            | Self::CursorAdvance { .. }
             | Self::SorterSort { .. }
             | Self::SorterNext { .. }
             | Self::Return(_) => None,
@@ -1227,7 +1244,7 @@ impl Terminator {
                 remap_target(if_false)?;
                 remap_target(if_null)
             }
-            Self::CursorRewind {
+            Self::CursorStart {
                 if_non_empty,
                 if_empty,
                 ..
@@ -1235,7 +1252,7 @@ impl Terminator {
                 remap_target(if_non_empty)?;
                 remap_target(if_empty)
             }
-            Self::CursorNext {
+            Self::CursorAdvance {
                 if_next, if_done, ..
             } => {
                 remap_target(if_next)?;
@@ -1288,7 +1305,7 @@ impl Terminator {
             Self::Jump { target, arguments } => {
                 retain_live_arguments(arguments, &parameter_live[target.index()])
             }
-            Self::CursorRewind {
+            Self::CursorStart {
                 if_non_empty,
                 if_empty,
                 arguments,
@@ -1301,7 +1318,7 @@ impl Terminator {
                 );
                 retain_live_arguments(arguments, &parameter_live[if_non_empty.index()])
             }
-            Self::CursorNext {
+            Self::CursorAdvance {
                 if_next,
                 if_done,
                 arguments,
@@ -2035,8 +2052,8 @@ impl IrProgram {
                 Terminator::Jump { .. }
                 | Terminator::Branch { .. }
                 | Terminator::Compare { .. }
-                | Terminator::CursorRewind { .. }
-                | Terminator::CursorNext { .. }
+                | Terminator::CursorStart { .. }
+                | Terminator::CursorAdvance { .. }
                 | Terminator::DistinctCheck { .. }
                 | Terminator::Return(_) => {}
             }
@@ -2321,12 +2338,12 @@ impl IrProgram {
             }
 
             let shared_targets = match &block.terminator {
-                Terminator::CursorRewind {
+                Terminator::CursorStart {
                     if_non_empty,
                     if_empty,
                     ..
                 } => Some((*if_non_empty, *if_empty)),
-                Terminator::CursorNext {
+                Terminator::CursorAdvance {
                     if_next, if_done, ..
                 } => Some((*if_next, *if_done)),
                 Terminator::SorterSort {
@@ -2667,12 +2684,12 @@ impl IrProgram {
             // before branching. Those two parameter packs therefore coexist
             // physically even though only one successor executes.
             let shared_targets = match &block.terminator {
-                Terminator::CursorRewind {
+                Terminator::CursorStart {
                     if_non_empty,
                     if_empty,
                     ..
                 } => Some((*if_non_empty, *if_empty)),
-                Terminator::CursorNext {
+                Terminator::CursorAdvance {
                     if_next, if_done, ..
                 } => Some((*if_next, *if_done)),
                 Terminator::SorterSort {
@@ -3337,8 +3354,9 @@ impl IrProgram {
                         target_pc: labels[if_false.index()],
                     });
                 }
-                Terminator::CursorRewind {
+                Terminator::CursorStart {
                     cursor,
+                    direction,
                     if_non_empty,
                     if_empty,
                     arguments,
@@ -3348,16 +3366,24 @@ impl IrProgram {
                         self.collect_edge_copies(&registers, *target, arguments, &mut copies);
                     }
                     Self::emit_parallel_copies(program, copies, &mut edge_copy_temporary);
-                    program.emit_insn(Insn::Rewind {
-                        cursor_id: Self::cursor_for(&physical_cursors, *cursor),
-                        pc_if_empty: labels[if_empty.index()],
+                    let cursor_id = Self::cursor_for(&physical_cursors, *cursor);
+                    program.emit_insn(match direction {
+                        ScanDirection::Forward => Insn::Rewind {
+                            cursor_id,
+                            pc_if_empty: labels[if_empty.index()],
+                        },
+                        ScanDirection::Reverse => Insn::Last {
+                            cursor_id,
+                            pc_if_empty: labels[if_empty.index()],
+                        },
                     });
                     program.emit_insn(Insn::Goto {
                         target_pc: labels[if_non_empty.index()],
                     });
                 }
-                Terminator::CursorNext {
+                Terminator::CursorAdvance {
                     cursor,
+                    direction,
                     if_next,
                     if_done,
                     arguments,
@@ -3367,9 +3393,16 @@ impl IrProgram {
                         self.collect_edge_copies(&registers, *target, arguments, &mut copies);
                     }
                     Self::emit_parallel_copies(program, copies, &mut edge_copy_temporary);
-                    program.emit_insn(Insn::Next {
-                        cursor_id: Self::cursor_for(&physical_cursors, *cursor),
-                        pc_if_next: labels[if_next.index()],
+                    let cursor_id = Self::cursor_for(&physical_cursors, *cursor);
+                    program.emit_insn(match direction {
+                        ScanDirection::Forward => Insn::Next {
+                            cursor_id,
+                            pc_if_next: labels[if_next.index()],
+                        },
+                        ScanDirection::Reverse => Insn::Prev {
+                            cursor_id,
+                            pc_if_prev: labels[if_next.index()],
+                        },
                     });
                     program.emit_insn(Insn::Goto {
                         target_pc: labels[if_done.index()],
@@ -3641,25 +3674,35 @@ impl fmt::Display for IrProgram {
                     if_false.0,
                     if_null.0,
                 )?,
-                Terminator::CursorRewind {
+                Terminator::CursorStart {
                     cursor,
+                    direction,
                     if_non_empty,
                     if_empty,
                     arguments,
                 } => {
-                    write!(f, "rewind ${}, block{}(", cursor.0, if_non_empty.0)?;
+                    write!(
+                        f,
+                        "cursor_start {direction:?} ${}, block{}(",
+                        cursor.0, if_non_empty.0
+                    )?;
                     Self::fmt_arguments(f, arguments)?;
                     write!(f, "), block{}(", if_empty.0)?;
                     Self::fmt_arguments(f, arguments)?;
                     writeln!(f, ")")?;
                 }
-                Terminator::CursorNext {
+                Terminator::CursorAdvance {
                     cursor,
+                    direction,
                     if_next,
                     if_done,
                     arguments,
                 } => {
-                    write!(f, "next ${}, block{}(", cursor.0, if_next.0)?;
+                    write!(
+                        f,
+                        "cursor_advance {direction:?} ${}, block{}(",
+                        cursor.0, if_next.0
+                    )?;
                     Self::fmt_arguments(f, arguments)?;
                     write!(f, "), block{}(", if_done.0)?;
                     Self::fmt_arguments(f, arguments)?;
@@ -3752,6 +3795,7 @@ pub(crate) struct OpenReadTable {
 #[derive(Clone, Copy)]
 pub(crate) struct CursorRows {
     cursor: CursorId,
+    direction: ScanDirection,
 }
 
 type BoxedRowConsumer<Item> = Box<dyn FnOnce(Item) -> BoxedCompile<()>>;
@@ -3893,6 +3937,7 @@ impl RowStream for CursorRows {
     fn for_each_boxed(self, body: BoxedRowConsumer<Self::Item>) -> BoxedCompile<()> {
         ForEachRow {
             cursor: self.cursor,
+            direction: self.direction,
             body,
             compiler: PhantomData,
         }
@@ -3907,6 +3952,7 @@ impl RowStream for CursorRows {
         TryFoldRows {
             initial,
             cursor: self.cursor,
+            direction: self.direction,
             body,
             compiler: PhantomData,
         }
@@ -4595,17 +4641,31 @@ impl Row {
 }
 
 /// Opens a table when compiled and returns its symbolic row stream.
-pub(crate) struct ScanTable(OpenReadTable);
+pub(crate) struct ScanTable {
+    table: OpenReadTable,
+    direction: ScanDirection,
+}
 
-pub(crate) fn scan_table(table: Arc<BTreeTable>, db: usize, schema_cookie: u32) -> ScanTable {
-    ScanTable(open_read_table(table, db, schema_cookie))
+pub(crate) fn scan_table(
+    table: Arc<BTreeTable>,
+    db: usize,
+    schema_cookie: u32,
+    direction: ScanDirection,
+) -> ScanTable {
+    ScanTable {
+        table: open_read_table(table, db, schema_cookie),
+        direction,
+    }
 }
 
 impl Compile for ScanTable {
     type Output = CursorRows;
 
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
-        self.0.compile(builder).map(|cursor| CursorRows { cursor })
+        self.table.compile(builder).map(|cursor| CursorRows {
+            cursor,
+            direction: self.direction,
+        })
     }
 }
 
@@ -5160,7 +5220,7 @@ mod tests {
     #[test]
     fn row_stream_for_each_builds_a_cursor_loop_without_loop_state() {
         let table = Arc::new(BTreeTable::from_sql("CREATE TABLE streamed(a)", 2).unwrap());
-        let compiler = scan_table(table, 0, 0).and_then(|rows| {
+        let compiler = scan_table(table, 0, 0, ScanDirection::Forward).and_then(|rows| {
             rows.for_each(|row| {
                 pack_values(smallvec![row.column(0).boxed()]).and_then(result_row_pack)
             })
@@ -5175,12 +5235,12 @@ mod tests {
                 "\n",
                 "block0:\n",
                 "  open_read $0 root 2 db 0 schema 0\n",
-                "  rewind $0, block1(), block2()\n",
+                "  cursor_start Forward $0, block1(), block2()\n",
                 "\n",
                 "block1:\n",
                 "  %0 = column $0[0]\n",
                 "  result_row [%0]\n",
-                "  next $0, block1(), block2()\n",
+                "  cursor_advance Forward $0, block1(), block2()\n",
                 "\n",
                 "block2:\n",
                 "  %1 = constant Null\n",
@@ -5190,9 +5250,43 @@ mod tests {
     }
 
     #[test]
+    fn reverse_row_stream_lowers_to_last_and_prev() {
+        let table = Arc::new(BTreeTable::from_sql("CREATE TABLE reversed(a)", 2).unwrap());
+        let compiler = scan_table(table, 0, 0, ScanDirection::Reverse).and_then(|rows| {
+            rows.for_each(|row| {
+                pack_values(smallvec![row.column(0).boxed()]).and_then(result_row_pack)
+            })
+        });
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+
+        assert!(rendered.contains("cursor_start Reverse $0, block1(), block2()"));
+        assert!(rendered.contains("cursor_advance Reverse $0, block1(), block2()"));
+
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 2, 0));
+        let target = program.alloc_register();
+        ir.lower_into(&mut program, target).unwrap();
+        program.resolve_labels().unwrap();
+
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Last { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Prev { .. })));
+        assert!(program.insns.iter().all(|(instruction, _)| !matches!(
+            instruction,
+            Insn::Rewind { .. } | Insn::Next { .. }
+        )));
+    }
+
+    #[test]
     fn row_stream_sort_materializes_then_yields_symbolic_records() {
         let table = Arc::new(BTreeTable::from_sql("CREATE TABLE sorted(a,b)", 2).unwrap());
-        let compiler = scan_table(table, 0, 0).and_then(|rows| {
+        let compiler = scan_table(table, 0, 0, ScanDirection::Forward).and_then(|rows| {
             rows.map(|row| pack_values(smallvec![row.column(1).boxed(), row.column(0).boxed()]))
                 .sort(
                     smallvec![SortKey::new(
@@ -5219,13 +5313,13 @@ mod tests {
                 "block0:\n",
                 "  open_read $0 root 2 db 0 schema 0\n",
                 "  open_sorter #0\n",
-                "  rewind $0, block1(), block2()\n",
+                "  cursor_start Forward $0, block1(), block2()\n",
                 "\n",
                 "block1:\n",
                 "  %0 = column $0[1]\n",
                 "  %1 = column $0[0]\n",
                 "  sorter_insert #0 [%0, %1]\n",
-                "  next $0, block1(), block2()\n",
+                "  cursor_advance Forward $0, block1(), block2()\n",
                 "\n",
                 "block2:\n",
                 "  sort #0, block3(), block4()\n",
@@ -5246,7 +5340,7 @@ mod tests {
     #[test]
     fn row_stream_distinct_checks_projected_packs_before_yielding() {
         let table = Arc::new(BTreeTable::from_sql("CREATE TABLE deduplicated(a,b)", 2).unwrap());
-        let compiler = scan_table(table, 0, 0).and_then(|rows| {
+        let compiler = scan_table(table, 0, 0, ScanDirection::Forward).and_then(|rows| {
             rows.map(|row| pack_values(smallvec![row.column(0).boxed(), row.column(1).boxed()]))
                 .distinct(smallvec![CollationSeq::NoCase, CollationSeq::Binary])
                 .for_each(result_row_pack)
@@ -5263,7 +5357,7 @@ mod tests {
             .find("open_distinct_set &0")
             .expect("the distinct set must be reset before scanning");
         let rewind = rendered
-            .find("rewind $0")
+            .find("cursor_start Forward $0")
             .expect("the source cursor must be entered");
         let check = rendered
             .find("distinct_check &0 [%0, %1]")
@@ -5279,7 +5373,7 @@ mod tests {
     fn row_stream_distinct_by_preserves_records_for_downstream_sorting() {
         let table =
             Arc::new(BTreeTable::from_sql("CREATE TABLE ordered_distinct(a,b)", 2).unwrap());
-        let compiler = scan_table(table, 0, 0).and_then(|rows| {
+        let compiler = scan_table(table, 0, 0, ScanDirection::Forward).and_then(|rows| {
             rows.map(|row| pack_values(smallvec![row.column(1).boxed(), row.column(0).boxed()]))
                 .distinct_by(smallvec![CollationSeq::NoCase], |pack| {
                     select_pack(pack, 1, 1)
@@ -5309,7 +5403,7 @@ mod tests {
             "the complete record should survive for downstream sorting:\n{rendered}"
         );
         assert!(
-            rendered.contains("next $0, block1(), block2()")
+            rendered.contains("cursor_advance Forward $0, block1(), block2()")
                 && rendered.contains("block2:\n  sort #0, block8(), block9()"),
             "sorting should begin only after the distinct source loop exits:\n{rendered}"
         );
@@ -5331,7 +5425,7 @@ mod tests {
     #[test]
     fn verifier_rejects_distinct_keys_with_the_wrong_width() {
         let table = Arc::new(BTreeTable::from_sql("CREATE TABLE deduplicated(a)", 2).unwrap());
-        let compiler = scan_table(table, 0, 0).and_then(|rows| {
+        let compiler = scan_table(table, 0, 0, ScanDirection::Forward).and_then(|rows| {
             rows.map(|row| pack_values(smallvec![row.column(0).boxed()]))
                 .distinct(smallvec![CollationSeq::Binary])
                 .for_each(result_row_pack)
@@ -5351,7 +5445,7 @@ mod tests {
     #[test]
     fn verifier_rejects_distinct_checks_without_a_dominating_open() {
         let table = Arc::new(BTreeTable::from_sql("CREATE TABLE deduplicated(a)", 2).unwrap());
-        let compiler = scan_table(table, 0, 0).and_then(|rows| {
+        let compiler = scan_table(table, 0, 0, ScanDirection::Forward).and_then(|rows| {
             rows.map(|row| pack_values(smallvec![row.column(0).boxed()]))
                 .distinct(smallvec![CollationSeq::Binary])
                 .for_each(result_row_pack)
@@ -5420,7 +5514,7 @@ mod tests {
     #[test]
     fn row_stream_filters_and_maps_compose_in_source_order() {
         let table = Arc::new(BTreeTable::from_sql("CREATE TABLE filtered(a,b,c)", 2).unwrap());
-        let compiler = scan_table(table, 0, 0).and_then(|rows| {
+        let compiler = scan_table(table, 0, 0, ScanDirection::Forward).and_then(|rows| {
             rows.filter(|row| row.column(0))
                 .filter(|row| row.column(1))
                 .map(|row| row.column(2))
@@ -5436,7 +5530,7 @@ mod tests {
                 "\n",
                 "block0:\n",
                 "  open_read $0 root 2 db 0 schema 0\n",
-                "  rewind $0, block1(), block2()\n",
+                "  cursor_start Forward $0, block1(), block2()\n",
                 "\n",
                 "block1:\n",
                 "  %0 = column $0[0]\n",
@@ -5451,7 +5545,7 @@ mod tests {
                 "  branch %1, block5, block6\n",
                 "\n",
                 "block4:\n",
-                "  next $0, block1(), block2()\n",
+                "  cursor_advance Forward $0, block1(), block2()\n",
                 "\n",
                 "block5:\n",
                 "  %2 = column $0[2]\n",
@@ -5467,7 +5561,7 @@ mod tests {
     #[test]
     fn row_stream_take_short_circuits_before_cursor_advance() {
         let table = Arc::new(BTreeTable::from_sql("CREATE TABLE limited(a,b)", 2).unwrap());
-        let compiler = scan_table(table, 0, 0).and_then(|rows| {
+        let compiler = scan_table(table, 0, 0, ScanDirection::Forward).and_then(|rows| {
             rows.filter(|row| row.column(0))
                 .map(|row| row.column(1))
                 .take(constant(Value::from_i64(2)))
@@ -5488,7 +5582,7 @@ mod tests {
                 "  branch %1, block1, block2\n",
                 "\n",
                 "block1:\n",
-                "  rewind $0, block4(%1), block7(%1)\n",
+                "  cursor_start Forward $0, block4(%1), block7(%1)\n",
                 "\n",
                 "block2:\n",
                 "  jump block3()\n",
@@ -5502,7 +5596,7 @@ mod tests {
                 "  branch %4, block8, block9\n",
                 "\n",
                 "block5:\n",
-                "  next $0, block4(%15), block7(%15)\n",
+                "  cursor_advance Forward $0, block4(%15), block7(%15)\n",
                 "\n",
                 "block6:\n",
                 "  jump block7(%15)\n",
@@ -5548,7 +5642,7 @@ mod tests {
     #[test]
     fn row_stream_skip_discards_items_before_projection() {
         let table = Arc::new(BTreeTable::from_sql("CREATE TABLE skipped(a,b)", 2).unwrap());
-        let compiler = scan_table(table, 0, 0).and_then(|rows| {
+        let compiler = scan_table(table, 0, 0, ScanDirection::Forward).and_then(|rows| {
             rows.skip(constant(Value::from_i64(2)))
                 .map(|row| row.column(1))
                 .for_each(|value| result_row([value]))
@@ -5560,7 +5654,7 @@ mod tests {
             .find("must_be_int")
             .expect("skip must coerce its deferred count");
         let rewind = rendered
-            .find("rewind $0")
+            .find("cursor_start Forward $0")
             .expect("the source cursor must be entered");
         let skip_comparison = rendered
             .find("compare Greater")
@@ -5784,8 +5878,9 @@ mod tests {
         let exit_second = builder.add_block_parameter(exit).unwrap();
         builder.add_block_parameter(exit).unwrap();
         builder
-            .terminate(Terminator::CursorRewind {
+            .terminate(Terminator::CursorStart {
                 cursor,
+                direction: ScanDirection::Forward,
                 if_non_empty: row,
                 if_empty: exit,
                 arguments: smallvec![first, second, third],
@@ -5798,8 +5893,9 @@ mod tests {
             })
             .unwrap();
         builder
-            .terminate(Terminator::CursorNext {
+            .terminate(Terminator::CursorAdvance {
                 cursor,
+                direction: ScanDirection::Forward,
                 if_next: row,
                 if_done: exit,
                 arguments: smallvec![row_first, row_second, row_third],
@@ -5817,11 +5913,11 @@ mod tests {
                 "block0:\n",
                 "  %0 = constant Numeric(Integer(10))\n",
                 "  %1 = constant Numeric(Integer(20))\n",
-                "  rewind $0, block1(%0, %1), block2(%0, %1)\n",
+                "  cursor_start Forward $0, block1(%0, %1), block2(%0, %1)\n",
                 "\n",
                 "block1(%3, %4):\n",
                 "  result_row [%3]\n",
-                "  next $0, block1(%3, %4), block2(%3, %4)\n",
+                "  cursor_advance Forward $0, block1(%3, %4), block2(%3, %4)\n",
                 "\n",
                 "block2(%6, %7):\n",
                 "  return %7\n",
@@ -6262,12 +6358,12 @@ mod tests {
                 "\n",
                 "block0:\n",
                 "  %0 = constant Numeric(Integer(0))\n",
-                "  rewind $0, block1(%0), block2(%0)\n",
+                "  cursor_start Forward $0, block1(%0), block2(%0)\n",
                 "\n",
                 "block1(%1):\n",
                 "  %3 = column $0[2]\n",
                 "  %4 = add %1, %3\n",
-                "  next $0, block1(%4), block2(%4)\n",
+                "  cursor_advance Forward $0, block1(%4), block2(%4)\n",
                 "\n",
                 "block2(%2):\n",
                 "  return %2\n",
@@ -6657,8 +6753,9 @@ mod tests {
         let exit = builder.create_block().unwrap();
         builder.add_block_parameter(row).unwrap();
         builder
-            .terminate(Terminator::CursorRewind {
+            .terminate(Terminator::CursorStart {
                 cursor,
+                direction: ScanDirection::Forward,
                 if_non_empty: row,
                 if_empty: exit,
                 arguments: smallvec![initial],

@@ -8,7 +8,7 @@ use crate::{
         collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         compiler::{
             compile_effect, pack_values, result_row_pack, scan_table, select_pack, BoxedCompile,
-            Compile, Row, RowStream, SortKey, SortedRow, ValueId,
+            Compile, Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -101,16 +101,20 @@ fn try_emit_declarative_table_scan(
         || member.table_id != joined.internal_id
         || member.is_outer
         || joined.join_info.is_some()
-        || !matches!(
-            joined.op,
-            Operation::Scan(Scan::BTreeTable {
-                iter_dir: IterationDirection::Forwards,
-                index: None,
-            })
-        )
     {
         return Ok(None);
     }
+    let Operation::Scan(Scan::BTreeTable {
+        iter_dir,
+        index: None,
+    }) = joined.op
+    else {
+        return Ok(None);
+    };
+    let direction = match iter_dir {
+        IterationDirection::Forwards => ScanDirection::Forward,
+        IterationDirection::Backwards => ScanDirection::Reverse,
+    };
     let Table::BTree(table) = &joined.table else {
         return Ok(None);
     };
@@ -215,7 +219,7 @@ fn try_emit_declarative_table_scan(
     let database_id = joined.database_id;
     let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
     let result_column_count = projections.len();
-    let compiler = scan_table(table, database_id, schema_cookie).and_then(move |rows| {
+    let compiler = scan_table(table, database_id, schema_cookie, direction).and_then(move |rows| {
         if predicates.is_empty() {
             compile_declarative_rows(
                 rows,
@@ -1772,6 +1776,54 @@ mod tests {
                 Value::from_i64(1),
                 Value::from_i64(0),
             ]]
+        );
+    }
+
+    #[test]
+    fn reverse_table_scan_crosses_the_declarative_compiler_boundary() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute("CREATE TABLE reversed(id INTEGER PRIMARY KEY, flag, name)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO reversed VALUES \
+                 (1, 1, 'one'), (2, 1, 'two'), (3, 0, 'three'), (4, 1, 'four')",
+            )
+            .unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT name, flag FROM reversed \
+                 WHERE flag ORDER BY id DESC LIMIT 2 OFFSET 1",
+            )
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Last { .. })));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Prev { .. })));
+        assert!(instructions
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::SorterOpen { .. })));
+        let result_row = instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 2, .. }))
+            .expect("reverse declarative scan must produce its projected row pack");
+        assert!(instructions[result_row - 2..result_row]
+            .iter()
+            .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })));
+
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::Text("two".into()), Value::from_i64(1)],
+                vec![Value::Text("one".into()), Value::from_i64(1)],
+            ]
         );
     }
 }
