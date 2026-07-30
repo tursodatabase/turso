@@ -10,9 +10,8 @@ use crate::{
             bind_cursor_input, constant, cursor_input, cursor_values, declare_ephemeral_index,
             initialize_cursor_once, insert_index_pack, literal_values,
             open_declared_ephemeral_index, open_ephemeral_index, open_index, open_table,
-            pack_values, pure, result_row_pack, scan_index, scan_table, seek_index, seek_rowid,
-            seek_table_range, select_pack, BoxedCompile, Compile, CompileRegion, CursorId,
-            CursorInputId, DeferredInValues, DeferredIndexBound, DeferredIndexRange,
+            pack_values, pure, result_row_pack, select_pack, BoxedCompile, Compile, CompileRegion,
+            CursorId, CursorInputId, DeferredInValues, DeferredIndexBound, DeferredIndexRange,
             DeferredTableBound, DeferredTableRange, ErasedRows, InputProducer, InputRequirement,
             InputRequirements, InputSlot, OpenedIndex, OpenedTable, PhysicalInputBinding, Row,
             RowStream, ScanDirection, SortKey, SortedRow, ValueId, ValuePack,
@@ -368,47 +367,10 @@ fn resolve_table_range(
     }))
 }
 
-#[derive(Clone, Copy)]
-enum DeclarativeBtreeAccess<'a> {
-    Scan {
-        direction: ScanDirection,
-        index: Option<&'a Arc<Index>>,
-    },
-    RowidEq(&'a Expr),
-    TableRange {
-        direction: ScanDirection,
-        seek_def: &'a SeekDef,
-    },
-    IndexRange {
-        direction: ScanDirection,
-        index: &'a Arc<Index>,
-        seek_def: &'a SeekDef,
-    },
-    InValues {
-        index: Option<&'a Arc<Index>>,
-        source: DeclarativeInSource<'a>,
-    },
-}
-
-#[derive(Clone, Copy)]
-enum DeclarativeInSource<'a> {
-    Literal {
-        values: &'a [Expr],
-        affinity: Affinity,
-    },
-    Subquery {
-        cursor_id: CursorID,
-    },
-}
-
 enum ResolvedInnerInValues {
     Literal {
         values: SmallVec<[ResolvedScalarExpr; 4]>,
         affinity: Affinity,
-        collation: Option<CollationSeq>,
-    },
-    Cursor {
-        input: CursorInputId,
         collation: Option<CollationSeq>,
     },
 }
@@ -427,7 +389,6 @@ impl ResolvedInnerInValues {
                 }
                 literal_values(compilers, affinity, collation)
             }
-            Self::Cursor { input, collation } => cursor_values(input, collation),
         }
     }
 }
@@ -682,26 +643,6 @@ impl DeclarativePackSink {
                 index_name,
                 affinity,
             } => insert_index_pack(cursor, pack, index_name, affinity).boxed(),
-        }
-    }
-}
-
-impl<'a> DeclarativeBtreeAccess<'a> {
-    const fn direction(self) -> ScanDirection {
-        match self {
-            Self::Scan { direction, .. }
-            | Self::TableRange { direction, .. }
-            | Self::IndexRange { direction, .. } => direction,
-            Self::RowidEq(_) | Self::InValues { .. } => ScanDirection::Forward,
-        }
-    }
-
-    const fn index(self) -> Option<&'a Arc<Index>> {
-        match self {
-            Self::Scan { index, .. } => index,
-            Self::IndexRange { index, .. } => Some(index),
-            Self::InValues { index, .. } => index,
-            Self::RowidEq(_) | Self::TableRange { .. } => None,
         }
     }
 }
@@ -1016,19 +957,19 @@ fn try_compile_declarative_table_scan(
     }
 
     let mut inputs = InputRequirements::new();
-    let (destination, destination_cursor, destination_index) = match &plan.query_destination {
-        QueryDestination::ResultRows => (DeclarativeSelectDestination::ResultRows, None, None),
+    let (destination, destination_index) = match &plan.query_destination {
+        QueryDestination::ResultRows => (DeclarativeSelectDestination::ResultRows, None),
         QueryDestination::ExistsSubqueryResult { .. }
             if matches!(plan.distinctness, Distinctness::NonDistinct) =>
         {
-            (DeclarativeSelectDestination::Exists, None, None)
+            (DeclarativeSelectDestination::Exists, None)
         }
         QueryDestination::RowValueSubqueryResult { num_regs: 1, .. }
             if plan.result_columns.len() == 1
                 && plan.order_by.is_empty()
                 && matches!(plan.distinctness, Distinctness::NonDistinct) =>
         {
-            (DeclarativeSelectDestination::RowValue, None, None)
+            (DeclarativeSelectDestination::RowValue, None)
         }
         // The first producer migration covers the identity-shaped index used by
         // scalar IN subqueries. Wider/reordered keys and generated rowids retain
@@ -1052,335 +993,90 @@ fn try_compile_declarative_table_scan(
                     index_name: index.name.clone(),
                     affinity: affinity_str.as_ref().map(|value| (**value).clone()),
                 },
-                Some(DeclarativeCursorBinding {
-                    input: destination_input,
-                    cursor: *cursor_id,
-                }),
                 Some(index.clone()),
             )
         }
         _ => return Ok(None),
     };
 
-    if plan.join_order.len() >= 2 {
-        return try_compile_declarative_join(
-            resolver,
-            plan,
-            destination,
-            destination_index,
-            inputs,
-        );
-    }
-
-    let [joined] = plan.table_references.joined_tables() else {
-        return Ok(None);
-    };
-    let [member] = plan.join_order.as_slice() else {
-        return Ok(None);
-    };
-    if member.original_idx != 0
-        || member.table_id != joined.internal_id
-        || member.is_outer
-        || joined.join_info.is_some()
-    {
-        return Ok(None);
-    }
-    let access = match &joined.op {
-        Operation::Scan(Scan::BTreeTable { iter_dir, index }) => DeclarativeBtreeAccess::Scan {
-            direction: match iter_dir {
-                IterationDirection::Forwards => ScanDirection::Forward,
-                IterationDirection::Backwards => ScanDirection::Reverse,
-            },
-            index: index.as_ref(),
-        },
-        Operation::Search(Search::RowidEq { cmp_expr }) => {
-            DeclarativeBtreeAccess::RowidEq(cmp_expr)
-        }
-        Operation::Search(Search::Seek {
-            index: None,
-            seek_def,
-        }) => DeclarativeBtreeAccess::TableRange {
-            direction: match seek_def.iter_dir {
-                IterationDirection::Forwards => ScanDirection::Forward,
-                IterationDirection::Backwards => ScanDirection::Reverse,
-            },
-            seek_def,
-        },
-        Operation::Search(Search::Seek {
-            index: Some(index),
-            seek_def,
-        }) => DeclarativeBtreeAccess::IndexRange {
-            direction: match seek_def.iter_dir {
-                IterationDirection::Forwards => ScanDirection::Forward,
-                IterationDirection::Backwards => ScanDirection::Reverse,
-            },
-            index,
-            seek_def,
-        },
-        Operation::Search(Search::InSeek {
-            index,
-            source: InSeekSource::LiteralList { values, affinity },
-        }) => DeclarativeBtreeAccess::InValues {
-            index: index.as_ref(),
-            source: DeclarativeInSource::Literal {
-                values,
-                affinity: *affinity,
-            },
-        },
-        Operation::Search(Search::InSeek {
-            index,
-            source: InSeekSource::Subquery { cursor_id },
-        }) => DeclarativeBtreeAccess::InValues {
-            index: index.as_ref(),
-            source: DeclarativeInSource::Subquery {
-                cursor_id: *cursor_id,
-            },
-        },
-        _ => return Ok(None),
-    };
-    let external_input = CursorInputId::new(u32::from(destination_cursor.is_some()));
-    let external_in_cursor = match access {
-        DeclarativeBtreeAccess::InValues {
-            source: DeclarativeInSource::Subquery { cursor_id },
-            ..
-        } => resolve_declarative_in_cursor(plan, cursor_id, external_input)?,
-        _ => None,
-    };
-    let direction = access.direction();
-    let index = access.index();
-    let Table::BTree(table) = &joined.table else {
-        return Ok(None);
-    };
-    if index.is_some_and(|index| index.ephemeral || index.index_method.is_some()) {
-        return Ok(None);
-    }
-    if matches!(
-        access,
-        DeclarativeBtreeAccess::IndexRange { .. }
-            | DeclarativeBtreeAccess::InValues { index: Some(_), .. }
-    ) && index.is_some_and(|index| {
-        resolver.with_schema(joined.database_id, |schema| {
-            index.columns.iter().any(|index_column| {
-                table
-                    .columns()
-                    .get(index_column.pos_in_table)
-                    .and_then(|column| schema.get_type_def(&column.ty_str, table.is_strict))
-                    .is_some_and(|type_def| type_def.encode().is_some())
-            })
-        })
-    }) {
-        return Ok(None);
-    }
-    let covering_index = index
-        .map(Arc::as_ref)
-        .filter(|_| joined.utilizes_covering_index());
-    let row_layout = covering_index
-        .map(RowLayout::CoveringIndex)
-        .unwrap_or(RowLayout::Table);
-    let mut expr_resolver = RowExprResolver::new(
-        resolver,
-        joined.database_id,
-        joined.internal_id,
-        table,
-        row_layout,
-        &plan.table_references,
-    );
-    let in_values = match access {
-        DeclarativeBtreeAccess::InValues {
-            source: DeclarativeInSource::Literal { values, affinity },
-            ..
-        } => {
-            let mut compiled = SmallVec::with_capacity(values.len());
-            for value in values {
-                let Some(resolved) = expr_resolver.resolve(value)? else {
-                    return Ok(None);
-                };
-                let Some(value) = compile_symbolic_static_expr(&resolved) else {
-                    return Ok(None);
-                };
-                compiled.push(value);
-            }
-            Some(literal_values(
-                compiled,
-                affinity,
-                index
-                    .and_then(|index| index.columns.first())
-                    .and_then(|column| column.collation),
-            ))
-        }
-        DeclarativeBtreeAccess::InValues {
-            source: DeclarativeInSource::Subquery { .. },
-            ..
-        } => Some(cursor_values(
-            external_in_cursor
-                .expect("subquery IN access must declare its external cursor")
-                .binding
-                .input,
-            index
-                .and_then(|index| index.columns.first())
-                .and_then(|column| column.collation),
-        )),
-        _ => None,
-    };
-    let rowid_eq = match access {
-        DeclarativeBtreeAccess::RowidEq(rowid_eq) => {
-            let Some(rowid_eq) = expr_resolver.resolve(rowid_eq)? else {
-                return Ok(None);
-            };
-            let Some(rowid_eq) = compile_symbolic_static_expr(&rowid_eq) else {
-                return Ok(None);
-            };
-            Some(rowid_eq)
-        }
-        _ => None,
-    };
-    let table_range = match access {
-        DeclarativeBtreeAccess::TableRange {
-            direction,
-            seek_def,
-        } => {
-            let Some(range) = resolve_table_range(direction, table, seek_def, &mut expr_resolver)?
-            else {
-                return Ok(None);
-            };
-            let Some(range) = range.into_static_deferred() else {
-                return Ok(None);
-            };
-            Some(range)
-        }
-        _ => None,
-    };
-    let index_range = match access {
-        DeclarativeBtreeAccess::IndexRange {
-            direction,
-            index,
-            seek_def,
-        } => {
-            let Some(range) = resolve_index_range(direction, index, seek_def, &mut expr_resolver)?
-            else {
-                return Ok(None);
-            };
-            let Some(range) = range.into_static_deferred() else {
-                return Ok(None);
-            };
-            Some(range)
-        }
-        _ => None,
-    };
-    let Some(body) =
-        resolve_declarative_select_body(plan, resolver, &mut expr_resolver, joined.database_id, 0)?
-    else {
-        return Ok(None);
-    };
-
-    let Some(dependencies) = validate_and_order_declarative_dependencies(
-        plan,
-        external_in_cursor,
-        expr_resolver.into_scalar_inputs(),
-    )?
-    else {
-        return Ok(None);
-    };
-    for dependency in dependencies {
-        inputs.declare(dependency)?;
-    }
-
-    let table = table.clone();
-    let database_id = joined.database_id;
-    let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
-    let compiler = match access {
-        DeclarativeBtreeAccess::RowidEq(_) => body.into_compiler(
-            seek_rowid(
-                table,
-                database_id,
-                schema_cookie,
-                rowid_eq.expect("rowid equality access must compile a key"),
-            ),
-            destination,
-            inputs,
-        ),
-        DeclarativeBtreeAccess::TableRange { .. } => body.into_compiler(
-            seek_table_range(
-                table,
-                database_id,
-                schema_cookie,
-                table_range.expect("table range access must compile a range"),
-            ),
-            destination,
-            inputs,
-        ),
-        DeclarativeBtreeAccess::IndexRange { index, .. } => body.into_compiler(
-            seek_index(
-                table,
-                index.clone(),
-                covering_index.is_some(),
-                database_id,
-                schema_cookie,
-                index_range.expect("index range access must compile a range"),
-            ),
-            destination,
-            inputs,
-        ),
-        DeclarativeBtreeAccess::InValues {
-            index: Some(index), ..
-        } => body.into_compiler(
-            open_index(
-                table,
-                index.clone(),
-                covering_index.is_some(),
-                database_id,
-                schema_cookie,
-            )
-            .then(in_values.expect("IN access must compile its value source"))
-            .map(|(index, values)| index.seek_each(values)),
-            destination,
-            inputs,
-        ),
-        DeclarativeBtreeAccess::InValues { index: None, .. } => body.into_compiler(
-            open_table(table, database_id, schema_cookie)
-                .then(in_values.expect("IN access must compile its value source"))
-                .map(|(table, values)| table.seek_each(values)),
-            destination,
-            inputs,
-        ),
-        DeclarativeBtreeAccess::Scan {
-            index: Some(index), ..
-        } => body.into_compiler(
-            scan_index(
-                table,
-                index.clone(),
-                covering_index.is_some(),
-                database_id,
-                schema_cookie,
-                direction,
-            ),
-            destination,
-            inputs,
-        ),
-        DeclarativeBtreeAccess::Scan { index: None, .. } => body.into_compiler(
-            scan_table(table, database_id, schema_cookie, direction),
-            destination,
-            inputs,
-        ),
-    };
-    Ok(Some(DeclarativeSelectProgram {
-        compiler,
-        destination_index,
-        result_column_count: plan.result_columns.len(),
-    }))
+    try_compile_declarative_source_pipeline(resolver, plan, destination, destination_index, inputs)
 }
 
 enum ResolvedTableJoinAccess {
     Scan(ScanDirection),
-    Rowid(ResolvedScalarExpr),
-    Range(ResolvedTableRange),
-    InValues(ResolvedInnerInValues),
+    Rowid(ResolvedJoinValue),
+    Range(ResolvedJoinTableRange),
+    InValues(ResolvedJoinInValues),
 }
 
 enum ResolvedIndexJoinAccess {
     Scan(ScanDirection),
-    Range(ResolvedIndexRange),
-    InValues(ResolvedInnerInValues),
+    Range(ResolvedJoinIndexRange),
+    InValues(ResolvedJoinInValues),
+}
+
+enum ResolvedJoinValue {
+    Static(BoxedCompile<ValueId>),
+    Dependent(ResolvedScalarExpr),
+}
+
+impl ResolvedJoinValue {
+    fn into_compiler(self, outer_rows: Option<&SymbolicRows>) -> BoxedCompile<ValueId> {
+        match self {
+            Self::Static(value) => value,
+            Self::Dependent(value) => compile_symbolic_expr(
+                outer_rows.expect("dependent join value requires rows to its left"),
+                &value,
+            ),
+        }
+    }
+}
+
+enum ResolvedJoinTableRange {
+    Static(DeferredTableRange),
+    Dependent(ResolvedTableRange),
+}
+
+impl ResolvedJoinTableRange {
+    fn into_deferred(self, outer_rows: Option<&SymbolicRows>) -> DeferredTableRange {
+        match self {
+            Self::Static(range) => range,
+            Self::Dependent(range) => range.into_row_deferred(
+                outer_rows.expect("dependent table range requires rows to its left"),
+            ),
+        }
+    }
+}
+
+enum ResolvedJoinIndexRange {
+    Static(DeferredIndexRange),
+    Dependent(ResolvedIndexRange),
+}
+
+impl ResolvedJoinIndexRange {
+    fn into_deferred(self, outer_rows: Option<&SymbolicRows>) -> DeferredIndexRange {
+        match self {
+            Self::Static(range) => range,
+            Self::Dependent(range) => range.into_row_deferred(
+                outer_rows.expect("dependent index range requires rows to its left"),
+            ),
+        }
+    }
+}
+
+enum ResolvedJoinInValues {
+    Static(DeferredInValues),
+    Dependent(ResolvedInnerInValues),
+}
+
+impl ResolvedJoinInValues {
+    fn into_deferred(self, outer_rows: Option<&SymbolicRows>) -> DeferredInValues {
+        match self {
+            Self::Static(values) => values,
+            Self::Dependent(values) => values
+                .into_deferred(outer_rows.expect("dependent IN values require rows to their left")),
+        }
+    }
 }
 
 enum ResolvedJoinMember {
@@ -1425,15 +1121,21 @@ impl ResolvedJoinMember {
     }
 }
 
-fn append_join_row<Rows>(rows: Rows, outer_rows: SymbolicRows) -> ErasedRows<SymbolicRows>
+fn append_join_row<Rows>(rows: Rows, outer_rows: Option<SymbolicRows>) -> ErasedRows<SymbolicRows>
 where
     Rows: RowStream<Item = Row>,
 {
-    rows.map(move |row| pure(outer_rows.with_row(row))).erase()
+    rows.map(move |row| {
+        pure(match outer_rows {
+            Some(outer_rows) => outer_rows.with_row(row),
+            None => SymbolicRows::single(row),
+        })
+    })
+    .erase()
 }
 
 impl OpenedJoinMember {
-    fn into_rows(self, outer_rows: SymbolicRows) -> BoxedCompile<ErasedRows<SymbolicRows>> {
+    fn into_rows(self, outer_rows: Option<SymbolicRows>) -> BoxedCompile<ErasedRows<SymbolicRows>> {
         match self {
             Self::Table {
                 table,
@@ -1443,7 +1145,7 @@ impl OpenedJoinMember {
                 table,
                 access: ResolvedTableJoinAccess::Rowid(rowid),
             } => {
-                let rowid = compile_symbolic_expr(&outer_rows, &rowid);
+                let rowid = rowid.into_compiler(outer_rows.as_ref());
                 rowid
                     .map(move |rowid| append_join_row(table.seek_rowid(rowid), outer_rows))
                     .boxed()
@@ -1452,7 +1154,7 @@ impl OpenedJoinMember {
                 table,
                 access: ResolvedTableJoinAccess::Range(range),
             } => {
-                let range = range.into_row_deferred(&outer_rows);
+                let range = range.into_deferred(outer_rows.as_ref());
                 table
                     .seek_range(range)
                     .map(move |rows| append_join_row(rows, outer_rows))
@@ -1462,7 +1164,7 @@ impl OpenedJoinMember {
                 table,
                 access: ResolvedTableJoinAccess::InValues(values),
             } => values
-                .into_deferred(&outer_rows)
+                .into_deferred(outer_rows.as_ref())
                 .map(move |values| append_join_row(table.seek_each(values), outer_rows))
                 .boxed(),
             Self::Index {
@@ -1473,7 +1175,7 @@ impl OpenedJoinMember {
                 index,
                 access: ResolvedIndexJoinAccess::Range(range),
             } => {
-                let range = range.into_row_deferred(&outer_rows);
+                let range = range.into_deferred(outer_rows.as_ref());
                 index
                     .seek(range)
                     .map(move |rows| append_join_row(rows, outer_rows))
@@ -1483,7 +1185,7 @@ impl OpenedJoinMember {
                 index,
                 access: ResolvedIndexJoinAccess::InValues(values),
             } => values
-                .into_deferred(&outer_rows)
+                .into_deferred(outer_rows.as_ref())
                 .map(move |values| append_join_row(index.seek_each(values), outer_rows))
                 .boxed(),
         }
@@ -1491,30 +1193,62 @@ impl OpenedJoinMember {
 }
 
 fn nested_join_rows(
-    outer: OpenedTable,
-    outer_direction: ScanDirection,
-    members: SmallVec<[OpenedJoinMember; 4]>,
-) -> ErasedRows<SymbolicRows> {
-    let mut rows = outer
-        .scan(outer_direction)
-        .map(|row| pure(SymbolicRows::single(row)))
-        .erase();
+    mut members: SmallVec<[OpenedJoinMember; 4]>,
+) -> BoxedCompile<ErasedRows<SymbolicRows>> {
+    assert!(
+        !members.is_empty(),
+        "a join stream requires at least one source"
+    );
+    let first = members.remove(0);
+    let mut rows = first.into_rows(None);
     for member in members {
         rows = rows
-            .flat_map(move |outer_rows| member.into_rows(outer_rows))
-            .erase();
+            .map(move |rows| {
+                rows.flat_map(move |outer_rows| member.into_rows(Some(outer_rows)))
+                    .erase()
+            })
+            .boxed();
     }
     rows
 }
 
-fn try_compile_declarative_join(
+fn declarative_join_index(operation: &Operation) -> Option<Option<&Arc<Index>>> {
+    match operation {
+        Operation::Scan(Scan::BTreeTable { index, .. })
+        | Operation::Search(Search::Seek { index, .. })
+        | Operation::Search(Search::InSeek { index, .. }) => Some(index.as_ref()),
+        Operation::Search(Search::RowidEq { .. }) => Some(None),
+        _ => None,
+    }
+}
+
+fn declarative_join_index_is_supported(
+    resolver: &Resolver,
+    database_id: usize,
+    table: &BTreeTable,
+    index: &Index,
+) -> bool {
+    !index.ephemeral
+        && index.index_method.is_none()
+        && !resolver.with_schema(database_id, |schema| {
+            index.columns.iter().any(|index_column| {
+                table
+                    .columns()
+                    .get(index_column.pos_in_table)
+                    .and_then(|column| schema.get_type_def(&column.ty_str, table.is_strict))
+                    .is_some_and(|type_def| type_def.encode().is_some())
+            })
+        })
+}
+
+fn try_compile_declarative_source_pipeline(
     resolver: &Resolver,
     plan: &SelectPlan,
     destination: DeclarativeSelectDestination,
     destination_index: Option<Arc<Index>>,
     mut inputs: InputRequirements<DeclarativeInputSource>,
 ) -> Result<Option<DeclarativeSelectProgram>> {
-    if plan.join_order.len() < 2 {
+    if plan.join_order.is_empty() {
         return Ok(None);
     }
     let joined_tables = plan.table_references.joined_tables();
@@ -1539,31 +1273,33 @@ fn try_compile_declarative_join(
     let Table::BTree(outer_table) = &first_joined.table else {
         return Ok(None);
     };
-    let outer_direction = match &first_joined.op {
-        Operation::Scan(Scan::BTreeTable {
-            iter_dir,
-            index: None,
-        }) => match iter_dir {
-            IterationDirection::Forwards => ScanDirection::Forward,
-            IterationDirection::Backwards => ScanDirection::Reverse,
-        },
-        _ => return Ok(None),
+    let Some(first_index) = declarative_join_index(&first_joined.op) else {
+        return Ok(None);
     };
+    if first_index.is_some_and(|index| {
+        !declarative_join_index_is_supported(resolver, first_joined.database_id, outer_table, index)
+    }) {
+        return Ok(None);
+    }
+    let first_covering = first_index.is_some() && first_joined.utilizes_covering_index();
 
     let database_id = first_joined.database_id;
-    let mut seen = SmallVec::<[usize; 4]>::from_slice(&[first_member.original_idx]);
+    let mut seen = SmallVec::<[usize; 4]>::new();
     let mut expr_resolver = RowExprResolver::new(
         resolver,
         database_id,
         first_joined.internal_id,
         outer_table,
-        RowLayout::Table,
+        first_index
+            .filter(|_| first_covering)
+            .map(|index| RowLayout::CoveringIndex(index.as_ref()))
+            .unwrap_or(RowLayout::Table),
         &plan.table_references,
     );
     let mut external_in_cursors = SmallVec::<[DeclarativeInCursor; 4]>::new();
     let mut resolved_members = SmallVec::<[ResolvedJoinMember; 4]>::new();
 
-    for member in &plan.join_order[1..] {
+    for (position, member) in plan.join_order.iter().enumerate() {
         let Some(joined) = joined_tables.get(member.original_idx) else {
             return Ok(None);
         };
@@ -1579,33 +1315,19 @@ fn try_compile_declarative_join(
             return Ok(None);
         };
 
-        let planned_index = match &joined.op {
-            Operation::Scan(Scan::BTreeTable { index, .. })
-            | Operation::Search(Search::InSeek { index, .. }) => index.as_ref(),
-            Operation::Search(Search::Seek { index, .. }) => index.as_ref(),
-            Operation::Search(Search::RowidEq { .. }) => None,
-            _ => return Ok(None),
+        let Some(planned_index) = declarative_join_index(&joined.op) else {
+            return Ok(None);
         };
-        if let Some(index) = planned_index {
-            if index.ephemeral
-                || index.index_method.is_some()
-                || resolver.with_schema(database_id, |schema| {
-                    index.columns.iter().any(|index_column| {
-                        table
-                            .columns()
-                            .get(index_column.pos_in_table)
-                            .and_then(|column| schema.get_type_def(&column.ty_str, table.is_strict))
-                            .is_some_and(|type_def| type_def.encode().is_some())
-                    })
-                })
-            {
-                return Ok(None);
-            }
+        if planned_index.is_some_and(|index| {
+            !declarative_join_index_is_supported(resolver, database_id, table, index)
+        }) {
+            return Ok(None);
         }
         let covering = planned_index.is_some() && joined.utilizes_covering_index();
         let collation = planned_index
             .and_then(|index| index.columns.first())
             .and_then(|column| column.collation);
+        let is_root = position == 0;
 
         let resolved = match &joined.op {
             Operation::Scan(Scan::BTreeTable { iter_dir, index }) => {
@@ -1630,6 +1352,14 @@ fn try_compile_declarative_join(
                 let Some(rowid) = expr_resolver.resolve(cmp_expr)? else {
                     return Ok(None);
                 };
+                let rowid = if is_root {
+                    let Some(rowid) = compile_symbolic_static_expr(&rowid) else {
+                        return Ok(None);
+                    };
+                    ResolvedJoinValue::Static(rowid)
+                } else {
+                    ResolvedJoinValue::Dependent(rowid)
+                };
                 ResolvedJoinMember::Table {
                     table: table.clone(),
                     access: ResolvedTableJoinAccess::Rowid(rowid),
@@ -1647,6 +1377,14 @@ fn try_compile_declarative_join(
                     resolve_table_range(direction, table, seek_def, &mut expr_resolver)?
                 else {
                     return Ok(None);
+                };
+                let range = if is_root {
+                    let Some(range) = range.into_static_deferred() else {
+                        return Ok(None);
+                    };
+                    ResolvedJoinTableRange::Static(range)
+                } else {
+                    ResolvedJoinTableRange::Dependent(range)
                 };
                 ResolvedJoinMember::Table {
                     table: table.clone(),
@@ -1666,6 +1404,14 @@ fn try_compile_declarative_join(
                 else {
                     return Ok(None);
                 };
+                let range = if is_root {
+                    let Some(range) = range.into_static_deferred() else {
+                        return Ok(None);
+                    };
+                    ResolvedJoinIndexRange::Static(range)
+                } else {
+                    ResolvedJoinIndexRange::Dependent(range)
+                };
                 ResolvedJoinMember::Index {
                     table: table.clone(),
                     index: index.clone(),
@@ -1683,10 +1429,23 @@ fn try_compile_declarative_join(
                             };
                             resolved.push(value);
                         }
-                        ResolvedInnerInValues::Literal {
-                            values: resolved,
-                            affinity: *affinity,
-                            collation,
+                        if is_root {
+                            let mut compiled = SmallVec::with_capacity(resolved.len());
+                            for value in &resolved {
+                                let Some(value) = compile_symbolic_static_expr(value) else {
+                                    return Ok(None);
+                                };
+                                compiled.push(value);
+                            }
+                            ResolvedJoinInValues::Static(literal_values(
+                                compiled, *affinity, collation,
+                            ))
+                        } else {
+                            ResolvedJoinInValues::Dependent(ResolvedInnerInValues::Literal {
+                                values: resolved,
+                                affinity: *affinity,
+                                collation,
+                            })
                         }
                     }
                     InSeekSource::Subquery { cursor_id } => {
@@ -1700,7 +1459,7 @@ fn try_compile_declarative_join(
                             return Ok(None);
                         };
                         external_in_cursors.push(dependency);
-                        ResolvedInnerInValues::Cursor { input, collation }
+                        ResolvedJoinInValues::Static(cursor_values(input, collation))
                     }
                 };
                 match index {
@@ -1719,15 +1478,17 @@ fn try_compile_declarative_join(
             _ => return Ok(None),
         };
         resolved_members.push(resolved);
-        expr_resolver.add_source(
-            database_id,
-            joined.internal_id,
-            table,
-            planned_index
-                .filter(|_| covering)
-                .map(|index| RowLayout::CoveringIndex(index.as_ref()))
-                .unwrap_or(RowLayout::Table),
-        );
+        if !is_root {
+            expr_resolver.add_source(
+                database_id,
+                joined.internal_id,
+                table,
+                planned_index
+                    .filter(|_| covering)
+                    .map(|index| RowLayout::CoveringIndex(index.as_ref()))
+                    .unwrap_or(RowLayout::Table),
+            );
+        }
     }
 
     let Some(body) = resolve_declarative_select_body(
@@ -1753,20 +1514,17 @@ fn try_compile_declarative_join(
     }
 
     let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
-    let mut opened = open_table(outer_table.clone(), database_id, schema_cookie)
-        .map(|outer| (outer, SmallVec::<[OpenedJoinMember; 4]>::new()))
-        .boxed();
+    let mut opened = pure(SmallVec::<[OpenedJoinMember; 4]>::new()).boxed();
     for member in resolved_members {
         opened = opened
             .then(member.open(database_id, schema_cookie))
-            .map(|((outer, mut members), member)| {
+            .map(|(mut members, member)| {
                 members.push(member);
-                (outer, members)
+                members
             })
             .boxed();
     }
-    let rows =
-        opened.map(move |(outer, members)| nested_join_rows(outer, outer_direction, members));
+    let rows = opened.and_then(nested_join_rows);
     let compiler = body.into_symbolic_compiler(rows, destination, inputs);
     Ok(Some(DeclarativeSelectProgram {
         compiler,
@@ -1910,23 +1668,6 @@ fn resolve_declarative_select_body(
 }
 
 impl DeclarativeSelectBody {
-    fn into_compiler<Scan, Rows>(
-        self,
-        scan: Scan,
-        destination: DeclarativeSelectDestination,
-        inputs: InputRequirements<DeclarativeInputSource>,
-    ) -> DeclarativeSelectCompiler
-    where
-        Scan: Compile<Output = Rows> + 'static,
-        Rows: RowStream<Item = Row> + 'static,
-    {
-        self.into_symbolic_compiler(
-            scan.and_then(|rows| pure(rows.map(|row| pure(SymbolicRows::single(row))))),
-            destination,
-            inputs,
-        )
-    }
-
     fn into_symbolic_compiler<Scan, Rows>(
         self,
         scan: Scan,
@@ -5489,6 +5230,98 @@ mod tests {
                 vec![
                     Value::from_i64(2),
                     Value::from_i64(3),
+                    Value::from_text("three")
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn static_index_range_can_seed_a_dependent_join_stream() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE root_range_a(\
+                    id INTEGER PRIMARY KEY, key TEXT, b_id INTEGER\
+                )",
+            )
+            .unwrap();
+        connection
+            .execute("CREATE INDEX root_range_a_key ON root_range_a(key)")
+            .unwrap();
+        connection
+            .execute("CREATE TABLE root_range_b(id INTEGER PRIMARY KEY, c_id INTEGER)")
+            .unwrap();
+        connection
+            .execute("CREATE TABLE root_range_c(id INTEGER PRIMARY KEY, payload TEXT)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO root_range_a VALUES \
+                 (1, 'a', 1), (2, 'b', 2), (3, 'c', 1), (4, 'd', 3)",
+            )
+            .unwrap();
+        connection
+            .execute("INSERT INTO root_range_b VALUES (1, 3), (2, 1), (3, 2)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO root_range_c VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+            .unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT a.id, b.id, c.payload \
+                   FROM root_range_a AS a INDEXED BY root_range_a_key \
+                  CROSS JOIN root_range_b AS b \
+                  CROSS JOIN root_range_c AS c \
+                  WHERE a.key >= 'b' AND a.key < 'd' \
+                    AND b.id = a.b_id AND c.id = b.c_id",
+            )
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+        assert!(instructions.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::SeekGE {
+                is_index: true,
+                eq_only: false,
+                num_regs: 1,
+                ..
+            }
+        )));
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::SeekRowid { .. }))
+                .count(),
+            2
+        );
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::DeferredSeek { .. })));
+        let result_row = instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 3, .. }))
+            .expect("static root range must feed one symbolic result pack");
+        assert!(
+            instructions[result_row - 3..result_row]
+                .iter()
+                .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })),
+            "root and dependent projections must remain symbolic until pack lowering"
+        );
+
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![
+                vec![
+                    Value::from_i64(2),
+                    Value::from_i64(2),
+                    Value::from_text("one")
+                ],
+                vec![
+                    Value::from_i64(3),
+                    Value::from_i64(1),
                     Value::from_text("three")
                 ],
             ]

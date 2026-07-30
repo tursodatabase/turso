@@ -423,6 +423,27 @@ expect {
     2|3|three
 }
 
+test cross-join-static-index-range-root {
+    CREATE TABLE root_a(id INTEGER PRIMARY KEY, key TEXT, b_id INTEGER);
+    CREATE INDEX root_a_key ON root_a(key);
+    CREATE TABLE root_b(id INTEGER PRIMARY KEY, c_id INTEGER);
+    CREATE TABLE root_c(id INTEGER PRIMARY KEY, payload TEXT);
+    INSERT INTO root_a VALUES
+        (1, 'a', 1), (2, 'b', 2), (3, 'c', 1), (4, 'd', 3);
+    INSERT INTO root_b VALUES (1, 3), (2, 1), (3, 2);
+    INSERT INTO root_c VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    SELECT a.id, b.id, c.payload
+    FROM root_a AS a INDEXED BY root_a_key
+    CROSS JOIN root_b AS b
+    CROSS JOIN root_c AS c
+    WHERE a.key >= 'b' AND a.key < 'd'
+      AND b.id = a.b_id AND c.id = b.c_id;
+}
+expect {
+    2|2|one
+    3|1|three
+}
+
 test cross-join-subquery-right {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);

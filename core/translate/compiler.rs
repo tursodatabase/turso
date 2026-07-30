@@ -7520,7 +7520,8 @@ impl DeferredIndexRange {
     }
 }
 
-pub(crate) fn scan_table(
+#[cfg(test)]
+fn scan_table(
     table: Arc<BTreeTable>,
     db: usize,
     schema_cookie: u32,
@@ -7529,7 +7530,8 @@ pub(crate) fn scan_table(
     open_table(table, db, schema_cookie).map(move |table| table.scan(direction))
 }
 
-pub(crate) fn seek_rowid(
+#[cfg(test)]
+fn seek_rowid(
     table: Arc<BTreeTable>,
     db: usize,
     schema_cookie: u32,
@@ -7540,7 +7542,8 @@ pub(crate) fn seek_rowid(
         .map(|(table, rowid)| table.seek_rowid(rowid))
 }
 
-pub(crate) fn seek_table_range(
+#[cfg(test)]
+fn seek_table_range(
     table: Arc<BTreeTable>,
     db: usize,
     schema_cookie: u32,
@@ -7549,7 +7552,8 @@ pub(crate) fn seek_table_range(
     open_table(table, db, schema_cookie).and_then(move |table| table.seek_range(range))
 }
 
-pub(crate) fn scan_index(
+#[cfg(test)]
+fn scan_index(
     table: Arc<BTreeTable>,
     index: Arc<Index>,
     covering: bool,
@@ -7560,7 +7564,8 @@ pub(crate) fn scan_index(
     open_index(table, index, covering, db, schema_cookie).map(move |index| index.scan(direction))
 }
 
-pub(crate) fn seek_index(
+#[cfg(test)]
+fn seek_index(
     table: Arc<BTreeTable>,
     index: Arc<Index>,
     covering: bool,

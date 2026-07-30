@@ -115,9 +115,9 @@ set.
 Columns, literals, numeric and bitwise arithmetic, three-valued `AND` and `OR`,
 both forms of `CASE`, parentheses, collation wrappers, and ordinary comparisons
 can be nested and shared by both result expressions and predicates.
-It composes `scan_table`, row-stream operators, scalar projection, and
-`result_row`, then builds and verifies the complete IR before touching
-`ProgramBuilder`.
+It composes symbolic resource acquisition, row-stream operators, scalar
+projection, and `result_row`, then builds and verifies the complete IR before
+touching `ProgramBuilder`.
 
 The row stream has an associated symbolic item type and composes chainable
 `filter` and `map` operators before a terminal `for_each`. A filter compiles its
@@ -129,24 +129,24 @@ terminal consumer.
 `flat_map` gives nested row production the same shape as Rust's iterator
 adapter. Join compilation opens every resource before entering the outer loop,
 then folds the planner-sized member list over the first stream. Each member is
-an owned table-or-index access description; inside its `flat_map`, it compiles
-keys and bounds against the symbolic rows produced to its left, positions its
-opened resource, and appends one symbolic row slot. This produces an N-way
-nested-loop CFG without selecting cursor numbers, emitting bytecode, or
-hard-coding tuple arities. SQL table identities are resolved to ordered
+an owned table-or-index access description. The first member compiles static
+keys, bounds, or `IN` inputs and seeds a `SymbolicRows` stream; every later
+member compiles its access against the symbolic rows produced to its left,
+positions its opened resource inside `flat_map`, and appends one row slot. A
+single-source SELECT is the same pipeline with a one-element member list. This
+produces nested-loop CFG without selecting cursor numbers, emitting bytecode,
+or hard-coding tuple arities. SQL table identities are resolved to ordered
 `SymbolicRows` slots before IR construction. The concrete Rust adapter type is
 erased after every fold while that symbolic item type remains intact, so
-filtering, sorting, distinctness, slicing, and destinations consume every join
-shape through the same operators as a single-table scan.
+filtering, sorting, distinctness, slicing, and destinations consume every
+source shape through one path.
 Table resource acquisition is separate from stream positioning. `open_table`
 produces a non-cloneable symbolic `OpenedTable`; consuming that handle with
 `scan`, `seek_rowid`, or `seek_range` produces the row stream. A dependent join
 can therefore open both tables in its entry block, compile a point key or range
 endpoints from the outer symbolic row, and position the already-open inner
 table inside `flat_map`. The inner cursor is repositioned per outer row without
-emitting an `OpenRead` in the loop. The `scan_table`, `seek_rowid`, and
-`seek_table_range` entry points are convenience compositions over this same
-resource API.
+emitting an `OpenRead` in the loop.
 Index acquisition follows the same contract. `open_index` produces an
 `OpenedIndex` that owns the index cursor and, for a non-covering access, its
 table cursor and deferred-seek relationship. `scan` or `seek` consumes the
@@ -154,8 +154,7 @@ resource into a stream. A dependent index join resolves SQL affinity, NULL,
 and boundary policy in the frontend, then compiles the range key from the
 outer symbolic row inside `flat_map`. All physical cursors still open before
 the outer loop; only index positioning and deferred table lookup repeat for
-each outer row. `scan_index` and `seek_index` are convenience compositions over
-this resource API.
+each outer row.
 IN-driven positioning uses the same resource boundary instead of a combined
 open-and-seek compiler. `DeferredInValues` compiles independently into an
 `InValueRows` stream that retains its comparison collation. Pairing that stream
