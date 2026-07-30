@@ -3136,7 +3136,6 @@ impl Window {
                     && *nulls_a == col_b.nulls
             })
     }
-
 }
 
 /// Convert a parsed `FRAME` clause into the planner's `Frame`.
