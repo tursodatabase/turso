@@ -6162,6 +6162,24 @@ fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
     }
 }
 
+/// Switch sum() from its exact integer total to the floating-point
+/// total, seeding it with the integer sum so far. A large integer can't
+/// fit in a double exactly, so split it into a high part (the value) and
+/// a low part (the running error term) and lose no bits. Mirrors
+/// SQLite's `kahanBabuskaNeumaierInit` (func.c).
+fn kbn_init_from_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
+    const THRESHOLD: i64 = 4503599627370496; // 2^52
+
+    if i <= -THRESHOLD || i >= THRESHOLD {
+        let i_sm = i % 16384;
+        *acc = Value::from_f64((i - i_sm) as f64);
+        state.r_err = i_sm as f64;
+    } else {
+        *acc = Value::from_f64(i as f64);
+        state.r_err = 0.0;
+    }
+}
+
 /// Initialize aggregate payload with default values.
 /// Payload layout by aggregate type:
 /// - Count/Count0: [Integer(0)]
@@ -6387,16 +6405,16 @@ fn update_agg_payload(
                     Value::Numeric(Numeric::Integer(acc_i)) => match acc_i.checked_add(*i) {
                         Some(sum) => *acc_i = sum,
                         None => {
-                            if matches!(func, AggFunc::Total) {
-                                let acc_f = *acc_i as f64;
-                                *acc = Value::from_f64(acc_f);
-                                sum_state.approx = true;
-                                sum_state.ovrfl = true;
-                                apply_kbn_step_int(acc, *i, &mut sum_state);
-                            } else {
-                                mark_unlikely();
-                                return Err(LimboError::IntegerOverflow);
-                            }
+                            // The integer total overflowed i64. Switch to
+                            // the floating-point total and remember the
+                            // overflow: sum() reports it at the end unless
+                            // a later float clears it, and total() never
+                            // reports it. Mirrors sumStep (func.c:1838-1846).
+                            let prev = *acc_i;
+                            sum_state.approx = true;
+                            sum_state.ovrfl = true;
+                            kbn_init_from_int(acc, prev, &mut sum_state);
+                            apply_kbn_step_int(acc, *i, &mut sum_state);
                         }
                     },
                     Value::Numeric(Numeric::Float(_)) => {
@@ -6410,12 +6428,21 @@ fn update_agg_payload(
                         sum_state.approx = true;
                     }
                     Value::Numeric(Numeric::Integer(i)) => {
-                        *acc = Value::from_f64(*i as f64);
+                        // First float, after an all-integer run. Switch to
+                        // the floating-point total, seeding it from the
+                        // exact integer sum so far (func.c:1834-1836).
+                        let prev = *i;
                         sum_state.approx = true;
+                        kbn_init_from_int(acc, prev, &mut sum_state);
                         apply_kbn_step(acc, f64::from(*f), &mut sum_state);
                     }
                     Value::Numeric(Numeric::Float(_)) => {
+                        // Already a floating-point total. A float input
+                        // clears any earlier integer-overflow flag: the
+                        // result is a float approximation regardless, so
+                        // there's nothing to report (func.c:1852).
                         sum_state.approx = true;
+                        sum_state.ovrfl = false;
                         apply_kbn_step(acc, f64::from(*f), &mut sum_state);
                     }
                     _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
@@ -6661,10 +6688,24 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
             let approx = payload[2].as_int().unwrap_or(0) != 0;
             let ovrfl = payload[3].as_int().unwrap_or(0) != 0;
             let r_err = payload[1].to_float_or_zero();
+            // An all-integer sum that overflowed and was never cleared by
+            // a float is reported here, at the end — not when it happened.
+            // The frame may have shrunk back into range since, but SQLite
+            // still reports it (sumFinalize). This check comes before the
+            // NULL-accumulator (NaN) case below, matching SQLite's order.
+            if approx && ovrfl {
+                mark_unlikely();
+                return Err(LimboError::IntegerOverflow);
+            }
             match acc {
                 Value::Null => Value::Null,
-                Value::Numeric(Numeric::Integer(i)) if !approx && !ovrfl => Value::from_i64(*i),
-                Value::Numeric(Numeric::Float(f)) => Value::from_f64(f64::from(*f) + r_err),
+                Value::Numeric(Numeric::Integer(i)) if !approx => Value::from_i64(*i),
+                // An infinite error term can't be added back meaningfully,
+                // so return the total alone (sumFinalize's overflow guard).
+                Value::Numeric(Numeric::Float(f)) if r_err.is_finite() => {
+                    Value::from_f64(f64::from(*f) + r_err)
+                }
+                Value::Numeric(Numeric::Float(f)) => Value::from_f64(f64::from(*f)),
                 _ => Value::from_f64(acc.to_float_or_zero() + r_err),
             }
         }
@@ -7539,21 +7580,6 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             };
             debug_assert!(*count > 0, "Sum/Total xInverse without matching xStep");
             *count -= 1;
-            // Exact integer subtract only applies when acc is still an
-            // Integer (sum() with no float input yet — Total never
-            // qualifies, its acc starts as Float(0.0)) and step hasn't
-            // promoted to approximate mode. SQLite's exact branch at
-            // `func.c:1872` always calls `sqlite3_value_int64`, which
-            // truncates floats — we restrict to Integer-typed args so
-            // step and inverse stay symmetric.
-            if *approx_i == 0 {
-                if let Value::Numeric(Numeric::Integer(acc_i)) = acc {
-                    if let NumericArg::Integer(sub) = parsed {
-                        *acc_i = acc_i.wrapping_sub(sub);
-                        return Ok(());
-                    }
-                }
-            }
             let r_err = r_err_val.to_float_or_zero();
             let ovrfl = matches!(ovrfl_val, Value::Numeric(Numeric::Integer(n)) if *n != 0);
             let mut sum_state = SumAggState {
@@ -7561,6 +7587,37 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
                 approx: true,
                 ovrfl,
             };
+            // Undo a row's contribution with an exact integer subtract,
+            // but only while the total is still an exact integer (sum()
+            // with no float yet; total() never qualifies, it starts as a
+            // float). If that subtract overflows i64, switch to the
+            // floating-point total and remember the overflow, just like
+            // the step path — so sum() still reports it at the end.
+            // Mirrors sumInverse (func.c). We only take this branch for
+            // integer args; a float here is impossible, since a float
+            // step would already have switched away from the exact total.
+            if *approx_i == 0 {
+                if let Value::Numeric(Numeric::Integer(acc_i)) = acc {
+                    if let NumericArg::Integer(sub) = parsed {
+                        match acc_i.checked_sub(sub) {
+                            Some(x) => {
+                                *acc_i = x;
+                                return Ok(());
+                            }
+                            None => {
+                                let prev = *acc_i;
+                                sum_state.ovrfl = true;
+                                kbn_init_from_int(acc, prev, &mut sum_state);
+                                kbn_step_int_neg(acc, sub, &mut sum_state);
+                                *approx_val = Value::from_i64(1);
+                                *r_err_val = Value::from_f64(sum_state.r_err);
+                                *ovrfl_val = Value::from_i64(sum_state.ovrfl as i64);
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
             match parsed {
                 NumericArg::Integer(i) => kbn_step_int_neg(acc, i, &mut sum_state),
                 NumericArg::Float(f) => apply_kbn_step(acc, -f, &mut sum_state),
