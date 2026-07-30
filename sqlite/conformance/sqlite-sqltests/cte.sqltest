@@ -1532,3 +1532,28 @@ test table-referenced-with-call-arguments-rejected {
 expect error {
     'not_a_function' is not a function
 }
+
+# A CTE nested inside a derived table can read a CTE from the enclosing
+# WITH clause.
+test cte-nested-in-derived-table-reads-outer-cte {
+    WITH a AS (SELECT 1 v) SELECT * FROM (WITH b AS (SELECT v FROM a) SELECT * FROM b);
+}
+expect {
+    1
+}
+
+# A CTE nested inside another CTE's body can read a sibling of that body.
+test cte-nested-in-cte-body-reads-sibling-cte {
+    WITH a AS (SELECT 2 v), c AS (WITH b AS (SELECT v FROM a) SELECT * FROM b) SELECT * FROM c;
+}
+expect {
+    2
+}
+
+# A nested CTE shadows an outer CTE with the same name.
+test cte-nested-in-derived-table-shadows-outer-cte {
+    WITH a AS (SELECT 1 v), b AS (SELECT 9 v) SELECT * FROM (WITH b AS (SELECT v+10 v FROM a) SELECT * FROM b);
+}
+expect {
+    11
+}

@@ -2156,33 +2156,45 @@ pub fn plan_bound_ctes(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<rustc_hash::FxHashMap<String, JoinedTable>> {
-    plan_bound_ctes_with_outer_refs(cte_definitions, resolver, program, connection, &[])
+    plan_bound_ctes_with_outer_refs(
+        cte_definitions,
+        resolver,
+        program,
+        connection,
+        &[],
+        &Default::default(),
+    )
 }
 
-/// [plan_bound_ctes] with correlation refs from the enclosing scope. Only
-/// recursive CTE entries need them: their bodies are planned raw (not
-/// pre-bound), so correlated references to outer tables must be resolvable
-/// during that planning.
+/// [plan_bound_ctes] with context from the enclosing scope: correlation refs
+/// (for recursive CTE bodies, which are planned raw) and already-planned CTEs
+/// from enclosing WITH clauses. The inherited CTEs seed the planned map so a
+/// nested CTE body that references a parent or sibling CTE can find it; a CTE
+/// defined here shadows an inherited one with the same name.
 pub fn plan_bound_ctes_with_outer_refs(
     mut cte_definitions: Vec<(String, super::bind::CteEntry)>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     outer_query_refs: &[OuterQueryReference],
+    inherited_ctes: &rustc_hash::FxHashMap<String, JoinedTable>,
 ) -> Result<rustc_hash::FxHashMap<String, JoinedTable>> {
-    let mut planned: rustc_hash::FxHashMap<String, JoinedTable> = Default::default();
+    let mut planned = inherited_ctes.clone();
+    // Track planning per definition index, not by map membership: an
+    // inherited entry with the same name must not stop the shadowing
+    // definition from being planned.
+    let mut done = vec![false; cte_definitions.len()];
     for idx in 0..cte_definitions.len() {
-        if !planned.contains_key(&cte_definitions[idx].0) {
-            plan_one_bound_cte(
-                idx,
-                &mut cte_definitions,
-                resolver,
-                program,
-                connection,
-                &mut planned,
-                outer_query_refs,
-            )?;
-        }
+        plan_one_bound_cte(
+            idx,
+            &mut cte_definitions,
+            resolver,
+            program,
+            connection,
+            &mut planned,
+            &mut done,
+            outer_query_refs,
+        )?;
     }
     Ok(planned)
 }
@@ -2286,12 +2298,8 @@ pub fn plan_bound_select_refs(
         program,
         connection,
         &outer_query_refs,
+        inherited_ctes,
     )?;
-    for (name, jt) in inherited_ctes {
-        planned_ctes
-            .entry(name.clone())
-            .or_insert_with(|| jt.clone());
-    }
 
     let mut planned_derived = plan_derived_tables_with_outer_refs(
         derived_bindings,
@@ -2360,8 +2368,13 @@ fn plan_one_bound_cte(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     planned: &mut rustc_hash::FxHashMap<String, JoinedTable>,
+    done: &mut [bool],
     outer_query_refs: &[OuterQueryReference],
 ) -> Result<()> {
+    if done[cte_idx] {
+        return Ok(());
+    }
+    done[cte_idx] = true;
     // A poisoned entry (deferred binding error) was never referenced — the
     // binder surfaces its error at any reference — so there is nothing to
     // plan, matching SQLite's lazy resolution of unused CTE bodies.
@@ -2374,17 +2387,16 @@ fn plan_one_bound_cte(
 
     // Recursively plan referenced sibling CTEs first.
     for &ref_idx in &referenced_indices {
-        if !planned.contains_key(&cte_definitions[ref_idx].0) {
-            plan_one_bound_cte(
-                ref_idx,
-                cte_definitions,
-                resolver,
-                program,
-                connection,
-                planned,
-                outer_query_refs,
-            )?;
-        }
+        plan_one_bound_cte(
+            ref_idx,
+            cte_definitions,
+            resolver,
+            program,
+            connection,
+            planned,
+            done,
+            outer_query_refs,
+        )?;
     }
 
     if cte_definitions[cte_idx].1.recursive {
