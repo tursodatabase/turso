@@ -996,7 +996,9 @@ pub fn translate_alter_table(
                     continue;
                 }
                 // Table-level constraint: check if it references the dropped column
-                if check_expr_references_column(&check.expr, &col_normalized) {
+                if self_table_expr_references_column(&check.expr, dropped_index)
+                    || check_expr_references_column(&check.expr, &col_normalized)
+                {
                     return Err(LimboError::ParseError(format!(
                         "error in table {table_name} after drop column: no such column: {column_name}"
                     )));
@@ -1102,6 +1104,15 @@ pub fn translate_alter_table(
             }
 
             btree.columns_mut().remove(dropped_index);
+            // Shift SELF_TABLE positional references in surviving CHECK
+            // constraints so the regenerated schema SQL renders the right
+            // column names.
+            for check in &mut btree.check_constraints {
+                crate::schema::shift_self_table_positions_after_drop(
+                    &mut check.expr,
+                    dropped_index,
+                )?;
+            }
 
             let sql = escape_sql_string_literal(&btree.to_sql());
 

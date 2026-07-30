@@ -28,7 +28,6 @@ use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
     EXPR_INDEX_SENTINEL,
 };
-use crate::translate::bind::bind_fixed_scope_expr;
 use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::ColumnMask;
 use crate::vdbe::{
@@ -2098,25 +2097,19 @@ fn emit_check_constraint_bytecode(
     or_conflict: ResolveType,
     skip_row_label: BranchOffset,
     referenced_tables: Option<&TableReferences>,
-    table_name: &str,
 ) -> Result<()> {
     for check_constraint in check_constraints {
         let expr_result_reg = program.alloc_register();
 
+        // Stored CHECK expressions are pre-resolved to SELF_TABLE form; point
+        // them at this statement's table reference. Raw identifiers (e.g. the
+        // ALTER ADD COLUMN validation pass) resolve through the expression
+        // register cache set up by emit_check_constraints.
         let mut rewritten_expr = check_constraint.expr.clone();
-        if let Some(referenced_tables) = referenced_tables {
-            let mut binding_tables = referenced_tables.clone();
-            if let Some(joined_table) = binding_tables.joined_tables_mut().first_mut() {
-                // CHECK expressions come from schema SQL and may use the base table name
-                // even when the query references the table through an alias.
-                joined_table.identifier = table_name.to_string();
-            }
-            bind_fixed_scope_expr(
-                &mut rewritten_expr,
-                Some(&mut binding_tables),
-                resolver,
-                false,
-            )?;
+        if let Some(joined_table) =
+            referenced_tables.and_then(|tables| tables.joined_tables().first())
+        {
+            crate::schema::bind_self_table_expr(&mut rewritten_expr, joined_table.internal_id);
         }
 
         translate_expr_no_constant_opt(
@@ -2145,7 +2138,18 @@ fn emit_check_constraint_bytecode(
 
         let constraint_name = match &check_constraint.name {
             Some(name) => name.clone(),
-            None => format!("{}", check_constraint.expr),
+            // Render SELF_TABLE positional references back to column names
+            // for the error message.
+            None => referenced_tables
+                .and_then(|tables| tables.joined_tables().first())
+                .and_then(|jt| {
+                    crate::schema::render_gencol_expr_sql_with_new_names(
+                        &check_constraint.expr,
+                        jt.columns(),
+                    )
+                    .ok()
+                })
+                .unwrap_or_else(|| format!("{}", check_constraint.expr)),
         };
 
         match or_conflict {
@@ -2182,6 +2186,38 @@ fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<String
     column_names
         .iter()
         .any(|name| check_expr_references_column(expr, name))
+}
+
+/// True if a stored CHECK expression references any updated column. Stored
+/// expressions carry `SELF_TABLE` positional references, checked against the
+/// affected-column set; leftover raw identifiers (lenient schema load) are
+/// checked by name.
+pub(crate) fn check_expr_references_updated_columns(
+    expr: &ast::Expr,
+    affected: impl Fn(usize) -> bool,
+    column_names: &HashSet<String>,
+    updates_rowid: bool,
+) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        match e {
+            ast::Expr::Column { table, column, .. } if table.is_self_table() => {
+                if affected(*column) {
+                    found = true;
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            ast::Expr::RowId { table, .. } if table.is_self_table() => {
+                if updates_rowid {
+                    found = true;
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+    found || check_expr_references_columns(expr, column_names)
 }
 
 /// Emit CHECK constraint evaluation with resolver cache setup and teardown.
@@ -2281,7 +2317,6 @@ pub(crate) fn emit_check_constraints<'a>(
         or_conflict,
         skip_row_label,
         referenced_tables,
-        table_name,
     );
 
     // Always restore resolver state, even on error.
