@@ -180,6 +180,36 @@ pub(crate) fn compile_value_expr<'a>(
             }
         },
         ast::Expr::Binary(lhs_expr, op, rhs_expr) => {
+            // IS [NOT] TRUE/FALSE use truth semantics (only non-zero
+            // numbers are truthy), not equality — the eager special case
+            // at the top of the Binary arm.
+            if let Some((is_not, is_true_literal)) = match (op, rhs_expr.as_ref()) {
+                (ast::Operator::Is, ast::Expr::Literal(ast::Literal::True)) => Some((false, true)),
+                (ast::Operator::Is, ast::Expr::Literal(ast::Literal::False)) => {
+                    Some((false, false))
+                }
+                (ast::Operator::IsNot, ast::Expr::Literal(ast::Literal::True)) => {
+                    Some((true, true))
+                }
+                (ast::Operator::IsNot, ast::Expr::Literal(ast::Literal::False)) => {
+                    Some((true, false))
+                }
+                _ => None,
+            } {
+                return Ok(compile_value_expr(lhs_expr.as_ref(), ctx)?.map(|operand| {
+                    // For NULL: IS variants return 0, IS NOT variants 1.
+                    // For non-NULL: IS TRUE/IS NOT FALSE keep truthiness,
+                    // IS FALSE/IS NOT TRUE invert it.
+                    let null_value = is_not;
+                    let invert = is_not == is_true_literal;
+                    Built {
+                        compiler: operand.compiler.map_with(move |builder, value| {
+                            Ok(builder.truth(value, null_value, invert))
+                        }),
+                        effect: operand.effect,
+                    }
+                }));
+            }
             enum Kind {
                 Value(BinOp),
                 Cmp(CmpOp),
@@ -558,6 +588,49 @@ pub(crate) fn compile_value_expr<'a>(
                 Ok(builder.leaf(expr))
             })))
         }
+        // Bound parameters, as non-deduping leaves: anonymous `?`
+        // parameters register a fresh index per occurrence, and eager
+        // translation re-emits `Insn::Variable` per reference either
+        // way. No collation bookkeeping in the eager arm.
+        ast::Expr::Variable(_) => Some(Built::plain(Compiler::build_with(move |builder| {
+            Ok(builder.leaf_unique(expr))
+        }))),
+        ast::Expr::Cast {
+            expr: operand,
+            type_name,
+        } => {
+            // Custom-type casts (encode chains, domain constraints) stay
+            // on the eager path; without a resolver we cannot rule them
+            // out.
+            if let Some(type_name) = type_name {
+                let Some(resolver) = ctx.resolver else {
+                    return Ok(None);
+                };
+                if resolver
+                    .schema()
+                    .resolve_type_unchecked(&type_name.name)?
+                    .is_some()
+                {
+                    return Ok(None);
+                }
+            }
+            let Some(operand) = compile_value_expr(operand.as_ref(), ctx)? else {
+                return Ok(None);
+            };
+            // SQLite allows CAST(x AS) without a type name: NUMERIC.
+            let affinity = type_name
+                .as_ref()
+                .map(|type_name| crate::vdbe::affinity::Affinity::affinity(&type_name.name))
+                .unwrap_or(crate::vdbe::affinity::Affinity::Numeric);
+            Some(Built {
+                compiler: operand
+                    .compiler
+                    .map_with(move |builder, value| Ok(builder.cast_value(value, affinity))),
+                // The eager Cast arm adds no collation bookkeeping of its
+                // own; the operand's context survives.
+                effect: operand.effect,
+            })
+        }
         _ => None,
     })
 }
@@ -807,6 +880,10 @@ const fn value_binop(op: &ast::Operator) -> Option<BinOp> {
         ast::Operator::LeftShift => BinOp::ShiftLeft,
         ast::Operator::RightShift => BinOp::ShiftRight,
         ast::Operator::Concat => BinOp::Concat,
+        // Value position only: condition position matches AND/OR into
+        // predicate composition before reaching value compilation.
+        ast::Operator::And => BinOp::And,
+        ast::Operator::Or => BinOp::Or,
         _ => return None,
     })
 }

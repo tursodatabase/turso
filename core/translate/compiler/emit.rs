@@ -173,9 +173,10 @@ impl<'a> Emitter<'a> {
         for id in 0..func.num_values() {
             is_const[id] = match inst_of[id] {
                 Some(Inst::Const(_)) => true,
-                Some(Inst::Unary { operand, .. }) | Some(Inst::NullTest { operand, .. }) => {
-                    is_const[operand.index()]
-                }
+                Some(Inst::Unary { operand, .. })
+                | Some(Inst::NullTest { operand, .. })
+                | Some(Inst::Cast { operand, .. })
+                | Some(Inst::Truth { operand, .. }) => is_const[operand.index()],
                 Some(Inst::Binary { lhs, rhs, .. }) | Some(Inst::Compare { lhs, rhs, .. }) => {
                     is_const[lhs.index()] && is_const[rhs.index()]
                 }
@@ -202,7 +203,10 @@ impl<'a> Emitter<'a> {
             for (_, inst) in &block.insts {
                 match inst {
                     Inst::Const(_) | Inst::External { .. } | Inst::Leaf(_) => {}
-                    Inst::Unary { operand, .. } | Inst::NullTest { operand, .. } => count(operand),
+                    Inst::Unary { operand, .. }
+                    | Inst::NullTest { operand, .. }
+                    | Inst::Cast { operand, .. }
+                    | Inst::Truth { operand, .. } => count(operand),
                     Inst::Binary { lhs, rhs, .. } | Inst::Compare { lhs, rhs, .. } => {
                         count(lhs);
                         count(rhs);
@@ -250,6 +254,8 @@ impl<'a> Emitter<'a> {
                                 | Inst::Binary { .. }
                                 | Inst::Compare { .. }
                                 | Inst::NullTest { .. }
+                                | Inst::Cast { .. }
+                                | Inst::Truth { .. }
                                 | Inst::Call { .. }
                                 | Inst::Leaf(_)
                         )
@@ -521,8 +527,40 @@ impl<'a> Emitter<'a> {
                         BinOp::ShiftLeft => Insn::ShiftLeft { lhs, rhs, dest },
                         BinOp::ShiftRight => Insn::ShiftRight { lhs, rhs, dest },
                         BinOp::Concat => Insn::Concat { lhs, rhs, dest },
+                        BinOp::And => Insn::And { lhs, rhs, dest },
+                        BinOp::Or => Insn::Or { lhs, rhs, dest },
                     };
                     self.program.emit_insn(insn);
+                }
+                Inst::Cast { cast, operand } => {
+                    // Insn::Cast mutates in place; the operand may be
+                    // shared (interned constants), so cast a copy in
+                    // this value's own register.
+                    let src = self.reg_of(*operand);
+                    let dest = self.reg_of(value);
+                    self.program.emit_insn(Insn::Copy {
+                        src_reg: src,
+                        dst_reg: dest,
+                        extra_amount: 0,
+                    });
+                    self.program.emit_insn(Insn::Cast {
+                        reg: dest,
+                        affinity: self.func.cast_affinity(*cast),
+                    });
+                }
+                Inst::Truth {
+                    operand,
+                    null_value,
+                    invert,
+                } => {
+                    let reg = self.reg_of(*operand);
+                    let dest = self.reg_of(value);
+                    self.program.emit_insn(Insn::IsTrue {
+                        reg,
+                        dest,
+                        null_value: *null_value,
+                        invert: *invert,
+                    });
                 }
             }
         }

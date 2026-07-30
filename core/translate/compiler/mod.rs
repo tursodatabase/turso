@@ -311,8 +311,72 @@ mod tests {
         // Function calls need a resolver; NO_TABLES has none.
         assert!(pipeline("abs(-1)").is_none());
         assert!(pipeline("CURRENT_TIMESTAMP").is_none());
-        assert!(pipeline("1 AND 2").is_none());
+        // Named-type casts need a resolver to rule out custom types.
         assert!(pipeline("CAST(1 AS TEXT)").is_none());
+        assert!(pipeline("1 BETWEEN 0 AND 2").is_none());
+    }
+
+    #[test]
+    fn value_position_logic_and_truth_tests_compile() {
+        // AND/OR in value position are plain three-valued instructions.
+        assert!(matches!(
+            pipeline("1 AND 2").unwrap()[..],
+            [
+                Insn::Integer { value: 1, .. },
+                Insn::Integer { value: 2, .. },
+                Insn::And { .. },
+            ]
+        ));
+        assert!(matches!(pipeline("0 OR 1").unwrap()[2], Insn::Or { .. }));
+        // IS TRUE family: a single IsTrue instruction.
+        let insns = pipeline("1 IS NOT FALSE").unwrap();
+        let [Insn::Integer { value: 1, .. }, Insn::IsTrue {
+            null_value: true,
+            invert: false,
+            ..
+        }] = insns[..]
+        else {
+            panic!("unexpected IS NOT FALSE shape: {insns:?}");
+        };
+        // CAST without a type name is NUMERIC and needs no resolver;
+        // the operand is copied so shared constants stay intact.
+        let insns = pipeline("CAST(7 AS)").unwrap();
+        let [Insn::Integer { value: 7, dest: c }, Insn::Copy {
+            src_reg, dst_reg, ..
+        }, Insn::Cast { reg, .. }] = insns[..]
+        else {
+            panic!("unexpected CAST shape: {insns:?}");
+        };
+        assert_eq!(src_reg, c);
+        assert_eq!(reg, dst_reg);
+    }
+
+    #[test]
+    fn variables_never_share_a_leaf() {
+        // ? + ? are two distinct parameters; the leaves must not dedup.
+        let anon = parse_expr("?");
+        let mut builder = FuncBuilder::new();
+        let first = builder.leaf_unique(&anon);
+        let second = builder.leaf_unique(&anon);
+        assert_ne!(first, second);
+        let sum = builder.binary(BinOp::Add, first, second);
+        builder.ret(sum);
+        let func = builder.finish();
+        verify(&func).unwrap();
+
+        let mut program = test_program();
+        let dest = program.alloc_register();
+        let mut calls = 0usize;
+        let mut leaf_emitter = |program: &mut ProgramBuilder, _leaf: &ast::Expr, dest: usize| {
+            calls += 1;
+            program.emit_insn(Insn::Integer {
+                value: calls as i64,
+                dest,
+            });
+            Ok(())
+        };
+        emit::emit_function_with_leaves(&mut program, &func, dest, &mut leaf_emitter).unwrap();
+        assert_eq!(calls, 2, "each variable occurrence emits its own read");
     }
 
     #[test]

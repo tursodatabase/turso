@@ -278,9 +278,18 @@ boundary (the whole tree is constant, so the span opened by
       Root-level integration hooks added to the FunctionCall, IsNull,
       and NotNull arms of `translate_expr` (previously only Binary/Case
       roots reached the pipeline).
-- [ ] 2b-3. Remaining short-circuit value forms: AND/OR in value
-      position, BETWEEN, IN-list, LIKE/GLOB, IS TRUE/FALSE, CAST.
-      Parameter/variable references (`Expr::Variable`) as leaves.
+- [x] 2b-3a. Value-position AND/OR (`BinOp::And`/`Or` — plain
+      three-valued `Insn::And`/`Or`, same merge/effect flow as other
+      binaries); IS [NOT] TRUE/FALSE (`Inst::Truth` -> `Insn::IsTrue`,
+      matching the eager null_value/invert mapping); plain-affinity CAST
+      (`Inst::Cast` with an affinity side table; `Insn::Cast` mutates in
+      place so emission casts a copy — interned constants stay sound;
+      custom-type casts gated to eager); bound parameters
+      (`Expr::Variable`) as **non-deduping** leaves via `leaf_unique` —
+      anonymous `?` registers a fresh index per occurrence, and eager
+      never dedups variables either. Root hooks added for the Cast arm.
+- [ ] 2b-3b. Remaining short-circuit value forms: BETWEEN, IN-list,
+      LIKE/GLOB (via translate_like_base), Collate(expr).
 - [ ] 2c. Constant hoisting as an IR transform (move constant-only
       instructions to the entry block) so IR islands stop depending on
       the constant-span machinery; then start deleting

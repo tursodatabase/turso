@@ -92,6 +92,23 @@ pub enum BinOp {
     ShiftLeft,
     ShiftRight,
     Concat,
+    /// Logical AND in value position: three-valued at runtime
+    /// (`Insn::And`).
+    And,
+    /// Logical OR in value position: three-valued at runtime
+    /// (`Insn::Or`).
+    Or,
+}
+
+/// Handle to a cast payload (an `Affinity`, which is not `Eq`/`Hash`, so
+/// it lives in a side table like comparison payloads).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CastId(u32);
+
+impl CastId {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
 }
 
 /// Handle to a *leaf*: an AST expression the IR cannot decompose but can
@@ -239,6 +256,21 @@ pub enum Inst {
         operand: ValueId,
         negated: bool,
     },
+    /// `CAST(operand AS type)`, plain affinity casts only (custom types
+    /// stay eager). `Insn::Cast` mutates its register in place, so
+    /// emission copies the operand into this value's fresh register
+    /// first — sharing (interned constants) stays sound.
+    Cast {
+        cast: CastId,
+        operand: ValueId,
+    },
+    /// `IS [NOT] TRUE/FALSE` truth test (`Insn::IsTrue`): `null_value`
+    /// is the result for NULL operands, `invert` flips truthiness.
+    Truth {
+        operand: ValueId,
+        null_value: bool,
+        invert: bool,
+    },
     /// A value that already lives in a physical register owned by code
     /// outside this function (the eager translation surrounding an IR
     /// island). Emission binds the value to that register directly; no
@@ -364,6 +396,8 @@ pub struct Function {
     calls: Vec<CallData>,
     /// Payloads backing [`Inst::Compare`] instructions.
     cmps: Vec<CmpData>,
+    /// Affinities backing [`Inst::Cast`] instructions.
+    casts: Vec<Affinity>,
     /// Number of declared external exits ([`ExitId`]s are dense).
     num_exits: usize,
 }
@@ -397,6 +431,10 @@ impl Function {
         &self.cmps[id.0 as usize]
     }
 
+    pub fn cast_affinity(&self, id: CastId) -> Affinity {
+        self.casts[id.index()]
+    }
+
     pub fn num_exits(&self) -> usize {
         self.num_exits
     }
@@ -416,6 +454,7 @@ pub struct FuncBuilder {
     placed_leaves: Vec<(LeafId, ValueId)>,
     calls: Vec<CallData>,
     cmps: Vec<CmpData>,
+    casts: Vec<Affinity>,
     num_exits: usize,
 }
 
@@ -430,6 +469,7 @@ impl FuncBuilder {
             placed_leaves: Vec::new(),
             calls: Vec::new(),
             cmps: Vec::new(),
+            casts: Vec::new(),
             num_exits: 0,
         }
     }
@@ -523,6 +563,18 @@ impl FuncBuilder {
         value
     }
 
+    /// A leaf that must never share a value with other reads. Anonymous
+    /// `?` parameters register a fresh index per occurrence, so two
+    /// structurally equal `Expr::Variable`s are different parameters —
+    /// and eager translation never dedups variables either.
+    pub fn leaf_unique(&mut self, expr: &ast::Expr) -> ValueId {
+        let id = LeafId(u32::try_from(self.leaves.len()).expect("leaf count fits in u32"));
+        self.leaves.push(expr.clone());
+        // Deliberately not recorded in placed_leaves: not a dedup
+        // candidate.
+        self.push_inst(Inst::Leaf(id))
+    }
+
     pub fn unary(&mut self, op: UnaryOp, operand: ValueId) -> ValueId {
         self.push_inst(Inst::Unary { op, operand })
     }
@@ -530,6 +582,22 @@ impl FuncBuilder {
     /// `IS NULL` / `IS NOT NULL` in value position (result 1/0).
     pub fn null_test(&mut self, operand: ValueId, negated: bool) -> ValueId {
         self.push_inst(Inst::NullTest { operand, negated })
+    }
+
+    /// A plain affinity cast.
+    pub fn cast_value(&mut self, operand: ValueId, affinity: Affinity) -> ValueId {
+        let id = CastId(u32::try_from(self.casts.len()).expect("cast count fits in u32"));
+        self.casts.push(affinity);
+        self.push_inst(Inst::Cast { cast: id, operand })
+    }
+
+    /// An `IS [NOT] TRUE/FALSE` truth test.
+    pub fn truth(&mut self, operand: ValueId, null_value: bool, invert: bool) -> ValueId {
+        self.push_inst(Inst::Truth {
+            operand,
+            null_value,
+            invert,
+        })
     }
 
     /// Terminate the current block with a nullness branch.
@@ -653,6 +721,7 @@ impl FuncBuilder {
             leaves: self.leaves,
             calls: self.calls,
             cmps: self.cmps,
+            casts: self.casts,
             num_exits: self.num_exits,
         }
     }

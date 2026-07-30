@@ -610,8 +610,33 @@ pub fn translate_expr(
             program.preassign_label_to_next_insn(return_label);
             Ok(target_register)
         }
-        ast::Expr::Cast { expr, type_name } => {
-            translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+        ast::Expr::Cast {
+            expr: cast_operand,
+            type_name,
+        } => {
+            // Composable compiler path; falls back to eager emission
+            // below for anything the pipeline cannot represent yet.
+            if try_compiler_value_expr(
+                program,
+                referenced_tables,
+                expr,
+                target_register,
+                resolver,
+                has_expression_indexes,
+            )? {
+                if let Some(span) = constant_span {
+                    program.constant_span_end(span);
+                }
+                return Ok(target_register);
+            }
+
+            translate_expr(
+                program,
+                referenced_tables,
+                cast_operand,
+                target_register,
+                resolver,
+            )?;
 
             // Check if casting to a custom type
             if let Some(ref tn) = type_name {
