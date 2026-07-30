@@ -1184,3 +1184,63 @@ expect {
     2|integer
     ok
 }
+
+# Changing the column collation rebuilds the index in the new order so
+# seeks respect the new collation.
+test alter-column-add-collate-nocase-with-index {
+    CREATE TABLE t (name TEXT);
+    CREATE INDEX i ON t (name);
+    INSERT INTO t VALUES ('Apple'), ('apple'), ('BANANA'), ('banana'), ('cherry');
+    ALTER TABLE t ALTER COLUMN name TO name TEXT COLLATE NOCASE;
+    SELECT count(*) FROM t WHERE name = 'APPLE';
+    SELECT name FROM t WHERE name = 'BaNaNa' ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    2
+    BANANA
+    banana
+    ok
+}
+
+# Omitting COLLATE drops it back to BINARY.
+test alter-column-drop-collation {
+    CREATE TABLE t (name TEXT COLLATE NOCASE);
+    CREATE INDEX i ON t (name);
+    INSERT INTO t VALUES ('Apple');
+    ALTER TABLE t ALTER COLUMN name TO name TEXT;
+    SELECT count(*) FROM t WHERE name = 'APPLE';
+    SELECT count(*) FROM t WHERE name = 'Apple';
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    1
+    ok
+}
+
+# An index with its own explicit collation does not follow the column.
+test alter-column-collation-keeps-explicit-index-collation {
+    CREATE TABLE t (name TEXT);
+    CREATE INDEX i ON t (name COLLATE NOCASE);
+    INSERT INTO t VALUES ('Apple'), ('apple');
+    ALTER TABLE t ALTER COLUMN name TO name TEXT COLLATE NOCASE;
+    SELECT count(*) FROM t WHERE name = 'APPLE';
+    PRAGMA integrity_check;
+}
+expect {
+    2
+    ok
+}
+
+test alter-column-notnull-with-default {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    INSERT INTO t VALUES (1, 'x');
+    ALTER TABLE t ALTER COLUMN b TO b TEXT NOT NULL DEFAULT 'd';
+    INSERT INTO t (a) VALUES (2);
+    SELECT a, b FROM t ORDER BY a;
+}
+expect {
+    1|x
+    2|d
+}

@@ -15390,6 +15390,8 @@ pub fn op_alter_column(
                 .is_some_and(|column| column.is_rowid_alias())
             && !new_column.is_rowid_alias();
 
+        let old_collation = btree.columns()[*column_index].collation();
+
         if *rename {
             btree.columns_mut()[*column_index].name = Some(new_name.clone());
 
@@ -15425,6 +15427,26 @@ pub fn op_alter_column(
                             expr,
                             new_column.name.as_deref(),
                         ));
+                }
+            }
+
+            // Indexes whose collation was inherited from the column follow it
+            // to the new collation, like a fresh parse of the schema would.
+            if old_collation != new_column.collation() {
+                if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
+                    for idx in idxs {
+                        let idx = Arc::make_mut(idx);
+                        for ic in &mut idx.columns {
+                            if ic.pos_in_table == *column_index && ic.expr.is_none() {
+                                let effective = ic
+                                    .collation
+                                    .unwrap_or(crate::translate::collate::CollationSeq::Binary);
+                                if effective == old_collation {
+                                    ic.collation = new_column.collation_opt();
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -1828,8 +1828,8 @@ pub fn translate_alter_table(
                 ));
             }
 
-            let (rewrites_physical_layout, replacement_column) = match rename {
-                true => (false, None),
+            let (rewrites_physical_layout, collation_changed, replacement_column) = match rename {
+                true => (false, false, None),
                 false => {
                     let replacement_column = Column::try_from(&definition)?;
                     if btree.is_strict {
@@ -1893,7 +1893,13 @@ pub fn translate_alter_table(
                         != replacement_column.affinity_with_strict(btree.is_strict);
                     let rewrites_physical_layout =
                         becomes_generated || virtuality_changed || affinity_changed;
-                    (rewrites_physical_layout, Some(replacement_column))
+                    let collation_changed =
+                        old_column.collation() != replacement_column.collation();
+                    (
+                        rewrites_physical_layout,
+                        collation_changed,
+                        Some(replacement_column),
+                    )
                 }
             };
             let clears_autoincrement_sequence = !rename
@@ -2292,37 +2298,67 @@ pub fn translate_alter_table(
                         connection,
                         database_id,
                     );
+                }
 
-                    // The rewrite changes the stored values of the altered
-                    // column, so every index that contains those values must be
-                    // rebuilt from the new rows or index seeks would keep
-                    // finding the old values.
+                // A rewrite changes the stored values of the altered column
+                // and a collation change reorders its comparisons, so every
+                // index that contains those values must be rebuilt from the
+                // new rows or index seeks would keep finding the old values
+                // in the old order. Indexes whose collation was inherited
+                // from the column follow it to the new collation, like a
+                // fresh parse of the schema would.
+                if rewrites_physical_layout || collation_changed {
                     let from_normalized = normalize_ident(from);
-                    let affected_indexes: Vec<Arc<crate::schema::Index>> =
+                    let old_collation = btree.columns()[column_index].collation();
+                    let new_collation_opt = altered_table.columns()[column_index].collation_opt();
+                    let new_collation = altered_table.columns()[column_index].collation();
+                    let refill_indexes: Vec<Arc<crate::schema::Index>> =
                         resolver.with_schema(database_id, |s| {
-                            s.get_indices(table_name)
-                                .filter(|index| {
-                                    index.columns.iter().any(|ic| {
-                                        ic.pos_in_table == column_index
-                                            || ic.expr.as_deref().is_some_and(|expr| {
-                                                check_expr_references_column(expr, &from_normalized)
-                                            })
-                                    }) || index.where_clause.as_deref().is_some_and(|expr| {
+                            let mut refill = Vec::new();
+                            for index in s.get_indices(table_name) {
+                                let direct = index
+                                    .columns
+                                    .iter()
+                                    .any(|ic| ic.pos_in_table == column_index && ic.expr.is_none());
+                                let via_expr = index.columns.iter().any(|ic| {
+                                    ic.expr.as_deref().is_some_and(|expr| {
                                         check_expr_references_column(expr, &from_normalized)
                                     })
-                                })
-                                .cloned()
-                                .collect()
+                                }) || index.where_clause.as_deref().is_some_and(
+                                    |expr| check_expr_references_column(expr, &from_normalized),
+                                );
+                                if !direct && !via_expr {
+                                    continue;
+                                }
+                                let mut patched = (**index).clone();
+                                let mut collation_patched = false;
+                                for ic in &mut patched.columns {
+                                    if ic.pos_in_table == column_index && ic.expr.is_none() {
+                                        let effective = ic.collation.unwrap_or(
+                                            crate::translate::collate::CollationSeq::Binary,
+                                        );
+                                        if effective == old_collation && effective != new_collation
+                                        {
+                                            ic.collation = new_collation_opt;
+                                            collation_patched = true;
+                                        }
+                                    }
+                                }
+                                if rewrites_physical_layout || collation_patched {
+                                    refill.push(Arc::new(patched));
+                                }
+                            }
+                            refill
                         });
-                    if !affected_indexes.is_empty() {
+                    if !refill_indexes.is_empty() {
                         if database_uses_mvcc(connection, database_id) {
                             return Err(LimboError::ParseError(
-                                "ALTER COLUMN cannot change the values of an indexed column in MVCC mode"
+                                "ALTER COLUMN cannot change the values or collation of an indexed column in MVCC mode"
                                     .to_string(),
                             ));
                         }
                         let altered_table_arc = Arc::new(altered_table.clone());
-                        for index in &affected_indexes {
+                        for index in &refill_indexes {
                             let index_cursor_id = program.alloc_cursor_index(None, index)?;
                             crate::translate::index::emit_refill_index(
                                 program,

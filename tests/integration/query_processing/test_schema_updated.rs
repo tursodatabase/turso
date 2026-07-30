@@ -313,3 +313,58 @@ fn test_alter_table_alter_column_clears_autoincrement_reopen() {
         conn.close().unwrap();
     }
 }
+
+/// Changing a column's collation must rebuild indexes on that column in the
+/// new collation order. Before the fix, the index kept its BINARY-ordered
+/// entries; a fresh connection parsed the index definition as NOCASE, so
+/// index seeks returned wrong results and PRAGMA integrity_check reported a
+/// missing index row.
+#[test]
+fn test_alter_column_collation_change_rebuilds_index() {
+    let path = TempDir::new()
+        .unwrap()
+        .keep()
+        .join("alter_col_collation_rebuild.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t (name TEXT)").unwrap();
+        conn.execute("CREATE INDEX i ON t (name)").unwrap();
+        conn.execute(
+            "INSERT INTO t VALUES ('Apple'), ('apple'), ('BANANA'), ('banana'), ('cherry')",
+        )
+        .unwrap();
+        conn.execute("ALTER TABLE t ALTER COLUMN name TO name TEXT COLLATE NOCASE")
+            .unwrap();
+
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t WHERE name = 'APPLE'");
+        assert_eq!(rows, vec![(2,)], "NOCASE must match both casings");
+        conn.close().unwrap();
+    }
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t WHERE name = 'APPLE'");
+        assert_eq!(
+            rows,
+            vec![(2,)],
+            "index seek after reopen must respect the new collation"
+        );
+
+        let names: Vec<(String,)> =
+            conn.exec_rows("SELECT name FROM t WHERE name = 'banana' ORDER BY rowid");
+        assert_eq!(
+            names,
+            vec![("BANANA".into(),), ("banana".into(),)],
+            "seek must find both casings after reopen"
+        );
+
+        let ok: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(ok, vec![("ok".into(),)], "index must be consistent on disk");
+
+        conn.close().unwrap();
+    }
+}
