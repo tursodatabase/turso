@@ -21,7 +21,7 @@ use crate::{
     PreparedProgram, Value,
 };
 use strum::EnumCount;
-use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
+use strum_macros::{EnumDiscriminants, FromRepr, IntoStaticStr, VariantArray};
 use turso_macros::Description;
 use turso_parser::ast::{ResolveType, SortOrder};
 
@@ -284,7 +284,7 @@ pub struct HashDistinctData {
 #[repr(u8)]
 #[derive(Description, Debug, Clone, EnumDiscriminants)]
 #[strum_discriminants(vis(pub(crate)))]
-#[strum_discriminants(derive(VariantArray, EnumCount, FromRepr))]
+#[strum_discriminants(derive(VariantArray, EnumCount, FromRepr, IntoStaticStr))]
 #[strum_discriminants(name(InsnVariants))]
 pub enum Insn {
     /// Initialize the program state and jump to the given PC.
@@ -2304,6 +2304,258 @@ impl Insn {
                 Subprogram::Pending(_) => false,
             },
             _ => true,
+        }
+    }
+
+    /// Short opcode name, e.g. "Goto".
+    pub(crate) fn name(&self) -> &'static str {
+        InsnVariants::from(self).into()
+    }
+
+    /// Visit every branch-offset operand of this instruction.
+    ///
+    /// This is the single source of truth for which fields of which opcodes
+    /// hold jump targets. Label resolution and the peephole pass both use it
+    /// to find, chase and remap targets, so a new opcode with a jump target
+    /// only needs to be added here. The match is exhaustive on purpose:
+    /// adding a variant forces the author to classify it.
+    pub(crate) fn for_each_branch_offset(&mut self, mut f: impl FnMut(&mut BranchOffset)) {
+        match self {
+            Insn::Init { target_pc, .. } => f(target_pc),
+            Insn::Jump {
+                target_pc_lt,
+                target_pc_eq,
+                target_pc_gt,
+                ..
+            } => {
+                f(target_pc_lt);
+                f(target_pc_eq);
+                f(target_pc_gt);
+            }
+            Insn::IfPos { target_pc, .. } => f(target_pc),
+            Insn::NotNull { target_pc, .. } => f(target_pc),
+            Insn::Eq { target_pc, .. } => f(target_pc),
+            Insn::Filter { target_pc, .. } => f(target_pc),
+            Insn::Ne { target_pc, .. } => f(target_pc),
+            Insn::Lt { target_pc, .. } => f(target_pc),
+            Insn::Le { target_pc, .. } => f(target_pc),
+            Insn::Gt { target_pc, .. } => f(target_pc),
+            Insn::Ge { target_pc, .. } => f(target_pc),
+            Insn::If { target_pc, .. } => f(target_pc),
+            Insn::IfNot { target_pc, .. } => f(target_pc),
+            Insn::VFilter { pc_if_empty, .. } => f(pc_if_empty),
+            Insn::VNext { pc_if_next, .. } => f(pc_if_next),
+            Insn::Rewind { pc_if_empty, .. } => f(pc_if_empty),
+            Insn::Last { pc_if_empty, .. } => f(pc_if_empty),
+            Insn::ColumnHasField { target_pc, .. } => f(target_pc),
+            Insn::Next { pc_if_next, .. } => f(pc_if_next),
+            Insn::Prev { pc_if_prev, .. } => f(pc_if_prev),
+            Insn::Goto { target_pc, .. } => f(target_pc),
+            Insn::Gosub { target_pc, .. } => f(target_pc),
+            Insn::Program {
+                ignore_jump_target, ..
+            } => f(ignore_jump_target),
+            Insn::SeekRowid { target_pc, .. } => f(target_pc),
+            Insn::SeekGE { target_pc, .. } => f(target_pc),
+            Insn::SeekGT { target_pc, .. } => f(target_pc),
+            Insn::SeekLE { target_pc, .. } => f(target_pc),
+            Insn::SeekLT { target_pc, .. } => f(target_pc),
+            Insn::IdxGE { target_pc, .. } => f(target_pc),
+            Insn::IdxGT { target_pc, .. } => f(target_pc),
+            Insn::IdxLE { target_pc, .. } => f(target_pc),
+            Insn::IdxLT { target_pc, .. } => f(target_pc),
+            Insn::DecrJumpZero { target_pc, .. } => f(target_pc),
+            Insn::SorterCompare {
+                pc_when_nonequal, ..
+            } => f(pc_when_nonequal),
+            Insn::SorterSort { pc_if_empty, .. } => f(pc_if_empty),
+            Insn::SorterNext { pc_if_next, .. } => f(pc_if_next),
+            Insn::RowSetRead { pc_if_empty, .. } => f(pc_if_empty),
+            Insn::RowSetTest { pc_if_found, .. } => f(pc_if_found),
+            Insn::InitCoroutine {
+                jump_on_definition,
+                start_offset,
+                ..
+            } => {
+                f(jump_on_definition);
+                f(start_offset);
+            }
+            Insn::Yield { end_offset, .. } => f(end_offset),
+            Insn::MustBeInt { target_pc, .. } => {
+                if let Some(pc) = target_pc.as_mut() {
+                    f(pc);
+                }
+            }
+            Insn::NoConflict { target_pc, .. } => f(target_pc),
+            Insn::NotExists { target_pc, .. } => f(target_pc),
+            Insn::IndexMethodQuery { pc_if_empty, .. } => f(pc_if_empty),
+            Insn::IsNull { target_pc, .. } => f(target_pc),
+            Insn::Once {
+                target_pc_when_reentered,
+                ..
+            } => f(target_pc_when_reentered),
+            Insn::Found { target_pc, .. } => f(target_pc),
+            Insn::NotFound { target_pc, .. } => f(target_pc),
+            Insn::IfNeg { target_pc, .. } => f(target_pc),
+            Insn::SequenceTest { target_pc, .. } => f(target_pc),
+            Insn::FkIfZero { target_pc, .. } => f(target_pc),
+            Insn::HashDistinct { data } => f(&mut data.target_pc),
+            Insn::HashProbe { target_pc, .. } => f(target_pc),
+            Insn::HashNext { target_pc, .. } => f(target_pc),
+            Insn::HashScanUnmatched { target_pc, .. } => f(target_pc),
+            Insn::HashNextUnmatched { target_pc, .. } => f(target_pc),
+            Insn::HashGraceInit { target_pc, .. } => f(target_pc),
+            Insn::HashGraceLoadPartition { target_pc, .. } => f(target_pc),
+            Insn::HashGraceNextProbe { target_pc, .. } => f(target_pc),
+            Insn::HashGraceAdvancePartition { target_pc, .. } => f(target_pc),
+            // Opcodes with no branch-offset operands.
+            Insn::Null { .. }
+            | Insn::BeginSubrtn { .. }
+            | Insn::NullRow { .. }
+            | Insn::Add { .. }
+            | Insn::Subtract { .. }
+            | Insn::Multiply { .. }
+            | Insn::MemMax { .. }
+            | Insn::Divide { .. }
+            | Insn::Compare { .. }
+            | Insn::BitAnd { .. }
+            | Insn::BitOr { .. }
+            | Insn::BitNot { .. }
+            | Insn::Checkpoint { .. }
+            | Insn::Remainder { .. }
+            | Insn::Move { .. }
+            | Insn::FilterAdd { .. }
+            | Insn::OpenRead { .. }
+            | Insn::VOpen { .. }
+            | Insn::VCreate { .. }
+            | Insn::VColumn { .. }
+            | Insn::VUpdate { .. }
+            | Insn::VDestroy { .. }
+            | Insn::VBegin { .. }
+            | Insn::VRename { .. }
+            | Insn::OpenPseudo { .. }
+            | Insn::Column { .. }
+            | Insn::TypeCheck { .. }
+            | Insn::ArrayEncode { .. }
+            | Insn::ArrayDecode { .. }
+            | Insn::ArrayElement { .. }
+            | Insn::ArrayLength { .. }
+            | Insn::MakeArray { .. }
+            | Insn::MakeArrayDynamic { .. }
+            | Insn::StructField { .. }
+            | Insn::UnionPack { .. }
+            | Insn::UnionTag { .. }
+            | Insn::UnionExtract { .. }
+            | Insn::RegCopyOffset { .. }
+            | Insn::BlobRead { .. }
+            | Insn::BlobWrite { .. }
+            | Insn::BlobLen { .. }
+            | Insn::ArrayConcat { .. }
+            | Insn::ArraySetElement { .. }
+            | Insn::ArraySlice { .. }
+            | Insn::MakeRecord { .. }
+            | Insn::ResultRow { .. }
+            | Insn::Halt { .. }
+            | Insn::HaltIfNull { .. }
+            | Insn::Transaction { .. }
+            | Insn::AutoCommit { .. }
+            | Insn::Savepoint { .. }
+            | Insn::Return { .. }
+            | Insn::ResetCount
+            | Insn::Integer { .. }
+            | Insn::Real { .. }
+            | Insn::RealAffinity { .. }
+            | Insn::String8 { .. }
+            | Insn::Blob { .. }
+            | Insn::RowData { .. }
+            | Insn::RowId { .. }
+            | Insn::IdxRowId { .. }
+            | Insn::SeekEnd { .. }
+            | Insn::DeferredSeek { .. }
+            | Insn::IdxInsert { .. }
+            | Insn::AggStep { .. }
+            | Insn::AggInverse { .. }
+            | Insn::AggFinal { .. }
+            | Insn::AggValue { .. }
+            | Insn::SorterOpen { .. }
+            | Insn::SorterInsert { .. }
+            | Insn::SorterData { .. }
+            | Insn::RowSetAdd { .. }
+            | Insn::Function { .. }
+            | Insn::Cast { .. }
+            | Insn::EndCoroutine { .. }
+            | Insn::Insert { .. }
+            | Insn::Int64 { .. }
+            | Insn::Delete { .. }
+            | Insn::IdxDelete { .. }
+            | Insn::NewRowid { .. }
+            | Insn::SoftNull { .. }
+            | Insn::OffsetLimit { .. }
+            | Insn::OpenWrite { .. }
+            | Insn::Copy { .. }
+            | Insn::CreateBtree { .. }
+            | Insn::IndexMethodCreate { .. }
+            | Insn::IndexMethodDestroy { .. }
+            | Insn::IndexMethodOptimize { .. }
+            | Insn::ClearBtree { .. }
+            | Insn::Destroy { .. }
+            | Insn::ResetSorter { .. }
+            | Insn::DropTable { .. }
+            | Insn::DropView { .. }
+            | Insn::DropIndex { .. }
+            | Insn::DropTrigger { .. }
+            | Insn::DropType { .. }
+            | Insn::AddSequence { .. }
+            | Insn::DropSequence { .. }
+            | Insn::SequenceBeginInnerTx { .. }
+            | Insn::SequenceCommitInnerTx { .. }
+            | Insn::SequenceComputeNext { .. }
+            | Insn::SetSequenceCurrval { .. }
+            | Insn::SequenceTrackAllocation { .. }
+            | Insn::SequenceRegisterAllocation { .. }
+            | Insn::AddType { .. }
+            | Insn::Close { .. }
+            | Insn::ParseSchema { .. }
+            | Insn::PopulateMaterializedViews { .. }
+            | Insn::ShiftRight { .. }
+            | Insn::ShiftLeft { .. }
+            | Insn::AddImm { .. }
+            | Insn::Variable { .. }
+            | Insn::ZeroOrNull { .. }
+            | Insn::Not { .. }
+            | Insn::IsTrue { .. }
+            | Insn::Concat { .. }
+            | Insn::And { .. }
+            | Insn::Or { .. }
+            | Insn::Noop
+            | Insn::PageCount { .. }
+            | Insn::ReadCookie { .. }
+            | Insn::SetCookie { .. }
+            | Insn::OpenEphemeral { .. }
+            | Insn::OpenAutoindex { .. }
+            | Insn::OpenDup { .. }
+            | Insn::Affinity { .. }
+            | Insn::Count { .. }
+            | Insn::IntegrityCk { .. }
+            | Insn::RenameTable { .. }
+            | Insn::DropColumn { .. }
+            | Insn::AddColumn { .. }
+            | Insn::AlterColumn { .. }
+            | Insn::MaxPgcnt { .. }
+            | Insn::JournalMode { .. }
+            | Insn::Sequence { .. }
+            | Insn::Explain { .. }
+            | Insn::FkCounter { .. }
+            | Insn::FkCheck { .. }
+            | Insn::HashBuild { .. }
+            | Insn::HashBuildFinalize { .. }
+            | Insn::HashClose { .. }
+            | Insn::HashClear { .. }
+            | Insn::HashMarkMatched { .. }
+            | Insn::HashResetMatched { .. }
+            | Insn::VacuumInto { .. }
+            | Insn::Vacuum { .. }
+            | Insn::InitCdcVersion { .. } => {}
         }
     }
 }

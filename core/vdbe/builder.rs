@@ -1312,227 +1312,29 @@ impl ProgramBuilder {
     /// It ensures that all labels are resolved correctly and updates the target program counter (PC)
     /// of each instruction that references a label.
     pub fn resolve_labels(&mut self) -> crate::Result<()> {
-        let resolve = |pc: &mut BranchOffset, insn_name: &str| -> crate::Result<()> {
-            if let BranchOffset::Label(label) = pc {
-                let Some(Some(anchor)) = self.label_to_resolved_offset.get(*label as usize) else {
-                    crate::bail_corrupt_error!(
-                        "Reference to undefined or unresolved label in {insn_name}: {label}"
-                    );
-                };
-                *pc = BranchOffset::Offset(anchor + 1);
-            }
-            Ok(())
-        };
+        let label_to_resolved_offset = &self.label_to_resolved_offset;
+        // The visitor callback cannot early-return, so remember the first
+        // unresolved label and report it after the scan.
+        let mut unresolved: Option<(u32, &'static str)> = None;
         for (insn, _) in self.insns.iter_mut() {
-            match insn {
-                Insn::Init { target_pc } => {
-                    resolve(target_pc, "Init")?;
+            let insn_name = insn.name();
+            insn.for_each_branch_offset(|pc| {
+                if let BranchOffset::Label(label) = pc {
+                    match label_to_resolved_offset.get(*label as usize) {
+                        Some(Some(anchor)) => *pc = BranchOffset::Offset(anchor + 1),
+                        _ => {
+                            if unresolved.is_none() {
+                                unresolved = Some((*label, insn_name));
+                            }
+                        }
+                    }
                 }
-                Insn::Eq {
-                    lhs: _lhs,
-                    rhs: _rhs,
-                    target_pc,
-                    ..
-                } => {
-                    resolve(target_pc, "Eq")?;
-                }
-                Insn::Ne {
-                    lhs: _lhs,
-                    rhs: _rhs,
-                    target_pc,
-                    ..
-                } => {
-                    resolve(target_pc, "Ne")?;
-                }
-                Insn::Lt {
-                    lhs: _lhs,
-                    rhs: _rhs,
-                    target_pc,
-                    ..
-                } => {
-                    resolve(target_pc, "Lt")?;
-                }
-                Insn::Le {
-                    lhs: _lhs,
-                    rhs: _rhs,
-                    target_pc,
-                    ..
-                } => {
-                    resolve(target_pc, "Le")?;
-                }
-                Insn::Gt {
-                    lhs: _lhs,
-                    rhs: _rhs,
-                    target_pc,
-                    ..
-                } => {
-                    resolve(target_pc, "Gt")?;
-                }
-                Insn::Ge {
-                    lhs: _lhs,
-                    rhs: _rhs,
-                    target_pc,
-                    ..
-                } => {
-                    resolve(target_pc, "Ge")?;
-                }
-                Insn::If {
-                    reg: _reg,
-                    target_pc,
-                    jump_if_null: _,
-                } => {
-                    resolve(target_pc, "If")?;
-                }
-                Insn::IfNot {
-                    reg: _reg,
-                    target_pc,
-                    jump_if_null: _,
-                } => {
-                    resolve(target_pc, "IfNot")?;
-                }
-                Insn::Rewind { pc_if_empty, .. } => {
-                    resolve(pc_if_empty, "Rewind")?;
-                }
-                Insn::Last { pc_if_empty, .. } => {
-                    resolve(pc_if_empty, "Last")?;
-                }
-                Insn::Goto { target_pc } => {
-                    resolve(target_pc, "Goto")?;
-                }
-                Insn::DecrJumpZero {
-                    reg: _reg,
-                    target_pc,
-                } => {
-                    resolve(target_pc, "DecrJumpZero")?;
-                }
-                Insn::SorterNext {
-                    cursor_id: _cursor_id,
-                    pc_if_next,
-                } => {
-                    resolve(pc_if_next, "SorterNext")?;
-                }
-                Insn::SorterSort { pc_if_empty, .. } => {
-                    resolve(pc_if_empty, "SorterSort")?;
-                }
-                Insn::SorterCompare {
-                    pc_when_nonequal: target_pc,
-                    ..
-                } => {
-                    resolve(target_pc, "SorterCompare")?;
-                }
-                Insn::NotNull {
-                    reg: _reg,
-                    target_pc,
-                } => {
-                    resolve(target_pc, "NotNull")?;
-                }
-                Insn::ColumnHasField { target_pc, .. } => {
-                    resolve(target_pc, "ColumnHasField")?;
-                }
-                Insn::IfPos { target_pc, .. } => {
-                    resolve(target_pc, "IfPos")?;
-                }
-                Insn::Next { pc_if_next, .. } => {
-                    resolve(pc_if_next, "Next")?;
-                }
-                Insn::Once {
-                    target_pc_when_reentered,
-                    ..
-                } => {
-                    resolve(target_pc_when_reentered, "Once")?;
-                }
-                Insn::Prev { pc_if_prev, .. } => {
-                    resolve(pc_if_prev, "Prev")?;
-                }
-                Insn::InitCoroutine {
-                    yield_reg: _,
-                    jump_on_definition,
-                    start_offset,
-                } => {
-                    resolve(jump_on_definition, "InitCoroutine")?;
-                    resolve(start_offset, "InitCoroutine")?;
-                }
-                Insn::NotExists {
-                    cursor: _,
-                    rowid_reg: _,
-                    target_pc,
-                } => {
-                    resolve(target_pc, "NotExists")?;
-                }
-                Insn::MustBeInt {
-                    target_pc: Some(target_pc),
-                    ..
-                } => {
-                    resolve(target_pc, "MustBeInt")?;
-                }
-                Insn::Yield {
-                    yield_reg: _,
-                    end_offset,
-                    subtype_clear_start_reg: _,
-                    subtype_clear_count: _,
-                } => {
-                    resolve(end_offset, "Yield")?;
-                }
-                Insn::SeekRowid { target_pc, .. } => {
-                    resolve(target_pc, "SeekRowid")?;
-                }
-                Insn::Gosub { target_pc, .. } => {
-                    resolve(target_pc, "Gosub")?;
-                }
-                Insn::Jump {
-                    target_pc_eq,
-                    target_pc_lt,
-                    target_pc_gt,
-                } => {
-                    resolve(target_pc_eq, "Jump")?;
-                    resolve(target_pc_lt, "Jump")?;
-                    resolve(target_pc_gt, "Jump")?;
-                }
-                Insn::SeekGE { target_pc, .. } => resolve(target_pc, "SeekGE")?,
-                Insn::SeekGT { target_pc, .. } => resolve(target_pc, "SeekGT")?,
-                Insn::SeekLE { target_pc, .. } => resolve(target_pc, "SeekLE")?,
-                Insn::SeekLT { target_pc, .. } => resolve(target_pc, "SeekLT")?,
-                Insn::IdxGE { target_pc, .. } => resolve(target_pc, "IdxGE")?,
-                Insn::IdxLE { target_pc, .. } => resolve(target_pc, "IdxLE")?,
-                Insn::IdxGT { target_pc, .. } => resolve(target_pc, "IdxGT")?,
-                Insn::IdxLT { target_pc, .. } => resolve(target_pc, "IdxLT")?,
-                Insn::IndexMethodQuery { pc_if_empty, .. } => {
-                    resolve(pc_if_empty, "IndexMethodQuery")?;
-                }
-                Insn::IsNull { reg: _, target_pc } => resolve(target_pc, "IsNull")?,
-                Insn::VNext { pc_if_next, .. } => resolve(pc_if_next, "VNext")?,
-                Insn::VFilter { pc_if_empty, .. } => resolve(pc_if_empty, "VFilter")?,
-                Insn::RowSetRead { pc_if_empty, .. } => resolve(pc_if_empty, "RowSetRead")?,
-                Insn::RowSetTest { pc_if_found, .. } => resolve(pc_if_found, "RowSetTest")?,
-                Insn::NoConflict { target_pc, .. } => resolve(target_pc, "NoConflict")?,
-                Insn::Found { target_pc, .. } => resolve(target_pc, "Found")?,
-                Insn::NotFound { target_pc, .. } => resolve(target_pc, "NotFound")?,
-                Insn::FkIfZero { target_pc, .. } => resolve(target_pc, "FkIfZero")?,
-                Insn::Filter { target_pc, .. } => resolve(target_pc, "Filter")?,
-                Insn::HashProbe { target_pc, .. } => resolve(target_pc, "HashProbe")?,
-                Insn::HashNext { target_pc, .. } => resolve(target_pc, "HashNext")?,
-                Insn::HashDistinct { data } => resolve(&mut data.target_pc, "HashDistinct")?,
-                Insn::HashScanUnmatched { target_pc, .. } => {
-                    resolve(target_pc, "HashScanUnmatched")?
-                }
-                Insn::HashNextUnmatched { target_pc, .. } => {
-                    resolve(target_pc, "HashNextUnmatched")?
-                }
-                Insn::HashGraceInit { target_pc, .. } => resolve(target_pc, "HashGraceInit")?,
-                Insn::HashGraceLoadPartition { target_pc, .. } => {
-                    resolve(target_pc, "HashGraceLoadPartition")?
-                }
-                Insn::HashGraceNextProbe { target_pc, .. } => {
-                    resolve(target_pc, "HashGraceNextProbe")?
-                }
-                Insn::HashGraceAdvancePartition { target_pc, .. } => {
-                    resolve(target_pc, "HashGraceAdvancePartition")?
-                }
-                Insn::Program {
-                    ignore_jump_target, ..
-                } => resolve(ignore_jump_target, "Program")?,
-                _ => {}
-            }
+            });
+        }
+        if let Some((label, insn_name)) = unresolved {
+            crate::bail_corrupt_error!(
+                "Reference to undefined or unresolved label in {insn_name}: {label}"
+            );
         }
         self.label_to_resolved_offset.clear();
         Ok(())
