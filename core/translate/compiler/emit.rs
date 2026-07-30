@@ -11,6 +11,8 @@
 
 use std::collections::HashSet;
 
+use turso_parser::ast;
+
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
@@ -19,7 +21,16 @@ use crate::{LimboError, Result};
 use super::ir::{BinOp, BlockId, Const, Function, Inst, JumpTarget, Terminator, UnaryOp};
 use super::verify::verify;
 
+/// Callback that emits an opaque leaf ([`Inst::Leaf`]) by materializing
+/// the given AST expression into `dest`. In production this delegates to
+/// the eager `translate_expr`, which keeps cursor/index/collation
+/// resolution in one place while the IR owns the tree structure around
+/// it.
+pub type LeafEmitter<'e> = dyn FnMut(&mut ProgramBuilder, &ast::Expr, usize) -> Result<()> + 'e;
+
 /// Emit `func` into `program`, leaving the function's result in `dest`.
+/// Functions containing [`Inst::Leaf`] must use
+/// [`emit_function_with_leaves`].
 ///
 /// The IR is verified first; malformed IR is an internal error and never
 /// reaches bytecode. `dest` must already be allocated by the caller (the
@@ -27,7 +38,20 @@ use super::verify::verify;
 pub fn emit_function(program: &mut ProgramBuilder, func: &Function, dest: usize) -> Result<()> {
     verify(func)
         .map_err(|e| LimboError::InternalError(format!("compiler IR failed verification: {e}")))?;
-    Emitter::new(program, func, dest).emit()
+    Emitter::new(program, func, dest, None).emit()
+}
+
+/// [`emit_function`] with a leaf emitter for functions whose values
+/// include opaque leaves.
+pub fn emit_function_with_leaves(
+    program: &mut ProgramBuilder,
+    func: &Function,
+    dest: usize,
+    leaf_emitter: &mut LeafEmitter<'_>,
+) -> Result<()> {
+    verify(func)
+        .map_err(|e| LimboError::InternalError(format!("compiler IR failed verification: {e}")))?;
+    Emitter::new(program, func, dest, Some(leaf_emitter)).emit()
 }
 
 struct Emitter<'a> {
@@ -43,10 +67,22 @@ struct Emitter<'a> {
     labels: Vec<Option<BranchOffset>>,
     /// Label for the single exit point, if any `Ret` needed a jump.
     exit_label: Option<BranchOffset>,
+    /// Emits [`Inst::Leaf`] values; absent when the function has none.
+    leaf_emitter: Option<&'a mut LeafEmitter<'a>>,
+    /// Whether each value is transitively constant. Runs of constant
+    /// instructions emit inside constant spans so they stay eligible for
+    /// hoisting into the program prologue, matching what nested eager
+    /// translation does for constant subtrees of mixed expressions.
+    is_const: Vec<bool>,
 }
 
 impl<'a> Emitter<'a> {
-    fn new(program: &'a mut ProgramBuilder, func: &'a Function, dest: usize) -> Self {
+    fn new(
+        program: &'a mut ProgramBuilder,
+        func: &'a Function,
+        dest: usize,
+        leaf_emitter: Option<&'a mut LeafEmitter<'a>>,
+    ) -> Self {
         // Emission order: creation order restricted to reachable blocks.
         // Creation order keeps combinator-generated CFGs readable (arms
         // appear where they were described) and is trivially
@@ -71,6 +107,28 @@ impl<'a> Emitter<'a> {
             .map(|(index, _)| BlockId::from_index(index))
             .collect();
 
+        // Transitive constness per value. Operand values are always
+        // created before their users, so one pass in id order suffices.
+        let mut inst_of: Vec<Option<&Inst>> = vec![None; func.num_values()];
+        for block in &func.blocks {
+            for (value, inst) in &block.insts {
+                inst_of[value.index()] = Some(inst);
+            }
+        }
+        let mut is_const = vec![false; func.num_values()];
+        for id in 0..func.num_values() {
+            is_const[id] = match inst_of[id] {
+                Some(Inst::Const(_)) => true,
+                Some(Inst::Unary { operand, .. }) => is_const[operand.index()],
+                Some(Inst::Binary { lhs, rhs, .. }) => {
+                    is_const[lhs.index()] && is_const[rhs.index()]
+                }
+                // External inputs, leaves, and block parameters read
+                // state the prologue cannot see.
+                Some(Inst::External { .. }) | Some(Inst::Leaf(_)) | None => false,
+            };
+        }
+
         Self {
             program,
             func,
@@ -79,6 +137,8 @@ impl<'a> Emitter<'a> {
             labels: vec![None; func.blocks.len()],
             order,
             exit_label: None,
+            leaf_emitter,
+            is_const,
         }
     }
 
@@ -107,14 +167,38 @@ impl<'a> Emitter<'a> {
         for &param in &block.params {
             let _ = self.reg_of(param);
         }
+        // A maximal run of constant instructions emits inside its own
+        // constant span so it stays eligible for hoisting into the
+        // program prologue, matching what nested eager translation does
+        // for constant subtrees of mixed expressions. If a span is
+        // already open (e.g. the whole expression is constant and the
+        // caller opened one), the outer span covers us.
+        let mut open_span: Option<usize> = None;
         for (value, inst) in &block.insts {
             let value = *value;
+            if self.is_const[value.index()] {
+                if open_span.is_none() && !self.program.constant_span_is_open() {
+                    open_span = Some(self.program.constant_span_start());
+                }
+            } else if let Some(span) = open_span.take() {
+                self.program.constant_span_end(span);
+            }
             match inst {
                 Inst::External { reg } => {
                     // Bind, no code. The value simply *is* that register.
                     if self.regs[value.index()].is_none() {
                         self.regs[value.index()] = Some(*reg);
                     }
+                }
+                Inst::Leaf(leaf) => {
+                    let dest = self.reg_of(value);
+                    let expr = self.func.leaf_expr(*leaf);
+                    let emitter = self.leaf_emitter.as_mut().ok_or_else(|| {
+                        LimboError::InternalError(
+                            "compiler IR: leaf value without a leaf emitter".to_string(),
+                        )
+                    })?;
+                    emitter(self.program, expr, dest)?;
                 }
                 Inst::Const(constant) => {
                     let dest = self.reg_of(value);
@@ -167,6 +251,11 @@ impl<'a> Emitter<'a> {
                     self.program.emit_insn(insn);
                 }
             }
+        }
+        // Close the trailing constant run before control flow: jumps,
+        // copies, and later blocks are not constant work.
+        if let Some(span) = open_span.take() {
+            self.program.constant_span_end(span);
         }
 
         let terminator = block

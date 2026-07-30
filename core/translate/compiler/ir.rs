@@ -14,6 +14,8 @@
 
 use std::collections::HashMap;
 
+use turso_parser::ast;
+
 /// A symbolic SSA value. Defined exactly once, either by an instruction or
 /// as a block parameter; mapped to a physical register only at emission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -88,9 +90,21 @@ pub enum BinOp {
     Concat,
 }
 
+/// Handle to a *leaf*: an AST expression the IR cannot decompose but can
+/// treat as a value source — column reads, rowids. Emission delegates the
+/// leaf back to eager translation, which keeps cursor/index/covering/
+/// virtual-table resolution in one place while the IR owns the tree
+/// around it.
+///
+/// Leaves are reads of mutable state (cursor position), so they are only
+/// coherent within one IR island: a function must never span an effectful
+/// boundary (cursor movement, slot write) as long as leaves dedup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LeafId(u32);
+
 /// A value-producing instruction. Effectful operations (cursor movement,
 /// row production) will grow here as the migration proceeds; today the IR
-/// covers pure scalar computation plus external inputs.
+/// covers pure scalar computation plus external inputs and opaque leaves.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Inst {
     Const(Const),
@@ -111,6 +125,9 @@ pub enum Inst {
     External {
         reg: usize,
     },
+    /// Opaque leaf emitted by delegating its AST expression to the eager
+    /// translation path. See [`LeafId`].
+    Leaf(LeafId),
 }
 
 /// A control-flow edge: the destination block plus the values bound to its
@@ -183,6 +200,8 @@ pub struct Function {
     pub blocks: Vec<Block>,
     /// Definition site of every value, indexed by [`ValueId`].
     defs: Vec<DefSite>,
+    /// AST expressions backing [`Inst::Leaf`] instructions.
+    leaves: Vec<ast::Expr>,
 }
 
 impl Function {
@@ -197,6 +216,10 @@ impl Function {
     pub fn num_values(&self) -> usize {
         self.defs.len()
     }
+
+    pub fn leaf_expr(&self, id: LeafId) -> &ast::Expr {
+        &self.leaves[id.0 as usize]
+    }
 }
 
 /// Builds a [`Function`] one block at a time. The builder has a *current*
@@ -208,6 +231,7 @@ pub struct FuncBuilder {
     defs: Vec<DefSite>,
     current: BlockId,
     interned: HashMap<Inst, ValueId>,
+    leaves: Vec<ast::Expr>,
 }
 
 impl FuncBuilder {
@@ -217,6 +241,7 @@ impl FuncBuilder {
             defs: Vec::new(),
             current: BlockId::ENTRY,
             interned: HashMap::new(),
+            leaves: Vec::new(),
         }
     }
 
@@ -276,6 +301,27 @@ impl FuncBuilder {
         self.intern_in_entry(Inst::External { reg })
     }
 
+    /// An opaque leaf backed by `expr`, emitted by delegation to the
+    /// eager translation path. Structurally equal leaves dedup (linear
+    /// scan — leaves per expression are few), so repeated reads of the
+    /// same column within one island share a value.
+    pub fn leaf(&mut self, expr: &ast::Expr) -> ValueId {
+        let id = match self.leaves.iter().position(|e| e == expr) {
+            Some(index) => LeafId(u32::try_from(index).expect("leaf table bounded by values")),
+            None => {
+                let id = LeafId(u32::try_from(self.leaves.len()).expect("leaf count fits in u32"));
+                self.leaves.push(expr.clone());
+                id
+            }
+        };
+        if let Some(&value) = self.interned.get(&Inst::Leaf(id)) {
+            return value;
+        }
+        let value = self.push_inst(Inst::Leaf(id));
+        self.interned.insert(Inst::Leaf(id), value);
+        value
+    }
+
     pub fn unary(&mut self, op: UnaryOp, operand: ValueId) -> ValueId {
         self.push_inst(Inst::Unary { op, operand })
     }
@@ -311,6 +357,7 @@ impl FuncBuilder {
         Function {
             blocks: self.blocks,
             defs: self.defs,
+            leaves: self.leaves,
         }
     }
 

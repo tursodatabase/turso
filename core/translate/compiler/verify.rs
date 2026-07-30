@@ -136,7 +136,9 @@ pub fn verify(func: &Function) -> Result<(), VerifyError> {
 
         for (index, (_, inst)) in block.insts.iter().enumerate() {
             match inst {
-                super::ir::Inst::Const(_) | super::ir::Inst::External { .. } => {}
+                super::ir::Inst::Const(_)
+                | super::ir::Inst::External { .. }
+                | super::ir::Inst::Leaf(_) => {}
                 super::ir::Inst::Unary { operand, .. } => check(*operand, index)?,
                 super::ir::Inst::Binary { lhs, rhs, .. } => {
                     check(*lhs, index)?;

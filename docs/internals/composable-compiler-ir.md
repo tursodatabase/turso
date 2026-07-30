@@ -171,14 +171,23 @@ boundary (the whole tree is constant, so the span opened by
       describe -> build -> verify -> emit, eager fallback otherwise.
       Collation post-state mirrored; constant hoisting verified via
       EXPLAIN; conformance corpus green.
-- [ ] 1c. Column and rowid reads as IR leaves. Requires the eager-leaf
-      bridge (delegate a leaf's emission to `translate_expr` at its
-      destination register, like the prior branch's opaque emitter) and
-      the same safety gates it identified: refuse when the
-      expression-register cache is enabled, expression indexes are in
-      play, custom-typed columns (operator overloads), array `||`
-      operands, SELF_TABLE placeholders. Region rule: one IR island =
-      one region; no cursor movement inside.
+- [x] 1c. Column and rowid reads as IR leaves (`Inst::Leaf` +
+      `emit_function_with_leaves`): the leaf's AST expression is emitted
+      by delegating back to eager `translate_expr` at the leaf's
+      destination register, so cursor/index/covering/virtual/custom-type
+      resolution stays in one place while the IR owns the tree.
+      Structurally equal leaves dedup (`x + x` reads the column once).
+      The frontend computes the collation post-state statically (same
+      merge rules as `binary_expr_shared`) and the integration hook
+      restores it after emission. Maximal constant runs of mixed trees
+      emit inside constant spans during emission (`is_const` transitive
+      flags), preserving hoisting into the prologue — verified via
+      EXPLAIN. Safety gates — the IR path refuses: expression→register
+      cache enabled (GROUP BY-style contexts where re-reading columns is
+      wrong), expression indexes in play, custom-typed columns (operator
+      overloads), array operands of `||` (ArrayConcat), SELF_TABLE
+      placeholders. Region rule: one IR island = one region; no cursor
+      movement inside.
 - [ ] 1d. Function calls as instructions — needs contiguous argument
       packs in the emitter (allocate N adjacent registers; `lower` each
       arg into its pack slot). Start with pure scalar functions on the

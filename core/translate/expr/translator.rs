@@ -436,22 +436,53 @@ pub fn translate_expr(
             }
 
             // Composable compiler path: expressions the new pipeline can
-            // fully represent (today the literal-only arithmetic/bitwise/
-            // concat subset) are described as compiler values, built into
-            // verified IR, and emitted in one pass. Anything else falls
-            // back to eager emission below.
-            if crate::translate::compiler::try_emit_value_expr(program, expr, target_register)? {
-                // Mirror the eager path's collation post-state: with
-                // literal-only operands the resolved collation context is
-                // always cleared, except in the equivalent-operand branch
-                // which leaves it untouched.
-                if !exprs_are_equivalent(e1, e2) {
-                    program.set_collation(None);
+            // fully represent (arithmetic/bitwise/concat over literals
+            // and column/rowid reads) are described as compiler values,
+            // built into verified IR, and emitted in one pass. Anything
+            // else falls back to eager emission below.
+            //
+            // Gated off when the expression→register cache or expression
+            // indexes are active: the frontend decomposes trees without
+            // consulting either, and re-reading columns in those contexts
+            // is incorrect (cursors may not be positioned on the source
+            // row, or the table cursor may not be open at all).
+            if !has_expression_indexes && !resolver.expr_to_reg_cache_enabled {
+                let build_ctx = crate::translate::compiler::BuildCtx {
+                    referenced_tables,
+                    resolver: Some(resolver),
+                };
+                if let Some(built) =
+                    crate::translate::compiler::compile_value_expr(expr, &build_ctx)?
+                {
+                    let mut emit_leaf = |program: &mut ProgramBuilder,
+                                         leaf: &ast::Expr,
+                                         dest: usize| {
+                        translate_expr(program, referenced_tables, leaf, dest, resolver).map(|_| ())
+                    };
+                    crate::translate::compiler::emit_value(
+                        program,
+                        built.compiler,
+                        target_register,
+                        Some(&mut emit_leaf),
+                    )?;
+                    // Restore the collation post-state the eager path
+                    // would have left: the statically computed context
+                    // when there is one; otherwise cleared, except in the
+                    // equivalent-operand shape where the eager path
+                    // leaves the state untouched.
+                    match built.collation {
+                        Some(collation) => program.set_collation(Some(collation)),
+                        None => {
+                            if !exprs_are_equivalent(e1, e2) {
+                                program.set_collation(None);
+                            }
+                        }
+                    }
+                    if let Some(span) = constant_span {
+                        program.constant_span_end(span);
+                    }
+                    return Ok(target_register);
                 }
-                if let Some(span) = constant_span {
-                    program.constant_span_end(span);
-                }
-                return Ok(target_register);
             }
 
             binary_expr_shared(

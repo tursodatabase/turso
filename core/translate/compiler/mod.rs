@@ -15,10 +15,12 @@
 //! 3. **VDBE backend** ([`emit`]) — allocates physical registers and
 //!    labels, and turns verified IR into `Insn`s in a `ProgramBuilder`.
 //!
-//! Integration is gradual: frontends try to describe an expression and
-//! fall back to the eager path when a construct is not yet representable
-//! ([`try_emit_value_expr`] returns `false`). The eager fallback shrinks
-//! as coverage grows; it is an escape hatch, not an architecture.
+//! Integration is gradual: frontends try to describe an expression
+//! ([`compile_value_expr`] returns `None` for unsupported shapes) and
+//! fall back to the eager path. The eager fallback shrinks as coverage
+//! grows; it is an escape hatch, not an architecture. Opaque leaves
+//! (column and rowid reads) bridge the other direction: the IR owns the
+//! tree, and emission delegates each leaf back to eager translation.
 
 // The combinator and IR authoring surfaces are ahead of their lib-code
 // callers by design: branches, block parameters, and external inputs are
@@ -32,35 +34,35 @@ pub(crate) mod expr;
 pub(crate) mod ir;
 pub(crate) mod verify;
 
-use turso_parser::ast;
+pub(crate) use emit::LeafEmitter;
+pub(crate) use expr::{compile_value_expr, BuildCtx};
 
 use crate::vdbe::builder::ProgramBuilder;
 use crate::Result;
 
-/// Full pipeline for an expression in value position: describe → build
-/// IR → verify → emit, leaving the result in `dest`.
-///
-/// Returns `Ok(false)` without emitting anything when the expression is
-/// not yet representable, in which case the caller must use the eager
-/// path.
-pub(crate) fn try_emit_value_expr(
+/// Run a described value through build → verify → emit, leaving the
+/// result in `dest`. `leaf_emitter` is required when the description
+/// contains opaque leaves (column/rowid reads).
+pub(crate) fn emit_value(
     program: &mut ProgramBuilder,
-    expr: &ast::Expr,
+    compiler: combine::Compiler<'_, ir::ValueId>,
     dest: usize,
-) -> Result<bool> {
-    let Some(compiler) = expr::compile_value_expr(expr)? else {
-        return Ok(false);
-    };
+    leaf_emitter: Option<&mut LeafEmitter<'_>>,
+) -> Result<()> {
     let mut builder = ir::FuncBuilder::new();
     let value = compiler.run(&mut builder)?;
     builder.ret(value);
     let func = builder.finish();
-    emit::emit_function(program, &func, dest)?;
-    Ok(true)
+    match leaf_emitter {
+        Some(leaf_emitter) => emit::emit_function_with_leaves(program, &func, dest, leaf_emitter),
+        None => emit::emit_function(program, &func, dest),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use turso_parser::ast;
+
     use super::combine::{self, Compiler};
     use super::ir::{BinOp, FuncBuilder, JumpTarget, UnaryOp};
     use super::verify::{verify, VerifyError};
@@ -99,13 +101,15 @@ mod tests {
         *expr
     }
 
-    /// Run the full pipeline for a SQL expression; `None` = fell back.
+    /// Run the full pipeline for a column-free SQL expression;
+    /// `None` = fell back.
     fn pipeline(sql: &str) -> Option<Vec<Insn>> {
         let expr = parse_expr(sql);
         let mut program = test_program();
         let dest = program.alloc_register();
-        let emitted = try_emit_value_expr(&mut program, &expr, dest).unwrap();
-        emitted.then(|| program.insns.into_iter().map(|(insn, _)| insn).collect())
+        let built = compile_value_expr(&expr, &BuildCtx::NO_TABLES).unwrap()?;
+        emit_value(&mut program, built.compiler, dest, None).unwrap();
+        Some(program.insns.into_iter().map(|(insn, _)| insn).collect())
     }
 
     #[test]
@@ -217,7 +221,10 @@ mod tests {
         let expr = parse_expr("1 + 2");
         let mut program = test_program();
         let dest = program.alloc_register();
-        assert!(try_emit_value_expr(&mut program, &expr, dest).unwrap());
+        let built = compile_value_expr(&expr, &BuildCtx::NO_TABLES)
+            .unwrap()
+            .unwrap();
+        emit_value(&mut program, built.compiler, dest, None).unwrap();
         let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
         let Insn::Add { dest: add_dest, .. } = insns[insns.len() - 1] else {
             panic!("expected trailing Add, got {insns:?}");
@@ -491,7 +498,10 @@ mod tests {
             let mut program = test_program();
             let dest = program.alloc_register();
             let expr = parse_expr("('a' || 'b') || 3");
-            assert!(try_emit_value_expr(&mut program, &expr, dest).unwrap());
+            let built = compile_value_expr(&expr, &BuildCtx::NO_TABLES)
+                .unwrap()
+                .unwrap();
+            emit_value(&mut program, built.compiler, dest, None).unwrap();
             program
                 .insns
                 .iter()
@@ -499,6 +509,91 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(run(), run());
+    }
+
+    /// Stub leaf emitter: materializes every leaf as `Integer 7`.
+    fn stub_leaf_emitter() -> impl FnMut(&mut ProgramBuilder, &ast::Expr, usize) -> Result<()> {
+        |program: &mut ProgramBuilder, _leaf: &ast::Expr, dest: usize| {
+            program.emit_insn(Insn::Integer { value: 7, dest });
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn leaves_delegate_to_the_emitter_and_dedup() {
+        // x + x: structurally equal leaves share one value, so the leaf
+        // is materialized once and both operands read its register.
+        let leaf_expr = parse_expr("x");
+        let mut builder = FuncBuilder::new();
+        let lhs = builder.leaf(&leaf_expr);
+        let rhs = builder.leaf(&leaf_expr);
+        assert_eq!(lhs, rhs);
+        let sum = builder.binary(BinOp::Add, lhs, rhs);
+        builder.ret(sum);
+        let func = builder.finish();
+
+        let mut program = test_program();
+        let dest = program.alloc_register();
+        let mut leaf_emitter = stub_leaf_emitter();
+        emit::emit_function_with_leaves(&mut program, &func, dest, &mut leaf_emitter).unwrap();
+        let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
+        let [Insn::Integer {
+            value: 7,
+            dest: leaf_reg,
+        }, Insn::Add { lhs, rhs, .. }] = insns[..]
+        else {
+            panic!("expected one leaf load + Add, got {insns:?}");
+        };
+        assert_eq!(lhs, leaf_reg);
+        assert_eq!(rhs, leaf_reg);
+    }
+
+    #[test]
+    fn leaf_without_emitter_is_an_error() {
+        let leaf_expr = parse_expr("x");
+        let mut builder = FuncBuilder::new();
+        let leaf = builder.leaf(&leaf_expr);
+        builder.ret(leaf);
+        let func = builder.finish();
+
+        let mut program = test_program();
+        let dest = program.alloc_register();
+        let err = emit::emit_function(&mut program, &func, dest);
+        assert!(matches!(err, Err(crate::LimboError::InternalError(_))));
+    }
+
+    #[test]
+    fn constant_subtrees_of_mixed_trees_emit_in_spans() {
+        // (1 + 2) + x: the constant subtree emits inside a constant span
+        // so it hoists into the prologue; the leaf does not.
+        let mut builder = FuncBuilder::new();
+        let one = builder.int(1);
+        let two = builder.int(2);
+        let sum = builder.binary(BinOp::Add, one, two);
+        let leaf_expr = parse_expr("x");
+        let leaf = builder.leaf(&leaf_expr);
+        let root = builder.binary(BinOp::Add, sum, leaf);
+        builder.ret(root);
+        let func = builder.finish();
+
+        let mut program = test_program();
+        let dest = program.alloc_register();
+        let mut leaf_emitter = stub_leaf_emitter();
+        emit::emit_function_with_leaves(&mut program, &func, dest, &mut leaf_emitter).unwrap();
+        // One span covering exactly the constant run: Integer 1,
+        // Integer 2, Add — instructions 0..=2.
+        assert_eq!(program.constant_spans, vec![(0, 2)]);
+        let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
+        assert!(matches!(
+            insns[..],
+            [
+                Insn::Integer { value: 1, .. },
+                Insn::Integer { value: 2, .. },
+                Insn::Add { .. },
+                Insn::Integer { value: 7, .. },
+                Insn::Add { .. },
+            ]
+        ));
     }
 
     #[test]
