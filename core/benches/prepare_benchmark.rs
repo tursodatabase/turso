@@ -437,7 +437,7 @@ fn ddl_create_index(bencher: Bencher) {
     );
 }
 
-// --- Established corpora: TPC-H and ClickBench -----------------------------
+// --- Established corpora: TPC-H, ClickBench, JOB, TPC-DS -------------------
 //
 // Prepare-only runs over the industry-standard query sets vendored under
 // `perf/`, so planner work on realistic analytical SQL is tracked per query.
@@ -552,4 +552,84 @@ fn corpus_clickbench(bencher: Bencher, q: usize) {
     bencher.bench_local(|| {
         black_box(conn.prepare(black_box(sql)).unwrap());
     });
+}
+
+/// Run every `;`-separated statement of `schema`, then bench preparing `sql`.
+fn bench_corpus_query(bencher: Bencher, schema: &str, sql: &str) {
+    let (db, conn) = open_db();
+    for stmt in schema.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        execute(&db, &conn, stmt);
+    }
+    conn.prepare(sql).unwrap();
+    bencher.bench_local(|| {
+        black_box(conn.prepare(black_box(sql)).unwrap());
+    });
+}
+
+macro_rules! corpus_queries {
+    ($dir:literal, [$($n:literal),* $(,)?]) => {
+        &[$(($n, include_str!(concat!("../../perf/", $dir, "/queries/", $n, ".sql")))),*]
+    };
+}
+
+fn corpus_sql(queries: &[(&str, &'static str)], name: &str) -> &'static str {
+    queries
+        .iter()
+        .find(|(n, _)| *n == name)
+        .unwrap_or_else(|| panic!("{name} is not in the corpus"))
+        .1
+}
+
+/// Join Order Benchmark ("How Good Are Query Optimizers, Really?", VLDB
+/// 2015): 113 join-heavy queries over the IMDB schema, the standard corpus
+/// for stressing join-order planning. All 113 compile today.
+const JOB_QUERIES: &[(&str, &str)] = corpus_queries!(
+    "job",
+    [
+        "1a", "1b", "1c", "1d", "2a", "2b", "2c", "2d", "3a", "3b", "3c", "4a", "4b", "4c", "5a",
+        "5b", "5c", "6a", "6b", "6c", "6d", "6e", "6f", "7a", "7b", "7c", "8a", "8b", "8c", "8d",
+        "9a", "9b", "9c", "9d", "10a", "10b", "10c", "11a", "11b", "11c", "11d", "12a", "12b",
+        "12c", "13a", "13b", "13c", "13d", "14a", "14b", "14c", "15a", "15b", "15c", "15d", "16a",
+        "16b", "16c", "16d", "17a", "17b", "17c", "17d", "17e", "17f", "18a", "18b", "18c", "19a",
+        "19b", "19c", "19d", "20a", "20b", "20c", "21a", "21b", "21c", "22a", "22b", "22c", "22d",
+        "23a", "23b", "23c", "24a", "24b", "25a", "25b", "25c", "26a", "26b", "26c", "27a", "27b",
+        "27c", "28a", "28b", "28c", "29a", "29b", "29c", "30a", "30b", "30c", "31a", "31b", "31c",
+        "32a", "32b", "33a", "33b", "33c",
+    ]
+);
+
+const JOB_SCHEMA: &str = concat!(
+    include_str!("../../perf/job/schema.sql"),
+    include_str!("../../perf/job/fkindexes.sql"),
+);
+
+// Several JOB queries take hundreds of milliseconds to plan today, so cap
+// the sample count to keep local walltime runs reasonable.
+#[turso_macros::divan_bench(args = JOB_QUERIES.iter().map(|(name, _)| *name), sample_count = 10)]
+fn corpus_job(bencher: Bencher, q: &str) {
+    bench_corpus_query(bencher, JOB_SCHEMA, corpus_sql(JOB_QUERIES, q));
+}
+
+/// TPC-DS queries that compile today. Skipped, with the blocking feature:
+/// ROLLUP (05, 14, 18, 22, 67, 70, 77, 80, 86), stddev_samp (17, 39),
+/// custom window frame specifications (51), parenthesized compound selects
+/// (87), FULL OUTER JOIN without an equality condition (97). Remove entries
+/// from this skip note as features land.
+const TPCDS_QUERIES: &[(&str, &str)] = corpus_queries!(
+    "tpc-ds",
+    [
+        "01", "02", "03", "04", "06", "07", "08", "09", "10", "11", "12", "13", "15", "16", "19",
+        "20", "21", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34", "35",
+        "36", "37", "38", "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "52",
+        "53", "54", "55", "56", "57", "58", "59", "60", "61", "62", "63", "64", "65", "66", "68",
+        "69", "71", "72", "73", "74", "75", "76", "78", "79", "81", "82", "83", "84", "85", "88",
+        "89", "90", "91", "92", "93", "94", "95", "96", "98", "99",
+    ]
+);
+
+const TPCDS_SCHEMA: &str = include_str!("../../perf/tpc-ds/schema.sql");
+
+#[turso_macros::divan_bench(args = TPCDS_QUERIES.iter().map(|(name, _)| *name), sample_count = 10)]
+fn corpus_tpcds(bencher: Bencher, q: &str) {
+    bench_corpus_query(bencher, TPCDS_SCHEMA, corpus_sql(TPCDS_QUERIES, q));
 }
