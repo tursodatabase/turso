@@ -4252,6 +4252,43 @@ mod tests {
             .prepare("SELECT a COLLATE missing_collation FROM expressions")
             .is_err());
 
+        let mut arithmetic_statement = connection
+            .prepare(
+                "SELECT a - b, a * b, a / b, a % b, \
+                        a & b, a | b, a << 1, a >> 1, (a - b) * (b + 1) \
+                   FROM expressions \
+                  WHERE name = 'BETA'",
+            )
+            .unwrap();
+        let arithmetic_instructions = &arithmetic_statement.get_program().insns;
+        let arithmetic_result_row = arithmetic_instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 9, .. }))
+            .expect("arithmetic projections must produce one nine-value pack");
+        assert!(
+            arithmetic_instructions[arithmetic_result_row - 9..arithmetic_result_row]
+                .iter()
+                .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })),
+            "arithmetic values must remain symbolic until result-pack lowering"
+        );
+        assert_eq!(
+            arithmetic_statement.run_collect_rows().unwrap(),
+            vec![
+                vec![
+                    Value::from_i64(0),
+                    Value::from_i64(4),
+                    Value::from_i64(1),
+                    Value::from_i64(0),
+                    Value::from_i64(2),
+                    Value::from_i64(2),
+                    Value::from_i64(4),
+                    Value::from_i64(1),
+                    Value::from_i64(0),
+                ],
+                vec![Value::Null; 9],
+            ]
+        );
+
         let mut parameter_statement = connection
             .prepare(
                 "SELECT a + ?1, a >= ?2, :name FROM expressions \

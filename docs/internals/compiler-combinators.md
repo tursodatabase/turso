@@ -110,9 +110,9 @@ explicit loops with block parameters, and effectful cursor folds and row
 production. A production SELECT path uses these pieces for a forward scan of
 one B-tree table. Its frontend first resolves an owned scalar description, then
 compiles that description against each symbolic row. Columns, literals,
-addition, three-valued `AND` and `OR`, both forms of `CASE`, parentheses, collation
-wrappers, and ordinary comparisons can be nested and shared by both result
-expressions and predicates.
+numeric and bitwise arithmetic, three-valued `AND` and `OR`, both forms of
+`CASE`, parentheses, collation wrappers, and ordinary comparisons can be nested
+and shared by both result expressions and predicates.
 It composes `scan_table`, row-stream operators, scalar projection, and
 `result_row`, then builds and verifies the complete IR before touching
 `ProgramBuilder`.
@@ -164,6 +164,11 @@ NULL successors; a comparison used as a value joins `1`, `0`, or `NULL` through
 a block parameter. NULL-safe `IS` and `IS NOT` comparisons have only true and
 false successors and lower with the VDBE `NULL_EQ` policy, so `NULL IS NULL`
 produces true without inventing an unreachable third SSA edge.
+Arithmetic follows the same separation: the frontend maps SQL operators to a
+typed symbolic operation, compiler composition only connects its `ValueId`
+operands, and lowering selects `Add`, `Subtract`, `Multiply`, `Divide`,
+`Remainder`, bitwise, or shift VDBE instructions. Nested arithmetic therefore
+does not assign registers or emit instructions while its description is built.
 An ordered compiler combinator collects independently composed scalar values
 into a symbolic `ValuePack`; contiguous result registers are still chosen only
 during lowering. Searched `CASE` builds nested SSA diamonds, so only the chosen

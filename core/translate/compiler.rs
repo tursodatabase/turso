@@ -1405,6 +1405,36 @@ pub(crate) enum LogicalOp {
     Or,
 }
 
+/// A scalar arithmetic operation whose operands and result remain symbolic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArithmeticOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Remainder,
+    BitAnd,
+    BitOr,
+    ShiftLeft,
+    ShiftRight,
+}
+
+impl ArithmeticOp {
+    const fn mnemonic(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Subtract => "subtract",
+            Self::Multiply => "multiply",
+            Self::Divide => "divide",
+            Self::Remainder => "remainder",
+            Self::BitAnd => "bit_and",
+            Self::BitOr => "bit_or",
+            Self::ShiftLeft => "shift_left",
+            Self::ShiftRight => "shift_right",
+        }
+    }
+}
+
 /// SQLite comparison metadata resolved before symbolic IR construction.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ResolvedComparison {
@@ -1655,7 +1685,8 @@ enum ScalarOp {
     Input(InputId),
     Parameter(Variable),
     Constant(Value),
-    Add {
+    Arithmetic {
+        op: ArithmeticOp,
         lhs: ValueId,
         rhs: ValueId,
     },
@@ -1733,7 +1764,9 @@ impl ScalarOp {
             | Self::IndexRowId { .. }
             | Self::SorterColumn { .. } => [None, None],
             Self::MustBeInt { value } => [Some(*value), None],
-            Self::Add { lhs, rhs } | Self::Logical { lhs, rhs, .. } => [Some(*lhs), Some(*rhs)],
+            Self::Arithmetic { lhs, rhs, .. } | Self::Logical { lhs, rhs, .. } => {
+                [Some(*lhs), Some(*rhs)]
+            }
         };
         operands.into_iter().flatten()
     }
@@ -1746,7 +1779,7 @@ impl ScalarOp {
             Self::Input(_)
             | Self::Parameter(_)
             | Self::Constant(_)
-            | Self::Add { .. }
+            | Self::Arithmetic { .. }
             | Self::MustBeInt { .. }
             | Self::Logical { .. }
             | Self::SorterColumn { .. } => None,
@@ -1759,7 +1792,7 @@ impl ScalarOp {
             Self::Input(_)
             | Self::Parameter(_)
             | Self::Constant(_)
-            | Self::Add { .. }
+            | Self::Arithmetic { .. }
             | Self::MustBeInt { .. }
             | Self::Logical { .. }
             | Self::Column { .. }
@@ -1774,7 +1807,7 @@ impl ScalarOp {
             Self::Input(_)
             | Self::Parameter(_)
             | Self::Constant(_)
-            | Self::Add { .. }
+            | Self::Arithmetic { .. }
             | Self::Logical { .. } => true,
             // Integer coercion can raise a datatype error. Column reads remain
             // ordered until storage-read and corruption behavior is modeled as
@@ -4516,11 +4549,57 @@ impl IrProgram {
                                     dest: destination,
                                 });
                             }
-                            ScalarOp::Add { lhs, rhs } => program.emit_insn(Insn::Add {
-                                lhs: Self::register_for(&registers, *lhs),
-                                rhs: Self::register_for(&registers, *rhs),
-                                dest: destination,
-                            }),
+                            ScalarOp::Arithmetic { op, lhs, rhs } => {
+                                let lhs = Self::register_for(&registers, *lhs);
+                                let rhs = Self::register_for(&registers, *rhs);
+                                program.emit_insn(match op {
+                                    ArithmeticOp::Add => Insn::Add {
+                                        lhs,
+                                        rhs,
+                                        dest: destination,
+                                    },
+                                    ArithmeticOp::Subtract => Insn::Subtract {
+                                        lhs,
+                                        rhs,
+                                        dest: destination,
+                                    },
+                                    ArithmeticOp::Multiply => Insn::Multiply {
+                                        lhs,
+                                        rhs,
+                                        dest: destination,
+                                    },
+                                    ArithmeticOp::Divide => Insn::Divide {
+                                        lhs,
+                                        rhs,
+                                        dest: destination,
+                                    },
+                                    ArithmeticOp::Remainder => Insn::Remainder {
+                                        lhs,
+                                        rhs,
+                                        dest: destination,
+                                    },
+                                    ArithmeticOp::BitAnd => Insn::BitAnd {
+                                        lhs,
+                                        rhs,
+                                        dest: destination,
+                                    },
+                                    ArithmeticOp::BitOr => Insn::BitOr {
+                                        lhs,
+                                        rhs,
+                                        dest: destination,
+                                    },
+                                    ArithmeticOp::ShiftLeft => Insn::ShiftLeft {
+                                        lhs,
+                                        rhs,
+                                        dest: destination,
+                                    },
+                                    ArithmeticOp::ShiftRight => Insn::ShiftRight {
+                                        lhs,
+                                        rhs,
+                                        dest: destination,
+                                    },
+                                });
+                            }
                             ScalarOp::MustBeInt { value } => {
                                 let source = Self::register_for(&registers, *value);
                                 if source != destination {
@@ -5339,8 +5418,8 @@ impl fmt::Display for IrProgram {
                                 }
                             }
                             ScalarOp::Constant(value) => writeln!(f, "constant {value:?}")?,
-                            ScalarOp::Add { lhs, rhs } => {
-                                writeln!(f, "add %{}, %{}", lhs.0, rhs.0)?;
+                            ScalarOp::Arithmetic { op, lhs, rhs } => {
+                                writeln!(f, "{} %{}, %{}", op.mnemonic(), lhs.0, rhs.0)?;
                             }
                             ScalarOp::MustBeInt { value } => {
                                 writeln!(f, "must_be_int %{}", value.0)?;
@@ -7576,7 +7655,8 @@ impl Compile for Constant {
     }
 }
 
-pub(crate) struct Add {
+pub(crate) struct Arithmetic {
+    op: ArithmeticOp,
     lhs: ValueId,
     rhs: ValueId,
 }
@@ -7831,15 +7911,20 @@ impl Compile for IndexRowId {
     }
 }
 
-pub(crate) fn add(lhs: ValueId, rhs: ValueId) -> Add {
-    Add { lhs, rhs }
+pub(crate) const fn arithmetic(op: ArithmeticOp, lhs: ValueId, rhs: ValueId) -> Arithmetic {
+    Arithmetic { op, lhs, rhs }
 }
 
-impl Compile for Add {
+pub(crate) const fn add(lhs: ValueId, rhs: ValueId) -> Arithmetic {
+    arithmetic(ArithmeticOp::Add, lhs, rhs)
+}
+
+impl Compile for Arithmetic {
     type Output = ValueId;
 
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
-        builder.push(ScalarOp::Add {
+        builder.push(ScalarOp::Arithmetic {
+            op: self.op,
             lhs: self.lhs,
             rhs: self.rhs,
         })
@@ -8024,6 +8109,47 @@ mod tests {
                 dest: 7,
             }
         ));
+    }
+
+    #[test]
+    fn arithmetic_operations_select_vdbe_opcodes_only_during_lowering() {
+        let operations = [
+            (ArithmeticOp::Add, "add"),
+            (ArithmeticOp::Subtract, "subtract"),
+            (ArithmeticOp::Multiply, "multiply"),
+            (ArithmeticOp::Divide, "divide"),
+            (ArithmeticOp::Remainder, "remainder"),
+            (ArithmeticOp::BitAnd, "bit_and"),
+            (ArithmeticOp::BitOr, "bit_or"),
+            (ArithmeticOp::ShiftLeft, "shift_left"),
+            (ArithmeticOp::ShiftRight, "shift_right"),
+        ];
+
+        for (op, mnemonic) in operations {
+            let compiler = constant(Value::from_i64(8))
+                .then(constant(Value::from_i64(2)))
+                .and_then(move |(lhs, rhs)| arithmetic(op, lhs, rhs));
+            let ir = compile_scalar(compiler).unwrap();
+            assert!(ir.to_string().contains(&format!("{mnemonic} %0, %1")));
+
+            let mut program =
+                ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 3, 0));
+            ir.lower_into(&mut program, 7).unwrap();
+            let instruction = &program.insns.last().expect("arithmetic instruction").0;
+            assert!(match op {
+                ArithmeticOp::Add => matches!(instruction, Insn::Add { dest: 7, .. }),
+                ArithmeticOp::Subtract => matches!(instruction, Insn::Subtract { dest: 7, .. }),
+                ArithmeticOp::Multiply => matches!(instruction, Insn::Multiply { dest: 7, .. }),
+                ArithmeticOp::Divide => matches!(instruction, Insn::Divide { dest: 7, .. }),
+                ArithmeticOp::Remainder => matches!(instruction, Insn::Remainder { dest: 7, .. }),
+                ArithmeticOp::BitAnd => matches!(instruction, Insn::BitAnd { dest: 7, .. }),
+                ArithmeticOp::BitOr => matches!(instruction, Insn::BitOr { dest: 7, .. }),
+                ArithmeticOp::ShiftLeft => matches!(instruction, Insn::ShiftLeft { dest: 7, .. }),
+                ArithmeticOp::ShiftRight => {
+                    matches!(instruction, Insn::ShiftRight { dest: 7, .. })
+                }
+            });
+        }
     }
 
     #[test]
@@ -9868,7 +9994,8 @@ mod tests {
         ir.switch_to(body).unwrap();
         let decrement = ir.push(ScalarOp::Constant(Value::from_i64(-1))).unwrap();
         let next_remaining = ir
-            .push(ScalarOp::Add {
+            .push(ScalarOp::Arithmetic {
+                op: ArithmeticOp::Add,
                 lhs: carried_remaining,
                 rhs: decrement,
             })

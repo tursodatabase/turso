@@ -121,6 +121,32 @@ expect {
     4|99|other
 }
 
+@cross-check-integrity
+test select-symbolic-arithmetic-family {
+    CREATE TABLE arithmetic_values(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+    INSERT INTO arithmetic_values VALUES
+        (1, 7, 2),
+        (2, 5, 0),
+        (3, NULL, 4);
+    SELECT id,
+           a - b,
+           a * b,
+           a / b,
+           a % b,
+           a & b,
+           a | b,
+           a << 1,
+           a >> 1,
+           (a - b) * (b + 1)
+      FROM arithmetic_values
+     ORDER BY id;
+}
+expect {
+    1|5|14|3|1|2|7|14|3|15
+    2|5|0|||0|5|10|2|5
+    3|||||||||
+}
+
 # IS TRUE/IS FALSE in WHERE clause
 @cross-check-integrity
 test is-true-where {

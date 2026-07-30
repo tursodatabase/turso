@@ -7,9 +7,9 @@ use crate::{
         alter::literal_default_value,
         collate::resolve_comparison_collseq_with_symbols,
         compiler::{
-            add, compare, constant, input, logical, pack_values, parameter, resolved_comparison,
-            BoxedCompile, ComparisonOp, Compile, InputId, InputRequirements, InputSlot, LogicalOp,
-            PackValues, ResolvedComparison, Row, ValueId,
+            arithmetic, compare, constant, input, logical, pack_values, parameter,
+            resolved_comparison, ArithmeticOp, BoxedCompile, ComparisonOp, Compile, InputId,
+            InputRequirements, InputSlot, LogicalOp, PackValues, ResolvedComparison, Row, ValueId,
         },
         emitter::Resolver,
         plan::TableReferences,
@@ -32,7 +32,11 @@ pub(crate) enum ResolvedScalarExpr {
     IndexRowId,
     Parameter(Variable),
     Constant(Value),
-    Add(Box<Self>, Box<Self>),
+    Arithmetic {
+        op: ArithmeticOp,
+        lhs: Box<Self>,
+        rhs: Box<Self>,
+    },
     Logical {
         op: LogicalOp,
         lhs: Box<Self>,
@@ -274,10 +278,14 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
         operator: Operator,
         rhs: &Expr,
     ) -> Result<Option<ResolvedScalarExpr>> {
+        let arithmetic_op = arithmetic_op(operator);
+        let logical_op = match operator {
+            Operator::And => Some(LogicalOp::And),
+            Operator::Or => Some(LogicalOp::Or),
+            _ => None,
+        };
         let comparison_op = comparison_op(operator);
-        if !matches!(operator, Operator::Add | Operator::And | Operator::Or)
-            && comparison_op.is_none()
-        {
+        if arithmetic_op.is_none() && logical_op.is_none() && comparison_op.is_none() {
             return Ok(None);
         }
         let Some(lhs_resolved) = self.resolve(lhs)? else {
@@ -287,23 +295,19 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
             return Ok(None);
         };
 
-        if matches!(operator, Operator::Add | Operator::And | Operator::Or) {
-            let expression = match operator {
-                Operator::Add => {
-                    ResolvedScalarExpr::Add(Box::new(lhs_resolved), Box::new(rhs_resolved))
-                }
-                Operator::And | Operator::Or => ResolvedScalarExpr::Logical {
-                    op: match operator {
-                        Operator::And => LogicalOp::And,
-                        Operator::Or => LogicalOp::Or,
-                        _ => unreachable!(),
-                    },
-                    lhs: Box::new(lhs_resolved),
-                    rhs: Box::new(rhs_resolved),
-                },
-                _ => unreachable!(),
-            };
-            return Ok(Some(expression));
+        if let Some(op) = arithmetic_op {
+            return Ok(Some(ResolvedScalarExpr::Arithmetic {
+                op,
+                lhs: Box::new(lhs_resolved),
+                rhs: Box::new(rhs_resolved),
+            }));
+        }
+        if let Some(op) = logical_op {
+            return Ok(Some(ResolvedScalarExpr::Logical {
+                op,
+                lhs: Box::new(lhs_resolved),
+                rhs: Box::new(rhs_resolved),
+            }));
         }
 
         let op = comparison_op.expect("comparison operator checked above");
@@ -422,6 +426,21 @@ const fn comparison_op(operator: Operator) -> Option<ComparisonOp> {
     }
 }
 
+const fn arithmetic_op(operator: Operator) -> Option<ArithmeticOp> {
+    match operator {
+        Operator::Add => Some(ArithmeticOp::Add),
+        Operator::Subtract => Some(ArithmeticOp::Subtract),
+        Operator::Multiply => Some(ArithmeticOp::Multiply),
+        Operator::Divide => Some(ArithmeticOp::Divide),
+        Operator::Modulus => Some(ArithmeticOp::Remainder),
+        Operator::BitwiseAnd => Some(ArithmeticOp::BitAnd),
+        Operator::BitwiseOr => Some(ArithmeticOp::BitOr),
+        Operator::LeftShift => Some(ArithmeticOp::ShiftLeft),
+        Operator::RightShift => Some(ArithmeticOp::ShiftRight),
+        _ => None,
+    }
+}
+
 /// Builds a compiler for one resolved expression against a symbolic row.
 pub(crate) fn compile_expr(row: Row, expr: &ResolvedScalarExpr) -> BoxedCompile<ValueId> {
     try_compile_expr(Some(row), expr)
@@ -441,10 +460,13 @@ fn try_compile_expr(row: Option<Row>, expr: &ResolvedScalarExpr) -> Option<Boxed
         ResolvedScalarExpr::IndexRowId => Some(row?.index_rowid().boxed()),
         ResolvedScalarExpr::Parameter(variable) => Some(parameter(variable.clone()).boxed()),
         ResolvedScalarExpr::Constant(value) => Some(constant(value.clone()).boxed()),
-        ResolvedScalarExpr::Add(lhs, rhs) => Some(
+        ResolvedScalarExpr::Arithmetic { op, lhs, rhs } => Some(
             try_compile_expr(row, lhs)?
                 .then(try_compile_expr(row, rhs)?)
-                .and_then(|(lhs, rhs)| add(lhs, rhs))
+                .and_then({
+                    let op = *op;
+                    move |(lhs, rhs)| arithmetic(op, lhs, rhs)
+                })
                 .boxed(),
         ),
         ResolvedScalarExpr::Logical { op, lhs, rhs } => Some(
