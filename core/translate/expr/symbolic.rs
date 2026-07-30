@@ -241,32 +241,48 @@ const fn comparison_op(operator: Operator) -> Option<ComparisonOp> {
 
 /// Builds a compiler for one resolved expression against a symbolic row.
 pub(crate) fn compile_expr(row: Row, expr: &ResolvedScalarExpr) -> BoxedCompile<ValueId> {
+    try_compile_expr(Some(row), expr)
+        .expect("row-backed symbolic expressions must have a column source")
+}
+
+/// Builds a compiler for a resolved expression that does not read a row.
+pub(crate) fn compile_static_expr(expr: &ResolvedScalarExpr) -> Option<BoxedCompile<ValueId>> {
+    try_compile_expr(None, expr)
+}
+
+fn try_compile_expr(row: Option<Row>, expr: &ResolvedScalarExpr) -> Option<BoxedCompile<ValueId>> {
     match expr {
-        ResolvedScalarExpr::Column(column) => row.column(*column).boxed(),
-        ResolvedScalarExpr::Parameter(variable) => parameter(variable.clone()).boxed(),
-        ResolvedScalarExpr::Constant(value) => constant(value.clone()).boxed(),
-        ResolvedScalarExpr::Add(lhs, rhs) => compile_expr(row, lhs)
-            .then(compile_expr(row, rhs))
-            .and_then(|(lhs, rhs)| add(lhs, rhs))
-            .boxed(),
-        ResolvedScalarExpr::Logical { op, lhs, rhs } => compile_expr(row, lhs)
-            .then(compile_expr(row, rhs))
-            .and_then({
-                let op = *op;
-                move |(lhs, rhs)| logical(op, lhs, rhs)
-            })
-            .boxed(),
+        ResolvedScalarExpr::Column(column) => Some(row?.column(*column).boxed()),
+        ResolvedScalarExpr::Parameter(variable) => Some(parameter(variable.clone()).boxed()),
+        ResolvedScalarExpr::Constant(value) => Some(constant(value.clone()).boxed()),
+        ResolvedScalarExpr::Add(lhs, rhs) => Some(
+            try_compile_expr(row, lhs)?
+                .then(try_compile_expr(row, rhs)?)
+                .and_then(|(lhs, rhs)| add(lhs, rhs))
+                .boxed(),
+        ),
+        ResolvedScalarExpr::Logical { op, lhs, rhs } => Some(
+            try_compile_expr(row, lhs)?
+                .then(try_compile_expr(row, rhs)?)
+                .and_then({
+                    let op = *op;
+                    move |(lhs, rhs)| logical(op, lhs, rhs)
+                })
+                .boxed(),
+        ),
         ResolvedScalarExpr::Compare {
             lhs,
             rhs,
             comparison,
-        } => compile_expr(row, lhs)
-            .then(compile_expr(row, rhs))
-            .and_then({
-                let comparison = *comparison;
-                move |(lhs, rhs)| compare(lhs, rhs, comparison)
-            })
-            .boxed(),
+        } => Some(
+            try_compile_expr(row, lhs)?
+                .then(try_compile_expr(row, rhs)?)
+                .and_then({
+                    let comparison = *comparison;
+                    move |(lhs, rhs)| compare(lhs, rhs, comparison)
+                })
+                .boxed(),
+        ),
         ResolvedScalarExpr::Case {
             when_then_pairs,
             else_expr,
@@ -275,19 +291,21 @@ pub(crate) fn compile_expr(row: Row, expr: &ResolvedScalarExpr) -> BoxedCompile<
 }
 
 fn compile_case(
-    row: Row,
+    row: Option<Row>,
     when_then_pairs: &[(ResolvedScalarExpr, ResolvedScalarExpr)],
     else_expr: &ResolvedScalarExpr,
-) -> BoxedCompile<ValueId> {
+) -> Option<BoxedCompile<ValueId>> {
     let Some(((when_expr, then_expr), remaining)) = when_then_pairs.split_first() else {
-        return compile_expr(row, else_expr);
+        return try_compile_expr(row, else_expr);
     };
-    compile_expr(row, when_expr)
-        .branch(
-            compile_expr(row, then_expr),
-            compile_case(row, remaining, else_expr),
-        )
-        .boxed()
+    Some(
+        try_compile_expr(row, when_expr)?
+            .branch(
+                try_compile_expr(row, then_expr)?,
+                compile_case(row, remaining, else_expr)?,
+            )
+            .boxed(),
+    )
 }
 
 /// Compiles expressions in source order into one symbolic register pack.

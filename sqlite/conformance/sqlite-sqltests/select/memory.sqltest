@@ -2004,8 +2004,15 @@ test symbolic-scalar-limit {
         (0, 0, 'skip'), (1, 2, 'one'), (NULL, 4, 'null'),
         (2, 2, 'two'), (7, 0, 'tail');
     SELECT a + 1, name FROM limited_rows WHERE a + b >= 3 LIMIT 2;
+    SELECT a FROM limited_rows LIMIT 0;
+    SELECT a FROM limited_rows LIMIT 1 + 1;
+    SELECT a FROM limited_rows LIMIT '2';
 }
 expect {
     2|one
     3|two
+    0
+    1
+    0
+    1
 }

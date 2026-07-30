@@ -4,7 +4,7 @@
 //! completed description is first interpreted into symbolic SSA IR and only
 //! then lowered into physical VDBE registers, labels, and instructions.
 
-use std::{fmt, marker::PhantomData, num::NonZeroI64};
+use std::{fmt, marker::PhantomData};
 
 use smallvec::{smallvec, SmallVec};
 use turso_parser::ast::Variable;
@@ -83,8 +83,9 @@ pub(crate) trait Compile: Sized {
     ) -> Branch<Self, IfTrue, IfFalse>
     where
         Self: Compile<Output = ValueId>,
-        IfTrue: Compile<Output = ValueId>,
-        IfFalse: Compile<Output = ValueId>,
+        IfTrue: Compile,
+        IfTrue::Output: BranchOutput,
+        IfFalse: Compile<Output = IfTrue::Output>,
     {
         Branch {
             condition: self,
@@ -216,17 +217,17 @@ pub(crate) struct Branch<Condition, IfTrue, IfFalse> {
 impl<Condition, IfTrue, IfFalse> Compile for Branch<Condition, IfTrue, IfFalse>
 where
     Condition: Compile<Output = ValueId>,
-    IfTrue: Compile<Output = ValueId>,
-    IfFalse: Compile<Output = ValueId>,
+    IfTrue: Compile,
+    IfTrue::Output: BranchOutput,
+    IfFalse: Compile<Output = IfTrue::Output>,
 {
-    type Output = ValueId;
+    type Output = IfTrue::Output;
 
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
         let condition = self.condition.compile(builder)?;
         let if_true_block = builder.create_block()?;
         let if_false_block = builder.create_block()?;
         let merge_block = builder.create_block()?;
-        let output = builder.add_block_parameter(merge_block)?;
 
         builder.terminate(Terminator::Branch {
             condition,
@@ -235,21 +236,32 @@ where
         })?;
 
         builder.switch_to(if_true_block)?;
-        let if_true = self.if_true.compile(builder)?;
+        let if_true = self.if_true.compile(builder)?.into_branch_values();
+        let mut output = SmallVec::with_capacity(if_true.len());
+        for _ in 0..if_true.len() {
+            output.push(builder.add_block_parameter(merge_block)?);
+        }
         builder.terminate(Terminator::Jump {
             target: merge_block,
-            arguments: smallvec![if_true],
+            arguments: if_true,
         })?;
 
         builder.switch_to(if_false_block)?;
-        let if_false = self.if_false.compile(builder)?;
+        let if_false = self.if_false.compile(builder)?.into_branch_values();
+        if if_false.len() != output.len() {
+            return Err(LimboError::InternalError(format!(
+                "compiler branch changed output arity from {} to {}",
+                output.len(),
+                if_false.len()
+            )));
+        }
         builder.terminate(Terminator::Jump {
             target: merge_block,
-            arguments: smallvec![if_false],
+            arguments: if_false,
         })?;
 
         builder.switch_to(merge_block)?;
-        Ok(output)
+        IfTrue::Output::from_branch_values(output)
     }
 }
 
@@ -329,29 +341,6 @@ pub(crate) struct TryFoldRows<Initial, BodyFn, Body> {
     cursor: CursorId,
     body: BodyFn,
     compiler: PhantomData<fn() -> Body>,
-}
-
-/// Selects one of two loop steps and joins both state packs in SSA form.
-pub(crate) struct SelectLoopStep<IfTrue, IfFalse> {
-    condition: ValueId,
-    if_true: IfTrue,
-    if_false: IfFalse,
-}
-
-pub(crate) const fn select_loop_step<IfTrue, IfFalse>(
-    condition: ValueId,
-    if_true: IfTrue,
-    if_false: IfFalse,
-) -> SelectLoopStep<IfTrue, IfFalse>
-where
-    IfTrue: Compile<Output = LoopStep>,
-    IfFalse: Compile<Output = LoopStep>,
-{
-    SelectLoopStep {
-        condition,
-        if_true,
-        if_false,
-    }
 }
 
 /// Executes an effectful compiler only when an SSA condition is truthy.
@@ -497,61 +486,6 @@ where
     }
 }
 
-impl<IfTrue, IfFalse> Compile for SelectLoopStep<IfTrue, IfFalse>
-where
-    IfTrue: Compile<Output = LoopStep>,
-    IfFalse: Compile<Output = LoopStep>,
-{
-    type Output = LoopStep;
-
-    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
-        let if_true = builder.create_block()?;
-        let if_false = builder.create_block()?;
-        let merge = builder.create_block()?;
-        builder.terminate(Terminator::Branch {
-            condition: self.condition,
-            if_true,
-            if_false,
-        })?;
-
-        builder.switch_to(if_true)?;
-        let true_step = self.if_true.compile(builder)?;
-        let mut state = SmallVec::with_capacity(true_step.state.len());
-        for _ in 0..true_step.state.len() {
-            state.push(builder.add_block_parameter(merge)?);
-        }
-        let should_continue = builder.add_block_parameter(merge)?;
-        let mut true_arguments = true_step.state.values;
-        true_arguments.push(true_step.should_continue);
-        builder.terminate(Terminator::Jump {
-            target: merge,
-            arguments: true_arguments,
-        })?;
-
-        builder.switch_to(if_false)?;
-        let false_step = self.if_false.compile(builder)?;
-        if false_step.state.len() != state.len() {
-            return Err(LimboError::InternalError(format!(
-                "row stream branch changed state arity from {} to {}",
-                state.len(),
-                false_step.state.len()
-            )));
-        }
-        let mut false_arguments = false_step.state.values;
-        false_arguments.push(false_step.should_continue);
-        builder.terminate(Terminator::Jump {
-            target: merge,
-            arguments: false_arguments,
-        })?;
-
-        builder.switch_to(merge)?;
-        Ok(LoopStep {
-            state: LoopState { values: state },
-            should_continue,
-        })
-    }
-}
-
 impl<Initial, BodyFn, Body> Compile for CursorFold<Initial, BodyFn, Body>
 where
     Initial: Compile<Output = ValueId>,
@@ -598,6 +532,32 @@ impl ValueId {
     }
 }
 
+/// An output whose SSA values can be joined through block parameters.
+pub(crate) trait BranchOutput: Sized {
+    fn into_branch_values(self) -> SmallVec<[ValueId; 2]>;
+
+    fn from_branch_values(values: SmallVec<[ValueId; 2]>) -> Result<Self>;
+}
+
+impl BranchOutput for ValueId {
+    fn into_branch_values(self) -> SmallVec<[ValueId; 2]> {
+        smallvec![self]
+    }
+
+    fn from_branch_values(mut values: SmallVec<[ValueId; 2]>) -> Result<Self> {
+        let value = values.pop().ok_or_else(|| {
+            LimboError::InternalError("scalar compiler branch produced no value".to_owned())
+        })?;
+        if !values.is_empty() {
+            return Err(LimboError::InternalError(format!(
+                "scalar compiler branch produced {} values",
+                values.len() + 1
+            )));
+        }
+        Ok(value)
+    }
+}
+
 /// SSA values carried together across a row-stream loop backedge.
 #[derive(Clone, Debug)]
 pub(crate) struct LoopState {
@@ -630,19 +590,31 @@ pub(crate) struct LoopStep {
     should_continue: ValueId,
 }
 
-/// A statically known, positive row count for [`RowStream::take`].
-#[derive(Clone, Copy)]
-pub(crate) struct TakeCount(NonZeroI64);
-
-impl TakeCount {
-    pub(crate) fn new(count: i64) -> Option<Self> {
-        NonZeroI64::new(count)
-            .filter(|count| count.get() > 0)
-            .map(Self)
+impl BranchOutput for LoopState {
+    fn into_branch_values(self) -> SmallVec<[ValueId; 2]> {
+        self.values
     }
 
-    const fn get(self) -> i64 {
-        self.0.get()
+    fn from_branch_values(values: SmallVec<[ValueId; 2]>) -> Result<Self> {
+        Ok(Self { values })
+    }
+}
+
+impl BranchOutput for LoopStep {
+    fn into_branch_values(self) -> SmallVec<[ValueId; 2]> {
+        let mut values = self.state.values;
+        values.push(self.should_continue);
+        values
+    }
+
+    fn from_branch_values(mut values: SmallVec<[ValueId; 2]>) -> Result<Self> {
+        let should_continue = values.pop().ok_or_else(|| {
+            LimboError::InternalError("row-stream branch produced no continuation value".to_owned())
+        })?;
+        Ok(Self {
+            state: LoopState { values },
+            should_continue,
+        })
     }
 }
 
@@ -775,6 +747,9 @@ enum ScalarOp {
         lhs: ValueId,
         rhs: ValueId,
     },
+    MustBeInt {
+        value: ValueId,
+    },
     Logical {
         op: LogicalOp,
         lhs: ValueId,
@@ -805,6 +780,7 @@ impl ScalarOp {
             Self::Input(_) | Self::Parameter(_) | Self::Constant(_) | Self::Column { .. } => {
                 [None, None]
             }
+            Self::MustBeInt { value } => [Some(*value), None],
             Self::Add { lhs, rhs } | Self::Logical { lhs, rhs, .. } => [Some(*lhs), Some(*rhs)],
         };
         operands.into_iter().flatten()
@@ -817,6 +793,7 @@ impl ScalarOp {
             | Self::Parameter(_)
             | Self::Constant(_)
             | Self::Add { .. }
+            | Self::MustBeInt { .. }
             | Self::Logical { .. } => None,
         }
     }
@@ -1722,6 +1699,20 @@ impl IrProgram {
                                 rhs: registers[rhs.index()],
                                 dest: destination,
                             }),
+                            ScalarOp::MustBeInt { value } => {
+                                let source = registers[value.index()];
+                                if source != destination {
+                                    program.emit_insn(Insn::Copy {
+                                        src_reg: source,
+                                        dst_reg: destination,
+                                        extra_amount: 0,
+                                    });
+                                }
+                                program.emit_insn(Insn::MustBeInt {
+                                    reg: destination,
+                                    target_pc: None,
+                                });
+                            }
                             ScalarOp::Logical { op, lhs, rhs } => {
                                 let lhs = registers[lhs.index()];
                                 let rhs = registers[rhs.index()];
@@ -1986,6 +1977,9 @@ impl fmt::Display for IrProgram {
                             ScalarOp::Add { lhs, rhs } => {
                                 writeln!(f, "add %{}, %{}", lhs.0, rhs.0)?;
                             }
+                            ScalarOp::MustBeInt { value } => {
+                                writeln!(f, "must_be_int %{}", value.0)?;
+                            }
                             ScalarOp::Logical { op, lhs, rhs } => {
                                 writeln!(
                                     f,
@@ -2191,7 +2185,10 @@ pub(crate) trait RowStream: Sized {
         }
     }
 
-    fn take(self, count: TakeCount) -> TakeRows<Self> {
+    fn take<Count>(self, count: Count) -> TakeRows<Self, Count>
+    where
+        Count: Compile<Output = ValueId>,
+    {
         TakeRows {
             source: self,
             count,
@@ -2318,21 +2315,22 @@ where
         } = self;
         source.try_fold(initial, move |item, state| {
             predicate(item.clone()).and_then(move |condition| {
-                select_loop_step(condition, body(item, state.clone()), continue_loop(state))
+                pure(condition).branch(body(item, state.clone()), continue_loop(state))
             })
         })
     }
 }
 
-/// A row stream that stops after a fixed number of downstream items.
-pub(crate) struct TakeRows<Source> {
+/// A row stream that stops after a deferred number of downstream items.
+pub(crate) struct TakeRows<Source, Count> {
     source: Source,
-    count: TakeCount,
+    count: Count,
 }
 
-impl<Source> RowStream for TakeRows<Source>
+impl<Source, Count> RowStream for TakeRows<Source, Count>
 where
     Source: RowStream,
+    Count: Compile<Output = ValueId>,
 {
     type Item = Source::Item;
 
@@ -2358,53 +2356,61 @@ where
         Body: Compile<Output = LoopStep>,
     {
         let Self { source, count } = self;
-        let initial =
-            initial
-                .then(constant(Value::from_i64(count.get())))
-                .map(|(mut state, remaining)| {
-                    state.push(remaining);
-                    state
-                });
-        source
-            .try_fold(initial, move |item, mut state| {
-                let remaining = state
-                    .pop()
-                    .expect("take loop state must include its remaining-row count");
-                body(item, state).and_then(move |step| {
-                    constant(Value::from_i64(-1)).and_then(move |minus_one| {
-                        add(remaining, minus_one).and_then(move |next_remaining| {
-                            constant(Value::from_i64(0)).and_then(move |zero| {
-                                compare(
-                                    next_remaining,
-                                    zero,
-                                    resolved_comparison(
-                                        ComparisonOp::Greater,
-                                        Affinity::Numeric,
-                                        None,
-                                    ),
-                                )
-                                .and_then(move |limit_continue| {
-                                    logical(LogicalOp::And, step.should_continue, limit_continue)
-                                        .map(move |should_continue| {
-                                            let mut state = step.state;
-                                            state.push(next_remaining);
-                                            LoopStep {
-                                                state,
-                                                should_continue,
-                                            }
+        initial.then(count).and_then(move |(state, count)| {
+            must_be_int(count).and_then(move |count| {
+                let mut active_state = state.clone();
+                active_state.push(count);
+                pure(count).branch(
+                    source
+                        .try_fold(pure(active_state), move |item, mut state| {
+                            let remaining = state
+                                .pop()
+                                .expect("take loop state must include its remaining-row count");
+                            body(item, state).and_then(move |step| {
+                                constant(Value::from_i64(-1)).and_then(move |minus_one| {
+                                    add(remaining, minus_one).and_then(move |next_remaining| {
+                                        constant(Value::from_i64(0)).and_then(move |zero| {
+                                            compare(
+                                                next_remaining,
+                                                zero,
+                                                resolved_comparison(
+                                                    ComparisonOp::NotEqual,
+                                                    Affinity::Numeric,
+                                                    None,
+                                                ),
+                                            )
+                                            .and_then(
+                                                move |limit_continue| {
+                                                    logical(
+                                                        LogicalOp::And,
+                                                        step.should_continue,
+                                                        limit_continue,
+                                                    )
+                                                    .map(move |should_continue| {
+                                                        let mut state = step.state;
+                                                        state.push(next_remaining);
+                                                        LoopStep {
+                                                            state,
+                                                            should_continue,
+                                                        }
+                                                    })
+                                                },
+                                            )
                                         })
+                                    })
                                 })
                             })
                         })
-                    })
-                })
+                        .map(|mut state| {
+                            state
+                                .pop()
+                                .expect("take result state must include its remaining-row count");
+                            state
+                        }),
+                    pure(state),
+                )
             })
-            .map(|mut state| {
-                state
-                    .pop()
-                    .expect("take result state must include its remaining-row count");
-                state
-            })
+        })
     }
 }
 
@@ -2529,6 +2535,10 @@ impl Compile for Constant {
 pub(crate) struct Add {
     lhs: ValueId,
     rhs: ValueId,
+}
+
+pub(crate) struct MustBeInt {
+    value: ValueId,
 }
 
 pub(crate) struct Logical {
@@ -2677,6 +2687,18 @@ impl Compile for Add {
             lhs: self.lhs,
             rhs: self.rhs,
         })
+    }
+}
+
+pub(crate) const fn must_be_int(value: ValueId) -> MustBeInt {
+    MustBeInt { value }
+}
+
+impl Compile for MustBeInt {
+    type Output = ValueId;
+
+    fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
+        builder.push(ScalarOp::MustBeInt { value: self.value })
     }
 }
 
@@ -3021,13 +3043,11 @@ mod tests {
 
     #[test]
     fn row_stream_take_short_circuits_before_cursor_advance() {
-        assert!(TakeCount::new(0).is_none());
-        assert!(TakeCount::new(-1).is_none());
         let table = Arc::new(BTreeTable::from_sql("CREATE TABLE limited(a,b)", 2).unwrap());
         let compiler = scan_table(table, 0, 0).and_then(|rows| {
             rows.filter(|row| row.column(0))
                 .map(|row| row.column(1))
-                .take(TakeCount::new(2).unwrap())
+                .take(constant(Value::from_i64(2)))
                 .for_each(|value| result_row([value]))
         });
 
@@ -3041,53 +3061,63 @@ mod tests {
                 "block0:\n",
                 "  open_read $0 root 2 db 0 schema 0\n",
                 "  %0 = constant Numeric(Integer(2))\n",
-                "  rewind $0, block1(%0), block4(%0)\n",
+                "  %1 = must_be_int %0\n",
+                "  branch %1, block1, block2\n",
                 "\n",
-                "block1(%1):\n",
-                "  %3 = column $0[0]\n",
-                "  branch %3, block5, block6\n",
+                "block1:\n",
+                "  rewind $0, block4(%1), block7(%1)\n",
                 "\n",
                 "block2:\n",
-                "  next $0, block1(%14), block4(%14)\n",
+                "  jump block3()\n",
                 "\n",
                 "block3:\n",
-                "  jump block4(%14)\n",
+                "  %18 = constant Null\n",
+                "  return %18\n",
                 "\n",
                 "block4(%2):\n",
-                "  %17 = constant Null\n",
-                "  return %17\n",
+                "  %4 = column $0[0]\n",
+                "  branch %4, block8, block9\n",
                 "\n",
                 "block5:\n",
-                "  %4 = column $0[1]\n",
-                "  result_row [%4]\n",
-                "  %5 = constant Numeric(Integer(1))\n",
-                "  %6 = constant Numeric(Integer(-1))\n",
-                "  %7 = add %1, %6\n",
-                "  %8 = constant Numeric(Integer(0))\n",
-                "  compare Greater %7, %8 affinity Numeric collation None, block8, block9, block10\n",
+                "  next $0, block4(%15), block7(%15)\n",
                 "\n",
                 "block6:\n",
-                "  %16 = constant Numeric(Integer(1))\n",
-                "  jump block7(%1, %16)\n",
+                "  jump block7(%15)\n",
                 "\n",
-                "block7(%14, %15):\n",
-                "  branch %15, block2, block3\n",
+                "block7(%3):\n",
+                "  jump block3()\n",
                 "\n",
                 "block8:\n",
-                "  %10 = constant Numeric(Integer(1))\n",
-                "  jump block11(%10)\n",
+                "  %5 = column $0[1]\n",
+                "  result_row [%5]\n",
+                "  %6 = constant Numeric(Integer(1))\n",
+                "  %7 = constant Numeric(Integer(-1))\n",
+                "  %8 = add %2, %7\n",
+                "  %9 = constant Numeric(Integer(0))\n",
+                "  compare NotEqual %8, %9 affinity Numeric collation None, block11, block12, block13\n",
                 "\n",
                 "block9:\n",
-                "  %11 = constant Numeric(Integer(0))\n",
-                "  jump block11(%11)\n",
+                "  %17 = constant Numeric(Integer(1))\n",
+                "  jump block10(%2, %17)\n",
                 "\n",
-                "block10:\n",
-                "  %12 = constant Null\n",
-                "  jump block11(%12)\n",
+                "block10(%15, %16):\n",
+                "  branch %16, block5, block6\n",
                 "\n",
-                "block11(%9):\n",
-                "  %13 = and %5, %9\n",
-                "  jump block7(%7, %13)\n",
+                "block11:\n",
+                "  %11 = constant Numeric(Integer(1))\n",
+                "  jump block14(%11)\n",
+                "\n",
+                "block12:\n",
+                "  %12 = constant Numeric(Integer(0))\n",
+                "  jump block14(%12)\n",
+                "\n",
+                "block13:\n",
+                "  %13 = constant Null\n",
+                "  jump block14(%13)\n",
+                "\n",
+                "block14(%10):\n",
+                "  %14 = and %6, %10\n",
+                "  jump block10(%8, %14)\n",
             )
         );
     }
@@ -3149,15 +3179,15 @@ mod tests {
                 "  branch %0, block1, block2\n",
                 "\n",
                 "block1:\n",
-                "  %2 = constant Numeric(Integer(10))\n",
-                "  jump block3(%2)\n",
+                "  %1 = constant Numeric(Integer(10))\n",
+                "  jump block3(%1)\n",
                 "\n",
                 "block2:\n",
                 "  %3 = constant Numeric(Integer(20))\n",
                 "  jump block3(%3)\n",
                 "\n",
-                "block3(%1):\n",
-                "  return %1\n",
+                "block3(%2):\n",
+                "  return %2\n",
             )
         );
     }

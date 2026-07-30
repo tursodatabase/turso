@@ -7,7 +7,7 @@ use crate::{
         aggregation::emit_ungrouped_aggregation,
         compiler::{
             compile_effect, result_row_pack, scan_table, BoxedCompile, Compile, Row, RowStream,
-            TakeCount,
+            ValueId,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -15,8 +15,8 @@ use crate::{
             OperationMode, ResultSetColumn, TableMask, TranslateCtx,
         },
         expr::{
-            compile_symbolic_conjunction, compile_symbolic_exprs, ResolvedScalarExpr,
-            RowExprResolver,
+            compile_symbolic_conjunction, compile_symbolic_exprs, compile_symbolic_static_expr,
+            ResolvedScalarExpr, RowExprResolver,
         },
         group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
@@ -33,14 +33,13 @@ use crate::{
         window::{emit_window_flush, EmitWindow},
         ProgramBuilder, Resolver,
     },
-    util::parse_numeric_literal,
     vdbe::{builder::QueryMode, insn::Insn},
-    HashMap, HashSet, LimboError, Numeric, Result, Value,
+    HashMap, HashSet, LimboError, Result,
 };
 use smallvec::SmallVec;
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
-use turso_parser::ast::{Expr, Literal};
+use turso_parser::ast::Expr;
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_select(
@@ -94,19 +93,6 @@ fn try_emit_declarative_table_scan(
         return Ok(None);
     }
 
-    let limit = match plan.limit.as_deref() {
-        None => None,
-        Some(Expr::Literal(Literal::Numeric(value))) => match parse_numeric_literal(value)? {
-            Value::Numeric(Numeric::Integer(value)) => match TakeCount::new(value) {
-                Some(count) => Some(count),
-                None => return Ok(None),
-            },
-            Value::Numeric(Numeric::Float(_)) => return Ok(None),
-            _ => unreachable!("numeric literal parser only returns numeric values"),
-        },
-        Some(_) => return Ok(None),
-    };
-
     let [joined] = plan.table_references.joined_tables() else {
         return Ok(None);
     };
@@ -138,6 +124,18 @@ fn try_emit_declarative_table_scan(
         table,
         &plan.table_references,
     );
+    let limit = match plan.limit.as_deref() {
+        None => None,
+        Some(limit) => {
+            let Some(limit) = expr_resolver.resolve(limit)? else {
+                return Ok(None);
+            };
+            let Some(limit) = compile_symbolic_static_expr(&limit) else {
+                return Ok(None);
+            };
+            Some(limit)
+        }
+    };
     let mut projections =
         SmallVec::<[ResolvedScalarExpr; 4]>::with_capacity(plan.result_columns.len());
     for result_column in &plan.result_columns {
@@ -198,7 +196,7 @@ fn try_emit_declarative_table_scan(
 fn compile_declarative_projection<Stream>(
     rows: Stream,
     projections: SmallVec<[ResolvedScalarExpr; 4]>,
-    limit: Option<TakeCount>,
+    limit: Option<BoxedCompile<ValueId>>,
 ) -> BoxedCompile<()>
 where
     Stream: RowStream<Item = Row> + 'static,
@@ -1395,6 +1393,61 @@ mod tests {
             .run_collect_rows()
             .unwrap()
             .is_empty());
+
+        let mut dynamic_limit = connection
+            .prepare("SELECT a FROM expressions LIMIT ?1")
+            .unwrap();
+        assert!(dynamic_limit
+            .get_program()
+            .insns
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::DecrJumpZero { .. })));
+        assert!(dynamic_limit
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::MustBeInt { .. })));
+        dynamic_limit
+            .bind_at(1.try_into().unwrap(), Value::from_i64(0))
+            .unwrap();
+        assert!(dynamic_limit.run_collect_rows().unwrap().is_empty());
+        dynamic_limit.reset().unwrap();
+        dynamic_limit
+            .bind_at(1.try_into().unwrap(), Value::from_text("2"))
+            .unwrap();
+        assert_eq!(
+            dynamic_limit.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+        );
+        dynamic_limit.reset().unwrap();
+        dynamic_limit
+            .bind_at(1.try_into().unwrap(), Value::from_i64(-1))
+            .unwrap();
+        assert_eq!(dynamic_limit.run_collect_rows().unwrap().len(), 5);
+
+        let mut expression_limit = connection
+            .prepare("SELECT a FROM expressions LIMIT ?1 + 1")
+            .unwrap();
+        assert!(expression_limit
+            .get_program()
+            .insns
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::DecrJumpZero { .. })));
+        expression_limit
+            .bind_at(1.try_into().unwrap(), Value::from_i64(1))
+            .unwrap();
+        assert_eq!(
+            expression_limit.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+        );
+
+        let mut invalid_limit = connection
+            .prepare("SELECT a FROM expressions LIMIT ?1")
+            .unwrap();
+        invalid_limit
+            .bind_at(1.try_into().unwrap(), Value::from_f64(1.5))
+            .unwrap();
+        assert!(invalid_limit.run_collect_rows().is_err());
 
         let mut control_flow_statement = connection
             .prepare(

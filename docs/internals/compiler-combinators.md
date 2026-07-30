@@ -72,10 +72,13 @@ returns a state pack and a symbolic continuation value. A false continuation
 branches directly to the loop exit, while a true continuation reaches the
 cursor-advance block. `take` layers a remaining-row value onto that state pack,
 so nested stream operators preserve their own loop state and the final accepted
-row exits without moving the cursor again. The production table-scan path uses
-this for positive integer literal `LIMIT`; zero, negative, floating-point,
-parameterized, and offset limits retain the eager emitter until their complete
-SQLite coercion and initialization semantics are modeled.
+row exits without moving the cursor again. Its count is itself a deferred value:
+an SSA integer-coercion operation implements SQLite's `MustBeInt` behavior, a
+zero count branches around the source pipeline, and a negative count never
+reaches zero. The production table-scan path uses this for row-independent
+`LIMIT` expressions supported by the scalar IR, including parameters and
+searched `CASE`; column-dependent and otherwise unsupported limits, and all
+offset limits, retain the eager emitter.
 The production path preserves predicate and projection source order. Comparison
 affinity and collation are resolved by the SQL frontend before IR construction.
 The resulting terminator has separate true, false, and NULL successors; a
@@ -145,6 +148,9 @@ are discarded before that subtree is treated as one external value.
 Conditional branches only admit branch bodies that are fully represented in
 the IR. An unsupported branch body sends the whole conditional back to the
 legacy emitter instead of evaluating that body as an eager external input.
+Branch outputs implement an SSA-join contract, so the same combinator can merge
+a scalar value, a loop-state pack, or a state-plus-continuation loop step through
+block parameters.
 Likewise, SQL-specific operator implementations remain atomic external inputs;
 the surrounding expression may be deferred without bypassing custom-type
 dispatch.
