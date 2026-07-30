@@ -7,8 +7,8 @@ use crate::{
         aggregation::emit_ungrouped_aggregation,
         collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         compiler::{
-            compile_effect, pack_values, result_row_pack, scan_table, BoxedCompile, Compile, Row,
-            RowStream, SortKey, SortedRow, ValueId,
+            compile_effect, pack_values, result_row_pack, scan_table, select_pack, BoxedCompile,
+            Compile, Row, RowStream, SortKey, SortedRow, ValueId,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -77,7 +77,6 @@ fn try_emit_declarative_table_scan(
 ) -> Result<Option<usize>> {
     if matches!(program.get_query_mode(), QueryMode::ExplainQueryPlan)
         || !matches!(plan.query_destination, QueryDestination::ResultRows)
-        || (matches!(plan.distinctness, Distinctness::Distinct { .. }) && !plan.order_by.is_empty())
         || plan.group_by.is_some()
         || !plan.aggregates.is_empty()
         || plan.contains_constant_false_condition
@@ -270,11 +269,12 @@ where
     Stream: RowStream<Item = Row> + 'static,
 {
     let DeclarativeSlice { limit, offset } = slice;
-    if let Some(collations) = distinct_collations {
-        debug_assert!(sort_keys.is_empty());
-        compile_declarative_distinct_projection(rows, projections, collations, limit, offset)
-    } else if sort_keys.is_empty() {
-        compile_declarative_projection(rows, projections, limit, offset)
+    if sort_keys.is_empty() {
+        if let Some(collations) = distinct_collations {
+            compile_declarative_distinct_projection(rows, projections, collations, limit, offset)
+        } else {
+            compile_declarative_projection(rows, projections, limit, offset)
+        }
     } else {
         sort_expressions.extend(projections);
         compile_declarative_sorted_projection(
@@ -282,6 +282,7 @@ where
             sort_expressions,
             sort_keys,
             result_column_count,
+            distinct_collations,
             limit,
             offset,
         )
@@ -318,6 +319,7 @@ fn compile_declarative_sorted_projection<Stream>(
     expressions: SmallVec<[ResolvedScalarExpr; 4]>,
     sort_keys: SmallVec<[SortKey; 4]>,
     result_column_count: usize,
+    distinct_collations: Option<SmallVec<[CollationSeq; 4]>>,
     limit: Option<BoxedCompile<ValueId>>,
     offset: Option<BoxedCompile<ValueId>>,
 ) -> BoxedCompile<()>
@@ -326,9 +328,39 @@ where
 {
     let key_count = sort_keys.len();
     let record_width = expressions.len();
-    let rows = rows
-        .map(move |row| compile_symbolic_exprs(row, &expressions))
-        .sort(sort_keys, record_width);
+    let rows = rows.map(move |row| compile_symbolic_exprs(row, &expressions));
+    if let Some(collations) = distinct_collations {
+        compile_declarative_sorted_stream(
+            rows.distinct_by(collations, move |pack| {
+                select_pack(pack, key_count, result_column_count)
+            })
+            .sort(sort_keys, record_width),
+            key_count,
+            result_column_count,
+            limit,
+            offset,
+        )
+    } else {
+        compile_declarative_sorted_stream(
+            rows.sort(sort_keys, record_width),
+            key_count,
+            result_column_count,
+            limit,
+            offset,
+        )
+    }
+}
+
+fn compile_declarative_sorted_stream<Stream>(
+    rows: Stream,
+    key_count: usize,
+    result_column_count: usize,
+    limit: Option<BoxedCompile<ValueId>>,
+    offset: Option<BoxedCompile<ValueId>>,
+) -> BoxedCompile<()>
+where
+    Stream: RowStream<Item = SortedRow> + 'static,
+{
     match (limit, offset) {
         (Some(limit), Some(offset)) => rows
             .skip(offset)

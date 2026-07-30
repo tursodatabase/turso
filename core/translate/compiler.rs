@@ -3756,6 +3756,7 @@ pub(crate) struct CursorRows {
 
 type BoxedRowConsumer<Item> = Box<dyn FnOnce(Item) -> BoxedCompile<()>>;
 type BoxedRowFolder<Item> = Box<dyn FnOnce(Item, LoopState) -> BoxedCompile<LoopStep>>;
+type BoxedDistinctKey<Item> = Box<dyn FnOnce(Item) -> BoxedCompile<ValuePack>>;
 
 /// A compile-time row-program algebra analogous to [`Iterator`].
 ///
@@ -3864,9 +3865,24 @@ pub(crate) trait RowStream: Sized + 'static {
     where
         Self: RowStream<Item = ValuePack>,
     {
+        self.distinct_by(collations, pure)
+    }
+
+    /// Yield the first item for each collation-aware derived key.
+    fn distinct_by<KeyFn, Key>(
+        self,
+        collations: SmallVec<[CollationSeq; 4]>,
+        key: KeyFn,
+    ) -> DistinctRows<Self>
+    where
+        Self::Item: Clone,
+        KeyFn: FnOnce(Self::Item) -> Key + 'static,
+        Key: Compile<Output = ValuePack> + 'static,
+    {
         DistinctRows {
             source: self,
             collations,
+            key: Box::new(move |item| key(item).boxed()),
         }
     }
 }
@@ -4122,10 +4138,15 @@ where
     }
 }
 
-/// A streaming row stage that remembers and filters previously yielded packs.
-pub(crate) struct DistinctRows<Source> {
+/// A streaming row stage that remembers derived keys and yields each first item.
+pub(crate) struct DistinctRows<Source>
+where
+    Source: RowStream,
+    Source::Item: Clone,
+{
     source: Source,
     collations: SmallVec<[CollationSeq; 4]>,
+    key: BoxedDistinctKey<Source::Item>,
 }
 
 struct CheckDistinct {
@@ -4167,45 +4188,56 @@ impl Compile for CheckDistinct {
     }
 }
 
-struct ForEachDistinct<Source> {
+struct ForEachDistinct<Source>
+where
+    Source: RowStream,
+    Source::Item: Clone,
+{
     source: Source,
     collations: SmallVec<[CollationSeq; 4]>,
-    body: BoxedRowConsumer<ValuePack>,
+    key: BoxedDistinctKey<Source::Item>,
+    body: BoxedRowConsumer<Source::Item>,
 }
 
 impl<Source> Compile for ForEachDistinct<Source>
 where
-    Source: RowStream<Item = ValuePack>,
+    Source: RowStream,
+    Source::Item: Clone,
 {
     type Output = ();
 
     fn compile(self, builder: &mut IrBuilder) -> Result<Self::Output> {
         let set = builder.allocate_distinct_set(self.collations)?;
         builder.push_effect(EffectOp::OpenDistinctSet { set })?;
+        let key = self.key;
         let body = self.body;
         self.source
-            .for_each_boxed(Box::new(move |pack| {
-                CheckDistinct {
-                    set,
-                    pack: pack.clone(),
-                }
-                .and_then(move |is_unique| when(is_unique, body(pack)))
-                .boxed()
+            .for_each_boxed(Box::new(move |item| {
+                key(item.clone())
+                    .and_then(move |pack| CheckDistinct { set, pack })
+                    .and_then(move |is_unique| when(is_unique, body(item)))
+                    .boxed()
             }))
             .compile(builder)
     }
 }
 
-struct TryFoldDistinct<Source> {
+struct TryFoldDistinct<Source>
+where
+    Source: RowStream,
+    Source::Item: Clone,
+{
     source: Source,
     collations: SmallVec<[CollationSeq; 4]>,
+    key: BoxedDistinctKey<Source::Item>,
     initial: BoxedCompile<LoopState>,
-    body: BoxedRowFolder<ValuePack>,
+    body: BoxedRowFolder<Source::Item>,
 }
 
 impl<Source> Compile for TryFoldDistinct<Source>
 where
-    Source: RowStream<Item = ValuePack>,
+    Source: RowStream,
+    Source::Item: Clone,
 {
     type Output = LoopState;
 
@@ -4213,19 +4245,18 @@ where
         let initial = self.initial.compile(builder)?;
         let set = builder.allocate_distinct_set(self.collations)?;
         builder.push_effect(EffectOp::OpenDistinctSet { set })?;
+        let key = self.key;
         let body = self.body;
         self.source
             .try_fold_boxed(
                 pure(initial).boxed(),
-                Box::new(move |pack, state| {
-                    CheckDistinct {
-                        set,
-                        pack: pack.clone(),
-                    }
-                    .and_then(move |is_unique| {
-                        pure(is_unique).branch(body(pack, state.clone()), continue_loop(state))
-                    })
-                    .boxed()
+                Box::new(move |item, state| {
+                    key(item.clone())
+                        .and_then(move |pack| CheckDistinct { set, pack })
+                        .and_then(move |is_unique| {
+                            pure(is_unique).branch(body(item, state.clone()), continue_loop(state))
+                        })
+                        .boxed()
                 }),
             )
             .compile(builder)
@@ -4234,14 +4265,16 @@ where
 
 impl<Source> RowStream for DistinctRows<Source>
 where
-    Source: RowStream<Item = ValuePack>,
+    Source: RowStream,
+    Source::Item: Clone,
 {
-    type Item = ValuePack;
+    type Item = Source::Item;
 
     fn for_each_boxed(self, body: BoxedRowConsumer<Self::Item>) -> BoxedCompile<()> {
         ForEachDistinct {
             source: self.source,
             collations: self.collations,
+            key: self.key,
             body,
         }
         .boxed()
@@ -4255,6 +4288,7 @@ where
         TryFoldDistinct {
             source: self.source,
             collations: self.collations,
+            key: self.key,
             initial,
             body,
         }
@@ -4741,6 +4775,13 @@ pub(crate) struct PackValues {
     values: SmallVec<[BoxedCompile<ValueId>; 4]>,
 }
 
+/// Selects an ordered sub-pack without emitting a physical copy.
+pub(crate) struct SelectPack {
+    pack: ValuePack,
+    start: usize,
+    len: usize,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn result_row<const N: usize>(values: [ValueId; N]) -> ResultRow {
     ResultRow {
@@ -4754,6 +4795,10 @@ pub(crate) fn result_row_pack(pack: ValuePack) -> ResultRow {
 
 pub(crate) fn pack_values(values: SmallVec<[BoxedCompile<ValueId>; 4]>) -> PackValues {
     PackValues { values }
+}
+
+pub(crate) const fn select_pack(pack: ValuePack, start: usize, len: usize) -> SelectPack {
+    SelectPack { pack, start, len }
 }
 
 impl Compile for PackValues {
@@ -4770,6 +4815,29 @@ impl Compile for PackValues {
             values.push(compiler.compile(builder)?);
         }
         Ok(ValuePack(values))
+    }
+}
+
+impl Compile for SelectPack {
+    type Output = ValuePack;
+
+    fn compile(self, _builder: &mut IrBuilder) -> Result<Self::Output> {
+        if self.len == 0 {
+            return Err(LimboError::InternalError(
+                "compiler IR selected value pack must not be empty".to_owned(),
+            ));
+        }
+        let end = self.start.checked_add(self.len).ok_or_else(|| {
+            LimboError::InternalError("compiler IR value-pack selection overflow".to_owned())
+        })?;
+        let Some(values) = self.pack.values().get(self.start..end) else {
+            return Err(LimboError::InternalError(format!(
+                "compiler IR selects values {}..{end} from pack of width {}",
+                self.start,
+                self.pack.values().len()
+            )));
+        };
+        Ok(ValuePack(values.iter().copied().collect()))
     }
 }
 
@@ -5205,6 +5273,59 @@ mod tests {
             .expect("only admitted packs reach the consumer");
 
         assert!(open < rewind && rewind < check && check < result);
+    }
+
+    #[test]
+    fn row_stream_distinct_by_preserves_records_for_downstream_sorting() {
+        let table =
+            Arc::new(BTreeTable::from_sql("CREATE TABLE ordered_distinct(a,b)", 2).unwrap());
+        let compiler = scan_table(table, 0, 0).and_then(|rows| {
+            rows.map(|row| pack_values(smallvec![row.column(1).boxed(), row.column(0).boxed()]))
+                .distinct_by(smallvec![CollationSeq::NoCase], |pack| {
+                    select_pack(pack, 1, 1)
+                })
+                .sort(
+                    smallvec![SortKey::new(
+                        SortOrder::Asc,
+                        Some(CollationSeq::Binary),
+                        None,
+                        None,
+                    )],
+                    2,
+                )
+                .for_each(|row| {
+                    pack_values(smallvec![row.column(1).boxed()]).and_then(result_row_pack)
+                })
+        });
+
+        let ir = compile_effect(compiler).unwrap();
+        let rendered = ir.to_string();
+        assert!(
+            rendered.contains("distinct_check &0 [%1], block3, block4"),
+            "only the derived SELECT-value suffix should be the distinct key:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("sorter_insert #0 [%0, %1]"),
+            "the complete record should survive for downstream sorting:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("next $0, block1(), block2()")
+                && rendered.contains("block2:\n  sort #0, block8(), block9()"),
+            "sorting should begin only after the distinct source loop exits:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn selecting_a_key_outside_a_value_pack_is_rejected() {
+        let compiler = pack_values(smallvec![constant(Value::from_i64(1)).boxed()])
+            .and_then(|pack| select_pack(pack, 1, 1))
+            .and_then(result_row_pack);
+
+        let error = compile_effect(compiler).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("selects values 1..2 from pack of width 1"));
     }
 
     #[test]
@@ -6864,6 +6985,36 @@ mod tests {
                 vec![Value::from_text("b"), Value::from_i64(2)],
                 vec![Value::Null, Value::from_i64(3)],
             ]
+        );
+    }
+
+    #[test]
+    fn distinct_ordered_table_scan_composes_symbolic_stream_stages() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute("CREATE TABLE ordered_distinct(key, sort_key)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO ordered_distinct VALUES \
+                 ('a', 2), ('A', 1), ('b', 4), ('B', 3), ('c', 0)",
+            )
+            .unwrap();
+
+        let rows = connection
+            .prepare(
+                "SELECT DISTINCT key COLLATE NOCASE FROM ordered_distinct \
+                 ORDER BY sort_key DESC LIMIT 2",
+            )
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![vec![Value::from_text("b")], vec![Value::from_text("a")]]
         );
     }
 

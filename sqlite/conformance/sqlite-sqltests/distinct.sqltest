@@ -141,6 +141,21 @@ expect {
     c|3
 }
 
+@cross-check-integrity
+test distinct-stream-order-by {
+    CREATE TABLE distinct_stream_order (key, sort_key);
+    INSERT INTO distinct_stream_order VALUES
+        ('a', 2), ('A', 1), ('b', 4), ('B', 3), ('c', 0);
+    SELECT DISTINCT key COLLATE NOCASE
+    FROM distinct_stream_order
+    ORDER BY sort_key DESC
+    LIMIT 2;
+}
+expect {
+    b
+    a
+}
+
 # Regression: OFFSET must be applied after DISTINCT deduplication.
 # This query projects all input rows to the same value (0), so DISTINCT yields
 # exactly one row. OFFSET 2 should therefore skip that one row and return empty.
