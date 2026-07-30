@@ -698,6 +698,8 @@ const AGGREGATE_WINDOW_FUNCS: &[(&str, WindowFnArity)] = &[
     ("total", WindowFnArity::OneArg),
     ("count", WindowFnArity::OneArg),
     ("avg", WindowFnArity::OneArg),
+    ("min", WindowFnArity::OneArg),
+    ("max", WindowFnArity::OneArg),
     ("group_concat", WindowFnArity::Concat),
     ("string_agg", WindowFnArity::Concat),
     ("json_group_array", WindowFnArity::OneArg),
@@ -1744,6 +1746,8 @@ mod tests {
                         "total(",
                         "count(",
                         "avg(",
+                        "min(",
+                        "max(",
                         "group_concat(",
                         "string_agg(",
                         "json_group_array(",
@@ -1815,6 +1819,8 @@ mod tests {
                         "total(",
                         "count(",
                         "avg(",
+                        "min(",
+                        "max(",
                         "group_concat(",
                         "string_agg(",
                         "json_group_array(",
@@ -1879,6 +1885,8 @@ mod tests {
                         "total(",
                         "count(",
                         "avg(",
+                        "min(",
+                        "max(",
                         "group_concat(",
                         "string_agg(",
                         "json_group_array(",
@@ -1946,9 +1954,15 @@ mod tests {
             saw_unexcluded_removable_prefix |= sql.contains(" BETWEEN ")
                 && !sql.contains("BETWEEN UNBOUNDED PRECEDING")
                 && !sql.contains(" EXCLUDE ")
-                && ["group_concat(", "string_agg(", "json_group_array("]
-                    .iter()
-                    .any(|name| sql.contains(name));
+                && [
+                    "min(",
+                    "max(",
+                    "group_concat(",
+                    "string_agg(",
+                    "json_group_array(",
+                ]
+                .iter()
+                .any(|name| sql.contains(name));
 
             if saw_no_others
                 && saw_current_row
