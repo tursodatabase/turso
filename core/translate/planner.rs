@@ -1252,7 +1252,8 @@ pub fn add_planned_ctes_as_outer_refs(
 ///    can still reference them by name
 ///
 /// Also returns the pre-bound expression subqueries, keyed by the id in the
-/// corresponding [ast::Expr::SubqueryResult].
+/// corresponding [ast::Expr::SubqueryResult], and any compound ORDER BY keys
+/// resolved by the binder.
 pub fn plan_bound_select_refs(
     mut bound: super::bind::BoundSelect,
     resolver: &Resolver,
@@ -1263,7 +1264,9 @@ pub fn plan_bound_select_refs(
 ) -> Result<(
     Vec<TableReferences>,
     rustc_hash::FxHashMap<TableInternalId, super::bind::BoundSubquery>,
+    Option<Vec<super::plan::CompoundOrderByKey>>,
 )> {
+    let compound_order_by = bound.compound_order_by.take();
     let cte_definitions = std::mem::take(&mut bound.cte_definitions);
     let subquery_bindings = std::mem::take(&mut bound.subquery_bindings);
     let derived_bindings = std::mem::take(&mut bound.derived_bindings);
@@ -1294,7 +1297,7 @@ pub fn plan_bound_select_refs(
 
     add_planned_ctes_as_outer_refs(&mut table_refs, &planned_ctes);
 
-    Ok((table_refs, subquery_bindings))
+    Ok((table_refs, subquery_bindings, compound_order_by))
 }
 
 /// Plan a pre-bound subquery ([super::bind::BoundSubquery]) into a [Plan]
@@ -1309,7 +1312,7 @@ pub fn plan_bound_subquery(
     inherited_ctes: &rustc_hash::FxHashMap<String, JoinedTable>,
     query_destination: QueryDestination,
 ) -> Result<Plan> {
-    let (table_refs, bound_subqueries) = plan_bound_select_refs(
+    let (table_refs, bound_subqueries, compound_order_by) = plan_bound_select_refs(
         bound_sq.inner_bound,
         resolver,
         program,
@@ -1324,6 +1327,7 @@ pub fn plan_bound_subquery(
         crate::translate::select::SelectBinding {
             table_refs: table_refs.into_iter(),
             bound_subqueries,
+            compound_order_by,
         },
         query_destination,
         connection,
@@ -1336,8 +1340,8 @@ pub fn plan_bound_subquery(
 /// recursive arm's reference to the CTE was bound to `binding.input_id`.
 /// Making that id resolve to the recursive input table only requires seeding
 /// the arms' planned-CTE map with the input table under the CTE's own name.
-/// Compound-operator validation, ORDER BY (queue order), and LIMIT still read
-/// the raw body in `select`, which the binder leaves untouched.
+/// Compound-operator validation and LIMIT still read the body in `select`;
+/// queue ordering is already resolved in `binding`.
 #[allow(clippy::too_many_arguments)]
 fn prepare_bound_recursive_cte_plan(
     name: &str,
@@ -1350,7 +1354,14 @@ fn prepare_bound_recursive_cte_plan(
     outer_query_refs: &[OuterQueryReference],
     inherited_ctes: &rustc_hash::FxHashMap<String, JoinedTable>,
 ) -> Result<Plan> {
-    let first_recursive_query_index = binding.first_recursive_arm_index;
+    let super::bind::RecursiveCteBinding {
+        initial,
+        recursive_arms,
+        first_recursive_arm_index,
+        input_id,
+        queue_order,
+    } = binding;
+    let first_recursive_query_index = first_recursive_arm_index;
 
     let recursive_compound_operator =
         select.body.compounds[first_recursive_query_index - 1].operator;
@@ -1375,7 +1386,7 @@ fn prepare_bound_recursive_cte_plan(
     }
 
     let initial_query = plan_bound_subquery(
-        binding.initial,
+        initial,
         resolver,
         program,
         connection,
@@ -1400,7 +1411,7 @@ fn prepare_bound_recursive_cte_plan(
     let input_table = JoinedTable::new_recursive_cte_input(
         name.to_string(),
         &initial_query,
-        binding.input_id,
+        input_id,
         explicit_columns,
     )?;
     let input_table_id = input_table.internal_id;
@@ -1412,8 +1423,8 @@ fn prepare_bound_recursive_cte_plan(
     let mut arm_ctes = inherited_ctes.clone();
     arm_ctes.insert(name.to_string(), input_table);
 
-    let mut arm_plans = Vec::with_capacity(binding.recursive_arms.len());
-    for arm in binding.recursive_arms {
+    let mut arm_plans = Vec::with_capacity(recursive_arms.len());
+    for arm in recursive_arms {
         let arm_plan = plan_bound_subquery(
             arm,
             resolver,
@@ -1462,11 +1473,10 @@ fn prepare_bound_recursive_cte_plan(
     }
     reject_aggregates_and_windows_in_recursive_query(&recursive_query)?;
 
-    let queue_order = super::select::resolve_recursive_cte_queue_order(
-        &select.order_by,
-        &initial_query,
-        &recursive_query,
-    )?;
+    assert!(
+        select.order_by.is_empty(),
+        "recursive CTE ORDER BY must be consumed during binding"
+    );
     // The binder already resolved the body-level LIMIT/OFFSET.
     let (limit, offset) = select
         .limit

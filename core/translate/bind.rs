@@ -436,6 +436,8 @@ pub struct RecursiveCteBinding {
     /// All recursive arms read the same recursive input table, so the planner
     /// creates that table with this id.
     pub input_id: ast::TableInternalId,
+    /// Body-level ORDER BY resolved to output-column positions.
+    pub queue_order: Option<Vec<super::plan::CompoundOrderByKey>>,
 }
 
 /// Set while a recursive CTE's recursive arms are being bound: the CTE's own
@@ -453,6 +455,10 @@ struct RecursiveSelfRef {
 
 pub struct BoundSelect {
     pub result_columns: Arc<Vec<BoundColumn>>,
+    /// Result-column metadata for each compound arm after the first.
+    pub compound_result_columns: Vec<Arc<Vec<BoundColumn>>>,
+    /// Compound ORDER BY resolved to output-column positions.
+    pub compound_order_by: Option<Vec<super::plan::CompoundOrderByKey>>,
     pub main_scope: BindScope,
     pub compound_scopes: Vec<BindScope>,
     pub tracking: BindTracking,
@@ -466,6 +472,101 @@ pub struct BoundSelect {
     /// `internal_id`. Planned before `into_table_references` and looked up
     /// by the `Derived` arm in `scope_to_table_references`.
     pub derived_bindings: HashMap<ast::TableInternalId, BoundSubquery>,
+}
+
+fn ordinal(n: usize) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (1, 11) | (2, 12) | (3, 13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
+fn resolve_compound_order_by_expr(
+    expr: &ast::Expr,
+    result_column_arms: &[&[BoundColumn]],
+    term_number: usize,
+) -> Result<(usize, Option<super::collate::CollationSeq>)> {
+    let num_result_columns = result_column_arms
+        .first()
+        .expect("compound SELECT must have a first arm")
+        .len();
+    match expr {
+        ast::Expr::Collate(inner, collation_name) => {
+            let (column, _) =
+                resolve_compound_order_by_expr(inner, result_column_arms, term_number)?;
+            Ok((
+                column,
+                Some(super::collate::CollationSeq::new(collation_name.as_str())?),
+            ))
+        }
+        ast::Expr::Literal(ast::Literal::Numeric(number)) => {
+            let Ok(column_number) = number.parse::<i32>() else {
+                crate::bail_parse_error!(
+                    "{} ORDER BY term does not match any column in the result set",
+                    ordinal(term_number)
+                );
+            };
+            if column_number <= 0 || column_number as usize > num_result_columns {
+                crate::bail_parse_error!(
+                    "{} ORDER BY term out of range - should be between 1 and {}",
+                    column_number,
+                    num_result_columns
+                );
+            }
+            Ok((column_number as usize - 1, None))
+        }
+        ast::Expr::Id(name) => {
+            let normalized = normalize_ident(name.as_str());
+            for result_columns in result_column_arms {
+                if let Some((column, _)) = result_columns.iter().enumerate().find(|(_, column)| {
+                    column.is_explicit_alias && column.name.eq_ignore_ascii_case(&normalized)
+                }) {
+                    return Ok((column, None));
+                }
+                if let Some((column, _)) = result_columns.iter().enumerate().find(|(_, column)| {
+                    !column.name.is_empty() && column.name.eq_ignore_ascii_case(&normalized)
+                }) {
+                    return Ok((column, None));
+                }
+            }
+            crate::bail_parse_error!(
+                "{} ORDER BY term does not match any column in the result set",
+                ordinal(term_number)
+            );
+        }
+        _ => crate::bail_parse_error!(
+            "{} ORDER BY term does not match any column in the result set",
+            ordinal(term_number)
+        ),
+    }
+}
+
+fn resolve_compound_order_by(
+    order_by: &[ast::SortedColumn],
+    result_column_arms: &[&[BoundColumn]],
+) -> Result<Option<Vec<super::plan::CompoundOrderByKey>>> {
+    if order_by.is_empty() {
+        return Ok(None);
+    }
+    order_by
+        .iter()
+        .enumerate()
+        .map(|(index, term)| {
+            let (column, collation) =
+                resolve_compound_order_by_expr(&term.expr, result_column_arms, index + 1)?;
+            Ok((
+                column,
+                term.order.unwrap_or(ast::SortOrder::Asc),
+                term.nulls,
+                collation,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
 }
 
 pub struct BoundUpdate {
@@ -1188,8 +1289,8 @@ pub struct CteEntry {
     pub materialize_hint: bool,
     /// True if the body references its own name (a recursive CTE, whether or
     /// not the RECURSIVE keyword was written). `select` keeps the raw body
-    /// (the planner reads compound operators, ORDER BY, and LIMIT from it);
-    /// the bound arms live in `recursive_binding`.
+    /// (the planner reads compound operators and LIMIT from it); bound arms
+    /// and resolved queue ordering live in `recursive_binding`.
     pub recursive: bool,
     /// Bound arms of a recursive CTE body (`recursive` is true), consumed by
     /// the recursive-CTE planner. `None` for non-recursive entries.
@@ -1627,18 +1728,17 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
             // 3. Bind compound selects (UNION, INTERSECT, EXCEPT)
             let mut compound_scopes = Vec::with_capacity(select.body.compounds.len());
+            let mut compound_result_columns = Vec::with_capacity(select.body.compounds.len());
             for compound in &mut select.body.compounds {
-                let (_compound_cols, compound_scope) = ctx.bind_one_select(&mut compound.select)?;
+                let (compound_columns, compound_scope) =
+                    ctx.bind_one_select(&mut compound.select)?;
+                compound_result_columns.push(compound_columns);
                 compound_scopes.push(compound_scope);
             }
 
             // 4. Bind ORDER BY (AliasFirst phase — aliases take priority).
-            // Compound SELECTs are excluded: their ORDER BY terms resolve by
-            // result-column position/name across all constituent SELECTs
-            // (see resolve_compound_order_by_expr in the planner), so the raw
-            // identifiers must be preserved.
             ctx.set_aliases(Arc::clone(&result_columns));
-            if select.body.compounds.is_empty() {
+            let compound_order_by = if select.body.compounds.is_empty() {
                 ctx.with_phase(BindPhase::AliasFirst, |ctx| {
                     for sort_col in &mut select.order_by {
                         ctx.replace_column_number(&mut sort_col.expr)?;
@@ -1650,7 +1750,41 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     }
                     Ok(())
                 })?;
-            }
+                None
+            } else {
+                let right_most_count = compound_result_columns
+                    .last()
+                    .expect("compound SELECT must have a right-most arm")
+                    .len();
+                let mut left_counts = std::iter::once(result_columns.len())
+                    .chain(
+                        compound_result_columns[..compound_result_columns.len() - 1]
+                            .iter()
+                            .map(|columns| columns.len()),
+                    )
+                    .zip(select.body.compounds.iter().map(|compound| compound.operator));
+                if let Some((_, operator)) =
+                    left_counts.find(|(column_count, _)| *column_count != right_most_count)
+                {
+                    crate::bail_parse_error!(
+                        "SELECTs to the left and right of {} do not have the same number of result columns",
+                        operator
+                    );
+                }
+
+                let result_column_arms: Vec<&[BoundColumn]> =
+                    std::iter::once(result_columns.as_slice())
+                        .chain(
+                            compound_result_columns
+                                .iter()
+                                .map(|columns| columns.as_slice()),
+                        )
+                        .collect();
+                let resolved =
+                    resolve_compound_order_by(&select.order_by, &result_column_arms)?;
+                select.order_by.clear();
+                resolved
+            };
 
             // 5. Bind LIMIT/OFFSET (no scope — these are standalone expressions)
             if let Some(limit) = select.limit.as_mut() {
@@ -1679,6 +1813,8 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
             Ok(BoundSelect {
                 result_columns,
+                compound_result_columns,
+                compound_order_by,
                 main_scope,
                 compound_scopes,
                 tracking: std::mem::take(&mut ctx.tracking),
@@ -2389,12 +2525,54 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 })();
                 self.recursive_self = saved_self;
                 let recursive_arms = arms_result?;
+                let last_recursive_count = recursive_arms
+                    .last()
+                    .expect("recursive CTE must have a recursive arm")
+                    .inner_bound
+                    .result_columns
+                    .len();
+                if recursive_arms[..recursive_arms.len() - 1]
+                    .iter()
+                    .any(|arm| arm.inner_bound.result_columns.len() != last_recursive_count)
+                {
+                    crate::bail_parse_error!(
+                        "SELECTs to the left and right of {} do not have the same number of result columns",
+                        ast::CompoundOperator::UnionAll
+                    );
+                }
+                let recursive_operator =
+                    with.ctes[idx].select.body.compounds[first_recursive_idx - 1].operator;
+                if initial_bound.result_columns.len() != last_recursive_count {
+                    crate::bail_parse_error!(
+                        "SELECTs to the left and right of {} do not have the same number of result columns",
+                        recursive_operator
+                    );
+                }
+
+                let mut result_column_arms: Vec<&[BoundColumn]> = Vec::new();
+                result_column_arms.push(initial_bound.result_columns.as_slice());
+                result_column_arms.extend(
+                    initial_bound
+                        .compound_result_columns
+                        .iter()
+                        .map(|columns| columns.as_slice()),
+                );
+                result_column_arms.extend(
+                    recursive_arms
+                        .iter()
+                        .map(|arm| arm.inner_bound.result_columns.as_slice()),
+                );
+                let queue_order = resolve_compound_order_by(
+                    &self.ctes.get(&cte_name).unwrap().select.order_by,
+                    &result_column_arms,
+                )?;
                 // Bind the body-level LIMIT/OFFSET up front. They are
                 // scope-less (identifiers cannot resolve against the body's
                 // tables), and the recursive-CTE planner consumes them as
                 // already bound.
                 let resolver = self.resolver;
                 let entry = self.ctes.get_mut(&cte_name).unwrap();
+                entry.select.order_by.clear();
                 if let Some(limit) = entry.select.limit.as_mut() {
                     bind_scopeless_expr(&mut limit.expr, resolver, false)?;
                     if let Some(offset) = limit.offset.as_mut() {
@@ -2411,6 +2589,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         recursive_arms,
                         first_recursive_arm_index: first_recursive_idx,
                         input_id,
+                        queue_order,
                     },
                 ));
             } else {

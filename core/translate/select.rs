@@ -6,7 +6,6 @@ use super::plan::{
 use crate::schema::Table;
 use crate::stack::trace_stack;
 use crate::sync::Arc;
-use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{expr_vector_size, walk_expr, WalkControl};
 use crate::translate::group_by::compute_group_by_sort_order;
@@ -41,6 +40,7 @@ const SQLITE_MAX_COLUMN: usize = 2000;
 pub struct SelectBinding {
     pub table_refs: std::vec::IntoIter<TableReferences>,
     pub bound_subqueries: rustc_hash::FxHashMap<ast::TableInternalId, super::bind::BoundSubquery>,
+    pub compound_order_by: Option<Vec<super::plan::CompoundOrderByKey>>,
 }
 
 /// Per-SELECT-core slice of a [SelectBinding], passed to `prepare_one_select_plan`.
@@ -98,14 +98,15 @@ pub fn prepare_bound_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
-    let (all_table_refs, bound_subqueries) = crate::translate::planner::plan_bound_select_refs(
-        bound,
-        resolver,
-        program,
-        connection,
-        Vec::new(),
-        &Default::default(),
-    )?;
+    let (all_table_refs, bound_subqueries, compound_order_by) =
+        crate::translate::planner::plan_bound_select_refs(
+            bound,
+            resolver,
+            program,
+            connection,
+            Vec::new(),
+            &Default::default(),
+        )?;
     prepare_select_plan(
         select,
         resolver,
@@ -113,6 +114,7 @@ pub fn prepare_bound_select_plan(
         SelectBinding {
             table_refs: all_table_refs.into_iter(),
             bound_subqueries,
+            compound_order_by,
         },
         query_destination,
         connection,
@@ -257,6 +259,7 @@ pub fn prepare_select_plan(
     let SelectBinding {
         mut table_refs,
         mut bound_subqueries,
+        compound_order_by,
     } = binding;
     // The binder built one TableReferences per SELECT core (main
     // first, then compounds); hand each core its own.
@@ -272,6 +275,10 @@ pub fn prepare_select_plan(
     }
     let compounds = select.body.compounds;
     if compounds.is_empty() {
+        assert!(
+            compound_order_by.is_none(),
+            "non-compound SELECT cannot have compound ORDER BY binding"
+        );
         return Ok(Plan::Select(Box::new(prepare_one_select_plan(
             select.body.select,
             resolver,
@@ -329,20 +336,17 @@ pub fn prepare_select_plan(
         .limit
         .map_or((None, None), |l| (Some(l.expr), l.offset));
 
-    // ORDER BY names can come from any arm of a compound SELECT.
-    let all_plans: Vec<&SelectPlan> = left
-        .iter()
-        .map(|(plan, _)| plan)
-        .chain(std::iter::once(&last))
-        .collect();
-    let order_by = resolve_compound_order_by(&select.order_by, &all_plans)?;
+    assert!(
+        select.order_by.is_empty(),
+        "compound ORDER BY must be consumed during binding"
+    );
 
     Ok(Plan::CompoundSelect {
         left,
         right_most: Box::new(last),
         limit,
         offset,
-        order_by,
+        order_by: compound_order_by,
     })
 }
 
@@ -1140,142 +1144,6 @@ fn add_vtab_predicates_to_where_clause(
         &mut plan.table_references,
         &mut plan.where_clause,
     )
-}
-
-/// Resolves a compound SELECT ORDER BY expression to a 0-based column index.
-/// ORDER BY in compound selects can reference columns by:
-/// 1. Numeric position (1-based): ORDER BY 1
-/// 2. Column name or alias from any constituent SELECT: ORDER BY name
-fn resolve_compound_order_by_expr(
-    expr: &ast::Expr,
-    all_plans: &[&SelectPlan],
-    term_number: usize,
-) -> Result<(usize, Option<CollationSeq>)> {
-    let num_result_columns = all_plans[0].result_columns.len();
-    match expr {
-        // An explicit COLLATE wraps the column reference. Resolve the inner
-        // reference and carry the collation so it overrides the referenced
-        // column's own collation when the compound result is sorted.
-        ast::Expr::Collate(inner, collation_name) => {
-            let (col_idx, _) = resolve_compound_order_by_expr(inner, all_plans, term_number)?;
-            Ok((col_idx, Some(CollationSeq::new(collation_name.as_str())?)))
-        }
-        // Case 1: Numeric column reference (e.g., ORDER BY 1). As in SQLite's
-        // sqlite3ExprIsInteger, only literals that fit a 32-bit int count as
-        // column positions.
-        ast::Expr::Literal(ast::Literal::Numeric(num)) => {
-            if let Ok(column_number) = num.parse::<i32>() {
-                if column_number <= 0 || column_number as usize > num_result_columns {
-                    crate::bail_parse_error!(
-                        "{} ORDER BY term out of range - should be between 1 and {}",
-                        column_number,
-                        num_result_columns
-                    );
-                }
-                Ok((column_number as usize - 1, None))
-            } else {
-                crate::bail_parse_error!(
-                    "{} ORDER BY term does not match any column in the result set",
-                    ordinal(term_number)
-                );
-            }
-        }
-        // Case 2: Name reference (e.g., ORDER BY name or ORDER BY alias)
-        ast::Expr::Id(name) => {
-            let name_normalized = normalize_ident(name.as_str());
-            // Check aliases and column names across all constituent SELECTs
-            for plan in all_plans {
-                let result_columns = &plan.result_columns;
-                let table_references = &plan.table_references;
-                // Try matching against aliases
-                for (i, rc) in result_columns.iter().enumerate() {
-                    if let Some(alias) = &rc.alias {
-                        if normalize_ident(alias) == name_normalized {
-                            return Ok((i, None));
-                        }
-                    }
-                }
-                // Try matching against column names from the table references
-                for (i, rc) in result_columns.iter().enumerate() {
-                    if let Some(col_name) = rc.name(table_references) {
-                        if normalize_ident(col_name) == name_normalized {
-                            return Ok((i, None));
-                        }
-                    }
-                }
-            }
-            crate::bail_parse_error!(
-                "{} ORDER BY term does not match any column in the result set",
-                ordinal(term_number)
-            );
-        }
-        _ => {
-            crate::bail_parse_error!(
-                "{} ORDER BY term does not match any column in the result set",
-                ordinal(term_number)
-            );
-        }
-    }
-}
-
-fn resolve_compound_order_by(
-    order_by: &[ast::SortedColumn],
-    plans: &[&SelectPlan],
-) -> Result<Option<Vec<super::plan::CompoundOrderByKey>>> {
-    if order_by.is_empty() {
-        return Ok(None);
-    }
-    order_by
-        .iter()
-        .enumerate()
-        .map(|(index, term)| {
-            let (column, collation) = resolve_compound_order_by_expr(&term.expr, plans, index + 1)?;
-            Ok((
-                column,
-                term.order.unwrap_or(ast::SortOrder::Asc),
-                term.nulls,
-                collation,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()
-        .map(Some)
-}
-
-pub(crate) fn resolve_recursive_cte_queue_order(
-    order_by: &[ast::SortedColumn],
-    initial_query: &Plan,
-    recursive_query: &Plan,
-) -> Result<Option<Vec<super::plan::CompoundOrderByKey>>> {
-    fn collect_selects<'a>(plan: &'a Plan, out: &mut Vec<&'a SelectPlan>) {
-        match plan {
-            Plan::Select(plan) => out.push(plan),
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => {
-                out.extend(left.iter().map(|(plan, _)| plan));
-                out.push(right_most);
-            }
-            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {
-                unreachable!("recursive CTE queries must be SELECT plans")
-            }
-        }
-    }
-
-    let mut plans = Vec::new();
-    collect_selects(initial_query, &mut plans);
-    collect_selects(recursive_query, &mut plans);
-    resolve_compound_order_by(order_by, &plans)
-}
-
-fn ordinal(n: usize) -> String {
-    let suffix = match (n % 10, n % 100) {
-        (1, 11) | (2, 12) | (3, 13) => "th",
-        (1, _) => "st",
-        (2, _) => "nd",
-        (3, _) => "rd",
-        _ => "th",
-    };
-    format!("{n}{suffix}")
 }
 
 /// Counts cursors needed to emit a query plan.
