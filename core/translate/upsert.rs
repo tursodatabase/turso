@@ -9,14 +9,12 @@ use crate::alloc::TursoIteratorExt;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
-use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
     emit_fk_child_update_counters, emit_fk_update_parent_actions, fire_fk_update_actions,
     ParentKeyNewProbeMode,
 };
 use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
 use crate::translate::plan::{ColumnMask, OuterQueryReference};
-use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
     fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
 };
@@ -35,7 +33,7 @@ use crate::{
         insert::Insertion,
         plan::{ResultSetColumn, TableReferences},
     },
-    util::{exprs_are_equivalent, normalize_ident},
+    util::exprs_are_equivalent,
     vdbe::{
         affinity::Affinity,
         builder::{DmlColumnContext, ProgramBuilder},
@@ -192,11 +190,15 @@ fn referenced_index_cols(idx: &Index, table: &Table) -> crate::Result<ColumnMask
     let mut referenced_cols = ColumnMask::default();
 
     if let Some(expr) = &idx.where_clause {
-        index_expression_cols(table, &mut referenced_cols, expr);
+        crate::translate::bind::bind_index_expression_columns(table, &mut referenced_cols, expr)?;
     }
     for ic in &idx.columns {
         if let Some(expr) = &ic.expr {
-            index_expression_cols(table, &mut referenced_cols, expr);
+            crate::translate::bind::bind_index_expression_columns(
+                table,
+                &mut referenced_cols,
+                expr,
+            )?;
         } else {
             referenced_cols.set(ic.pos_in_table)?;
         }
@@ -205,42 +207,6 @@ fn referenced_index_cols(idx: &Index, table: &Table) -> crate::Result<ColumnMask
         Some(btree) => btree.dependencies_of_columns(referenced_cols),
         None => Ok(referenced_cols),
     }
-}
-
-/// Columns referenced by any expression index columns on the index.
-fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) {
-    use ast::Expr;
-    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
-        match e {
-            Expr::Id(n) => {
-                if let Some((i, _)) = table.get_column_by_name(&normalize_ident(n.as_str())) {
-                    out.set(i)?;
-                } else if ROWID_STRS
-                    .iter()
-                    .any(|r| r.eq_ignore_ascii_case(n.as_str()))
-                {
-                    if let Some(rowid_pos) = table
-                        .btree()
-                        .and_then(|t| t.get_rowid_alias_column().map(|(p, _)| p))
-                    {
-                        out.set(rowid_pos)?;
-                    }
-                }
-            }
-            Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
-                let nsn = normalize_ident(ns.as_str());
-                let tname = normalize_ident(table.get_name());
-                if nsn.eq_ignore_ascii_case(&tname) {
-                    if let Some((i, _)) = table.get_column_by_name(&normalize_ident(c.as_str())) {
-                        out.set(i)?;
-                    }
-                }
-            }
-            Expr::Column { column, .. } => out.set(*column)?,
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    });
 }
 
 fn partial_index_where_clauses_match(target_where: &ast::Expr, index_where: &ast::Expr) -> bool {

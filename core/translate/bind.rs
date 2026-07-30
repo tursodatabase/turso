@@ -11,7 +11,7 @@ use turso_parser::ast::{self, JoinConstraint, SortOrder, SortedColumn, TableInte
 
 use super::emitter::Resolver;
 use super::expr::{unwrap_parens, walk_expr, walk_expr_mut, WalkControl};
-use super::plan::{BitSet, JoinInfo, TableReferences};
+use super::plan::{BitSet, ColumnMask, JoinInfo, TableReferences};
 use super::planner::parse_row_id;
 use crate::schema::{
     is_deterministic_schema_function_call, BTreeTable, Column, GeneratedType, Index, IndexColumn,
@@ -304,6 +304,50 @@ pub fn bind_generated_column_dependencies(
             | ast::Expr::SubqueryResult { .. } => {
                 unreachable!("generated columns cannot contain subqueries")
             }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+/// Resolve columns read by a stored index expression to table positions.
+pub fn bind_index_expression_columns(
+    table: &Table,
+    columns: &mut ColumnMask,
+    expr: &ast::Expr,
+) -> Result<()> {
+    walk_expr(expr, &mut |expr| {
+        match expr {
+            ast::Expr::Id(name) => {
+                if let Some((column, _)) = table.get_column_by_name(&normalize_ident(name.as_str()))
+                {
+                    columns.set(column)?;
+                } else if super::planner::ROWID_STRS
+                    .iter()
+                    .any(|rowid| rowid.eq_ignore_ascii_case(name.as_str()))
+                {
+                    if let Some(rowid_column) = table
+                        .btree()
+                        .and_then(|table| table.get_rowid_alias_column().map(|(column, _)| column))
+                    {
+                        columns.set(rowid_column)?;
+                    }
+                }
+            }
+            ast::Expr::Qualified(namespace, name)
+            | ast::Expr::DoublyQualified(_, namespace, name) => {
+                if normalize_ident(namespace.as_str())
+                    .eq_ignore_ascii_case(&normalize_ident(table.get_name()))
+                {
+                    if let Some((column, _)) =
+                        table.get_column_by_name(&normalize_ident(name.as_str()))
+                    {
+                        columns.set(column)?;
+                    }
+                }
+            }
+            ast::Expr::Column { column, .. } => columns.set(*column)?,
             _ => {}
         }
         Ok(WalkControl::Continue)
