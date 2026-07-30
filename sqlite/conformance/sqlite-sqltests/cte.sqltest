@@ -1463,3 +1463,20 @@ expect {
     1
     2
 }
+
+# A CTE is not a table-valued function; calling it with arguments is an error.
+test cte-referenced-with-call-arguments-rejected {
+    WITH cte1(x) AS (VALUES(1)) SELECT * FROM cte1(7);
+}
+expect error {
+    'cte1' is not a function
+}
+
+# Neither is a regular table.
+test table-referenced-with-call-arguments-rejected {
+    CREATE TABLE not_a_function(a);
+    SELECT * FROM not_a_function(5);
+}
+expect error {
+    'not_a_function' is not a function
+}

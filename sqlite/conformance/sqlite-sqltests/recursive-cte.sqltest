@@ -1828,3 +1828,16 @@ test recursive-cte-window-clause-self-ref-rejected {
 expect error {
     multiple recursive references: w
 }
+
+test recursive-cte-self-ref-with-call-arguments-rejected {
+    CREATE TABLE tvf_probe(a);
+    WITH RECURSIVE cte1(x, y, z) AS (
+        VALUES(1, 2, 3)
+        UNION ALL
+        SELECT x, 4, 5 FROM tvf_probe RIGHT JOIN cte1(x)
+    )
+    SELECT * FROM cte1;
+}
+expect error {
+    too many arguments on cte1\(\) - max 0
+}

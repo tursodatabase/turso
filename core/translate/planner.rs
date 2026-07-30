@@ -1631,6 +1631,9 @@ fn parse_table(
             .iter()
             .position(|definition| definition.name == normalized_qualified_name)
         {
+            if !args.is_empty() {
+                crate::bail_parse_error!("'{}' is not a function", table_name.as_str());
+            }
             let planning_outer_query_refs = base_outer_refs_for_cte_planning(
                 table_references.outer_query_refs(),
                 cte_definitions,
@@ -1672,6 +1675,17 @@ fn parse_table(
         if let Some(outer_ref) =
             table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
         {
+            if !args.is_empty() {
+                if matches!(outer_ref.table, Table::RecursiveCteInput(_)) {
+                    // SQLite resolves the recursive self-reference as a plain
+                    // table with zero table-valued-function parameters.
+                    crate::bail_parse_error!(
+                        "too many arguments on {}() - max 0",
+                        table_name.as_str()
+                    );
+                }
+                crate::bail_parse_error!("'{}' is not a function", table_name.as_str());
+            }
             let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
             let cte_select_syntax = outer_ref.cte_select.clone();
             let cte_explicit_columns = outer_ref.cte_explicit_columns.clone();
@@ -1758,6 +1772,9 @@ fn parse_table(
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
             Table::Virtual(tbl.clone())
         } else if let Table::BTree(table) = table.as_ref() {
+            if !args.is_empty() {
+                crate::bail_parse_error!("'{}' is not a function", table_name.as_str());
+            }
             Table::BTree(table.clone())
         } else {
             return Err(crate::LimboError::InvalidArgument(
