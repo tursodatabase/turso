@@ -5,6 +5,7 @@ use crate::{
     schema::{BTreeTable, Index},
     translate::{
         alter::literal_default_value,
+        collate::resolve_comparison_collseq_with_symbols,
         compiler::{
             add, compare, constant, input, logical, pack_values, parameter, resolved_comparison,
             BoxedCompile, ComparisonOp, Compile, InputId, InputRequirements, InputSlot, LogicalOp,
@@ -46,6 +47,17 @@ pub(crate) enum ResolvedScalarExpr {
         when_then_pairs: Vec<(Self, Self)>,
         else_expr: Box<Self>,
     },
+    SimpleCase {
+        base: Box<Self>,
+        when_then_pairs: Vec<ResolvedSimpleCaseArm>,
+        else_expr: Box<Self>,
+    },
+}
+
+pub(crate) struct ResolvedSimpleCaseArm {
+    when_expr: ResolvedScalarExpr,
+    then_expr: ResolvedScalarExpr,
+    comparison: ResolvedComparison,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -316,32 +328,73 @@ impl<'a, 'schema> RowExprResolver<'a, 'schema> {
         when_then_pairs: &[(Box<Expr>, Box<Expr>)],
         else_expr: Option<&Expr>,
     ) -> Result<Option<ResolvedScalarExpr>> {
-        if base.is_some() {
-            return Ok(None);
-        }
-        let mut resolved_pairs = Vec::with_capacity(when_then_pairs.len());
-        for (when_expr, then_expr) in when_then_pairs {
-            let Some(when_expr) = self.resolve(when_expr)? else {
-                return Ok(None);
-            };
-            let Some(then_expr) = self.resolve(then_expr)? else {
-                return Ok(None);
-            };
-            resolved_pairs.push((when_expr, then_expr));
-        }
-        let else_expr = match else_expr {
-            Some(else_expr) => {
-                let Some(else_expr) = self.resolve(else_expr)? else {
+        let Some(base_expr) = base else {
+            let mut resolved_pairs = Vec::with_capacity(when_then_pairs.len());
+            for (when_expr, then_expr) in when_then_pairs {
+                let Some(when_expr) = self.resolve(when_expr)? else {
                     return Ok(None);
                 };
-                else_expr
+                let Some(then_expr) = self.resolve(then_expr)? else {
+                    return Ok(None);
+                };
+                resolved_pairs.push((when_expr, then_expr));
             }
-            None => ResolvedScalarExpr::Constant(Value::Null),
+            let Some(else_expr) = self.resolve_case_else(else_expr)? else {
+                return Ok(None);
+            };
+            return Ok(Some(ResolvedScalarExpr::Case {
+                when_then_pairs: resolved_pairs,
+                else_expr: Box::new(else_expr),
+            }));
         };
-        Ok(Some(ResolvedScalarExpr::Case {
+
+        let Some(base) = self.resolve(base_expr)? else {
+            return Ok(None);
+        };
+        let mut resolved_pairs = Vec::with_capacity(when_then_pairs.len());
+        for (when_expr, then_expr) in when_then_pairs {
+            let Some(resolved_when) = self.resolve(when_expr)? else {
+                return Ok(None);
+            };
+            let Some(resolved_then) = self.resolve(then_expr)? else {
+                return Ok(None);
+            };
+            let affinity = comparison_affinity(
+                base_expr,
+                when_expr,
+                Some(self.referenced_tables),
+                Some(self.resolver),
+            );
+            let collation = resolve_comparison_collseq_with_symbols(
+                base_expr,
+                when_expr,
+                self.referenced_tables,
+                Some(self.resolver.symbol_table),
+            )?;
+            resolved_pairs.push(ResolvedSimpleCaseArm {
+                when_expr: resolved_when,
+                then_expr: resolved_then,
+                comparison: resolved_comparison(ComparisonOp::Equal, affinity, Some(collation)),
+            });
+        }
+        let Some(else_expr) = self.resolve_case_else(else_expr)? else {
+            return Ok(None);
+        };
+        Ok(Some(ResolvedScalarExpr::SimpleCase {
+            base: Box::new(base),
             when_then_pairs: resolved_pairs,
             else_expr: Box::new(else_expr),
         }))
+    }
+
+    fn resolve_case_else(
+        &mut self,
+        else_expr: Option<&Expr>,
+    ) -> Result<Option<ResolvedScalarExpr>> {
+        match else_expr {
+            Some(else_expr) => self.resolve(else_expr),
+            None => Ok(Some(ResolvedScalarExpr::Constant(Value::Null))),
+        }
     }
 }
 
@@ -420,6 +473,11 @@ fn try_compile_expr(row: Option<Row>, expr: &ResolvedScalarExpr) -> Option<Boxed
             when_then_pairs,
             else_expr,
         } => compile_case(row, when_then_pairs, else_expr),
+        ResolvedScalarExpr::SimpleCase {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => compile_simple_case(row, base, when_then_pairs, else_expr),
     }
 }
 
@@ -439,6 +497,47 @@ fn compile_case(
             )
             .boxed(),
     )
+}
+
+fn compile_simple_case(
+    row: Option<Row>,
+    base: &ResolvedScalarExpr,
+    when_then_pairs: &[ResolvedSimpleCaseArm],
+    else_expr: &ResolvedScalarExpr,
+) -> Option<BoxedCompile<ValueId>> {
+    let base = try_compile_expr(row, base)?;
+    let mut arms = Vec::with_capacity(when_then_pairs.len());
+    for arm in when_then_pairs {
+        arms.push((
+            try_compile_expr(row, &arm.when_expr)?,
+            try_compile_expr(row, &arm.then_expr)?,
+            arm.comparison,
+        ));
+    }
+    let else_compiler = try_compile_expr(row, else_expr)?;
+    Some(
+        base.and_then(move |base| compile_simple_case_arms(base, arms.into_iter(), else_compiler))
+            .boxed(),
+    )
+}
+
+fn compile_simple_case_arms(
+    base: ValueId,
+    mut arms: std::vec::IntoIter<(
+        BoxedCompile<ValueId>,
+        BoxedCompile<ValueId>,
+        ResolvedComparison,
+    )>,
+    else_compiler: BoxedCompile<ValueId>,
+) -> BoxedCompile<ValueId> {
+    let Some((when_compiler, then_compiler, comparison)) = arms.next() else {
+        return else_compiler;
+    };
+    let remaining = compile_simple_case_arms(base, arms, else_compiler);
+    when_compiler
+        .and_then(move |when| compare(base, when, comparison))
+        .branch(then_compiler, remaining)
+        .boxed()
 }
 
 /// Compiles expressions in source order into one symbolic register pack.

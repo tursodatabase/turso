@@ -110,7 +110,7 @@ explicit loops with block parameters, and effectful cursor folds and row
 production. A production SELECT path uses these pieces for a forward scan of
 one B-tree table. Its frontend first resolves an owned scalar description, then
 compiles that description against each symbolic row. Columns, literals,
-addition, three-valued `AND` and `OR`, searched `CASE`, parentheses, collation
+addition, three-valued `AND` and `OR`, both forms of `CASE`, parentheses, collation
 wrappers, and ordinary comparisons can be nested and shared by both result
 expressions and predicates.
 It composes `scan_table`, row-stream operators, scalar projection, and
@@ -167,8 +167,11 @@ produces true without inventing an unreachable third SSA edge.
 An ordered compiler combinator collects independently composed scalar values
 into a symbolic `ValuePack`; contiguous result registers are still chosen only
 during lowering. Searched `CASE` builds nested SSA diamonds, so only the chosen
-result arm executes and every arm joins as one value. Base-expression `CASE`
-still falls back until its per-`WHEN` affinity and collation rules are resolved.
+result arm executes and every arm joins as one value. For base-expression
+`CASE`, the frontend resolves equality affinity and collation independently for
+each `WHEN` arm. The compiler evaluates the base once, retains its `ValueId`,
+and composes each ordered arm from `then`, `and_then`, comparison, and `branch`;
+NULL comparison results follow the false arm, as required by SQLite.
 The path also falls back when SQL semantics still live in the eager frontend:
 other expression forms, joins, aggregates, most subquery forms, generated
 values, arrays, and custom-type decoding.

@@ -85,6 +85,42 @@ expect {
     1
 }
 
+@cross-check-integrity
+test select-simple-case-affinity-collation-null {
+    CREATE TABLE simple_case_values(
+        id INTEGER PRIMARY KEY,
+        n INTEGER,
+        tag TEXT COLLATE NOCASE
+    );
+    INSERT INTO simple_case_values VALUES
+        (1, 1, 'ALPHA'),
+        (2, 2, 'beta'),
+        (3, NULL, 'BETA'),
+        (4, 5, NULL);
+    SELECT id,
+           CASE tag
+               WHEN 'alpha' COLLATE BINARY THEN 700
+               WHEN 'alpha' THEN n + 10
+               WHEN 'beta' THEN n + 2
+               WHEN NULL THEN 500
+               ELSE 99
+           END,
+           CASE n
+               WHEN '1' THEN 'one'
+               WHEN '2' THEN 'two'
+               WHEN NULL THEN 'null'
+               ELSE 'other'
+           END
+      FROM simple_case_values
+     ORDER BY id;
+}
+expect {
+    1|11|one
+    2|4|two
+    3||other
+    4|99|other
+}
+
 # IS TRUE/IS FALSE in WHERE clause
 @cross-check-integrity
 test is-true-where {

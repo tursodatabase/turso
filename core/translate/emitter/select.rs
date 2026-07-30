@@ -4474,6 +4474,93 @@ mod tests {
                 Value::from_i64(0),
             ]]
         );
+
+        connection
+            .execute(
+                "CREATE TABLE simple_cases(\
+                    id INTEGER PRIMARY KEY, n INTEGER, tag TEXT COLLATE NOCASE\
+                )",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO simple_cases VALUES \
+                 (1, 1, 'ALPHA'), (2, 2, 'beta'), (3, NULL, 'BETA'), (4, 5, NULL)",
+            )
+            .unwrap();
+        let mut simple_case_statement = connection
+            .prepare(
+                "SELECT CASE tag \
+                            WHEN 'alpha' COLLATE BINARY THEN 700 \
+                            WHEN 'alpha' THEN n + 10 \
+                            WHEN 'beta' THEN n + 2 \
+                            WHEN NULL THEN 500 \
+                            ELSE 99 \
+                        END, \
+                        CASE n \
+                            WHEN '1' THEN 'one' \
+                            WHEN '2' THEN 'two' \
+                            WHEN NULL THEN 'null' \
+                            ELSE 'other' \
+                        END \
+                   FROM simple_cases",
+            )
+            .unwrap();
+        let simple_case_instructions = &simple_case_statement.get_program().insns;
+        let simple_case_result_row = simple_case_instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 2, .. }))
+            .expect("simple CASE must produce its projected row");
+        assert!(
+            simple_case_instructions[simple_case_result_row - 2..simple_case_result_row]
+                .iter()
+                .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. }))
+        );
+        assert_eq!(
+            simple_case_instructions
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::Column { column: 2, .. }))
+                .count(),
+            1,
+            "the simple CASE base expression must be compiled once"
+        );
+        let simple_case_comparisons = simple_case_instructions
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::Eq {
+                    flags, collation, ..
+                } => Some((flags.get_affinity(), *collation)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(simple_case_comparisons.len(), 7);
+        assert_eq!(
+            simple_case_comparisons
+                .iter()
+                .filter(|(_, collation)| {
+                    *collation == Some(crate::translate::collate::CollationSeq::NoCase)
+                })
+                .count(),
+            3,
+            "each WHEN comparison must resolve explicit and implicit collation precedence"
+        );
+        assert_eq!(
+            simple_case_comparisons
+                .iter()
+                .filter(|(affinity, _)| *affinity == Affinity::Integer)
+                .count(),
+            3,
+            "base column affinity must apply to every WHEN comparison"
+        );
+        assert_eq!(
+            simple_case_statement.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(11), Value::from_text("one")],
+                vec![Value::from_i64(4), Value::from_text("two")],
+                vec![Value::Null, Value::from_text("other")],
+                vec![Value::from_i64(99), Value::from_text("other")],
+            ]
+        );
     }
 
     #[test]
