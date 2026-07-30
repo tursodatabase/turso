@@ -584,6 +584,12 @@ pub struct WindowRegisters {
     /// AGGSTEP under a PRECEDING end). Mirrors SQLite's `regEnd`
     /// (window.c:2885-2887).
     pub end_offset_reg: Option<usize>,
+    /// Inclusive rowid bounds of the live frame when an explicit EXCLUDE
+    /// clause selects full-frame rescans. AGGSTEP advances the end bound;
+    /// AGGINVERSE advances the start bound. They begin at 1 and 0 so the
+    /// initial frame is empty.
+    pub frame_start_rowid: Option<usize>,
+    pub frame_end_rowid: Option<usize>,
     /// Return-address register for the `labels.row_output` Gosub. Mirrors
     /// SQLite's `regGosub` (window.c:2793).
     pub row_output_return: usize,
@@ -849,22 +855,20 @@ impl EmitWindow {
         } else {
             None
         };
-        // `csr_app` is the per-row lookup cursor used at output time by
-        // first_value / nth_value / lag / lead (positional seek). Mirrors
-        // SQLite's `csrApp` allocation (`window.c:1422-1426`). Allocate
-        // only when needed so unaffected windows don't pay the extra
-        // `OpenDup`.
-        let needs_csr_app = window.functions.iter().any(|f| {
-            matches!(
-                &f.func,
-                AccumulatorFunc::Window(
-                    WindowFunc::FirstValue
-                        | WindowFunc::NthValue
-                        | WindowFunc::Lag
-                        | WindowFunc::Lead
-                ),
-            )
-        });
+        // `csr_app` either seeks positional values or scans the inclusive
+        // frame bounds for an explicit EXCLUDE clause.
+        let needs_csr_app = window.frame.exclude.is_some()
+            || window.functions.iter().any(|f| {
+                matches!(
+                    &f.func,
+                    AccumulatorFunc::Window(
+                        WindowFunc::FirstValue
+                            | WindowFunc::NthValue
+                            | WindowFunc::Lag
+                            | WindowFunc::Lead
+                    ),
+                )
+            });
         let cursor_csr_app = if needs_csr_app {
             Some(program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone())))
         } else {
@@ -875,16 +879,29 @@ impl EmitWindow {
         // consult them — lag / lead seek relative to the emitted row's own
         // rowid, not the frame bounds. Zeroed per partition alongside the
         // accumulator reset, so no init is needed here.
-        let frame_counters = window
-            .functions
-            .iter()
-            .any(|f| {
+        let frame_counters = (window.frame.exclude.is_none()
+            && window.functions.iter().any(|f| {
                 matches!(
                     &f.func,
                     AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue),
                 )
-            })
-            .then(|| program.alloc_registers(2));
+            }))
+        .then(|| program.alloc_registers(2));
+        let (frame_start_rowid, frame_end_rowid) = if window.frame.exclude.is_some() {
+            let start = program.alloc_register();
+            let end = program.alloc_register();
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: start,
+            });
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: end,
+            });
+            (Some(start), Some(end))
+        } else {
+            (None, None)
+        };
         program.emit_insn(Insn::OpenEphemeral {
             cursor_id: cursor_csr_current,
             is_table: true,
@@ -1010,6 +1027,8 @@ impl EmitWindow {
                     }
                     _ => None,
                 },
+                frame_start_rowid,
+                frame_end_rowid,
                 row_output_return: program.alloc_register(),
                 frame_counters,
             },
@@ -1251,7 +1270,9 @@ impl EmitWindow {
                     collation: None,
                 });
             }
-            emit_window_agg_final(program, window, &registers);
+            if window.frame.exclude.is_none() {
+                emit_window_agg_final(program, window, &registers, false);
+            }
             // The row was just inserted, so the empty branch of this
             // Rewind is unreachable — the label lands on the next
             // instruction either way.
@@ -1824,14 +1845,18 @@ fn window_delete_op(window: &Window) -> Option<WindowOp> {
 /// function seeks arbitrary buffered rows through `csr_app` at output
 /// time. Mirrors SQLite's `windowCacheFrame` (window.c:2031-2045).
 fn window_cache_frame(window: &Window) -> bool {
-    window.functions.iter().any(|f| {
-        matches!(
-            &f.func,
-            AccumulatorFunc::Window(
-                WindowFunc::FirstValue | WindowFunc::NthValue | WindowFunc::Lag | WindowFunc::Lead
-            ),
-        )
-    })
+    window.frame.exclude.is_some()
+        || window.functions.iter().any(|f| {
+            matches!(
+                &f.func,
+                AccumulatorFunc::Window(
+                    WindowFunc::FirstValue
+                        | WindowFunc::NthValue
+                        | WindowFunc::Lag
+                        | WindowFunc::Lead
+                ),
+            )
+        })
 }
 
 /// Whether a frame offset is a literal provably greater than zero. Only
@@ -1864,22 +1889,201 @@ fn emit_window_agg_final(
     program: &mut ProgramBuilder,
     window: &Window,
     registers: &WindowRegisters,
+    finalize: bool,
 ) {
     for (i, func) in window.functions.iter().enumerate() {
-        if matches!(
+        let positional = matches!(
             &func.func,
-            AccumulatorFunc::Window(
-                WindowFunc::FirstValue | WindowFunc::NthValue | WindowFunc::Lag | WindowFunc::Lead
-            ),
-        ) {
+            AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue)
+        );
+        let always_lookup = matches!(
+            &func.func,
+            AccumulatorFunc::Window(WindowFunc::Lag | WindowFunc::Lead)
+        );
+        if always_lookup || (positional && !finalize) {
             continue;
         }
-        program.emit_insn(Insn::AggValue {
-            acc_reg: registers.acc_start + i,
-            dest_reg: registers.acc_result_start + i,
-            func: func.func.clone(),
-        });
+        let acc_reg = registers.acc_start + i;
+        let result_reg = registers.acc_result_start + i;
+        if finalize {
+            program.emit_insn(Insn::AggFinal {
+                register: acc_reg,
+                func: func.func.clone(),
+            });
+            program.emit_insn(Insn::Copy {
+                src_reg: acc_reg,
+                dst_reg: result_reg,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::Null {
+                dest: acc_reg,
+                dest_end: None,
+            });
+        } else {
+            program.emit_insn(Insn::AggValue {
+                acc_reg,
+                dest_reg: result_reg,
+                func: func.func.clone(),
+            });
+        }
     }
+}
+
+/// Recompute every function over the live frame after applying an explicit
+/// EXCLUDE clause. The streaming cursors maintain inclusive rowid bounds;
+/// rescanning only that range avoids requiring xInverse implementations for
+/// aggregates such as min/max and group_concat.
+fn emit_window_full_scan(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    plan: &SelectPlan,
+) -> Result<()> {
+    let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
+    let window = plan.window.as_ref().expect("missing window");
+    let registers = meta.registers;
+    let cursors = meta.cursors;
+    let exclude = window
+        .frame
+        .exclude
+        .as_ref()
+        .expect("full frame scan requires an explicit EXCLUDE clause");
+    let frame_start_rowid = registers
+        .frame_start_rowid
+        .expect("EXCLUDE frame requires a start-rowid tracker");
+    let frame_end_rowid = registers
+        .frame_end_rowid
+        .expect("EXCLUDE frame requires an end-rowid tracker");
+    let scan_cursor = cursors
+        .csr_app
+        .expect("EXCLUDE frame requires a full-scan cursor");
+
+    let current_rowid = program.alloc_register();
+    let scan_rowid = program.alloc_register();
+    program.emit_insn(Insn::RowId {
+        cursor_id: cursors.csr_current,
+        dest: current_rowid,
+    });
+
+    let compare_peers = matches!(
+        exclude,
+        turso_parser::ast::FrameExclude::Group | turso_parser::ast::FrameExclude::Ties
+    );
+    let order_by_len = window.order_by.len();
+    let current_peer =
+        (compare_peers && order_by_len > 0).then(|| program.alloc_registers(order_by_len));
+    let scan_peer =
+        (compare_peers && order_by_len > 0).then(|| program.alloc_registers(order_by_len));
+    if let Some(current_peer) = current_peer {
+        for (i, (expr, _, _)) in window.order_by.iter().enumerate() {
+            let Expr::Column { column, .. } = expr else {
+                unreachable!("window ORDER BY expressions are buffer columns after rewrite");
+            };
+            program.emit_insn(Insn::Column {
+                cursor_id: cursors.csr_current,
+                column: *column,
+                dest: current_peer + i,
+                default: None,
+            });
+        }
+    }
+
+    program.emit_insn(Insn::Null {
+        dest: registers.acc_start,
+        dest_end: Some(registers.acc_start + window.functions.len() - 1),
+    });
+
+    let label_break = program.allocate_label();
+    let label_loop = program.allocate_label();
+    let label_next = program.allocate_label();
+    let label_step = program.allocate_label();
+    program.emit_insn(Insn::SeekGE {
+        is_index: false,
+        cursor_id: scan_cursor,
+        start_reg: frame_start_rowid,
+        num_regs: 1,
+        target_pc: label_break,
+        eq_only: false,
+    });
+    program.preassign_label_to_next_insn(label_loop);
+    program.emit_insn(Insn::RowId {
+        cursor_id: scan_cursor,
+        dest: scan_rowid,
+    });
+    program.emit_insn(Insn::Gt {
+        lhs: scan_rowid,
+        rhs: frame_end_rowid,
+        target_pc: label_break,
+        flags: crate::vdbe::insn::CmpInsFlags::default(),
+        collation: None,
+    });
+
+    match exclude {
+        turso_parser::ast::FrameExclude::NoOthers => {}
+        turso_parser::ast::FrameExclude::CurrentRow => {
+            program.emit_insn(Insn::Eq {
+                lhs: current_rowid,
+                rhs: scan_rowid,
+                target_pc: label_next,
+                flags: crate::vdbe::insn::CmpInsFlags::default(),
+                collation: None,
+            });
+        }
+        turso_parser::ast::FrameExclude::Group | turso_parser::ast::FrameExclude::Ties => {
+            if matches!(exclude, turso_parser::ast::FrameExclude::Ties) {
+                program.emit_insn(Insn::Eq {
+                    lhs: current_rowid,
+                    rhs: scan_rowid,
+                    target_pc: label_step,
+                    flags: crate::vdbe::insn::CmpInsFlags::default(),
+                    collation: None,
+                });
+            }
+            if order_by_len == 0 {
+                program.emit_insn(Insn::Goto {
+                    target_pc: label_next,
+                });
+            } else {
+                let current_peer = current_peer.expect("allocated above");
+                let scan_peer = scan_peer.expect("allocated above");
+                for (i, (expr, _, _)) in window.order_by.iter().enumerate() {
+                    let Expr::Column { column, .. } = expr else {
+                        unreachable!(
+                            "window ORDER BY expressions are buffer columns after rewrite"
+                        );
+                    };
+                    program.emit_insn(Insn::Column {
+                        cursor_id: scan_cursor,
+                        column: *column,
+                        dest: scan_peer + i,
+                        default: None,
+                    });
+                }
+                let (reg_a, reg_b) = (current_peer.min(scan_peer), current_peer.max(scan_peer));
+                program.emit_insn(Insn::Compare {
+                    start_reg_a: reg_a,
+                    start_reg_b: reg_b,
+                    count: order_by_len,
+                    key_info: build_order_by_key_info(window, &plan.table_references)?,
+                });
+                program.emit_insn(Insn::Jump {
+                    target_pc_lt: label_step,
+                    target_pc_eq: label_next,
+                    target_pc_gt: label_step,
+                });
+            }
+        }
+    }
+
+    program.preassign_label_to_next_insn(label_step);
+    emit_function_step(program, t_ctx, plan, scan_cursor)?;
+    program.preassign_label_to_next_insn(label_next);
+    program.emit_insn(Insn::Next {
+        cursor_id: scan_cursor,
+        pc_if_next: label_loop,
+    });
+    program.preassign_label_to_next_insn(label_break);
+    emit_window_agg_final(program, window, &registers, true);
+    Ok(())
 }
 
 /// A comparison operator held as plain data. The RANGE boundary test
@@ -2220,7 +2424,9 @@ fn emit_window_op(
     // RETURN_ROW finalizes accumulators before emitting (SQLite's
     // windowAggFinal at window.c:2284).
     if matches!(op, WindowOp::ReturnRow) {
-        emit_window_agg_final(program, window, &registers);
+        if window.frame.exclude.is_none() {
+            emit_window_agg_final(program, window, &registers, false);
+        }
     }
 
     let label_continue = program.allocate_label();
@@ -2283,34 +2489,56 @@ fn emit_window_op(
 
     match op {
         WindowOp::AggStep => {
-            emit_function_step(program, t_ctx, plan, cursors.csr_end)?;
-            // Count the row just stepped into the frame. This runs once
-            // per row in the peer-loop, so after AGGSTEP has walked the
-            // whole peer group the counter holds the frame end's buffer
-            // index — the bound first_value / nth_value seek against.
-            // Mirrors SQLite's `OP_AddImm regApp+1` inside
-            // `windowAggStep` (window.c:1726).
-            if let Some(frame_counters) = registers.frame_counters {
+            if let Some(frame_end_rowid) = registers.frame_end_rowid {
+                assert!(
+                    registers.frame_start_rowid.is_some(),
+                    "EXCLUDE frame rowid trackers must be allocated as a pair"
+                );
                 program.emit_insn(Insn::AddImm {
-                    register: frame_counters + 1,
+                    register: frame_end_rowid,
                     value: 1,
                 });
+            } else {
+                emit_function_step(program, t_ctx, plan, cursors.csr_end)?;
+                // Count the row just stepped into the frame. This runs once
+                // per row in the peer-loop, so after AGGSTEP has walked the
+                // whole peer group the counter holds the frame end's buffer
+                // index — the bound first_value / nth_value seek against.
+                // Mirrors SQLite's `OP_AddImm regApp+1` inside
+                // `windowAggStep` (window.c:1726).
+                if let Some(frame_counters) = registers.frame_counters {
+                    program.emit_insn(Insn::AddImm {
+                        register: frame_counters + 1,
+                        value: 1,
+                    });
+                }
             }
         }
         WindowOp::ReturnRow => {
             emit_return_one_row(program, t_ctx, plan)?;
         }
         WindowOp::AggInverse => {
-            emit_function_inverse(program, t_ctx, plan)?;
-            // Count the row that just left the frame; the counter is the
-            // frame start's buffer index minus one. Mirrors SQLite's
-            // `OP_AddImm regApp+0` inside `windowAggStep`
-            // (window.c:1726, `regApp+1-bInverse`).
-            if let Some(frame_counters) = registers.frame_counters {
+            if let Some(frame_start_rowid) = registers.frame_start_rowid {
+                assert!(
+                    registers.frame_end_rowid.is_some(),
+                    "EXCLUDE frame rowid trackers must be allocated as a pair"
+                );
                 program.emit_insn(Insn::AddImm {
-                    register: frame_counters,
+                    register: frame_start_rowid,
                     value: 1,
                 });
+            } else {
+                emit_function_inverse(program, t_ctx, plan)?;
+                // Count the row that just left the frame; the counter is the
+                // frame start's buffer index minus one. Mirrors SQLite's
+                // `OP_AddImm regApp+0` inside `windowAggStep`
+                // (window.c:1726, `regApp+1-bInverse`).
+                if let Some(frame_counters) = registers.frame_counters {
+                    program.emit_insn(Insn::AddImm {
+                        register: frame_counters,
+                        value: 1,
+                    });
+                }
             }
         }
     }
@@ -2466,16 +2694,19 @@ fn emit_function_step(
     let cache_was_enabled = t_ctx.resolver.expr_to_reg_cache_enabled;
 
     for (i, func) in window.functions.iter().enumerate() {
-        // first_value / nth_value / lag / lead are WINDOWFUNCNOOP in
-        // SQLite (window.c:591, 1727-1730): no step function — the value
-        // is computed at output time via `SeekRowid` on `csr_app`. See
-        // `emit_first_value_nth_value_lookup` and `emit_lag_lead_lookup`.
-        if matches!(
+        // Without EXCLUDE, first_value / nth_value / lag / lead use
+        // positional seeks instead of xStep. An explicit EXCLUDE clause
+        // switches first_value / nth_value to SQLite's slow accumulator
+        // implementations so only included rows are counted.
+        let positional = matches!(
             &func.func,
-            AccumulatorFunc::Window(
-                WindowFunc::FirstValue | WindowFunc::NthValue | WindowFunc::Lag | WindowFunc::Lead
-            )
-        ) {
+            AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue)
+        );
+        let always_lookup = matches!(
+            &func.func,
+            AccumulatorFunc::Window(WindowFunc::Lag | WindowFunc::Lead)
+        );
+        if always_lookup || (positional && window.frame.exclude.is_none()) {
             continue;
         }
         let acc_reg = acc_start + i;
@@ -2494,8 +2725,19 @@ fn emit_function_step(
         if let Some(base) = arg_load_start {
             for (j, arg) in args.iter().enumerate() {
                 if let Expr::Column { column, .. } = arg {
+                    // SQLite's slow nth_value() path reads the value from
+                    // each included scan row, but keeps N fixed to the
+                    // current output row (window.c:1679-1683).
+                    let arg_cursor = if window.frame.exclude.is_some()
+                        && j == 1
+                        && matches!(&func.func, AccumulatorFunc::Window(WindowFunc::NthValue))
+                    {
+                        meta.cursors.csr_current
+                    } else {
+                        read_csr
+                    };
                     program.emit_insn(Insn::Column {
-                        cursor_id: read_csr,
+                        cursor_id: arg_cursor,
                         column: *column,
                         dest: base + j,
                         default: None,
@@ -2999,12 +3241,17 @@ fn emit_return_one_row(
         program.emit_column_or_rowid(cursors.csr_current, *col_idx, reg_result);
     }
 
-    // Per-row lookups for functions whose value is computed at output
-    // time (first_value / nth_value / lag / lead). Each writes the
-    // function's value register before the outer query reads it via
-    // `emit_select_result`'s expression-cache lookup.
-    emit_first_value_nth_value_lookup(program, t_ctx, plan)?;
-    emit_lag_lead_lookup(program, t_ctx, plan)?;
+    let window = plan.window.as_ref().expect("missing window");
+    if window.frame.exclude.is_some() {
+        emit_window_full_scan(program, t_ctx, plan)?;
+    } else {
+        // Per-row lookups for functions whose value is computed at output
+        // time (first_value / nth_value / lag / lead). Each writes the
+        // function's value register before the outer query reads it via
+        // `emit_select_result`'s expression-cache lookup.
+        emit_first_value_nth_value_lookup(program, t_ctx, plan)?;
+        emit_lag_lead_lookup(program, t_ctx, plan)?;
+    }
 
     // The select-result / sorter-insert code is a shared subroutine —
     // RETURN_ROW is emitted at several sites (streaming step + flush
@@ -3309,6 +3556,19 @@ pub fn emit_window_flush(
     program.emit_insn(Insn::ResetSorter {
         cursor_id: cursors.csr_current,
     });
+    if let Some(frame_start_rowid) = registers.frame_start_rowid {
+        let frame_end_rowid = registers
+            .frame_end_rowid
+            .expect("EXCLUDE frame rowid trackers must be allocated as a pair");
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: frame_start_rowid,
+        });
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: frame_end_rowid,
+        });
+    }
     program.emit_insn(Insn::Return {
         return_reg: registers.flush_buffer_return_offset,
         can_fallthrough: true,

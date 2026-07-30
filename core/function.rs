@@ -553,16 +553,19 @@ impl WindowFunc {
                 mode: FrameMode::Rows,
                 start: FrameBoundary::UnboundedPreceding,
                 end: FrameBoundary::CurrentRow,
+                exclude: None,
             }),
             Self::Rank | Self::DenseRank => Some(Frame {
                 mode: FrameMode::Range,
                 start: FrameBoundary::UnboundedPreceding,
                 end: FrameBoundary::CurrentRow,
+                exclude: None,
             }),
             Self::PercentRank => Some(Frame {
                 mode: FrameMode::Groups,
                 start: FrameBoundary::CurrentRow,
                 end: FrameBoundary::UnboundedFollowing,
+                exclude: None,
             }),
             Self::CumeDist => Some(Frame {
                 mode: FrameMode::Groups,
@@ -570,16 +573,19 @@ impl WindowFunc {
                     "1".to_string(),
                 )))),
                 end: FrameBoundary::UnboundedFollowing,
+                exclude: None,
             }),
             Self::Ntile => Some(Frame {
                 mode: FrameMode::Rows,
                 start: FrameBoundary::CurrentRow,
                 end: FrameBoundary::UnboundedFollowing,
+                exclude: None,
             }),
             Self::Lead => Some(Frame {
                 mode: FrameMode::Rows,
                 start: FrameBoundary::UnboundedPreceding,
                 end: FrameBoundary::UnboundedFollowing,
+                exclude: None,
             }),
             Self::FirstValue | Self::LastValue | Self::NthValue => None,
             Self::External(_) => unreachable!(

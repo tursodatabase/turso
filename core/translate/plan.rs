@@ -27,8 +27,7 @@ use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
 use turso_parser::ast::{
-    self, Expr, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder,
-    SubqueryType,
+    self, Expr, FrameBound, FrameClause, FrameMode, ResolveType, SortOrder, SubqueryType,
 };
 
 use turso_parser::ast::TableInternalId;
@@ -3248,13 +3247,6 @@ pub fn validate_frame_clause(
         exclude,
     } = clause;
 
-    // EXCLUDE other than NO OTHERS isn't supported yet.
-    if let Some(exclude) = exclude {
-        if *exclude != FrameExclude::NoOthers {
-            crate::bail_parse_error!("EXCLUDE clauses are not supported");
-        }
-    }
-
     let start_bound = translate_frame_bound(start, /* is_start = */ true)?;
     let end_bound = match end {
         Some(b) => translate_frame_bound(b, /* is_start = */ false)?,
@@ -3299,6 +3291,7 @@ pub fn validate_frame_clause(
         mode: *mode,
         start: start_bound,
         end: end_bound,
+        exclude: exclude.clone(),
     }))
 }
 
@@ -3382,6 +3375,15 @@ pub struct Frame {
     pub mode: ast::FrameMode,
     pub start: FrameBoundary,
     pub end: FrameBoundary,
+    /// The EXCLUDE clause the user wrote, or `None` if they wrote none.
+    ///
+    /// `Some(NoOthers)` (an explicit `EXCLUDE NO OTHERS`) excludes
+    /// nothing, so it returns the same rows as `None`. We keep the two
+    /// apart anyway: like SQLite, any EXCLUDE clause — even NO OTHERS —
+    /// switches the window to the slower path that recomputes each
+    /// function over the whole frame per output row. Only `None` gets the
+    /// fast streaming path.
+    pub exclude: Option<ast::FrameExclude>,
 }
 
 impl Default for Frame {
@@ -3390,6 +3392,7 @@ impl Default for Frame {
             mode: ast::FrameMode::Range,
             start: FrameBoundary::UnboundedPreceding,
             end: FrameBoundary::CurrentRow,
+            exclude: None,
         }
     }
 }

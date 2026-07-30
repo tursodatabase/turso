@@ -2110,17 +2110,42 @@ impl fmt::Display for WindowFrameBoundary {
     }
 }
 
+/// Rows omitted from a generated window frame before aggregate evaluation.
+#[derive(Debug, Clone, Copy)]
+pub enum WindowFrameExclude {
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
+}
+
+impl fmt::Display for WindowFrameExclude {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoOthers => write!(f, "NO OTHERS"),
+            Self::CurrentRow => write!(f, "CURRENT ROW"),
+            Self::Group => write!(f, "GROUP"),
+            Self::Ties => write!(f, "TIES"),
+        }
+    }
+}
+
 /// A generated `ROWS`/`GROUPS`/`RANGE BETWEEN ... AND ...` clause.
 #[derive(Debug, Clone, Copy)]
 pub struct WindowFrame {
     pub mode: WindowFrameMode,
     pub start: WindowFrameBoundary,
     pub end: WindowFrameBoundary,
+    pub exclude: Option<WindowFrameExclude>,
 }
 
 impl fmt::Display for WindowFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} BETWEEN {} AND {}", self.mode, self.start, self.end)
+        write!(f, "{} BETWEEN {} AND {}", self.mode, self.start, self.end)?;
+        if let Some(exclude) = self.exclude {
+            write!(f, " EXCLUDE {exclude}")?;
+        }
+        Ok(())
     }
 }
 

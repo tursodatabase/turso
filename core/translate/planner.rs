@@ -896,6 +896,7 @@ fn resolve_effective_frame(
             mode: FrameMode::Range,
             start: FrameBoundary::UnboundedPreceding,
             end: FrameBoundary::CurrentRow,
+            exclude: None,
         });
     };
     // Aggregates we haven't ported an xInverse for. SQLite supports
@@ -922,7 +923,7 @@ fn resolve_effective_frame(
         frame.start,
         crate::translate::plan::FrameBoundary::UnboundedPreceding
     );
-    if moving_start && !supports_sliding {
+    if moving_start && frame.exclude.is_none() && !supports_sliding {
         crate::bail_parse_error!(
             "{}() does not yet support window frames with a moving start; \
              use a frame with UNBOUNDED PRECEDING start",
