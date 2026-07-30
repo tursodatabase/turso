@@ -1048,7 +1048,6 @@ impl InputId {
 pub(crate) struct CursorInputId(u32);
 
 impl CursorInputId {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn new(index: u32) -> Self {
         Self(index)
     }

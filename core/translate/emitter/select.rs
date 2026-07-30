@@ -43,7 +43,7 @@ use crate::{
     vdbe::{affinity::Affinity, builder::QueryMode, insn::Insn},
     HashMap, HashSet, LimboError, Result,
 };
-use smallvec::SmallVec;
+use smallvec::{smallvec, SmallVec};
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
 use turso_parser::ast::{Expr, SortOrder, SubqueryType, TableInternalId};
@@ -163,15 +163,28 @@ enum DeclarativeSelectOutcome {
 
 struct DeclarativeSelectProgram {
     compiler: BoxedCompile<()>,
-    destination_cursor: Option<CursorID>,
+    destination_cursor: Option<DeclarativeCursorBinding>,
     destination_index: Option<Arc<Index>>,
-    external_in_cursor: Option<(CursorID, TableInternalId)>,
+    external_in_cursor: Option<DeclarativeInCursor>,
     result_column_count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct DeclarativeCursorBinding {
+    input: CursorInputId,
+    cursor: CursorID,
+}
+
+#[derive(Clone, Copy)]
+struct DeclarativeInCursor {
+    binding: DeclarativeCursorBinding,
+    subquery_id: TableInternalId,
 }
 
 enum DeclarativeSelectDestination {
     ResultRows,
     EphemeralIndex {
+        input: CursorInputId,
         index_name: String,
         affinity: Option<String>,
     },
@@ -242,7 +255,7 @@ fn try_emit_declarative_table_scan(
     } = compilation;
     let ir = compile_effect(compiler)?;
     let target_register = program.alloc_register();
-    let lowered = if let Some((cursor_id, subquery_id)) = external_in_cursor {
+    if let Some(external) = external_in_cursor {
         emit_non_from_clause_subqueries_for_eval_at(
             program,
             resolver,
@@ -250,13 +263,29 @@ fn try_emit_declarative_table_scan(
             &plan.join_order,
             Some(&plan.table_references),
             EvalAt::BeforeLoop,
-            |subquery| subquery.internal_id == subquery_id,
+            |subquery| subquery.internal_id == external.subquery_id,
         )?;
-        ir.lower_into_with_resources(program, target_register, &[], &[cursor_id])?
-    } else if let Some(cursor_id) = destination_cursor {
-        ir.lower_into_with_resources(program, target_register, &[], &[cursor_id])?
-    } else {
+    }
+    let cursor_inputs: SmallVec<[CursorID; 2]> = match (destination_cursor, external_in_cursor) {
+        (Some(destination), Some(external)) => {
+            turso_assert!(destination.input == CursorInputId::new(0));
+            turso_assert!(external.binding.input == CursorInputId::new(1));
+            smallvec![destination.cursor, external.binding.cursor]
+        }
+        (Some(destination), None) => {
+            turso_assert!(destination.input == CursorInputId::new(0));
+            smallvec![destination.cursor]
+        }
+        (None, Some(external)) => {
+            turso_assert!(external.binding.input == CursorInputId::new(0));
+            smallvec![external.binding.cursor]
+        }
+        (None, None) => SmallVec::new(),
+    };
+    let lowered = if cursor_inputs.is_empty() {
         ir.lower_into(program, target_register)?
+    } else {
+        ir.lower_into_with_resources(program, target_register, &[], &cursor_inputs)?
     };
     if destination_cursor.is_some() {
         lowered.expect_no_result_rows()?;
@@ -280,9 +309,11 @@ fn compose_declarative_in_subquery(
     plan: &mut SelectPlan,
     outer: DeclarativeSelectProgram,
 ) -> Result<DeclarativeSelectProgram> {
-    let Some((cursor_id, subquery_id)) = outer.external_in_cursor else {
+    let Some(external) = outer.external_in_cursor else {
         return Ok(outer);
     };
+    let cursor_id = external.binding.cursor;
+    let subquery_id = external.subquery_id;
     let Some(subquery) = plan
         .non_from_clause_subqueries
         .iter()
@@ -306,7 +337,10 @@ fn compose_declarative_in_subquery(
     let Some(inner) = try_compile_declarative_table_scan(query_mode, resolver, select_plan)? else {
         return Ok(outer);
     };
-    if inner.destination_cursor != Some(cursor_id) || inner.external_in_cursor.is_some() {
+    let Some(inner_destination) = inner.destination_cursor else {
+        return Ok(outer);
+    };
+    if inner_destination.cursor != cursor_id || inner.external_in_cursor.is_some() {
         return Ok(outer);
     }
     let Some(index) = inner.destination_index.clone() else {
@@ -316,12 +350,23 @@ fn compose_declarative_in_subquery(
     };
     let inner_table_references = select_plan.table_references.clone();
 
-    let input = CursorInputId::new(0);
+    let outer_input = external.binding.input;
+    let producer_input = inner_destination.input;
     let producer = inner.compiler;
     let consumer = outer.compiler;
     let compiler = open_ephemeral_index(index)
         .and_then(move |cursor| {
-            bind_cursor_input(input, cursor, producer.and_then(move |()| consumer))
+            let combined = producer.and_then(move |()| consumer);
+            if producer_input == outer_input {
+                bind_cursor_input(producer_input, cursor, combined).boxed()
+            } else {
+                bind_cursor_input(
+                    producer_input,
+                    cursor,
+                    bind_cursor_input(outer_input, cursor, combined),
+                )
+                .boxed()
+            }
         })
         .boxed();
 
@@ -361,6 +406,7 @@ fn try_compile_declarative_table_scan(
         return Ok(None);
     }
 
+    let destination_input = CursorInputId::new(0);
     let (destination, destination_cursor, destination_index) = match &plan.query_destination {
         QueryDestination::ResultRows => (DeclarativeSelectDestination::ResultRows, None, None),
         // The first producer migration covers the identity-shaped index used by
@@ -379,10 +425,14 @@ fn try_compile_declarative_table_scan(
         {
             (
                 DeclarativeSelectDestination::EphemeralIndex {
+                    input: destination_input,
                     index_name: index.name.clone(),
                     affinity: affinity_str.as_ref().map(|value| (**value).clone()),
                 },
-                Some(*cursor_id),
+                Some(DeclarativeCursorBinding {
+                    input: destination_input,
+                    cursor: *cursor_id,
+                }),
                 Some(index.clone()),
             )
         }
@@ -455,6 +505,7 @@ fn try_compile_declarative_table_scan(
         },
         _ => return Ok(None),
     };
+    let external_input = CursorInputId::new(u32::from(destination_cursor.is_some()));
     let external_in_cursor = match access {
         DeclarativeBtreeAccess::InValues {
             source: DeclarativeInSource::Subquery { cursor_id },
@@ -481,14 +532,17 @@ fn try_compile_declarative_table_scan(
             {
                 return Ok(None);
             }
-            Some((cursor_id, subquery.internal_id))
+            Some(DeclarativeInCursor {
+                binding: DeclarativeCursorBinding {
+                    input: external_input,
+                    cursor: cursor_id,
+                },
+                subquery_id: subquery.internal_id,
+            })
         }
         _ if !plan.non_from_clause_subqueries.is_empty() => return Ok(None),
         _ => None,
     };
-    if destination_cursor.is_some() && external_in_cursor.is_some() {
-        return Ok(None);
-    }
     let direction = access.direction();
     let index = access.index();
     let Table::BTree(table) = &joined.table else {
@@ -556,7 +610,10 @@ fn try_compile_declarative_table_scan(
             source: DeclarativeInSource::Subquery { .. },
             ..
         } => Some(cursor_values(
-            CursorInputId::new(0),
+            external_in_cursor
+                .expect("subquery IN access must declare its external cursor")
+                .binding
+                .input,
             index
                 .and_then(|index| index.columns.first())
                 .and_then(|column| column.collation),
@@ -876,12 +933,13 @@ impl DeclarativeSelectBody {
                 self.with_sink(scan, DeclarativePackSink::ResultRows)
             }
             DeclarativeSelectDestination::EphemeralIndex {
+                input,
                 index_name,
                 affinity,
             } => {
                 // The description owns only a symbolic input slot. Its physical
                 // destination cursor is not selected until lowering.
-                cursor_input(CursorInputId::new(0))
+                cursor_input(input)
                     .and_then(move |cursor| {
                         self.with_sink(
                             scan,
@@ -2312,11 +2370,61 @@ mod tests {
                  ) ORDER BY id",
             )
             .unwrap();
-        assert!(nested
-            .get_program()
-            .insns
+        let nested_instructions = &nested.get_program().insns;
+        assert!(nested_instructions
             .iter()
             .any(|(instruction, _)| matches!(instruction, Insn::Once { .. })));
+        let ephemeral_cursors = nested_instructions
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::OpenEphemeral {
+                    cursor_id,
+                    is_table: false,
+                } => Some(*cursor_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ephemeral_cursors.len(), 2);
+        let destination_cursor = ephemeral_cursors[0];
+        let source_cursor = ephemeral_cursors[1];
+        let source_insert = nested_instructions
+            .iter()
+            .position(|(instruction, _)| {
+                matches!(instruction, Insn::IdxInsert { cursor_id, .. } if *cursor_id == source_cursor)
+            })
+            .expect("nested producer must fill its source index");
+        let source_scan = nested_instructions
+            .iter()
+            .enumerate()
+            .skip(source_insert + 1)
+            .find_map(|(position, (instruction, _))| {
+                matches!(instruction, Insn::Rewind { cursor_id, .. } if *cursor_id == source_cursor)
+                    .then_some(position)
+            })
+            .expect("nested declarative producer must scan its distinct source cursor");
+        let destination_insert = nested_instructions
+            .iter()
+            .enumerate()
+            .skip(source_scan + 1)
+            .find_map(|(position, (instruction, _))| {
+                matches!(instruction, Insn::IdxInsert { cursor_id, .. } if *cursor_id == destination_cursor)
+                    .then_some(position)
+            })
+            .expect("nested declarative producer must fill its distinct destination cursor");
+        let destination_scan = nested_instructions
+            .iter()
+            .enumerate()
+            .skip(destination_insert + 1)
+            .find_map(|(position, (instruction, _))| {
+                matches!(instruction, Insn::Rewind { cursor_id, .. } if *cursor_id == destination_cursor)
+                    .then_some(position)
+            })
+            .expect("outer declarative consumer must scan the nested destination cursor");
+        assert!(
+            source_insert < source_scan
+                && source_scan < destination_insert
+                && destination_insert < destination_scan
+        );
         assert_eq!(
             nested.run_collect_rows().unwrap(),
             vec![
