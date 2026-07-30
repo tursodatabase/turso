@@ -251,17 +251,20 @@ In that case every use resolves directly to the producer's `ValueId`, no
 external input remains at lowering, and ordinary dominance verification covers
 the composed value. Simple uncorrelated `EXISTS` children compile to `has_rows`;
 simple uncorrelated single-column scalar children compile to `first_or(NULL)`.
-Each sibling receives its own symbolic input, and the producer compilers are
-folded around the consumer in reverse construction order so they execute in the
-SQL frontend's original subquery order. Child plans are compiled from staged
-clones; the originals are consumed only after every sibling has produced a
-complete compiler. An unsupported later sibling can therefore return the whole
-query to the eager emitter without leaving an earlier plan half-consumed. Their
-values can be bound into supported outer expression trees, and all scans then
-lower as one graph. Scalar `LIMIT` and `OFFSET` compose through the same stream
-operators before the first-row terminal. Correlated, aggregate, distinct,
-ordered, multi-column, mixed scalar-and-`IN`, and other unsupported subquery
-shapes retain the eager subquery emitter.
+Each subquery dependency is an ordered typed stage: either a scalar producer
+that binds an SSA input or an `IN` producer that materializes and binds a
+symbolic cursor. The stages are folded around the consumer in reverse
+construction order so they execute in the SQL frontend's original subquery
+order. Cursor-producing stages keep their resource scope around every later
+scalar stage and the final consumer. This lets scalar and `IN` children share
+one recursively composable pipeline instead of being coordinated by separate
+emission passes. Child plans are compiled from staged clones; the originals are
+consumed only after every dependency has produced a complete compiler. An
+unsupported later dependency can therefore return the whole query to the eager
+emitter without leaving an earlier plan half-consumed. Scalar `LIMIT` and
+`OFFSET` compose through the same stream operators before the first-row
+terminal. Correlated, aggregate, distinct, ordered, multi-column, and other
+unsupported subquery shapes retain the eager subquery emitter.
 
 Conditional branches only admit branch bodies that are fully represented in
 the IR. An unsupported branch body sends the whole conditional back to the

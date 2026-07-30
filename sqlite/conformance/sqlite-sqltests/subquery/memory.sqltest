@@ -260,6 +260,26 @@ expect {
     2|50
 }
 
+@cross-check-integrity
+test subquery-mixed-scalar-and-in-dependencies {
+    create table mixed_rows(id integer primary key);
+    create table mixed_keys(id integer);
+    create table mixed_bias(value integer);
+    create table mixed_bound(value integer);
+    insert into mixed_rows values (1), (2), (3), (4), (5);
+    insert into mixed_keys values (5), (1), (3);
+    insert into mixed_bias values (10);
+    insert into mixed_bound values (5), (4);
+    select id, id + (select value from mixed_bias)
+      from mixed_rows
+     where id in (select id from mixed_keys)
+       and id < (select value from mixed_bound);
+}
+expect {
+    1|11
+    3|13
+}
+
 # LIMIT and OFFSET are applied before the scalar subquery chooses its first row.
 @cross-check-integrity
 test subquery-scalar-limit-offset-first-row {
