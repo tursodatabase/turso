@@ -50,6 +50,32 @@ expect {
     2|2|two
 }
 
+@cross-check-integrity
+test where-declarative-composite-index-equality {
+    CREATE TABLE declarative_indexed(
+        id INTEGER PRIMARY KEY,
+        category TEXT,
+        rank NUMERIC,
+        payload TEXT
+    );
+    CREATE INDEX declarative_category_rank
+        ON declarative_indexed(category, rank);
+    INSERT INTO declarative_indexed VALUES
+        (1, 'group', 1, 'one'),
+        (2, 'group', 2, 'two'),
+        (3, 'other', 2, 'other'),
+        (4, 'group', NULL, 'null'),
+        (5, 'group', 2, 'five');
+    SELECT id, payload
+      FROM declarative_indexed INDEXED BY declarative_category_rank
+     WHERE category = 'group' AND rank = '2'
+     ORDER BY id DESC;
+}
+expect {
+    5|five
+    2|two
+}
+
 # in WHERE clauses, column aliases do not take precedence when resolving identifiers to columns.
 @cross-check-integrity
 test where_alias_precedence {

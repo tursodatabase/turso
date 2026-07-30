@@ -7,9 +7,9 @@ use crate::{
         aggregation::emit_ungrouped_aggregation,
         collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         compiler::{
-            compile_effect, pack_values, result_row_pack, scan_index, scan_table, seek_rowid,
-            select_pack, BoxedCompile, Compile, Row, RowStream, ScanDirection, SortKey, SortedRow,
-            ValueId,
+            compile_effect, pack_values, result_row_pack, scan_index, scan_table, seek_index,
+            seek_rowid, select_pack, BoxedCompile, Compile, DeferredIndexBound, DeferredIndexRange,
+            Row, RowStream, ScanDirection, SortKey, SortedRow, ValueId,
         },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
@@ -105,7 +105,7 @@ fn try_emit_declarative_table_scan(
     {
         return Ok(None);
     }
-    let (direction, index, rowid_eq) = match &joined.op {
+    let (direction, index, rowid_eq, index_seek) = match &joined.op {
         Operation::Scan(Scan::BTreeTable { iter_dir, index }) => (
             match iter_dir {
                 IterationDirection::Forwards => ScanDirection::Forward,
@@ -113,16 +113,44 @@ fn try_emit_declarative_table_scan(
             },
             index.as_ref(),
             None,
+            None,
         ),
         Operation::Search(Search::RowidEq { cmp_expr }) => {
-            (ScanDirection::Forward, None, Some(cmp_expr))
+            (ScanDirection::Forward, None, Some(cmp_expr), None)
         }
+        Operation::Search(Search::Seek {
+            index: Some(index),
+            seek_def,
+        }) => (
+            match seek_def.iter_dir {
+                IterationDirection::Forwards => ScanDirection::Forward,
+                IterationDirection::Backwards => ScanDirection::Reverse,
+            },
+            Some(index),
+            None,
+            Some(seek_def),
+        ),
         _ => return Ok(None),
     };
     let Table::BTree(table) = &joined.table else {
         return Ok(None);
     };
     if index.is_some_and(|index| index.ephemeral || index.index_method.is_some()) {
+        return Ok(None);
+    }
+    if index_seek.is_some()
+        && index.is_some_and(|index| {
+            resolver.with_schema(joined.database_id, |schema| {
+                index.columns.iter().any(|index_column| {
+                    table
+                        .columns()
+                        .get(index_column.pos_in_table)
+                        .and_then(|column| schema.get_type_def(&column.ty_str, table.is_strict))
+                        .is_some_and(|type_def| type_def.encode().is_some())
+                })
+            })
+        })
+    {
         return Ok(None);
     }
     let covering_index = index
@@ -151,6 +179,45 @@ fn try_emit_declarative_table_scan(
             };
             Some(rowid_eq)
         }
+    };
+    let index_range = match index_seek {
+        None => None,
+        Some(seek_def)
+            if !seek_def.prefix.is_empty()
+                && seek_def
+                    .prefix
+                    .iter()
+                    .all(|constraint| constraint.eq.is_some())
+                && matches!(seek_def.start.last_component, SeekKeyComponent::None)
+                && matches!(seek_def.end.last_component, SeekKeyComponent::None) =>
+        {
+            let mut values = SmallVec::with_capacity(seek_def.prefix.len());
+            let mut affinities = SmallVec::with_capacity(seek_def.prefix.len());
+            for constraint in &seek_def.prefix {
+                let (_, expression, affinity) = constraint
+                    .eq
+                    .as_ref()
+                    .expect("exact index seek prefix must contain only equalities");
+                let Some(resolved) = expr_resolver.resolve(expression)? else {
+                    return Ok(None);
+                };
+                let Some(value) = compile_symbolic_static_expr(&resolved) else {
+                    return Ok(None);
+                };
+                values.push(value);
+                affinities.push(if affinity.expr_needs_no_affinity_change(expression) {
+                    crate::vdbe::affinity::Affinity::Blob
+                } else {
+                    *affinity
+                });
+            }
+            Some(DeferredIndexRange::with_shared_key(
+                DeferredIndexBound::new(values, affinities, seek_def.start.op),
+                seek_def.end.op,
+                direction,
+            ))
+        }
+        Some(_) => return Ok(None),
     };
     let mut sort_keys = SmallVec::<[SortKey; 4]>::with_capacity(plan.order_by.len());
     let mut sort_expressions =
@@ -245,9 +312,17 @@ fn try_emit_declarative_table_scan(
     let database_id = joined.database_id;
     let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
     let result_column_count = projections.len();
-    let scan = match (rowid_eq, index) {
-        (Some(rowid), None) => seek_rowid(table, database_id, schema_cookie, rowid),
-        (None, Some(index)) => scan_index(
+    let scan = match (rowid_eq, index_range, index) {
+        (Some(rowid), None, None) => seek_rowid(table, database_id, schema_cookie, rowid),
+        (None, Some(range), Some(index)) => seek_index(
+            table,
+            index.clone(),
+            covering_index.is_some(),
+            database_id,
+            schema_cookie,
+            range,
+        ),
+        (None, None, Some(index)) => scan_index(
             table,
             index.clone(),
             covering_index.is_some(),
@@ -255,8 +330,8 @@ fn try_emit_declarative_table_scan(
             schema_cookie,
             direction,
         ),
-        (None, None) => scan_table(table, database_id, schema_cookie, direction),
-        (Some(_), Some(_)) => unreachable!("rowid searches do not use secondary indexes"),
+        (None, None, None) => scan_table(table, database_id, schema_cookie, direction),
+        _ => unreachable!("planner access methods have one declarative B-tree source"),
     };
     let compiler = scan.and_then(move |rows| {
         if predicates.is_empty() {
@@ -1439,7 +1514,7 @@ mod tests {
             .unwrap();
 
         let mut statement = connection
-            .prepare("SELECT rowid, id, payload FROM point WHERE rowid = ?1 + 0")
+            .prepare("SELECT rowid, id, payload FROM point WHERE rowid = ?1 + 0 LIMIT 1")
             .unwrap();
         let instructions = &statement.get_program().insns;
         assert_eq!(
@@ -1487,6 +1562,135 @@ mod tests {
             .bind_at(1.try_into().unwrap(), Value::Null)
             .unwrap();
         assert!(statement.run_collect_rows().unwrap().is_empty());
+    }
+
+    #[test]
+    fn exact_composite_index_search_uses_a_declarative_range_stream() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE indexed(\
+                    id INTEGER PRIMARY KEY, category TEXT, rank NUMERIC, payload TEXT\
+                )",
+            )
+            .unwrap();
+        connection
+            .execute("CREATE INDEX indexed_category_rank ON indexed(category, rank)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO indexed VALUES \
+                 (1, 'group', 1, 'one'), \
+                 (2, 'group', 2, 'two'), \
+                 (3, 'other', 2, 'other'), \
+                 (4, 'group', NULL, 'null'), \
+                 (5, 'group', 2, 'five')",
+            )
+            .unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT id, payload FROM indexed INDEXED BY indexed_category_rank \
+                 WHERE category = ?1 AND rank = ?2 LIMIT 1",
+            )
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+        assert!(instructions.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::SeekGE {
+                is_index: true,
+                eq_only: true,
+                num_regs: 2,
+                ..
+            }
+        )));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::IdxGT { num_regs: 2, .. })));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::DeferredSeek { .. })));
+        assert!(instructions
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Next { .. })));
+        assert!(instructions
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::Rewind { .. })));
+        let result_row = instructions
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 2, .. }))
+            .expect("exact index stream must produce its projected row");
+        assert!(instructions[result_row - 2..result_row]
+            .iter()
+            .all(|(instruction, _)| matches!(instruction, Insn::Copy { .. })));
+
+        statement
+            .bind_at(1.try_into().unwrap(), Value::from_text("group"))
+            .unwrap();
+        statement
+            .bind_at(2.try_into().unwrap(), Value::from_text("2"))
+            .unwrap();
+        assert_eq!(
+            statement.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(2), Value::from_text("two")]]
+        );
+
+        statement.reset().unwrap();
+        statement
+            .bind_at(1.try_into().unwrap(), Value::from_text("missing"))
+            .unwrap();
+        statement
+            .bind_at(2.try_into().unwrap(), Value::from_i64(2))
+            .unwrap();
+        assert!(statement.run_collect_rows().unwrap().is_empty());
+
+        statement.reset().unwrap();
+        statement
+            .bind_at(1.try_into().unwrap(), Value::from_text("group"))
+            .unwrap();
+        statement
+            .bind_at(2.try_into().unwrap(), Value::Null)
+            .unwrap();
+        assert!(statement.run_collect_rows().unwrap().is_empty());
+
+        let mut reverse = connection
+            .prepare(
+                "SELECT id, payload FROM indexed INDEXED BY indexed_category_rank \
+                 WHERE category = 'group' AND rank = 2 ORDER BY id DESC",
+            )
+            .unwrap();
+        assert!(reverse
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(
+                instruction,
+                Insn::SeekLE {
+                    is_index: true,
+                    eq_only: true,
+                    num_regs: 2,
+                    ..
+                }
+            )));
+        assert!(reverse
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::IdxLT { num_regs: 2, .. })));
+        assert!(reverse
+            .get_program()
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Prev { .. })));
+        assert_eq!(
+            reverse.run_collect_rows().unwrap(),
+            vec![
+                vec![Value::from_i64(5), Value::from_text("five")],
+                vec![Value::from_i64(2), Value::from_text("two")],
+            ]
+        );
     }
 
     #[test]
