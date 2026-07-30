@@ -1244,3 +1244,77 @@ expect {
     1|x
     2|d
 }
+
+# A generated expression referencing an unknown column fails cleanly.
+test fail-alter-column-generated-expr-unknown-column {
+    CREATE TABLE t (a INT, b INT);
+    ALTER TABLE t ALTER COLUMN b TO c AS (nosuch + 1);
+}
+expect error {
+}
+
+test fail-alter-column-generated-expr-self-reference {
+    CREATE TABLE t (a INT, b INT);
+    ALTER TABLE t ALTER COLUMN b TO c AS (c + 1);
+}
+expect error {
+}
+
+test alter-column-virtual-to-virtual-new-expression {
+    CREATE TABLE t (a INT, b AS (a * 2));
+    INSERT INTO t (a) VALUES (5);
+    ALTER TABLE t ALTER COLUMN b TO b2 AS (a * 3);
+    SELECT a, b2 FROM t;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    5|15
+    CREATE TABLE t (a INT, b2 AS (a * 3))
+}
+
+# Changing the type of a composite PRIMARY KEY member keeps the PK
+# working: values are converted and the PK index is rebuilt.
+test alter-column-composite-pk-member-type-change {
+    CREATE TABLE t (a TEXT, b TEXT, c TEXT, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES ('x', '1', 'v1'), ('x', '2', 'v2');
+    ALTER TABLE t ALTER COLUMN b TO b INTEGER;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT c FROM t WHERE a = 'x' AND b = 1;
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE TABLE t (a TEXT, b INTEGER, c TEXT, PRIMARY KEY (a, b))
+    v1
+    ok
+}
+
+# Changing an INTEGER PRIMARY KEY column to TEXT: rowids are preserved,
+# the column keeps the old rowid values as text, and new inserts leave
+# it NULL because it is no longer the rowid alias.
+test alter-column-rowid-alias-to-text {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'a'), (2, 'b');
+    ALTER TABLE t ALTER COLUMN id TO id TEXT;
+    INSERT INTO t (v) VALUES ('c');
+    SELECT rowid, quote(id), v FROM t ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    1|'1'|a
+    2|'2'|b
+    3|NULL|c
+    ok
+}
+
+# A UNIQUE index created separately stays consistent after conversion.
+test alter-column-separate-unique-index-conversion {
+    CREATE TABLE t (x TEXT);
+    CREATE UNIQUE INDEX u ON t (x);
+    INSERT INTO t VALUES ('7'), ('8');
+    ALTER TABLE t ALTER COLUMN x TO x INTEGER;
+    SELECT x, typeof(x) FROM t WHERE x = 7;
+    INSERT INTO t VALUES (7);
+    PRAGMA integrity_check;
+}
+expect error {
+}
