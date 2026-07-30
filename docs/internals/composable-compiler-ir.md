@@ -345,13 +345,22 @@ boundary (the whole tree is constant, so the span opened by
       never interned; the block-scoped leaf-dedup rule automatically
       gives per-iteration column re-reads. IR-level tests only — the
       production integration is Phase 4a.
-- [ ] 3b. IR-owned cursors: symbolic cursor declaration with open/close
-      effects (table root/type as opaque frontend payloads) and seeks
-      (SeekGE and friends). Last/Prev are done: the scan terminators
-      are direction-aware (`ScanStart`/`ScanAdvance` carrying an
-      IR-owned `ScanDirection`, emitting Rewind/Next forward and
-      Last/Prev backward; `rewind`/`next_row` remain as forward
-      builder shorthands).
+- [ ] 3b. IR-owned cursors: symbolic identity is done — `CursorId` is
+      declared on the builder (`declare_cursor`, dense like `ExitId`)
+      and bound to a physical VDBE cursor id only at emission
+      (`emit_condition_function` takes a `cursors: &[usize]` binding;
+      `emit_function_bound` is the general value-producing entry), so
+      descriptions no longer close over physical cursor numbering and
+      can be built before the surrounding eager code resolves its
+      cursors. The verifier rejects scan terminators referencing
+      undeclared cursors (`UndeclaredCursor` — a CursorId from another
+      builder is meaningless here). Remaining: open/close effects
+      (table root/type as opaque frontend payloads) and seeks (SeekGE
+      and friends). Last/Prev are done: the scan terminators are
+      direction-aware (`ScanStart`/`ScanAdvance` carrying an IR-owned
+      `ScanDirection`, emitting Rewind/Next forward and Last/Prev
+      backward; `rewind`/`next_row` remain as forward builder
+      shorthands).
 - [ ] 3c. Register packs are done (calls, rows); remaining: `Slot`
       (explicit mutable cells) for aggregate accumulators and coroutine
       yield cells; liveness-based register reuse instead of

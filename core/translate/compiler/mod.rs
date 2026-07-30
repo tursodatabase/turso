@@ -162,7 +162,7 @@ pub(crate) fn try_emit_scan_query(
     if index_cursor.is_some() {
         return Ok(false);
     }
-    let Some(cursor) = table_cursor else {
+    let Some(physical_cursor) = table_cursor else {
         return Ok(false);
     };
 
@@ -192,6 +192,7 @@ pub(crate) fn try_emit_scan_query(
     // emission, so the loop needs no trailing block of its own.
     let fallthrough = program.allocate_label();
     let mut builder = ir::FuncBuilder::new();
+    let cursor = builder.declare_cursor();
     let done_exit = builder.declare_exit();
     let done = builder.exit_block(done_exit);
     let body = builder.create_block();
@@ -271,6 +272,7 @@ pub(crate) fn try_emit_scan_query(
         program,
         &func,
         &[fallthrough],
+        &[physical_cursor],
         Some(fallthrough),
         Some(&mut emit_leaf),
     )?;
@@ -361,6 +363,7 @@ pub(crate) fn emit_condition(
         program,
         &func,
         &exit_labels,
+        &[],
         Some(fallthrough),
         leaf_emitter,
     )?;
@@ -933,6 +936,31 @@ mod tests {
     }
 
     #[test]
+    fn verifier_rejects_undeclared_cursors() {
+        // A CursorId is only meaningful within the function that
+        // declared it (emission binds physical ids by declaration
+        // index); smuggling one in from another builder is rejected.
+        let mut other = FuncBuilder::new();
+        let phantom = other.declare_cursor();
+
+        let mut builder = FuncBuilder::new();
+        let value = builder.int(1);
+        let done = builder.create_block();
+        let body = builder.create_block();
+        builder.rewind(
+            phantom,
+            JumpTarget::new(done, Vec::new()),
+            JumpTarget::new(body, Vec::new()),
+        );
+        builder.switch_to(body);
+        builder.jump(done, Vec::new());
+        builder.switch_to(done);
+        builder.ret(value);
+        let err = verify(&builder.finish()).unwrap_err();
+        assert!(matches!(err, VerifyError::UndeclaredCursor { .. }), "{err}");
+    }
+
+    #[test]
     fn emission_is_iterative_over_deep_chains() {
         // 50k chained adds built directly against the builder: emission
         // and verification must not recurse over value chains.
@@ -1492,36 +1520,49 @@ mod tests {
 
     #[test]
     fn scan_loops_emit_the_rewind_next_shape() {
-        // scan_loop composes the eager Rewind / body / Next / done shape;
-        // the row value steers into the ResultRow pack with no copies.
+        // scan_loop composes the eager Rewind / body / Next / done
+        // shape over a declared cursor; the row value steers into the
+        // ResultRow pack with no copies, and the symbolic cursor binds
+        // to the physical id supplied at emission.
         let leaf_expr = parse_expr("x");
-        let description = combine::scan_loop(0, |builder| {
+        let mut builder = FuncBuilder::new();
+        let cursor = builder.declare_cursor();
+        let done_exit = builder.declare_exit();
+        combine::scan_loop(cursor, |builder| {
             let row_value = builder.leaf(&leaf_expr);
             builder.emit_row(vec![row_value]);
             Ok(())
-        });
-        let mut builder = FuncBuilder::new();
-        description.run(&mut builder).unwrap();
-        let sentinel = builder.null();
-        builder.ret(sentinel);
+        })
+        .run(&mut builder)
+        .unwrap();
+        builder.exit(done_exit);
         let func = builder.finish();
         verify(&func).unwrap();
 
         let mut program = test_program();
-        let dest = program.alloc_register();
+        let fallthrough = program.allocate_label();
         let mut leaf_emitter = stub_leaf_emitter();
-        emit::emit_function_with_leaves(&mut program, &func, dest, &mut leaf_emitter).unwrap();
+        emit::emit_condition_function(
+            &mut program,
+            &func,
+            &[fallthrough],
+            &[3],
+            Some(fallthrough),
+            Some(&mut leaf_emitter),
+        )
+        .unwrap();
+        program.preassign_label_to_next_insn(fallthrough);
         program.resolve_labels().unwrap();
         let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
-        // Entry consts (the sentinel NULL) precede the loop; the body
-        // reads the leaf straight into the ResultRow pack.
-        let [Insn::Null { .. }, Insn::Rewind { cursor_id: 0, .. }, Insn::Integer {
+        // The body reads the leaf straight into the ResultRow pack, and
+        // both scan terminators reference the bound physical cursor.
+        let [Insn::Rewind { cursor_id: 3, .. }, Insn::Integer {
             value: 7,
             dest: leaf_dest,
         }, Insn::ResultRow {
             start_reg,
             count: 1,
-        }, Insn::Next { cursor_id: 0, .. }] = insns[..]
+        }, Insn::Next { cursor_id: 3, .. }] = insns[..]
         else {
             panic!("unexpected scan shape: {insns:?}");
         };
@@ -1541,13 +1582,14 @@ mod tests {
         let filter_leaf = parse_expr("x");
         let column_leaf = parse_expr("y");
         let mut builder = FuncBuilder::new();
+        let cursor = builder.declare_cursor();
         let done_exit = builder.declare_exit();
         let done = builder.exit_block(done_exit);
         let body = builder.create_block();
         let row = builder.create_block();
         let latch = builder.create_block();
         builder.rewind(
-            0,
+            cursor,
             JumpTarget::new(done, Vec::new()),
             JumpTarget::new(body, Vec::new()),
         );
@@ -1570,7 +1612,7 @@ mod tests {
         builder.jump(latch, Vec::new());
         builder.switch_to(latch);
         builder.next_row(
-            0,
+            cursor,
             JumpTarget::new(body, Vec::new()),
             JumpTarget::new(done, Vec::new()),
         );
@@ -1584,6 +1626,7 @@ mod tests {
             &mut program,
             &func,
             &[fallthrough],
+            &[0],
             Some(fallthrough),
             Some(&mut leaf_emitter),
         )
@@ -1613,12 +1656,13 @@ mod tests {
         // eager ResultRow / DecrJumpZero / Next sequence.
         let column_leaf = parse_expr("x");
         let mut builder = FuncBuilder::new();
+        let cursor = builder.declare_cursor();
         let done_exit = builder.declare_exit();
         let done = builder.exit_block(done_exit);
         let body = builder.create_block();
         let latch = builder.create_block();
         builder.rewind(
-            0,
+            cursor,
             JumpTarget::new(done, Vec::new()),
             JumpTarget::new(body, Vec::new()),
         );
@@ -1632,7 +1676,7 @@ mod tests {
         );
         builder.switch_to(latch);
         builder.next_row(
-            0,
+            cursor,
             JumpTarget::new(body, Vec::new()),
             JumpTarget::new(done, Vec::new()),
         );
@@ -1646,6 +1690,7 @@ mod tests {
             &mut program,
             &func,
             &[fallthrough],
+            &[0],
             Some(fallthrough),
             Some(&mut leaf_emitter),
         )
@@ -1669,13 +1714,14 @@ mod tests {
         // run — the eager IfPos-before-columns sequence.
         let column_leaf = parse_expr("x");
         let mut builder = FuncBuilder::new();
+        let cursor = builder.declare_cursor();
         let done_exit = builder.declare_exit();
         let done = builder.exit_block(done_exit);
         let body = builder.create_block();
         let row = builder.create_block();
         let latch = builder.create_block();
         builder.rewind(
-            0,
+            cursor,
             JumpTarget::new(done, Vec::new()),
             JumpTarget::new(body, Vec::new()),
         );
@@ -1691,7 +1737,7 @@ mod tests {
         builder.jump(latch, Vec::new());
         builder.switch_to(latch);
         builder.next_row(
-            0,
+            cursor,
             JumpTarget::new(body, Vec::new()),
             JumpTarget::new(done, Vec::new()),
         );
@@ -1705,6 +1751,7 @@ mod tests {
             &mut program,
             &func,
             &[fallthrough],
+            &[0],
             Some(fallthrough),
             Some(&mut leaf_emitter),
         )
@@ -1732,12 +1779,13 @@ mod tests {
         // opening the iteration and Prev as the back edge.
         let column_leaf = parse_expr("x");
         let mut builder = FuncBuilder::new();
+        let cursor = builder.declare_cursor();
         let done_exit = builder.declare_exit();
         let done = builder.exit_block(done_exit);
         let body = builder.create_block();
         let latch = builder.create_block();
         builder.scan_start(
-            0,
+            cursor,
             ScanDirection::Backward,
             JumpTarget::new(done, Vec::new()),
             JumpTarget::new(body, Vec::new()),
@@ -1748,7 +1796,7 @@ mod tests {
         builder.jump(latch, Vec::new());
         builder.switch_to(latch);
         builder.scan_advance(
-            0,
+            cursor,
             ScanDirection::Backward,
             JumpTarget::new(body, Vec::new()),
             JumpTarget::new(done, Vec::new()),
@@ -1763,6 +1811,7 @@ mod tests {
             &mut program,
             &func,
             &[fallthrough],
+            &[0],
             Some(fallthrough),
             Some(&mut leaf_emitter),
         )
@@ -1784,6 +1833,7 @@ mod tests {
         // value through a trampoline (edge copies cannot ride the Next
         // jump itself).
         let mut builder = FuncBuilder::new();
+        let cursor = builder.declare_cursor();
         let zero = builder.int(0);
         let one = builder.int(1);
         let body = builder.create_block();
@@ -1791,7 +1841,7 @@ mod tests {
         let latch = builder.create_block();
         let done = builder.create_block();
         builder.rewind(
-            5,
+            cursor,
             JumpTarget::new(done, Vec::new()),
             JumpTarget::new(body, vec![zero]),
         );
@@ -1801,7 +1851,7 @@ mod tests {
         builder.jump(latch, Vec::new());
         builder.switch_to(latch);
         builder.next_row(
-            5,
+            cursor,
             JumpTarget::new(body, vec![incremented]),
             JumpTarget::new(done, Vec::new()),
         );
@@ -1812,7 +1862,7 @@ mod tests {
 
         let mut program = test_program();
         let dest = program.alloc_register();
-        emit::emit_function(&mut program, &func, dest).unwrap();
+        emit::emit_function_bound(&mut program, &func, dest, &[5], None).unwrap();
         program.resolve_labels().unwrap();
         let insns: Vec<_> = program.insns.iter().map(|(insn, _)| insn).collect();
         // The back edge carries the incremented counter: Next jumps to a

@@ -194,6 +194,21 @@ impl ExitId {
     }
 }
 
+/// A symbolic cursor: an iteration resource declared by the IR and
+/// bound to a physical VDBE cursor id only at emission (`emit` receives
+/// one physical id per declared cursor). Like [`Inst::External`] for
+/// registers and [`ExitId`] for labels, this keeps descriptions free of
+/// physical resource numbering — a scan can be described before the
+/// surrounding eager code has resolved its cursors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CursorId(u32);
+
+impl CursorId {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// Handle to a function-call payload ([`CallData`]). `FuncCtx` is neither
 /// `Eq` nor `Hash`, so call payloads live in a side table and each call
 /// site gets a fresh id — calls are never interned or deduplicated.
@@ -365,13 +380,13 @@ pub enum Terminator {
     },
     /// Leave the IR island for an external continuation. See [`ExitId`].
     Exit(ExitId),
-    /// Position `cursor` (externally opened, referenced by its physical
-    /// id like `Inst::External` references registers) at the first row
-    /// in iteration order — the table start going forward
-    /// (`Insn::Rewind`), the table end going backward (`Insn::Last`):
-    /// `if_empty` when the table has no rows, `if_rows` otherwise.
+    /// Position `cursor` (externally opened, bound to a physical
+    /// cursor id at emission) at the first row in iteration order —
+    /// the table start going forward (`Insn::Rewind`), the table end
+    /// going backward (`Insn::Last`): `if_empty` when the table has no
+    /// rows, `if_rows` otherwise.
     ScanStart {
-        cursor: usize,
+        cursor: CursorId,
         direction: ScanDirection,
         if_empty: JumpTarget,
         if_rows: JumpTarget,
@@ -381,7 +396,7 @@ pub enum Terminator {
     /// which may carry loop values as block arguments) when another
     /// row exists, `if_done` otherwise.
     ScanAdvance {
-        cursor: usize,
+        cursor: CursorId,
         direction: ScanDirection,
         if_more: JumpTarget,
         if_done: JumpTarget,
@@ -475,6 +490,8 @@ pub struct Function {
     casts: Vec<Affinity>,
     /// Number of declared external exits ([`ExitId`]s are dense).
     num_exits: usize,
+    /// Number of declared symbolic cursors ([`CursorId`]s are dense).
+    num_cursors: usize,
 }
 
 impl Function {
@@ -513,6 +530,10 @@ impl Function {
     pub fn num_exits(&self) -> usize {
         self.num_exits
     }
+
+    pub fn num_cursors(&self) -> usize {
+        self.num_cursors
+    }
 }
 
 /// Builds a [`Function`] one block at a time. The builder has a *current*
@@ -531,6 +552,7 @@ pub struct FuncBuilder {
     cmps: Vec<CmpData>,
     casts: Vec<Affinity>,
     num_exits: usize,
+    num_cursors: usize,
 }
 
 impl FuncBuilder {
@@ -546,6 +568,7 @@ impl FuncBuilder {
             cmps: Vec::new(),
             casts: Vec::new(),
             num_exits: 0,
+            num_cursors: 0,
         }
     }
 
@@ -684,11 +707,11 @@ impl FuncBuilder {
         });
     }
 
-    /// Terminate the current block by positioning an external cursor
-    /// at the first row in `direction`'s iteration order.
+    /// Terminate the current block by positioning a declared cursor at
+    /// the first row in `direction`'s iteration order.
     pub fn scan_start(
         &mut self,
-        cursor: usize,
+        cursor: CursorId,
         direction: ScanDirection,
         if_empty: JumpTarget,
         if_rows: JumpTarget,
@@ -701,11 +724,11 @@ impl FuncBuilder {
         });
     }
 
-    /// Terminate the current block by advancing an external cursor one
+    /// Terminate the current block by advancing a declared cursor one
     /// row in `direction`'s iteration order.
     pub fn scan_advance(
         &mut self,
-        cursor: usize,
+        cursor: CursorId,
         direction: ScanDirection,
         if_more: JumpTarget,
         if_done: JumpTarget,
@@ -718,14 +741,14 @@ impl FuncBuilder {
         });
     }
 
-    /// Forward [`Self::scan_start`]: rewind an external cursor.
-    pub fn rewind(&mut self, cursor: usize, if_empty: JumpTarget, if_rows: JumpTarget) {
+    /// Forward [`Self::scan_start`]: rewind a declared cursor.
+    pub fn rewind(&mut self, cursor: CursorId, if_empty: JumpTarget, if_rows: JumpTarget) {
         self.scan_start(cursor, ScanDirection::Forward, if_empty, if_rows);
     }
 
-    /// Forward [`Self::scan_advance`]: step an external cursor to its
+    /// Forward [`Self::scan_advance`]: step a declared cursor to its
     /// next row.
-    pub fn next_row(&mut self, cursor: usize, if_more: JumpTarget, if_done: JumpTarget) {
+    pub fn next_row(&mut self, cursor: CursorId, if_more: JumpTarget, if_done: JumpTarget) {
         self.scan_advance(cursor, ScanDirection::Forward, if_more, if_done);
     }
 
@@ -809,6 +832,14 @@ impl FuncBuilder {
         id
     }
 
+    /// Declare a symbolic cursor, bound to a physical cursor id at
+    /// emission time (`emit` receives one id per declared cursor).
+    pub fn declare_cursor(&mut self) -> CursorId {
+        let id = CursorId(u32::try_from(self.num_cursors).expect("cursor count fits in u32"));
+        self.num_cursors += 1;
+        id
+    }
+
     /// A block that immediately leaves the island for `exit`. Jumping to
     /// it is how in-island control flow reaches external continuations;
     /// emission bypasses the block entirely, jumping straight to the
@@ -887,6 +918,7 @@ impl FuncBuilder {
             cmps: self.cmps,
             casts: self.casts,
             num_exits: self.num_exits,
+            num_cursors: self.num_cursors,
         }
     }
 

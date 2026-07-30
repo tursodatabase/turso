@@ -39,6 +39,9 @@ pub enum VerifyError {
     CmpBranchNullTarget {
         block: BlockId,
     },
+    UndeclaredCursor {
+        block: BlockId,
+    },
 }
 
 impl fmt::Display for VerifyError {
@@ -72,6 +75,10 @@ impl fmt::Display for VerifyError {
             VerifyError::CmpBranchNullTarget { block } => write!(
                 f,
                 "CmpBranch in block {block:?} has a NULL target distinct from both the true and false targets; VDBE comparison jumps route NULL via a flag"
+            ),
+            VerifyError::UndeclaredCursor { block } => write!(
+                f,
+                "scan terminator in block {block:?} references a cursor that was never declared"
             ),
         }
     }
@@ -189,10 +196,12 @@ pub fn verify(func: &Function) -> Result<(), VerifyError> {
             }
             Terminator::NullBranch { value, .. } => check(*value, end)?,
             Terminator::Ret { value } => check(*value, end)?,
-            Terminator::ScanStart { .. }
-            | Terminator::ScanAdvance { .. }
-            | Terminator::DecrJumpZero { .. }
-            | Terminator::IfPos { .. } => {}
+            Terminator::ScanStart { cursor, .. } | Terminator::ScanAdvance { cursor, .. } => {
+                if cursor.index() >= func.num_cursors() {
+                    return Err(VerifyError::UndeclaredCursor { block: block_id });
+                }
+            }
+            Terminator::DecrJumpZero { .. } | Terminator::IfPos { .. } => {}
         }
         for target in terminator.targets() {
             for &arg in &target.args {

@@ -38,9 +38,7 @@ pub type LeafEmitter<'e> = dyn FnMut(&mut ProgramBuilder, &ast::Expr, usize) -> 
 /// reaches bytecode. `dest` must already be allocated by the caller (the
 /// usual pre-allocated `target_register` of the eager translation paths).
 pub fn emit_function(program: &mut ProgramBuilder, func: &Function, dest: usize) -> Result<()> {
-    verify(func)
-        .map_err(|e| LimboError::InternalError(format!("compiler IR failed verification: {e}")))?;
-    Emitter::new(program, func, Some(dest), &[], None).emit()
+    emit_function_bound(program, func, dest, &[], None)
 }
 
 /// [`emit_function`] with a leaf emitter for functions whose values
@@ -51,19 +49,48 @@ pub fn emit_function_with_leaves(
     dest: usize,
     leaf_emitter: &mut LeafEmitter<'_>,
 ) -> Result<()> {
+    emit_function_bound(program, func, dest, &[], Some(leaf_emitter))
+}
+
+/// The general value-producing entry point: emit `func` into `program`
+/// leaving its `Ret` result in `dest`, with `cursors[i]` the physical
+/// VDBE cursor id bound to the function's `CursorId(i)`.
+pub fn emit_function_bound(
+    program: &mut ProgramBuilder,
+    func: &Function,
+    dest: usize,
+    cursors: &[usize],
+    leaf_emitter: Option<&mut LeafEmitter<'_>>,
+) -> Result<()> {
     verify(func)
         .map_err(|e| LimboError::InternalError(format!("compiler IR failed verification: {e}")))?;
-    Emitter::new(program, func, Some(dest), &[], Some(leaf_emitter)).emit()
+    bind_cursors(func, cursors)?;
+    // Explicit reborrow: `Option<&mut dyn ...>` is invariant, so shorten
+    // the emitter borrow to this call's lifetime by hand.
+    match leaf_emitter {
+        Some(leaf_emitter) => Emitter::new(
+            program,
+            func,
+            Some(dest),
+            &[],
+            cursors,
+            Some(&mut *leaf_emitter),
+        )
+        .emit(),
+        None => Emitter::new(program, func, Some(dest), &[], cursors, None).emit(),
+    }
 }
 
 /// Emit a condition island: a function whose control flow leaves through
 /// declared exits rather than a `Ret` value. `exit_labels[i]` is the
 /// label bound to `ExitId(i)`; empty exit blocks are bypassed entirely
-/// (jumps go straight to the bound label).
+/// (jumps go straight to the bound label). `cursors[i]` is the physical
+/// VDBE cursor id bound to the function's `CursorId(i)`.
 pub fn emit_condition_function(
     program: &mut ProgramBuilder,
     func: &Function,
     exit_labels: &[BranchOffset],
+    cursors: &[usize],
     fallthrough_label: Option<BranchOffset>,
     leaf_emitter: Option<&mut LeafEmitter<'_>>,
 ) -> Result<()> {
@@ -76,21 +103,41 @@ pub fn emit_condition_function(
             func.num_exits()
         )));
     }
+    bind_cursors(func, cursors)?;
     // Explicit reborrow: `Option<&mut dyn ...>` is invariant, so shorten
     // the emitter borrow to this call's lifetime by hand.
     match leaf_emitter {
         Some(leaf_emitter) => {
-            let mut emitter =
-                Emitter::new(program, func, None, exit_labels, Some(&mut *leaf_emitter));
+            let mut emitter = Emitter::new(
+                program,
+                func,
+                None,
+                exit_labels,
+                cursors,
+                Some(&mut *leaf_emitter),
+            );
             emitter.fallthrough_label = fallthrough_label;
             emitter.emit()
         }
         None => {
-            let mut emitter = Emitter::new(program, func, None, exit_labels, None);
+            let mut emitter = Emitter::new(program, func, None, exit_labels, cursors, None);
             emitter.fallthrough_label = fallthrough_label;
             emitter.emit()
         }
     }
+}
+
+/// Check that exactly one physical cursor id was supplied per declared
+/// symbolic cursor.
+fn bind_cursors(func: &Function, cursors: &[usize]) -> Result<()> {
+    if cursors.len() != func.num_cursors() {
+        return Err(LimboError::InternalError(format!(
+            "compiler IR: {} cursor ids bound but {} cursors declared",
+            cursors.len(),
+            func.num_cursors()
+        )));
+    }
+    Ok(())
 }
 
 struct Emitter<'a> {
@@ -101,6 +148,9 @@ struct Emitter<'a> {
     dest: Option<usize>,
     /// Labels bound to declared exits, indexed by `ExitId`.
     exit_labels: &'a [BranchOffset],
+    /// Physical VDBE cursor ids bound to declared symbolic cursors,
+    /// indexed by `CursorId`.
+    cursors: &'a [usize],
     /// Physical register per value, assigned at definition.
     regs: Vec<Option<usize>>,
     /// Emission order: entry first, reachable blocks only.
@@ -138,6 +188,7 @@ impl<'a> Emitter<'a> {
         func: &'a Function,
         dest: Option<usize>,
         exit_labels: &'a [BranchOffset],
+        cursors: &'a [usize],
         leaf_emitter: Option<&'a mut LeafEmitter<'a>>,
     ) -> Self {
         // Emission order: creation order restricted to reachable blocks.
@@ -297,6 +348,7 @@ impl<'a> Emitter<'a> {
             func,
             dest,
             exit_labels,
+            cursors,
             regs,
             labels: vec![None; func.blocks.len()],
             order,
@@ -794,13 +846,14 @@ impl<'a> Emitter<'a> {
             } => {
                 let mut trampolines: Vec<(BranchOffset, JumpTarget)> = Vec::new();
                 let pc_if_empty = self.edge_entry_pc(if_empty, &mut trampolines);
+                let cursor_id = self.cursors[cursor.index()];
                 self.program.emit_insn(match direction {
                     ScanDirection::Forward => Insn::Rewind {
-                        cursor_id: *cursor,
+                        cursor_id,
                         pc_if_empty,
                     },
                     ScanDirection::Backward => Insn::Last {
-                        cursor_id: *cursor,
+                        cursor_id,
                         pc_if_empty,
                     },
                 });
@@ -821,13 +874,14 @@ impl<'a> Emitter<'a> {
             } => {
                 let mut trampolines: Vec<(BranchOffset, JumpTarget)> = Vec::new();
                 let pc_back_edge = self.edge_entry_pc(if_more, &mut trampolines);
+                let cursor_id = self.cursors[cursor.index()];
                 self.program.emit_insn(match direction {
                     ScanDirection::Forward => Insn::Next {
-                        cursor_id: *cursor,
+                        cursor_id,
                         pc_if_next: pc_back_edge,
                     },
                     ScanDirection::Backward => Insn::Prev {
-                        cursor_id: *cursor,
+                        cursor_id,
                         pc_if_prev: pc_back_edge,
                     },
                 });

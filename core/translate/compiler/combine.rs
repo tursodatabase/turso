@@ -257,9 +257,10 @@ impl<'a> Predicate<'a> {
     }
 }
 
-/// Describe a full scan over an externally-opened cursor: rewind, run
-/// `body` once per row, advance. The eager Rewind/Next loop shape,
-/// composed instead of hand-sequenced.
+/// Describe a full scan over a declared cursor (opened externally,
+/// bound to a physical id at emission): rewind, run `body` once per
+/// row, advance. The eager Rewind/Next loop shape, composed instead of
+/// hand-sequenced.
 ///
 /// `body` runs with the builder positioned in the loop-body block and
 /// must leave its final block unterminated (the loop wires it to the
@@ -267,7 +268,7 @@ impl<'a> Predicate<'a> {
 /// block. Loop-carried values (block parameters on the body) come with
 /// the aggregate work; today's bodies are effect-only.
 pub fn scan_loop<'a>(
-    cursor: usize,
+    cursor: super::ir::CursorId,
     body: impl FnOnce(&mut FuncBuilder) -> Result<()> + 'a,
 ) -> Compiler<'a, ()> {
     Compiler::build_with(move |builder| {
