@@ -173,7 +173,9 @@ fn is_stmt_valid_for_schema(
         // SELECT is always valid (SELECT 1, SELECT ABS(-5), etc.)
         StmtKind::Select => true,
         // INSERT/DELETE/UPDATE require tables
-        StmtKind::Insert | StmtKind::Delete | StmtKind::Update => has_tables,
+        StmtKind::Insert | StmtKind::Delete | StmtKind::Update | StmtKind::PragmaForeignKeyList => {
+            has_tables
+        }
         // DDL that operates on existing tables
         StmtKind::DropTable
         | StmtKind::AlterTable
@@ -184,11 +186,7 @@ fn is_stmt_valid_for_schema(
         // DROP TRIGGER requires triggers to exist
         StmtKind::DropTrigger => has_triggers,
         // These are always valid
-        StmtKind::CreateTable
-        | StmtKind::Begin
-        | StmtKind::Commit
-        | StmtKind::Rollback
-        | StmtKind::PragmaForeignKeyList => true,
+        StmtKind::CreateTable | StmtKind::Begin | StmtKind::Commit | StmtKind::Rollback => true,
         // Stubs — always valid (would require tables for views but weight is 0 anyway)
         StmtKind::CreateView => has_tables,
         StmtKind::DropView => true,
@@ -1709,6 +1707,17 @@ mod tests {
 
         let stmt = generate_statement(&generator, &mut ctx);
         assert!(stmt.is_ok());
+    }
+
+    #[test]
+    fn empty_schema_never_chooses_a_statement_that_needs_a_table() {
+        let generator: SqlGen<Full> = SqlGen::new(SchemaBuilder::new().build(), Policy::default());
+
+        for seed in 0..1000 {
+            let mut ctx = Context::new_with_seed(seed);
+            let stmt = generate_statement(&generator, &mut ctx);
+            assert!(stmt.is_ok(), "generation failed for seed {seed}: {stmt:?}");
+        }
     }
 
     #[test]
