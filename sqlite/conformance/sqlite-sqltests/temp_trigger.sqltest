@@ -156,6 +156,31 @@ expect {
     big value: 15
 }
 
+# An unqualified TEMP trigger stays with the table found when it is
+# created. A same-named table created later must not take it over.
+test unqualified-temp-trigger-stays-with-attached-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.attached_target (x INTEGER);
+    CREATE TEMP TRIGGER attached_trigger AFTER INSERT ON attached_target BEGIN
+        SELECT raise(FAIL, 'wrong table');
+    END;
+
+    CREATE TABLE main.attached_target (x INTEGER);
+    INSERT INTO main.attached_target VALUES (1);
+
+    DROP TABLE main.attached_target;
+    SELECT count(*) FROM temp.sqlite_schema
+        WHERE type = 'trigger' AND name = 'attached_trigger';
+
+    DROP TABLE aux.attached_target;
+    SELECT count(*) FROM temp.sqlite_schema
+        WHERE type = 'trigger' AND name = 'attached_trigger';
+}
+expect {
+    1
+    0
+}
+
 #  regression: DROP TABLE main.t must not wipe temp triggers
 # that target temp.t. `remove_triggers_for_table` used to key only on
 # the table name, so a temp trigger trying to follow `temp.t` was

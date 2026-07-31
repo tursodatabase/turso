@@ -1301,6 +1301,26 @@ impl Schema {
         self.triggers.remove(&table_name);
     }
 
+    pub fn set_trigger_target_database_id(
+        &mut self,
+        trigger_name: &str,
+        target_database_id: usize,
+    ) -> Result<()> {
+        let trigger_name = normalize_ident(trigger_name);
+        let trigger = self
+            .triggers
+            .values_mut()
+            .flatten()
+            .find(|trigger| normalize_ident(&trigger.name) == trigger_name)
+            .ok_or_else(|| {
+                crate::LimboError::InternalError(format!(
+                    "new trigger {trigger_name} was not loaded into the schema"
+                ))
+            })?;
+        Arc::make_mut(trigger).target_database_id = Some(target_database_id);
+        Ok(())
+    }
+
     /// Like [`remove_triggers_for_table`] but only removes triggers whose
     /// `target_database_id` matches `target_db` (or is `None`, meaning
     /// "targets the parent schema's table of this name", which also

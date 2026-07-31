@@ -153,6 +153,7 @@ pub fn emit_sequence_backing_table(
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!("name = '{escaped}'")),
+        trigger_target_database_id: None,
     });
 
     Ok(())

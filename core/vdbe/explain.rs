@@ -1992,7 +1992,9 @@ pub fn insn_to_row(
                 0,
                 format!("if (r[{}]==NULL) goto {}", reg, target_pc.as_debug_int()),
             ),
-            Insn::ParseSchema { db, where_clause } => (
+            Insn::ParseSchema {
+                db, where_clause, ..
+            } => (
                 "ParseSchema",
                 *db as i64,
                 0,

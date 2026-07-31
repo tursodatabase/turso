@@ -255,6 +255,7 @@ pub fn translate_create_materialized_view(
         where_clause: Some(format!(
             "name = '{escaped_view_name}' OR name = '{escaped_dbsp_table_name}' OR name = '{escaped_dbsp_index_name}'"
         )),
+        trigger_target_database_id: None,
     });
 
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
@@ -386,6 +387,7 @@ pub fn translate_create_view(
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!("name = '{escaped_view_name}'")),
+        trigger_target_database_id: None,
     });
 
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);

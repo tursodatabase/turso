@@ -1451,6 +1451,7 @@ pub fn translate_create_table(
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(parse_schema_where_clause),
+        trigger_target_database_id: None,
     });
 
     // For CTAS, emit bytecode to populate the new table from the SELECT
@@ -1770,6 +1771,7 @@ pub fn translate_create_virtual_table(
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
         where_clause: Some(parse_schema_where_clause),
+        trigger_target_database_id: None,
     });
 
     Ok(())
@@ -2564,6 +2566,7 @@ fn persist_type_definition(
             where_clause: Some(format!(
                 "tbl_name = '{TURSO_TYPES_TABLE_NAME}' AND type != 'trigger'"
             )),
+            trigger_target_database_id: None,
         });
     }
 

@@ -215,6 +215,8 @@ pub fn translate_create_trigger(
         where_clause: Some(format!(
             "name = '{escaped_trigger_name}' AND type = 'trigger'"
         )),
+        trigger_target_database_id: (temporary && tbl_name.db_name.is_none())
+            .then_some(target_table_database_id),
     });
 
     Ok(())

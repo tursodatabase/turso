@@ -294,6 +294,7 @@ pub fn translate_create_index(
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(parse_schema_where_clause),
+        trigger_target_database_id: None,
     });
     // Close the final sqlite_schema cursor
     program.emit_insn(Insn::Close {

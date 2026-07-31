@@ -1577,6 +1577,16 @@ pub enum Insn {
     ParseSchema {
         db: usize,
         where_clause: Option<String>,
+        /// The database containing the table used by an unqualified TEMP trigger.
+        ///
+        /// SQLite can look through every attached database while rebuilding a
+        /// trigger. Turso's schema reader handles one schema at a time, so it
+        /// cannot repeat the lookup already done by CREATE TRIGGER. The SQL in
+        /// temp.sqlite_schema only says `ON table`, not which database supplied
+        /// `table`. CREATE TRIGGER passes the answer here so ParseSchema can keep
+        /// it on the in-memory trigger. Every other ParseSchema use leaves this
+        /// as `None`.
+        trigger_target_database_id: Option<usize>,
     },
 
     /// Populate all materialized views after schema parsing

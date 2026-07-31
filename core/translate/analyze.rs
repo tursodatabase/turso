@@ -225,6 +225,7 @@ pub fn translate_analyze(
         program.emit_insn(Insn::ParseSchema {
             db: database_id,
             where_clause: Some(parse_schema_where_clause),
+            trigger_target_database_id: None,
         });
 
         // Bump schema cookie so subsequent statements reparse schema.

@@ -14043,6 +14043,7 @@ pub struct OpParseSchemaInner {
     dbsp_state_roots: crate::HashMap<String, i64>,
     dbsp_state_index_roots: crate::HashMap<String, i64>,
     materialized_view_info: crate::HashMap<String, (String, i64)>,
+    trigger_target_database_id: Option<usize>,
     db: usize,
     previous_auto_commit: bool,
 }
@@ -14063,7 +14064,14 @@ pub fn op_parse_schema(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(ParseSchema { db, where_clause }, insn);
+    load_insn!(
+        ParseSchema {
+            db,
+            where_clause,
+            trigger_target_database_id
+        },
+        insn
+    );
 
     let conn = program.connection.clone();
 
@@ -14147,6 +14155,7 @@ pub fn op_parse_schema(
         dbsp_state_roots: Default::default(),
         dbsp_state_index_roots: Default::default(),
         materialized_view_info: Default::default(),
+        trigger_target_database_id: *trigger_target_database_id,
         db: *db,
         previous_auto_commit,
     }));
@@ -14207,6 +14216,11 @@ fn op_parse_schema_step(
                     &attached_resolver,
                     conn.dialect().as_ref(),
                 )?;
+                if ty == "trigger" {
+                    if let Some(target_database_id) = inner.trigger_target_database_id {
+                        schema.set_trigger_target_database_id(name, target_database_id)?;
+                    }
+                }
                 continue;
             }
             StepResult::Done => {
@@ -14219,6 +14233,7 @@ fn op_parse_schema_step(
                     dbsp_state_roots,
                     dbsp_state_index_roots,
                     materialized_view_info,
+                    trigger_target_database_id: _,
                     db,
                     previous_auto_commit,
                 } = *state
