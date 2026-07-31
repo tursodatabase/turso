@@ -77,8 +77,12 @@ plus `pg_input_error_info`. Present but always empty: `pg_policy`,
 `pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_userbyid`,
 `pg_*_is_visible`, `pg_encoding_to_char`, `pg_input_is_valid`, `to_char`
 (numeric), `now`/`clock_timestamp`/`transaction_timestamp`/`statement_timestamp`.
-DML against pg_catalog is rejected. `version()`, `pg_typeof`, and
-`current_schema` are not implemented.
+Session information functions: `version()`, `current_database()` /
+`current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
+forms), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
+`obj_description()`/`col_description()` always return NULL because COMMENT ON
+is not persisted. DML against pg_catalog is rejected. `pg_typeof` is not
+implemented.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
