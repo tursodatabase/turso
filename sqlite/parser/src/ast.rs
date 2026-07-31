@@ -424,6 +424,10 @@ pub enum FieldAccessResolution {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum CustomTypeFunctionResolution {
+    UnionValue {
+        tag_index: u8,
+        result_type: String,
+    },
     UnionTag {
         tag_names: Arc<[String]>,
     },

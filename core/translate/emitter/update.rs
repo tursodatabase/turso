@@ -838,17 +838,6 @@ fn emit_update_column_values<'a>(
                         program,
                         self_table_context.as_ref(),
                         |program, _| {
-                            // Save/restore target_union_type so union_value() resolves tags
-                            // against this column's union type. See ProgramBuilder::target_union_type.
-                            let union_td = t_ctx
-                                .resolver
-                                .schema
-                                .get_type_def_unchecked(&table_column.ty_str)
-                                .filter(|td| td.is_union())
-                                .cloned();
-                            let prev_union = program.target_union_type.take();
-                            program.target_union_type = union_td;
-
                             // Columns with custom type encode must not have their
                             // SET expressions hoisted as constants. See the doc
                             // comment on NoConstantOptReason::CustomTypeEncode.
@@ -879,7 +868,6 @@ fn emit_update_column_values<'a>(
                                     &t_ctx.resolver,
                                 )
                             };
-                            program.target_union_type = prev_union;
                             translate_result?;
                             if table_column.notnull() && !skip_notnull_checks {
                                 let notnull_conflict = if program.flags.has_statement_conflict() {

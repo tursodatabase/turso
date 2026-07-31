@@ -15,7 +15,7 @@ use super::plan::{BitSet, ColumnMask, JoinInfo, TableReferences};
 use super::planner::parse_row_id;
 use crate::schema::{
     is_deterministic_schema_function_call, BTreeTable, Column, GeneratedType, Index, IndexColumn,
-    Schema, Table, EXPR_INDEX_SENTINEL,
+    Schema, Table, TypeDef, EXPR_INDEX_SENTINEL,
 };
 use crate::util::normalize_ident;
 use crate::Result;
@@ -2252,12 +2252,55 @@ pub struct BoundInsert {
     pub database_id: usize,
     /// The validated target table.
     pub table: Arc<Table>,
+    /// Destination type for each source expression, in INSERT column order.
+    pub value_types: Vec<Option<Arc<TypeDef>>>,
     /// ID used by bound references to the current target row.
     pub target_table_id: ast::TableInternalId,
     /// ID used by bound references to the would-be inserted row.
     pub excluded_table_id: ast::TableInternalId,
     /// Stored index keys and predicates bound to the target table reference.
     pub bound_index_expressions: Vec<super::plan::BoundIndexExpressions>,
+}
+
+fn insert_value_types(
+    table: &Table,
+    columns: &[ast::Name],
+    resolver: &Resolver,
+) -> Result<Vec<Option<Arc<TypeDef>>>> {
+    if columns.is_empty() {
+        return Ok(table
+            .columns()
+            .iter()
+            .filter(|column| !column.hidden() && !column.is_generated())
+            .map(|column| {
+                resolver
+                    .schema()
+                    .get_type_def_unchecked(&column.ty_str)
+                    .cloned()
+            })
+            .collect());
+    }
+
+    columns
+        .iter()
+        .map(|name| {
+            let name = normalize_ident(name.as_str());
+            if let Some((_, column)) = table.get_column_by_name(&name) {
+                column.ensure_not_generated("INSERT into", &name)?;
+                Ok(resolver
+                    .schema()
+                    .get_type_def_unchecked(&column.ty_str)
+                    .cloned())
+            } else if super::planner::ROWID_STRS
+                .iter()
+                .any(|rowid| rowid.eq_ignore_ascii_case(&name))
+            {
+                Ok(None)
+            } else {
+                crate::bail_parse_error!("table {} has no column named {}", table.get_name(), name)
+            }
+        })
+        .collect()
 }
 
 fn upsert_scope_table(
@@ -2386,6 +2429,52 @@ fn collect_upsert_set_clauses(
     Ok(result)
 }
 
+fn assignment_type(
+    table: &Table,
+    column_name: &ast::Name,
+    resolver: &Resolver,
+) -> Result<Option<Arc<TypeDef>>> {
+    let name = normalize_ident(column_name.as_str());
+    let Some((_, column)) = table.get_column_by_name(&name) else {
+        crate::bail_parse_error!("no such column: {}", column_name);
+    };
+    Ok(resolver
+        .schema()
+        .get_type_def_unchecked(&column.ty_str)
+        .cloned())
+}
+
+fn bind_update_set<G: IdGenerator>(
+    binder: &mut BindContext<'_, G>,
+    set: &mut ast::Set,
+    scope: &BindScope,
+    table: &Table,
+) -> Result<()> {
+    match set.expr.as_mut() {
+        ast::Expr::Parenthesized(values) => {
+            if set.col_names.len() != values.len() {
+                crate::bail_parse_error!(
+                    "{} columns assigned {} values",
+                    set.col_names.len(),
+                    values.len()
+                );
+            }
+            for (column_name, expr) in set.col_names.iter().zip(values) {
+                let expected_type = assignment_type(table, column_name, binder.resolver)?;
+                binder.bind_expr_with_expected_type(expr, scope, expected_type.as_deref())?;
+            }
+        }
+        expr => {
+            if set.col_names.len() != 1 {
+                crate::bail_parse_error!("{} columns assigned 1 values", set.col_names.len());
+            }
+            let expected_type = assignment_type(table, &set.col_names[0], binder.resolver)?;
+            binder.bind_expr_with_expected_type(expr, scope, expected_type.as_deref())?;
+        }
+    }
+    Ok(())
+}
+
 fn bind_upsert_do<G: IdGenerator>(
     binder: &mut BindContext<'_, G>,
     do_clause: ast::UpsertDo,
@@ -2424,8 +2513,13 @@ fn bind_upsert_do<G: IdGenerator>(
     #[expect(clippy::arc_with_non_send_sync)]
     binder.append_outer_query_scope(Arc::new(excluded_scope), Arc::new(Vec::new()));
     let bind_result = binder.with_phase(BindPhase::NoAliases, |binder| {
-        for (_, expr) in &mut sets {
-            binder.bind_expr(expr, &target_scope)?;
+        for (column_index, expr) in &mut sets {
+            let expected_type = binder
+                .resolver
+                .schema()
+                .get_type_def_unchecked(&table.columns()[*column_index].ty_str)
+                .cloned();
+            binder.bind_expr_with_expected_type(expr, &target_scope, expected_type.as_deref())?;
         }
         if let Some(where_clause) = where_clause.as_mut() {
             binder.bind_expr(where_clause, &target_scope)?;
@@ -2461,6 +2555,7 @@ pub fn bind_insert_stmt(
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
     }
     validate_insert(table_name.as_str(), resolver, connection)?;
+    let value_types = insert_value_types(&table, columns, resolver)?;
 
     if table.virtual_table().is_some() {
         return Ok(BoundInsert {
@@ -2469,6 +2564,7 @@ pub fn bind_insert_stmt(
             inserting_multiple_rows: false,
             database_id,
             table,
+            value_types,
             target_table_id: program.table_reference_counter.next(),
             excluded_table_id: program.table_reference_counter.next(),
             bound_index_expressions: Vec::new(),
@@ -2534,8 +2630,6 @@ pub fn bind_insert_stmt(
                         if has_subquery {
                             inserting_multiple_rows = true;
                         } else {
-                            let empty_scope = BindScope::empty();
-                            let function_binder = BindContext::new(resolver, program);
                             for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
                                 match expr.as_mut() {
                                     ast::Expr::Id(name) => {
@@ -2556,9 +2650,6 @@ pub fn bind_insert_stmt(
                                     }
                                     _ => {}
                                 }
-                                bind_scopeless_expr(expr, resolver)?;
-                                function_binder
-                                    .bind_custom_type_function_calls(expr, &empty_scope)?;
                             }
                             values = values_expr.pop().unwrap_or_else(Vec::new);
                         }
@@ -2569,6 +2660,18 @@ pub fn bind_insert_stmt(
                 inserting_multiple_rows = true;
             }
             upsert = upsert_opt.take();
+        }
+    }
+    if !values.is_empty() {
+        let empty_scope = BindScope::empty();
+        let function_binder = BindContext::new(resolver, program);
+        for (index, expr) in values.iter_mut().enumerate() {
+            bind_scopeless_expr(expr, resolver)?;
+            function_binder.bind_custom_type_function_calls(
+                expr,
+                &empty_scope,
+                value_types.get(index).and_then(Option::as_deref),
+            )?;
         }
     }
     if let ast::ResolveType::Ignore = on_conflict {
@@ -2614,6 +2717,7 @@ pub fn bind_insert_stmt(
         inserting_multiple_rows,
         database_id,
         table,
+        value_types,
         target_table_id,
         excluded_table_id,
         bound_index_expressions,
@@ -3724,8 +3828,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         &mut self,
         columns: &mut [ast::ResultColumn],
         scope: &BindScope,
+        expected_types: &[Option<Arc<TypeDef>>],
     ) -> Result<Vec<BoundColumn>> {
         let mut result = Vec::with_capacity(columns.len());
+        let mut output_index = 0;
         for col in columns {
             match col {
                 ast::ResultColumn::Expr(expr, alias) => {
@@ -3771,12 +3877,17 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     };
                     let is_explicit_alias = explicit_alias.is_some();
                     // Resolve the expression
-                    self.bind_expr(expr, scope)?;
+                    self.bind_expr_with_expected_type(
+                        expr,
+                        scope,
+                        expected_types.get(output_index).and_then(Option::as_deref),
+                    )?;
                     result.push(BoundColumn {
                         name,
                         expr: expr.as_ref().clone(),
                         is_explicit_alias,
                     });
+                    output_index += 1;
                 }
                 ast::ResultColumn::Star => {
                     // The star stays unexpanded in the AST (the planner's
@@ -3853,6 +3964,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                                 },
                                 is_explicit_alias: false,
                             });
+                            output_index += 1;
                         }
                     }
                 }
@@ -3874,6 +3986,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                             },
                             is_explicit_alias: false,
                         });
+                        output_index += 1;
                     }
                 }
             }
@@ -3884,6 +3997,16 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     /// Bind a SELECT statement, resolving all name references in-place.
     /// Returns the bound query result needed by planning.
     pub fn bind_select(&mut self, select: &mut ast::Select) -> Result<BoundSelect> {
+        self.bind_select_with_expected_types(select, &[])
+    }
+
+    /// Bind a SELECT used as an INSERT source. Each result expression receives
+    /// the type of the destination column at the same position.
+    pub fn bind_select_with_expected_types(
+        &mut self,
+        select: &mut ast::Select,
+        expected_types: &[Option<Arc<TypeDef>>],
+    ) -> Result<BoundSelect> {
         self.with_query(|ctx| {
             // 1. Bind CTEs from WITH clause
             if let Some(with) = &mut select.with {
@@ -3892,14 +4015,15 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
             // 2. Bind the main OneSelect. Its aliases and FROM scope are the ones
             // visible to the query-level ORDER BY.
-            let (result_columns, main_scope) = ctx.bind_one_select(&mut select.body.select)?;
+            let (result_columns, main_scope) =
+                ctx.bind_one_select(&mut select.body.select, expected_types)?;
 
             // 3. Bind compound selects (UNION, INTERSECT, EXCEPT)
             let mut compound_scopes = Vec::with_capacity(select.body.compounds.len());
             let mut compound_result_columns = Vec::with_capacity(select.body.compounds.len());
             for compound in &mut select.body.compounds {
                 let (compound_columns, compound_scope) =
-                    ctx.bind_one_select(&mut compound.select)?;
+                    ctx.bind_one_select(&mut compound.select, expected_types)?;
                 compound_result_columns.push(compound_columns);
                 compound_scopes.push(compound_scope);
             }
@@ -3998,6 +4122,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     fn bind_one_select(
         &mut self,
         one: &mut ast::OneSelect,
+        expected_types: &[Option<Arc<TypeDef>>],
     ) -> Result<(Arc<Vec<BoundColumn>>, BindScope)> {
         self.with_scope(|ctx| {
             match one {
@@ -4042,7 +4167,8 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
                     // 5. Extract bound columns (names + resolved exprs) before
                     //    the main bind pass rewrites the AST in-place.
-                    let bound_columns = Arc::new(ctx.extract_bound_columns(columns, &scope)?);
+                    let bound_columns =
+                        Arc::new(ctx.extract_bound_columns(columns, &scope, expected_types)?);
 
                     // 6. Store as aliases for later phases (WHERE, GROUP BY, ORDER BY)
                     ctx.set_aliases(Arc::clone(&bound_columns));
@@ -4085,8 +4211,12 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                             .collect(),
                     );
                     for row in rows.iter_mut() {
-                        for expr in row.iter_mut() {
-                            ctx.bind_expr(expr, &scope)?;
+                        for (index, expr) in row.iter_mut().enumerate() {
+                            ctx.bind_expr_with_expected_type(
+                                expr,
+                                &scope,
+                                expected_types.get(index).and_then(Option::as_deref),
+                            )?;
                         }
                     }
                     Ok((bound_columns, scope))
@@ -4747,10 +4877,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 if let Some(limit) = limit.as_mut() {
                     let empty_scope = BindScope::empty();
                     bind_scopeless_expr(&mut limit.expr, resolver)?;
-                    self.bind_custom_type_function_calls(&mut limit.expr, &empty_scope)?;
+                    self.bind_custom_type_function_calls(&mut limit.expr, &empty_scope, None)?;
                     if let Some(offset) = limit.offset.as_mut() {
                         bind_scopeless_expr(offset, resolver)?;
-                        self.bind_custom_type_function_calls(offset, &empty_scope)?;
+                        self.bind_custom_type_function_calls(offset, &empty_scope, None)?;
                     }
                 }
                 self.ctes.get_mut(&cte_name).unwrap().select.limit = limit;
@@ -5575,7 +5705,8 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     })?
             }
             ast::Expr::BoundCustomTypeFunction { resolution, .. } => match resolution {
-                ast::CustomTypeFunctionResolution::UnionExtract { result_type, .. }
+                ast::CustomTypeFunctionResolution::UnionValue { result_type, .. }
+                | ast::CustomTypeFunctionResolution::UnionExtract { result_type, .. }
                 | ast::CustomTypeFunctionResolution::StructExtract { result_type, .. } => {
                     result_type.clone()
                 }
@@ -5623,6 +5754,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         &self,
         expr: &mut ast::Expr,
         scope: &BindScope,
+        expected_type: Option<&crate::schema::TypeDef>,
     ) -> Result<()> {
         walk_expr_mut(expr, &mut |expr| {
             let ast::Expr::FunctionCall {
@@ -5639,7 +5771,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             let function_name = normalize_ident(name.as_str());
             if matches!(
                 function_name.as_str(),
-                "union_tag" | "union_extract" | "struct_extract"
+                "union_value" | "union_tag" | "union_extract" | "struct_extract"
             ) {
                 if !order_by.is_empty() || !within_group.is_empty() {
                     crate::bail_parse_error!(
@@ -5654,7 +5786,45 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     );
                 }
             }
-            let resolution = match function_name.as_str() {
+            let (resolution, children_already_bound) = match function_name.as_str() {
+                "union_value" => {
+                    let ast::Expr::Literal(ast::Literal::String(tag_name)) = args[0].as_ref()
+                    else {
+                        unreachable!("union_value literal argument was validated earlier")
+                    };
+                    let tag_name = tag_name.trim_matches('\'');
+                    let union = expected_type
+                        .filter(|type_def| type_def.is_union())
+                        .ok_or_else(|| {
+                            crate::LimboError::ParseError(
+                                "union_value() can only be used in INSERT/UPDATE targeting a union-typed column"
+                                    .to_string(),
+                            )
+                        })?;
+                    let (tag_index, variant) =
+                        union.find_union_variant(tag_name).ok_or_else(|| {
+                            crate::LimboError::ParseError(format!(
+                                "unknown variant '{}' in union type '{}'",
+                                tag_name, union.name
+                            ))
+                        })?;
+                    let value_type = self
+                        .resolver
+                        .schema()
+                        .get_type_def_unchecked(&variant.type_name);
+                    self.bind_custom_type_function_calls(
+                        &mut args[1],
+                        scope,
+                        value_type.map(AsRef::as_ref),
+                    )?;
+                    (
+                        ast::CustomTypeFunctionResolution::UnionValue {
+                            tag_index,
+                            result_type: union.name.clone(),
+                        },
+                        true,
+                    )
+                }
                 "union_tag" => {
                     let union = self
                         .custom_type_expr_definition(&args[0], scope)
@@ -5670,7 +5840,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                             .expect("union type must have a union definition")
                             .tag_names,
                     );
-                    ast::CustomTypeFunctionResolution::UnionTag { tag_names }
+                    (
+                        ast::CustomTypeFunctionResolution::UnionTag { tag_names },
+                        false,
+                    )
                 }
                 "union_extract" => {
                     let ast::Expr::Literal(ast::Literal::String(tag_name)) = args[1].as_ref()
@@ -5694,10 +5867,13 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                                 tag_name, union.name
                             ))
                         })?;
-                    ast::CustomTypeFunctionResolution::UnionExtract {
-                        tag_index,
-                        result_type: variant.type_name.clone(),
-                    }
+                    (
+                        ast::CustomTypeFunctionResolution::UnionExtract {
+                            tag_index,
+                            result_type: variant.type_name.clone(),
+                        },
+                        false,
+                    )
                 }
                 "struct_extract" => {
                     let ast::Expr::Literal(ast::Literal::String(field_name)) = args[1].as_ref()
@@ -5721,17 +5897,24 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                                 field_name, structure.name
                             ))
                         })?;
-                    ast::CustomTypeFunctionResolution::StructExtract {
-                        field_index,
-                        result_type: field.type_name.clone(),
-                    }
+                    (
+                        ast::CustomTypeFunctionResolution::StructExtract {
+                            field_index,
+                            result_type: field.type_name.clone(),
+                        },
+                        false,
+                    )
                 }
                 _ => return Ok(WalkControl::Continue),
             };
 
             let call = Box::new(take_expr(expr));
             *expr = ast::Expr::BoundCustomTypeFunction { call, resolution };
-            Ok(WalkControl::Continue)
+            Ok(if children_already_bound {
+                WalkControl::SkipChildren
+            } else {
+                WalkControl::Continue
+            })
         })?;
         Ok(())
     }
@@ -6070,6 +6253,15 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
     /// Bind an expression, resolving column references against the given scope.
     fn bind_expr(&mut self, expr: &mut ast::Expr, scope: &BindScope) -> Result<()> {
+        self.bind_expr_with_expected_type(expr, scope, None)
+    }
+
+    fn bind_expr_with_expected_type(
+        &mut self,
+        expr: &mut ast::Expr,
+        scope: &BindScope,
+        expected_type: Option<&crate::schema::TypeDef>,
+    ) -> Result<()> {
         walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
             match expr {
                 ast::Expr::Between { .. } => {
@@ -6212,7 +6404,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             }
             Ok(WalkControl::Continue)
         })?;
-        self.bind_custom_type_function_calls(expr, scope)?;
+        self.bind_custom_type_function_calls(expr, scope, expected_type)?;
         Ok(())
     }
 
@@ -6535,7 +6727,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         };
 
         let mut binder = BindContext::new(self.resolver, &mut *self.id_gen);
-        let aliases = Arc::new(binder.extract_bound_columns(columns, &pattern_scope)?);
+        let aliases = Arc::new(binder.extract_bound_columns(columns, &pattern_scope, &[])?);
         binder.set_aliases(Arc::clone(&aliases));
         binder.with_phase(BindPhase::NoAliases, |binder| {
             binder.bind_select_list(columns, &pattern_scope)
@@ -6627,7 +6819,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             //    the planner via collect_update_set_clauses).
             ctx.with_phase(BindPhase::NoAliases, |ctx| {
                 for set in update.sets.iter_mut() {
-                    ctx.bind_expr(&mut set.expr, &read_scope)?;
+                    bind_update_set(ctx, set, &read_scope, &table)?;
                 }
                 Ok(())
             })?;

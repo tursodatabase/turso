@@ -661,6 +661,21 @@ pub fn translate_expr(
                 ));
             };
             match resolution {
+                ast::CustomTypeFunctionResolution::UnionValue { tag_index, .. } => {
+                    let [_tag, value] = args.as_slice() else {
+                        return Err(crate::LimboError::InternalError(
+                            "bound union_value call has invalid arity".to_string(),
+                        ));
+                    };
+                    let value_register = program.alloc_register();
+                    translate_expr(program, referenced_tables, value, value_register, resolver)?;
+                    program.emit_insn(Insn::UnionPack {
+                        tag_index: *tag_index,
+                        value_reg: value_register,
+                        dest: target_register,
+                    });
+                    Ok(target_register)
+                }
                 ast::CustomTypeFunctionResolution::UnionTag { tag_names } => {
                     let [source] = args.as_slice() else {
                         return Err(crate::LimboError::InternalError(
@@ -1954,51 +1969,9 @@ pub fn translate_expr(
                                 MakeArray
                             )
                         }
-                        ScalarFunc::UnionValueFunc => {
-                            let args = expect_arguments_exact!(args, 2, srf);
-                            let tag_name = extract_string_literal(&args[0])?;
-                            // union_value('tag', val): resolve the tag against the
-                            // target column's union type. The target is set by
-                            // INSERT/UPDATE/UPSERT before translating the value.
-                            let Some(ref union_td) = program.target_union_type else {
-                                return Err(crate::LimboError::ParseError(
-                                    "union_value() can only be used in INSERT/UPDATE targeting a union-typed column".to_string()
-                                ));
-                            };
-                            let Some((tag_index, variant)) = union_td.find_union_variant(&tag_name)
-                            else {
-                                return Err(crate::LimboError::ParseError(format!(
-                                    "unknown variant '{}' in union type '{}'",
-                                    tag_name, union_td.name
-                                )));
-                            };
-                            // If the variant's type is itself a union, set
-                            // target_union_type so nested union_value() resolves
-                            // against the inner union type, not the outer one.
-                            let inner_union_td = resolver
-                                .schema()
-                                .get_type_def_unchecked(&variant.type_name)
-                                .filter(|td| td.is_union())
-                                .cloned();
-                            let prev = program.target_union_type.take();
-                            program.target_union_type = inner_union_td;
-                            let value_reg = program.alloc_register();
-                            let result = translate_expr(
-                                program,
-                                referenced_tables,
-                                &args[1],
-                                value_reg,
-                                resolver,
-                            );
-                            program.target_union_type = prev;
-                            result?;
-                            program.emit_insn(Insn::UnionPack {
-                                tag_index,
-                                value_reg,
-                                dest: target_register,
-                            });
-                            Ok(target_register)
-                        }
+                        ScalarFunc::UnionValueFunc => Err(crate::LimboError::InternalError(
+                            "unbound union_value call reached expression translation".to_string(),
+                        )),
                         ScalarFunc::UnionTagFunc => Err(crate::LimboError::InternalError(
                             "unbound union_tag call reached expression translation".to_string(),
                         )),

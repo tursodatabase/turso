@@ -276,21 +276,6 @@ pub struct ProgramBuilder {
     next_cte_id: usize,
     /// Counter for subquery numbering in EXPLAIN QUERY PLAN output.
     next_subquery_eqp_id: usize,
-    /// Write-context for union-typed columns: tells `union_value('tag', val)`
-    /// which union TypeDef to resolve the tag against.
-    ///
-    /// Unlike read-path functions (`union_tag(col)`, `union_extract(col, 'tag')`)
-    /// which resolve the union type from the column expression they operate on,
-    /// `union_value()` constructs a *new* value — the SQL syntax doesn't reference
-    /// the target column, so the type must come from the INSERT/UPDATE/UPSERT context.
-    ///
-    /// This follows the same save/restore pattern as `id_register_overrides`
-    /// (ENCODE/DECODE context).
-    /// Callers must save with `.take()`, set the new value, translate the expression,
-    /// then restore the saved value. For nested unions (union-in-union), the
-    /// `UnionValueFunc` handler in expr.rs saves/restores this to the inner union
-    /// type before translating the value argument.
-    pub(crate) target_union_type: Option<Arc<crate::schema::TypeDef>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -693,7 +678,6 @@ impl ProgramBuilder {
             next_cte_id: 0,
             materialized_ctes: HashMap::default(),
             next_subquery_eqp_id: 1,
-            target_union_type: None,
         }
     }
 

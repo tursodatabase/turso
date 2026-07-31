@@ -607,23 +607,14 @@ pub fn emit_upsert(
         let mut new_rowid_reg = None;
         for (column_index, expr) in set_pairs.iter_mut() {
             let column = &table.columns()[*column_index];
-            let union_type = resolver
-                .schema()
-                .get_type_def_unchecked(&column.ty_str)
-                .filter(|type_def| type_def.is_union())
-                .cloned();
-            let previous_union_type = program.target_union_type.take();
-            program.target_union_type = union_type;
-            let translate_result = translate_expr_no_constant_opt(
+            translate_expr_no_constant_opt(
                 program,
                 Some(&upsert_expr_tables),
                 expr,
                 layout.to_register(new_start, *column_index),
                 resolver,
                 NoConstantOptReason::RegisterReuse,
-            );
-            program.target_union_type = previous_union_type;
-            translate_result?;
+            )?;
             if column.notnull() && !column.is_rowid_alias() {
                 program.emit_insn(Insn::HaltIfNull {
                     target_reg: layout.to_register(new_start, *column_index),

@@ -233,6 +233,7 @@ pub fn translate_insert(
         inserting_multiple_rows,
         database_id,
         table,
+        value_types,
         target_table_id,
         excluded_table_id,
         bound_index_expressions,
@@ -410,6 +411,7 @@ pub fn translate_insert(
         &columns,
         &table_references,
         database_id,
+        &value_types,
     )?;
     let has_upsert = !upsert_actions.is_empty();
 
@@ -1881,6 +1883,7 @@ fn init_source_emission<'a>(
     columns: &'a [ast::Name],
     table_references: &TableReferences,
     database_id: usize,
+    value_types: &[Option<Arc<crate::schema::TypeDef>>],
 ) -> Result<()> {
     let required_column_count = if columns.is_empty() {
         table.columns().iter().filter(|c| !c.is_generated()).count()
@@ -1940,8 +1943,12 @@ fn init_source_emission<'a>(
                 };
                 let num_result_cols = program.nested(|program| {
                     let mut select = select;
-                    let bound =
-                        crate::translate::select::bind_select_stmt(&mut select, resolver, program)?;
+                    let bound = crate::translate::select::bind_select_stmt_with_expected_types(
+                        &mut select,
+                        resolver,
+                        program,
+                        value_types,
+                    )?;
                     translate_select(
                         select,
                         bound,
@@ -2533,18 +2540,7 @@ fn translate_column(
     is_strict: bool,
 ) -> Result<()> {
     if let Some(value_index) = value_index {
-        // Save/restore target_union_type so union_value() resolves tags
-        // against this column's union type. See ProgramBuilder::target_union_type.
-        let union_td = resolver
-            .schema()
-            .get_type_def_unchecked(&column.ty_str)
-            .filter(|td| td.is_union())
-            .cloned();
-        let prev = program.target_union_type.take();
-        program.target_union_type = union_td;
-        let result = translate_value_fn(program, value_index, column_register);
-        program.target_union_type = prev;
-        result?;
+        translate_value_fn(program, value_index, column_register)?;
     } else if column.is_rowid_alias() {
         // Although a non-NULL integer key is used for the insertion key,
         // the rowid alias column is emitted as NULL.
