@@ -18,6 +18,10 @@ path = "integration/mod.rs"
 name = "fuzz_tests"
 path = "fuzz/mod.rs"
 
+[[test]]
+name = "pending_byte_tests"
+path = "fuzz/pending_byte.rs"
+
 [dependencies]
 anyhow.workspace = true
 env_logger = { workspace = true }
@@ -43,7 +47,7 @@ turso-dbhash.workspace = true
 
 [dev-dependencies]
 similar-asserts.workspace = true
-serial_test = "3"
+serial_test = { version = "3", features = ["file_locks"] }
 test-log = { version = "0.2.17", features = ["trace"] }
 turso_macros.workspace = true
 
