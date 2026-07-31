@@ -234,9 +234,13 @@ This design allows concurrent transactions to make progress during an exclusive 
 ```sql
 ALTER TABLE old_name RENAME TO new_name
 
+ALTER TABLE table_name RENAME COLUMN old_name TO new_name
+
 ALTER TABLE table_name ADD COLUMN column_name [ column_type ]
 
 ALTER TABLE table_name DROP COLUMN column_name
+
+ALTER TABLE table_name ALTER COLUMN column_name TO column_definition
 ```
 
 **Example:**
@@ -252,6 +256,35 @@ turso> ALTER TABLE t DROP COLUMN y;
 turso> .schema t
 CREATE TABLE t ( x  );
 ```
+
+`ALTER COLUMN` is a Turso extension that SQLite does not have. It replaces a
+column's whole definition — name, type, and constraints — in one statement.
+Existing values are converted to the new type the same way an insert would
+convert them, and indexes on the column are rebuilt. Adding a constraint
+checks existing rows first: `NOT NULL` fails if a row is NULL, `CHECK` fails
+if a row violates it. Anything the new definition leaves out (a default, a
+constraint) is dropped.
+
+**Example:**
+
+```console
+turso> CREATE TABLE t(x INT);
+turso> INSERT INTO t VALUES (1);
+turso> ALTER TABLE t ALTER COLUMN x TO x TEXT DEFAULT 'none';
+turso> .schema t
+CREATE TABLE t (x TEXT DEFAULT 'none');
+turso> SELECT x, typeof(x) FROM t;
+┌───┬───────────┐
+│ x │ typeof(x) │
+├───┼───────────┤
+│ 1 │ text      │
+└───┴───────────┘
+```
+
+`ALTER COLUMN` cannot add `PRIMARY KEY` or `UNIQUE` constraints, and cannot
+change the type of a `WITHOUT ROWID` table column or a `STRICT` table column
+to a type its data does not fit. See the
+[SQL reference](sql-reference/statements/alter-table.mdx) for the full rules.
 
 ### `BEGIN TRANSACTION` — start a transaction
 

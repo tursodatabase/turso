@@ -255,6 +255,17 @@ ALTER TABLE users ADD COLUMN email varchar(255);
 
 The added column follows the same STRICT type-checking rules as columns defined in the original CREATE TABLE.
 
+Changing an existing column to a custom type with [ALTER COLUMN](/docs/sql-reference/statements/alter-table#alter-column) requires an empty table, because the type's encoding and validation rules do not run on existing rows:
+
+```sql
+CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) STRICT;
+INSERT INTO t VALUES (1, 'abcdef');
+ALTER TABLE t ALTER COLUMN v TO v varchar(3);
+-- Error: Cannot change a column to a custom type on a non-empty table
+```
+
+Altering other properties of a column that already has a custom type (its default, for example) works on tables with data, as long as the declared type stays the same.
+
 ## Built-in Types
 
 Turso provides the following built-in custom types in STRICT tables:
