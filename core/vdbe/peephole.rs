@@ -107,26 +107,23 @@ impl PassStats {
     }
 
     fn add_to_global(&self) {
+        // Most programs leave most counters at zero; skip those RMWs.
+        fn add(counter: &AtomicU64, value: u64) {
+            if value != 0 {
+                counter.fetch_add(value, Ordering::Relaxed);
+            }
+        }
         let c = &COUNTERS;
         c.programs.fetch_add(1, Ordering::Relaxed);
-        c.jumps_threaded
-            .fetch_add(self.jumps_threaded, Ordering::Relaxed);
-        c.gotos_replaced_with_halt
-            .fetch_add(self.gotos_replaced_with_halt, Ordering::Relaxed);
-        c.branches_inverted
-            .fetch_add(self.branches_inverted, Ordering::Relaxed);
-        c.copies_merged
-            .fetch_add(self.copies_merged, Ordering::Relaxed);
-        c.affinities_folded
-            .fetch_add(self.affinities_folded, Ordering::Relaxed);
-        c.jumps_to_next_deleted
-            .fetch_add(self.jumps_to_next_deleted, Ordering::Relaxed);
-        c.unreachable_deleted
-            .fetch_add(self.unreachable_deleted, Ordering::Relaxed);
-        c.cmp_deletes_skipped
-            .fetch_add(self.cmp_deletes_skipped, Ordering::Relaxed);
-        c.affinity_folds_skipped
-            .fetch_add(self.affinity_folds_skipped, Ordering::Relaxed);
+        add(&c.jumps_threaded, self.jumps_threaded);
+        add(&c.gotos_replaced_with_halt, self.gotos_replaced_with_halt);
+        add(&c.branches_inverted, self.branches_inverted);
+        add(&c.copies_merged, self.copies_merged);
+        add(&c.affinities_folded, self.affinities_folded);
+        add(&c.jumps_to_next_deleted, self.jumps_to_next_deleted);
+        add(&c.unreachable_deleted, self.unreachable_deleted);
+        add(&c.cmp_deletes_skipped, self.cmp_deletes_skipped);
+        add(&c.affinity_folds_skipped, self.affinity_folds_skipped);
     }
 }
 
@@ -201,6 +198,33 @@ extern "C" fn dump_stats_at_exit() {
 ///
 /// `comments` maps instruction indices to EXPLAIN comments; entries move with
 /// their instruction and entries for deleted instructions are dropped.
+/// Reusable per-thread buffers. The pass runs on every prepare, often on
+/// programs a handful of instructions long, where fresh allocations would
+/// dominate its cost.
+#[derive(Default)]
+struct Scratch {
+    /// Which instructions are still alive.
+    live: Vec<bool>,
+    /// Which instructions some branch operand points at.
+    targets: Vec<bool>,
+    /// Rule 1's "was a Goto" set, reused as the sweep's "reached" set.
+    aux: Vec<bool>,
+    /// Rule 1's chain resolution state per instruction.
+    state: Vec<u8>,
+    /// Rule 1's final chain destinations, reused as compaction's old-to-new map.
+    u32_a: Vec<u32>,
+    /// The sweep's next-live-instruction table.
+    u32_b: Vec<u32>,
+    /// Rule 1's current chain of Gotos.
+    chain: Vec<u32>,
+    /// The sweep's worklist.
+    worklist: Vec<u32>,
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+}
+
 pub(crate) fn optimize_program(
     insns: &mut Vec<(Insn, usize)>,
     comments: &mut Vec<(InsnReference, &'static str)>,
@@ -210,19 +234,55 @@ pub(crate) fn optimize_program(
         return;
     }
     maybe_register_stats_dump();
+    SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut scratch) => run_pass(insns, comments, &mut scratch),
+        // Defensive: if a prepare ever nests inside another prepare on this
+        // thread, fall back to fresh buffers instead of sharing.
+        Err(_) => run_pass(insns, comments, &mut Scratch::default()),
+    });
+}
 
+fn run_pass(
+    insns: &mut Vec<(Insn, usize)>,
+    comments: &mut Vec<(InsnReference, &'static str)>,
+    scratch: &mut Scratch,
+) {
+    let n = insns.len();
     let mut stats = PassStats::default();
-    let mut live = vec![true; n];
-    // Scratch buffer for "is instruction i the target of any branch operand".
-    let mut targets = vec![false; n];
+    scratch.live.clear();
+    scratch.live.resize(n, true);
 
-    thread_jumps(insns, &mut stats);
-    invert_branches_over_gotos(insns, &mut live, &mut targets, &mut stats);
-    merge_adjacent_copies(insns, &mut live, &mut targets, &mut stats);
-    fold_affinity_into_make_record(insns, &mut live, &mut targets, &mut stats);
-    delete_jumps_to_next(insns, &mut live, &mut targets, &mut stats);
-    sweep_unreachable(insns, &mut live, &mut stats);
-    compact(insns, comments, &live);
+    // Threading also fills `scratch.targets` (which instructions some branch
+    // operand points at) in its operand walk: collected after retargeting and
+    // before anything is marked dead, so every operand (including those of
+    // instructions that later die) is included. The only rule that changes a
+    // target afterwards is the inversion, and the destination it retargets to
+    // is the dead Goto's destination, which that Goto's own operand already
+    // put in the set. Staleness is therefore always conservative: it can only
+    // block a rewrite.
+    let present = thread_jumps(insns, scratch, &mut stats);
+
+    let (live, targets) = (&mut scratch.live, &mut scratch.targets);
+    if present.any_goto {
+        // The inversion needs a Goto right after the conditional.
+        invert_branches_over_gotos(insns, live, targets, &mut stats);
+    }
+    if present.any_copy {
+        merge_adjacent_copies(insns, live, targets, &mut stats);
+    }
+    if present.any_affinity {
+        fold_affinity_into_make_record(insns, live, targets, &mut stats);
+    }
+    delete_jumps_to_next(insns, live, targets, &mut stats);
+    let dead_before_sweep = stats.branches_inverted
+        + stats.copies_merged
+        + stats.affinities_folded
+        + stats.jumps_to_next_deleted
+        > 0;
+    sweep_unreachable(insns, scratch, dead_before_sweep, &mut stats);
+    if dead_before_sweep || stats.unreachable_deleted > 0 {
+        compact(insns, comments, scratch);
+    }
 
     #[cfg(debug_assertions)]
     verify_all_branches_resolved(insns);
@@ -259,12 +319,27 @@ fn resolved_target(off: &BranchOffset, n: usize) -> Option<u32> {
 /// Afterwards, any `Goto` that (now) points directly at a plain `Halt` is
 /// replaced by a copy of that `Halt`: jumping to a `Halt` and executing it is
 /// identical to executing it in place, since `Goto` has no other effect.
-fn thread_jumps(insns: &mut [(Insn, usize)], stats: &mut PassStats) {
+/// Which opcodes the program contains at all, so `run_pass` can skip rules
+/// that cannot fire. Collected during rule 1's scans, which touch every
+/// instruction anyway.
+struct RulePresence {
+    any_goto: bool,
+    any_copy: bool,
+    any_affinity: bool,
+}
+
+fn thread_jumps(
+    insns: &mut [(Insn, usize)],
+    scratch: &mut Scratch,
+    stats: &mut PassStats,
+) -> RulePresence {
     let n = insns.len();
-    let is_goto: Vec<bool> = insns
-        .iter()
-        .map(|(insn, _)| matches!(insn, Insn::Goto { .. }))
-        .collect();
+    // was_goto[i]: instruction i was a Goto when chains were resolved. Kept
+    // separately from a live `matches!` check so that replacing a Goto with a
+    // Halt below does not stop later operands from threading through it.
+    let was_goto = &mut scratch.aux;
+    was_goto.clear();
+    was_goto.resize(n, false);
 
     // For each Goto index: the ultimate non-Goto destination of its chain, or
     // its own index when the chain hits a cycle or an unresolved operand
@@ -272,11 +347,34 @@ fn thread_jumps(insns: &mut [(Insn, usize)], stats: &mut PassStats) {
     const UNVISITED: u8 = 0;
     const IN_PROGRESS: u8 = 1;
     const DONE: u8 = 2;
-    let mut final_target: Vec<u32> = (0..n as u32).collect();
-    let mut state = vec![UNVISITED; n];
-    let mut chain: Vec<u32> = Vec::new();
+    let final_target = &mut scratch.u32_a;
+    final_target.clear();
+    final_target.extend(0..n as u32);
+    let state = &mut scratch.state;
+    state.clear();
+    state.resize(n, UNVISITED);
+    let chain = &mut scratch.chain;
+    let mut present = RulePresence {
+        any_goto: false,
+        any_copy: false,
+        any_affinity: false,
+    };
     for i in 0..n {
-        if !is_goto[i] || state[i] != UNVISITED {
+        match &insns[i].0 {
+            Insn::Copy { .. } => {
+                present.any_copy = true;
+                continue;
+            }
+            Insn::Affinity { .. } => {
+                present.any_affinity = true;
+                continue;
+            }
+            Insn::Goto { .. } => {}
+            _ => continue,
+        }
+        was_goto[i] = true;
+        present.any_goto = true;
+        if state[i] != UNVISITED {
             continue;
         }
         chain.clear();
@@ -286,12 +384,12 @@ fn thread_jumps(insns: &mut [(Insn, usize)], stats: &mut PassStats) {
             state[cur as usize] = IN_PROGRESS;
             chain.push(cur);
             let Insn::Goto { target_pc } = &insns[cur as usize].0 else {
-                unreachable!("is_goto guarantees a Goto");
+                unreachable!("checked above");
             };
             let Some(t) = resolved_target(target_pc, n) else {
                 break None;
             };
-            if !is_goto[t as usize] {
+            if !matches!(insns[t as usize].0, Insn::Goto { .. }) {
                 break Some(t);
             }
             match state[t as usize] {
@@ -303,64 +401,78 @@ fn thread_jumps(insns: &mut [(Insn, usize)], stats: &mut PassStats) {
                 _ => cur = t,
             }
         };
-        for &g in &chain {
+        for &g in chain.iter() {
             state[g as usize] = DONE;
             if let Some(d) = final_dst {
                 final_target[g as usize] = d;
             }
         }
     }
-
     // Retarget every operand that lands on a Goto with a known final
-    // destination. This includes the Gotos' own targets, so after this loop
-    // every Goto in a chain points directly at the chain's destination.
-    for (insn, _) in insns.iter_mut() {
-        insn.for_each_branch_offset(|off| {
+    // destination, and record the (post-rewrite) target set for the rules
+    // below in the same walk. Retargeting includes the Gotos' own operands,
+    // so every Goto in a chain ends up pointing directly at the chain's
+    // destination — which is why a Goto whose destination is a plain Halt can
+    // become a copy of that Halt in the same walk: its own operand was just
+    // rewritten, and operands of later instructions thread through
+    // `was_goto`/`final_target` rather than re-inspecting the replaced
+    // instruction.
+    let targets = &mut scratch.targets;
+    targets.clear();
+    targets.resize(n, false);
+    let threading = present.any_goto;
+    for i in 0..n {
+        if was_goto[i] {
+            // A Goto has exactly one operand. Thread it, and if the final
+            // destination is a plain Halt, become a copy of that Halt: the
+            // operand disappears with the replacement, so it must not be
+            // recorded as a target (that would keep an otherwise-unreachable
+            // Halt alive). The chain destination is never itself a Goto
+            // (cycles keep final_target[i] == i and are skipped by the
+            // d != i check), so a Halt seen here is a real Halt, not a copy
+            // this loop created.
+            let Insn::Goto { target_pc } = &mut insns[i].0 else {
+                unreachable!("was_goto is only set on Gotos and nothing replaced this one yet");
+            };
+            let Some(t) = resolved_target(target_pc, n) else {
+                continue;
+            };
+            let d = if threading && was_goto[t as usize] {
+                let d = final_target[t as usize];
+                if d != t {
+                    *target_pc = BranchOffset::Offset(d);
+                    stats.jumps_threaded += 1;
+                }
+                d
+            } else {
+                t
+            };
+            if d as usize != i && matches!(insns[d as usize].0, Insn::Halt { .. }) {
+                let halt = insns[d as usize].0.clone();
+                insns[i].0 = halt;
+                stats.gotos_replaced_with_halt += 1;
+            } else {
+                targets[d as usize] = true;
+            }
+            continue;
+        }
+        insns[i].0.for_each_branch_offset(|off| {
             let Some(t) = resolved_target(off, n) else {
                 return;
             };
-            if is_goto[t as usize] {
+            if threading && was_goto[t as usize] {
                 let d = final_target[t as usize];
                 if d != t {
                     *off = BranchOffset::Offset(d);
                     stats.jumps_threaded += 1;
+                    targets[d as usize] = true;
+                    return;
                 }
             }
+            targets[t as usize] = true;
         });
     }
-
-    // Replace `Goto -> Halt` with a copy of the Halt.
-    for i in 0..n {
-        if !is_goto[i] {
-            continue;
-        }
-        let Insn::Goto { target_pc } = &insns[i].0 else {
-            unreachable!("is_goto guarantees a Goto");
-        };
-        let Some(t) = resolved_target(target_pc, n) else {
-            continue;
-        };
-        if t as usize != i && matches!(insns[t as usize].0, Insn::Halt { .. }) {
-            let halt = insns[t as usize].0.clone();
-            insns[i].0 = halt;
-            stats.gotos_replaced_with_halt += 1;
-        }
-    }
-}
-
-/// Fill `targets[i] = true` for every instruction `i` that some branch operand
-/// points at. Operands of instructions already marked dead are included on
-/// purpose: that is conservative (it only ever blocks a rewrite).
-fn collect_jump_targets(insns: &mut [(Insn, usize)], targets: &mut [bool]) {
-    targets.fill(false);
-    let n = insns.len();
-    for (insn, _) in insns.iter_mut() {
-        insn.for_each_branch_offset(|off| {
-            if let Some(t) = resolved_target(off, n) {
-                targets[t as usize] = true;
-            }
-        });
-    }
+    present
 }
 
 /// The conditional opcodes rule 2 knows how to invert, paired up.
@@ -519,7 +631,6 @@ fn invert_branches_over_gotos(
     if n < 3 {
         return;
     }
-    collect_jump_targets(insns, targets);
     for i in 0..n - 2 {
         if !live[i] || !live[i + 1] || targets[i + 1] {
             continue;
@@ -559,7 +670,6 @@ fn merge_adjacent_copies(
     stats: &mut PassStats,
 ) {
     let n = insns.len();
-    collect_jump_targets(insns, targets);
     let mut i = 0;
     while i < n {
         if !live[i] {
@@ -654,7 +764,6 @@ fn fold_affinity_into_make_record(
         (from..live.len()).find(|&j| live[j])
     }
     let n = insns.len();
-    collect_jump_targets(insns, targets);
     for i in 0..n {
         if !live[i] {
             continue;
@@ -756,7 +865,6 @@ fn delete_jumps_to_next(
     stats: &mut PassStats,
 ) {
     let n = insns.len();
-    collect_jump_targets(insns, targets);
     for i in 0..n {
         if !live[i] || targets[i] {
             continue;
@@ -826,26 +934,47 @@ fn delete_jumps_to_next(
 
 /// Rule 6: delete instructions no path from instruction 0 reaches.
 ///
-/// Successors of a live instruction:
+/// Worklist reachability over the live instructions. Successors of a live
+/// instruction:
 /// - `Goto`, `Jump`, `Halt`: their branch targets only (none for `Halt`).
 /// - everything else: every branch target plus the next live instruction.
 ///   That covers `Gosub` and `Yield`, whose "return points" (index + 1) are
 ///   entered dynamically through an address stored in a register, and stays
 ///   conservative for opcodes like `Init` that never actually fall through.
-fn sweep_unreachable(insns: &mut [(Insn, usize)], live: &mut [bool], stats: &mut PassStats) {
+///
+/// A cheaper single forward scan (reachable = jump target or fall-through)
+/// was tried here and rejected: window-function programs carry whole dead
+/// regions with internal loops, and any scheme that trusts the static target
+/// set keeps a dead cycle alive because its members point at each other.
+/// Only real reachability from instruction 0 removes them.
+fn sweep_unreachable(
+    insns: &mut [(Insn, usize)],
+    scratch: &mut Scratch,
+    any_dead: bool,
+    stats: &mut PassStats,
+) {
     let n = insns.len();
-    // next_live[i] = smallest live index strictly greater than i.
-    let mut next_live = vec![u32::MAX; n];
-    let mut nl = u32::MAX;
-    for i in (0..n).rev() {
-        next_live[i] = nl;
-        if live[i] {
-            nl = i as u32;
+    let live = &mut scratch.live;
+    // next_live[i] = smallest live index strictly greater than i. When
+    // nothing is dead yet that is just i + 1, so skip building the table.
+    let next_live = &mut scratch.u32_b;
+    next_live.clear();
+    if any_dead {
+        next_live.resize(n, u32::MAX);
+        let mut nl = u32::MAX;
+        for i in (0..n).rev() {
+            next_live[i] = nl;
+            if live[i] {
+                nl = i as u32;
+            }
         }
     }
 
-    let mut reached = vec![false; n];
-    let mut worklist: Vec<u32> = Vec::with_capacity(16);
+    let reached = &mut scratch.aux;
+    reached.clear();
+    reached.resize(n, false);
+    let worklist = &mut scratch.worklist;
+    worklist.clear();
     // Instruction 0 may itself have been marked dead by an earlier rule; the
     // walk still starts there because its fall-through successor is the next
     // live instruction, which is where execution starts after compaction.
@@ -868,7 +997,13 @@ fn sweep_unreachable(insns: &mut [(Insn, usize)], live: &mut [bool], stats: &mut
             }
         });
         if falls_through {
-            let next = next_live[i];
+            let next = if any_dead {
+                next_live[i]
+            } else if i + 1 < n {
+                i as u32 + 1
+            } else {
+                u32::MAX
+            };
             if next != u32::MAX && !reached[next as usize] {
                 worklist.push(next);
             }
@@ -889,10 +1024,13 @@ fn sweep_unreachable(insns: &mut [(Insn, usize)], live: &mut [bool], stats: &mut
 fn compact(
     insns: &mut Vec<(Insn, usize)>,
     comments: &mut Vec<(InsnReference, &'static str)>,
-    live: &[bool],
+    scratch: &mut Scratch,
 ) {
     let n = insns.len();
-    let mut old_to_new = vec![u32::MAX; n];
+    let live = &scratch.live;
+    let old_to_new = &mut scratch.u32_a;
+    old_to_new.clear();
+    old_to_new.resize(n, u32::MAX);
     let mut new_index = 0u32;
     for i in 0..n {
         if live[i] {
@@ -1062,9 +1200,9 @@ mod tests {
         assert_eq!(actual_fmt, expected_fmt);
     }
 
-    fn run_whole_pass(
-        insns: Vec<Insn>,
-    ) -> (Vec<(Insn, usize)>, Vec<(InsnReference, &'static str)>) {
+    type PassOutput = (Vec<(Insn, usize)>, Vec<(InsnReference, &'static str)>);
+
+    fn run_whole_pass(insns: Vec<Insn>) -> PassOutput {
         let mut insns = prog(insns);
         let mut comments = Vec::new();
         optimize_program(&mut insns, &mut comments);
@@ -1083,7 +1221,7 @@ mod tests {
             integer(7, 0),        // 4
         ]);
         let mut stats = PassStats::default();
-        thread_jumps(&mut insns, &mut stats);
+        thread_jumps(&mut insns, &mut Scratch::default(), &mut stats);
         assert_program(
             &insns,
             &[
@@ -1103,7 +1241,7 @@ mod tests {
     fn threading_leaves_a_goto_to_itself_alone() {
         let mut insns = prog(vec![if_insn(0, 1, false), goto(1), halt()]);
         let mut stats = PassStats::default();
-        thread_jumps(&mut insns, &mut stats);
+        thread_jumps(&mut insns, &mut Scratch::default(), &mut stats);
         assert_program(&insns, &[if_insn(0, 1, false), goto(1), halt()]);
         assert_eq!(stats.jumps_threaded, 0);
     }
@@ -1112,7 +1250,7 @@ mod tests {
     fn threading_leaves_a_two_goto_cycle_alone() {
         let mut insns = prog(vec![if_insn(0, 1, false), goto(2), goto(1), halt()]);
         let mut stats = PassStats::default();
-        thread_jumps(&mut insns, &mut stats);
+        thread_jumps(&mut insns, &mut Scratch::default(), &mut stats);
         assert_program(&insns, &[if_insn(0, 1, false), goto(2), goto(1), halt()]);
     }
 
@@ -1124,7 +1262,7 @@ mod tests {
             halt_err(19, "constraint"), // 2
         ]);
         let mut stats = PassStats::default();
-        thread_jumps(&mut insns, &mut stats);
+        thread_jumps(&mut insns, &mut Scratch::default(), &mut stats);
         assert_program(
             &insns,
             &[
@@ -1140,9 +1278,23 @@ mod tests {
     fn conditional_branch_to_halt_is_not_replaced() {
         let mut insns = prog(vec![if_insn(0, 2, false), integer(1, 0), halt()]);
         let mut stats = PassStats::default();
-        thread_jumps(&mut insns, &mut stats);
+        thread_jumps(&mut insns, &mut Scratch::default(), &mut stats);
         assert_program(&insns, &[if_insn(0, 2, false), integer(1, 0), halt()]);
         assert_eq!(stats.gotos_replaced_with_halt, 0);
+    }
+
+    /// Populate `targets` the way `run_pass` does before the rules run.
+    fn collect_targets_for_test(insns: &mut [(Insn, usize)]) -> Vec<bool> {
+        let n = insns.len();
+        let mut targets = vec![false; n];
+        for (insn, _) in insns.iter_mut() {
+            insn.for_each_branch_offset(|off| {
+                if let Some(t) = resolved_target(off, n) {
+                    targets[t as usize] = true;
+                }
+            });
+        }
+        targets
     }
 
     // ---------------- rule 2: branch-over-goto inversion ----------------
@@ -1150,7 +1302,7 @@ mod tests {
     fn run_inversion(insns: &mut [(Insn, usize)]) -> (Vec<bool>, PassStats) {
         let n = insns.len();
         let mut live = vec![true; n];
-        let mut targets = vec![false; n];
+        let mut targets = collect_targets_for_test(insns);
         let mut stats = PassStats::default();
         invert_branches_over_gotos(insns, &mut live, &mut targets, &mut stats);
         (live, stats)
@@ -1283,7 +1435,7 @@ mod tests {
     fn run_copy_merge(insns: &mut [(Insn, usize)]) -> (Vec<bool>, PassStats) {
         let n = insns.len();
         let mut live = vec![true; n];
-        let mut targets = vec![false; n];
+        let mut targets = collect_targets_for_test(insns);
         let mut stats = PassStats::default();
         merge_adjacent_copies(insns, &mut live, &mut targets, &mut stats);
         (live, stats)
@@ -1348,7 +1500,7 @@ mod tests {
     fn run_affinity_fold(insns: &mut [(Insn, usize)]) -> (Vec<bool>, PassStats) {
         let n = insns.len();
         let mut live = vec![true; n];
-        let mut targets = vec![false; n];
+        let mut targets = collect_targets_for_test(insns);
         let mut stats = PassStats::default();
         fold_affinity_into_make_record(insns, &mut live, &mut targets, &mut stats);
         (live, stats)
@@ -1445,7 +1597,7 @@ mod tests {
     fn run_delete_jump_to_next(insns: &mut [(Insn, usize)]) -> (Vec<bool>, PassStats) {
         let n = insns.len();
         let mut live = vec![true; n];
-        let mut targets = vec![false; n];
+        let mut targets = collect_targets_for_test(insns);
         let mut stats = PassStats::default();
         delete_jumps_to_next(insns, &mut live, &mut targets, &mut stats);
         (live, stats)
@@ -1539,10 +1691,12 @@ mod tests {
 
     fn run_sweep(insns: &mut [(Insn, usize)]) -> (Vec<bool>, PassStats) {
         let n = insns.len();
-        let mut live = vec![true; n];
+        let mut scratch = Scratch::default();
+        scratch.live.resize(n, true);
+        scratch.targets = collect_targets_for_test(insns);
         let mut stats = PassStats::default();
-        sweep_unreachable(insns, &mut live, &mut stats);
-        (live, stats)
+        sweep_unreachable(insns, &mut scratch, false, &mut stats);
+        (scratch.live, stats)
     }
 
     #[test]
@@ -1625,13 +1779,83 @@ mod tests {
         let mut insns = prog(insns);
         let mut comments: Vec<(InsnReference, &'static str)> =
             vec![(0, "jump"), (1, "dead"), (2, "stop")];
-        let live = vec![true, false, true];
-        compact(&mut insns, &mut comments, &live);
+        let mut scratch = Scratch {
+            live: vec![true, false, true],
+            ..Scratch::default()
+        };
+        compact(&mut insns, &mut comments, &mut scratch);
         assert_program(&insns, &[goto(1), halt()]);
         assert_eq!(comments, vec![(0, "jump"), (1, "stop")]);
     }
 
     // ---------------- whole pass ----------------
+
+    /// Not a correctness test: measures the pass by itself, back to back with
+    /// the clone cost, so the numbers hold up even on machines whose speed
+    /// drifts between runs. Run with:
+    /// `cargo test --release -p turso_core --lib time_the_pass -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual timing harness"]
+    fn time_the_pass_manually() {
+        use std::time::Instant;
+        let build = || {
+            vec![
+                Insn::Init { target_pc: off(4) },
+                integer(1, 0),
+                goto(3),
+                Insn::ResultRow {
+                    start_reg: 0,
+                    count: 1,
+                },
+                halt(),
+                Insn::Transaction {
+                    db: 0,
+                    tx_mode: crate::translate::emitter::TransactionMode::Read,
+                    schema_cookie: 0,
+                },
+                goto(1),
+            ]
+        };
+        let build_noop = || {
+            vec![
+                Insn::Init { target_pc: off(3) },
+                Insn::ResultRow {
+                    start_reg: 0,
+                    count: 1,
+                },
+                halt(),
+                Insn::Transaction {
+                    db: 0,
+                    tx_mode: crate::translate::emitter::TransactionMode::Read,
+                    schema_cookie: 0,
+                },
+                goto(1),
+            ]
+        };
+        let iters = 1_000_000u32;
+        let mut sink = 0usize;
+        let time = |f: &dyn Fn() -> Vec<Insn>, run: bool, sink: &mut usize| {
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                let mut p = prog(f());
+                if run {
+                    let mut c = Vec::new();
+                    optimize_program(&mut p, &mut c);
+                }
+                *sink += p.len();
+            }
+            t0.elapsed() / iters
+        };
+        let clone_rw = time(&build, false, &mut sink);
+        let full_rw = time(&build, true, &mut sink);
+        let clone_no = time(&build_noop, false, &mut sink);
+        let full_no = time(&build_noop, true, &mut sink);
+        eprintln!(
+            "rewriting: pass {:?}/iter; no-op: pass {:?}/iter (sink {sink})",
+            full_rw - clone_rw,
+            full_no - clone_no,
+        );
+    }
 
     #[test]
     fn single_row_insert_epilogue_collapses() {

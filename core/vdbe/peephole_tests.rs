@@ -43,7 +43,6 @@ fn with_pass<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
 struct ExplainRow {
     addr: i64,
     opcode: String,
-    p1: i64,
     p2: i64,
     p3: i64,
 }
@@ -61,7 +60,6 @@ fn explain(conn: &Arc<Connection>, sql: &str) -> Vec<ExplainRow> {
             ExplainRow {
                 addr: int(&row[0]),
                 opcode: row[1].to_text().unwrap().to_string(),
-                p1: int(&row[2]),
                 p2: int(&row[3]),
                 p3: int(&row[4]),
             }
@@ -295,4 +293,64 @@ fn escape_hatch_toggles_the_pass() {
     assert!(has_goto_to_next(&off));
     assert!(!has_goto_to_next(&on));
     assert!(on.len() < off.len());
+}
+
+/// Not a correctness test: measures real prepare cost with the pass on and
+/// off in alternating blocks within one process, so machine speed drift
+/// cancels out. Run with:
+/// `cargo test --release -p turso_core --lib prepare_overhead -- --ignored --nocapture`
+#[test]
+#[ignore = "manual timing harness"]
+fn prepare_overhead_manually() {
+    use std::time::Instant;
+    let conn = fresh_db();
+    exec(
+        &conn,
+        "CREATE TABLE users(id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT, \
+         state TEXT, city TEXT, age INT, email TEXT, phone_number TEXT, zipcode TEXT)",
+    );
+    let queries = [
+        ("SELECT 1", 20_000u32),
+        ("SELECT * FROM users LIMIT 1", 10_000),
+        (
+            "SELECT first_name, count(1) FROM users GROUP BY first_name \
+             HAVING count(1) > 1 ORDER BY count(1) LIMIT 1",
+            5_000,
+        ),
+        ("INSERT INTO users(id, first_name) VALUES (1, 'a')", 10_000),
+    ];
+    for (sql, iters) in queries {
+        let measure = |enabled: bool| {
+            with_pass(enabled, || {
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    let stmt = conn.prepare(sql).unwrap();
+                    std::hint::black_box(&stmt);
+                }
+                t0.elapsed()
+            })
+        };
+        // Warm up, then alternate off/on blocks and use the sums.
+        measure(false);
+        measure(true);
+        let (mut off_total, mut on_total) = (Vec::new(), Vec::new());
+        for _ in 0..6 {
+            off_total.push(measure(false));
+            on_total.push(measure(true));
+        }
+        off_total.sort();
+        on_total.sort();
+        // Median block per side.
+        let off = off_total[off_total.len() / 2] / iters;
+        let on = on_total[on_total.len() / 2] / iters;
+        let delta = on.as_nanos() as i128 - off.as_nanos() as i128;
+        eprintln!(
+            "prepare {:60} off {:>8.3?} on {:>8.3?} delta {:>6}ns ({:+.1}%)",
+            &sql[..sql.len().min(60)],
+            off,
+            on,
+            delta,
+            delta as f64 * 100.0 / off.as_nanos() as f64,
+        );
+    }
 }
