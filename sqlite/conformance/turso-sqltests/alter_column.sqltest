@@ -1550,3 +1550,22 @@ test fail-insert-too-long-after-alter-to-varchar {
 }
 expect error {
 }
+
+# Domain types require STRICT tables, same as ADD COLUMN: on a
+# non-STRICT table the domain's constraints would silently not apply.
+test fail-alter-column-domain-type-on-non-strict-table {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE n (x INTEGER);
+    ALTER TABLE n ALTER COLUMN x TO x posint;
+}
+expect error {
+}
+
+test alter-column-domain-type-on-strict-table {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE n (id INTEGER PRIMARY KEY, x INTEGER) STRICT;
+    ALTER TABLE n ALTER COLUMN x TO x posint;
+    INSERT INTO n VALUES (1, -5);
+}
+expect error {
+}

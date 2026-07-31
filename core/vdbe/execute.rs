@@ -15292,6 +15292,42 @@ pub fn op_alter_column(
     let new_column = crate::schema::Column::try_from(definition.as_ref())?;
     let new_name = definition.col_name.as_str().to_owned();
 
+    // If the new type is a domain, its NOT NULL and CHECK constraints must
+    // land on the table like CREATE TABLE and ADD COLUMN propagate them.
+    // Resolve them up front: the schema mutation below holds a mutable
+    // borrow that a resolve_type call would conflict with.
+    let mut domain_checks: Vec<crate::schema::CheckConstraint> = Vec::new();
+    let mut domain_not_null = false;
+    if !*rename {
+        conn.with_schema(*db, |schema| -> Result<()> {
+            let Some(resolved) = schema.resolve_type_unchecked(&new_column.ty_str)? else {
+                return Ok(());
+            };
+            if !resolved.is_domain() {
+                return Ok(());
+            }
+            let col_name = normalize_ident(&new_name);
+            for td in &resolved.chain {
+                if td.not_null {
+                    domain_not_null = true;
+                }
+                for (i, dc) in td.domain_checks.iter().enumerate() {
+                    let rewritten = crate::schema::rewrite_value_to_column(&dc.check, &col_name);
+                    let name = dc
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("{}_{}", td.name, i));
+                    domain_checks.push(crate::schema::CheckConstraint {
+                        name: Some(name),
+                        expr: *rewritten,
+                        column: Some(col_name.clone()),
+                    });
+                }
+            }
+            Ok(())
+        })?;
+    }
+
     let column_name_changed = *rename
         || !normalize_ident(&old_column_name).eq_ignore_ascii_case(&normalize_ident(&new_name));
     let view_rewrites: Vec<(usize, String, RewrittenView)> = if column_name_changed {
@@ -15430,6 +15466,13 @@ pub fn op_alter_column(
                             new_column.name.as_deref(),
                         ));
                 }
+            }
+
+            if btree.is_strict {
+                if domain_not_null {
+                    btree.columns_mut()[*column_index].set_notnull(true);
+                }
+                btree.check_constraints.append(&mut domain_checks);
             }
 
             // The new definition also replaces any column-level foreign key.

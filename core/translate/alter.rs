@@ -1833,6 +1833,20 @@ pub fn translate_alter_table(
                 true => (false, false, None),
                 false => {
                     let replacement_column = Column::try_from(&definition)?;
+                    if !btree.is_strict {
+                        if let Some(col_type) = definition.col_type.as_ref() {
+                            if let Some(td) = resolver
+                                .schema()
+                                .get_type_def_unchecked(&normalize_ident(col_type.name.as_str()))
+                            {
+                                if td.is_domain {
+                                    return Err(LimboError::ParseError(format!(
+                                        "domain type columns require STRICT tables: {table_name}.{col_name}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
                     if btree.is_strict {
                         let Some(col_type) = definition.col_type.as_ref() else {
                             return Err(LimboError::ParseError(format!(
