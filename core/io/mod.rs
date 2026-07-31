@@ -290,10 +290,12 @@ pub trait File: Send + Sync {
 }
 
 pub struct TempFile {
+    pub(crate) file: Arc<dyn File>,
     /// When temp_dir is dropped the folder is deleted
     /// set to None if tempfile allocated in memory (for example, in case of WASM target)
-    _temp_dir: Option<tempfile::TempDir>,
-    pub(crate) file: Arc<dyn File>,
+    /// Declared after `file` so the file closes before Windows removes its directory.
+    #[allow(dead_code, reason = "held for its Drop side effect")]
+    temp_dir: Option<tempfile::TempDir>,
 }
 
 impl TempFile {
@@ -307,7 +309,7 @@ impl TempFile {
             })?;
             let chunk_file = io.open_file(chunk_file_path_str, OpenFlags::Create, false)?;
             Ok(TempFile {
-                _temp_dir: Some(temp_dir),
+                temp_dir: Some(temp_dir),
                 file: chunk_file.clone(),
             })
         }
@@ -320,7 +322,7 @@ impl TempFile {
             let memory_io = Arc::new(MemoryIO::new());
             let memory_file = memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
             Ok(TempFile {
-                _temp_dir: None,
+                temp_dir: None,
                 file: memory_file,
             })
         }
@@ -340,7 +342,7 @@ impl TempFile {
                 let memory_file =
                     memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
                 Ok(TempFile {
-                    _temp_dir: None,
+                    temp_dir: None,
                     file: memory_file,
                 })
             }
@@ -351,7 +353,7 @@ impl TempFile {
                     let memory_file =
                         memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
                     return Ok(TempFile {
-                        _temp_dir: None,
+                        temp_dir: None,
                         file: memory_file,
                     });
                 }
@@ -365,6 +367,27 @@ impl TempFile {
             let _ = temp_store;
             Self::new(io)
         }
+    }
+}
+
+#[cfg(all(test, target_os = "windows", feature = "fs"))]
+mod temp_file_tests {
+    use super::*;
+
+    #[test]
+    fn closes_file_before_removing_temp_directory() {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().expect("platform IO must initialize"));
+        let temp_file = TempFile::new(&io).expect("temporary file must open");
+        let temp_dir = temp_file
+            .temp_dir
+            .as_ref()
+            .expect("filesystem temporary file must retain its directory")
+            .path()
+            .to_owned();
+
+        assert!(temp_dir.exists());
+        drop(temp_file);
+        assert!(!temp_dir.exists());
     }
 }
 
