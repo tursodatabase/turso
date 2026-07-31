@@ -898,6 +898,13 @@ pub(super) fn btree_access_order_consumed(
                     break;
                 }
 
+                // An index scan delivers NULLs in a known position: by
+                // default NULLs come first on a forward scan and last on a
+                // reverse scan, and an explicit NULLS FIRST/LAST on the index
+                // column flips that. If the scan delivers NULLs in a different
+                // position than the query requests, the index cannot satisfy
+                // the ordering and we must fall back to a sorter. MIN/MAX skip
+                // NULLs entirely, so for them the position does not matter.
                 if !order_target.is_extremum() {
                     let requested_nulls = target_col.effective_nulls_order();
                     let effective_nulls = idx_col.effective_nulls_order_when_iterated(iter_dir);
