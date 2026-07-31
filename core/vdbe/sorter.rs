@@ -1483,12 +1483,10 @@ mod tests {
             };
             let values = try_vec![Value::from_i64(1), second].unwrap();
             let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
-            io.block(|| sorter.insert(&record))
-                .expect("Failed to insert the record");
+            io.block(|| sorter.insert(&record)).unwrap();
         }
 
-        io.block(|| sorter.sort())
-            .expect("Failed to sort the records");
+        io.block(|| sorter.sort()).unwrap();
         assert!(
             !sorter.chunks.is_empty(),
             "test requires the sorter to have spilled to chunks"
@@ -1519,8 +1517,7 @@ mod tests {
                 }
             }
             idx += 1;
-            io.block(|| sorter.next())
-                .expect("Failed to get the next record");
+            io.block(|| sorter.next()).unwrap();
         }
         assert_eq!(idx, n);
     }
