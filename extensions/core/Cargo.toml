@@ -15,8 +15,8 @@ static = []
 [dependencies]
 turso_macros = { workspace = true }
 
-getrandom = "0.4.2"
+getrandom = { workspace = true }
 chrono = { workspace = true, default-features = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
-getrandom = { version = "0.4.2", features = ["wasm_js"] }
+getrandom = { workspace = true , features = ["wasm_js"] }
