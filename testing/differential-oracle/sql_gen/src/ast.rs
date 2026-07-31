@@ -1903,7 +1903,9 @@ pub struct UnaryOpExpr {
 impl fmt::Display for UnaryOpExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.op {
-            UnaryOp::Neg => write!(f, "-{}", self.operand),
+            // Without the space, two nested minus operators become `--`,
+            // which starts a SQL comment and hides the rest of the statement.
+            UnaryOp::Neg => write!(f, "- {}", self.operand),
             UnaryOp::Not => write!(f, "NOT {}", self.operand),
             UnaryOp::BitNot => write!(f, "~{}", self.operand),
         }
@@ -2268,6 +2270,19 @@ mod tests {
         assert_eq!(Literal::Text("hello".to_string()).to_string(), "'hello'");
         assert_eq!(Literal::Text("it's".to_string()).to_string(), "'it''s'");
         assert_eq!(Literal::Blob(vec![0xDE, 0xAD]).to_string(), "X'DEAD'");
+    }
+
+    #[test]
+    fn nested_minus_does_not_start_a_comment() {
+        let expr = Expr::UnaryOp(Box::new(UnaryOpExpr {
+            op: UnaryOp::Neg,
+            operand: Expr::UnaryOp(Box::new(UnaryOpExpr {
+                op: UnaryOp::Neg,
+                operand: Expr::Literal(Literal::Integer(1)),
+            })),
+        }));
+
+        assert_eq!(expr.to_string(), "- - 1");
     }
 
     #[test]
