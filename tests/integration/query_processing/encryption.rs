@@ -1401,8 +1401,11 @@ fn assert_encrypted_page_size_after_key_and_cipher(
         "file:{}?cipher={cipher}&hexkey={hexkey}",
         tmp_db.path.to_str().unwrap()
     );
-    let (_io, reopened) =
-        turso_core::Connection::from_uri(&uri, DatabaseOpts::new().with_encryption(true))?;
+    let (_io, reopened) = turso_core::Connection::from_uri(
+        &uri,
+        DatabaseOpts::new().with_encryption(true),
+        Arc::new(SqliteDialect),
+    )?;
     let rows: Vec<(i64,)> = reopened.exec_rows("SELECT count(*) FROM t");
     assert_eq!(
         rows[0].0, 1,
@@ -1437,8 +1440,11 @@ fn test_uri_encryption_then_page_size(_tmp_db: TempDatabase) -> anyhow::Result<(
     );
 
     {
-        let (io, conn) =
-            turso_core::Connection::from_uri(&uri, DatabaseOpts::new().with_encryption(true))?;
+        let (io, conn) = turso_core::Connection::from_uri(
+            &uri,
+            DatabaseOpts::new().with_encryption(true),
+            Arc::new(SqliteDialect),
+        )?;
         conn.execute("PRAGMA page_size = 512")?;
         conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)")?;
         conn.execute("INSERT INTO t VALUES(1, randomblob(300))")?;
@@ -1453,8 +1459,11 @@ fn test_uri_encryption_then_page_size(_tmp_db: TempDatabase) -> anyhow::Result<(
         }
     }
 
-    let (_io, reopened) =
-        turso_core::Connection::from_uri(&uri, DatabaseOpts::new().with_encryption(true))?;
+    let (_io, reopened) = turso_core::Connection::from_uri(
+        &uri,
+        DatabaseOpts::new().with_encryption(true),
+        Arc::new(SqliteDialect),
+    )?;
     let rows: Vec<(i64,)> = reopened.exec_rows("SELECT count(*) FROM t");
     assert_eq!(rows[0].0, 1);
     let ps: Vec<(i64,)> = reopened.exec_rows("PRAGMA page_size");
@@ -1494,8 +1503,11 @@ fn test_fresh_attach_encrypted_non_4k_page_size(_tmp_db: TempDatabase) -> anyhow
         do_flush(&conn, &main_db)?;
     }
 
-    let (_io, aux_conn) =
-        turso_core::Connection::from_uri(&aux_uri, DatabaseOpts::new().with_encryption(true))?;
+    let (_io, aux_conn) = turso_core::Connection::from_uri(
+        &aux_uri,
+        DatabaseOpts::new().with_encryption(true),
+        Arc::new(SqliteDialect),
+    )?;
     let rows: Vec<(i64,)> = aux_conn.exec_rows("SELECT count(*) FROM t");
     assert_eq!(rows[0].0, 1);
     let ps: Vec<(i64,)> = aux_conn.exec_rows("PRAGMA page_size");
@@ -1537,8 +1549,11 @@ fn test_inplace_vacuum_non_4k_encryption(_tmp_db: TempDatabase) -> anyhow::Resul
         "file:{}?cipher={CIPHER_A}&hexkey={KEY_A}",
         tmp_db.path.to_str().unwrap()
     );
-    let (_io, reopened) =
-        turso_core::Connection::from_uri(&uri, DatabaseOpts::new().with_encryption(true))?;
+    let (_io, reopened) = turso_core::Connection::from_uri(
+        &uri,
+        DatabaseOpts::new().with_encryption(true),
+        Arc::new(SqliteDialect),
+    )?;
     let rows: Vec<(i64,)> = reopened.exec_rows("SELECT count(*) FROM t");
     assert_eq!(rows[0].0, 66);
 
