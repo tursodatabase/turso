@@ -506,10 +506,7 @@ impl Statement {
 
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
-            self.program
-                .connection
-                .n_active_root_statements
-                .fetch_add(1, Ordering::SeqCst);
+            self.program.connection.start_root_statement()?;
             self.counted_as_active_root = true;
         }
         if matches!(self.state.execution_state, ProgramExecutionState::Init)

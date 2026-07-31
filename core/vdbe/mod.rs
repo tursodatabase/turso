@@ -786,6 +786,8 @@ pub struct ProgramState {
     /// Per-execution statement deadline derived from the connection query timeout.
     /// `None` means no timeout.
     pub query_deadline: Option<crate::MonotonicInstant>,
+    /// Excludes new root statements while an explicit checkpoint is suspended.
+    pub(crate) explicit_checkpoint_guard: Option<crate::connection::ExplicitCheckpointGuard>,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
@@ -903,6 +905,7 @@ impl ProgramState {
             once: SmallVec::<[u32; 4]>::new(),
             execution_state: ProgramExecutionState::Init,
             query_deadline: None,
+            explicit_checkpoint_guard: None,
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
             sequence_inner_commit: None,
@@ -1023,6 +1026,7 @@ impl ProgramState {
         self.once.clear();
         self.execution_state = ProgramExecutionState::Init;
         self.query_deadline = None;
+        self.explicit_checkpoint_guard = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
 
@@ -2545,6 +2549,7 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+        state.explicit_checkpoint_guard = None;
         // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather
         // than commit_state. Clean it before transaction abort logic inspects
         // pager checkpoint state or reset drops the opcode state.
