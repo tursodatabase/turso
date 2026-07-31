@@ -292,15 +292,31 @@ pub(crate) fn open_vacuum_temp_db(
     let test_path = path.clone();
 
     let (encryption_opts, encryption_key) = vacuum_temp_db_encryption(source_conn)?;
-    let db = Database::open_file_with_flags(
-        source_db.io.clone(),
-        &path,
-        OpenFlags::Create,
-        vacuum_target_opts_from_source(source_db),
-        encryption_opts,
-        source_db.dialect(),
-    )?;
-    let conn = db.connect_with_encryption(encryption_key)?;
+    let page_codec = source_conn.pager.load().page_codec();
+    let db = match &page_codec {
+        Some(codec) => Database::open_file_with_flags_and_page_codec(
+            source_db.io.clone(),
+            &path,
+            OpenFlags::Create,
+            vacuum_target_opts_from_source(source_db),
+            encryption_opts,
+            None,
+            codec.clone(),
+            source_db.dialect(),
+        )?,
+        None => Database::open_file_with_flags(
+            source_db.io.clone(),
+            &path,
+            OpenFlags::Create,
+            vacuum_target_opts_from_source(source_db),
+            encryption_opts,
+            source_db.dialect(),
+        )?,
+    };
+    let conn = match page_codec {
+        Some(codec) => db.connect_with_page_codec(codec)?,
+        None => db.connect_with_encryption(encryption_key)?,
+    };
     conn.reset_page_size(page_size)?;
     conn.set_reserved_bytes(reserved_space)?;
     conn.wal_auto_actions_disable();

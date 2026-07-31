@@ -146,6 +146,30 @@ impl Workload for SimpleInsertWorkload {
     }
 }
 
+/// Insert blobs large enough to force multi-page overflow chains, exercising the
+/// page-codec transform across page ids beyond the leaf cell.
+pub struct OverflowInsertWorkload;
+
+impl Workload for OverflowInsertWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if ctx.sim_state.simple_tables.is_empty() {
+            return None;
+        }
+        let table_name = match ctx.sim_state.simple_tables.pick(rng) {
+            Some((name, _)) => name.clone(),
+            None => return None,
+        };
+        let key = format!("ovf_{}", rng.random_range(0..10000));
+        let value_length = rng.random_range(20 * 1024..64 * 1024);
+
+        Some(Operation::SimpleInsert {
+            table_name,
+            key,
+            value_length,
+        })
+    }
+}
+
 /// Execute a SELECT query (works in both Idle and InTx states).
 pub struct SelectWorkload;
 

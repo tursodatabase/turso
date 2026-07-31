@@ -32,7 +32,6 @@ path = "regression_tests_cross_platform.rs"
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
-memmap2 = "0.9"
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 sql_generation = { workspace = true }

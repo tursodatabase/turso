@@ -21,7 +21,8 @@ use turso_core::SqliteDialect;
 use turso_core::WindowsIOCP;
 use turso_core::schema::SEQ_BACKING_TABLE_PREFIX;
 use turso_core::{
-    CipherMode, Connection, Database, DatabaseOpts, EncryptionOpts, IO, OpenFlags, Statement, Value,
+    CipherMode, Connection, Database, DatabaseOpts, EncryptionOpts, IO, OpenFlags, PageCodec,
+    PageCodecHeaderInfo, PageCodecId, PageCodecLocation, Statement, Value,
 };
 use turso_parser::ast::{ColumnConstraint, SortOrder};
 
@@ -42,6 +43,141 @@ pub mod worker;
 pub mod workloads;
 mod yield_injection;
 
+// The simulator codec is keyed by both page id and transform location so that a
+// bug threading the wrong `page_idx` or `PageCodecLocation` through any DB read,
+// WAL read, WAL write, or checkpoint path corrupts the decoded page rather than
+// silently producing correct bytes.
+struct SimulatorPageCodec;
+
+impl SimulatorPageCodec {
+    const MASK: u8 = 0x6d;
+
+    fn byte_key(page_idx: usize, location: PageCodecLocation, offset: usize) -> u8 {
+        // Persisted transforms must not depend on the host pointer width.
+        let page_id_byte = (page_idx as u64).to_le_bytes()[offset % std::mem::size_of::<u64>()];
+        let page_id_rotation = ((offset / std::mem::size_of::<u64>()) % (u8::BITS as usize)) as u32;
+        Self::MASK
+            ^ page_id_byte.rotate_left(page_id_rotation)
+            ^ match location {
+                PageCodecLocation::Database => 0,
+                PageCodecLocation::Wal => 0xa5,
+            }
+    }
+
+    fn transform(input: &[u8], output: &mut [u8], page_idx: usize, location: PageCodecLocation) {
+        for (offset, (input, output)) in input.iter().zip(output).enumerate() {
+            *output = input ^ Self::byte_key(page_idx, location, offset);
+        }
+    }
+}
+
+/// Page id of the database header, used to probe the encoded header prefix.
+const SIMULATOR_HEADER_PAGE_ID: usize = 1;
+
+impl PageCodec for SimulatorPageCodec {
+    fn codec_id(&self) -> PageCodecId {
+        PageCodecId::new(*b"simulator-codec-")
+    }
+
+    fn probe_header(
+        &self,
+        raw_page1_prefix: &[u8],
+    ) -> turso_core::Result<Option<PageCodecHeaderInfo>> {
+        if raw_page1_prefix.len() < 21 {
+            return Ok(None);
+        }
+        if !raw_page1_prefix[..16]
+            .iter()
+            .enumerate()
+            .zip(b"SQLite format 3\0")
+            .all(|((offset, encoded), expected)| {
+                *encoded
+                    ^ Self::byte_key(
+                        SIMULATOR_HEADER_PAGE_ID,
+                        PageCodecLocation::Database,
+                        offset,
+                    )
+                    == *expected
+            })
+        {
+            return Ok(None);
+        }
+
+        let raw_page_size = u16::from_be_bytes([
+            raw_page1_prefix[16]
+                ^ Self::byte_key(SIMULATOR_HEADER_PAGE_ID, PageCodecLocation::Database, 16),
+            raw_page1_prefix[17]
+                ^ Self::byte_key(SIMULATOR_HEADER_PAGE_ID, PageCodecLocation::Database, 17),
+        ]);
+        let page_size = if raw_page_size == 1 {
+            65_536
+        } else {
+            raw_page_size as usize
+        };
+        Ok(Some(PageCodecHeaderInfo {
+            page_size,
+            reserved_space: raw_page1_prefix[20]
+                ^ Self::byte_key(SIMULATOR_HEADER_PAGE_ID, PageCodecLocation::Database, 20),
+        }))
+    }
+
+    fn required_reserved_bytes(&self) -> u8 {
+        1
+    }
+
+    fn encode_page(
+        &self,
+        page: &[u8],
+        output: &mut [u8],
+        page_idx: usize,
+        location: PageCodecLocation,
+    ) -> turso_core::Result<()> {
+        Self::transform(page, output, page_idx, location);
+        Ok(())
+    }
+
+    fn decode_page(
+        &self,
+        page: &[u8],
+        output: &mut [u8],
+        page_idx: usize,
+        location: PageCodecLocation,
+    ) -> turso_core::Result<()> {
+        Self::transform(page, output, page_idx, location);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod simulator_page_codec_tests {
+    use super::*;
+
+    #[test]
+    fn simulator_page_codec_uses_full_page_id() {
+        let input = vec![0; 512];
+        let mut page_one = vec![0; input.len()];
+        let mut page_two_fifty_seven = vec![0; input.len()];
+        SimulatorPageCodec::transform(&input, &mut page_one, 1, PageCodecLocation::Database);
+        SimulatorPageCodec::transform(
+            &input,
+            &mut page_two_fifty_seven,
+            257,
+            PageCodecLocation::Database,
+        );
+
+        assert_ne!(page_one, page_two_fifty_seven);
+
+        let mut decoded = vec![0; input.len()];
+        SimulatorPageCodec::transform(
+            &page_two_fifty_seven,
+            &mut decoded,
+            257,
+            PageCodecLocation::Database,
+        );
+        assert_eq!(decoded, input);
+    }
+}
+
 use crate::{
     allocation_fault::{
         AllocationFaultConfig, AllocationFaultContext, SimulatorAllocationFaultInjector,
@@ -57,7 +193,7 @@ use crate::{
 pub fn multiprocess_platform_io() -> anyhow::Result<Arc<dyn IO>> {
     #[cfg(target_os = "windows")]
     {
-        return Ok(Arc::new(WindowsIOCP::new()?));
+        Ok(Arc::new(WindowsIOCP::new()?))
     }
 
     #[cfg(unix)]
@@ -282,6 +418,8 @@ pub struct WhopperOpts {
     pub experimental_mvcc_passive_checkpoint: bool,
     /// Enable database encryption with random cipher.
     pub enable_encryption: bool,
+    /// Enable a fixed external page codec for in-process simulator coverage.
+    pub enable_page_codec: bool,
     /// Elle tables to create: vec of (table_name, create_sql).
     pub elle_tables: Vec<(String, String)>,
     /// Workloads with weights: (weight, workload). Higher weight = more likely.
@@ -342,6 +480,7 @@ impl Default for WhopperOpts {
             enable_mvcc: false,
             experimental_mvcc_passive_checkpoint: false,
             enable_encryption: false,
+            enable_page_codec: false,
             elle_tables: vec![],
             workloads: vec![],
             properties: vec![],
@@ -468,6 +607,11 @@ impl WhopperOpts {
 
     pub fn with_enable_encryption(mut self, enable: bool) -> Self {
         self.enable_encryption = enable;
+        self
+    }
+
+    pub fn with_enable_page_codec(mut self, enable: bool) -> Self {
+        self.enable_page_codec = enable;
         self
     }
 
@@ -634,6 +778,7 @@ pub struct Whopper {
     db_path: String,
     wal_path: String,
     encryption_opts: Option<EncryptionOpts>,
+    page_codec: Option<Arc<dyn PageCodec>>,
     max_connections: usize,
     workloads: Vec<(u32, Box<dyn Workload>)>,
     properties: Vec<std::sync::Mutex<Box<dyn Property>>>,
@@ -659,6 +804,17 @@ pub struct Whopper {
 impl Whopper {
     /// Create a new Whopper simulator with the given options.
     pub fn new(opts: WhopperOpts) -> anyhow::Result<Self> {
+        if opts.enable_page_codec && opts.enable_encryption {
+            return Err(anyhow::anyhow!(
+                "page codec simulation cannot be combined with encryption"
+            ));
+        }
+        if opts.enable_page_codec && opts.enable_mvcc {
+            return Err(anyhow::anyhow!(
+                "page codec simulation cannot be combined with MVCC"
+            ));
+        }
+
         let seed = opts.seed.unwrap_or_else(|| {
             let mut rng = rand::rng();
             rng.next_u64()
@@ -698,6 +854,9 @@ impl Whopper {
         } else {
             None
         };
+        let page_codec = opts
+            .enable_page_codec
+            .then(|| Arc::new(SimulatorPageCodec) as Arc<dyn PageCodec>);
 
         let db = {
             let db_opts = DatabaseOpts::new()
@@ -706,14 +865,27 @@ impl Whopper {
                     opts.experimental_mvcc_passive_checkpoint,
                 );
 
-            match Database::open_file_with_flags(
-                io.clone(),
-                &db_path,
-                OpenFlags::default(),
-                db_opts,
-                encryption_opts.clone(),
-                Arc::new(SqliteDialect),
-            ) {
+            let result = match &page_codec {
+                Some(codec) => Database::open_file_with_flags_and_page_codec(
+                    io.clone(),
+                    &db_path,
+                    OpenFlags::default(),
+                    db_opts,
+                    encryption_opts.clone(),
+                    None,
+                    codec.clone(),
+                    Arc::new(SqliteDialect),
+                ),
+                None => Database::open_file_with_flags(
+                    io.clone(),
+                    &db_path,
+                    OpenFlags::default(),
+                    db_opts,
+                    encryption_opts.clone(),
+                    Arc::new(SqliteDialect),
+                ),
+            };
+            match result {
                 Ok(db) => db,
                 Err(e) => {
                     return Err(anyhow::anyhow!("Database open failed: {}", e));
@@ -721,7 +893,7 @@ impl Whopper {
             }
         };
 
-        let bootstrap_conn = match db.connect() {
+        let bootstrap_conn = match connect_with_optional_page_codec(&db, &page_codec) {
             Ok(conn) => may_be_set_encryption(conn, &encryption_opts)?,
             Err(e) => {
                 return Err(anyhow::anyhow!("Connection failed: {}", e));
@@ -793,6 +965,7 @@ impl Whopper {
             db_path,
             wal_path,
             encryption_opts,
+            page_codec,
             max_connections: opts.max_connections,
             workloads: opts.workloads,
             properties: opts
@@ -830,10 +1003,59 @@ impl Whopper {
             .unwrap_or(0)
     }
 
+    /// Number of submitted I/O operations whose completions are still pending.
+    pub fn pending_io_count(&self) -> usize {
+        self.io.pending_completion_count()
+    }
+
+    /// Run a direct integrity check after a controlled recovery boundary.
+    pub fn assert_integrity_check(&mut self) -> anyhow::Result<()> {
+        let conn = self
+            .context
+            .fibers
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("integrity check requires a live connection"))?
+            .connection
+            .clone();
+        let mut stmt = conn.prepare("PRAGMA integrity_check")?;
+        let mut rows = Vec::new();
+        loop {
+            match stmt.step()? {
+                turso_core::StepResult::Row => {
+                    let row = stmt
+                        .row()
+                        .ok_or_else(|| anyhow::anyhow!("integrity check returned no row"))?;
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                turso_core::StepResult::Done => break,
+                turso_core::StepResult::IO => self.io.step()?,
+                _ => {}
+            }
+        }
+
+        if rows.len() != 1 || rows[0].len() != 1 || rows[0][0].to_text() != Some("ok") {
+            anyhow::bail!("integrity_check returned unexpected rows: {rows:?}");
+        }
+        Ok(())
+    }
+
     /// Perform a single simulation step.
     /// Returns `StepResult::Ok` if the step completed normally,
     /// or `StepResult::WalSizeLimitExceeded` if the WAL file exceeded the soft limit.
     pub fn step(&mut self) -> anyhow::Result<StepResult> {
+        self.step_with_io_completion(true)
+    }
+
+    /// Perform one state-machine step without completing queued simulated I/O.
+    ///
+    /// This leaves the operation resumable at its next I/O boundary. It is
+    /// intended for deterministic crash tests, which must call
+    /// [`Self::crash_reopen`] before running another regular step.
+    pub fn step_without_completing_io(&mut self) -> anyhow::Result<StepResult> {
+        self.step_with_io_completion(false)
+    }
+
+    fn step_with_io_completion(&mut self, complete_io: bool) -> anyhow::Result<StepResult> {
         trace!("step={}", self.current_step);
         if self.current_step >= self.max_steps {
             return Ok(StepResult::Ok);
@@ -841,7 +1063,9 @@ impl Whopper {
 
         let fiber_idx = self.current_step % self.context.fibers.len();
         self.perform_work(fiber_idx)?;
-        self.io.step()?;
+        if complete_io {
+            self.io.step()?;
+        }
         self.current_step += 1;
 
         if file_size_soft_limit_exceeded(&self.wal_path, self.file_sizes.clone()) {
@@ -1358,25 +1582,67 @@ impl Whopper {
         );
 
         self.drain_active_statements("reopen")?;
-        // Close and drop all fiber connections to release database Arc references
-        {
-            let fibers = self.context.fibers.drain(..).collect::<Vec<_>>();
-            for fiber in fibers {
-                drop(fiber.statement.into_inner());
-                if self.close_connections_gracefully {
-                    if let Err(e) = fiber.connection.close() {
-                        debug!("Error closing connection during restart: {}", e);
-                    }
-                }
-                drop(fiber.connection);
+        self.drop_fiber_connections(self.close_connections_gracefully);
+        self.finish_reopen()?;
+
+        debug!(
+            "Database restarted with {} fibers",
+            self.context.fibers.len()
+        );
+        Ok(())
+    }
+
+    /// Restart after aborting active statements and their queued I/O completions.
+    ///
+    /// This models a process crash after submitted I/O reaches simulated storage
+    /// but before the state machine observes completion. It deliberately does not
+    /// drain statements or gracefully close connections.
+    pub fn crash_reopen(&mut self) -> anyhow::Result<()> {
+        let discarded = self.io.abort_pending_completions();
+        debug!(
+            "Crashing database with {} pending I/O completions and {} fibers",
+            discarded,
+            self.context.fibers.len()
+        );
+        self.abort_fiber_properties()?;
+        self.drop_fiber_connections(false);
+        self.finish_reopen()?;
+
+        debug!(
+            "Database crash-restarted with {} fibers",
+            self.context.fibers.len()
+        );
+        Ok(())
+    }
+
+    fn abort_fiber_properties(&self) -> anyhow::Result<()> {
+        for (fiber_id, fiber) in self.context.fibers.iter().enumerate() {
+            for property in &self.properties {
+                property
+                    .lock()
+                    .unwrap()
+                    .abort_fiber(fiber_id, fiber.txn_id)?;
             }
-            // All fibers are now dropped, database Arc should be released
         }
+        Ok(())
+    }
 
-        // Without this, the Database object is never dropped and recovery never happens
+    fn drop_fiber_connections(&mut self, close_gracefully: bool) {
+        let fibers = self.context.fibers.drain(..).collect::<Vec<_>>();
+        for fiber in fibers {
+            drop(fiber.statement.into_inner());
+            if close_gracefully {
+                if let Err(e) = fiber.connection.close() {
+                    debug!("Error closing connection during restart: {}", e);
+                }
+            }
+            drop(fiber.connection);
+        }
+    }
+
+    fn finish_reopen(&mut self) -> anyhow::Result<()> {
+        // Without this, the Database object is never dropped and recovery never happens.
         turso_core::clear_database_registry();
-
-        // Reopen connections (creates new Database instance)
         self.open_connections()?;
 
         // Query persisted user sequence state from backing tables after restart.
@@ -1395,11 +1661,6 @@ impl Whopper {
         if !self.context.fibers.is_empty() {
             self.rebuild_sequences_after_restart(&persisted_sequences);
         }
-
-        debug!(
-            "Database restarted with {} fibers",
-            self.context.fibers.len()
-        );
         Ok(())
     }
 
@@ -1523,14 +1784,26 @@ impl Whopper {
         let db_opts = DatabaseOpts::new()
             .with_encryption(self.encryption_opts.is_some())
             .with_experimental_mvcc_passive_checkpoint(self.experimental_mvcc_passive_checkpoint);
-        let db = Database::open_file_with_flags(
-            self.io.clone(),
-            &self.db_path,
-            OpenFlags::default(),
-            db_opts,
-            self.encryption_opts.clone(),
-            Arc::new(SqliteDialect),
-        )
+        let db = match &self.page_codec {
+            Some(codec) => Database::open_file_with_flags_and_page_codec(
+                self.io.clone(),
+                &self.db_path,
+                OpenFlags::default(),
+                db_opts,
+                self.encryption_opts.clone(),
+                None,
+                codec.clone(),
+                Arc::new(SqliteDialect),
+            ),
+            None => Database::open_file_with_flags(
+                self.io.clone(),
+                &self.db_path,
+                OpenFlags::default(),
+                db_opts,
+                self.encryption_opts.clone(),
+                Arc::new(SqliteDialect),
+            ),
+        }
         .map_err(|e| anyhow::anyhow!("Database open failed: {}", e))?;
 
         if self.disable_mvcc_auto_checkpoint {
@@ -1540,8 +1813,7 @@ impl Whopper {
         }
 
         for i in 0..self.max_connections {
-            let conn = db
-                .connect()
+            let conn = connect_with_optional_page_codec(&db, &self.page_codec)
                 .map_err(|e| anyhow::anyhow!("Failed to create fiber connection {}: {}", i, e))?;
             let conn = may_be_set_encryption(conn, &self.encryption_opts)?;
             self.context.fibers.push(SimulatorFiber {
@@ -1561,6 +1833,16 @@ impl Whopper {
         }
 
         Ok(())
+    }
+}
+
+fn connect_with_optional_page_codec(
+    db: &Arc<Database>,
+    page_codec: &Option<Arc<dyn PageCodec>>,
+) -> turso_core::Result<Arc<Connection>> {
+    match page_codec {
+        Some(codec) => db.connect_with_page_codec(codec.clone()),
+        None => db.connect(),
     }
 }
 
