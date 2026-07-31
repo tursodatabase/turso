@@ -204,7 +204,7 @@ pub fn translate_insert(
     // For VALUES/DEFAULT VALUES with subqueries, we route through the multi-row
     // path which goes through translate_select and handles CTEs properly.
     // We also keep a copy for RETURNING clause subqueries.
-    let with_for_returning = with.clone();
+    let mut with_for_returning = with.clone();
     if let Some(insert_with) = with {
         if let InsertBody::Select(select, _) = &mut body {
             match &mut select.with {
@@ -234,6 +234,8 @@ pub fn translate_insert(
         database_id,
         table,
         source_select,
+        returning_cte_definitions,
+        mut returning_subquery_bindings,
         target_table_id,
         excluded_table_id,
         bound_index_expressions,
@@ -241,6 +243,8 @@ pub fn translate_insert(
         &tbl_name,
         &columns,
         &mut body,
+        &mut returning,
+        &mut with_for_returning,
         on_conflict.unwrap_or(ResolveType::Abort),
         resolver,
         program,
@@ -299,30 +303,14 @@ pub fn translate_insert(
         vec![],
     );
 
-    // Bind the RETURNING clause: resolve names against the target table and
-    // any WITH-clause CTEs (for subqueries inside RETURNING).
-    let mut bound_returning_subqueries = {
-        let mut with_for_returning = with_for_returning;
-        let target_id = table_references.joined_tables()[0].internal_id;
-        let mut binder = super::bind::BindContext::new(resolver, program);
-        let (cte_definitions, subquery_bindings) = binder.bind_insert_returning(
-            &tbl_name.name,
-            target_id,
-            &mut returning,
-            &mut with_for_returning,
-            database_id,
-        )?;
-
-        // Plan the CTEs and expose them as definition-only outer refs so
-        // RETURNING subqueries can reference them.
-        let planned_ctes =
-            super::planner::plan_bound_ctes(cte_definitions, resolver, program, connection)?;
-        super::planner::add_planned_ctes_as_outer_refs(
-            std::slice::from_mut(&mut table_references),
-            &planned_ctes,
-        );
-        subquery_bindings
-    };
+    // Plan the bound CTEs and expose them as definition-only outer refs so
+    // RETURNING subqueries can reference them.
+    let planned_ctes =
+        super::planner::plan_bound_ctes(returning_cte_definitions, resolver, program, connection)?;
+    super::planner::add_planned_ctes_as_outer_refs(
+        std::slice::from_mut(&mut table_references),
+        &planned_ctes,
+    );
 
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)
@@ -334,7 +322,7 @@ pub fn translate_insert(
         &mut returning,
         resolver,
         connection,
-        &mut bound_returning_subqueries,
+        &mut returning_subquery_bindings,
     )?;
 
     // Process RETURNING clause using shared module

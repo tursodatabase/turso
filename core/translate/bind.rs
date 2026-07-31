@@ -2254,6 +2254,10 @@ pub struct BoundInsert {
     pub table: Arc<Table>,
     /// Bound source for INSERT SELECT and VALUES paths that use a coroutine.
     pub source_select: Option<BoundSelect>,
+    /// WITH-clause definitions visible to RETURNING subqueries.
+    pub returning_cte_definitions: Vec<(String, CteEntry)>,
+    /// Subqueries extracted while binding RETURNING expressions.
+    pub returning_subquery_bindings: HashMap<ast::TableInternalId, BoundSubquery>,
     /// ID used by bound references to the current target row.
     pub target_table_id: ast::TableInternalId,
     /// ID used by bound references to the would-be inserted row.
@@ -2533,13 +2537,15 @@ fn bind_upsert_do<G: IdGenerator>(
 }
 
 /// Bind an INSERT statement up front: validate the target table, resolve
-/// defaults in VALUES rows, bind single-row VALUES scope-less, and bind every
-/// UPSERT conflict target and action.
+/// defaults in VALUES rows, bind source and RETURNING expressions, and bind
+/// every UPSERT conflict target and action.
 #[turso_macros::trace_stack]
 pub fn bind_insert_stmt(
     tbl_name: &ast::QualifiedName,
     columns: &[ast::Name],
     body: &mut ast::InsertBody,
+    returning: &mut Vec<ast::ResultColumn>,
+    with_for_returning: &mut Option<ast::With>,
     on_conflict: ast::ResolveType,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
@@ -2563,6 +2569,8 @@ pub fn bind_insert_stmt(
             database_id,
             table,
             source_select: None,
+            returning_cte_definitions: Vec::new(),
+            returning_subquery_bindings: HashMap::default(),
             target_table_id: program.table_reference_counter.next(),
             excluded_table_id: program.table_reference_counter.next(),
             bound_index_expressions: Vec::new(),
@@ -2717,6 +2725,16 @@ pub fn bind_insert_stmt(
         upsert_actions.push((resolved_target, action_label, bound_do));
         upsert = next;
     }
+    let (returning_cte_definitions, returning_subquery_bindings) = {
+        let mut binder = BindContext::new(resolver, program);
+        binder.bind_insert_returning(
+            &tbl_name.name,
+            target_table_id,
+            returning,
+            with_for_returning,
+            database_id,
+        )?
+    };
     let bound_index_expressions =
         bind_table_index_expressions(resolver, database_id, table.get_name(), target_table_id);
     Ok(BoundInsert {
@@ -2726,6 +2744,8 @@ pub fn bind_insert_stmt(
         database_id,
         table,
         source_select,
+        returning_cte_definitions,
+        returning_subquery_bindings,
         target_table_id,
         excluded_table_id,
         bound_index_expressions,
@@ -7117,7 +7137,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     /// already allocated for the target table so the bound column references
     /// line up with its `TableReferences`.
     #[allow(clippy::type_complexity)]
-    pub fn bind_insert_returning(
+    fn bind_insert_returning(
         &mut self,
         tbl_name: &ast::Name,
         target_internal_id: TableInternalId,
