@@ -1826,7 +1826,7 @@ impl Schema {
                     pk_index_added = true;
 
                     if unique_set.columns.len() == 1 {
-                        let col_name = &unique_set.columns.first().unwrap().0;
+                        let col_name = &unique_set.columns.first().unwrap().name;
                         let Some((_, column)) = table.get_column(col_name) else {
                             return Err(LimboError::ParseError(format!(
                                 "Column {col_name} not found in table {}",
@@ -1845,7 +1845,7 @@ impl Schema {
                             index_entry,
                             unique_set.columns.len(),
                             unique_set.conflict_clause,
-                            &unique_set.collations,
+                            &unique_set.columns,
                         )?))?;
                     } else if mvcc_enabled {
                         // In MVCC mode, automatic indices might not be fully populated yet during recovery
@@ -1861,15 +1861,15 @@ impl Schema {
                     // Add composite unique index
                     let mut column_indices_and_sort_orders =
                         Vec::try_with_capacity_ext(unique_set.columns.len())?;
-                    for (col_name, sort_order) in unique_set.columns.iter() {
-                        let Some((pos_in_table, _)) = table.get_column(col_name) else {
+                    for unique_column in unique_set.columns.iter() {
+                        let Some((pos_in_table, _)) = table.get_column(&unique_column.name) else {
                             return Err(crate::LimboError::ParseError(format!(
                                 "Column {} not found in table {}",
-                                col_name, table.name
+                                unique_column.name, table.name
                             )));
                         };
                         column_indices_and_sort_orders
-                            .push_within_capacity((pos_in_table, *sort_order))
+                            .push_within_capacity((pos_in_table, unique_column.sort_order))
                             .expect("unique columns vector was preallocated to its input length");
                     }
                     if let Some(index_entry) = automatic_indexes.pop() {
@@ -1878,7 +1878,7 @@ impl Schema {
                             index_entry,
                             column_indices_and_sort_orders,
                             unique_set.conflict_clause,
-                            &unique_set.collations,
+                            &unique_set.columns,
                         )?))?;
                     } else if mvcc_enabled {
                         // In MVCC mode, automatic indices might not be fully populated yet during recovery
@@ -2627,7 +2627,6 @@ impl TryClone for UniqueSet {
     fn try_clone(&self) -> Result<Self, Self::Error> {
         Ok(Self {
             columns: self.columns.try_clone()?,
-            collations: self.collations.try_clone()?,
             is_primary_key: self.is_primary_key,
             conflict_clause: self.conflict_clause,
         })
@@ -2644,7 +2643,7 @@ crate::alloc::impl_try_clone_via_clone!(
 // std global allocator (Strings, `std::vec::Vec`, boxed parser AST), so
 // forwarding to `Clone` is correct today. TODO(alloc): give these real
 // fallible impls when their fields become allocator-aware.
-crate::alloc::impl_try_clone_via_clone!(Column, IndexColumn, CheckConstraint);
+crate::alloc::impl_try_clone_via_clone!(Column, IndexColumn, CheckConstraint, UniqueSetColumn);
 
 impl Schema {
     #[turso_macros::allocation_site(crate::alloc::SchemaAllocationSite::MakeMut)]
@@ -3112,15 +3111,19 @@ impl PartialEq for Table {
     }
 }
 
+/// UniqueSet describes a column or set of columns for which rows are unique (PRIMARY KEY, UNIQUE)
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct UniqueSet {
-    pub columns: Vec<(String, SortOrder)>,
-    /// Per-column collation overrides from the constraint definition,
-    /// e.g. `PRIMARY KEY(a COLLATE NOCASE)`. Parallel to `columns`; `None`
-    /// falls back to the column definition's collation.
-    pub collations: Vec<Option<CollationSeq>>,
+    pub columns: Vec<UniqueSetColumn>,
     pub is_primary_key: bool,
     pub conflict_clause: Option<ResolveType>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct UniqueSetColumn {
+    pub name: String,
+    pub sort_order: SortOrder,
+    pub collation: Option<CollationSeq>,
 }
 
 #[derive(Clone, Debug)]
@@ -3717,7 +3720,7 @@ impl BTreeTable {
             }
             // Skip single-column unique constraints that were already emitted inline
             if unique_set.columns.len() == 1 {
-                let col_name = &unique_set.columns[0].0;
+                let col_name = &unique_set.columns[0].name;
                 if let Some((_, col)) = self.get_column(col_name) {
                     if col.unique() {
                         continue;
@@ -3725,11 +3728,11 @@ impl BTreeTable {
                 }
             }
             sql.push_str(", UNIQUE (");
-            for (i, (col_name, _)) in unique_set.columns.iter().enumerate() {
+            for (i, unique_column) in unique_set.columns.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                sql.push_str(&quote_ident(col_name));
+                sql.push_str(&quote_ident(&unique_column.name));
             }
             sql.push(')');
         }
@@ -4446,7 +4449,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     }
                     reject_explicit_nulls(columns)?;
 
-                    let mut pk_collations = Vec::try_with_capacity_ext(columns.len())?;
+                    let mut pk_unique_set_columns = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
                         let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
                         let col_name = match expr {
@@ -4458,13 +4461,16 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 bail_parse_error!("unsupported primary key expression: {}", expr)
                             }
                         };
-                        primary_key_columns
-                            .try_push((col_name, column.order.unwrap_or(SortOrder::Asc)))?;
-                        pk_collations.try_push(collation)?;
+                        let sort_order = column.order.unwrap_or(SortOrder::Asc);
+                        pk_unique_set_columns.try_push(UniqueSetColumn {
+                            name: col_name.clone(),
+                            sort_order,
+                            collation,
+                        })?;
+                        primary_key_columns.try_push((col_name, sort_order))?;
                     }
                     unique_sets_constraints.try_push(UniqueSet {
-                        columns: primary_key_columns.try_clone()?,
-                        collations: pk_collations,
+                        columns: pk_unique_set_columns,
                         is_primary_key: true,
                         conflict_clause: *conflict_clause,
                     })?;
@@ -4475,27 +4481,25 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 {
                     reject_explicit_nulls(columns)?;
                     let mut unique_columns = Vec::try_with_capacity_ext(columns.len())?;
-                    let mut unique_collations = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
                         let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
-                        match expr {
-                            Expr::Id(id) => unique_columns.try_push((
-                                id.as_str().to_string(),
-                                column.order.unwrap_or(SortOrder::Asc),
-                            ))?,
-                            Expr::Literal(Literal::String(value)) => unique_columns.try_push((
-                                value.trim_matches('\'').to_owned(),
-                                column.order.unwrap_or(SortOrder::Asc),
-                            ))?,
+                        let col_name = match expr {
+                            Expr::Id(id) => id.as_str().to_string(),
+                            Expr::Literal(Literal::String(value)) => {
+                                value.trim_matches('\'').to_owned()
+                            }
                             expr => {
                                 bail_parse_error!("unsupported unique key expression: {}", expr)
                             }
-                        }
-                        unique_collations.try_push(collation)?;
+                        };
+                        unique_columns.try_push(UniqueSetColumn {
+                            name: col_name,
+                            sort_order: column.order.unwrap_or(SortOrder::Asc),
+                            collation,
+                        })?;
                     }
                     let unique_set = UniqueSet {
                         columns: unique_columns,
-                        collations: unique_collations,
                         is_primary_key: false,
                         conflict_clause: *conflict_clause,
                     };
@@ -4675,8 +4679,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 order = *o;
                             }
                             unique_sets_columns.try_push(UniqueSet {
-                                columns: try_vec![(name.clone(), order)]?,
-                                collations: try_vec![None]?,
+                                columns: try_vec![UniqueSetColumn {
+                                    name: name.clone(),
+                                    sort_order: order,
+                                    collation: None,
+                                }]?,
                                 is_primary_key: true,
                                 conflict_clause: *conflict_clause,
                             })?;
@@ -4699,8 +4706,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         ast::ColumnConstraint::Unique(conflict) => {
                             unique = true;
                             unique_sets_columns.try_push(UniqueSet {
-                                columns: try_vec![(name.clone(), order)]?,
-                                collations: try_vec![None]?,
+                                columns: try_vec![UniqueSetColumn {
+                                    name: name.clone(),
+                                    sort_order: order,
+                                    collation: None,
+                                }]?,
                                 is_primary_key: false,
                                 conflict_clause: *conflict,
                             })?;
@@ -4895,7 +4905,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         .columns
                         .first()
                         .unwrap()
-                        .0
+                        .name
                         .eq_ignore_ascii_case(col.name.as_ref().unwrap())
             });
             if let Some(u) = unique_set_w_only_rowid_alias {
@@ -4931,7 +4941,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             .columns
                             .iter()
                             .zip(unique_sets[j].columns.iter())
-                            .all(|((a_name, _), (b_name, _))| a_name.eq_ignore_ascii_case(b_name))
+                            .all(|(a, b)| a.name.eq_ignore_ascii_case(&b.name))
                     {
                         // SQLite rejects duplicate constraints on the same columns when both
                         // specify ON CONFLICT with different resolve types.
@@ -5801,7 +5811,7 @@ impl Index {
         auto_index: (String, i64), // name, root_page
         column_count: usize,
         conflict_clause: Option<ResolveType>,
-        collation_overrides: &[Option<CollationSeq>],
+        constraint_columns: &[UniqueSetColumn],
     ) -> Result<Index> {
         let has_primary_key_index =
             table.get_rowid_alias_column().is_none() && !table.primary_key_columns.is_empty();
@@ -5822,10 +5832,9 @@ impl Index {
                     name: normalize_ident(col_name),
                     order: *order,
                     pos_in_table,
-                    collation: collation_overrides
+                    collation: constraint_columns
                         .get(i)
-                        .copied()
-                        .flatten()
+                        .and_then(|c| c.collation)
                         .or_else(|| column.collation_opt()),
                     default: column.default.clone(),
                     expr: None,
@@ -5854,7 +5863,7 @@ impl Index {
         auto_index: (String, i64), // name, root_page
         column_indices_and_sort_orders: Vec<(usize, SortOrder)>,
         conflict_clause: Option<ResolveType>,
-        collation_overrides: &[Option<CollationSeq>],
+        constraint_columns: &[UniqueSetColumn],
     ) -> Result<Index> {
         let (index_name, root_page) = auto_index;
 
@@ -5876,10 +5885,9 @@ impl Index {
                     name: normalize_ident(col.name.as_ref().unwrap()),
                     order: *sort_order,
                     pos_in_table,
-                    collation: collation_overrides
+                    collation: constraint_columns
                         .get(i)
-                        .copied()
-                        .flatten()
+                        .and_then(|c| c.collation)
                         .or_else(|| col.collation_opt()),
                     default: col.default.clone(),
                     expr: None,

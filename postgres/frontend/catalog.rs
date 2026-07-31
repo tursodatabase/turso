@@ -2460,8 +2460,7 @@ impl PgConstraintCursor {
             // PK / UNIQUE constraints from unique_sets
             for us in &btree.unique_sets {
                 let contype = if us.is_primary_key { "p" } else { "u" };
-                let col_names: Vec<&str> =
-                    us.columns.iter().map(|(name, _)| name.as_str()).collect();
+                let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
                 let conname = if us.is_primary_key {
                     format!("{table_name}_pkey")
                 } else {
@@ -3523,8 +3522,7 @@ pub fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String
         // PK / UNIQUE from unique_sets
         for us in &btree.unique_sets {
             if constraint_oid == target_oid {
-                let col_names: Vec<&str> =
-                    us.columns.iter().map(|(name, _)| name.as_str()).collect();
+                let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
                 let kw = if us.is_primary_key {
                     "PRIMARY KEY"
                 } else {

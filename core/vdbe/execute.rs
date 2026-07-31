@@ -15420,9 +15420,9 @@ pub fn op_alter_column(
 
         // Update unique_sets to reflect the renamed column
         for unique_set in &mut btree.unique_sets {
-            for (col_name, _) in &mut unique_set.columns {
-                if col_name.eq_ignore_ascii_case(&old_column_name) {
-                    col_name.clone_from(&new_name);
+            for unique_column in &mut unique_set.columns {
+                if unique_column.name.eq_ignore_ascii_case(&old_column_name) {
+                    unique_column.name.clone_from(&new_name);
                 }
             }
         }

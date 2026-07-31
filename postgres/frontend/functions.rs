@@ -310,8 +310,7 @@ fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
 
         for us in &btree.unique_sets {
             if constraint_oid == target_oid {
-                let col_names: Vec<&str> =
-                    us.columns.iter().map(|(name, _)| name.as_str()).collect();
+                let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
                 let kw = if us.is_primary_key {
                     "PRIMARY KEY"
                 } else {

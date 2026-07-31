@@ -941,7 +941,7 @@ pub fn translate_alter_table(
                 || btree.unique_sets.iter().any(|set| {
                     set.columns
                         .iter()
-                        .any(|(name, _)| name == &normalize_ident(column_name))
+                        .any(|c| c.name == normalize_ident(column_name))
                 })
             {
                 return Err(LimboError::ParseError(format!(

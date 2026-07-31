@@ -238,7 +238,7 @@ fn check_column_writable(
         || table.unique_sets.iter().any(|set| {
             set.columns
                 .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case(col_name))
+                .any(|c| c.name.eq_ignore_ascii_case(col_name))
         });
     if indexed {
         return Err(LimboError::InternalError(
