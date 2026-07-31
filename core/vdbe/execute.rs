@@ -5771,11 +5771,26 @@ pub fn op_seek(
         Insn::SeekLE { eq_only, .. } => *eq_only,
         _ => false,
     };
+    let null_matching_mask = match insn {
+        Insn::SeekGE {
+            null_matching_mask, ..
+        } => *null_matching_mask,
+        Insn::SeekLE {
+            null_matching_mask, ..
+        } => *null_matching_mask,
+        _ => 0,
+    };
 
     if is_eq_only
         && state.registers[start_reg..start_reg + num_regs]
             .iter()
-            .any(|value| value.is_null())
+            .enumerate()
+            .any(|(i, value)| {
+                // A NULL-matching component (`x IS ?`) seeks with the NULL key:
+                // index keys compare NULLs as equal, so such a key can match.
+                let null_matching = i < 64 && (null_matching_mask >> i) & 1 == 1;
+                value.is_null() && !null_matching
+            })
     {
         // Exact-match seeks use "=" semantics across the full unpacked key.
         // If any key column is NULL, the comparison is unknown, so no row can match.

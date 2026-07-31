@@ -2952,6 +2952,23 @@ impl SeekDef {
             _t: PhantomData,
         }
     }
+
+    /// Whether the key component at `pos` came from a NULL-matching equality
+    /// (`x IS <expr>`) rather than `x = <expr>`.
+    ///
+    /// A NULL key value means different things for the two: `NULL = NULL` is not
+    /// true, so an `=` seek can skip the loop entirely once its key turns out to
+    /// be NULL, while an `IS` seek must seek with the NULL key because index keys
+    /// compare NULLs as equal. Only equality prefix components can be
+    /// NULL-matching; range bounds never are.
+    pub fn is_null_matching_key_component(&self, pos: usize) -> bool {
+        self.prefix.get(pos).is_some_and(|component| {
+            matches!(
+                component.eq.as_ref().map(|(op, _, _)| op),
+                Some(ast::Operator::Is)
+            )
+        })
+    }
 }
 
 /// Build the affinity string for a synthesized ephemeral seek index.

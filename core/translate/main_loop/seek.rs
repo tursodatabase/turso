@@ -176,7 +176,13 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         &self.t_ctx.resolver,
                         NoConstantOptReason::RegisterReuse,
                     )?;
-                    if !expr.is_nonnull(self.tables) {
+                    // A NULL key can never satisfy `=`, so the loop is done as
+                    // soon as one shows up. `IS` matches NULL instead: keep the
+                    // NULL in the seek register and let the index comparison
+                    // find the rows whose key component is NULL.
+                    if !expr.is_nonnull(self.tables)
+                        && !self.seek_def.is_null_matching_key_component(i)
+                    {
                         self.program.emit_insn(Insn::IsNull {
                             reg,
                             target_pc: self.loop_end,
@@ -190,6 +196,12 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             }
         }
         let num_regs = self.seek_def.size(&self.seek_def.start);
+        // Which key components match NULL rather than comparing with `=`; the
+        // seek and the bloom-filter probe keep their "NULL key cannot match"
+        // shortcut for the rest.
+        let null_matching_mask = (0..num_regs.min(64))
+            .filter(|i| self.seek_def.is_null_matching_key_component(*i))
+            .fold(0u64, |mask, i| mask | (1u64 << i));
 
         if let Some(idx) = self.seek_index {
             encode_seek_keys_for_custom_types(
@@ -209,7 +221,10 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     affinities,
                 });
             }
-            if use_bloom_filter {
+            // The bloom filter neither stores nor probes NULLs (a NULL key can
+            // never satisfy `=`), so a NULL-matching seek cannot use it: probing
+            // would report "definitely not present" for keys that do match.
+            if use_bloom_filter && null_matching_mask == 0 {
                 turso_assert!(
                     idx.ephemeral,
                     "bloom filter can only be used with ephemeral indexes"
@@ -231,6 +246,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 num_regs,
                 target_pc: self.loop_end,
                 eq_only,
+                null_matching_mask,
             }),
             SeekOp::GT => self.program.emit_insn(Insn::SeekGT {
                 is_index: self.is_index,
@@ -246,6 +262,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 num_regs,
                 target_pc: self.loop_end,
                 eq_only,
+                null_matching_mask,
             }),
             SeekOp::LT => self.program.emit_insn(Insn::SeekLT {
                 is_index: self.is_index,

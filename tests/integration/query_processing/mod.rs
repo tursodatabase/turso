@@ -4,6 +4,7 @@ mod test_ddl;
 mod test_ephemeral_cleanup;
 mod test_hash_join_materialization;
 mod test_in_seek;
+mod test_is_seek;
 mod test_materialized_subquery;
 mod test_read_path;
 mod test_vacuum;

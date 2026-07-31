@@ -1,0 +1,90 @@
+@database :memory:
+
+# `IS` is an index-usable, NULL-matching equality, exactly like SQLite: it seeks
+# the index (see the query-plan tests below) and a NULL key component matches the
+# rows whose key component is NULL, which `=` can never do.
+
+test is-matches-null-key-component-on-composite-pk {
+    CREATE TABLE t (a, b, c, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES ('a1', NULL, 'c1'), ('a1', 'b1', 'c2'), ('a2', 'b2', 'c3'), (NULL, NULL, 'c4');
+
+    SELECT c FROM t WHERE a IS 'a1' AND b IS NULL;
+}
+expect {
+    c1
+}
+
+test equals-never-matches-null-key-component {
+    CREATE TABLE t (a, b, c, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES ('a1', NULL, 'c1'), ('a1', 'b1', 'c2');
+
+    SELECT count(*) FROM t WHERE a = 'a1' AND b = NULL;
+}
+expect {
+    0
+}
+
+test is-matches-null-in-every-key-component {
+    CREATE TABLE t (a, b, c, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES ('a1', NULL, 'c1'), (NULL, NULL, 'c4'), (NULL, 'b6', 'c6');
+
+    SELECT c FROM t WHERE a IS NULL AND b IS NULL;
+}
+expect {
+    c4
+}
+
+test is-mixed-with-equals-on-the-same-key {
+    CREATE TABLE t (a, b, c, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES ('a1', NULL, 'c1'), ('a1', 'b1', 'c2');
+
+    SELECT c FROM t WHERE a = 'a1' AND b IS NULL;
+}
+expect {
+    c1
+}
+
+test is-deletes-row-with-null-key-component {
+    CREATE TABLE t (a, b, c, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES ('a1', NULL, 'c1'), ('a1', 'b1', 'c2');
+    DELETE FROM t WHERE a IS 'a1' AND b IS NULL;
+
+    SELECT c FROM t ORDER BY c;
+}
+expect {
+    c2
+}
+
+test is-updates-row-with-null-key-component {
+    CREATE TABLE t (a, b, c, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES ('a1', NULL, 'c1'), ('a1', 'b1', 'c2');
+    UPDATE t SET c = 'updated' WHERE a IS 'a1' AND b IS NULL;
+
+    SELECT c FROM t ORDER BY c;
+}
+expect {
+    c2
+    updated
+}
+
+test is-matches-null-on-single-column-primary-key {
+    CREATE TABLE s (k, v);
+    CREATE UNIQUE INDEX si ON s (k);
+    INSERT INTO s VALUES ('k1', 'v1'), (NULL, 'v2');
+
+    SELECT v FROM s WHERE k IS NULL;
+}
+expect {
+    v2
+}
+
+test is-null-matches-across-a-left-join {
+    CREATE TABLE t (a, b, c, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES ('a1', NULL, 'c1'), (NULL, 'a1', 'c2');
+
+    SELECT t1.c, t2.c FROM t t1 LEFT JOIN t t2 ON t1.a IS t2.b ORDER BY t1.c;
+}
+expect {
+    c1|c2
+    c2|c1
+}

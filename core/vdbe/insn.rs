@@ -998,6 +998,13 @@ pub enum Insn {
         num_regs: usize,
         target_pc: BranchOffset,
         eq_only: bool,
+        /// Bitmask over the `num_regs` key registers (bit `i` = `start_reg + i`)
+        /// marking components that came from a NULL-matching equality (`x IS ?`).
+        /// An `eq_only` seek normally cannot match when a key register is NULL, so it
+        /// jumps to `target_pc`; masked components skip that check and seek with the
+        /// NULL key, because index keys compare NULLs as equal. Bits at position
+        /// >= 64 are treated as unset.
+        null_matching_mask: u64,
     },
 
     /// If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
@@ -1035,6 +1042,13 @@ pub enum Insn {
         num_regs: usize,
         target_pc: BranchOffset,
         eq_only: bool,
+        /// Bitmask over the `num_regs` key registers (bit `i` = `start_reg + i`)
+        /// marking components that came from a NULL-matching equality (`x IS ?`).
+        /// An `eq_only` seek normally cannot match when a key register is NULL, so it
+        /// jumps to `target_pc`; masked components skip that check and seek with the
+        /// NULL key, because index keys compare NULLs as equal. Bits at position
+        /// >= 64 are treated as unset.
+        null_matching_mask: u64,
     },
 
     // If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.

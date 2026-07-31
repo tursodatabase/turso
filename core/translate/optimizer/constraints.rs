@@ -511,6 +511,19 @@ pub fn constraints_from_where_clause(
                     .as_ast_operator()
                     .filter(|op| op.is_comparison())
                     .map(|_| comparison_affinity(lhs, rhs, Some(table_references), None));
+                // `IS` is the one seek-usable operator that can be TRUE for a
+                // null-extended row (`e.id IS NULL`). Such a WHERE term must not
+                // constrain the loop of an outer join's RHS table: filtering the
+                // RHS by it removes the very rows whose absence produces the null
+                // extension, so an antijoin would report every LHS row as
+                // unmatched. Terms from that join's own ON clause are fine, since
+                // they define what counts as a match.
+                let usable = !matches!(operator.as_ast_operator(), Some(ast::Operator::Is))
+                    || !table_reference
+                        .join_info
+                        .as_ref()
+                        .is_some_and(|join| join.is_outer())
+                    || term.from_outer_join == Some(table_reference.internal_id);
                 // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
                 match lhs {
                     ast::Expr::Column { table, column, .. } => {
@@ -532,7 +545,7 @@ pub fn constraints_from_where_clause(
                                     params,
                                     false,
                                 ),
-                                usable: true,
+                                usable,
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
                             });
@@ -561,7 +574,7 @@ pub fn constraints_from_where_clause(
                                     params,
                                     true,
                                 ),
-                                usable: true,
+                                usable,
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                             });
@@ -599,7 +612,7 @@ pub fn constraints_from_where_clause(
                             constraining_expr: None,
                             lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
                             selectivity,
-                            usable: true,
+                            usable,
                             is_rowid: false,
                             comparison_affinity: cmp_aff,
                         });
@@ -626,7 +639,7 @@ pub fn constraints_from_where_clause(
                                     params,
                                     false,
                                 ),
-                                usable: true,
+                                usable,
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
                             });
@@ -655,7 +668,7 @@ pub fn constraints_from_where_clause(
                                     params,
                                     true,
                                 ),
-                                usable: true,
+                                usable,
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                             });
@@ -693,7 +706,7 @@ pub fn constraints_from_where_clause(
                             constraining_expr: None,
                             lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
                             selectivity,
-                            usable: true,
+                            usable,
                             is_rowid: false,
                             comparison_affinity: cmp_aff,
                         });
@@ -856,9 +869,9 @@ pub fn constraints_from_where_clause(
         // sort equalities first so that index keys will be properly constructed.
         // see e.g.: https://www.solarwinds.com/blog/the-left-prefix-index-rule
         cs.constraints.sort_by(|a, b| {
-            if a.operator == ast::Operator::Equals.into() {
+            if is_equality_operator(a.operator) {
                 Ordering::Less
-            } else if b.operator == ast::Operator::Equals.into() {
+            } else if is_equality_operator(b.operator) {
                 Ordering::Greater
             } else {
                 Ordering::Equal
@@ -1199,7 +1212,7 @@ pub fn usable_constraints_for_lhs_mask(
         }
         let operator = constraints[cref.constraint_vec_pos].operator;
         let table_col_pos = constraints[cref.constraint_vec_pos].table_col_pos;
-        if operator == ast::Operator::Equals.into()
+        if is_equality_operator(operator)
             && usable
                 .last()
                 .is_some_and(|x| x.table_col_pos == table_col_pos)
@@ -1209,7 +1222,7 @@ pub fn usable_constraints_for_lhs_mask(
             continue;
         }
         let constraint_group = match operator.as_ast_operator() {
-            Some(ast::Operator::Equals) => RangeConstraintRef {
+            Some(ast::Operator::Equals | ast::Operator::Is) => RangeConstraintRef {
                 table_col_pos,
                 index_col_pos: cref.index_col_pos,
                 sort_order: cref.sort_order,
@@ -1612,6 +1625,22 @@ pub fn convert_to_vtab_constraint(
         })
         .collect();
     Ok(constraints)
+}
+
+/// Whether `op` constrains an index column to a single value, making it usable
+/// as an index seek key.
+///
+/// `IS` belongs here next to `=`: SQLite treats it as an index-usable equality
+/// that additionally matches NULL (`x IS NULL` seeks the index's NULL entries,
+/// and `x IS ?` with a NULL bind finds the rows whose key component is NULL).
+/// The only difference is in codegen: an `=` seek can stop early when its key is
+/// NULL because `NULL = NULL` is not true, while an `IS` seek must seek with the
+/// NULL key. See [`SeekDef::is_null_matching_key_component`].
+pub fn is_equality_operator(op: ConstraintOperator) -> bool {
+    matches!(
+        op.as_ast_operator(),
+        Some(ast::Operator::Equals | ast::Operator::Is)
+    )
 }
 
 fn to_ext_constraint_op(op: &ConstraintOperator) -> Option<ConstraintOp> {
