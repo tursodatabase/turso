@@ -119,6 +119,8 @@ pub trait DurableStorage: Send + Sync + Debug {
 
     /// Called after the checkpoint has fully completed: rows are flushed, WAL is
     /// truncated, and the logical log is reset.
+    ///
+    /// Runs while checkpoint locks are still held.
     fn on_checkpoint_end(&self, _result: Result<&CheckpointResult>) -> Result<()> {
         Ok(())
     }

@@ -162,7 +162,7 @@ pub struct LockStates {
 /// 6. Immediately does a TRUNCATE checkpoint from the WAL to the DB
 /// 7. Fsync the DB file
 /// 8. Truncate logical log to 0 (salt regenerated in memory), fsync, then truncate WAL
-/// 9. Releases the blocking_checkpoint_lock
+/// 9. Calls `on_checkpoint_end`, then releases checkpoint locks
 ///
 /// Passive mode defers step 1 until publish and runs collection/write concurrently; the durable
 /// outcome (WAL backfill, log truncate, metadata) is the same.
@@ -853,6 +853,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         )
     }
 
+    /// Drop checkpoint locks. Call only after `on_checkpoint_end`.
+    fn release_checkpoint_locks_if_needed(&mut self) {
+        if self.lock_states.blocking_checkpoint_lock_held {
+            tracing::debug!("Releasing blocking checkpoint lock");
+            self.checkpoint_lock.unlock();
+            self.lock_states.blocking_checkpoint_lock_held = false;
+        }
+        if self.owns_checkpoint_in_progress {
+            self.mvstore
+                .checkpoint_in_progress
+                .store(false, Ordering::Release);
+            self.owns_checkpoint_in_progress = false;
+        }
+    }
+
     /// Cleanup path for I/O errors that happen while waiting on completions outside
     /// of `step()`. This mirrors `step()` error handling and also resets pager/WAL
     /// checkpoint bookkeeping.
@@ -889,18 +904,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             wal.abort_checkpoint();
         }
 
-        // Release the checkpoint lock only after checkpoint state has been reset.
-        if self.lock_states.blocking_checkpoint_lock_held {
-            self.checkpoint_lock.unlock();
-            self.lock_states.blocking_checkpoint_lock_held = false;
-        }
-        // Release the single-orchestrator gate so a future checkpoint can run.
-        if self.owns_checkpoint_in_progress {
-            self.mvstore
-                .checkpoint_in_progress
-                .store(false, Ordering::Release);
-            self.owns_checkpoint_in_progress = false;
-        }
+        self.release_checkpoint_locks_if_needed();
 
         result
     }
@@ -2949,23 +2953,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
             CheckpointState::Finalize => {
                 if self.lock_states.blocking_checkpoint_lock_held {
-                    // Blocking lock held: the slot-removing GC variant is safe (no writer races
-                    // the empty-slot removal). Then release.
-                    tracing::debug!("Releasing blocking checkpoint lock");
+                    // Slot-removing GC is safe while the blocking lock is held.
                     self.mvstore.drop_unused_row_versions_and_slots();
-                    self.checkpoint_lock.unlock();
-                    self.lock_states.blocking_checkpoint_lock_held = false;
                 } else {
-                    // Passive: GC chains in place only; empty slots reclaimed on next insert.
+                    // Passive: GC chains in place; empty slots reclaimed on next insert.
                     self.mvstore.drop_unused_row_versions();
                 }
-                // Release the single-orchestrator gate so the next checkpoint can run.
-                if self.owns_checkpoint_in_progress {
-                    self.mvstore
-                        .checkpoint_in_progress
-                        .store(false, Ordering::Release);
-                    self.owns_checkpoint_in_progress = false;
-                }
+                // Locks stay held until `step()` runs `on_checkpoint_end`.
                 self.finalize(&())?;
                 Ok(TransitionResult::Done(
                     self.checkpoint_result.take().ok_or_else(|| {
@@ -2988,14 +2982,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
         match res {
             Err(ref err) => {
                 tracing::debug!("Error in checkpoint state machine: {err}");
-                // `cleanup_after_external_io_error` already emits the paired
-                // `on_checkpoint_end(Err(..))`, so don't call it here too — doing both
-                // double-fires the hook for a single failure.
+                // cleanup already calls on_checkpoint_end + unlock
                 self.cleanup_after_external_io_error(err.clone())?;
                 res
             }
             Ok(TransitionResult::Done(ref result)) => {
-                self.mvstore.storage.on_checkpoint_end(Ok(result))?;
+                // End hook before unlock so storage cannot race the next writer/checkpoint.
+                let end = self.mvstore.storage.on_checkpoint_end(Ok(result));
+                self.release_checkpoint_locks_if_needed();
+                end?;
                 res
             }
             Ok(result) => Ok(result),
