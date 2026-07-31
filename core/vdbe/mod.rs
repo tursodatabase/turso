@@ -2076,6 +2076,16 @@ impl Program {
         mv_store: Option<&Arc<MvStore>>,
         rollback: bool,
     ) -> Result<IOResult<()>> {
+        if !rollback {
+            turso_assert!(
+                !matches!(
+                    program_state.sequence_inner_tx_pending.as_ref(),
+                    Some(pending) if pending.saved_outer.is_some()
+                ),
+                "cannot commit while a sequence inner tx has a saved outer user tx"
+            );
+        }
+
         // Apply view deltas with I/O handling
         match self.apply_view_deltas(program_state, rollback, &pager)? {
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
@@ -2719,6 +2729,13 @@ impl Program {
                     // These MVCC errors mean the current transaction cannot
                     // commit. Roll it back even if this statement opened a
                     // statement savepoint, as DDL does.
+                    if let Err(err) = self.rollback_pending_sequence_outer_tx(state) {
+                        capture_abort_error(
+                            &mut abort_error,
+                            err,
+                            "Failed to rollback saved outer transaction after sequence conflict",
+                        );
+                    }
                     self.rollback_current_txn(pager);
                     self.connection.set_changes(0);
                 }
@@ -2877,6 +2894,44 @@ impl Program {
 
     fn rollback_current_txn(&self, pager: &Arc<Pager>) {
         self.connection.rollback_current_txn_state(pager, true);
+    }
+
+    /// MVCC sequence operations run in a separate inner tx, which temporarily
+    /// replaces the connection's `mv_tx` slot. If a transaction-level conflict
+    /// happens while that swap is active, the user transaction lives only in
+    /// `saved_outer`, not in `connection.mv_tx`. Roll it back here and clear
+    /// `saved_outer` so later statement cleanup cannot restore a transaction
+    /// that has already been aborted.
+    fn rollback_pending_sequence_outer_tx(&self, state: &mut ProgramState) -> Result<()> {
+        let Some(pending) = state.sequence_inner_tx_pending.as_mut() else {
+            return Ok(());
+        };
+        let db = pending.db;
+        let (outer_tx_id, _) = pending.saved_outer.take().ok_or_else(|| {
+            LimboError::InternalError(
+                "sequence conflict rollback had pending inner transaction without saved outer \
+                 transaction"
+                    .to_string(),
+            )
+        })?;
+        let mv_store = self.connection.mv_store_for_db(db).ok_or_else(|| {
+            LimboError::InternalError(
+                "sequence inner transaction has no MV store during conflict rollback".to_string(),
+            )
+        })?;
+        let pager = self.connection.get_pager_from_database_index(&db)?;
+        if !mv_store.is_tx_rollbackable(outer_tx_id) {
+            return Err(LimboError::InternalError(format!(
+                "saved sequence outer transaction {outer_tx_id} is not rollbackable during \
+                 conflict rollback"
+            )));
+        }
+        mv_store.rollback_tx(outer_tx_id, pager, &self.connection, db);
+        // `rollback_tx` clears the connection's MVCC tx slot for this db. The caller's
+        // generic rollback then has no current tx to inspect, so it will not flip
+        // autocommit for us.
+        self.connection.auto_commit.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn is_trigger_subprogram(&self) -> bool {
