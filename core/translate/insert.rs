@@ -233,7 +233,7 @@ pub fn translate_insert(
         inserting_multiple_rows,
         database_id,
         table,
-        value_types,
+        source_select,
         target_table_id,
         excluded_table_id,
         bound_index_expressions,
@@ -411,7 +411,7 @@ pub fn translate_insert(
         &columns,
         &table_references,
         database_id,
-        &value_types,
+        source_select,
     )?;
     let has_upsert = !upsert_actions.is_empty();
 
@@ -1883,7 +1883,7 @@ fn init_source_emission<'a>(
     columns: &'a [ast::Name],
     table_references: &TableReferences,
     database_id: usize,
-    value_types: &[Option<Arc<crate::schema::TypeDef>>],
+    source_select: Option<super::bind::BoundSelect>,
 ) -> Result<()> {
     let required_column_count = if columns.is_empty() {
         table.columns().iter().filter(|c| !c.is_generated()).count()
@@ -1942,13 +1942,8 @@ fn init_source_emission<'a>(
                     coroutine_implementation_start: ctx.halt_label,
                 };
                 let num_result_cols = program.nested(|program| {
-                    let mut select = select;
-                    let bound = crate::translate::select::bind_select_stmt_with_expected_types(
-                        &mut select,
-                        resolver,
-                        program,
-                        value_types,
-                    )?;
+                    let bound = source_select
+                        .expect("coroutine INSERT source must be bound before emission");
                     translate_select(
                         select,
                         bound,

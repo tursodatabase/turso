@@ -2241,8 +2241,8 @@ pub type BoundUpsertAction = (
 /// Single-row VALUES bind scope-less because they have no FROM clause.
 /// UPSERT conflict targets bind against the schema table and `DO UPDATE`
 /// expressions bind against the target row plus the EXCLUDED pseudo-table.
-/// Multi-row/SELECT sources bind when the source SELECT is planned. Virtual
-/// table inserts consume the unbound body.
+/// Multi-row/SELECT sources are fully bound here. Virtual table inserts still
+/// consume their restricted VALUES body directly.
 pub struct BoundInsert {
     #[allow(clippy::vec_box)]
     pub values: Vec<Box<ast::Expr>>,
@@ -2252,8 +2252,8 @@ pub struct BoundInsert {
     pub database_id: usize,
     /// The validated target table.
     pub table: Arc<Table>,
-    /// Destination type for each source expression, in INSERT column order.
-    pub value_types: Vec<Option<Arc<TypeDef>>>,
+    /// Bound source for INSERT SELECT and VALUES paths that use a coroutine.
+    pub source_select: Option<BoundSelect>,
     /// ID used by bound references to the current target row.
     pub target_table_id: ast::TableInternalId,
     /// ID used by bound references to the would-be inserted row.
@@ -2555,8 +2555,6 @@ pub fn bind_insert_stmt(
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
     }
     validate_insert(table_name.as_str(), resolver, connection)?;
-    let value_types = insert_value_types(&table, columns, resolver)?;
-
     if table.virtual_table().is_some() {
         return Ok(BoundInsert {
             values: vec![],
@@ -2564,7 +2562,7 @@ pub fn bind_insert_stmt(
             inserting_multiple_rows: false,
             database_id,
             table,
-            value_types,
+            source_select: None,
             target_table_id: program.table_reference_counter.next(),
             excluded_table_id: program.table_reference_counter.next(),
             bound_index_expressions: Vec::new(),
@@ -2573,6 +2571,7 @@ pub fn bind_insert_stmt(
 
     let target_table_id = program.table_reference_counter.next();
     let excluded_table_id = program.table_reference_counter.next();
+    let value_types = insert_value_types(&table, columns, resolver)?;
 
     let mut values: Vec<Box<ast::Expr>> = vec![];
     let mut upsert: Option<Box<ast::Upsert>> = None;
@@ -2674,6 +2673,15 @@ pub fn bind_insert_stmt(
             )?;
         }
     }
+    let source_select = if inserting_multiple_rows {
+        let ast::InsertBody::Select(select, _) = body else {
+            unreachable!("only INSERT SELECT can use the multi-row source path")
+        };
+        let mut binder = BindContext::new(resolver, program);
+        Some(binder.bind_select_with_expected_types(select, &value_types)?)
+    } else {
+        None
+    };
     if let ast::ResolveType::Ignore = on_conflict {
         program.set_resolve_type(ast::ResolveType::Ignore);
         upsert.replace(Box::new(ast::Upsert {
@@ -2717,7 +2725,7 @@ pub fn bind_insert_stmt(
         inserting_multiple_rows,
         database_id,
         table,
-        value_types,
+        source_select,
         target_table_id,
         excluded_table_id,
         bound_index_expressions,
@@ -4002,7 +4010,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
     /// Bind a SELECT used as an INSERT source. Each result expression receives
     /// the type of the destination column at the same position.
-    pub fn bind_select_with_expected_types(
+    fn bind_select_with_expected_types(
         &mut self,
         select: &mut ast::Select,
         expected_types: &[Option<Arc<TypeDef>>],

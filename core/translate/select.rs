@@ -87,17 +87,6 @@ pub fn bind_select_stmt(
     binder.bind_select(select)
 }
 
-/// Bind a SELECT that supplies values to typed destination columns.
-pub fn bind_select_stmt_with_expected_types(
-    select: &mut ast::Select,
-    resolver: &Resolver,
-    program: &mut ProgramBuilder,
-    expected_types: &[Option<Arc<crate::schema::TypeDef>>],
-) -> Result<super::bind::BoundSelect> {
-    let mut binder = super::bind::BindContext::new(resolver, program);
-    binder.bind_select_with_expected_types(select, expected_types)
-}
-
 /// Plan an already-bound SELECT (the second half of
 /// [bind_prepare_select_plan]).
 #[turso_macros::trace_stack]
