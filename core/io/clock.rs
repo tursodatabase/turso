@@ -1,7 +1,5 @@
 use std::sync::LazyLock;
-use std::time::Duration;
-
-use web_time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A monotonic instant in time, backed by `std::time::Instant`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -13,7 +11,7 @@ impl MonotonicInstant {
     }
 
     pub fn now() -> Self {
-        static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+        static EPOCH: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
         let elapsed = EPOCH.elapsed();
         MonotonicInstant(elapsed.as_nanos())
     }
