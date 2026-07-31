@@ -43,7 +43,7 @@ addr  opcode              p1  p2  p3  p4                     p5  comment
   18        Yield          1  42   0                          0
   19        Copy           2  19   0                          0  r[19]=r[2]
   20        NotNull       17  28   0                          0  r[17]!=NULL -> goto 28
-  21        Null           0  11  11                          0  r[11..11]=NULL; initialize per-cursor peer-reference registers for new partition
+  21        Null           0  11  11                          0  r[11..11]=NULL; reset accumulator registers
   22        MakeRecord     2   4  21                          0  r[21]=mkrec(r[2..5])
   23        NewRowid       3  17   0                          0  r[17]=rowid
   24        Insert         3  21  17  buffer_table_window_0   2  intkey=r[17] data=r[21]

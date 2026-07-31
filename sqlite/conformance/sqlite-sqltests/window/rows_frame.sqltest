@@ -69,6 +69,13 @@ expect {
     4|30.0
     5|40.0
 }
+expect @js {
+    1|10
+    2|15
+    3|20
+    4|30
+    5|40
+}
 
 # Large-integer precision under the approximate-sum path. Once a float
 # enters the sum, SQLite's `sumInverse` uses `kahanBabuskaNeumaierStepInt64`
@@ -305,6 +312,13 @@ expect {
     4|50|1|50.0|50.0|50|50|
     5||0|0.0||||
 }
+expect @js {
+    1|50|2|50.0|25|30|20|30
+    2|70|2|70.0|35|40|30|40
+    3|90|2|90.0|45|50|40|50
+    4|50|1|50.0|50|50|50|
+    5||0|0.0||||
+}
 
 @setup base
 test rows-2-following-to-1-following-is-empty {
@@ -342,6 +356,13 @@ expect {
     2|120|3|120.0|40.0|50|30|40
     3|90|2|90.0|45.0|50|40|50
     4|50|1|50.0|50.0|50|50|
+    5||0|0.0||||
+}
+expect @js {
+    1|140|4|140.0|35|50|20|30
+    2|120|3|120.0|40|50|30|40
+    3|90|2|90.0|45|50|40|50
+    4|50|1|50.0|50|50|50|
     5||0|0.0||||
 }
 
@@ -804,6 +825,12 @@ expect {
     2|101.25
     3|300.0
     4|500.0
+}
+expect @js {
+    1|1.25
+    2|101.25
+    3|300
+    4|500
 }
 
 # first_value / nth_value over sliding ROWS frames. SQLite computes

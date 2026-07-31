@@ -765,6 +765,12 @@ expect {
     0.75
     1.0
 }
+expect @js {
+    0.25
+    0.75
+    0.75
+    1
+}
 
 # Named-window chaining: w2 AS (w1 ORDER BY v) inherits w1's
 # PARTITION BY (sqlite3WindowChain, window.c:1276).
@@ -779,4 +785,10 @@ expect {
     1.0
     0.5
     1.0
+}
+expect @js {
+    0.5
+    1
+    0.5
+    1
 }

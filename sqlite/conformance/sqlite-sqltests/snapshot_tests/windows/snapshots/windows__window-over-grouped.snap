@@ -82,7 +82,7 @@ addr  opcode                      p1   p2  p3  p4                     p5  commen
   56        Yield                  1   79   0                          0
   57        Copy                   2   32   0                          0  r[32]=r[2]
   58        NotNull               30   66   0                          0  r[30]!=NULL -> goto 66
-  59        Null                   0   25  25                          0  r[25..25]=NULL; initialize per-cursor peer-reference registers for new partition
+  59        Null                   0   25  25                          0  r[25..25]=NULL; reset accumulator registers
   60        MakeRecord             2    3  34                          0  r[34]=mkrec(r[2..4])
   61        NewRowid               5   30   0                          0  r[30]=rowid
   62        Insert                 5   34  30  buffer_table_window_0   2  intkey=r[30] data=r[34]

@@ -339,6 +339,13 @@ expect {
     4|2.0|70
     5|4.0|50
 }
+expect @js {
+    1|1|30
+    2|1|30
+    3|2|70
+    4|2|70
+    5|4|50
+}
 
 setup mixed_keys {
     CREATE TABLE m(id INTEGER PRIMARY KEY, k, v INTEGER);

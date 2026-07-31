@@ -65,6 +65,13 @@ expect {
     4|30|0.75
     5|40|1.0
 }
+expect @js {
+    1|10|0
+    2|10|0
+    3|20|0.5
+    4|30|0.75
+    5|40|1
+}
 
 @setup base
 test cume-dist-user-frame-overridden {
@@ -77,6 +84,13 @@ expect {
     3|20|0.6
     4|30|0.8
     5|40|1.0
+}
+expect @js {
+    1|10|0.4
+    2|10|0.4
+    3|20|0.6
+    4|30|0.8
+    5|40|1
 }
 
 @setup base
