@@ -15448,7 +15448,14 @@ fn test_mvcc_portable_changes_emit_header_only_commits() {
     let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
     let recovery_ops = collect_mvcc_recovery_ops(&db.conn);
 
-    assert!(portable_changes.is_empty());
+    // Header-only commits touch no user object, but a portable-enabled writer
+    // still emits the extension block so readers can tell an empty change set
+    // apart from pre-portable history. The payload therefore carries the frame
+    // cursor and commit timestamp and nothing else.
+    let txns = decode_portable_change_txns(&portable_changes);
+    assert_eq!(txns.len(), 2);
+    assert!(decoded_object_maps(&txns).is_empty());
+    assert!(txns.iter().all(|txn| txn.metadata.is_empty()));
     assert_eq!(
         recovery_ops
             .iter()
@@ -15693,6 +15700,55 @@ fn test_mvcc_portable_changes_do_not_infer_origin_from_application_table() {
     ));
     assert!(txns.iter().all(|txn| !txn.metadata.contains_key("client")));
     assert!(objects.iter().any(|object| object.name == "items"));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_mark_internal_only_commits_explicitly() {
+    // A push whose user statements match no row commits only the sync
+    // bookkeeping upsert. That transaction has recovery ops but no user-visible
+    // change, and it must still be written as an extension frame: a plain frame
+    // is indistinguishable from pre-portable history, so a sync server planning
+    // a logical pull has to refuse the range, which wedges the database into a
+    // replace-base loop (no fresh replica can bootstrap again).
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute(
+            "CREATE TABLE turso_sync_last_change_id(client_id TEXT PRIMARY KEY, change_id INTEGER)",
+        )
+        .unwrap();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES (1, 'alpha')")
+        .unwrap();
+
+    let before = decode_portable_change_txns(&collect_mvcc_portable_change_bytes(&db.conn)).len();
+
+    db.conn.execute("BEGIN").unwrap();
+    db.conn
+        .execute("DELETE FROM items WHERE payload = 'no-such-row'")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO turso_sync_last_change_id VALUES ('client-a', 7)")
+        .unwrap();
+    db.conn.execute("COMMIT").unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+
+    assert_eq!(
+        txns.len(),
+        before + 1,
+        "internal-only commit must still emit a portable extension frame"
+    );
+    let internal_only = txns.last().unwrap();
+    assert!(internal_only.objects.is_empty());
+    assert!(!bytes_contain(
+        &portable_changes,
+        b"turso_sync_last_change_id"
+    ));
 }
 
 #[cfg(feature = "conn_raw_api")]
