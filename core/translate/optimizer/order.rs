@@ -557,6 +557,8 @@ fn match_intrinsic_order(
         if expected_order != target_col.order {
             return 0;
         }
+        // If the target requests an explicit NULLS ordering, the intrinsic
+        // order must provide the same.
         let requested_nulls = target_col.effective_nulls_order();
         let intrinsic_nulls = intrinsic_col.effective_nulls_order_when_iterated(iter_dir);
         if requested_nulls != intrinsic_nulls {
