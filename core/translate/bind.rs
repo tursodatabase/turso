@@ -5419,6 +5419,56 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         Ok(result)
     }
 
+    fn field_access_resolution(
+        type_def: &crate::schema::TypeDef,
+        field_name: &str,
+    ) -> Option<ast::FieldAccessResolution> {
+        if let Some((field_index, _)) = type_def.find_struct_field(field_name) {
+            Some(ast::FieldAccessResolution::StructField { field_index })
+        } else if let Some((tag_index, _)) = type_def.find_union_variant(field_name) {
+            Some(ast::FieldAccessResolution::UnionVariant { tag_index })
+        } else {
+            None
+        }
+    }
+
+    fn make_field_access_expr(
+        table_id: TableInternalId,
+        col_idx: usize,
+        is_rowid_alias: bool,
+        field_name: &str,
+        type_def: &crate::schema::TypeDef,
+    ) -> Result<ast::Expr> {
+        let Some(resolved) = Self::field_access_resolution(type_def, field_name) else {
+            if type_def.is_struct() {
+                crate::bail_parse_error!(
+                    "no such field '{}' in struct type '{}'",
+                    field_name,
+                    type_def.name
+                );
+            }
+            if type_def.is_union() {
+                crate::bail_parse_error!(
+                    "no such variant '{}' in union type '{}'",
+                    field_name,
+                    type_def.name
+                );
+            }
+            crate::bail_parse_error!("type '{}' is not a struct or union type", type_def.name);
+        };
+
+        Ok(ast::Expr::FieldAccess {
+            base: Box::new(ast::Expr::Column {
+                database: None,
+                table: table_id,
+                column: col_idx,
+                is_rowid_alias,
+            }),
+            field: ast::Name::from_bytes(field_name.as_bytes()),
+            resolved: Some(resolved),
+        })
+    }
+
     /// Try to resolve `col.mid.leaf` as 2-level deep field access
     /// (e.g. `data.telegram.chat_id`). Scope-based counterpart of
     /// `try_resolve_nested_field_access`.
@@ -5437,21 +5487,27 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
         // Case A: UNION column — mid_name is a variant tag.
         // Case B: STRUCT column — mid_name is a struct field.
+        let Some(mid_resolution) = Self::field_access_resolution(td, mid_name) else {
+            return Ok(None);
+        };
         let inner_type_name = td
             .find_union_variant(mid_name)
-            .map(|(_, v)| v.type_name.as_str())
+            .map(|(_, variant)| variant.type_name.as_str())
             .or_else(|| {
                 td.find_struct_field(mid_name)
-                    .map(|(_, f)| f.type_name.as_str())
-            });
-
-        let has_leaf = inner_type_name
-            .and_then(|tn| self.resolver.schema().get_type_def_unchecked(tn))
-            .is_some_and(|itd| itd.find_struct_field(leaf_name).is_some());
-
-        if !has_leaf {
+                    .map(|(_, field)| field.type_name.as_str())
+            })
+            .expect("resolved field access has a matching type definition entry");
+        let Some(inner_type) = self
+            .resolver
+            .schema()
+            .get_type_def_unchecked(inner_type_name)
+        else {
             return Ok(None);
-        }
+        };
+        let Some(leaf_resolution) = Self::field_access_resolution(inner_type, leaf_name) else {
+            return Ok(None);
+        };
 
         let nested_expr = ast::Expr::FieldAccess {
             base: Box::new(ast::Expr::FieldAccess {
@@ -5462,10 +5518,10 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     is_rowid_alias,
                 }),
                 field: ast::Name::from_bytes(mid_name.as_bytes()),
-                resolved: None,
+                resolved: Some(mid_resolution),
             }),
             field: ast::Name::from_bytes(leaf_name.as_bytes()),
-            resolved: None,
+            resolved: Some(leaf_resolution),
         };
         self.tracking.record_column(table_id, col_idx);
         Ok(Some(nested_expr))
@@ -5544,13 +5600,13 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                     if let Some((table_id, col_idx, is_rowid_alias, td)) =
                         self.find_custom_type_column_in_scope(scope, &tbl_normalized)?
                     {
-                        *expr = super::expr::make_field_access_expr(
+                        *expr = Self::make_field_access_expr(
                             table_id,
                             col_idx,
                             is_rowid_alias,
                             &field_name,
                             td,
-                        );
+                        )?;
                         self.tracking.record_column(table_id, col_idx);
                         return Ok(());
                     }
@@ -5658,13 +5714,13 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                             if is_struct_or_union {
                                 let internal_id = st.internal_id;
                                 let is_rowid_alias = col.is_rowid_alias();
-                                *expr = super::expr::make_field_access_expr(
+                                *expr = Self::make_field_access_expr(
                                     internal_id,
                                     col_idx,
                                     is_rowid_alias,
                                     &field_name,
                                     type_def.unwrap(),
-                                );
+                                )?;
                                 self.tracking.record_column(internal_id, col_idx);
                                 return Ok(());
                             } else {
@@ -6785,6 +6841,14 @@ mod tests {
                 .expect("table should be added to schema");
         }
 
+        with_schema_bind_context(&schema, false, f)
+    }
+
+    fn with_schema_bind_context<T>(
+        schema: &Schema,
+        enable_custom_types: bool,
+        f: impl FnOnce(&mut BindContext<'_, TestIdGenerator>) -> T,
+    ) -> T {
         let database_schemas = RwLock::new(HashMap::default());
         let temp_database = RwLock::new(None);
         let attached_databases = RwLock::new(DatabaseCatalog::new());
@@ -6795,13 +6859,73 @@ mod tests {
             &temp_database,
             &attached_databases,
             &symbol_table,
-            false,
+            enable_custom_types,
             crate::translate::emitter::DoubleQuotedDml::Enabled,
             crate::sync::Arc::new(crate::dialect::SqliteDialect),
         );
         let mut id_gen = TestIdGenerator::default();
         let mut ctx = BindContext::new(&resolver, &mut id_gen);
         f(&mut ctx)
+    }
+
+    #[test]
+    fn nested_custom_field_access_is_fully_bound() {
+        let mut schema = Schema::new();
+        schema
+            .add_type_from_sql("CREATE TYPE telegram_msg AS STRUCT(chat_id INT, text TEXT)")
+            .unwrap();
+        schema
+            .add_type_from_sql("CREATE TYPE platform AS UNION(telegram telegram_msg, slack TEXT)")
+            .unwrap();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql("CREATE TABLE msgs(id INT, data platform) STRICT", 2).unwrap(),
+            ))
+            .unwrap();
+
+        with_schema_bind_context(&schema, true, |ctx| {
+            let mut select = parse_select("SELECT data.telegram.chat_id FROM msgs");
+            ctx.bind_select(&mut select).unwrap();
+
+            let ast::Expr::FieldAccess {
+                base,
+                resolved: Some(ast::FieldAccessResolution::StructField { field_index: 0 }),
+                ..
+            } = select_expr(&select, 0)
+            else {
+                panic!("expected bound struct field access");
+            };
+            let ast::Expr::FieldAccess {
+                base,
+                resolved: Some(ast::FieldAccessResolution::UnionVariant { tag_index: 0 }),
+                ..
+            } = base.as_ref()
+            else {
+                panic!("expected bound union variant access");
+            };
+            assert_column_expr(base, 0, 1);
+        });
+    }
+
+    #[test]
+    fn invalid_custom_field_access_fails_during_binding() {
+        let mut schema = Schema::new();
+        schema
+            .add_type_from_sql("CREATE TYPE point AS STRUCT(x INT, y INT)")
+            .unwrap();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql("CREATE TABLE points(id INT, pos point) STRICT", 2).unwrap(),
+            ))
+            .unwrap();
+
+        with_schema_bind_context(&schema, true, |ctx| {
+            let error = bind_select_error(ctx, "SELECT pos.z FROM points").to_string();
+            assert!(
+                error.contains("no such field 'z' in struct type 'point'"),
+                "unexpected error: {error}"
+            );
+        });
     }
 
     fn select_expr(select: &ast::Select, idx: usize) -> &ast::Expr {
