@@ -1120,6 +1120,7 @@ impl ToTokens for Expr {
                 s.append(TK_DOT, None)?;
                 field.to_tokens(s, context)
             }
+            Self::BoundCustomTypeFunction { call, .. } => call.to_tokens(s, context),
             Self::Raise(rt, err) => {
                 s.append(TK_RAISE, None)?;
                 s.append(TK_LP, None)?;

@@ -1735,6 +1735,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                 }
             }
 
+            ast::Expr::BoundCustomTypeFunction { call, .. } => self.build_expr(call, schema),
+
             ast::Expr::FunctionCallStar { name, .. } => {
                 // Handle COUNT(*) and similar
                 let func_name = Self::name_to_string(name);
@@ -2012,6 +2014,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 // Also check if any arguments contain aggregates (for nested functions like HEX(SUM(...)))
                 args.iter().any(|arg| Self::expr_has_aggregate(arg))
             }
+            ast::Expr::BoundCustomTypeFunction { call, .. } => Self::expr_has_aggregate(call),
             ast::Expr::FunctionCallStar { name, .. } => {
                 // FunctionCallStar always has 0 args
                 Self::parse_aggregate_function(&Self::name_to_string(name), 0).is_some()
@@ -2294,6 +2297,7 @@ impl<'a> LogicalPlanBuilder<'a> {
             ast::Expr::Id(name) => Self::name_to_string(name),
             ast::Expr::Qualified(_, col) => Self::name_to_string(col),
             ast::Expr::FunctionCall { name, .. } => Self::name_to_string(name),
+            ast::Expr::BoundCustomTypeFunction { call, .. } => Self::expr_to_column_name(call),
             ast::Expr::FunctionCallStar { name, .. } => {
                 format!("{}(*)", Self::name_to_string(name))
             }

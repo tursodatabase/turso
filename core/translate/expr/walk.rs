@@ -103,6 +103,33 @@ where
                             stack.push(WalkItem::Expr(arg));
                         }
                     }
+                    ast::Expr::BoundCustomTypeFunction { call, .. } => {
+                        let ast::Expr::FunctionCall {
+                            args,
+                            order_by,
+                            within_group,
+                            filter_over,
+                            ..
+                        } = call.as_ref()
+                        else {
+                            unreachable!("bound custom-type function must wrap a function call")
+                        };
+                        if let Some(over_clause) = &filter_over.over_clause {
+                            push_over_clause_walk_items(&mut stack, over_clause);
+                        }
+                        if let Some(filter_clause) = &filter_over.filter_clause {
+                            stack.push(WalkItem::Expr(filter_clause));
+                        }
+                        for sort_col in within_group.iter().rev() {
+                            stack.push(WalkItem::Expr(&sort_col.expr));
+                        }
+                        for sort_col in order_by.iter().rev() {
+                            stack.push(WalkItem::Expr(&sort_col.expr));
+                        }
+                        for arg in args.iter().rev() {
+                            stack.push(WalkItem::Expr(arg));
+                        }
+                    }
                     ast::Expr::FunctionCallStar { filter_over, .. } => {
                         if let Some(over_clause) = &filter_over.over_clause {
                             push_over_clause_walk_items(&mut stack, over_clause);
@@ -363,6 +390,33 @@ where
                         filter_over,
                         ..
                     } => {
+                        if let Some(over_clause) = &mut filter_over.over_clause {
+                            push_over_clause_walk_items(&mut stack, over_clause);
+                        }
+                        if let Some(filter_clause) = &mut filter_over.filter_clause {
+                            stack.push(WalkItem::Expr(filter_clause));
+                        }
+                        for sort_col in within_group.iter_mut().rev() {
+                            stack.push(WalkItem::Expr(&mut sort_col.expr));
+                        }
+                        for sort_col in order_by.iter_mut().rev() {
+                            stack.push(WalkItem::Expr(&mut sort_col.expr));
+                        }
+                        for arg in args.iter_mut().rev() {
+                            stack.push(WalkItem::Expr(arg));
+                        }
+                    }
+                    ast::Expr::BoundCustomTypeFunction { call, .. } => {
+                        let ast::Expr::FunctionCall {
+                            args,
+                            order_by,
+                            within_group,
+                            filter_over,
+                            ..
+                        } = call.as_mut()
+                        else {
+                            unreachable!("bound custom-type function must wrap a function call")
+                        };
                         if let Some(over_clause) = &mut filter_over.over_clause {
                             push_over_clause_walk_items(&mut stack, over_clause);
                         }

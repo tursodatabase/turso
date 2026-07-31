@@ -420,6 +420,23 @@ pub enum FieldAccessResolution {
     UnionVariant { tag_index: u8 },
 }
 
+/// Schema identities needed to emit a custom-type function call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum CustomTypeFunctionResolution {
+    UnionTag {
+        tag_names: Arc<[String]>,
+    },
+    UnionExtract {
+        tag_index: u8,
+        result_type: String,
+    },
+    StructExtract {
+        field_index: usize,
+        result_type: String,
+    },
+}
+
 // https://sqlite.org/syntax/expr.html
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -470,6 +487,11 @@ pub enum Expr {
         field: Name,
         /// pre-resolved field/variant index (populated during binding)
         resolved: Option<FieldAccessResolution>,
+    },
+    /// Custom-type function call with schema identities recorded by binding.
+    BoundCustomTypeFunction {
+        call: Box<Expr>,
+        resolution: CustomTypeFunctionResolution,
     },
     /// call to a built-in function
     FunctionCall {

@@ -654,6 +654,78 @@ pub fn translate_expr(
         ast::Expr::Exists(_) => {
             crate::bail_parse_error!("EXISTS is not supported in this position")
         }
+        ast::Expr::BoundCustomTypeFunction { call, resolution } => {
+            let ast::Expr::FunctionCall { args, .. } = call.as_ref() else {
+                return Err(crate::LimboError::InternalError(
+                    "bound custom-type function does not wrap a function call".to_string(),
+                ));
+            };
+            match resolution {
+                ast::CustomTypeFunctionResolution::UnionTag { tag_names } => {
+                    let [source] = args.as_slice() else {
+                        return Err(crate::LimboError::InternalError(
+                            "bound union_tag call has invalid arity".to_string(),
+                        ));
+                    };
+                    let source_register = program.alloc_register();
+                    translate_expr(
+                        program,
+                        referenced_tables,
+                        source,
+                        source_register,
+                        resolver,
+                    )?;
+                    program.emit_insn(Insn::UnionTag {
+                        src_reg: source_register,
+                        dest: target_register,
+                        tag_names: Arc::clone(tag_names),
+                    });
+                    Ok(target_register)
+                }
+                ast::CustomTypeFunctionResolution::UnionExtract { tag_index, .. } => {
+                    let [source, _tag] = args.as_slice() else {
+                        return Err(crate::LimboError::InternalError(
+                            "bound union_extract call has invalid arity".to_string(),
+                        ));
+                    };
+                    let source_register = program.alloc_register();
+                    translate_expr(
+                        program,
+                        referenced_tables,
+                        source,
+                        source_register,
+                        resolver,
+                    )?;
+                    program.emit_insn(Insn::UnionExtract {
+                        src_reg: source_register,
+                        expected_tag: *tag_index,
+                        dest: target_register,
+                    });
+                    Ok(target_register)
+                }
+                ast::CustomTypeFunctionResolution::StructExtract { field_index, .. } => {
+                    let [source, _field] = args.as_slice() else {
+                        return Err(crate::LimboError::InternalError(
+                            "bound struct_extract call has invalid arity".to_string(),
+                        ));
+                    };
+                    let source_register = program.alloc_register();
+                    translate_expr(
+                        program,
+                        referenced_tables,
+                        source,
+                        source_register,
+                        resolver,
+                    )?;
+                    program.emit_insn(Insn::StructField {
+                        src_reg: source_register,
+                        field_index: *field_index,
+                        dest: target_register,
+                    });
+                    Ok(target_register)
+                }
+            }
+        }
         ast::Expr::FunctionCall {
             name,
             distinctness: _,
@@ -1927,55 +1999,16 @@ pub fn translate_expr(
                             });
                             Ok(target_register)
                         }
-                        ScalarFunc::UnionTagFunc => {
-                            // union_tag(col): resolve col's union type for index→name lookup.
-                            let args = expect_arguments_exact!(args, 1, srf);
-                            let td =
-                                resolve_union_from_column(&args[0], referenced_tables, resolver);
-                            let tag_names = td
-                                .as_ref()
-                                .and_then(|td| td.union_def())
-                                .map(|ud| Arc::clone(&ud.tag_names))
-                                .unwrap_or_else(|| Arc::from(Vec::<String>::new()));
-                            translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
-                                [src_reg <- 0],
-                                Insn::UnionTag { src_reg, dest: target_register, tag_names })
-                        }
-                        ScalarFunc::UnionExtractFunc => {
-                            let args = expect_arguments_exact!(args, 2, srf);
-                            let tag_name = extract_string_literal(&args[1])?;
-                            // union_extract(col, 'tag'): resolve col's union type for name→index.
-                            let td =
-                                resolve_union_from_column(&args[0], referenced_tables, resolver);
-                            let tag_index = td
-                                .as_ref()
-                                .and_then(|td| td.resolve_union_tag_index(&tag_name))
-                                .ok_or_else(|| {
-                                    crate::LimboError::ParseError(format!(
-                                        "cannot resolve union variant '{tag_name}' for union_extract"
-                                    ))
-                                })?;
-                            translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
-                                [src_reg <- 0],
-                                Insn::UnionExtract { src_reg, expected_tag: tag_index, dest: target_register })
-                        }
-                        ScalarFunc::StructExtractFunc => {
-                            let args = expect_arguments_exact!(args, 2, srf);
-                            let field_name = extract_string_literal(&args[1])?;
-                            let td =
-                                resolve_struct_from_expr(&args[0], referenced_tables, resolver);
-                            let (field_index, _) = td
-                                .as_ref()
-                                .and_then(|td| td.find_struct_field(&field_name))
-                                .ok_or_else(|| {
-                                    crate::LimboError::ParseError(format!(
-                                        "cannot resolve struct field '{field_name}' for struct_extract"
-                                    ))
-                                })?;
-                            translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
-                                [src_reg <- 0],
-                                Insn::StructField { src_reg, field_index, dest: target_register })
-                        }
+                        ScalarFunc::UnionTagFunc => Err(crate::LimboError::InternalError(
+                            "unbound union_tag call reached expression translation".to_string(),
+                        )),
+                        ScalarFunc::UnionExtractFunc => Err(crate::LimboError::InternalError(
+                            "unbound union_extract call reached expression translation".to_string(),
+                        )),
+                        ScalarFunc::StructExtractFunc => Err(crate::LimboError::InternalError(
+                            "unbound struct_extract call reached expression translation"
+                                .to_string(),
+                        )),
                         ScalarFunc::NextVal | ScalarFunc::SetVal => translate_sequence_function(
                             program,
                             args,

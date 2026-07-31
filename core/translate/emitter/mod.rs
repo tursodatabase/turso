@@ -238,21 +238,6 @@ impl SelfTableScope {
             .as_ref()
             .and_then(|affinities| affinities.get(column).copied())
     }
-
-    fn column_type_str(&self, column: usize) -> Option<String> {
-        match &self.context {
-            SelfTableContext::ForDML { table, .. } => {
-                table.columns().get(column).map(|c| c.ty_str.clone())
-            }
-            SelfTableContext::ForSelect {
-                table_ref_id,
-                referenced_tables,
-            } => referenced_tables
-                .find_table_by_internal_id(*table_ref_id)
-                .and_then(|(_, table_ref)| table_ref.columns().get(column))
-                .map(|c| c.ty_str.clone()),
-        }
-    }
 }
 
 /// Context for restricting table resolution during trigger subprogram compilation.
@@ -409,13 +394,6 @@ impl<'a> Resolver<'a> {
             .borrow()
             .as_ref()
             .and_then(|scope| scope.affinity(column))
-    }
-
-    pub(crate) fn self_table_column_type_str(&self, column: usize) -> Option<String> {
-        self.self_table_scope
-            .borrow()
-            .as_ref()
-            .and_then(|scope| scope.column_type_str(column))
     }
 
     fn cached_non_main_schema(&self, database_id: usize) -> Arc<Schema> {

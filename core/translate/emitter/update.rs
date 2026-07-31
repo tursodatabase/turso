@@ -1797,10 +1797,8 @@ fn emit_update_insns<'a>(
                 NoConstantOptReason::RegisterReuse,
             )?;
 
-            // Evaluate the partial index predicate against the NEW row image.
-            // We use emit_dml_expr_index_value which properly sets up SelfTableContext::ForDML,
-            // allowing resolve_union_from_column to find type definitions for custom type
-            // functions like union_tag() in the WHERE clause.
+            // Evaluate the partial index predicate against the NEW row image using the
+            // DML self-table register mapping.
             let new_where_expr = index
                 .where_clause
                 .as_ref()

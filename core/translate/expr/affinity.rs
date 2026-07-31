@@ -170,6 +170,7 @@ pub(crate) fn expr_data_type(
             StorageClassMask::TEXT | StorageClassMask::BLOB
         }
         ast::Expr::FunctionCall { .. }
+        | ast::Expr::BoundCustomTypeFunction { .. }
         | ast::Expr::FunctionCallStar { .. }
         | ast::Expr::Variable(_) => StorageClassMask::all(),
         ast::Expr::Column { .. }

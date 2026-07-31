@@ -2534,6 +2534,8 @@ pub fn bind_insert_stmt(
                         if has_subquery {
                             inserting_multiple_rows = true;
                         } else {
+                            let empty_scope = BindScope::empty();
+                            let function_binder = BindContext::new(resolver, program);
                             for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
                                 match expr.as_mut() {
                                     ast::Expr::Id(name) => {
@@ -2555,6 +2557,8 @@ pub fn bind_insert_stmt(
                                     _ => {}
                                 }
                                 bind_scopeless_expr(expr, resolver)?;
+                                function_binder
+                                    .bind_custom_type_function_calls(expr, &empty_scope)?;
                             }
                             values = values_expr.pop().unwrap_or_else(Vec::new);
                         }
@@ -4735,14 +4739,21 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                 // tables), and the recursive-CTE planner consumes them as
                 // already bound.
                 let resolver = self.resolver;
-                let entry = self.ctes.get_mut(&cte_name).unwrap();
-                entry.select.order_by.clear();
-                if let Some(limit) = entry.select.limit.as_mut() {
+                let mut limit = {
+                    let entry = self.ctes.get_mut(&cte_name).unwrap();
+                    entry.select.order_by.clear();
+                    entry.select.limit.take()
+                };
+                if let Some(limit) = limit.as_mut() {
+                    let empty_scope = BindScope::empty();
                     bind_scopeless_expr(&mut limit.expr, resolver)?;
+                    self.bind_custom_type_function_calls(&mut limit.expr, &empty_scope)?;
                     if let Some(offset) = limit.offset.as_mut() {
                         bind_scopeless_expr(offset, resolver)?;
+                        self.bind_custom_type_function_calls(offset, &empty_scope)?;
                     }
                 }
+                self.ctes.get_mut(&cte_name).unwrap().select.limit = limit;
                 recursive_bindings.push((
                     cte_name.clone(),
                     RecursiveCteBinding {
@@ -5527,6 +5538,204 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         Ok(Some(nested_expr))
     }
 
+    fn custom_type_expr_definition(
+        &self,
+        expr: &ast::Expr,
+        scope: &BindScope,
+    ) -> Option<Arc<crate::schema::TypeDef>> {
+        let type_name = match expr {
+            ast::Expr::Column { table, column, .. } => {
+                let scope_table = scope
+                    .tables
+                    .iter()
+                    .find(|scope_table| scope_table.internal_id == *table)
+                    .or_else(|| {
+                        self.all_outer_scopes_iter().find_map(|outer_scope| {
+                            outer_scope
+                                .tables
+                                .iter()
+                                .find(|scope_table| scope_table.internal_id == *table)
+                        })
+                    })?;
+                let ScopeTableSource::Table(table) = &scope_table.source else {
+                    return None;
+                };
+                table.columns().get(*column)?.ty_str.clone()
+            }
+            ast::Expr::Variable(variable) => variable.col_type.as_ref()?.to_string(),
+            ast::Expr::FieldAccess { base, field, .. } => {
+                let parent = self.custom_type_expr_definition(base, scope)?;
+                parent
+                    .find_struct_field(field.as_str())
+                    .map(|(_, field)| field.type_name.clone())
+                    .or_else(|| {
+                        parent
+                            .find_union_variant(field.as_str())
+                            .map(|(_, variant)| variant.type_name.clone())
+                    })?
+            }
+            ast::Expr::BoundCustomTypeFunction { resolution, .. } => match resolution {
+                ast::CustomTypeFunctionResolution::UnionExtract { result_type, .. }
+                | ast::CustomTypeFunctionResolution::StructExtract { result_type, .. } => {
+                    result_type.clone()
+                }
+                ast::CustomTypeFunctionResolution::UnionTag { .. } => return None,
+            },
+            ast::Expr::FunctionCall { name, args, .. } => {
+                let function_name = normalize_ident(name.as_str());
+                match function_name.as_str() {
+                    "union_extract" if args.len() == 2 => {
+                        let ast::Expr::Literal(ast::Literal::String(tag_name)) = args[1].as_ref()
+                        else {
+                            return None;
+                        };
+                        let union = self.custom_type_expr_definition(&args[0], scope)?;
+                        union
+                            .find_union_variant(tag_name.trim_matches('\''))?
+                            .1
+                            .type_name
+                            .clone()
+                    }
+                    "struct_extract" if args.len() == 2 => {
+                        let ast::Expr::Literal(ast::Literal::String(field_name)) = args[1].as_ref()
+                        else {
+                            return None;
+                        };
+                        let structure = self.custom_type_expr_definition(&args[0], scope)?;
+                        structure
+                            .find_struct_field(field_name.trim_matches('\''))?
+                            .1
+                            .type_name
+                            .clone()
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        self.resolver
+            .schema()
+            .get_type_def_unchecked(&type_name)
+            .cloned()
+    }
+
+    fn bind_custom_type_function_calls(
+        &self,
+        expr: &mut ast::Expr,
+        scope: &BindScope,
+    ) -> Result<()> {
+        walk_expr_mut(expr, &mut |expr| {
+            let ast::Expr::FunctionCall {
+                name,
+                args,
+                order_by,
+                within_group,
+                filter_over,
+                ..
+            } = expr
+            else {
+                return Ok(WalkControl::Continue);
+            };
+            let function_name = normalize_ident(name.as_str());
+            if matches!(
+                function_name.as_str(),
+                "union_tag" | "union_extract" | "struct_extract"
+            ) {
+                if !order_by.is_empty() || !within_group.is_empty() {
+                    crate::bail_parse_error!(
+                        "ORDER BY is not allowed for scalar function {}()",
+                        function_name
+                    );
+                }
+                if filter_over.filter_clause.is_some() || filter_over.over_clause.is_some() {
+                    crate::bail_parse_error!(
+                        "{}() may not be used as an aggregate or window function",
+                        function_name
+                    );
+                }
+            }
+            let resolution = match function_name.as_str() {
+                "union_tag" => {
+                    let union = self
+                        .custom_type_expr_definition(&args[0], scope)
+                        .filter(|type_def| type_def.is_union())
+                        .ok_or_else(|| {
+                            crate::LimboError::ParseError(
+                                "union_tag() argument must have a known union type".to_string(),
+                            )
+                        })?;
+                    let tag_names = Arc::clone(
+                        &union
+                            .union_def()
+                            .expect("union type must have a union definition")
+                            .tag_names,
+                    );
+                    ast::CustomTypeFunctionResolution::UnionTag { tag_names }
+                }
+                "union_extract" => {
+                    let ast::Expr::Literal(ast::Literal::String(tag_name)) = args[1].as_ref()
+                    else {
+                        unreachable!("union_extract literal argument was validated earlier")
+                    };
+                    let tag_name = tag_name.trim_matches('\'');
+                    let union = self
+                        .custom_type_expr_definition(&args[0], scope)
+                        .filter(|type_def| type_def.is_union())
+                        .ok_or_else(|| {
+                            crate::LimboError::ParseError(
+                                "union_extract() first argument must have a known union type"
+                                    .to_string(),
+                            )
+                        })?;
+                    let (tag_index, variant) =
+                        union.find_union_variant(tag_name).ok_or_else(|| {
+                            crate::LimboError::ParseError(format!(
+                                "unknown variant '{}' in union type '{}'",
+                                tag_name, union.name
+                            ))
+                        })?;
+                    ast::CustomTypeFunctionResolution::UnionExtract {
+                        tag_index,
+                        result_type: variant.type_name.clone(),
+                    }
+                }
+                "struct_extract" => {
+                    let ast::Expr::Literal(ast::Literal::String(field_name)) = args[1].as_ref()
+                    else {
+                        unreachable!("struct_extract literal argument was validated earlier")
+                    };
+                    let field_name = field_name.trim_matches('\'');
+                    let structure = self
+                        .custom_type_expr_definition(&args[0], scope)
+                        .filter(|type_def| type_def.is_struct())
+                        .ok_or_else(|| {
+                            crate::LimboError::ParseError(
+                                "struct_extract() first argument must have a known struct type"
+                                    .to_string(),
+                            )
+                        })?;
+                    let (field_index, field) =
+                        structure.find_struct_field(field_name).ok_or_else(|| {
+                            crate::LimboError::ParseError(format!(
+                                "unknown field '{}' in struct type '{}'",
+                                field_name, structure.name
+                            ))
+                        })?;
+                    ast::CustomTypeFunctionResolution::StructExtract {
+                        field_index,
+                        result_type: field.type_name.clone(),
+                    }
+                }
+                _ => return Ok(WalkControl::Continue),
+            };
+
+            let call = Box::new(take_expr(expr));
+            *expr = ast::Expr::BoundCustomTypeFunction { call, resolution };
+            Ok(WalkControl::Continue)
+        })?;
+        Ok(())
+    }
+
     fn bind_identifier(&mut self, expr: &mut ast::Expr, scope: &BindScope) -> Result<()> {
         if self.bind_trigger_column(expr)? {
             return Ok(());
@@ -6003,6 +6212,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
             }
             Ok(WalkControl::Continue)
         })?;
+        self.bind_custom_type_function_calls(expr, scope)?;
         Ok(())
     }
 
@@ -6904,6 +7114,82 @@ mod tests {
                 panic!("expected bound union variant access");
             };
             assert_column_expr(base, 0, 1);
+        });
+    }
+
+    #[test]
+    fn custom_type_extraction_functions_are_fully_bound() {
+        let mut schema = Schema::new();
+        schema
+            .add_type_from_sql("CREATE TYPE telegram_msg AS STRUCT(chat_id INT, text TEXT)")
+            .unwrap();
+        schema
+            .add_type_from_sql("CREATE TYPE platform AS UNION(telegram telegram_msg, slack TEXT)")
+            .unwrap();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql("CREATE TABLE msgs(id INT, data platform) STRICT", 2).unwrap(),
+            ))
+            .unwrap();
+
+        with_schema_bind_context(&schema, true, |ctx| {
+            let mut select = parse_select(
+                "SELECT union_tag(data), \
+                 struct_extract(union_extract(data, 'telegram'), 'chat_id') FROM msgs",
+            );
+            ctx.bind_select(&mut select).unwrap();
+
+            let ast::Expr::BoundCustomTypeFunction {
+                resolution: ast::CustomTypeFunctionResolution::UnionTag { tag_names },
+                ..
+            } = select_expr(&select, 0)
+            else {
+                panic!("expected bound union_tag call");
+            };
+            assert_eq!(tag_names.as_ref(), ["telegram", "slack"]);
+
+            let ast::Expr::BoundCustomTypeFunction {
+                call,
+                resolution: ast::CustomTypeFunctionResolution::StructExtract { field_index: 0, .. },
+            } = select_expr(&select, 1)
+            else {
+                panic!("expected bound struct_extract call");
+            };
+            let ast::Expr::FunctionCall { args, .. } = call.as_ref() else {
+                panic!("expected wrapped struct_extract call");
+            };
+            assert!(matches!(
+                args[0].as_ref(),
+                ast::Expr::BoundCustomTypeFunction {
+                    resolution: ast::CustomTypeFunctionResolution::UnionExtract {
+                        tag_index: 0,
+                        ..
+                    },
+                    ..
+                }
+            ));
+        });
+    }
+
+    #[test]
+    fn invalid_union_extract_fails_during_binding() {
+        let mut schema = Schema::new();
+        schema
+            .add_type_from_sql("CREATE TYPE platform AS UNION(telegram TEXT, slack TEXT)")
+            .unwrap();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql("CREATE TABLE msgs(id INT, data platform) STRICT", 2).unwrap(),
+            ))
+            .unwrap();
+
+        with_schema_bind_context(&schema, true, |ctx| {
+            let error = bind_select_error(ctx, "SELECT union_extract(data, 'discord') FROM msgs")
+                .to_string();
+            assert!(
+                error.contains("unknown variant 'discord' in union type 'platform'"),
+                "unexpected error: {error}"
+            );
         });
     }
 

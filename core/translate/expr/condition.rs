@@ -426,6 +426,7 @@ pub fn translate_condition_expr(
         ast::Expr::Literal(_)
         | ast::Expr::Cast { .. }
         | ast::Expr::FunctionCall { .. }
+        | ast::Expr::BoundCustomTypeFunction { .. }
         | ast::Expr::Column { .. }
         | ast::Expr::RowId { .. }
         | ast::Expr::Case { .. } => {

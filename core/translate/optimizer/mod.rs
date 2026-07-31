@@ -2923,6 +2923,7 @@ impl Optimizable for ast::Expr {
             }
             Expr::Exists(..) => false,
             Expr::FunctionCall { .. } => false,
+            Expr::BoundCustomTypeFunction { .. } => false,
             Expr::FunctionCallStar { .. } => false,
             Expr::Id(..) => panic!("Do not call is_nonnull before Id has been rewritten as Column"),
             Expr::Column {
@@ -3035,6 +3036,7 @@ impl Optimizable for ast::Expr {
                 };
                 func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
             }
+            Expr::BoundCustomTypeFunction { call, .. } => call.is_constant(resolver),
             Expr::FunctionCallStar { .. } => false,
             Expr::Id(_) => true,
             Expr::Column { .. } => false,
