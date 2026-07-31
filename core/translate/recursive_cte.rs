@@ -49,6 +49,7 @@ pub(crate) fn emit_recursive_cte(
                 queue_index_columns.try_push(IndexColumn {
                     name: format!("null-rank-{}", queue_sort_keys.len()),
                     order: SortOrder::Asc,
+                    nulls_order: None,
                     pos_in_table: queue_index_columns.len(),
                     collation: None,
                     default: None,
@@ -62,6 +63,7 @@ pub(crate) fn emit_recursive_cte(
             queue_index_columns.try_push(IndexColumn {
                 name: format!("priority-{}", queue_sort_keys.len()),
                 order: *order,
+                nulls_order: None,
                 pos_in_table: queue_index_columns.len(),
                 collation,
                 default: None,
@@ -107,6 +109,7 @@ pub(crate) fn emit_recursive_cte(
             seen_row_index_columns.try_push(IndexColumn {
                 name: format!("distinct-{result_column_index}"),
                 order: SortOrder::Asc,
+                nulls_order: None,
                 pos_in_table: result_column_index,
                 collation: recursive_cte_result_column_collation(
                     recursive_cte,
