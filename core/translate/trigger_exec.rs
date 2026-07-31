@@ -436,15 +436,14 @@ pub fn fire_trigger(
         // Evaluate WHEN clause if present
         if let Some(mut when_expr) = trigger.when_clause.clone() {
             crate::stack::trace_stack!("when_clause");
-            let mut bound_subqueries = {
-                let mut binder = crate::translate::bind::BindContext::new(resolver, program);
-                binder.bind_trigger_when(
-                    &mut when_expr,
-                    ctx.table.clone(),
-                    ctx.new_registers.as_deref(),
-                    ctx.old_registers.as_deref(),
-                )?
-            };
+            let mut bound_subqueries = crate::translate::bind::bind_trigger_when_clause(
+                &mut when_expr,
+                ctx.table.clone(),
+                ctx.new_registers.as_deref(),
+                ctx.old_registers.as_deref(),
+                resolver,
+                program,
+            )?;
 
             // Plan and emit any subqueries in the WHEN clause (e.g. IN (SELECT ...), EXISTS, scalar subqueries).
             let mut subqueries = Vec::new();

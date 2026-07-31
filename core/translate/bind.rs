@@ -2113,6 +2113,19 @@ pub fn bind_select_stmt(
     binder.bind_select(select)
 }
 
+/// Bind NEW/OLD references and subqueries in a trigger WHEN clause.
+pub fn bind_trigger_when_clause(
+    expr: &mut ast::Expr,
+    table: Arc<BTreeTable>,
+    new_registers: Option<&[usize]>,
+    old_registers: Option<&[usize]>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<HashMap<ast::TableInternalId, BoundSubquery>> {
+    let mut binder = BindContext::new(resolver, program);
+    binder.bind_trigger_when(expr, table, new_registers, old_registers)
+}
+
 /// Bind a DELETE statement up front: validate the target table and resolve
 /// all names in WHERE and RETURNING. Planning consumes the result without
 /// re-resolving anything.
@@ -7066,7 +7079,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     /// Bind NEW/OLD references and subqueries in a trigger WHEN clause.
     /// Top-level identifiers are either resolved here or rejected. DQS string
     /// fallback is also completed here so emission never binds raw SQL names.
-    pub fn bind_trigger_when(
+    fn bind_trigger_when(
         &mut self,
         expr: &mut ast::Expr,
         table: Arc<BTreeTable>,
