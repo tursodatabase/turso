@@ -189,14 +189,14 @@ jobs:
             exit $LASTEXITCODE
           }
 
-  build-wasm32-unknow-unknow:
+  build-wasm32-unknown-unknown:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
+      - name: Add wasm32 Rust target
+        run: rustup target add wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
