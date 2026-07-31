@@ -7617,6 +7617,7 @@ dependencies = [
  "tracing-subscriber",
  "turso_core",
  "turso_ext",
+ "vcpkg",
 ]
 
 [[package]]

@@ -121,16 +121,14 @@ impl TerminalDetector {
             return TerminalTheme::Unknown;
         }
 
-        Self::query_terminal_theme().unwrap_or(TerminalTheme::Unknown)
+        Self::detect_via_ansi_query().unwrap_or(TerminalTheme::Unknown)
     }
 }
 
 #[cfg(target_os = "windows")]
 impl TerminalDetector {
-    fn query_terminal_theme() -> Option<TerminalTheme> {
-        Self::detect_via_ansi_query().or_else(Self::detect_via_console_screen_buffer)
-    }
-
+    // GetConsoleScreenBufferInfoEx can return the default palette, so only use OSC 11.
+    // https://github.com/microsoft/terminal/issues/10639
     fn detect_via_ansi_query() -> Option<TerminalTheme> {
         let reader = WindowsTerminalResponseReader::new()?;
 
@@ -139,37 +137,6 @@ impl TerminalDetector {
 
         let response = reader.read()?;
         Self::parse_ansi_color_response(&response)
-    }
-
-    fn detect_via_console_screen_buffer() -> Option<TerminalTheme> {
-        use std::mem::size_of;
-        use windows_sys::Win32::System::Console::{
-            GetConsoleScreenBufferInfoEx, CONSOLE_SCREEN_BUFFER_INFOEX, STD_OUTPUT_HANDLE,
-        };
-
-        let output = windows_std_handle(STD_OUTPUT_HANDLE)?;
-        let mut info = CONSOLE_SCREEN_BUFFER_INFOEX::default();
-        info.cbSize = size_of::<CONSOLE_SCREEN_BUFFER_INFOEX>() as u32;
-
-        // SAFETY: `output` is a valid standard handle and `info` points to a
-        // writable, correctly sized structure for the duration of the call.
-        if unsafe { GetConsoleScreenBufferInfoEx(output, &mut info) } == 0 {
-            return None;
-        }
-
-        Some(Self::theme_from_console_screen_buffer(&info))
-    }
-
-    fn theme_from_console_screen_buffer(
-        info: &windows_sys::Win32::System::Console::CONSOLE_SCREEN_BUFFER_INFOEX,
-    ) -> TerminalTheme {
-        let background_index = ((info.wAttributes >> 4) & 0x0f) as usize;
-        let color = info.ColorTable[background_index];
-        let red = (color & 0x0000_00ff) as u8;
-        let green = ((color & 0x0000_ff00) >> 8) as u8;
-        let blue = ((color & 0x00ff_0000) >> 16) as u8;
-
-        Self::classify_color_brightness(red, green, blue)
     }
 }
 
@@ -425,10 +392,6 @@ fn read_windows_pipe_response(
 
 #[cfg(unix)]
 impl TerminalDetector {
-    fn query_terminal_theme() -> Option<TerminalTheme> {
-        Self::detect_via_ansi_query()
-    }
-
     /// Query terminal background color using ANSI escape sequence OSC 11
     fn detect_via_ansi_query() -> Option<TerminalTheme> {
         // Save current terminal settings
@@ -598,27 +561,6 @@ mod tests {
         assert_eq!(
             TerminalDetector::parse_ansi_color_response(invalid_response),
             None
-        );
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn test_console_screen_buffer_theme_uses_background_color() {
-        use windows_sys::Win32::System::Console::CONSOLE_SCREEN_BUFFER_INFOEX;
-
-        let mut info = CONSOLE_SCREEN_BUFFER_INFOEX::default();
-        info.wAttributes = 1 << 4;
-        info.ColorTable[1] = 0x00ff_ffff;
-        assert_eq!(
-            TerminalDetector::theme_from_console_screen_buffer(&info),
-            TerminalTheme::Light
-        );
-
-        info.wAttributes = 2 << 4;
-        info.ColorTable[2] = 0;
-        assert_eq!(
-            TerminalDetector::theme_from_console_screen_buffer(&info),
-            TerminalTheme::Dark
         );
     }
 }
