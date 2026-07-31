@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::expr::translate_plan_expr_no_constant_opt;
 
 /// Open or reuse the ephemeral cursor that supplies RHS values for an IN-seek.
 ///
@@ -10,7 +11,7 @@ pub(super) fn open_in_seek_source_cursor(
     program: &mut ProgramBuilder,
     table_references: &TableReferences,
     resolver: &Resolver<'_>,
-    index: Option<&Arc<Index>>,
+    index: Option<&Index>,
     source: &InSeekSource,
 ) -> Result<CursorID> {
     match source {
@@ -20,7 +21,6 @@ pub(super) fn open_in_seek_source_cursor(
                 target_pc_when_reentered: label_once_end,
             });
             let collation = index
-                .as_ref()
                 .and_then(|idx| idx.columns.first())
                 .and_then(|c| c.collation);
             let ephemeral_index = Arc::new(Index {
@@ -51,7 +51,7 @@ pub(super) fn open_in_seek_source_cursor(
             let record_reg = program.alloc_register();
             let affinity_str = affinity.aff_mask().to_string();
             for value in values.iter() {
-                translate_expr_no_constant_opt(
+                translate_plan_expr_no_constant_opt(
                     program,
                     Some(table_references),
                     value,

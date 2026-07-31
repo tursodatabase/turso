@@ -61,6 +61,28 @@ expect {
     1
 }
 
+@requires strict "uses STRICT tables"
+test op-recursive-cte-final-type-binds-comparison {
+    CREATE TYPE recursive_uint(value any) BASE text
+        ENCODE test_uint_encode(value)
+        DECODE test_uint_decode(value)
+        OPERATOR '<' test_uint_lt;
+    CREATE TABLE recursive_values(id INTEGER PRIMARY KEY, val recursive_uint) STRICT;
+    INSERT INTO recursive_values VALUES (1, 2), (2, 10);
+    WITH RECURSIVE steps(step, val) AS (
+        VALUES (0, NULL)
+        UNION ALL
+        SELECT step + 1, next.val
+        FROM steps
+        JOIN recursive_values AS next ON next.id = step + 1
+        WHERE step = 0 OR val < next.val
+    )
+    SELECT max(step) FROM steps;
+}
+expect {
+    2
+}
+
 
 @requires strict "uses STRICT tables"
 test op-literal-add-integer {

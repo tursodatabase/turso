@@ -1,29 +1,27 @@
 use crate::alloc::TursoIteratorExt;
-use turso_parser::ast::{self, SortOrder};
+use turso_parser::ast::{NullsOrder, SortOrder};
 
 use super::{
     emitter::TranslateCtx,
-    expr::{translate_condition_expr, translate_expr, ConditionMetadata},
+    expr::{translate_plan_condition_expr, translate_plan_expr, ConditionMetadata},
     plan::{Distinctness, GroupBy, SelectPlan, SubqueryEvalPhase, SubqueryOrigin},
+    plan_expr::{
+        plan_expr_collation, plan_expr_dependencies, plan_exprs_are_equivalent, walk_plan_expr,
+        PlanExpr, PlanOrderTerm, PlanSubqueryExpr, PlanWalkControl,
+    },
     result_row::emit_select_result,
 };
-use crate::function::AccumulatorFunc;
+use crate::function::{AccumulatorFunc, Deterministic};
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     order_by::{custom_type_comparator, EmitOrderBy},
     plan::{Aggregate, NonFromClauseSubquery},
     subquery::emit_non_from_clause_subqueries_for_phase,
 };
-use crate::translate::{
-    emitter::Resolver,
-    expr::{walk_expr, WalkControl},
-    optimizer::Optimizable,
-};
 use crate::{
     emit_explain,
     schema::PseudoCursorType,
-    translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq},
-    util::exprs_are_equivalent,
+    translate::collate::CollationSeq,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::Insn,
@@ -96,11 +94,7 @@ impl EmitGroupBy {
         group_by: &'a GroupBy,
         plan: &SelectPlan,
         result_columns: &'a [ResultSetColumn],
-        order_by: &'a [(
-            Box<ast::Expr>,
-            ast::SortOrder,
-            Option<turso_parser::ast::NullsOrder>,
-        )],
+        order_by: &'a [PlanOrderTerm],
     ) -> Result<()> {
         collect_non_aggregate_expressions(
             &mut t_ctx.non_aggregate_expressions,
@@ -163,18 +157,14 @@ impl EmitGroupBy {
             let order_collations_nulls: crate::alloc::Vec<(
                 SortOrder,
                 Option<CollationSeq>,
-                Option<turso_parser::ast::NullsOrder>,
+                Option<NullsOrder>,
             )> = group_by
                 .exprs
                 .iter()
                 .zip(sort_order.iter())
                 .zip(group_by.nulls_order.iter())
                 .map(|((expr, ord), nulls)| {
-                    let collation = get_collseq_from_expr_with_symbols(
-                        expr,
-                        &plan.table_references,
-                        Some(t_ctx.resolver.symbol_table),
-                    )?;
+                    let collation = plan_expr_collation(expr, plan)?;
                     Ok::<_, crate::LimboError>((*ord, collation, *nulls))
                 })
                 .try_collect::<Result<crate::alloc::Vec<_>>>()??;
@@ -183,9 +173,7 @@ impl EmitGroupBy {
             let comparators = group_by
                 .exprs
                 .iter()
-                .map(|expr| {
-                    custom_type_comparator(expr, &plan.table_references, t_ctx.resolver.schema())
-                })
+                .map(|expr| custom_type_comparator(expr, plan))
                 .try_collect()?;
 
             program.emit_insn(Insn::SorterOpen {
@@ -277,14 +265,42 @@ impl EmitGroupBy {
 /// on the stability of the ORDER BY sorter to preserve the traversal order
 /// of groups established by GROUP BY iteration, and no extra tiebreak
 /// `Sequence` column is appended
-pub fn is_orderby_agg_or_const(resolver: &Resolver, e: &ast::Expr, aggs: &[Aggregate]) -> bool {
+pub fn is_orderby_agg_or_const(e: &PlanExpr, aggs: &[Aggregate]) -> bool {
     if aggs
         .iter()
-        .any(|agg| exprs_are_equivalent(&agg.original_expr, e))
+        .any(|agg| plan_exprs_are_equivalent(&agg.original_expr, e))
     {
         return true;
     }
-    e.is_constant(resolver)
+    is_constant_plan_expr(e)
+}
+
+fn is_constant_plan_expr(expr: &PlanExpr) -> bool {
+    if !plan_expr_dependencies(expr).is_ok_and(|dependencies| dependencies.is_constant()) {
+        return false;
+    }
+    let mut deterministic = true;
+    let walked = walk_plan_expr(expr, &mut |expr| {
+        let is_nondeterministic = match expr {
+            PlanExpr::Function(call) => {
+                call.window.is_some()
+                    || call.sequence_operation.is_some()
+                    || !call.function.value().is_deterministic()
+            }
+            PlanExpr::Binary {
+                custom: Some(custom),
+                ..
+            } => !custom.function.value().is_deterministic(),
+            PlanExpr::Like { function, .. } => !function.value().is_deterministic(),
+            _ => false,
+        };
+        if is_nondeterministic {
+            deterministic = false;
+            return Ok(PlanWalkControl::SkipChildren);
+        }
+        Ok(PlanWalkControl::Continue)
+    });
+    walked.is_ok() && deterministic
 }
 
 /// Computes the traversal order of GROUP BY keys so that the final
@@ -299,26 +315,21 @@ pub fn is_orderby_agg_or_const(resolver: &Resolver, e: &ast::Expr, aggs: &[Aggre
 /// we try to mirror explicit directions for any GROUP BY expression that
 /// appears in ORDER BY, and the remaining keys default to `ASC`.
 pub fn compute_group_by_sort_order(
-    group_by_exprs: &[ast::Expr],
-    order_by: &[(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )],
+    group_by_exprs: &[PlanExpr],
+    order_by: &[PlanOrderTerm],
     aggs: &[Aggregate],
-    resolver: &Resolver,
-) -> (Vec<SortOrder>, Vec<Option<ast::NullsOrder>>) {
+) -> (Vec<SortOrder>, Vec<Option<NullsOrder>>) {
     let groupby_len = group_by_exprs.len();
     if groupby_len == 0 || order_by.is_empty() {
         return (vec![SortOrder::Asc; groupby_len], vec![None; groupby_len]);
     }
     let only_agg_or_const = order_by
         .iter()
-        .all(|(e, _, _)| is_orderby_agg_or_const(resolver, e, aggs));
+        .all(|term| is_orderby_agg_or_const(&term.expr, aggs));
 
     if only_agg_or_const {
-        let first_direction = order_by[0].1;
-        let first_nulls = order_by[0].2;
+        let first_direction = order_by[0].order;
+        let first_nulls = order_by[0].nulls;
         return (
             vec![first_direction; groupby_len],
             vec![first_nulls; groupby_len],
@@ -328,12 +339,12 @@ pub fn compute_group_by_sort_order(
     let mut sort_order = vec![SortOrder::Asc; groupby_len];
     let mut nulls_order = vec![None; groupby_len];
     for (idx, groupby_expr) in group_by_exprs.iter().enumerate() {
-        if let Some((_, direction, nulls)) = order_by
+        if let Some(term) = order_by
             .iter()
-            .find(|(expr, _, _)| exprs_are_equivalent(expr, groupby_expr))
+            .find(|term| plan_exprs_are_equivalent(&term.expr, groupby_expr))
         {
-            sort_order[idx] = *direction;
-            nulls_order[idx] = *nulls;
+            sort_order[idx] = term.order;
+            nulls_order[idx] = term.nulls;
         }
     }
     (sort_order, nulls_order)
@@ -344,75 +355,103 @@ pub fn compute_group_by_sort_order(
 /// By storing only these in the GROUP BY sorter (instead of pre-computed expression
 /// results), we reduce sorter record size and avoid redundant B-tree column reads.
 ///
-/// Correlated subquery results (`SubqueryResult`) inside aggregate arguments are
-/// also collected as leaf expressions.  Their value is computed per-row during the
+/// Correlated subquery expressions inside aggregate arguments are also collected
+/// as leaves. Their value is computed per-row during the
 /// scan loop, stored in the sorter, and read back during the sorter loop so that
 /// each sorted row sees the correct subquery result instead of a stale register
 /// value left over from the last scanned row.
-fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Result<Vec<ast::Expr>> {
-    let mut leaf_columns: Vec<ast::Expr> = Vec::new();
-    let mut collect = |expr: &ast::Expr| -> Result<WalkControl> {
+fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Result<Vec<PlanExpr>> {
+    let mut leaf_columns: Vec<PlanExpr> = Vec::new();
+    let mut collect = |expr: &PlanExpr| -> Result<PlanWalkControl> {
         match expr {
-            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
+            PlanExpr::Column(column) => {
                 if plan
                     .table_references
-                    .find_joined_table_by_internal_id(*table)
+                    .find_joined_table_by_internal_id(column.source)
                     .is_some()
-                    && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr))
+                    && !leaf_columns
+                        .iter()
+                        .any(|leaf| plan_exprs_are_equivalent(leaf, expr))
                 {
                     leaf_columns.push(expr.clone());
                 }
-                Ok(WalkControl::SkipChildren)
+                Ok(PlanWalkControl::SkipChildren)
             }
-            ast::Expr::SubqueryResult { subquery_id, .. } => {
+            PlanExpr::MergedColumn(column) => {
+                if plan
+                    .table_references
+                    .find_joined_table_by_internal_id(column.right.source)
+                    .is_some()
+                    && !leaf_columns
+                        .iter()
+                        .any(|leaf| plan_exprs_are_equivalent(leaf, expr))
+                {
+                    leaf_columns.push(expr.clone());
+                }
+                Ok(PlanWalkControl::SkipChildren)
+            }
+            PlanExpr::RowId(source) => {
+                if plan
+                    .table_references
+                    .find_joined_table_by_internal_id(*source)
+                    .is_some()
+                    && !leaf_columns
+                        .iter()
+                        .any(|leaf| plan_exprs_are_equivalent(leaf, expr))
+                {
+                    leaf_columns.push(expr.clone());
+                }
+                Ok(PlanWalkControl::SkipChildren)
+            }
+            PlanExpr::Subquery(subquery) => {
+                let subquery_id = plan_subquery_id(subquery);
                 let is_correlated = plan
                     .non_from_clause_subqueries
                     .iter()
-                    .find(|s| s.internal_id == *subquery_id)
+                    .find(|subquery| subquery.internal_id == subquery_id)
                     .is_some_and(|s| s.correlated);
                 if is_correlated {
-                    if !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr)) {
+                    if !leaf_columns
+                        .iter()
+                        .any(|leaf| plan_exprs_are_equivalent(leaf, expr))
+                    {
                         leaf_columns.push(expr.clone());
                     }
-                    Ok(WalkControl::SkipChildren)
+                    Ok(PlanWalkControl::SkipChildren)
                 } else {
                     // A non-correlated subquery is materialized once and probed
                     // per row (e.g. the LHS of `x IN (SELECT ...)`), so the
                     // probe's column references must be carried through the
                     // sorter like any other aggregate input.
-                    Ok(WalkControl::Continue)
+                    Ok(PlanWalkControl::Continue)
                 }
             }
-            _ => Ok(WalkControl::Continue),
+            _ => Ok(PlanWalkControl::Continue),
         }
     };
     for agg in aggregates {
         for arg in &agg.args {
-            walk_expr(arg, &mut collect)?;
+            walk_plan_expr(arg, &mut collect)?;
         }
         if let Some(filter_expr) = &agg.filter_expr {
-            walk_expr(filter_expr, &mut collect)?;
+            walk_plan_expr(filter_expr, &mut collect)?;
         }
     }
     Ok(leaf_columns)
 }
 
 fn collect_non_aggregate_expressions<'a>(
-    non_aggregate_expressions: &mut Vec<(&'a ast::Expr, bool)>,
+    non_aggregate_expressions: &mut Vec<(&'a PlanExpr, bool)>,
     group_by: &'a GroupBy,
     plan: &SelectPlan,
     root_result_columns: &'a [ResultSetColumn],
-    order_by: &'a [(
-        Box<ast::Expr>,
-        ast::SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )],
+    order_by: &'a [PlanOrderTerm],
 ) -> Result<()> {
     let mut result_columns = Vec::new();
     for expr in root_result_columns
         .iter()
         .map(|col| &col.expr)
-        .chain(order_by.iter().map(|(e, _, _)| e.as_ref()))
+        .chain(order_by.iter().map(|term| &term.expr))
         .chain(group_by.having.iter().flatten())
     {
         collect_result_columns(expr, plan, &mut result_columns)?;
@@ -421,17 +460,17 @@ fn collect_non_aggregate_expressions<'a>(
     for group_expr in &group_by.exprs {
         let expr_appears_in_result_columns = result_columns
             .iter()
-            .any(|expr| exprs_are_equivalent(expr, group_expr))
+            .any(|expr| plan_exprs_are_equivalent(expr, group_expr))
             || root_result_columns
                 .iter()
-                .any(|rc| exprs_are_equivalent(&rc.expr, group_expr));
+                .any(|rc| plan_exprs_are_equivalent(&rc.expr, group_expr));
         non_aggregate_expressions.push((group_expr, expr_appears_in_result_columns));
     }
     for expr in result_columns {
         let in_group_by = group_by
             .exprs
             .iter()
-            .any(|group_expr| exprs_are_equivalent(expr, group_expr));
+            .any(|group_expr| plan_exprs_are_equivalent(expr, group_expr));
         if !in_group_by {
             non_aggregate_expressions.push((expr, true));
         }
@@ -442,13 +481,13 @@ fn collect_non_aggregate_expressions<'a>(
 /// Collects columns from different parts of a SELECT that are needed for
 /// GROUP BY.
 fn collect_result_columns<'a>(
-    root_expr: &'a ast::Expr,
+    root_expr: &'a PlanExpr,
     plan: &SelectPlan,
-    result_columns: &mut Vec<&'a ast::Expr>,
+    result_columns: &mut Vec<&'a PlanExpr>,
 ) -> Result<()> {
     fn is_deferred_grouped_output_subquery(
         plan: &SelectPlan,
-        subquery_id: turso_parser::ast::TableInternalId,
+        subquery_id: crate::translate::plan_expr::PlanSubqueryId,
     ) -> bool {
         plan.non_from_clause_subqueries
             .iter()
@@ -456,64 +495,98 @@ fn collect_result_columns<'a>(
             .is_some_and(|subquery| matches!(subquery.eval_phase, SubqueryEvalPhase::GroupedOutput))
     }
 
-    walk_expr(root_expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
-        match expr {
-            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
-                if plan
-                    .table_references
-                    .find_joined_table_by_internal_id(*table)
-                    .is_some()
-                {
-                    result_columns.push(expr);
-                }
-            }
-            // SubqueryResult is an exception because we can't "extract" columns from it
-            // unlike other expressions like function calls or direct column references,
-            // so we must add it so that the subquery result gets collected to the GROUP BY
-            // columns.
-            //
-            // However, if the subquery is of the form: 'aggregate_result IN (SELECT...)', we need to skip it because the aggregation
-            // is done later.
-            ast::Expr::SubqueryResult {
-                subquery_id, lhs, ..
-            } => {
-                if is_deferred_grouped_output_subquery(plan, *subquery_id) {
-                    return Ok(WalkControl::SkipChildren);
-                }
-                if let Some(ref lhs) = lhs {
-                    let mut lhs_contains_agg = false;
-                    walk_expr(lhs, &mut |expr: &ast::Expr| -> Result<WalkControl> {
-                        if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
-                            lhs_contains_agg = true;
-                            return Ok(WalkControl::SkipChildren);
-                        }
-                        Ok(WalkControl::Continue)
-                    })?;
-                    if lhs_contains_agg {
-                        return Ok(WalkControl::SkipChildren);
+    walk_plan_expr(
+        root_expr,
+        &mut |expr: &PlanExpr| -> Result<PlanWalkControl> {
+            match expr {
+                PlanExpr::Column(column) => {
+                    if plan
+                        .table_references
+                        .find_joined_table_by_internal_id(column.source)
+                        .is_some()
+                    {
+                        result_columns.push(expr);
                     }
                 }
-                result_columns.push(expr);
-            }
-            _ => {
-                if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
-                    return Ok(WalkControl::SkipChildren);
+                PlanExpr::MergedColumn(column) => {
+                    if plan
+                        .table_references
+                        .find_joined_table_by_internal_id(column.right.source)
+                        .is_some()
+                    {
+                        result_columns.push(expr);
+                    }
+                    return Ok(PlanWalkControl::SkipChildren);
                 }
-                // Skip children of GROUP BY expressions — their leaf columns
-                // are already covered by the GROUP BY key and don't need
-                // separate materialization in the sorter.
-                if plan
-                    .group_by
-                    .as_ref()
-                    .is_some_and(|gb| gb.exprs.iter().any(|ge| exprs_are_equivalent(ge, expr)))
-                {
-                    return Ok(WalkControl::SkipChildren);
+                PlanExpr::RowId(source) => {
+                    if plan
+                        .table_references
+                        .find_joined_table_by_internal_id(*source)
+                        .is_some()
+                    {
+                        result_columns.push(expr);
+                    }
                 }
-            }
-        };
-        Ok(WalkControl::Continue)
-    })?;
+                // A subquery is an exception because we can't "extract" columns from it like
+                // we can from function calls or direct column references. Add the subquery
+                // itself so its result is collected into the GROUP BY columns.
+                //
+                // However, if the subquery is of the form: 'aggregate_result IN (SELECT...)', we need to skip it because the aggregation
+                // is done later.
+                PlanExpr::Subquery(subquery) => {
+                    let subquery_id = plan_subquery_id(subquery);
+                    if is_deferred_grouped_output_subquery(plan, subquery_id) {
+                        return Ok(PlanWalkControl::SkipChildren);
+                    }
+                    if let PlanSubqueryExpr::In { lhs, .. } = subquery {
+                        let mut lhs_contains_agg = false;
+                        walk_plan_expr(lhs, &mut |expr: &PlanExpr| -> Result<PlanWalkControl> {
+                            if plan.aggregates.iter().any(|aggregate| {
+                                plan_exprs_are_equivalent(&aggregate.original_expr, expr)
+                            }) {
+                                lhs_contains_agg = true;
+                                return Ok(PlanWalkControl::SkipChildren);
+                            }
+                            Ok(PlanWalkControl::Continue)
+                        })?;
+                        if lhs_contains_agg {
+                            return Ok(PlanWalkControl::SkipChildren);
+                        }
+                    }
+                    result_columns.push(expr);
+                }
+                _ => {
+                    if plan
+                        .aggregates
+                        .iter()
+                        .any(|aggregate| plan_exprs_are_equivalent(&aggregate.original_expr, expr))
+                    {
+                        return Ok(PlanWalkControl::SkipChildren);
+                    }
+                    // Skip children of GROUP BY expressions — their leaf columns
+                    // are already covered by the GROUP BY key and don't need
+                    // separate materialization in the sorter.
+                    if plan.group_by.as_ref().is_some_and(|gb| {
+                        gb.exprs
+                            .iter()
+                            .any(|group_expr| plan_exprs_are_equivalent(group_expr, expr))
+                    }) {
+                        return Ok(PlanWalkControl::SkipChildren);
+                    }
+                }
+            };
+            Ok(PlanWalkControl::Continue)
+        },
+    )?;
     Ok(())
+}
+
+fn plan_subquery_id(subquery: &PlanSubqueryExpr) -> crate::translate::plan_expr::PlanSubqueryId {
+    match subquery {
+        PlanSubqueryExpr::Scalar { query, .. }
+        | PlanSubqueryExpr::Exists(query)
+        | PlanSubqueryExpr::In { query, .. } => *query,
+    }
 }
 
 /// In case sorting is needed for GROUP BY, creates a pseudo table that matches
@@ -672,11 +745,7 @@ pub fn group_by_process_single_group(
         .enumerate()
         .take(group_by.exprs.len())
     {
-        let maybe_collation = get_collseq_from_expr_with_symbols(
-            &group_by.exprs[i],
-            &plan.table_references,
-            Some(t_ctx.resolver.symbol_table),
-        )?;
+        let maybe_collation = plan_expr_collation(&group_by.exprs[i], plan)?;
         c.collation = maybe_collation.unwrap_or_default();
     }
 
@@ -736,22 +805,19 @@ pub fn group_by_process_single_group(
     match &row_source {
         GroupByRowSource::Sorter { pseudo_cursor, .. } => {
             // Read leaf columns from the pseudo cursor and cache them so that
-            // translate_expr can resolve column references during expression evaluation.
+            // Plan-expression lowering can resolve column references during expression evaluation.
             let leaf_start_idx = t_ctx.non_aggregate_expressions.len();
             let leaf_regs = program.alloc_registers(t_ctx.agg_leaf_columns.len());
             for i in 0..t_ctx.agg_leaf_columns.len() {
                 program.emit_column_or_rowid(*pseudo_cursor, leaf_start_idx + i, leaf_regs + i);
             }
 
-            let cache_len = t_ctx.resolver.expr_to_reg_cache.len();
+            let cache_len = t_ctx.resolver.plan_expr_to_reg_cache.len();
             let cache_was_enabled = t_ctx.resolver.expr_to_reg_cache_enabled;
             for (i, leaf_expr) in t_ctx.agg_leaf_columns.drain(..).enumerate() {
-                t_ctx.resolver.cache_expr_reg(
-                    std::borrow::Cow::Owned(leaf_expr),
-                    leaf_regs + i,
-                    false,
-                    None,
-                );
+                t_ctx
+                    .resolver
+                    .cache_plan_expr_reg(leaf_expr, leaf_regs + i, false, None);
             }
             t_ctx.resolver.enable_expr_to_reg_cache();
 
@@ -765,7 +831,7 @@ pub fn group_by_process_single_group(
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
                     let label = program.allocate_label();
                     let filter_reg = program.alloc_register();
-                    translate_expr(
+                    translate_plan_expr(
                         program,
                         Some(&plan.table_references),
                         filter_expr,
@@ -790,6 +856,7 @@ pub fn group_by_process_single_group(
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    plan,
                     agg.fraction_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
@@ -804,7 +871,7 @@ pub fn group_by_process_single_group(
                 }
             }
 
-            t_ctx.resolver.expr_to_reg_cache.truncate(cache_len);
+            t_ctx.resolver.plan_expr_to_reg_cache.truncate(cache_len);
             t_ctx.resolver.expr_to_reg_cache_enabled = cache_was_enabled;
         }
         GroupByRowSource::MainLoop { start_reg_src, .. } => {
@@ -819,7 +886,7 @@ pub fn group_by_process_single_group(
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
                     let label = program.allocate_label();
                     let filter_reg = program.alloc_register();
-                    translate_expr(
+                    translate_plan_expr(
                         program,
                         Some(&plan.table_references),
                         filter_expr,
@@ -845,6 +912,7 @@ pub fn group_by_process_single_group(
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    plan,
                     agg.fraction_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
@@ -889,11 +957,11 @@ pub fn group_by_process_single_group(
             {
                 if *expr_appears_in_result_columns {
                     program.emit_column_or_rowid(*pseudo_cursor, sorter_column_index, next_reg);
-                    t_ctx.resolver.cache_scalar_expr_reg(
-                        std::borrow::Cow::Borrowed(expr),
+                    t_ctx.resolver.cache_plan_scalar_expr_reg(
+                        (**expr).clone(),
                         next_reg,
                         false,
-                        &plan.table_references,
+                        plan,
                     )?;
                     next_reg += 1;
                 }
@@ -910,18 +978,18 @@ pub fn group_by_process_single_group(
                 .enumerate()
             {
                 let dest_reg = start_reg_dest + i;
-                translate_expr(
+                translate_plan_expr(
                     program,
                     Some(&plan.table_references),
                     expr,
                     dest_reg,
                     &t_ctx.resolver,
                 )?;
-                t_ctx.resolver.cache_scalar_expr_reg(
-                    std::borrow::Cow::Borrowed(expr),
+                t_ctx.resolver.cache_plan_scalar_expr_reg(
+                    (**expr).clone(),
                     dest_reg,
                     false,
-                    &plan.table_references,
+                    plan,
                 )?;
             }
         }
@@ -1043,12 +1111,9 @@ pub fn group_by_emit_row_phase<'a>(
             register: agg_result_reg,
             func: AccumulatorFunc::Agg(agg.func.clone()),
         });
-        t_ctx.resolver.cache_expr_reg(
-            std::borrow::Cow::Owned(agg.original_expr.clone()),
-            agg_result_reg,
-            false,
-            None,
-        );
+        t_ctx
+            .resolver
+            .cache_plan_expr_reg(agg.original_expr.clone(), agg_result_reg, false, None);
     }
 
     t_ctx.resolver.enable_expr_to_reg_cache();
@@ -1072,9 +1137,9 @@ pub fn group_by_emit_row_phase<'a>(
 
         for expr in having.iter() {
             let if_true_target = program.allocate_label();
-            translate_condition_expr(
+            translate_plan_condition_expr(
                 program,
-                &plan.table_references,
+                Some(&plan.table_references),
                 expr,
                 ConditionMetadata {
                     jump_if_condition_is_true: false,

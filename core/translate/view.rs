@@ -1,4 +1,4 @@
-use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, view::IncrementalView};
+use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, view::IncrementalViewTemplate};
 use crate::schema::{
     BTreeCharacteristics, BTreeTable, SchemaObjectType, DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES,
 };
@@ -44,7 +44,9 @@ fn validate_materialized(
     // Check if view already exists (including broken sqlite_schema rows,
     // which must be dropped before the name can be reused)
     if resolver.with_schema(database_id, |s| {
-        s.get_materialized_view(normalized_view_name).is_some()
+        s.get_view(normalized_view_name).is_some()
+            || s.is_materialized_view(normalized_view_name)
+            || s.incompatible_views.contains(normalized_view_name)
             || s.broken_views.contains(normalized_view_name)
     }) {
         return Err(crate::LimboError::ParseError(format!(
@@ -71,7 +73,12 @@ pub fn translate_create_materialized_view(
         && resolver.with_schema(database_id, |s| {
             s.get_view(&normalized_view_name).is_some()
                 || s.is_materialized_view(&normalized_view_name)
+                || s.incompatible_views.contains(&normalized_view_name)
                 || s.broken_views.contains(&normalized_view_name)
+                || matches!(
+                    s.get_object_type(&normalized_view_name),
+                    Some(SchemaObjectType::Table | SchemaObjectType::View)
+                )
         })
     {
         return Ok(());
@@ -82,13 +89,37 @@ pub fn translate_create_materialized_view(
     // storing invalid view definitions
     validate_materialized(&connection, database_id, resolver, &normalized_view_name)?;
 
-    // Check for cross-database table references first
+    if let Some(object_type) =
+        resolver.with_schema(database_id, |s| s.get_object_type(&normalized_view_name))
+    {
+        if if_not_exists
+            && matches!(
+                object_type,
+                SchemaObjectType::Table | SchemaObjectType::View
+            )
+        {
+            return Ok(());
+        }
+        let type_name = match object_type {
+            SchemaObjectType::Table => "table",
+            SchemaObjectType::View => "view",
+            SchemaObjectType::Index => "index",
+        };
+        return Err(crate::LimboError::ParseError(format!(
+            "{type_name} {normalized_view_name} already exists"
+        )));
+    }
     crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
 
-    let view_column_schema = resolver.with_schema(database_id, |s| {
-        IncrementalView::validate_and_extract_columns(select_stmt, s)
-    })?;
-    let view_columns = view_column_schema.flat_columns();
+    // Analyze once while preparing the DDL. The resulting logical template is
+    // independent of the btree roots allocated when the program executes.
+    let semantic_context = resolver.semantic_context();
+    let view_template = Arc::new(IncrementalViewTemplate::analyze_select(
+        &semantic_context,
+        select_stmt,
+    )?);
+    let view_columns = view_template.column_schema().flat_columns();
+    program.register_incremental_view_template(&normalized_view_name, view_template);
 
     // Reconstruct the SQL string for storage
     let sql = create_materialized_view_to_str(&view_name.name.as_ident(), select_stmt);
@@ -290,6 +321,7 @@ fn validate_create_view(
     if resolver.with_schema(database_id, |s| {
         s.get_view(normalized_view_name).is_some()
             || s.is_materialized_view(normalized_view_name)
+            || s.incompatible_views.contains(normalized_view_name)
             || s.broken_views.contains(normalized_view_name)
     }) {
         return Err(crate::LimboError::ParseError(format!(
@@ -322,6 +354,7 @@ pub fn translate_create_view(
         && resolver.with_schema(database_id, |s| {
             s.get_view(&normalized_view_name).is_some()
                 || s.is_materialized_view(&normalized_view_name)
+                || s.incompatible_views.contains(&normalized_view_name)
                 || s.broken_views.contains(&normalized_view_name)
         })
     {

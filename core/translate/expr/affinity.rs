@@ -72,29 +72,6 @@ pub(crate) fn get_expr_affinity_info(
     resolver: Option<&Resolver>,
 ) -> ExprAffinityInfo {
     match expr {
-        ast::Expr::Column { table, column, .. } => {
-            if table.is_self_table() {
-                if let Some(resolver) = resolver {
-                    if let Some(aff) = resolver.self_table_affinity(*column) {
-                        return ExprAffinityInfo::with_affinity(aff);
-                    }
-                }
-            }
-            if let Some(tables) = referenced_tables {
-                if let Some((_, table_ref)) = tables.find_table_by_internal_id(*table) {
-                    if let Some(col) = table_ref.get_column_at(*column) {
-                        if let Some(btree) = table_ref.btree() {
-                            return ExprAffinityInfo::with_affinity(
-                                col.affinity_with_strict(btree.is_strict),
-                            );
-                        }
-                        return ExprAffinityInfo::with_affinity(col.affinity());
-                    }
-                }
-            }
-            ExprAffinityInfo::no_affinity()
-        }
-        ast::Expr::RowId { .. } => ExprAffinityInfo::with_affinity(Affinity::Integer),
         ast::Expr::Cast { type_name, .. } => {
             if let Some(type_name) = type_name {
                 ExprAffinityInfo::with_affinity(Affinity::affinity(&type_name.name))
@@ -108,29 +85,6 @@ pub(crate) fn get_expr_affinity_info(
         ast::Expr::Collate(expr, _) => get_expr_affinity_info(expr, referenced_tables, resolver),
         // Literals have NO affinity in SQLite.
         ast::Expr::Literal(_) => ExprAffinityInfo::no_affinity(),
-        ast::Expr::Register(reg) => {
-            // During UPDATE expression index evaluation, column references are
-            // rewritten to Expr::Register. Look up the original column affinity
-            // from the resolver's register_affinities map.
-            if let Some(resolver) = resolver {
-                if let Some(aff) = resolver.register_affinities.get(reg) {
-                    return ExprAffinityInfo::with_affinity(*aff);
-                }
-            }
-            ExprAffinityInfo::no_affinity()
-        }
-        ast::Expr::SubqueryResult {
-            subquery_id,
-            query_type: ast::SubqueryType::RowValue { num_regs, .. },
-            ..
-        } if *num_regs == 1 => {
-            if let Some(resolver) = resolver {
-                if let Some(aff) = resolver.subquery_affinities.borrow().get(subquery_id) {
-                    return *aff;
-                }
-            }
-            ExprAffinityInfo::no_affinity()
-        }
         _ => ExprAffinityInfo::no_affinity(),
     }
 }
@@ -170,13 +124,9 @@ pub(crate) fn expr_data_type(
             StorageClassMask::TEXT | StorageClassMask::BLOB
         }
         ast::Expr::FunctionCall { .. }
-        | ast::Expr::BoundCustomTypeFunction { .. }
         | ast::Expr::FunctionCallStar { .. }
         | ast::Expr::Variable(_) => StorageClassMask::all(),
-        ast::Expr::Column { .. }
-        | ast::Expr::RowId { .. }
-        | ast::Expr::Cast { .. }
-        | ast::Expr::Subquery(_) => {
+        ast::Expr::Cast { .. } | ast::Expr::Subquery(_) => {
             let aff = get_expr_affinity(expr, referenced_tables, None);
             if aff.is_numeric() {
                 StorageClassMask::NUMERIC | StorageClassMask::BLOB

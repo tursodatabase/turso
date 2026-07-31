@@ -3,6 +3,7 @@ use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
 use crate::schema::{Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
+use crate::schema_expr::{ResolutionMode, SchemaExpr, SchemaExprContext, SchemaExprProfile};
 use crate::sync::Arc;
 use crate::translate::{
     collate::CollationSeq,
@@ -10,11 +11,16 @@ use crate::translate::{
         emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
         OperationMode, Resolver,
     },
-    expr::{translate_condition_expr, translate_expr, ConditionMetadata},
+    expr::{translate_plan_condition_expr, translate_plan_expr, ConditionMetadata},
     insert::format_unique_violation_desc,
-    plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
+    plan::{
+        ColumnUsedMask, IterationDirection, JoinedTable, Operation, PlanIndexHint, Scan,
+        SourceReadPrograms, TableReferences,
+    },
+    plan_expr::{lower_hir_expr, PlanExpr, PlanIdentityMap},
+    semantic::schema_expr::analyze_schema_exprs,
 };
-use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
+use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts};
 use crate::vdbe::insn::{to_u32, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEMP_DB_ID};
 use crate::{
@@ -142,7 +148,8 @@ pub fn translate_create_index(
     if !tbl.has_rowid {
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
     }
-    let columns = crate::translate::bind::bind_index_columns(&tbl, &columns, Some(resolver))?;
+    let columns =
+        crate::schema::resolve_index_columns(&tbl, &columns, resolver, ResolutionMode::Strict)?;
 
     // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns
     for col in &columns {
@@ -197,13 +204,20 @@ pub fn translate_create_index(
             })?);
         }
     }
-    // Pre-resolve the WHERE clause's column references to SELF_TABLE form.
-    // Resolution is lenient: names that don't resolve stay as identifiers,
-    // and predicate validation below rejects them.
-    let resolved_where_clause = where_clause.clone().map(|mut wc| {
-        crate::translate::bind::bind_index_schema_expr(&mut wc, &tbl);
-        wc
-    });
+    let table_context = tbl.schema_expr_table();
+    let resolved_where_clause = where_clause
+        .as_deref()
+        .map(|predicate| {
+            SchemaExpr::resolve(
+                predicate,
+                SchemaExprProfile::PartialIndexPredicate,
+                SchemaExprContext::for_table(&table_context),
+                resolver,
+                ResolutionMode::Strict,
+            )
+            .map(Box::new)
+        })
+        .transpose()?;
     let idx = Arc::new(Index {
         name: idx_name.clone(),
         table_name: tbl.name.clone(),
@@ -216,16 +230,6 @@ pub fn translate_create_index(
         index_method: index_method.clone(),
         on_conflict: None,
     });
-
-    if !crate::translate::bind::validate_partial_index_predicate(&idx, &table) {
-        crate::bail_parse_error!(
-            "Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:\n {}",
-            where_clause
-                .as_ref()
-                .expect("where expr has to exist in order to fail")
-                .to_string()
-        );
-    }
 
     let sqlite_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id =
@@ -308,7 +312,7 @@ pub fn translate_create_index(
 /// records have been collected and sorted. Statement journaling is therefore required
 /// around REINDEX callers so any later refill error restores the original index b-tree.
 #[allow(clippy::too_many_arguments)]
-fn emit_refill_index(
+pub(crate) fn emit_refill_index(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     database_id: usize,
@@ -318,7 +322,7 @@ fn emit_refill_index(
     index_root_page: RegisterOrLiteral<i64>,
     clear_existing_root: Option<i64>,
 ) -> crate::Result<()> {
-    let table_ref = program.table_reference_counter.next();
+    let table_ref = program.next_plan_source_id();
     let table_cursor_id = program.alloc_cursor_id_keyed(
         CursorKey::table(table_ref),
         CursorType::BTreeTable(tbl.clone()),
@@ -330,13 +334,104 @@ fn emit_refill_index(
     let columns = &idx.columns;
     let tbl_name = normalize_ident(tbl.name.as_str());
 
-    let mut table_references = TableReferences::new(
+    // Analyze every stored expression against one source occurrence, then map
+    // that semantic source to the exact plan identity used by the table cursor.
+    let mut stored_expressions = Vec::new();
+    let where_slot = idx
+        .where_clause
+        .as_deref()
+        .map(|expression| -> crate::Result<usize> {
+            let slot = stored_expressions.len();
+            stored_expressions.push(expression.as_valid()?);
+            Ok(slot)
+        })
+        .transpose()?;
+    let mut index_slots = Vec::with_capacity(columns.len());
+    for column in columns {
+        let slot = column
+            .expr
+            .as_deref()
+            .map(|expression| -> crate::Result<usize> {
+                let slot = stored_expressions.len();
+                stored_expressions.push(expression.as_valid()?);
+                Ok(slot)
+            })
+            .transpose()?;
+        index_slots.push(slot);
+    }
+    let mut generated_slots = Vec::with_capacity(tbl.columns().len());
+    for column in tbl.columns() {
+        let slot = column
+            .generated_expr()
+            .map(|expression| -> crate::Result<usize> {
+                let slot = stored_expressions.len();
+                stored_expressions.push(expression.as_valid()?);
+                Ok(slot)
+            })
+            .transpose()?;
+        generated_slots.push(slot);
+    }
+    let mut default_slots = Vec::with_capacity(tbl.columns().len());
+    for column in tbl.columns() {
+        let slot = column
+            .default
+            .as_deref()
+            .map(|expression| -> crate::Result<usize> {
+                let slot = stored_expressions.len();
+                stored_expressions.push(expression.as_valid()?);
+                Ok(slot)
+            })
+            .transpose()?;
+        default_slots.push(slot);
+    }
+
+    let context = resolver.semantic_context();
+    let analyzed = analyze_schema_exprs(
+        &context,
+        database_id,
+        Arc::new(Table::BTree(tbl.clone())),
+        &stored_expressions,
+    )?;
+    let mut identities = PlanIdentityMap::new();
+    identities.bind_source_definition(&analyzed.source, table_ref);
+    let lowered_expressions = analyzed
+        .expressions
+        .iter()
+        .map(|expression| {
+            lower_hir_expr(expression, &identities).map_err(|error| {
+                LimboError::InternalError(format!(
+                    "failed to lower stored index expression: {error}"
+                ))
+            })
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    let where_clause = where_slot.map(|slot| lowered_expressions[slot].clone());
+    let index_expressions: Vec<Option<PlanExpr>> = index_slots
+        .into_iter()
+        .map(|slot| slot.map(|slot| lowered_expressions[slot].clone()))
+        .collect();
+    let generated_expressions: Vec<Option<PlanExpr>> = generated_slots
+        .into_iter()
+        .map(|slot| slot.map(|slot| lowered_expressions[slot].clone()))
+        .collect();
+    let default_expressions: Vec<Option<PlanExpr>> = default_slots
+        .into_iter()
+        .map(|slot| slot.map(|slot| lowered_expressions[slot].clone()))
+        .collect();
+    let read_programs = Arc::new(SourceReadPrograms {
+        column_type_programs: vec![None; generated_expressions.len()],
+        generated_expressions,
+        default_expressions,
+    });
+
+    let table_references = TableReferences::new(
         vec![JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
                 index: None,
             }),
             table: Table::BTree(tbl.clone()),
+            resolved_table: None,
             identifier: tbl_name.clone(),
             internal_id: table_ref,
             join_info: None,
@@ -344,17 +439,14 @@ fn emit_refill_index(
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id,
-            indexed: None,
-            bound_index_method_patterns: Vec::new(),
-            bound_index_expressions: Vec::new(),
+            index_hint: PlanIndexHint::None,
+            index_method_patterns: Vec::new(),
+            index_expressions: Vec::new(),
+            read_programs,
+            check_constraints: Vec::new(),
         }],
         vec![],
     );
-    let where_clause = idx
-        .where_clause
-        .as_deref()
-        .map(|expr| crate::translate::bind::bind_schema_expr(expr, table_ref))
-        .transpose()?;
 
     if idx
         .index_method
@@ -382,13 +474,13 @@ fn emit_refill_index(
         program.preassign_label_to_next_insn(loop_start_label);
 
         let mut skip_row_label = None;
-        if let Some(where_clause) = where_clause {
+        if let Some(where_clause) = &where_clause {
             let label = program.allocate_label();
             let condition_true_label = program.allocate_label();
-            translate_condition_expr(
+            translate_plan_condition_expr(
                 program,
-                &table_references,
-                &where_clause,
+                Some(&table_references),
+                where_clause,
                 ConditionMetadata {
                     jump_if_condition_is_true: false,
                     jump_target_when_false: label,
@@ -402,14 +494,15 @@ fn emit_refill_index(
         }
 
         let start_reg = program.alloc_registers(columns.len() + 1);
-        for (i, col) in columns.iter().enumerate() {
+        for (i, (col, expression)) in columns.iter().zip(&index_expressions).enumerate() {
             emit_index_column_value_from_cursor(
                 program,
                 resolver,
-                &mut table_references,
+                &table_references,
                 table_cursor_id,
                 tbl,
                 col,
+                expression.as_ref(),
                 start_reg + i,
             )?;
         }
@@ -479,13 +572,13 @@ fn emit_refill_index(
         program.preassign_label_to_next_insn(loop_start_label);
 
         let mut skip_row_label = None;
-        if let Some(where_clause) = where_clause {
+        if let Some(where_clause) = &where_clause {
             let label = program.allocate_label();
             let condition_true_label = program.allocate_label();
-            translate_condition_expr(
+            translate_plan_condition_expr(
                 program,
-                &table_references,
-                &where_clause,
+                Some(&table_references),
+                where_clause,
                 ConditionMetadata {
                     jump_if_condition_is_true: false,
                     jump_target_when_false: label,
@@ -499,14 +592,15 @@ fn emit_refill_index(
         }
 
         let start_reg = program.alloc_registers(columns.len() + 1);
-        for (i, col) in columns.iter().enumerate() {
+        for (i, (col, expression)) in columns.iter().zip(&index_expressions).enumerate() {
             emit_index_column_value_from_cursor(
                 program,
                 resolver,
-                &mut table_references,
+                &table_references,
                 table_cursor_id,
                 tbl,
                 col,
+                expression.as_ref(),
                 start_reg + i,
             )?;
         }
@@ -896,33 +990,21 @@ pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
 fn emit_index_column_value_from_cursor(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    table_references: &mut TableReferences,
+    table_references: &TableReferences,
     table_cursor_id: usize,
     table: &BTreeTable,
     idx_col: &IndexColumn,
+    expression: Option<&PlanExpr>,
     dest_reg: usize,
 ) -> crate::Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        // Index expressions are stored pre-resolved to SELF_TABLE form;
-        // point them at this statement's table reference.
-        let table_internal_id = table_references
-            .joined_tables()
-            .first()
-            .expect("index creation has a target table reference")
-            .internal_id;
-        let expr = crate::translate::bind::bind_schema_expr(expr, table_internal_id)?;
-        let self_table_context =
-            table_references
-                .joined_tables()
-                .first()
-                .map(|jt| SelfTableContext::ForSelect {
-                    table_ref_id: jt.internal_id,
-                    referenced_tables: table_references.clone(),
-                });
-        resolver.with_self_table_context(program, self_table_context.as_ref(), |program, _| {
-            translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
-            Ok(())
-        })?;
+    if let Some(expression) = expression {
+        translate_plan_expr(
+            program,
+            Some(table_references),
+            expression,
+            dest_reg,
+            resolver,
+        )?;
         // For virtual generated column references, apply the column's
         // declared affinity to the computed expression result.
         if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {

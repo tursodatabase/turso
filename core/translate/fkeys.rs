@@ -1,12 +1,21 @@
-use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
+use turso_parser::{
+    ast::{self, Expr, Literal, Name, QualifiedName, RefAct},
+    parser::Parser,
+};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
-use crate::translate::emitter::emit_columns_and_dependencies;
-use crate::translate::expr::emit_table_column_for_dml;
-use crate::translate::plan::ColumnMask;
+use crate::translate::emitter::{
+    emit_columns_and_dependencies_for_target, emit_columns_and_dependencies_from_schema,
+};
+use crate::translate::expr::{
+    emit_plan_column_value_decode, emit_table_column_for_dml,
+    emit_user_facing_column_value_from_schema,
+};
+use crate::translate::plan::{ColumnMask, JoinedTable};
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef},
+    schema_expr::SchemaExpr,
     sync::{Arc, OnceLock, Weak},
     translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
     vdbe::{
@@ -644,11 +653,10 @@ pub fn emit_parent_index_key_change_checks(
     old_rowid_reg: usize,
     new_rowid_reg: usize,
     incoming: &[ResolvedFkRef],
-    table_btree: &BTreeTable,
+    parent: &JoinedTable,
     index: &Index,
     updated_positions: &ColumnMask,
     new_key_probe_mode: ParentKeyNewProbeMode,
-    database_id: usize,
     resolver: &Resolver,
 ) -> Result<Option<DeferredNewKeyProbePlan>> {
     // Only process FKs that reference this specific index.
@@ -667,6 +675,10 @@ pub fn emit_parent_index_key_change_checks(
         return Ok(None);
     }
 
+    let table_btree = parent.table.btree().ok_or_else(|| {
+        LimboError::InternalError("foreign-key parent is not a B-tree table".to_string())
+    })?;
+    let database_id = parent.database_id;
     let idx_len = index.columns.len();
     let layout = table_btree.column_layout()?;
     let some_idx_columns_are_virtual = index
@@ -678,9 +690,9 @@ pub fn emit_parent_index_key_change_checks(
     let idx_target_cols = index.columns.iter().map(|c| c.pos_in_table);
     let dml_ctx = some_idx_columns_are_virtual
         .then(|| {
-            emit_columns_and_dependencies(
+            emit_columns_and_dependencies_for_target(
                 program,
-                table_btree,
+                parent,
                 cursor_id,
                 old_rowid_reg,
                 idx_target_cols,
@@ -690,16 +702,7 @@ pub fn emit_parent_index_key_change_checks(
         .transpose()?;
     for (i, index_col) in index.columns.iter().enumerate() {
         if let Some(ref ctx) = dml_ctx {
-            emit_table_column_for_dml(
-                program,
-                cursor_id,
-                ctx.clone(),
-                &table_btree.columns()[index_col.pos_in_table],
-                index_col.pos_in_table,
-                old_key + i,
-                resolver,
-                &Arc::new(table_btree.clone()),
-            )?;
+            emit_table_column_for_dml(program, ctx, index_col.pos_in_table, old_key + i);
         } else {
             program.emit_column_or_rowid(cursor_id, index_col.pos_in_table, old_key + i);
         }
@@ -727,7 +730,7 @@ pub fn emit_parent_index_key_change_checks(
         new_key,
         idx_len,
         old_rowid_reg,
-        table_btree,
+        &table_btree,
         updated_positions,
         new_key_probe_mode,
         database_id,
@@ -957,6 +960,69 @@ fn emit_fk_parent_key_probe(
     Ok(())
 }
 
+fn build_parent_key_for_target(
+    program: &mut ProgramBuilder,
+    parent: &JoinedTable,
+    parent_cols: &[String],
+    parent_cursor_id: usize,
+    parent_rowid_reg: usize,
+    dest_start: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let parent_bt = parent.table.btree().ok_or_else(|| {
+        LimboError::InternalError("foreign-key parent is not a B-tree table".to_string())
+    })?;
+    build_parent_key(
+        program,
+        &parent_bt,
+        parent_cols,
+        parent_cursor_id,
+        parent_rowid_reg,
+        dest_start,
+        |program, target_columns| {
+            emit_columns_and_dependencies_for_target(
+                program,
+                parent,
+                parent_cursor_id,
+                parent_rowid_reg,
+                target_columns.iter().copied(),
+                resolver,
+            )
+        },
+    )
+}
+
+fn build_parent_key_from_schema(
+    program: &mut ProgramBuilder,
+    parent_bt: &BTreeTable,
+    database_id: usize,
+    parent_cols: &[String],
+    parent_cursor_id: usize,
+    parent_rowid_reg: usize,
+    dest_start: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    build_parent_key(
+        program,
+        parent_bt,
+        parent_cols,
+        parent_cursor_id,
+        parent_rowid_reg,
+        dest_start,
+        |program, target_columns| {
+            emit_columns_and_dependencies_from_schema(
+                program,
+                parent_bt,
+                database_id,
+                parent_cursor_id,
+                parent_rowid_reg,
+                target_columns.iter().copied(),
+                resolver,
+            )
+        },
+    )
+}
+
 /// Build a parent key vector (in FK parent-column order) into `dest_start`.
 /// Handles rowid aliasing and explicit ROWID names; uses current row for non-rowid columns.
 fn build_parent_key(
@@ -966,7 +1032,7 @@ fn build_parent_key(
     parent_cursor_id: usize,
     parent_rowid_reg: usize,
     dest_start: usize,
-    resolver: &Resolver,
+    emit_columns: impl FnOnce(&mut ProgramBuilder, &[usize]) -> Result<DmlColumnContext>,
 ) -> Result<()> {
     let some_fk_cols_are_virtual = parent_cols.iter().any(|pcol| {
         parent_bt
@@ -974,24 +1040,18 @@ fn build_parent_key(
             .is_some_and(|(_, c)| c.is_virtual_generated())
     });
 
-    let fk_target_cols = parent_cols
+    let fk_target_cols: Vec<_> = parent_cols
         .iter()
-        .filter_map(|pcol| parent_bt.get_column(pcol).map(|(pos, _)| pos));
-    let ctx = some_fk_cols_are_virtual
-        .then(|| {
-            emit_columns_and_dependencies(
-                program,
-                parent_bt,
-                parent_cursor_id,
-                parent_rowid_reg,
-                fk_target_cols,
-                resolver,
-            )
-        })
-        .transpose()?;
+        .filter_map(|pcol| parent_bt.get_column(pcol).map(|(pos, _)| pos))
+        .collect();
+    let ctx = if some_fk_cols_are_virtual {
+        Some(emit_columns(program, &fk_target_cols)?)
+    } else {
+        None
+    };
 
     for (i, pcol) in parent_cols.iter().enumerate() {
-        let Some((pos, col)) = parent_bt.get_column(pcol) else {
+        let Some((pos, _)) = parent_bt.get_column(pcol) else {
             if ROWID_STRS.iter().any(|s| pcol.eq_ignore_ascii_case(s)) {
                 // child column references parent rowid
                 program.emit_insn(Insn::Copy {
@@ -1005,18 +1065,14 @@ fn build_parent_key(
         };
 
         if some_fk_cols_are_virtual {
-            // the virtual column will need the registers we previously copied
+            // The register row already contains semantically compiled virtual columns.
             emit_table_column_for_dml(
                 program,
-                parent_cursor_id,
-                ctx.clone()
+                ctx.as_ref()
                     .expect("ctx is always computed if some fk cols are virtual"),
-                col,
                 pos,
                 dest_start + i,
-                resolver,
-                &Arc::new(parent_bt.clone()),
-            )?;
+            );
         } else {
             program.emit_column_or_rowid(parent_cursor_id, pos, dest_start + i);
         }
@@ -1031,16 +1087,20 @@ fn build_parent_key(
 #[allow(clippy::too_many_arguments)]
 pub fn emit_fk_child_update_counters(
     program: &mut ProgramBuilder,
-    child_tbl: &BTreeTable,
-    child_table_name: &str,
+    child: &JoinedTable,
     child_cursor_id: usize,
     new_start_reg: usize,
     new_rowid_reg: usize,
     updated_cols: &ColumnMask,
-    database_id: usize,
     resolver: &Resolver,
     layout: &ColumnLayout,
 ) -> Result<()> {
+    let child_tbl = child.table.btree().ok_or_else(|| {
+        LimboError::InternalError("foreign-key child is not a B-tree table".to_string())
+    })?;
+    let child_table_name = child.table.get_name();
+    let database_id = child.database_id;
+
     // Helper: materialize OLD FK column values.
     // Returns (dml_ctx, fk_col_positions, null_skip_label).
     // The null_skip_label is unresolved and must be resolved by the caller after the FK check
@@ -1061,9 +1121,9 @@ pub fn emit_fk_child_update_counters(
             .filter_map(|col_name| child_tbl.get_column(col_name).map(|(pos, _)| pos))
             .collect();
 
-        let dml_ctx = emit_columns_and_dependencies(
+        let dml_ctx = emit_columns_and_dependencies_for_target(
             program,
-            child_tbl,
+            child,
             child_cursor_id,
             old_rowid_reg,
             fk_col_positions.clone(),
@@ -1084,7 +1144,7 @@ pub fn emit_fk_child_update_counters(
         resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
     {
         // If the child-side FK columns did not change, there is nothing to do.
-        if !fk_ref.child_key_changed(updated_cols, child_tbl) {
+        if !fk_ref.child_key_changed(updated_cols, &child_tbl) {
             continue;
         }
 
@@ -1351,13 +1411,13 @@ pub fn emit_fk_child_update_counters(
 fn emit_fk_delete_parent_existence_check_single(
     program: &mut ProgramBuilder,
     fk_ref: &ResolvedFkRef,
-    parent_bt: &Arc<BTreeTable>,
-    parent_table_name: &str,
+    parent: &JoinedTable,
     parent_cursor_id: usize,
     parent_rowid_reg: usize,
-    database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
+    let parent_table_name = parent.table.get_name();
+    let database_id = parent.database_id;
     let is_self_ref = fk_ref
         .child_table
         .name
@@ -1370,9 +1430,9 @@ fn emit_fk_delete_parent_existence_check_single(
     let ncols = parent_cols.len();
 
     let parent_key_start = program.alloc_registers(ncols);
-    build_parent_key(
+    build_parent_key_for_target(
         program,
-        parent_bt,
+        parent,
         parent_cols,
         parent_cursor_id,
         parent_rowid_reg,
@@ -1458,7 +1518,7 @@ fn emit_fk_delete_parent_existence_check_single(
 #[allow(clippy::too_many_arguments)]
 pub fn emit_fk_update_parent_actions(
     program: &mut ProgramBuilder,
-    table_btree: &BTreeTable,
+    parent: &JoinedTable,
     indexes_to_update: impl Iterator<Item = impl AsRef<Index>>,
     cursor_id: usize,
     old_rowid_reg: usize,
@@ -1467,16 +1527,19 @@ pub fn emit_fk_update_parent_actions(
     rowid_set_clause_reg: Option<usize>,
     updated_positions: &ColumnMask,
     new_key_probe_mode: ParentKeyNewProbeMode,
-    database_id: usize,
     resolver: &Resolver,
 ) -> Result<Vec<DeferredNewKeyProbePlan>> {
+    let table_btree = parent.table.btree().ok_or_else(|| {
+        LimboError::InternalError("foreign-key parent is not a B-tree table".to_string())
+    })?;
+    let database_id = parent.database_id;
     let mut deferred_new_key_plans = Vec::new();
     let mut check_fks: Vec<_> = Vec::new();
     let referencing = resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(&table_btree.name)
     })?;
     for fk in referencing {
-        if !fk.parent_key_may_change(updated_positions, table_btree)? {
+        if !fk.parent_key_may_change(updated_positions, &table_btree)? {
             continue;
         }
         if !matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict) {
@@ -1501,7 +1564,7 @@ pub fn emit_fk_update_parent_actions(
                 &rowid_fks,
                 old_rowid_reg,
                 rowid_set_clause_reg.unwrap_or(old_rowid_reg),
-                table_btree,
+                &table_btree,
                 updated_positions,
                 new_key_probe_mode,
                 database_id,
@@ -1520,11 +1583,10 @@ pub fn emit_fk_update_parent_actions(
             old_rowid_reg,
             rowid_new_reg,
             &check_fks,
-            table_btree,
+            parent,
             index.as_ref(),
             updated_positions,
             new_key_probe_mode,
-            database_id,
             resolver,
         )? {
             deferred_new_key_plans.push(plan);
@@ -1599,7 +1661,7 @@ impl FkSubprogramContext {
     }
 }
 
-/// Decode FK key registers in-place for custom type columns.
+/// Decode FK key registers in-place with the parent target's frozen read programs.
 /// FK action subprograms are compiled as normal SQL (via translate_inner), which
 /// means column reads in the WHERE clause apply decode automatically. Therefore,
 /// the parameter values passed to subprograms must also be in decoded (user-facing)
@@ -1607,16 +1669,59 @@ impl FkSubprogramContext {
 fn decode_fk_key_registers(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
+    parent: &JoinedTable,
+    parent_cols: &[String],
+    key_start: usize,
+) -> Result<()> {
+    let parent_bt = parent.table.btree().ok_or_else(|| {
+        LimboError::InternalError("foreign-key parent is not a B-tree table".to_string())
+    })?;
+    for (i, pcol) in parent_cols.iter().enumerate() {
+        let Some((position, column)) = parent_bt.get_column(pcol) else {
+            if ROWID_STRS
+                .iter()
+                .any(|rowid| pcol.eq_ignore_ascii_case(rowid))
+            {
+                continue;
+            }
+            return Err(LimboError::InternalError(format!(
+                "foreign-key parent column {pcol} is missing"
+            )));
+        };
+        if column.is_rowid_alias() {
+            continue;
+        }
+        let programs = parent
+            .read_programs
+            .column_type_programs
+            .get(position)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "foreign-key parent read programs omit column {position}"
+                ))
+            })?;
+        if let Some(programs) = programs {
+            let register = key_start + i;
+            emit_plan_column_value_decode(program, None, programs, register, resolver)?;
+        }
+    }
+    Ok(())
+}
+
+/// Decode a foreign-key key built without Semantic HIR, such as DROP TABLE.
+/// Normal DML must use `decode_fk_key_registers` and its frozen read programs.
+fn decode_fk_key_registers_from_schema(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
     parent_bt: &BTreeTable,
     parent_cols: &[String],
     key_start: usize,
 ) -> Result<()> {
-    for (i, pcol) in parent_cols.iter().enumerate() {
-        if let Some((_, col)) = parent_bt.get_column(pcol) {
-            let reg = key_start + i;
-            super::expr::emit_user_facing_column_value(
-                program, reg, reg, col, true, // custom types require STRICT tables
-                resolver,
+    for (i, parent_column) in parent_cols.iter().enumerate() {
+        if let Some((_, column)) = parent_bt.get_column(parent_column) {
+            let register = key_start + i;
+            emit_user_facing_column_value_from_schema(
+                program, register, register, column, true, resolver,
             )?;
         }
     }
@@ -1822,29 +1927,63 @@ fn generate_set_null_stmt(
 
 /// Generate an UPDATE statement AST for SET DEFAULT:
 /// UPDATE child_table SET fk_col1 = default1, fk_col2 = default2 ... WHERE fk_col1 = ?old1 AND fk_col2 = ?old2 ...
+fn schema_default_syntax(default: &SchemaExpr) -> Result<Expr> {
+    if let Some(unresolved) = default.as_unresolved() {
+        return Ok(unresolved.syntax().clone());
+    }
+
+    // Valid schema expressions are positional and intentionally do not retain
+    // parser syntax. Render their canonical SQL and parse it only at this
+    // explicit boundary where an engine-generated statement needs an AST.
+    let default_sql = default.render(&[] as &[&str])?;
+    let statement = format!("UPDATE __turso_fk_default SET __value = {default_sql}");
+    let mut parser = Parser::new(statement.as_bytes());
+    let command = parser.next_cmd().map_err(|error| {
+        LimboError::ParseError(format!(
+            "failed to parse stored default expression for foreign-key action: {error}"
+        ))
+    })?;
+    let Some(ast::Cmd::Stmt(ast::Stmt::Update(mut update))) = command else {
+        return Err(LimboError::InternalError(
+            "stored default expression did not produce an UPDATE statement".to_string(),
+        ));
+    };
+    if update.sets.len() != 1 {
+        return Err(LimboError::InternalError(
+            "stored default expression produced an invalid UPDATE assignment".to_string(),
+        ));
+    }
+    Ok(*update
+        .sets
+        .pop()
+        .expect("assignment count checked above")
+        .expr)
+}
+
 fn generate_set_default_stmt(
     child_table: &BTreeTable,
     child_cols: &[String],
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
-) -> ast::Stmt {
+) -> Result<ast::Stmt> {
     // Build SET clause: if no default is defined for a column, we use NULL
     let sets: Vec<ast::Set> = child_cols
         .iter()
-        .map(|col| {
+        .map(|col| -> Result<ast::Set> {
             let default_expr = child_table
                 .get_column(col)
                 .and_then(|(_, c)| c.default.as_ref())
-                .map(|d| (**d).clone())
+                .map(|default| schema_default_syntax(default))
+                .transpose()?
                 .unwrap_or(Expr::Literal(Literal::Null));
-            ast::Set {
+            Ok(ast::Set {
                 col_names: vec![Name::from_string(col)],
                 expr: Box::new(default_expr),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
-    ast::Stmt::Update(ast::Update {
+    Ok(ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
         tbl_name: qualified_table_name(&child_table.name, db_name),
@@ -1855,7 +1994,7 @@ fn generate_set_default_stmt(
         returning: vec![],
         order_by: vec![],
         limit: None,
-    })
+    }))
 }
 
 /// Generate an UPDATE statement AST for CASCADE UPDATE:
@@ -2022,7 +2161,7 @@ fn fire_fk_set_default(
         child_cols,
         &subprog_ctx,
         db_name.as_deref(),
-    );
+    )?;
     emit_fk_action_subprogram(
         program,
         resolver,
@@ -2099,15 +2238,16 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
     pub fn prepare_fk_delete_actions(
         program: &mut ProgramBuilder,
         resolver: &mut Resolver,
-        parent_table_name: &str,
+        parent: &JoinedTable,
         parent_cursor_id: usize,
         parent_rowid_reg: usize,
         replace_new_parent_regs: Option<(usize, usize)>,
-        database_id: usize,
     ) -> Result<ForeignKeyActions<PreparedFkDeleteAction>> {
-        let parent_bt = resolver
-            .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
-            .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
+        let parent_bt = parent.table.btree().ok_or_else(|| {
+            LimboError::InternalError("foreign-key parent is not a B-tree table".to_string())
+        })?;
+        let parent_table_name = parent.table.get_name();
+        let database_id = parent.database_id;
 
         let mut prepared = Vec::new();
 
@@ -2118,9 +2258,9 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
             let ncols = parent_cols.len();
             let key_regs_start = program.alloc_registers(ncols);
 
-            build_parent_key(
+            build_parent_key_for_target(
                 program,
-                &parent_bt,
+                parent,
                 parent_cols,
                 parent_cursor_id,
                 parent_rowid_reg,
@@ -2161,11 +2301,9 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                             emit_fk_delete_parent_existence_check_single(
                                 program,
                                 &fk_ref,
-                                &parent_bt,
-                                parent_table_name,
+                                parent,
                                 parent_cursor_id,
                                 parent_rowid_reg,
-                                database_id,
                                 resolver,
                             )?;
                             program.preassign_label_to_next_insn(skip);
@@ -2175,11 +2313,9 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                     emit_fk_delete_parent_existence_check_single(
                         program,
                         &fk_ref,
-                        &parent_bt,
-                        parent_table_name,
+                        parent,
                         parent_cursor_id,
                         parent_rowid_reg,
-                        database_id,
                         resolver,
                     )?;
                 }
@@ -2187,11 +2323,9 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                     emit_fk_delete_parent_existence_check_single(
                         program,
                         &fk_ref,
-                        &parent_bt,
-                        parent_table_name,
+                        parent,
                         parent_cursor_id,
                         parent_rowid_reg,
-                        database_id,
                         resolver,
                     )?;
                 }
@@ -2200,7 +2334,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                     decode_fk_key_registers(
                         program,
                         resolver,
-                        &parent_bt,
+                        parent,
                         parent_cols,
                         key_regs_start,
                     )?;
@@ -2275,17 +2409,18 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
 pub fn fire_fk_update_actions(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
-    parent_table_name: &str,
+    parent: &JoinedTable,
     old_rowid_reg: usize,
     old_values_start: usize,
     new_values_start: usize,
     new_rowid_reg: usize,
     connection: &Arc<Connection>,
-    database_id: usize,
 ) -> Result<()> {
-    let parent_bt = resolver
-        .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
-        .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
+    let parent_bt = parent.table.btree().ok_or_else(|| {
+        LimboError::InternalError("foreign-key parent is not a B-tree table".to_string())
+    })?;
+    let parent_table_name = parent.table.get_name();
+    let database_id = parent.database_id;
 
     // OLD-image registers are allocated one-per-schema-column in declaration order; the NEW image
     // lives in the UPDATE's packed DML layout (non-virtual first, virtual after).
@@ -2324,8 +2459,8 @@ pub fn fire_fk_update_actions(
         )?;
 
         // Decode encoded values so they match the subprogram's decoded column reads
-        decode_fk_key_registers(program, resolver, &parent_bt, parent_cols, old_key_start)?;
-        decode_fk_key_registers(program, resolver, &parent_bt, parent_cols, new_key_start)?;
+        decode_fk_key_registers(program, resolver, parent, parent_cols, old_key_start)?;
+        decode_fk_key_registers(program, resolver, parent, parent_cols, new_key_start)?;
 
         let old_key_registers: Vec<usize> = (old_key_start..old_key_start + ncols).collect();
         let new_key_registers: Vec<usize> = (new_key_start..new_key_start + ncols).collect();
@@ -2489,9 +2624,10 @@ pub fn emit_fk_drop_table_check(
         let ncols = parent_cols.len();
         let key_regs_start = program.alloc_registers(ncols);
 
-        build_parent_key(
+        build_parent_key_from_schema(
             program,
             &parent_tbl,
+            database_id,
             parent_cols,
             parent_write_cur,
             current_rowid_reg,
@@ -2500,7 +2636,13 @@ pub fn emit_fk_drop_table_check(
         )?;
 
         // Decode encoded values so they match the subprogram's decoded column reads
-        decode_fk_key_registers(program, resolver, &parent_tbl, parent_cols, key_regs_start)?;
+        decode_fk_key_registers_from_schema(
+            program,
+            resolver,
+            &parent_tbl,
+            parent_cols,
+            key_regs_start,
+        )?;
 
         let old_key_registers: Vec<usize> = (key_regs_start..key_regs_start + ncols).collect();
         let ctx = FkActionContext::new_for_delete(old_key_registers);
@@ -2532,9 +2674,10 @@ pub fn emit_fk_drop_table_check(
 
         // Build the parent key vector from the current parent row
         let parent_key_start = program.alloc_registers(ncols);
-        build_parent_key(
+        build_parent_key_from_schema(
             program,
             &parent_tbl,
+            database_id,
             parent_cols,
             parent_write_cur,
             current_rowid_reg,

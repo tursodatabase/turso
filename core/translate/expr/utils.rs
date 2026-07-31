@@ -60,7 +60,6 @@ pub fn as_binary_components(
 /// e.g. (((t.x > 5))) -> t.x > 5
 pub fn unwrap_parens(expr: &ast::Expr) -> Result<&ast::Expr> {
     match expr {
-        ast::Expr::Column { .. } => Ok(expr),
         ast::Expr::Parenthesized(exprs) => match exprs.len() {
             1 => unwrap_parens(exprs.first().unwrap()),
             _ => Ok(expr), // If the expression is e.g. (x, y), as used in e.g. (x, y) IN (SELECT ...), return as is.

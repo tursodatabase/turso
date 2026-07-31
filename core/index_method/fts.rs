@@ -2230,18 +2230,13 @@ impl FtsCursor {
         drop(previous);
     }
 
-    fn constant_integer_expression(expr: &turso_parser::ast::Expr) -> Option<i64> {
-        match expr {
-            turso_parser::ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
-                Self::constant_integer_expression(&expressions[0])
+    fn constant_integer_argument(argument: &super::IndexMethodCostArgument) -> Option<i64> {
+        match argument.constant()? {
+            Value::Numeric(crate::numeric::Numeric::Integer(value)) => Some(*value),
+            Value::Numeric(crate::numeric::Numeric::Float(value)) => {
+                crate::util::cast_real_to_integer(f64::from(*value)).ok()
             }
-            _ => match crate::util::parse_signed_number(expr).ok()? {
-                Value::Numeric(crate::numeric::Numeric::Integer(value)) => Some(value),
-                Value::Numeric(crate::numeric::Numeric::Float(value)) => {
-                    crate::util::cast_real_to_integer(f64::from(value)).ok()
-                }
-                Value::Null | Value::Text(_) | Value::Blob(_) => None,
-            },
+            Value::Null | Value::Text(_) | Value::Blob(_) => None,
         }
     }
 
@@ -3930,7 +3925,7 @@ impl IndexMethodCursor for FtsCursor {
             context
                 .arguments
                 .get(1)
-                .and_then(Self::constant_integer_expression)
+                .and_then(Self::constant_integer_argument)
         } else {
             None
         };
@@ -4022,20 +4017,19 @@ mod tests {
     };
     use crate::{
         index_method::{
-            IndexMethodAttachment, IndexMethodConfiguration, IndexMethodCostContext,
-            IndexMethodCostEstimate,
+            IndexMethodAttachment, IndexMethodConfiguration, IndexMethodCostArgument,
+            IndexMethodCostContext, IndexMethodCostEstimate,
         },
         schema::IndexColumn,
         Value,
     };
     use rustc_hash::FxHashMap;
-    use std::{num::NonZeroU32, path::PathBuf};
+    use std::path::PathBuf;
     use tantivy::{
         merge_policy::NoMergePolicy,
         schema::{Schema, TEXT},
         Index, SegmentMeta, TantivyDocument,
     };
-    use turso_parser::ast::{Expr, Literal, UnaryOperator, Variable};
 
     fn only_flush(mutations: &mut PendingFileMutations) -> (PathBuf, Option<Vec<u8>>) {
         let flushes = mutations.take_flushes();
@@ -4100,7 +4094,10 @@ mod tests {
         }
     }
 
-    fn estimate_cost(pattern_idx: i64, limit: Option<Expr>) -> IndexMethodCostEstimate {
+    fn estimate_cost(
+        pattern_idx: i64,
+        limit: Option<IndexMethodCostArgument>,
+    ) -> IndexMethodCostEstimate {
         let attachment = FtsIndexAttachment::new(IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "docs_fts".to_string(),
@@ -4109,7 +4106,7 @@ mod tests {
         })
         .unwrap();
         let cursor = attachment.init().unwrap();
-        let mut arguments = vec![Expr::Literal(Literal::String("'database'".to_string()))];
+        let mut arguments = vec![IndexMethodCostArgument::Dynamic];
         arguments.extend(limit);
 
         cursor
@@ -4128,13 +4125,13 @@ mod tests {
 
         let limited = estimate_cost(
             FTS_PATTERN_MATCH_LIMIT,
-            Some(Expr::Literal(Literal::Numeric("10".to_string()))),
+            Some(IndexMethodCostArgument::Constant(Value::from_i64(10))),
         );
         assert_eq!(limited.estimated_rows, 10);
         assert!(limited.estimated_cost < unlimited.estimated_cost);
         let ranked = estimate_cost(
             FTS_PATTERN_SCORE,
-            Some(Expr::Literal(Literal::Numeric("10".to_string()))),
+            Some(IndexMethodCostArgument::Constant(Value::from_i64(10))),
         );
         assert_eq!(ranked.estimated_rows, 10);
         assert!(
@@ -4144,22 +4141,19 @@ mod tests {
 
         let zero = estimate_cost(
             FTS_PATTERN_MATCH_LIMIT,
-            Some(Expr::Literal(Literal::Numeric("0".to_string()))),
+            Some(IndexMethodCostArgument::Constant(Value::from_i64(0))),
         );
         assert_eq!(zero.estimated_rows, 0);
 
         let negative = estimate_cost(
             FTS_PATTERN_MATCH_LIMIT,
-            Some(Expr::Unary(
-                UnaryOperator::Negative,
-                Box::new(Expr::Literal(Literal::Numeric("1".to_string()))),
-            )),
+            Some(IndexMethodCostArgument::Constant(Value::from_i64(-1))),
         );
         assert_eq!(negative.estimated_rows, unlimited.estimated_rows);
 
         let dynamic = estimate_cost(
             FTS_PATTERN_MATCH_LIMIT,
-            Some(Expr::Variable(Variable::indexed(NonZeroU32::MIN))),
+            Some(IndexMethodCostArgument::Dynamic),
         );
         assert_eq!(dynamic.estimated_rows, unlimited.estimated_rows);
     }

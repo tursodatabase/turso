@@ -390,11 +390,10 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Create an aggregate operator for SUM(age) with no GROUP BY
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,                               // operator_id for testing
             vec![],                          // No GROUP BY
             vec![AggregateFunction::Sum(2)], // age is at index 2
-            vec!["id".to_string(), "name".to_string(), "age".to_string()],
         )
         .unwrap();
 
@@ -510,16 +509,10 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,                               // operator_id for testing
             vec![1],                         // GROUP BY team (index 1)
             vec![AggregateFunction::Sum(3)], // score is at index 3
-            vec![
-                "id".to_string(),
-                "team".to_string(),
-                "player".to_string(),
-                "score".to_string(),
-            ],
         )
         .unwrap();
 
@@ -663,15 +656,10 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Create COUNT(*) GROUP BY category
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,       // operator_id for testing
             vec![1], // category is at index 1
             vec![AggregateFunction::Count],
-            vec![
-                "item_id".to_string(),
-                "category".to_string(),
-                "price".to_string(),
-            ],
         )
         .unwrap();
         agg.set_tracker(tracker.clone());
@@ -744,15 +732,10 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,                               // operator_id for testing
             vec![1],                         // product is at index 1
             vec![AggregateFunction::Sum(2)], // amount is at index 2
-            vec![
-                "sale_id".to_string(),
-                "product".to_string(),
-                "amount".to_string(),
-            ],
         )
         .unwrap();
         agg.set_tracker(tracker.clone());
@@ -842,17 +825,12 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,       // operator_id for testing
             vec![1], // user_id is at index 1
             vec![
                 AggregateFunction::Count,
                 AggregateFunction::Sum(2), // amount is at index 2
-            ],
-            vec![
-                "order_id".to_string(),
-                "user_id".to_string(),
-                "amount".to_string(),
             ],
         )
         .unwrap();
@@ -935,15 +913,10 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,                               // operator_id for testing
             vec![1],                         // category is at index 1
             vec![AggregateFunction::Avg(2)], // value is at index 2
-            vec![
-                "id".to_string(),
-                "category".to_string(),
-                "value".to_string(),
-            ],
         )
         .unwrap();
 
@@ -1036,17 +1009,12 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,       // operator_id for testing
             vec![1], // category is at index 1
             vec![
                 AggregateFunction::Count,
                 AggregateFunction::Sum(2), // value is at index 2
-            ],
-            vec![
-                "id".to_string(),
-                "category".to_string(),
-                "value".to_string(),
             ],
         )
         .unwrap();
@@ -1112,7 +1080,6 @@ mod tests {
     fn test_count_aggregation_with_deletions() {
         let aggregates = vec![AggregateFunction::Count];
         let group_by = vec![0]; // category is at index 0
-        let input_columns = vec!["category".to_string(), "value".to_string()];
 
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
@@ -1124,11 +1091,9 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1, // operator_id for testing
-            group_by,
-            aggregates,
-            input_columns,
+            group_by, aggregates,
         )
         .unwrap();
 
@@ -1203,7 +1168,6 @@ mod tests {
     fn test_sum_aggregation_with_deletions() {
         let aggregates = vec![AggregateFunction::Sum(1)]; // value is at index 1
         let group_by = vec![0]; // category is at index 0
-        let input_columns = vec!["category".to_string(), "value".to_string()];
 
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
@@ -1215,11 +1179,9 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1, // operator_id for testing
-            group_by,
-            aggregates,
-            input_columns,
+            group_by, aggregates,
         )
         .unwrap();
 
@@ -1288,7 +1250,6 @@ mod tests {
     fn test_avg_aggregation_with_deletions() {
         let aggregates = vec![AggregateFunction::Avg(1)]; // value is at index 1
         let group_by = vec![0]; // category is at index 0
-        let input_columns = vec!["category".to_string(), "value".to_string()];
 
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
@@ -1300,11 +1261,9 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1, // operator_id for testing
-            group_by,
-            aggregates,
-            input_columns,
+            group_by, aggregates,
         )
         .unwrap();
 
@@ -1358,7 +1317,6 @@ mod tests {
             AggregateFunction::Avg(1), // value is at index 1
         ];
         let group_by = vec![0]; // category is at index 0
-        let input_columns = vec!["category".to_string(), "value".to_string()];
 
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
@@ -1370,11 +1328,9 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1, // operator_id for testing
-            group_by,
-            aggregates,
-            input_columns,
+            group_by, aggregates,
         )
         .unwrap();
 
@@ -1607,17 +1563,12 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,       // operator_id for testing
             vec![1], // category is at index 1
             vec![
                 AggregateFunction::Count,
                 AggregateFunction::Sum(2), // amount is at index 2
-            ],
-            vec![
-                "id".to_string(),
-                "category".to_string(),
-                "amount".to_string(),
             ],
         )
         .unwrap();
@@ -1778,14 +1729,13 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,      // operator_id for testing
             vec![], // No GROUP BY
             vec![
                 AggregateFunction::Count,
                 AggregateFunction::Sum(1), // value is at index 1
             ],
-            vec!["id".to_string(), "value".to_string()],
         )
         .unwrap();
 
@@ -1861,11 +1811,10 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,       // operator_id for testing
             vec![1], // type is at index 1
             vec![AggregateFunction::Count],
-            vec!["id".to_string(), "type".to_string()],
         )
         .unwrap();
 
@@ -1976,14 +1925,13 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
                 AggregateFunction::Min(2), // price is at index 2
                 AggregateFunction::Max(2), // price is at index 2
             ],
-            vec!["id".to_string(), "name".to_string(), "price".to_string()],
         )
         .unwrap();
 
@@ -2045,14 +1993,13 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
                 AggregateFunction::Min(2), // price is at index 2
                 AggregateFunction::Max(2), // price is at index 2
             ],
-            vec!["id".to_string(), "name".to_string(), "price".to_string()],
         )
         .unwrap();
 
@@ -2136,14 +2083,13 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
                 AggregateFunction::Min(2), // price is at index 2
                 AggregateFunction::Max(2), // price is at index 2
             ],
-            vec!["id".to_string(), "name".to_string(), "price".to_string()],
         )
         .unwrap();
 
@@ -2227,14 +2173,13 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
                 AggregateFunction::Min(2), // price is at index 2
                 AggregateFunction::Max(2), // price is at index 2
             ],
-            vec!["id".to_string(), "name".to_string(), "price".to_string()],
         )
         .unwrap();
 
@@ -2310,14 +2255,13 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
                 AggregateFunction::Min(2), // price is at index 2
                 AggregateFunction::Max(2), // price is at index 2
             ],
-            vec!["id".to_string(), "name".to_string(), "price".to_string()],
         )
         .unwrap();
 
@@ -2393,14 +2337,13 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
                 AggregateFunction::Min(2), // price is at index 2
                 AggregateFunction::Max(2), // price is at index 2
             ],
-            vec!["id".to_string(), "name".to_string(), "price".to_string()],
         )
         .unwrap();
 
@@ -2484,18 +2427,12 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,       // operator_id
             vec![1], // GROUP BY category (index 1)
             vec![
                 AggregateFunction::Min(3), // price is at index 3
                 AggregateFunction::Max(3), // price is at index 3
-            ],
-            vec![
-                "id".to_string(),
-                "category".to_string(),
-                "name".to_string(),
-                "price".to_string(),
             ],
         )
         .unwrap();
@@ -2587,14 +2524,13 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
                 AggregateFunction::Min(2), // price is at index 2
                 AggregateFunction::Max(2), // price is at index 2
             ],
-            vec!["id".to_string(), "name".to_string(), "price".to_string()],
         )
         .unwrap();
 
@@ -2664,14 +2600,13 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
                 AggregateFunction::Min(2), // score is at index 2
                 AggregateFunction::Max(2), // score is at index 2
             ],
-            vec!["id".to_string(), "name".to_string(), "score".to_string()],
         )
         .unwrap();
 
@@ -2733,14 +2668,13 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
                 AggregateFunction::Min(1), // name is at index 1
                 AggregateFunction::Max(1), // name is at index 1
             ],
-            vec!["id".to_string(), "name".to_string()],
         )
         .unwrap();
 
@@ -2773,7 +2707,7 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
@@ -2783,7 +2717,6 @@ mod tests {
                 AggregateFunction::Max(1), // value is at index 1
                 AggregateFunction::Avg(1), // value is at index 1
             ],
-            vec!["id".to_string(), "value".to_string()],
         )
         .unwrap();
 
@@ -2866,7 +2799,7 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut agg = AggregateOperator::new(
+        let mut agg = AggregateOperator::new_typed(
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
@@ -2874,7 +2807,6 @@ mod tests {
                 AggregateFunction::Max(1), // col2 is at index 1
                 AggregateFunction::Min(2), // col3 is at index 2
             ],
-            vec!["col1".to_string(), "col2".to_string(), "col3".to_string()],
         )
         .unwrap();
 
@@ -4062,16 +3994,10 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Create first operator with SUM(col1), MIN(col3) GROUP BY col0
-        let mut agg1 = AggregateOperator::new(
+        let mut agg1 = AggregateOperator::new_typed(
             1,
             vec![0],
             vec![AggregateFunction::Sum(1), AggregateFunction::Min(3)],
-            vec![
-                "group".to_string(),
-                "val1".to_string(),
-                "val2".to_string(),
-                "val3".to_string(),
-            ],
         )
         .unwrap();
 
@@ -4108,16 +4034,10 @@ mod tests {
         assert_eq!(row1.values[2], Value::from_i64(3)); // MIN(val3) = min(5, 3)
 
         // Create operator with same ID but different column mappings: SUM(col3), MIN(col1)
-        let mut agg2 = AggregateOperator::new(
+        let mut agg2 = AggregateOperator::new_typed(
             1, // Same operator_id
             vec![0],
             vec![AggregateFunction::Sum(3), AggregateFunction::Min(1)],
-            vec![
-                "group".to_string(),
-                "val1".to_string(),
-                "val2".to_string(),
-                "val3".to_string(),
-            ],
         )
         .unwrap();
 
@@ -4173,11 +4093,10 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Create a DISTINCT operator that groups by all columns
-        let mut operator = AggregateOperator::new(
+        let mut operator = AggregateOperator::new_typed(
             0,       // operator_id
             vec![0], // group by column 0 (value)
             vec![],  // Empty aggregates for plain DISTINCT
-            vec!["value".to_string()],
         )
         .unwrap();
 
@@ -4230,11 +4149,10 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut operator = AggregateOperator::new(
+        let mut operator = AggregateOperator::new_typed(
             0,
             vec![0, 1], // group by both columns
             vec![],     // Empty aggregates for plain DISTINCT
-            vec!["category".to_string(), "value".to_string()],
         )
         .unwrap();
 
@@ -4317,11 +4235,10 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Test that DISTINCT correctly tracks state transitions (0 ↔ positive)
-        let mut operator = AggregateOperator::new(
+        let mut operator = AggregateOperator::new_typed(
             0,
             vec![0],
             vec![], // Empty aggregates for plain DISTINCT
-            vec!["value".to_string()],
         )
         .unwrap();
 
@@ -4387,11 +4304,10 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // First operator instance
-        let mut operator1 = AggregateOperator::new(
+        let mut operator1 = AggregateOperator::new_typed(
             0,
             vec![0],
             vec![], // Empty aggregates for plain DISTINCT
-            vec!["value".to_string()],
         )
         .unwrap();
 
@@ -4416,11 +4332,10 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors2 = DbspStateCursors::new(table_cursor2, index_cursor2);
 
-        let mut operator2 = AggregateOperator::new(
+        let mut operator2 = AggregateOperator::new_typed(
             0, // Same operator_id
             vec![0],
             vec![], // Empty aggregates for plain DISTINCT
-            vec!["value".to_string()],
         )
         .unwrap();
 
@@ -4464,11 +4379,10 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut operator = AggregateOperator::new(
+        let mut operator = AggregateOperator::new_typed(
             0,
             vec![0, 1], // group by category and value
             vec![],     // Empty aggregates for plain DISTINCT
-            vec!["category".to_string(), "value".to_string()],
         )
         .unwrap();
 
@@ -4554,7 +4468,7 @@ mod tests {
 
         // Create operator with COUNT(DISTINCT value), SUM(DISTINCT value), AVG(DISTINCT value)
         // all on the same column
-        let mut operator = AggregateOperator::new(
+        let mut operator = AggregateOperator::new_typed(
             0,
             vec![], // No group by - single group
             vec![
@@ -4562,7 +4476,6 @@ mod tests {
                 AggregateFunction::SumDistinct(0),   // SUM(DISTINCT value)
                 AggregateFunction::AvgDistinct(0),   // AVG(DISTINCT value)
             ],
-            vec!["value".to_string()],
         )
         .unwrap();
 
@@ -4609,11 +4522,10 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut operator = AggregateOperator::new(
+        let mut operator = AggregateOperator::new_typed(
             1,
             vec![], // No GROUP BY
             vec![AggregateFunction::CountDistinct(1)],
-            vec!["id".to_string(), "value".to_string()],
         )
         .unwrap();
 
@@ -4656,13 +4568,9 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut operator = AggregateOperator::new(
-            1,
-            vec![],
-            vec![AggregateFunction::SumDistinct(1)],
-            vec!["id".to_string(), "value".to_string()],
-        )
-        .unwrap();
+        let mut operator =
+            AggregateOperator::new_typed(1, vec![], vec![AggregateFunction::SumDistinct(1)])
+                .unwrap();
 
         // Insert values including a duplicate
         let mut delta1 = Delta::new();

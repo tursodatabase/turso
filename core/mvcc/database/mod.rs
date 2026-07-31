@@ -8300,9 +8300,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .block(|| pager.with_header(|header| header.schema_cookie))?
                     .get(),
             );
-        let mut fresh = Schema::with_options(
+        let syms = connection.syms.read();
+        let mut fresh = Schema::with_options_and_symbols(
             connection.db.experimental_custom_types_enabled(),
             connection.db.dialect().as_ref(),
+            &syms,
         )?;
         fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
@@ -8311,7 +8313,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
         let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
         let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
-        let syms = connection.syms.read();
         let mv_store = connection.db.get_mv_store().clone();
 
         let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
@@ -8401,6 +8402,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
+            &syms,
+            connection.experimental_custom_types_enabled(),
+            connection.dialect(),
+            None,
         )?;
         Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
 
@@ -9250,9 +9255,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .as_ref()
             .map(|header| header.schema_cookie.get())
             .unwrap_or(fallback_cookie);
-        let mut fresh = Schema::with_options(
+        let syms = connection.syms.read();
+        let mut fresh = Schema::with_options_and_symbols(
             connection.db.experimental_custom_types_enabled(),
             connection.db.dialect().as_ref(),
+            &syms,
         )?;
         fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
@@ -9263,7 +9270,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
         let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
         let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
-        let syms = connection.syms.read();
         let mv_store = connection.db.get_mv_store().clone();
 
         let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
@@ -9353,6 +9359,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
+            &syms,
+            connection.experimental_custom_types_enabled(),
+            connection.dialect(),
+            None,
         )?;
         Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
 

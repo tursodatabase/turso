@@ -1,7 +1,7 @@
 use crate::alloc::TursoVecExt;
 use crate::schema::{Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
-use crate::translate::collate::{get_collseq_from_expr, CollationSeq};
+use crate::translate::collate::CollationSeq;
 use crate::translate::compound_select::{
     emit_program_for_compound_select, set_select_plan_destination,
 };
@@ -10,8 +10,12 @@ use crate::translate::emitter::{
     select::{emit_materialized_build_inputs, emit_query},
     Resolver, TranslateCtx,
 };
-use crate::translate::plan::{Plan, QueryDestination, RecursiveCtePlan, RecursiveCteQueueKey};
-use crate::translate::result_row::{emit_columns_to_destination, emit_offset};
+use crate::translate::plan::{
+    EvalAt, Plan, QueryDestination, RecursiveCtePlan, RecursiveCteQueueKey, SelectPlan,
+    SubqueryOrigin,
+};
+use crate::translate::result_row::{emit_offset, emit_result_columns_to_destination};
+use crate::translate::subquery::emit_non_from_clause_subqueries_for_eval_at;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, Insn};
 use crate::{emit_explain, LimboError, Result};
@@ -22,56 +26,75 @@ pub(crate) fn emit_recursive_cte(
     resolver: &Resolver,
     recursive_cte: &mut RecursiveCtePlan,
 ) -> Result<usize> {
-    let num_result_columns = recursive_cte.initial_query.select_result_columns().len();
+    let num_result_columns = recursive_cte.result_columns.len();
     let input_record_reg = program.alloc_register();
-    let input_cursor_id = program.alloc_cursor_id_keyed_if_not_exists(
-        CursorKey::table(recursive_cte.input_table_id),
-        CursorType::Pseudo(PseudoCursorType {
-            column_count: num_result_columns,
-        }),
-    );
-    program.emit_insn(Insn::OpenPseudo {
-        cursor_id: input_cursor_id,
-        content_reg: input_record_reg,
-        num_fields: num_result_columns,
-    });
+    if recursive_cte.input_table_ids.is_empty() {
+        return Err(LimboError::InternalError(format!(
+            "recursive CTE '{}' has no recursive input source",
+            recursive_cte.name
+        )));
+    }
+    for &input_table_id in &recursive_cte.input_table_ids {
+        let input_cursor_id = program.alloc_cursor_id_keyed_if_not_exists(
+            CursorKey::table(input_table_id),
+            CursorType::Pseudo(PseudoCursorType {
+                column_count: num_result_columns,
+            }),
+        );
+        program.emit_insn(Insn::OpenPseudo {
+            cursor_id: input_cursor_id,
+            content_reg: input_record_reg,
+            num_fields: num_result_columns,
+        });
+    }
 
     let mut queue_index_columns = crate::alloc::try_vec![]?;
     let mut queue_sort_keys = crate::alloc::try_vec![]?;
-    if let Some(queue_order) = &recursive_cte.queue_order {
-        for (result_column_index, order, nulls, explicit_collation) in queue_order {
-            let default_nulls = match order {
-                SortOrder::Asc => NullsOrder::First,
-                SortOrder::Desc => NullsOrder::Last,
-            };
-            let nulls_override = nulls.filter(|nulls| *nulls != default_nulls);
-            if nulls_override.is_some() {
-                queue_index_columns.try_push(IndexColumn {
-                    name: format!("null-rank-{}", queue_sort_keys.len()),
-                    order: SortOrder::Asc,
-                    pos_in_table: queue_index_columns.len(),
-                    collation: None,
-                    default: None,
-                    expr: None,
-                })?;
-            }
-            let collation = explicit_collation.or(recursive_cte_result_column_collation(
-                recursive_cte,
-                *result_column_index,
-            )?);
+    for (term_index, term) in recursive_cte.queue_order.iter().enumerate() {
+        let result_column_index = term.result_column_index;
+        if result_column_index >= num_result_columns {
+            return Err(LimboError::InternalError(format!(
+                "resolved recursive CTE ORDER BY term {} references missing result column {}",
+                term_index + 1,
+                result_column_index + 1
+            )));
+        }
+        let order = term.order;
+        let default_nulls = match order {
+            SortOrder::Asc => NullsOrder::First,
+            SortOrder::Desc => NullsOrder::Last,
+        };
+        let nulls_override = term.nulls.filter(|nulls| *nulls != default_nulls);
+        if nulls_override.is_some() {
             queue_index_columns.try_push(IndexColumn {
-                name: format!("priority-{}", queue_sort_keys.len()),
-                order: *order,
+                name: format!("null-rank-{}", queue_sort_keys.len()),
+                order: SortOrder::Asc,
                 pos_in_table: queue_index_columns.len(),
-                collation,
+                collation: None,
                 default: None,
                 expr: None,
             })?;
-            queue_sort_keys.try_push(RecursiveCteQueueKey {
-                result_column_index: *result_column_index,
-                nulls_override,
-            })?;
         }
+        let explicit_collation = term
+            .explicit_collation
+            .as_ref()
+            .map(|collation| *collation.value());
+        let collation = explicit_collation.or(recursive_cte_result_column_collation(
+            recursive_cte,
+            result_column_index,
+        )?);
+        queue_index_columns.try_push(IndexColumn {
+            name: format!("priority-{}", queue_sort_keys.len()),
+            order,
+            pos_in_table: queue_index_columns.len(),
+            collation,
+            default: None,
+            expr: None,
+        })?;
+        queue_sort_keys.try_push(RecursiveCteQueueKey {
+            result_column_index,
+            nulls_override,
+        })?;
     }
     let queue_sort_column_count = queue_index_columns.len();
     queue_index_columns.try_push(IndexColumn::new("sequence", queue_index_columns.len()))?;
@@ -151,6 +174,27 @@ pub(crate) fn emit_recursive_cte(
     let run_recursive_query = program.allocate_label();
     let mut output_limit_context = TranslateCtx::new(program, resolver.fork(), 0, false);
     output_limit_context.label_main_loop_end = Some(recursive_cte_end);
+    let limit_owner = match recursive_cte.initial_query.as_mut() {
+        Plan::Select(select) => select.as_mut(),
+        Plan::CompoundSelect { right_most, .. } => right_most.as_mut(),
+        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {
+            return Err(LimboError::InternalError(
+                "recursive CTE seed is not a SELECT query".to_string(),
+            ));
+        }
+    };
+    output_limit_context
+        .resolver
+        .bind_plan_subqueries(&limit_owner.non_from_clause_subqueries);
+    emit_non_from_clause_subqueries_for_eval_at(
+        program,
+        &output_limit_context.resolver,
+        &mut limit_owner.non_from_clause_subqueries,
+        &[],
+        Some(&limit_owner.table_references),
+        EvalAt::BeforeLoop,
+        |subquery| subquery.origin == SubqueryOrigin::SelectLimitOffset,
+    )?;
     init_limit(
         program,
         &mut output_limit_context,
@@ -199,11 +243,14 @@ pub(crate) fn emit_recursive_cte(
         run_recursive_query,
         output_limit_context.reg_offset,
     );
-    emit_columns_to_destination(
+    let output_select = recursive_cte_initial_select(&recursive_cte.initial_query)?;
+    emit_result_columns_to_destination(
         program,
         &recursive_cte.query_destination,
         result_row_regs,
-        num_result_columns,
+        &recursive_cte.result_columns,
+        &output_select.table_references,
+        resolver,
     )?;
     if let Some(limit) = output_limit_context.limit_ctx {
         program.emit_insn(Insn::DecrJumpZero {
@@ -227,70 +274,49 @@ pub(crate) fn emit_recursive_cte(
     if let Some(cursor_id) = seen_rows_cursor_id {
         program.emit_insn(Insn::Close { cursor_id });
     }
-    program.emit_insn(Insn::Close {
-        cursor_id: input_cursor_id,
-    });
-    program.result_columns = recursive_cte.initial_query.select_result_columns().to_vec();
+    for &input_table_id in &recursive_cte.input_table_ids {
+        let input_cursor_id = program.resolve_cursor_id(&CursorKey::table(input_table_id));
+        program.emit_insn(Insn::Close {
+            cursor_id: input_cursor_id,
+        });
+    }
+    program
+        .result_columns
+        .clone_from(&recursive_cte.result_columns);
     program.reg_result_cols_start = Some(result_row_regs);
     Ok(result_row_regs)
+}
+
+fn recursive_cte_initial_select(query: &Plan) -> Result<&SelectPlan> {
+    match query {
+        Plan::Select(select) => Ok(select.as_ref()),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => Ok(left
+            .first()
+            .map(|(select, _)| select)
+            .unwrap_or(right_most.as_ref())),
+        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => Err(
+            LimboError::InternalError("recursive CTE seed is not a SELECT".to_string()),
+        ),
+    }
 }
 
 fn recursive_cte_result_column_collation(
     recursive_cte: &RecursiveCtePlan,
     result_column_index: usize,
 ) -> Result<Option<CollationSeq>> {
-    let initial_query_collation = recursive_cte_query_result_column_collation(
-        &recursive_cte.initial_query,
-        result_column_index,
-    )?;
-    if initial_query_collation.is_some() {
-        Ok(initial_query_collation)
-    } else {
-        recursive_cte_query_result_column_collation(
-            &recursive_cte.recursive_query,
-            result_column_index,
-        )
-    }
-}
-
-fn recursive_cte_query_result_column_collation(
-    query: &Plan,
-    result_column_index: usize,
-) -> Result<Option<CollationSeq>> {
-    match query {
-        Plan::Select(select) => {
-            let expr = select
-                .values
-                .first()
-                .and_then(|row| row.get(result_column_index))
-                .unwrap_or(&select.result_columns[result_column_index].expr);
-            get_collseq_from_expr(expr, &select.table_references)
-        }
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => {
-            for (select, _) in left {
-                let expr = select
-                    .values
-                    .first()
-                    .and_then(|row| row.get(result_column_index))
-                    .unwrap_or(&select.result_columns[result_column_index].expr);
-                let collation = get_collseq_from_expr(expr, &select.table_references)?;
-                if collation.is_some() {
-                    return Ok(collation);
-                }
-            }
-            let expr = right_most
-                .values
-                .first()
-                .and_then(|row| row.get(result_column_index))
-                .unwrap_or(&right_most.result_columns[result_column_index].expr);
-            get_collseq_from_expr(expr, &right_most.table_references)
-        }
-        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => Err(
-            LimboError::InternalError("recursive CTE query is not a SELECT".to_string()),
-        ),
-    }
+    recursive_cte
+        .comparison_collations
+        .get(result_column_index)
+        .map(|collation| collation.as_ref().map(|collation| *collation.value()))
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "recursive CTE '{}' has no result column {}",
+                recursive_cte.name,
+                result_column_index + 1
+            ))
+        })
 }
 
 fn emit_recursive_cte_query(

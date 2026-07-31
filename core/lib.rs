@@ -33,6 +33,7 @@ pub mod mvcc;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
 pub mod schema;
+pub mod schema_expr;
 pub mod skiplist;
 pub mod state_machine;
 pub mod storage;
@@ -812,7 +813,8 @@ impl Database {
         let db_size = db_file.size()?;
 
         let shared_page_cache = Arc::new(RwLock::new(PageCache::default()));
-        let syms = SymbolTable::new();
+        let mut syms = SymbolTable::new();
+        ext::register_global_builtin_functions(&mut syms);
         let arena_size = if std::env::var("TESTING").is_ok_and(|v| v.eq_ignore_ascii_case("true")) {
             BufferPool::TEST_ARENA_SIZE
         } else {
@@ -841,7 +843,8 @@ impl Database {
             path,
             wal_path,
             schema: Arc::new(Mutex::new(Arc::new({
-                let mut s = Schema::with_options(enable_custom_types, dialect.as_ref())?;
+                let mut s =
+                    Schema::with_options_and_symbols(enable_custom_types, dialect.as_ref(), &syms)?;
                 s.generated_columns_enabled = opts.enable_generated_columns;
                 s
             }))),
@@ -1609,7 +1612,8 @@ impl Database {
                         None,
                         pager,
                         &syms,
-                        dialect.as_ref(),
+                        conn.experimental_custom_types_enabled(),
+                        dialect,
                     );
 
                     match result {

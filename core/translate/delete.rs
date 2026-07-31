@@ -1,73 +1,46 @@
 use crate::schema::{BTreeTable, Table};
 use crate::sync::Arc;
 use crate::translate::emitter::{emit_program, Resolver};
-use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{
     DeletePlan, DmlSafety, DmlSafetyReason, IterationDirection, JoinOrderMember, Operation, Plan,
     QueryDestination, ResultSetColumn, Scan, SelectPlan,
 };
-use crate::translate::subquery::{
-    plan_subqueries_from_returning, plan_subqueries_from_select_plan,
-    plan_subqueries_from_where_clause,
-};
 use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
 use smallvec::SmallVec;
-use turso_parser::ast::{Expr, Limit, RefAct, ResultColumn, TriggerEvent};
+use turso_parser::ast::{RefAct, TriggerEvent};
 
 use super::plan::WhereTerm;
 
 #[allow(clippy::too_many_arguments)]
 #[turso_macros::trace_stack]
 pub fn translate_delete(
-    bound: super::bind::BoundDelete,
+    document: super::semantic::hir::HirDocument,
+    identities: &super::plan_expr::PlanIdentityMap,
     resolver: &Resolver,
-    where_clause: Option<Box<Expr>>,
-    limit: Option<Limit>,
-    returning: Vec<ResultColumn>,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let database_id = bound.database_id;
+    let super::semantic::hir::HirRoot::Delete(statement) = &document.root else {
+        return Err(crate::LimboError::InternalError(
+            "DELETE translator received a non-DELETE HIR root".to_string(),
+        ));
+    };
+    let source = document.source(statement.target).ok_or_else(|| {
+        crate::LimboError::InternalError(format!(
+            "missing DELETE target source {}",
+            statement.target
+        ))
+    })?;
+    let database_id = source.database.map_or(crate::MAIN_DB_ID, |id| id.index());
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
-    let (mut delete_plan, mut bound_subqueries) = prepare_delete_plan(
-        program,
-        resolver,
-        where_clause,
-        limit,
-        returning,
-        connection,
-        bound,
+    let mut delete_plan = prepare_delete_plan(
+        &document, statement, identities, program, resolver, connection,
     )?;
-
-    // Plan subqueries in the WHERE clause
-    if let Plan::Delete(ref mut delete_plan_inner) = delete_plan {
-        if let Some(ref mut rowset_plan) = delete_plan_inner.rowset_plan {
-            // When using rowset (triggers or subqueries present), subqueries are in the rowset_plan's WHERE
-            plan_subqueries_from_select_plan(
-                program,
-                rowset_plan,
-                resolver,
-                connection,
-                &mut bound_subqueries,
-            )?;
-        } else {
-            // Normal path: subqueries are in the DELETE plan's WHERE
-            plan_subqueries_from_where_clause(
-                program,
-                &mut delete_plan_inner.non_from_clause_subqueries,
-                &mut delete_plan_inner.table_references,
-                &mut delete_plan_inner.where_clause,
-                resolver,
-                connection,
-                &mut bound_subqueries,
-            )?;
-        }
-    }
 
     optimize_plan(program, &mut delete_plan, resolver)?;
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
@@ -122,62 +95,119 @@ pub fn translate_delete(
 #[allow(clippy::too_many_arguments)]
 #[turso_macros::trace_stack]
 pub fn prepare_delete_plan(
+    document: &super::semantic::hir::HirDocument,
+    statement: &super::semantic::hir::Delete,
+    identities: &super::plan_expr::PlanIdentityMap,
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    where_clause: Option<Box<Expr>>,
-    limit: Option<Limit>,
-    mut returning: Vec<ResultColumn>,
-    connection: &Arc<crate::Connection>,
-    mut bound: super::bind::BoundDelete,
-) -> Result<(
-    Plan,
-    rustc_hash::FxHashMap<turso_parser::ast::TableInternalId, super::bind::BoundSubquery>,
-)> {
-    let schema = resolver.schema();
-    let database_id = bound.database_id;
-    let table = bound.table.clone();
+    _connection: &Arc<crate::Connection>,
+) -> Result<Plan> {
+    let mut hir_ctx = super::planner::HirPlanContext::new(document, identities, program);
+    let target = super::planner::prepare_hir_source(&mut hir_ctx, statement.target, None)?;
+    let database_id = target.database_id;
+    let table = target.table.clone();
 
     let btree_table_for_triggers = table.btree();
-    let indexes = schema.get_indices(table.get_name()).cloned().collect();
-
-    let cte_definitions = std::mem::take(&mut bound.cte_definitions);
-    let bound_subqueries = std::mem::take(&mut bound.subquery_bindings);
-
-    // Plan CTEs using pre-bound data from the binder, then convert the bound
-    // scope into TableReferences. Planned CTEs become definition-only outer
-    // query refs so subqueries in WHERE/RETURNING can reference them.
-    let mut planned_ctes =
-        super::planner::plan_bound_ctes(cte_definitions, resolver, program, connection)?;
-    let mut table_references = bound.into_table_references(&mut planned_ctes)?;
-    super::planner::add_planned_ctes_as_outer_refs(
-        std::slice::from_mut(&mut table_references),
-        &planned_ctes,
-    );
+    let indexes = target
+        .index_expressions
+        .iter()
+        .map(|index| index.index.clone())
+        .collect();
+    let mut table_references = hir_ctx.new_table_references(vec![target], vec![])?;
 
     let mut where_predicates = vec![];
-    super::planner::parse_where_bound(where_clause.as_deref(), &mut where_predicates)?;
+    if let Some(predicate) = &statement.predicate {
+        super::update::split_where_expr(
+            super::plan_expr::lower_hir_expr(predicate, identities)
+                .map_err(|error| crate::LimboError::InternalError(error.to_string()))?,
+            &mut where_predicates,
+        );
+    }
+    let result_columns = statement
+        .returning
+        .as_ref()
+        .map(|returning| {
+            returning
+                .outputs
+                .iter()
+                .map(|output| super::update::lower_output(output, identities))
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let order_by = statement
+        .order_by
+        .iter()
+        .map(|term| {
+            Ok(super::plan_expr::PlanOrderTerm {
+                expr: super::plan_expr::lower_hir_expr(&term.expr, identities)
+                    .map_err(|error| crate::LimboError::InternalError(error.to_string()))?,
+                order: term.order,
+                nulls: term.nulls,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (resolved_limit, resolved_offset) = match &statement.limit {
+        Some(limit) => (
+            Some(
+                super::plan_expr::lower_hir_expr(&limit.limit, identities)
+                    .map_err(|error| crate::LimboError::InternalError(error.to_string()))?,
+            ),
+            limit
+                .offset
+                .as_ref()
+                .map(|expr| {
+                    super::plan_expr::lower_hir_expr(expr, identities)
+                        .map_err(|error| crate::LimboError::InternalError(error.to_string()))
+                })
+                .transpose()?,
+        ),
+        None => (None, None),
+    };
 
-    // Plan subqueries in RETURNING expressions before processing
-    // (so SubqueryResult nodes are cloned into result_columns).
-    // The bound map is passed separately to the caller for WHERE planning,
-    // so use a reborrow here.
-    let mut bound_subqueries = bound_subqueries;
+    for term in &where_predicates {
+        table_references.register_plan_expr_usage(&term.expr)?;
+    }
+    for output in &result_columns {
+        table_references.register_plan_expr_usage(&output.expr)?;
+    }
+    for term in &order_by {
+        table_references.register_plan_expr_usage(&term.expr)?;
+    }
+    if let Some(limit) = &resolved_limit {
+        table_references.register_plan_expr_usage(limit)?;
+    }
+    if let Some(offset) = &resolved_offset {
+        table_references.register_plan_expr_usage(offset)?;
+    }
+
     let mut non_from_clause_subqueries = vec![];
-    plan_subqueries_from_returning(
-        program,
-        &mut non_from_clause_subqueries,
+    let where_expressions = where_predicates
+        .iter()
+        .map(|term| &term.expr)
+        .chain(order_by.iter().map(|term| &term.expr))
+        .chain(resolved_limit.iter())
+        .chain(resolved_offset.iter())
+        .collect::<Vec<_>>();
+    super::subquery::prepare_hir_expression_subqueries(
+        &mut hir_ctx,
         &mut table_references,
-        &mut returning,
-        resolver,
-        connection,
-        &mut bound_subqueries,
+        &where_expressions,
+        super::plan::SubqueryOrigin::DmlWhere,
+        &mut non_from_clause_subqueries,
     )?;
-
-    let result_columns = process_returning_clause(&mut returning, &mut table_references)?;
-
-    // LIMIT/OFFSET identifiers were already resolved by the binder.
-    let (resolved_limit, resolved_offset) =
-        limit.map_or((None, None), |l| (Some(l.expr), l.offset));
+    let returning_expressions = result_columns
+        .iter()
+        .map(|output| &output.expr)
+        .collect::<Vec<_>>();
+    super::subquery::prepare_hir_expression_subqueries(
+        &mut hir_ctx,
+        &mut table_references,
+        &returning_expressions,
+        super::plan::SubqueryOrigin::DmlReturning,
+        &mut non_from_clause_subqueries,
+    )?;
+    drop(hir_ctx);
 
     // Check if there are DELETE triggers. If so, we need to materialize the write set into a RowSet first.
     // This is done in SQLite for all DELETE triggers on the affected table even if the trigger would not have an impact
@@ -210,7 +240,7 @@ pub fn prepare_delete_plan(
         table_references,
         result_columns,
         where_clause: where_predicates,
-        order_by: vec![],
+        order_by,
         limit: resolved_limit,
         offset: resolved_offset,
         contains_constant_false_condition: false,
@@ -225,7 +255,7 @@ pub fn prepare_delete_plan(
         ensure_delete_uses_rowset(program, &mut delete_plan);
     }
 
-    Ok((Plan::Delete(Box::new(delete_plan)), bound_subqueries))
+    Ok(Plan::Delete(Box::new(delete_plan)))
 }
 
 /// Returns true if any FK referencing `table_name` (transitively, following CASCADE chains)
@@ -284,33 +314,12 @@ fn table_has_fk_cascade_triggers(
     Ok(false)
 }
 
-/// Check if any WHERE predicate contains a subquery (Subquery, InSelect, or Exists).
+/// Check if any WHERE predicate depends on a semantic subquery plan.
 fn where_clause_has_subquery(predicates: &[WhereTerm]) -> bool {
-    for pred in predicates {
-        let mut found = false;
-        let _ = walk_expr(&pred.expr, &mut |e| {
-            // Raw subquery nodes (legacy path) or pre-bound SubqueryResult
-            // nodes produced by the binding phase.
-            if matches!(
-                e,
-                Expr::Subquery(_)
-                    | Expr::InSelect { .. }
-                    | Expr::Exists(_)
-                    | Expr::SubqueryResult { .. }
-            ) {
-                found = true;
-            }
-            Ok(if found {
-                WalkControl::SkipChildren
-            } else {
-                WalkControl::Continue
-            })
-        });
-        if found {
-            return true;
-        }
-    }
-    false
+    predicates.iter().any(|predicate| {
+        super::plan_expr::plan_expr_dependencies(&predicate.expr)
+            .is_ok_and(|dependencies| !dependencies.subqueries.is_empty())
+    })
 }
 
 fn estimate_num_instructions(plan: &DeletePlan) -> usize {
@@ -363,16 +372,33 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         plan.rowset_reg = Some(reg);
         reg
     });
+    let mut rowset_subqueries = Vec::new();
+    let mut delete_subqueries = Vec::new();
+    for subquery in std::mem::take(&mut plan.non_from_clause_subqueries) {
+        if matches!(subquery.origin, super::plan::SubqueryOrigin::DmlWhere) {
+            rowset_subqueries.push(subquery);
+        } else {
+            delete_subqueries.push(subquery);
+        }
+    }
+    plan.non_from_clause_subqueries = delete_subqueries;
 
     let rowset_plan = SelectPlan {
         table_references: plan.table_references.clone(),
         result_columns: vec![ResultSetColumn {
-            expr: Expr::RowId {
-                database: None,
-                table: rowid_internal_id,
-            },
-            alias: None,
-            implicit_column_name: None,
+            id: program.next_plan_output_id(),
+            name: "rowid".to_string(),
+            name_kind: super::semantic::hir::OutputNameKind::Inferred,
+            origin: Some(super::plan::ResultColumnOrigin::RowId {
+                source: rowid_internal_id,
+            }),
+            type_fact: super::semantic::hir::TypeFact::known(crate::schema::Type::Integer),
+            affinity: super::plan_expr::PlanExprAffinity::with_affinity(
+                crate::vdbe::affinity::Affinity::Integer,
+            ),
+            collation: None,
+            array_dimensions: 0,
+            expr: super::plan_expr::PlanExpr::rowid(rowid_internal_id),
             contains_aggregates: false,
         }],
         where_clause: std::mem::take(&mut plan.where_clause),
@@ -397,8 +423,7 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         distinctness: super::plan::Distinctness::NonDistinct,
         values: vec![],
         window: None,
-        // WHERE subqueries should already be planned into this SelectPlan when needed.
-        non_from_clause_subqueries: vec![],
+        non_from_clause_subqueries: rowset_subqueries,
         input_cardinality_hint: None,
         estimated_output_rows: None,
         simple_aggregate: None,

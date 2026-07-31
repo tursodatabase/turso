@@ -244,30 +244,16 @@ macro_rules! translate_fixed_insn {
     }};
 }
 
-#[inline]
-/// For expression indexes, try to emit code that directly reads the value from the index
-/// under the following conditions:
-/// - The expression only references columns from a single table
-/// - The referenced table has an index whose expression matches the given expression
-///
-/// If an expression index exactly matches the requested expression, we can
-/// fetch the precomputed value from the index key instead of re-evaluating
-/// the expression. That matters for:
-/// - SELECT a/b FROM t with INDEX ON t(a/b) (avoid computing a/b for every row)
-/// - ORDER BY a+b when the index already stores a+b (preserves ordering)
-///
-/// We mut do this check early in translate_expr so downstream translation does
-/// not build redundant bytecode.
-pub(super) fn try_emit_expression_index_value(
+pub(super) fn try_emit_plan_expression_index_value(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
-    expr: &ast::Expr,
+    expr: &crate::translate::plan_expr::PlanExpr,
     target_register: usize,
 ) -> Result<bool> {
     let Some(referenced_tables) = referenced_tables else {
         return Ok(false);
     };
-    let Some((table_id, _)) = single_table_column_usage(expr) else {
+    let Some((table_id, _)) = single_table_column_usage(expr)? else {
         return Ok(false);
     };
     let Some(table_reference) = referenced_tables.find_joined_table_by_internal_id(table_id) else {
@@ -276,11 +262,11 @@ pub(super) fn try_emit_expression_index_value(
     let Some(index) = table_reference.op.index() else {
         return Ok(false);
     };
-    let Some(expr_pos) = table_reference.bound_expression_index_pos(index, expr) else {
+    let Some(expr_pos) = table_reference.expression_index_pos(index.value(), expr) else {
         return Ok(false);
     };
     let Some(cursor_id) =
-        program.resolve_cursor_id_safe(&CursorKey::index(table_id, index.clone()))
+        program.resolve_cursor_id_safe(&CursorKey::index(table_id, index.handle()))
     else {
         return Ok(false);
     };

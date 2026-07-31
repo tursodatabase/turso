@@ -1,10 +1,10 @@
-use crate::error::{SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
+use crate::error::{SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
 use crate::translate::optimizer::constraints::ConstraintOperator;
 use crate::turso_assert;
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
+use turso_parser::ast::{self, Expr, ResolveType, UnaryOperator};
 
-use super::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
+use super::collate::CollationSeq;
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
@@ -14,15 +14,12 @@ use crate::function::FtsFunc;
 use crate::function::JsonFunc;
 use crate::function::{AggFunc, Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
-use crate::schema::{
-    BTreeTable, ColDef, Column, ColumnLayout, GeneratedType, Table, Type, TypeDef,
-};
-use crate::sync::Arc;
+use crate::schema::{ColDef, Column, ColumnLayout, Type};
 use crate::translate::expression_index::single_table_column_usage;
-use crate::translate::plan::{ColumnMask, Operation, ResultSetColumn, Search};
+use crate::translate::plan::{ColumnMask, ResultSetColumn};
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::{CursorKey, DmlColumnContext, SelfTableContext};
+use crate::vdbe::builder::{CursorKey, DmlColumnContext};
 use crate::vdbe::{
     builder::ProgramBuilder,
     insn::{CmpInsFlags, InsertFlags, Insn},
@@ -32,11 +29,11 @@ use crate::{LimboError, Numeric, Result, Value};
 
 #[macro_use]
 mod metadata;
+mod plan;
 
 mod affinity;
 mod arrays;
 mod binary;
-mod binding;
 mod columns;
 mod condition;
 mod custom_types;
@@ -53,8 +50,6 @@ use affinity::*;
 use arrays::*;
 #[allow(unused_imports)]
 use binary::*;
-#[allow(unused_imports)]
-use binding::*;
 #[allow(unused_imports)]
 use columns::*;
 #[allow(unused_imports)]
@@ -76,37 +71,28 @@ use vectors::*;
 #[allow(unused_imports)]
 use walk::*;
 
-pub(crate) use affinity::{
-    compare_affinity, expr_data_type, get_expr_affinity_info, ExprAffinityInfo, StorageClassMask,
-};
 pub use affinity::{comparison_affinity, get_expr_affinity};
 pub(crate) use arrays::{
-    emit_array_decode, emit_custom_type_decode_columns, emit_custom_type_encode_columns,
+    emit_plan_source_decode_columns, emit_plan_source_decode_columns_for_reencode,
+    emit_plan_source_encode_columns,
 };
-pub(crate) use binary::expr_is_array;
-pub(crate) use binding::validate_custom_type_function_call;
 pub use columns::{emit_table_column, emit_table_column_for_dml};
-pub use condition::translate_condition_expr;
-pub(crate) use custom_types::{
-    emit_dml_expr_index_value, emit_trigger_decode_registers, emit_type_expr,
-    emit_user_facing_column_value,
-};
-pub use emission::{
-    emit_function_call, emit_literal, process_returning_clause, ReturningBufferCtx,
-};
+pub(crate) use custom_types::emit_user_facing_column_value_from_schema;
+pub use emission::{emit_function_call, emit_literal, ReturningBufferCtx};
 pub(crate) use emission::{
     emit_returning_results, emit_returning_scan_back, restore_returning_row_image_in_cache,
     seed_returning_row_image_in_cache,
 };
 pub use metadata::ConditionMetadata;
-pub use translator::{
-    resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
+pub(crate) use plan::{
+    emit_plan_column_value_decode, emit_plan_column_value_decode_for_reencode,
+    emit_plan_column_value_encode, emit_plan_result_array_decode, emit_schema_domain_constraints,
+    emit_schema_type_transform,
 };
-pub use utils::{
-    as_binary_components, maybe_apply_affinity, sanitize_string, unwrap_parens, unwrap_parens_owned,
+pub use plan::{
+    translate_plan_condition_expr, translate_plan_expr, translate_plan_expr_no_constant_opt,
 };
+pub use translator::{translate_expr, NoConstantOptReason};
+pub use utils::{sanitize_string, unwrap_parens};
 pub use vectors::expr_vector_size;
-pub use walk::{
-    expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
-    expr_references_subquery_id, walk_expr, walk_expr_mut, WalkControl,
-};
+pub use walk::{walk_expr, walk_expr_mut, WalkControl};

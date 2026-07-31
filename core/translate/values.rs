@@ -1,7 +1,9 @@
 use crate::translate::emitter::TranslateCtx;
-use crate::translate::expr::{translate_expr_no_constant_opt, NoConstantOptReason};
+use crate::translate::expr::{translate_plan_expr_no_constant_opt, NoConstantOptReason};
 use crate::translate::plan::{QueryDestination, SelectPlan};
-use crate::translate::result_row::{emit_columns_to_destination, emit_offset};
+use crate::translate::result_row::{
+    emit_columns_to_destination, emit_offset, emit_result_columns_to_destination,
+};
 use crate::turso_assert_eq;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::{to_u32, IdxInsertFlags, InsertFlags, Insn};
@@ -63,7 +65,7 @@ fn emit_values_when_single_row(
         reg
     };
     for (i, v) in first_row.iter().enumerate() {
-        translate_expr_no_constant_opt(
+        translate_plan_expr_no_constant_opt(
             program,
             Some(&plan.table_references),
             v,
@@ -153,7 +155,7 @@ fn emit_values_in_subquery(
     };
     for value in &plan.values {
         for (i, v) in value.iter().enumerate() {
-            translate_expr_no_constant_opt(
+            translate_plan_expr_no_constant_opt(
                 program,
                 None,
                 v,
@@ -183,10 +185,14 @@ fn emit_values_to_destination(
 ) -> Result<()> {
     match &plan.query_destination {
         QueryDestination::ResultRows => {
-            program.emit_insn(Insn::ResultRow {
+            emit_result_columns_to_destination(
+                program,
+                &plan.query_destination,
                 start_reg,
-                count: row_len,
-            });
+                &plan.result_columns,
+                &plan.table_references,
+                &t_ctx.resolver,
+            )?;
             if let Some(limit_ctx) = t_ctx.limit_ctx {
                 program.emit_insn(Insn::DecrJumpZero {
                     reg: limit_ctx.reg_limit,

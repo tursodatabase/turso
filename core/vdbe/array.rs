@@ -156,6 +156,18 @@ pub(crate) fn values_to_record_blob(values: &[Value]) -> Result<Value> {
 /// - Text elements → double-quoted if they contain special chars, unquoted otherwise
 /// - Numeric elements → unquoted
 pub(crate) fn serialize_array_from_blob(blob: &[u8]) -> Result<String> {
+    serialize_array_from_blob_with_rank(blob, 1, false)
+}
+
+/// Serialize an array while preserving nested record arrays. `dimensions` is
+/// the deepest bounded rank known by semantic analysis. When the rank is
+/// unbounded, valid nested records are followed until a scalar value or an
+/// ordinary non-record BLOB is reached.
+pub(crate) fn serialize_array_from_blob_with_rank(
+    blob: &[u8],
+    dimensions: u32,
+    rank_unbounded: bool,
+) -> Result<String> {
     let iter = ValueIterator::new(blob)?;
     let mut result = String::from("{");
     let mut first = true;
@@ -165,13 +177,23 @@ pub(crate) fn serialize_array_from_blob(blob: &[u8]) -> Result<String> {
             result.push(',');
         }
         first = false;
-        write_value_ref_pg(&mut result, &vref);
+        write_value_ref_pg(
+            &mut result,
+            &vref,
+            dimensions.saturating_sub(1),
+            rank_unbounded,
+        );
     }
     result.push('}');
     Ok(result)
 }
 
-fn write_value_ref_pg(result: &mut String, val: &crate::ValueRef<'_>) {
+fn write_value_ref_pg(
+    result: &mut String,
+    val: &crate::ValueRef<'_>,
+    nested_dimensions: u32,
+    rank_unbounded: bool,
+) {
     match val {
         crate::ValueRef::Null => result.push_str("NULL"),
         crate::ValueRef::Numeric(Numeric::Integer(n)) => {
@@ -190,14 +212,24 @@ fn write_value_ref_pg(result: &mut String, val: &crate::ValueRef<'_>) {
         crate::ValueRef::Text(t) => {
             write_pg_text_element(result, t.as_str());
         }
-        crate::ValueRef::Blob(b) => {
-            result.push_str("\"X'");
-            for byte in *b {
-                let _ = write!(result, "{byte:02X}");
+        crate::ValueRef::Blob(b) if nested_dimensions > 0 || rank_unbounded => {
+            match serialize_array_from_blob_with_rank(b, nested_dimensions.max(1), rank_unbounded) {
+                Ok(nested) => result.push_str(&nested),
+                Err(_) => write_blob_element(result, b),
             }
-            result.push_str("'\"");
+        }
+        crate::ValueRef::Blob(b) => {
+            write_blob_element(result, b);
         }
     }
+}
+
+fn write_blob_element(result: &mut String, blob: &[u8]) {
+    result.push_str("\"X'");
+    for byte in blob {
+        let _ = write!(result, "{byte:02X}");
+    }
+    result.push_str("'\"");
 }
 
 /// Write a text element in PG array format.

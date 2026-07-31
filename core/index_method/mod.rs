@@ -6,6 +6,7 @@ use turso_parser::ast;
 use crate::{
     schema::IndexColumn,
     storage::btree::BTreeCursor,
+    translate::plan_expr::{parse_plan_signed_number, PlanExpr},
     types::{IOResult, IndexInfo, KeyInfo},
     vdbe::Register,
     Connection, LimboError, Result, Value,
@@ -81,13 +82,49 @@ pub struct IndexMethodCostEstimate {
 /// Planning-time inputs available to an index method's cost model.
 ///
 /// `arguments` are the query expressions captured from the selected pattern,
-/// ordered by parameter number. They may be literals or runtime expressions;
-/// implementations must treat unknown values conservatively.
+/// ordered by parameter number. Planning exposes only values that are already
+/// constant after semantic analysis; runtime expressions stay `Dynamic`.
+#[derive(Debug, Clone)]
+pub enum IndexMethodCostArgument {
+    Constant(Value),
+    Dynamic,
+}
+
+impl IndexMethodCostArgument {
+    pub fn constant(&self) -> Option<&Value> {
+        match self {
+            Self::Constant(value) => Some(value),
+            Self::Dynamic => None,
+        }
+    }
+
+    pub(crate) fn from_plan_expr(expr: &PlanExpr) -> Self {
+        if let Ok(value) = parse_plan_signed_number(expr) {
+            return Self::Constant(value);
+        }
+        let PlanExpr::Literal(literal) = expr else {
+            return Self::Dynamic;
+        };
+        if matches!(
+            literal,
+            ast::Literal::CurrentDate
+                | ast::Literal::CurrentTime
+                | ast::Literal::CurrentTimestamp
+                | ast::Literal::Keyword(_)
+        ) {
+            return Self::Dynamic;
+        }
+        crate::translate::alter::literal_default_value(literal)
+            .map(Self::Constant)
+            .unwrap_or(Self::Dynamic)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct IndexMethodCostContext<'a> {
     pub pattern_idx: usize,
     pub base_table_rows: f64,
-    pub arguments: &'a [ast::Expr],
+    pub arguments: &'a [IndexMethodCostArgument],
 }
 
 /// Internal index state exposed only to test-helper builds.

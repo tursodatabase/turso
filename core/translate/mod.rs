@@ -11,7 +11,6 @@ pub(crate) mod aggregation;
 pub(crate) mod alter;
 pub(crate) mod analyze;
 pub(crate) mod attach;
-pub(crate) mod bind;
 pub(crate) mod collate;
 mod compound_select;
 pub(crate) mod delete;
@@ -29,6 +28,7 @@ pub(crate) mod main_loop;
 pub(crate) mod optimizer;
 pub(crate) mod order_by;
 pub(crate) mod plan;
+pub(crate) mod plan_expr;
 pub(crate) mod planner;
 pub(crate) mod pragma;
 pub(crate) mod recursive_cte;
@@ -36,6 +36,7 @@ pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;
 pub(crate) mod select;
+pub(crate) mod semantic;
 pub(crate) mod sequence;
 pub(crate) mod stmt_journal;
 pub(crate) mod subquery;
@@ -63,11 +64,87 @@ use index::{translate_create_index, translate_drop_index, translate_optimize, tr
 use insert::translate_insert;
 use rollback::{translate_release, translate_rollback, translate_savepoint};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
-use select::translate_select;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
 use turso_parser::ast;
 use update::translate_update;
+
+/// Lower one already-analyzed semantic root. Every source, output, and nested
+/// query receives its physical identity once here; all downstream planners
+/// consume that same map.
+pub(crate) fn translate_hir_document(
+    document: semantic::hir::HirDocument,
+    resolver: &mut Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    query_destination: plan::QueryDestination,
+) -> Result<()> {
+    #[derive(Clone, Copy)]
+    enum RootKind {
+        Query(semantic::hir::QueryId),
+        Insert,
+        Update,
+        Delete,
+        TriggerPredicate,
+    }
+
+    let kind = match &document.root {
+        semantic::hir::HirRoot::Query(root) => RootKind::Query(root.query),
+        semantic::hir::HirRoot::Insert(_) => RootKind::Insert,
+        semantic::hir::HirRoot::Update(_) => RootKind::Update,
+        semantic::hir::HirRoot::Delete(_) => RootKind::Delete,
+        semantic::hir::HirRoot::TriggerPredicate(_) => RootKind::TriggerPredicate,
+    };
+    let identities = program.allocate_plan_identities(&document);
+    let trigger_environment = match &document.root {
+        semantic::hir::HirRoot::Query(root) => root.trigger.as_ref(),
+        semantic::hir::HirRoot::Insert(statement) => statement.trigger.as_ref(),
+        semantic::hir::HirRoot::Update(statement) => statement.trigger.as_ref(),
+        semantic::hir::HirRoot::Delete(statement) => statement.trigger.as_ref(),
+        semantic::hir::HirRoot::TriggerPredicate(predicate) => Some(&predicate.environment),
+    };
+    let runtime_bindings = trigger_environment
+        .map(|environment| {
+            trigger_exec::runtime_bindings_for_environment(&document, environment, &identities)
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    let emit = move |resolver: &mut Resolver<'_>| -> Result<()> {
+        match kind {
+            RootKind::Query(query) => {
+                let mut context = planner::HirPlanContext::new(&document, &identities, program);
+                let plan = planner::prepare_hir_query_plan(&mut context, query, query_destination)?;
+                drop(context);
+                if program.trigger.is_some() {
+                    if let Some(virtual_table) = select::plan_first_virtual_table_name(&plan) {
+                        bail_parse_error!("unsafe use of virtual table \"{}\"", virtual_table);
+                    }
+                }
+                select::emit_select_plan(plan, resolver, program, connection)?;
+                Ok(())
+            }
+            RootKind::Insert => {
+                translate_insert(document, &identities, resolver, program, connection)
+            }
+            RootKind::Update => {
+                translate_update(document, &identities, resolver, program, connection)
+            }
+            RootKind::Delete => {
+                translate_delete(document, &identities, resolver, program, connection)
+            }
+            RootKind::TriggerPredicate => Err(crate::LimboError::InternalError(
+                "trigger predicates are emitted by the trigger expression path".to_string(),
+            )),
+        }
+    };
+
+    // Plan identities are local to one HIR document. A fresh document without
+    // trigger inputs must therefore see an empty runtime map, not bindings from
+    // the document that caused it to be compiled (for example an FK action
+    // generated while compiling a trigger body).
+    resolver.with_plan_runtime_bindings_mut(runtime_bindings, emit)
+}
 
 #[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
@@ -149,9 +226,8 @@ pub fn translate(
 // statements, we would have to return a program builder instead
 /// Translate SQL statement into bytecode program.
 ///
-/// SELECT, DELETE, and UPDATE bind (resolve every table, column, and alias
-/// reference) at the top of their match arms, then hand the bound output to
-/// their translate functions — no binding happens during planning.
+/// SELECT and DML roots cross the semantic boundary once, then share one HIR
+/// document and one physical identity map through planning and emission.
 #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
 pub fn translate_inner(
     stmt: ast::Stmt,
@@ -195,6 +271,65 @@ pub fn translate_inner(
     }
 
     let is_select = matches!(stmt, ast::Stmt::Select { .. });
+
+    if matches!(
+        &stmt,
+        ast::Stmt::Select(_)
+            | ast::Stmt::Insert { .. }
+            | ast::Stmt::Update(_)
+            | ast::Stmt::Delete { .. }
+    ) {
+        if let ast::Stmt::Delete {
+            where_clause,
+            order_by,
+            ..
+        } = &stmt
+        {
+            if !order_by.is_empty() {
+                bail_parse_error!("ORDER BY clause is not supported in DELETE");
+            }
+            if where_clause.is_none() && connection.get_dml_require_where() {
+                bail_parse_error!(
+                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
+            }
+        }
+        if let ast::Stmt::Update(update) = &stmt {
+            if update.where_clause.is_none() && connection.get_dml_require_where() {
+                bail_parse_error!(
+                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
+            }
+        }
+
+        let document = {
+            let context =
+                resolver
+                    .semantic_context()
+                    .with_dml_policy(semantic::context::DmlPolicy::new(
+                        connection.is_nested_stmt(),
+                        connection.is_mvcc_bootstrap_connection(),
+                        false,
+                        connection.check_constraints_ignored(),
+                    ));
+            semantic::analyze(&context, semantic::AnalyzeInput::Statement(&stmt))?
+        };
+        translate_hir_document(
+            document,
+            resolver,
+            program,
+            connection,
+            plan::QueryDestination::ResultRows,
+        )?;
+
+        if is_write {
+            program.begin_write_operation()?;
+        }
+        if is_select && !program.table_references.is_empty() {
+            program.begin_read_operation()?;
+        }
+        return Ok(());
+    }
 
     match stmt {
         ast::Stmt::AlterTable(alter) => {
@@ -292,43 +427,7 @@ pub fn translate_inner(
         ast::Stmt::CreateVirtualTable(vtab) => {
             translate_create_virtual_table(vtab, resolver, program, connection)?
         }
-        ast::Stmt::Delete {
-            tbl_name,
-            indexed,
-            mut where_clause,
-            limit,
-            mut returning,
-            order_by,
-            mut with,
-        } => {
-            if !order_by.is_empty() {
-                bail_parse_error!("ORDER BY clause is not supported in DELETE");
-            }
-            if where_clause.is_none() && connection.get_dml_require_where() {
-                bail_parse_error!(
-                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
-                );
-            }
-            let binding = bind::bind_delete_stmt(
-                &tbl_name,
-                indexed,
-                &mut where_clause,
-                &mut returning,
-                &mut with,
-                resolver,
-                program,
-                connection,
-            )?;
-            translate_delete(
-                binding,
-                resolver,
-                where_clause,
-                limit,
-                returning,
-                program,
-                connection,
-            )?
-        }
+        ast::Stmt::Delete { .. } => unreachable!("DML is dispatched through semantic HIR"),
         ast::Stmt::Detach { name } => {
             attach::translate_detach(&name, resolver, program, connection.clone())?
         }
@@ -411,48 +510,12 @@ pub fn translate_inner(
             savepoint_name,
         } => translate_rollback(program, tx_name, savepoint_name)?,
         ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
-        ast::Stmt::Select(mut select) => {
-            let bound = bind::bind_select_stmt(&mut select, resolver, program)?;
-            translate_select(
-                select,
-                bound,
-                resolver,
-                program,
-                plan::QueryDestination::ResultRows,
-                connection,
-            )?;
-        }
-        ast::Stmt::Update(mut update) => {
-            if update.where_clause.is_none() && connection.get_dml_require_where() {
-                bail_parse_error!(
-                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
-                );
-            }
-            let binding =
-                bind::bind_update_stmt(&mut update, resolver, program, connection, false)?;
-            translate_update(update, binding, resolver, program, connection)?
-        }
+        ast::Stmt::Select(_) => unreachable!("queries are dispatched through semantic HIR"),
+        ast::Stmt::Update(_) => unreachable!("DML is dispatched through semantic HIR"),
         ast::Stmt::Vacuum { name, into } => {
             vacuum::translate_vacuum(program, name.as_ref(), into.as_deref(), connection.clone())?
         }
-        ast::Stmt::Insert {
-            with,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-        } => translate_insert(
-            resolver,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-            with,
-            program,
-            connection,
-        )?,
+        ast::Stmt::Insert { .. } => unreachable!("DML is dispatched through semantic HIR"),
         ast::Stmt::CreateSequence {
             if_not_exists,
             seq_name,

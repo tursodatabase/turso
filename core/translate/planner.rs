@@ -1,1038 +1,1982 @@
 use crate::sync::Arc;
-use crate::turso_assert;
 
-use super::plan::NamedWindowBound;
+use super::plan::PlannedWindowSpec;
+use super::plan::{
+    Aggregate, Distinctness, EvalAt, JoinOrderMember, JoinedTable, Operation, OuterQueryReference,
+    Plan, PlanOuterOutputReference, PlanOutputFact, PlanSourceScope, QueryDestination,
+    TableReferences, WhereTerm,
+};
 use super::{
-    expr::walk_expr,
     plan::{
-        Aggregate, Distinctness, EvalAt, JoinOrderMember, JoinedTable, Operation,
-        OuterQueryReference, Plan, QueryDestination, TableReferences, WhereTerm,
+        Frame, FrameBoundary, GroupBy, JoinInfo, JoinType as PlanJoinType, PlanCheckConstraint,
+        PlanIndexExpressions, PlanIndexHint, PlanIndexMethodPattern, ResultColumnOrigin,
+        ResultSetColumn, SelectPlan, SourceReadPrograms, Window,
     },
-    select::prepare_select_plan,
+    plan_expr::{
+        lower_hir_expr, plan_expr_contains_aggregate, plan_expr_dependencies,
+        plan_expr_vector_size, plan_exprs_are_equivalent as plan_exprs_equivalent,
+        type_fact_array_dimensions, walk_plan_expr, walk_plan_expr_mut, PlanColumnRef, PlanExpr,
+        PlanExprAffinity, PlanIdentityMap, PlanOrderTerm, PlanOutputId, PlanSourceId,
+        PlanWalkControl,
+    },
+    semantic::hir,
 };
 use crate::function::{AccumulatorFunc, AggFunc, ExtFunc};
 use crate::translate::plan::BitSet;
-use crate::translate::{
-    emitter::Resolver,
-    expr::{
-        expr_contains_nondeterministic_scalar_function, expr_vector_size, unwrap_parens,
-        WalkControl,
-    },
-    plan::{NonFromClauseSubquery, SubqueryState},
-};
-use crate::{
-    function::Func,
-    schema::Table,
-    util::{exprs_are_equivalent, normalize_ident},
-    Result,
-};
-use crate::{
-    translate::plan::{Window, WindowFunction},
-    vdbe::builder::ProgramBuilder,
-};
+use crate::translate::plan::{NonFromClauseSubquery, SubqueryState};
+use crate::{function::Func, LimboError, Result, MAIN_DB_ID};
+use crate::{translate::plan::WindowFunction, vdbe::builder::ProgramBuilder};
+use turso_parser::ast;
 use turso_parser::ast::Literal::Null;
-use turso_parser::ast::{self, Expr, JoinType, Over, Select, TableInternalId, With};
 
-/// Self-reference facts about a CTE body, for the binder: whether the body
-/// references its own name anywhere (making the CTE recursive, whether or not
-/// the RECURSIVE keyword was written), and whether the first arm itself
-/// contains such a reference (a circular reference — the initial query of a
-/// recursive CTE must not see the table).
-pub(crate) fn cte_self_reference_info(cte_name: &str, select: &Select) -> (bool, bool) {
-    let counter = RecursiveRefCounter { cte_name };
-    let references_itself = counter.count_select(select, &mut RecursiveRefScope::new()) > 0;
-    if !references_itself {
-        return (false, false);
-    }
-    let mut scope = RecursiveRefScope::new();
-    counter.push_nested_ctes(select.with.as_ref(), &mut scope);
-    let (_, first_arm_count) = counter.count_arm(&select.body.select, &mut scope);
-    (true, first_arm_count > 0)
+/// Planner state for lowering one closed Semantic HIR document.
+///
+/// Semantic identities are allocated once by the statement entry point and
+/// borrowed here. Nested queries reuse that exact map, so trigger row images,
+/// output references, and subqueries all stay in one plan identity space.
+pub struct HirPlanContext<'a> {
+    pub(crate) document: &'a hir::HirDocument,
+    pub(crate) identities: &'a PlanIdentityMap,
+    pub(crate) program: &'a mut ProgramBuilder,
+    pub(crate) outer_query_refs: Vec<OuterQueryReference>,
+    pub(crate) recursive_inputs: rustc_hash::FxHashMap<hir::SourceId, JoinedTable>,
 }
 
-/// Collect all table names referenced in a SELECT's FROM clause.
-/// Used to determine which earlier CTEs a CTE directly depends on.
-pub(crate) fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
-    collect_from_select_body(&select.body, out);
-    collect_subquery_table_refs_in_select_exprs(select, out);
-}
-
-fn collect_from_select_body(body: &ast::SelectBody, out: &mut Vec<String>) {
-    collect_from_one_select(&body.select, out);
-    for compound in &body.compounds {
-        collect_from_one_select(&compound.select, out);
-    }
-}
-
-fn collect_from_one_select(one: &ast::OneSelect, out: &mut Vec<String>) {
-    match one {
-        ast::OneSelect::Select { from, .. } => {
-            if let Some(from_clause) = from {
-                collect_from_select_table(&from_clause.select, out);
-                for join in &from_clause.joins {
-                    collect_from_select_table(&join.table, out);
-                }
-            }
+impl<'a> HirPlanContext<'a> {
+    pub fn new(
+        document: &'a hir::HirDocument,
+        identities: &'a PlanIdentityMap,
+        program: &'a mut ProgramBuilder,
+    ) -> Self {
+        Self {
+            document,
+            identities,
+            program,
+            outer_query_refs: Vec::new(),
+            recursive_inputs: Default::default(),
         }
-        ast::OneSelect::Values(_) => {}
-    }
-}
-
-/// Counts references to a recursive CTE's own name the way SQLite's name
-/// resolution does:
-/// - a nested `WITH` that redefines the name shadows it for that subtree, and
-/// - references inside a nested CTE body only count when that CTE is itself
-///   referenced (an unused nested CTE that mentions the recursive table does
-///   not make the query recursive), weighted by how many references its body
-///   contains.
-struct RecursiveRefCounter<'a> {
-    cte_name: &'a str,
-}
-
-/// Names visible at the current point, innermost last. Each entry carries the
-/// number of recursive references that using the name implies: 0 for a name
-/// that shadows the recursive table, and the body's own reference count for
-/// any other nested CTE.
-type RecursiveRefScope = Vec<(String, usize)>;
-
-impl RecursiveRefCounter<'_> {
-    /// The number of recursive references implied by referring to `name`.
-    fn name_weight(&self, name: &str, scope: &RecursiveRefScope) -> usize {
-        for (scope_name, weight) in scope.iter().rev() {
-            if scope_name == name {
-                return *weight;
-            }
-        }
-        usize::from(name == self.cte_name)
     }
 
-    /// Brings the CTEs of a nested `WITH` into scope with their reference
-    /// weights. The caller is responsible for truncating `scope` afterwards.
-    fn push_nested_ctes(&self, with: Option<&With>, scope: &mut RecursiveRefScope) {
-        let Some(with) = with else {
-            return;
+    pub(crate) fn lower_expr(&self, expression: &hir::Expr) -> Result<PlanExpr> {
+        self.lower_expr_for_owner(expression, None)
+    }
+
+    fn lower_query_expr(
+        &self,
+        expression: &hir::Expr,
+        block: hir::QueryBlockId,
+    ) -> Result<PlanExpr> {
+        self.lower_expr_for_owner(expression, Some(hir::OutputOwner::QueryBlock(block)))
+    }
+
+    fn lower_expr_for_owner(
+        &self,
+        expression: &hir::Expr,
+        owner: Option<hir::OutputOwner>,
+    ) -> Result<PlanExpr> {
+        let mut lowered = lower_hir_expr(expression, self.identities)
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        let mut expanding = rustc_hash::FxHashSet::default();
+        expand_hir_outputs(
+            self.document,
+            self.identities,
+            &mut lowered,
+            owner,
+            &mut expanding,
+        )?;
+        Ok(lowered)
+    }
+
+    pub(crate) fn lower_output(&self, output: &hir::Output) -> Result<ResultSetColumn> {
+        let id = self.identities.output(output.id).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "missing plan identity for semantic output {:?}",
+                output.id
+            ))
+        })?;
+        let expr = self.lower_expr_for_owner(&output.expr, Some(output.id.owner))?;
+        let origin = match &expr {
+            PlanExpr::Column(column) => Some(ResultColumnOrigin::Column {
+                source: column.source,
+                column: column.column,
+            }),
+            PlanExpr::RowId(source) => Some(ResultColumnOrigin::RowId { source: *source }),
+            _ => None,
         };
-        for cte in &with.ctes {
-            let name = normalize_ident(cte.tbl_name.as_str());
-            // The CTE's own name is visible inside its body, where it refers
-            // to the nested CTE itself rather than the recursive table.
-            scope.push((name, 0));
-            let weight = self.count_select(&cte.select, scope);
-            scope.last_mut().expect("scope entry pushed above").1 = weight;
-        }
-    }
-
-    fn count_select(&self, select: &Select, scope: &mut RecursiveRefScope) -> usize {
-        let scope_base = scope.len();
-        self.push_nested_ctes(select.with.as_ref(), scope);
-        let mut count = self.count_one_select(&select.body.select, scope);
-        for compound in &select.body.compounds {
-            count += self.count_one_select(&compound.select, scope);
-        }
-        for sorted in &select.order_by {
-            count += self.count_expr(&sorted.expr, scope);
-        }
-        if let Some(limit) = &select.limit {
-            count += self.count_expr(&limit.expr, scope);
-            if let Some(offset) = &limit.offset {
-                count += self.count_expr(offset, scope);
-            }
-        }
-        scope.truncate(scope_base);
-        count
-    }
-
-    fn count_one_select(&self, one: &ast::OneSelect, scope: &mut RecursiveRefScope) -> usize {
-        match one {
-            ast::OneSelect::Select {
-                columns,
-                from,
-                where_clause,
-                group_by,
-                window_clause,
-                ..
-            } => {
-                let mut count = 0;
-                if let Some(from) = from {
-                    count += self.count_from_table(&from.select, scope);
-                    for join in &from.joins {
-                        count += self.count_from_table(&join.table, scope);
-                        if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
-                            count += self.count_expr(expr, scope);
-                        }
-                    }
-                }
-                for column in columns {
-                    if let ast::ResultColumn::Expr(expr, _) = column {
-                        count += self.count_expr(expr, scope);
-                    }
-                }
-                if let Some(expr) = where_clause {
-                    count += self.count_expr(expr, scope);
-                }
-                if let Some(group_by) = group_by {
-                    for expr in &group_by.exprs {
-                        count += self.count_expr(expr, scope);
-                    }
-                    if let Some(having) = &group_by.having {
-                        count += self.count_expr(having, scope);
-                    }
-                }
-                for window_def in window_clause {
-                    count += self.count_window(&window_def.window, scope);
-                }
-                count
-            }
-            ast::OneSelect::Values(rows) => rows
-                .iter()
-                .flatten()
-                .map(|expr| self.count_expr(expr, scope))
-                .sum(),
-        }
-    }
-
-    fn count_from_table(&self, table: &ast::SelectTable, scope: &mut RecursiveRefScope) -> usize {
-        match table {
-            ast::SelectTable::Table(name, _, _) => {
-                if name.db_name.is_none() {
-                    self.name_weight(&normalize_ident(name.name.as_str()), scope)
-                } else {
-                    0
-                }
-            }
-            ast::SelectTable::TableCall(name, args, _) => {
-                let mut count = if name.db_name.is_none() {
-                    self.name_weight(&normalize_ident(name.name.as_str()), scope)
-                } else {
-                    0
-                };
-                for arg in args {
-                    count += self.count_expr(arg, scope);
-                }
-                count
-            }
-            ast::SelectTable::Select(subselect, _) => self.count_select(subselect, scope),
-            ast::SelectTable::Sub(from, _) => {
-                let mut count = self.count_from_table(&from.select, scope);
-                for join in &from.joins {
-                    count += self.count_from_table(&join.table, scope);
-                    if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
-                        count += self.count_expr(expr, scope);
-                    }
-                }
-                count
-            }
-        }
-    }
-
-    fn count_window(&self, window: &ast::Window, scope: &mut RecursiveRefScope) -> usize {
-        let mut count = 0;
-        for expr in &window.partition_by {
-            count += self.count_expr(expr, scope);
-        }
-        for sorted in &window.order_by {
-            count += self.count_expr(&sorted.expr, scope);
-        }
-        if let Some(frame_clause) = &window.frame_clause {
-            for bound in std::iter::once(&frame_clause.start).chain(frame_clause.end.as_ref()) {
-                if let ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) = bound {
-                    count += self.count_expr(expr, scope);
-                }
-            }
-        }
-        count
-    }
-
-    fn count_expr(&self, expr: &Expr, scope: &mut RecursiveRefScope) -> usize {
-        let mut count = 0;
-        let _ = walk_expr(expr, &mut |node: &Expr| -> Result<WalkControl> {
-            match node {
-                Expr::Exists(select) | Expr::Subquery(select) => {
-                    count += self.count_select(select, scope);
-                    Ok(WalkControl::SkipChildren)
-                }
-                Expr::InSelect { rhs, .. } => {
-                    count += self.count_select(rhs, scope);
-                    // The walker does not descend into the subquery, only the
-                    // left-hand side expression.
-                    Ok(WalkControl::Continue)
-                }
-                _ => Ok(WalkControl::Continue),
-            }
-        });
-        count
-    }
-
-    /// Returns `(top_level_from_count, total_count)` for one arm of a
-    /// recursive CTE body: direct references to the recursive table in the
-    /// arm's FROM clause, and all references reachable from the arm.
-    fn count_arm(&self, one: &ast::OneSelect, scope: &mut RecursiveRefScope) -> (usize, usize) {
-        fn count_direct_in_from_table(
-            counter: &RecursiveRefCounter,
-            table: &ast::SelectTable,
-            scope: &RecursiveRefScope,
-        ) -> usize {
-            match table {
-                ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
-                    if name.db_name.is_some() {
-                        return 0;
-                    }
-                    let name = normalize_ident(name.name.as_str());
-                    // A direct reference only counts when nothing shadows the
-                    // recursive table's name.
-                    usize::from(
-                        name == counter.cte_name
-                            && !scope.iter().any(|(scope_name, _)| *scope_name == name),
-                    )
-                }
-                ast::SelectTable::Select(_, _) => 0,
-                ast::SelectTable::Sub(from, _) => {
-                    count_direct_in_from_table(counter, &from.select, scope)
-                        + from
-                            .joins
-                            .iter()
-                            .map(|join| count_direct_in_from_table(counter, &join.table, scope))
-                            .sum::<usize>()
-                }
-            }
-        }
-
-        let top_level_from_count = if let ast::OneSelect::Select {
-            from: Some(from), ..
-        } = one
-        {
-            count_direct_in_from_table(self, &from.select, scope)
-                + from
-                    .joins
-                    .iter()
-                    .map(|join| count_direct_in_from_table(self, &join.table, scope))
-                    .sum::<usize>()
+        let affinity = if output.has_affinity {
+            PlanExprAffinity::with_affinity(output.affinity)
         } else {
-            0
+            PlanExprAffinity::no_affinity()
         };
-        let total_count = self.count_one_select(one, scope);
-        (top_level_from_count, total_count)
+        let contains_aggregates = plan_expr_contains_aggregate(&expr)?;
+        Ok(ResultSetColumn {
+            id,
+            name: output.name.clone(),
+            name_kind: output.name_kind,
+            origin,
+            type_fact: output.type_fact.clone(),
+            affinity,
+            collation: output.collation.clone(),
+            array_dimensions: type_fact_array_dimensions(&output.type_fact),
+            expr,
+            contains_aggregates,
+        })
+    }
+
+    fn outer_output_reference(&self, output: PlanOutputId) -> Result<PlanOuterOutputReference> {
+        let semantic_output = self.identities.semantic_output(output).ok_or_else(|| {
+            LimboError::InternalError(format!("plan output {output} has no semantic identity"))
+        })?;
+        let semantic = self.document.output(semantic_output).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "semantic output {semantic_output:?} is missing from its HIR document"
+            ))
+        })?;
+        let lowered = self.lower_output(semantic)?;
+        let dependencies = plan_expr_dependencies(&lowered.expr)?;
+        let mut source_dependencies = dependencies.sources().collect::<Vec<_>>();
+        if !dependencies.subqueries.is_empty() {
+            // A nested query hides its source reads behind a subquery identity.
+            // The child that reads this alias must still wait until every source
+            // in the alias owner's row is available. This owner-local closure is
+            // deliberately conservative: sources declared inside the nested
+            // query are excluded, while an outer read such as `(SELECT t.a)`
+            // cannot make `ORDER BY (SELECT alias)` run before `t` is positioned.
+            for source in &self.document.sources {
+                let belongs_to_owner = match (source.owner, semantic_output.owner) {
+                    (
+                        hir::SourceOwner::QueryBlock(source),
+                        hir::OutputOwner::QueryBlock(output),
+                    ) => source == output,
+                    (hir::SourceOwner::Root, hir::OutputOwner::Root) => true,
+                    _ => false,
+                };
+                if belongs_to_owner {
+                    source_dependencies.push(self.identities.source(source.id).ok_or_else(
+                        || {
+                            LimboError::InternalError(format!(
+                                "missing plan identity for semantic source {}",
+                                source.id
+                            ))
+                        },
+                    )?);
+                }
+            }
+        }
+        source_dependencies.sort_unstable();
+        source_dependencies.dedup();
+        let fact = PlanOutputFact::from(&lowered);
+        Ok(PlanOuterOutputReference {
+            output,
+            definition: lowered.expr,
+            fact,
+            source_dependencies,
+        })
+    }
+
+    /// Copy the HIR document's cursorless source identities into one physical
+    /// expression scope. Optimizer passes can then distinguish runtime values
+    /// from missing table sources without consulting semantic state.
+    pub(crate) fn add_runtime_sources_to(&self, tables: &mut TableReferences) -> Result<()> {
+        for source in &self.document.sources {
+            if !matches!(
+                &source.kind,
+                hir::SourceKind::Pseudo { .. } | hir::SourceKind::SchemaExpression
+            ) {
+                continue;
+            }
+            let plan_source = self.identities.source(source.id).ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "runtime source {} has no plan identity",
+                    source.id
+                ))
+            })?;
+            tables.add_runtime_source(plan_source);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn new_table_references(
+        &self,
+        joined_tables: Vec<JoinedTable>,
+        outer_query_refs: Vec<OuterQueryReference>,
+    ) -> Result<TableReferences> {
+        let mut tables = TableReferences::new(joined_tables, outer_query_refs);
+        self.add_runtime_sources_to(&mut tables)?;
+        Ok(tables)
     }
 }
 
-fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<String>) {
-    match table {
-        ast::SelectTable::Table(qualified_name, _, _) => {
-            if qualified_name.db_name.is_none() {
-                out.push(normalize_ident(qualified_name.name.as_str()));
-            }
-        }
-        ast::SelectTable::TableCall(qualified_name, args, _) => {
-            if qualified_name.db_name.is_none() {
-                out.push(normalize_ident(qualified_name.name.as_str()));
-            }
-            for arg in args {
-                collect_subquery_table_refs_in_expr(arg, out);
-            }
-        }
-        ast::SelectTable::Select(subselect, _) => {
-            collect_from_clause_table_refs(subselect, out);
-        }
-        ast::SelectTable::Sub(from_clause, _) => {
-            collect_from_select_table(&from_clause.select, out);
-            for join in &from_clause.joins {
-                collect_from_select_table(&join.table, out);
-                if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
-                    collect_subquery_table_refs_in_expr(expr, out);
-                }
-            }
-        }
-    }
-}
-
-/// Collect table references from subqueries embedded in expressions.
-fn collect_subquery_table_refs_in_select_exprs(select: &Select, out: &mut Vec<String>) {
-    collect_subquery_table_refs_in_one_select(&select.body.select, out);
-    for compound in &select.body.compounds {
-        collect_subquery_table_refs_in_one_select(&compound.select, out);
-    }
-
-    for sorted in &select.order_by {
-        collect_subquery_table_refs_in_expr(&sorted.expr, out);
-    }
-
-    if let Some(limit) = &select.limit {
-        collect_subquery_table_refs_in_expr(&limit.expr, out);
-        if let Some(offset) = &limit.offset {
-            collect_subquery_table_refs_in_expr(offset, out);
-        }
-    }
-}
-
-fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec<String>) {
-    match one {
-        ast::OneSelect::Select {
-            columns,
-            where_clause,
-            group_by,
-            ..
-        } => {
-            for column in columns {
-                if let ast::ResultColumn::Expr(expr, _) = column {
-                    collect_subquery_table_refs_in_expr(expr, out);
-                }
-            }
-            if let Some(expr) = where_clause {
-                collect_subquery_table_refs_in_expr(expr, out);
-            }
-            if let Some(group_by) = group_by {
-                for expr in &group_by.exprs {
-                    collect_subquery_table_refs_in_expr(expr, out);
-                }
-                if let Some(having) = &group_by.having {
-                    collect_subquery_table_refs_in_expr(having, out);
-                }
-            }
-            if let ast::OneSelect::Select {
-                from: Some(from), ..
-            } = one
-            {
-                for join in &from.joins {
-                    if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
-                        collect_subquery_table_refs_in_expr(expr, out);
-                    }
-                }
-            }
-        }
-        ast::OneSelect::Values(rows) => {
-            for row in rows {
-                for expr in row {
-                    collect_subquery_table_refs_in_expr(expr, out);
-                }
-            }
-        }
-    }
-}
-
-fn collect_subquery_table_refs_in_expr(expr: &Expr, out: &mut Vec<String>) {
-    let _ = walk_expr(expr, &mut |node: &Expr| -> Result<WalkControl> {
-        match node {
-            Expr::Exists(select) | Expr::Subquery(select) => {
-                collect_from_clause_table_refs(select, out);
-                Ok(WalkControl::SkipChildren)
-            }
-            Expr::InSelect { rhs, .. } => {
-                collect_from_clause_table_refs(rhs, out);
-                Ok(WalkControl::SkipChildren)
-            }
-            _ => Ok(WalkControl::Continue),
-        }
-    });
-}
-
-/// Valid ways to refer to the rowid of a btree table.
-pub const ROWID_STRS: [&str; 3] = ["rowid", "_rowid_", "oid"];
-
-/// This function walks the expression tree and identifies aggregate
-/// and window functions.
-///
-/// # Window functions
-/// - If `windows` is `Some`, window functions will be resolved against the
-///   provided set of windows or added to it if not present.
-/// - If `windows` is `None`, any encountered window function is treated
-///   as a misuse and results in a parse error.
-///
-/// # Aggregates
-/// Aggregate functions are always allowed. They are collected in `aggs`.
-///
-/// # Returns
-/// - `Ok(true)` if at least one aggregate function was found.
-/// - `Ok(false)` if no aggregates were found.
-/// - `Err(..)` if an invalid function usage is detected (e.g., window
-///   function encountered while `windows` is `None`).
-pub fn resolve_window_and_aggregate_functions(
-    top_level_expr: &Expr,
-    resolver: &Resolver,
-    aggs: &mut Vec<Aggregate>,
-    mut windows: Option<&mut Vec<Window>>,
-    named_windows: &mut [crate::translate::plan::NamedWindowDef],
-) -> Result<bool> {
-    let mut contains_aggregates = false;
-    walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
-        match expr {
-            Expr::FunctionCall {
-                name,
-                args,
-                distinctness,
-                filter_over,
-                order_by,
-                within_group,
-            } => {
-                let ordered_set_func = ordered_set_agg_func(&normalize_ident(name.as_str()));
-
-                if !within_group.is_empty() {
-                    let new_agg = build_ordered_set_aggregate(
-                        name,
-                        args,
-                        distinctness.as_ref(),
-                        order_by,
-                        within_group,
-                        filter_over,
-                        ordered_set_func,
-                    )?;
-                    add_aggregate_if_not_exists(
-                        aggs,
-                        expr,
-                        &new_agg.args,
-                        Distinctness::NonDistinct,
-                        new_agg.func,
-                        filter_over.filter_clause.as_deref().cloned(),
-                    )?;
-                    contains_aggregates = true;
-                    return Ok(WalkControl::SkipChildren);
-                }
-
-                // Ordered-set aggregates are only meaningful with WITHIN GROUP. mode() in
-                // particular has no plain-aggregate form, so reject it early with a clear error.
-                if matches!(ordered_set_func, Some(AggFunc::Mode)) {
-                    crate::bail_parse_error!(
-                        "mode() requires a WITHIN GROUP (ORDER BY ...) clause"
-                    );
-                }
-
-                if !order_by.is_empty() {
-                    crate::bail_parse_error!(
-                        "ORDER BY clause is not supported yet in aggregate functions"
-                    );
-                }
-                let args_count = args.len();
-                let distinctness = Distinctness::from_ast(distinctness.as_ref());
-
-                match Func::resolve_function(name.as_str(), args_count)? {
-                    Some(Func::Agg(f)) => {
-                        if let Some(over_clause) = filter_over.over_clause.as_ref() {
-                            link_with_window(
-                                windows.as_deref_mut(),
-                                named_windows,
-                                resolver,
-                                expr,
-                                AccumulatorFunc::Agg(f),
-                                over_clause,
-                                filter_over.filter_clause.as_deref(),
-                                distinctness,
-                            )?;
-                        } else {
-                            add_aggregate_if_not_exists(
-                                aggs,
-                                expr,
-                                args,
-                                distinctness,
-                                f,
-                                filter_over.filter_clause.as_deref().cloned(),
-                            )?;
-                            contains_aggregates = true;
-                        }
-                        return Ok(WalkControl::SkipChildren);
-                    }
-                    Some(Func::Window(f)) => {
-                        if let Some(over_clause) = filter_over.over_clause.as_ref() {
-                            link_with_window(
-                                windows.as_deref_mut(),
-                                named_windows,
-                                resolver,
-                                expr,
-                                AccumulatorFunc::Window(f),
-                                over_clause,
-                                filter_over.filter_clause.as_deref(),
-                                distinctness,
-                            )?;
-                        } else {
-                            crate::bail_parse_error!("misuse of window function: {}()", f);
-                        }
-                        return Ok(WalkControl::SkipChildren);
-                    }
-                    None => {
-                        if let Some(f) = resolver
-                            .symbol_table
-                            .resolve_function(name.as_str(), args_count)
-                        {
-                            let func = AggFunc::External(f.func.clone().into());
-                            if let ExtFunc::Aggregate { .. } = f.as_ref().func {
-                                if let Some(over_clause) = filter_over.over_clause.as_ref() {
-                                    link_with_window(
-                                        windows.as_deref_mut(),
-                                        named_windows,
-                                        resolver,
-                                        expr,
-                                        AccumulatorFunc::Agg(func),
-                                        over_clause,
-                                        filter_over.filter_clause.as_deref(),
-                                        distinctness,
-                                    )?;
-                                } else {
-                                    add_aggregate_if_not_exists(
-                                        aggs,
-                                        expr,
-                                        args,
-                                        distinctness,
-                                        func,
-                                        filter_over.filter_clause.as_deref().cloned(),
-                                    )?;
-                                    contains_aggregates = true;
-                                }
-                                return Ok(WalkControl::SkipChildren);
-                            }
-                        }
-                    }
-                    _ => {
-                        if filter_over.over_clause.is_some() {
-                            crate::bail_parse_error!(
-                                "{} may not be used as a window function",
-                                name.as_str()
-                            );
-                        }
-                    }
-                }
-            }
-            Expr::FunctionCallStar { name, filter_over } => {
-                match Func::resolve_function(name.as_str(), 0)? {
-                    Some(Func::Agg(f)) => {
-                        if let Some(over_clause) = filter_over.over_clause.as_ref() {
-                            link_with_window(
-                                windows.as_deref_mut(),
-                                named_windows,
-                                resolver,
-                                expr,
-                                AccumulatorFunc::Agg(f),
-                                over_clause,
-                                filter_over.filter_clause.as_deref(),
-                                Distinctness::NonDistinct,
-                            )?;
-                        } else {
-                            add_aggregate_if_not_exists(
-                                aggs,
-                                expr,
-                                &[],
-                                Distinctness::NonDistinct,
-                                f,
-                                filter_over.filter_clause.as_deref().cloned(),
-                            )?;
-                            contains_aggregates = true;
-                        }
-                        return Ok(WalkControl::SkipChildren);
-                    }
-                    Some(Func::Window(f)) => {
-                        if let Some(over_clause) = filter_over.over_clause.as_ref() {
-                            link_with_window(
-                                windows.as_deref_mut(),
-                                named_windows,
-                                resolver,
-                                expr,
-                                AccumulatorFunc::Window(f),
-                                over_clause,
-                                filter_over.filter_clause.as_deref(),
-                                Distinctness::NonDistinct,
-                            )?;
-                        } else {
-                            crate::bail_parse_error!("misuse of window function: {}()", f);
-                        }
-                        return Ok(WalkControl::SkipChildren);
-                    }
-                    Some(func) => {
-                        if filter_over.over_clause.is_some() {
-                            crate::bail_parse_error!(
-                                "{} may not be used as a window function",
-                                name.as_str()
-                            );
-                        }
-
-                        // Check if the function supports (*) syntax using centralized logic
-                        if func.supports_star_syntax() {
-                            return Ok(WalkControl::Continue);
-                        } else {
-                            crate::bail_parse_error!(
-                                "wrong number of arguments to function {}()",
-                                name.as_str()
-                            );
-                        }
-                    }
-                    None => {
-                        if let Some(f) = resolver.symbol_table.resolve_function(name.as_str(), 0) {
-                            let func = AggFunc::External(f.func.clone().into());
-                            if let ExtFunc::Aggregate { .. } = f.as_ref().func {
-                                if let Some(over_clause) = filter_over.over_clause.as_ref() {
-                                    link_with_window(
-                                        windows.as_deref_mut(),
-                                        named_windows,
-                                        resolver,
-                                        expr,
-                                        AccumulatorFunc::Agg(func),
-                                        over_clause,
-                                        filter_over.filter_clause.as_deref(),
-                                        Distinctness::NonDistinct,
-                                    )?;
-                                } else {
-                                    add_aggregate_if_not_exists(
-                                        aggs,
-                                        expr,
-                                        &[],
-                                        Distinctness::NonDistinct,
-                                        func,
-                                        filter_over.filter_clause.as_deref().cloned(),
-                                    )?;
-                                    contains_aggregates = true;
-                                }
-                                return Ok(WalkControl::SkipChildren);
-                            }
-                        } else {
-                            crate::bail_parse_error!("no such function: {}", name.as_str());
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        Ok(WalkControl::Continue)
-    })?;
-
-    Ok(contains_aggregates)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn link_with_window(
-    windows: Option<&mut Vec<Window>>,
-    named_windows: &mut [crate::translate::plan::NamedWindowDef],
-    resolver: &Resolver,
-    expr: &Expr,
-    func: AccumulatorFunc,
-    over_clause: &Over,
-    filter_clause: Option<&Expr>,
-    distinctness: Distinctness,
+fn expand_hir_outputs(
+    document: &hir::HirDocument,
+    identities: &PlanIdentityMap,
+    expression: &mut PlanExpr,
+    owner: Option<hir::OutputOwner>,
+    expanding: &mut rustc_hash::FxHashSet<PlanOutputId>,
 ) -> Result<()> {
-    if distinctness.is_distinct() {
-        crate::bail_parse_error!("DISTINCT is not supported for window functions");
-    }
-    // FILTER decides which input rows contribute to a running aggregate, so
-    // it is only meaningful for aggregating window functions. Non-aggregate
-    // ones (`row_number`/`lag`/`lead`) have nothing to filter.
-    if matches!(func, AccumulatorFunc::Window(_)) && filter_clause.is_some() {
-        crate::bail_parse_error!("FILTER clause may only be used with aggregate window functions");
-    }
-    expr_vector_size(expr)?;
-    if let Some(windows) = windows {
-        // Every function carries a coerced frame (`WindowFunc::coerced_frame`
-        // for built-in window funcs, the default `RANGE UNBOUNDED PRECEDING
-        // TO CURRENT ROW` for aggregate window funcs). Functions whose
-        // coerced frames disagree cannot share a single ephemeral-table
-        // pass — see SQLite's invariant at window.c:1679 — so the planner
-        // groups them into separate `Window` entries.
-        let coerced_frame = match &func {
-            AccumulatorFunc::Window(w) => w.coerced_frame(),
-            AccumulatorFunc::Agg(_) => None,
-        }
-        .unwrap_or_default();
-        let window = resolve_window(windows, named_windows, over_clause, coerced_frame)?;
-        // Two equivalent window expressions can share one `WindowFunction`
-        // entry unless they contain nondeterministic calls like `random()`,
-        // which SQLite evaluates separately at each SQL occurrence.
-        let deduplicate = !expr_contains_nondeterministic_scalar_function(expr, resolver)?;
-        if deduplicate
-            && window
-                .functions
-                .iter()
-                .any(|f| exprs_are_equivalent(&f.original_expr, expr))
-        {
-            return Ok(());
-        }
-        window.functions.push(WindowFunction {
-            func,
-            original_expr: expr.clone(),
-            rewritten: None,
-        });
-    } else {
-        let func_name = match &func {
-            AccumulatorFunc::Agg(f) => f.as_str().to_string(),
-            AccumulatorFunc::Window(f) => f.to_string(),
+    walk_plan_expr_mut(expression, &mut |node| {
+        let PlanExpr::Output(plan_output) = node else {
+            return Ok(PlanWalkControl::Continue);
         };
-        crate::bail_parse_error!("misuse of window function: {}()", func_name);
-    }
+        let semantic_output = identities.semantic_output(*plan_output).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "plan output {plan_output} has no semantic identity"
+            ))
+        })?;
+        let output = document.output(semantic_output).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "semantic output {semantic_output:?} is missing from its HIR document"
+            ))
+        })?;
+        if owner.is_some_and(|owner| semantic_output.owner != owner) {
+            return Ok(PlanWalkControl::Continue);
+        }
+        if !expanding.insert(*plan_output) {
+            return Err(LimboError::InternalError(format!(
+                "cyclic semantic output reference while lowering {plan_output}"
+            )));
+        }
+        let mut replacement = lower_hir_expr(&output.expr, identities)
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        expand_hir_outputs(document, identities, &mut replacement, owner, expanding)?;
+        expanding.remove(plan_output);
+        *node = replacement;
+        Ok(PlanWalkControl::SkipChildren)
+    })?;
     Ok(())
 }
 
-/// Resolve the `Window` a function call should be attached to, given the
-/// function's coerced frame. Two functions can share a `Window` only when
-/// their OVER clauses are equivalent AND their coerced frames match —
-/// functions with the same OVER but conflicting frames get separate
-/// `Window` entries so each compiles to its own ephemeral-table pass.
-fn resolve_window<'a>(
-    windows: &'a mut Vec<Window>,
-    named_windows: &mut [crate::translate::plan::NamedWindowDef],
-    over_clause: &Over,
-    frame: crate::translate::plan::Frame,
-) -> Result<&'a mut Window> {
-    match over_clause {
-        Over::Window(window) if window.base.is_none() => {
-            if let Some(idx) = windows.iter().position(|w| w.is_equivalent(window, &frame)) {
-                return Ok(&mut windows[idx]);
-            }
-            windows.push(Window::new_unnamed(window, frame)?);
-            Ok(windows.last_mut().expect("just pushed, so must exist"))
+/// Result of lowering one resolved FROM clause.
+pub struct PreparedHirFrom {
+    pub table_references: TableReferences,
+    pub predicates: Vec<WhereTerm>,
+}
+
+#[derive(Clone, Copy)]
+enum HirSourcePlanKind {
+    Derived(hir::QueryId),
+    Cte(hir::CteId),
+    Leaf,
+}
+
+#[derive(Clone, Copy)]
+enum HirCtePlanKind {
+    Query(hir::QueryId),
+    Recursive,
+}
+
+/// Lower one semantic source occurrence into the physical table shape used by
+/// the optimizer. This consumes only resolved HIR metadata; it never looks a
+/// table or index up by name.
+pub fn prepare_hir_source(
+    context: &mut HirPlanContext<'_>,
+    source_id: hir::SourceId,
+    join_info: Option<JoinInfo>,
+) -> Result<JoinedTable> {
+    // A long CTE chain calls this once per link. Dispatch query sources before
+    // creating all the metadata needed for a real table.
+    let kind = hir_source_plan_kind(context, source_id)?;
+
+    match kind {
+        HirSourcePlanKind::Derived(query) => {
+            prepare_hir_derived_source(context, source_id, query, join_info)
         }
-        Over::Window(window) => {
-            if !Window::is_default_frame_spec(&window.frame_clause) {
-                crate::bail_parse_error!("Custom frame specifications are not supported yet");
-            }
-            let base_name = normalize_ident(
-                window
-                    .base
-                    .as_ref()
-                    .expect("guarded by the preceding match arm")
-                    .as_str(),
-            );
-            let def = named_windows
-                .iter()
-                .rfind(|definition| definition.name == base_name)
+        HirSourcePlanKind::Cte(cte) => prepare_hir_cte_source(context, source_id, cte, join_info),
+        HirSourcePlanKind::Leaf => prepare_hir_leaf_source(context, source_id, join_info),
+    }
+}
+
+fn hir_source_plan_kind(
+    context: &HirPlanContext<'_>,
+    source_id: hir::SourceId,
+) -> Result<HirSourcePlanKind> {
+    let source = context
+        .document
+        .source(source_id)
+        .ok_or_else(|| LimboError::InternalError(format!("missing semantic source {source_id}")))?;
+    let column_count = source.columns.len();
+    if source.generated_expressions.len() != column_count
+        || source.default_expressions.len() != column_count
+        || source.column_type_programs.len() != column_count
+    {
+        return Err(LimboError::InternalError(format!(
+            "read-program metadata for semantic source {} is not aligned with its columns",
+            source.id
+        )));
+    }
+    Ok(match &source.kind {
+        hir::SourceKind::Derived(query) => HirSourcePlanKind::Derived(*query),
+        hir::SourceKind::Cte(cte) => HirSourcePlanKind::Cte(*cte),
+        _ => HirSourcePlanKind::Leaf,
+    })
+}
+
+fn hir_source_plan_identity(
+    context: &HirPlanContext<'_>,
+    source_id: hir::SourceId,
+) -> Result<(String, PlanSourceId)> {
+    let source = context
+        .document
+        .source(source_id)
+        .ok_or_else(|| LimboError::InternalError(format!("missing semantic source {source_id}")))?;
+    let identifier = source.alias.clone().unwrap_or_else(|| source.name.clone());
+    let internal_id = context.identities.source(source.id).ok_or_else(|| {
+        LimboError::InternalError(format!("missing plan identity for source {}", source.id))
+    })?;
+    Ok((identifier, internal_id))
+}
+
+fn prepare_hir_derived_source(
+    context: &mut HirPlanContext<'_>,
+    source_id: hir::SourceId,
+    query: hir::QueryId,
+    join_info: Option<JoinInfo>,
+) -> Result<JoinedTable> {
+    let plan =
+        prepare_hir_query_plan(context, query, QueryDestination::placeholder_for_subquery())?;
+    let (identifier, internal_id) = hir_source_plan_identity(context, source_id)?;
+    JoinedTable::new_subquery_from_plan(identifier, plan, join_info, internal_id, None, None, false)
+}
+
+fn prepare_hir_cte_source(
+    context: &mut HirPlanContext<'_>,
+    source_id: hir::SourceId,
+    cte_id: hir::CteId,
+    join_info: Option<JoinInfo>,
+) -> Result<JoinedTable> {
+    let kind = match &context
+        .document
+        .cte(cte_id)
+        .ok_or_else(|| LimboError::InternalError(format!("missing semantic CTE {cte_id}")))?
+        .body
+    {
+        hir::CteBody::Query(query) => HirCtePlanKind::Query(*query),
+        hir::CteBody::Recursive(_) => HirCtePlanKind::Recursive,
+    };
+    match kind {
+        HirCtePlanKind::Query(query) => {
+            let plan = prepare_hir_query_plan(
+                context,
+                query,
+                QueryDestination::placeholder_for_subquery(),
+            )?;
+            finish_hir_cte_source(context, source_id, cte_id, join_info, plan)
+        }
+        HirCtePlanKind::Recursive => {
+            prepare_hir_recursive_cte_source(context, source_id, cte_id, join_info)
+        }
+    }
+}
+
+fn prepare_hir_recursive_cte_source(
+    context: &mut HirPlanContext<'_>,
+    source_id: hir::SourceId,
+    cte_id: hir::CteId,
+    join_info: Option<JoinInfo>,
+) -> Result<JoinedTable> {
+    let cte = context
+        .document
+        .cte(cte_id)
+        .cloned()
+        .ok_or_else(|| LimboError::InternalError(format!("missing semantic CTE {cte_id}")))?;
+    let hir::CteBody::Recursive(recursive) = &cte.body else {
+        unreachable!("non-recursive CTEs are dispatched before recursive CTE planning")
+    };
+    let plan = prepare_hir_recursive_cte_plan(context, &cte, recursive)?;
+    finish_hir_cte_source(context, source_id, cte_id, join_info, plan)
+}
+
+fn finish_hir_cte_source(
+    context: &HirPlanContext<'_>,
+    source_id: hir::SourceId,
+    cte_id: hir::CteId,
+    join_info: Option<JoinInfo>,
+    plan: Plan,
+) -> Result<JoinedTable> {
+    let (identifier, internal_id) = hir_source_plan_identity(context, source_id)?;
+    let cte = context
+        .document
+        .cte(cte_id)
+        .ok_or_else(|| LimboError::InternalError(format!("missing semantic CTE {cte_id}")))?;
+    let explicit_columns = (!cte.columns.is_empty()).then(|| {
+        cte.columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>()
+    });
+    JoinedTable::new_subquery_from_plan(
+        identifier,
+        plan,
+        join_info,
+        internal_id,
+        explicit_columns.as_deref(),
+        Some(context.identities.cte(cte.id).ok_or_else(|| {
+            LimboError::InternalError(format!("missing plan identity for semantic CTE {}", cte.id))
+        })?),
+        cte.materialized == ast::Materialized::Yes,
+    )
+}
+
+fn prepare_hir_leaf_source(
+    context: &mut HirPlanContext<'_>,
+    source_id: hir::SourceId,
+    join_info: Option<JoinInfo>,
+) -> Result<JoinedTable> {
+    let source =
+        context.document.source(source_id).cloned().ok_or_else(|| {
+            LimboError::InternalError(format!("missing semantic source {source_id}"))
+        })?;
+    let (identifier, internal_id) = hir_source_plan_identity(context, source_id)?;
+
+    match &source.kind {
+        hir::SourceKind::SchemaExpression | hir::SourceKind::Pseudo { .. } => {
+            return Err(LimboError::InternalError(format!(
+                "cursorless runtime source {} cannot appear in FROM planning",
+                source.id
+            )));
+        }
+        hir::SourceKind::RecursiveInput(cte_id) => {
+            let mut input = context
+                .recursive_inputs
+                .get(&source.id)
+                .cloned()
                 .ok_or_else(|| {
-                    crate::LimboError::ParseError(format!("no such window: {base_name}"))
+                    LimboError::InternalError(format!(
+                    "recursive input source {} for CTE {} was planned outside its recursive arm",
+                    source.id, cte_id
+                ))
                 })?;
-            if !window.partition_by.is_empty() {
-                crate::bail_parse_error!("cannot override PARTITION clause of window: {base_name}");
+            input.identifier = identifier;
+            input.internal_id = internal_id;
+            input.join_info = join_info;
+            return Ok(input);
+        }
+        hir::SourceKind::Table(_) | hir::SourceKind::TableFunction { .. } => {}
+        hir::SourceKind::Cte(_) | hir::SourceKind::Derived(_) => {
+            unreachable!("query sources are dispatched before leaf planning")
+        }
+    }
+
+    let resolved_table = match &source.kind {
+        hir::SourceKind::Table(table) | hir::SourceKind::TableFunction { table, .. } => {
+            table.clone()
+        }
+        hir::SourceKind::SchemaExpression
+        | hir::SourceKind::Cte(_)
+        | hir::SourceKind::Derived(_)
+        | hir::SourceKind::RecursiveInput(_)
+        | hir::SourceKind::Pseudo { .. } => unreachable!(),
+    };
+    let table = resolved_table.value().clone();
+    let database_id = source.database.map_or(MAIN_DB_ID, hir::DatabaseId::index);
+    let index_hint = match &source.index_hint {
+        hir::IndexHint::None => PlanIndexHint::None,
+        hir::IndexHint::NotIndexed => PlanIndexHint::NotIndexed,
+        hir::IndexHint::Indexed(index) => PlanIndexHint::Indexed(index.clone()),
+    };
+
+    let generated_expressions = source
+        .generated_expressions
+        .iter()
+        .map(|expression| match expression {
+            hir::ColumnReadExpression::Absent | hir::ColumnReadExpression::NotRequired => Ok(None),
+            hir::ColumnReadExpression::Planned(expression) => {
+                context.lower_expr(expression).map(Some)
             }
-            if def.has_frame_clause {
-                crate::bail_parse_error!(
-                    "cannot override frame specification of window: {base_name}"
-                );
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let default_expressions = source
+        .default_expressions
+        .iter()
+        .map(|expression| match expression {
+            hir::ColumnReadExpression::Absent | hir::ColumnReadExpression::NotRequired => Ok(None),
+            hir::ColumnReadExpression::Planned(expression) => {
+                context.lower_expr(expression).map(Some)
             }
-            let mut bound = clone_named_window_bound(windows, def);
-            if !bound.order_by.is_empty() && !window.order_by.is_empty() {
-                crate::bail_parse_error!("cannot override ORDER BY clause of window: {base_name}");
-            }
-            if bound.order_by.is_empty() {
-                bound.order_by = window
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let column_type_programs = source
+        .column_type_programs
+        .iter()
+        .map(|programs| {
+            programs
+                .as_ref()
+                .map(|programs| {
+                    context
+                        .identities
+                        .lower_column_type_programs(programs)
+                        .map_err(|error| LimboError::InternalError(error.to_string()))
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let read_programs = Arc::new(SourceReadPrograms {
+        generated_expressions,
+        default_expressions,
+        column_type_programs,
+    });
+    let check_constraints = source
+        .check_constraints
+        .iter()
+        .map(|check| {
+            Ok(PlanCheckConstraint {
+                expression: context.lower_expr(&check.expression)?,
+                description: check.description.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let index_expressions = source
+        .index_expressions
+        .iter()
+        .map(|definition| {
+            Ok(PlanIndexExpressions {
+                index: definition.index.clone(),
+                columns: definition
+                    .columns
+                    .iter()
+                    .map(|expression| {
+                        expression
+                            .as_ref()
+                            .map(|expression| context.lower_expr(expression))
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                predicate: definition
+                    .predicate
+                    .as_ref()
+                    .map(|expression| context.lower_expr(expression))
+                    .transpose()?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let index_method_patterns = source
+        .index_method_patterns
+        .iter()
+        .enumerate()
+        .map(|(pattern_idx, pattern)| {
+            let (limit, offset) = lower_hir_limit(context, pattern.limit.as_ref())?;
+            Ok(PlanIndexMethodPattern {
+                index: pattern.index.clone(),
+                pattern_idx,
+                outputs: pattern
+                    .outputs
+                    .iter()
+                    .map(|output| context.lower_output(output))
+                    .collect::<Result<Vec<_>>>()?,
+                predicate: pattern
+                    .predicate
+                    .as_ref()
+                    .map(|expression| context.lower_expr(expression))
+                    .transpose()?,
+                order_by: pattern
                     .order_by
                     .iter()
-                    .map(|column| {
-                        (
-                            *column.expr.clone(),
-                            column.order.unwrap_or(ast::SortOrder::Asc),
-                            column.nulls,
-                        )
+                    .map(|term| {
+                        Ok(super::plan_expr::PlanOrderTerm {
+                            expr: context.lower_expr(&term.expr)?,
+                            order: term.order,
+                            nulls: term.nulls,
+                        })
                     })
-                    .collect();
-            }
-            if let Some(idx) = windows
-                .iter()
-                .position(|candidate| candidate.is_equivalent_to_bound(&bound, &frame))
-            {
-                return Ok(&mut windows[idx]);
-            }
-            windows.push(Window::from_unnamed_bound(bound, frame));
-            Ok(windows.last_mut().expect("just pushed, so must exist"))
-        }
-        Over::Name(name) => {
-            let window_name = normalize_ident(name.as_str());
-            // Reuse an existing resolved entry with the same name AND
-            // frame so functions sharing one coerced frame fold into one
-            // ephemeral-table pass. SQLite uses the most recent
-            // definition when names collide, so iterate in reverse.
-            if let Some(idx) = windows
-                .iter()
-                .rposition(|w| w.name.as_ref() == Some(&window_name) && w.frame == frame)
-            {
-                return Ok(&mut windows[idx]);
-            }
-            // Need a new resolved entry. Verify the name exists.
-            let def = named_windows
-                .iter_mut()
-                .rfind(|d| d.name == window_name)
-                .ok_or_else(|| {
-                    crate::LimboError::ParseError(format!("no such window: {window_name}"))
-                })?;
-            // First attachment under this name takes ownership of the
-            // bound exprs. Subsequent distinct-frame
-            // attachments deep-clone from a sister resolved Window —
-            // the first attachment guarantees one exists.
-            let bound = match def.bound.take() {
-                Some(bound) => bound,
-                None => {
-                    let sister = windows
-                        .iter()
-                        .rfind(|w| w.name.as_ref() == Some(&window_name))
-                        .expect("sister Window must exist after the named def was taken");
-                    NamedWindowBound {
-                        partition_by: sister.partition_by.clone(),
-                        order_by: sister.order_by.clone(),
-                    }
-                }
-            };
-            windows.push(Window::from_named_bound(window_name, bound, frame));
-            Ok(windows.last_mut().expect("just pushed, so must exist"))
-        }
-    }
+                    .collect::<Result<Vec<_>>>()?,
+                limit,
+                offset,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(JoinedTable {
+        op: Operation::default_scan_for(&table),
+        column_use_counts: vec![0; table.columns().len()],
+        table,
+        resolved_table: Some(resolved_table),
+        identifier,
+        internal_id,
+        join_info,
+        col_used_mask: Default::default(),
+        expression_index_usages: Vec::new(),
+        database_id,
+        index_hint,
+        index_method_patterns,
+        index_expressions,
+        read_programs,
+        check_constraints,
+    })
 }
 
-fn clone_named_window_bound(
-    windows: &[Window],
-    def: &crate::translate::plan::NamedWindowDef,
-) -> NamedWindowBound {
-    match def.bound.as_ref() {
-        Some(bound) => bound.clone(),
-        None => {
-            let sister = windows
-                .iter()
-                .rfind(|window| window.name.as_ref() == Some(&def.name))
-                .expect("sister Window must exist after the named def was taken");
-            NamedWindowBound {
-                partition_by: sister.partition_by.clone(),
-                order_by: sister.order_by.clone(),
-            }
-        }
-    }
-}
-
-fn add_aggregate_if_not_exists(
-    aggs: &mut Vec<Aggregate>,
-    expr: &Expr,
-    args: &[Box<Expr>],
-    distinctness: Distinctness,
-    func: AggFunc,
-    filter_expr: Option<ast::Expr>,
-) -> Result<()> {
-    if distinctness.is_distinct() && args.len() != 1 {
-        crate::bail_parse_error!("DISTINCT aggregate functions must have exactly one argument");
-    }
-    if aggs
-        .iter()
-        .all(|a| !exprs_are_equivalent(&a.original_expr, expr))
+/// Lower a resolved FROM tree, including JOIN conditions and virtual-table
+/// arguments, without repeating name resolution.
+pub fn prepare_hir_from(
+    context: &mut HirPlanContext<'_>,
+    from: &hir::From,
+) -> Result<PreparedHirFrom> {
+    if let Some(first_join) = from
+        .joins
+        .first()
+        .filter(|join| join.kind == hir::JoinKind::Right)
     {
-        aggs.push(Aggregate::new(func, args, expr, distinctness, filter_expr));
+        return prepare_hir_from_with_leading_right(context, from, first_join);
+    }
+
+    let first = prepare_hir_source(context, from.first, None)?;
+    finish_hir_from_with_first(context, from, first)
+}
+
+fn finish_hir_from_with_first(
+    context: &mut HirPlanContext<'_>,
+    from: &hir::From,
+    first: JoinedTable,
+) -> Result<PreparedHirFrom> {
+    let mut predicates = Vec::new();
+    add_hir_table_function_predicates(context, from.first, &first, None, &mut predicates)?;
+    let mut table_references =
+        context.new_table_references(Vec::new(), context.outer_query_refs.clone())?;
+    table_references.add_joined_table(first);
+    finish_hir_from_joins(context, from, table_references, predicates, 0)
+}
+
+fn prepare_hir_from_with_leading_right(
+    context: &mut HirPlanContext<'_>,
+    from: &hir::From,
+    first_join: &hir::Join,
+) -> Result<PreparedHirFrom> {
+    let mut predicates = Vec::new();
+    let mut table_references =
+        context.new_table_references(Vec::new(), context.outer_query_refs.clone())?;
+    let right = prepare_hir_source(context, first_join.right, None)?;
+    add_hir_table_function_predicates(context, first_join.right, &right, None, &mut predicates)?;
+    table_references.add_joined_table(right);
+
+    let using = hir_join_using_names(&first_join.constraint);
+    let join_info = JoinInfo {
+        join_type: PlanJoinType::LeftOuter,
+        using,
+        no_reorder: false,
+    };
+    let left = prepare_hir_source(context, from.first, Some(join_info))?;
+    let outer_id = left.internal_id;
+    add_hir_table_function_predicates(context, from.first, &left, Some(outer_id), &mut predicates)?;
+    table_references.add_joined_table(left);
+    add_hir_join_predicates(
+        context,
+        &first_join.constraint,
+        Some(outer_id),
+        &mut predicates,
+    )?;
+    table_references.set_right_join_swapped();
+    finish_hir_from_joins(context, from, table_references, predicates, 1)
+}
+
+fn finish_hir_from_joins(
+    context: &mut HirPlanContext<'_>,
+    from: &hir::From,
+    mut table_references: TableReferences,
+    mut predicates: Vec<WhereTerm>,
+    next_join: usize,
+) -> Result<PreparedHirFrom> {
+    for join in from.joins.iter().skip(next_join) {
+        if join.kind == hir::JoinKind::Right {
+            crate::bail_parse_error!(
+                "RIGHT JOIN following another join is not yet supported. Try rewriting as LEFT JOIN or using a subquery."
+            );
+        }
+        let join_info = hir_join_info(join);
+        let right = prepare_hir_source(context, join.right, Some(join_info))?;
+        let outer_id = right
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::is_outer)
+            .then_some(right.internal_id);
+        add_hir_table_function_predicates(context, join.right, &right, outer_id, &mut predicates)?;
+        table_references.add_joined_table(right);
+        add_hir_join_predicates(context, &join.constraint, outer_id, &mut predicates)?;
+    }
+
+    if table_references.joined_tables().len() > TableReferences::MAX_JOINED_TABLES {
+        crate::bail_parse_error!(
+            "at most {} tables in a join",
+            TableReferences::MAX_JOINED_TABLES
+        );
+    }
+    Ok(PreparedHirFrom {
+        table_references,
+        predicates,
+    })
+}
+
+fn hir_join_info(join: &hir::Join) -> JoinInfo {
+    let (join_type, no_reorder) = match join.kind {
+        hir::JoinKind::Comma | hir::JoinKind::Inner => (PlanJoinType::Inner, false),
+        hir::JoinKind::Cross => (PlanJoinType::Inner, true),
+        hir::JoinKind::Left | hir::JoinKind::Right => (PlanJoinType::LeftOuter, false),
+        hir::JoinKind::Full => (PlanJoinType::FullOuter, false),
+    };
+    JoinInfo {
+        join_type,
+        using: hir_join_using_names(&join.constraint),
+        no_reorder,
+    }
+}
+
+fn hir_join_using_names(constraint: &hir::JoinConstraint) -> Vec<ast::Name> {
+    match constraint {
+        hir::JoinConstraint::Using(columns) | hir::JoinConstraint::Natural(columns) => columns
+            .iter()
+            .map(|column| ast::Name::exact(column.name.clone()))
+            .collect(),
+        hir::JoinConstraint::None | hir::JoinConstraint::On(_) => Vec::new(),
+    }
+}
+
+fn add_hir_join_predicates(
+    context: &HirPlanContext<'_>,
+    constraint: &hir::JoinConstraint,
+    outer_id: Option<PlanSourceId>,
+    predicates: &mut Vec<WhereTerm>,
+) -> Result<()> {
+    match constraint {
+        hir::JoinConstraint::None => {}
+        hir::JoinConstraint::On(expression) => {
+            split_hir_predicate(context.lower_expr(expression)?, outer_id, predicates);
+        }
+        hir::JoinConstraint::Using(columns) | hir::JoinConstraint::Natural(columns) => {
+            for column in columns {
+                let lhs = context.lower_expr(&column.left)?;
+                let rhs = context.lower_expr(&hir::Expr::Column(column.right))?;
+                predicates.push(WhereTerm {
+                    expr: PlanExpr::Binary {
+                        lhs: Box::new(lhs),
+                        operator: ast::Operator::Equals,
+                        rhs: Box::new(rhs),
+                        custom: None,
+                    },
+                    from_outer_join: outer_id,
+                    consumed: false,
+                });
+            }
+        }
     }
     Ok(())
 }
 
-/// Maps a normalized function name to the ordered-set [`AggFunc`] it implements, if any.
-/// Ordered-set aggregates are written `f(direct_args) WITHIN GROUP (ORDER BY x)`.
-fn ordered_set_agg_func(normalized_name: &str) -> Option<AggFunc> {
-    match normalized_name {
-        "mode" => Some(AggFunc::Mode),
-        "percentile_cont" => Some(AggFunc::PercentileCont),
-        "percentile_disc" => Some(AggFunc::PercentileDisc),
+fn split_hir_predicate(
+    expression: PlanExpr,
+    outer_id: Option<PlanSourceId>,
+    predicates: &mut Vec<WhereTerm>,
+) {
+    match expression {
+        PlanExpr::Binary {
+            lhs,
+            operator: ast::Operator::And,
+            rhs,
+            custom: None,
+        } => {
+            split_hir_predicate(*lhs, outer_id, predicates);
+            split_hir_predicate(*rhs, outer_id, predicates);
+        }
+        expression => predicates.push(WhereTerm {
+            expr: expression,
+            from_outer_join: outer_id,
+            consumed: false,
+        }),
+    }
+}
+
+fn add_hir_table_function_predicates(
+    context: &HirPlanContext<'_>,
+    source_id: hir::SourceId,
+    table: &JoinedTable,
+    outer_id: Option<PlanSourceId>,
+    predicates: &mut Vec<WhereTerm>,
+) -> Result<()> {
+    let source = context
+        .document
+        .source(source_id)
+        .ok_or_else(|| LimboError::InternalError(format!("missing semantic source {source_id}")))?;
+    let hir::SourceKind::TableFunction { arguments, .. } = &source.kind else {
+        return Ok(());
+    };
+
+    let mut arguments = arguments.iter();
+    let mut hidden_count = 0;
+    for (column_index, schema_column) in table.table.columns().iter().enumerate() {
+        if !schema_column.hidden() {
+            continue;
+        }
+        hidden_count += 1;
+        let Some(argument) = arguments.next() else {
+            continue;
+        };
+        let metadata = source.columns.get(column_index).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "table-function source {} is missing hidden column {} metadata",
+                source.id, column_index
+            ))
+        })?;
+        let column = PlanExpr::Column(PlanColumnRef {
+            source: table.internal_id,
+            column: column_index,
+            rowid_alias: metadata.rowid_alias,
+            type_fact: metadata.type_fact.clone(),
+            affinity: metadata.affinity,
+            has_affinity: metadata.has_affinity,
+            collation: metadata.collation.clone(),
+        });
+        let argument = context.lower_expr(argument)?;
+        let expression = if matches!(&argument, PlanExpr::Literal(Null)) {
+            PlanExpr::IsNull(Box::new(column))
+        } else {
+            PlanExpr::Binary {
+                lhs: Box::new(column),
+                operator: ast::Operator::Equals,
+                rhs: Box::new(argument),
+                custom: None,
+            }
+        };
+        predicates.push(WhereTerm {
+            expr: expression,
+            from_outer_join: outer_id,
+            consumed: false,
+        });
+    }
+    if arguments.next().is_some() {
+        return Err(LimboError::ParseError(format!(
+            "Too many arguments for {}: expected at most {}, got {}",
+            table.table.get_name(),
+            hidden_count,
+            hidden_count + 1 + arguments.count()
+        )));
+    }
+    Ok(())
+}
+
+const HIR_MAX_RESULT_COLUMNS: usize = 2000;
+
+/// Lower one resolved HIR query. Identity allocation belongs to the caller;
+/// this function only consumes the supplied map and chooses physical query
+/// shapes and runtime destinations.
+pub fn prepare_hir_query_plan(
+    context: &mut HirPlanContext<'_>,
+    query_id: hir::QueryId,
+    query_destination: QueryDestination,
+) -> Result<Plan> {
+    let simple = context
+        .document
+        .query(query_id)
+        .ok_or_else(|| LimboError::InternalError(format!("missing semantic query {query_id}")))?
+        .compounds
+        .is_empty();
+    if simple {
+        return prepare_hir_simple_query_chain(context, query_id, query_destination);
+    }
+
+    prepare_hir_compound_query_plan(context, query_id, query_destination)
+}
+
+struct PendingHirCteLink {
+    block_id: hir::QueryBlockId,
+    from: hir::From,
+    order_by: Vec<hir::OrderTerm>,
+    limit: Option<hir::Limit>,
+    query_destination: QueryDestination,
+    source_id: hir::SourceId,
+    cte_id: hir::CteId,
+}
+
+/// Plan a linear chain of ordinary CTE references without retaining one Rust
+/// call stack per link. The physical plan remains nested exactly as before:
+/// only the order in which its nodes are built changes.
+fn prepare_hir_simple_query_chain(
+    context: &mut HirPlanContext<'_>,
+    query_id: hir::QueryId,
+    query_destination: QueryDestination,
+) -> Result<Plan> {
+    let mut pending = Vec::new();
+    let mut current_query_id = query_id;
+    let mut current_destination = query_destination;
+
+    let mut plan = loop {
+        let query = context
+            .document
+            .query(current_query_id)
+            .cloned()
+            .ok_or_else(|| {
+                LimboError::InternalError(format!("missing semantic query {current_query_id}"))
+            })?;
+        if !query.compounds.is_empty() {
+            break prepare_hir_compound_query_plan(context, current_query_id, current_destination)?;
+        }
+
+        let block = context
+            .document
+            .query_block(query.first)
+            .cloned()
+            .ok_or_else(|| {
+                LimboError::InternalError(format!("missing query block {}", query.first.index))
+            })?;
+        if block.outputs.is_empty() {
+            crate::bail_parse_error!("SELECT without columns is not allowed");
+        }
+        if block.outputs.len() > HIR_MAX_RESULT_COLUMNS {
+            crate::bail_parse_error!("too many columns in result set");
+        }
+
+        let Some(from) = block
+            .from
+            .as_ref()
+            .filter(|from| from.joins.is_empty())
+            .cloned()
+        else {
+            break Plan::Select(Box::new(prepare_hir_query_block(
+                context,
+                query.first,
+                &query.order_by,
+                query.limit.as_ref(),
+                current_destination,
+            )?));
+        };
+        let HirSourcePlanKind::Cte(cte_id) = hir_source_plan_kind(context, from.first)? else {
+            break Plan::Select(Box::new(prepare_hir_query_block(
+                context,
+                query.first,
+                &query.order_by,
+                query.limit.as_ref(),
+                current_destination,
+            )?));
+        };
+        let cte = context
+            .document
+            .cte(cte_id)
+            .ok_or_else(|| LimboError::InternalError(format!("missing semantic CTE {cte_id}")))?;
+        let hir::CteBody::Query(next_query_id) = &cte.body else {
+            break Plan::Select(Box::new(prepare_hir_query_block(
+                context,
+                query.first,
+                &query.order_by,
+                query.limit.as_ref(),
+                current_destination,
+            )?));
+        };
+
+        let source_id = from.first;
+        pending.push(PendingHirCteLink {
+            block_id: query.first,
+            from,
+            order_by: query.order_by.clone(),
+            limit: query.limit.clone(),
+            query_destination: current_destination,
+            source_id,
+            cte_id,
+        });
+        current_query_id = *next_query_id;
+        current_destination = QueryDestination::placeholder_for_subquery();
+    };
+
+    while let Some(link) = pending.pop() {
+        let first = finish_hir_cte_source(context, link.source_id, link.cte_id, None, plan)?;
+        let prepared_from = finish_hir_from_with_first(context, &link.from, first)?;
+        plan = Plan::Select(Box::new(finish_hir_query_block(
+            context,
+            link.block_id,
+            &link.order_by,
+            link.limit.as_ref(),
+            link.query_destination,
+            prepared_from,
+        )?));
+    }
+    Ok(plan)
+}
+
+fn prepare_hir_compound_query_plan(
+    context: &mut HirPlanContext<'_>,
+    query_id: hir::QueryId,
+    query_destination: QueryDestination,
+) -> Result<Plan> {
+    let query =
+        context.document.query(query_id).cloned().ok_or_else(|| {
+            LimboError::InternalError(format!("missing semantic query {query_id}"))
+        })?;
+
+    let mut current =
+        prepare_hir_query_block(context, query.first, &[], None, query_destination.clone())?;
+    let mut left = Vec::with_capacity(query.compounds.len());
+    for compound in &query.compounds {
+        left.push((current, compound.operator));
+        current = prepare_hir_query_block(
+            context,
+            compound.block,
+            &[],
+            None,
+            query_destination.clone(),
+        )?;
+    }
+
+    let (limit, offset) = lower_hir_limit(context, query.limit.as_ref())?;
+    let order_by = lower_hir_order_terms(context, &query.order_by)?;
+    let limit_expressions = limit.iter().chain(offset.iter()).collect::<Vec<_>>();
+    super::subquery::prepare_hir_expression_subqueries(
+        context,
+        &mut current.table_references,
+        &limit_expressions,
+        super::plan::SubqueryOrigin::SelectLimitOffset,
+        &mut current.non_from_clause_subqueries,
+    )?;
+    for expression in limit_expressions {
+        if plan_expr_vector_size(expression, &current)? != 1 {
+            crate::bail_parse_error!("row value misused");
+        }
+    }
+    let mut plan = Plan::CompoundSelect {
+        left,
+        right_most: Box::new(current),
+        limit,
+        offset,
+        order_by,
+    };
+    super::subquery::mark_shared_cte_materialization_requirements_in_plan(&mut plan);
+    Ok(plan)
+}
+
+fn prepare_hir_query_block(
+    context: &mut HirPlanContext<'_>,
+    block_id: hir::QueryBlockId,
+    query_order_by: &[hir::OrderTerm],
+    query_limit: Option<&hir::Limit>,
+    query_destination: QueryDestination,
+) -> Result<SelectPlan> {
+    let from = {
+        let block = context.document.query_block(block_id).ok_or_else(|| {
+            LimboError::InternalError(format!("missing query block {}", block_id.index))
+        })?;
+        if block.outputs.is_empty() {
+            crate::bail_parse_error!("SELECT without columns is not allowed");
+        }
+        if block.outputs.len() > HIR_MAX_RESULT_COLUMNS {
+            crate::bail_parse_error!("too many columns in result set");
+        }
+        block.from.clone()
+    };
+    let prepared_from = match &from {
+        Some(from) => prepare_hir_from(context, from)?,
+        None => PreparedHirFrom {
+            table_references: context
+                .new_table_references(Vec::new(), context.outer_query_refs.clone())?,
+            predicates: Vec::new(),
+        },
+    };
+    finish_hir_query_block(
+        context,
+        block_id,
+        query_order_by,
+        query_limit,
+        query_destination,
+        prepared_from,
+    )
+}
+
+fn finish_hir_query_block(
+    context: &mut HirPlanContext<'_>,
+    block_id: hir::QueryBlockId,
+    query_order_by: &[hir::OrderTerm],
+    query_limit: Option<&hir::Limit>,
+    query_destination: QueryDestination,
+    prepared_from: PreparedHirFrom,
+) -> Result<SelectPlan> {
+    let block = context
+        .document
+        .query_block(block_id)
+        .cloned()
+        .ok_or_else(|| {
+            LimboError::InternalError(format!("missing query block {}", block_id.index))
+        })?;
+    let PreparedHirFrom {
+        table_references,
+        predicates,
+    } = prepared_from;
+    let result_columns = block
+        .outputs
+        .iter()
+        .map(|output| context.lower_output(output))
+        .collect::<Result<Vec<_>>>()?;
+    let join_order = table_references
+        .joined_tables()
+        .iter()
+        .enumerate()
+        .map(|(original_idx, table)| JoinOrderMember {
+            table_id: table.internal_id,
+            original_idx,
+            is_outer: table.join_info.as_ref().is_some_and(JoinInfo::is_outer),
+        })
+        .collect();
+
+    let mut plan = SelectPlan {
+        table_references,
+        join_order,
+        result_columns,
+        where_clause: predicates,
+        group_by: None,
+        order_by: Vec::new(),
+        aggregates: Vec::new(),
+        limit: None,
+        offset: None,
+        contains_constant_false_condition: false,
+        query_destination,
+        distinctness: Distinctness::NonDistinct,
+        values: Vec::new(),
+        window: None,
+        non_from_clause_subqueries: Vec::new(),
+        input_cardinality_hint: None,
+        estimated_output_rows: None,
+        simple_aggregate: None,
+        phantom_params: Vec::new(),
+    };
+
+    match &block.body {
+        hir::QueryBlockBody::Select {
+            distinctness,
+            filter,
+            grouping,
+            windows: _,
+        } => {
+            plan.distinctness = Distinctness::from_ast(distinctness.as_ref());
+            if let Some(filter) = filter {
+                split_hir_predicate(
+                    context.lower_query_expr(filter, block_id)?,
+                    None,
+                    &mut plan.where_clause,
+                );
+            }
+            if let Some(grouping) = grouping {
+                let exprs = grouping
+                    .keys
+                    .iter()
+                    .map(|expression| context.lower_query_expr(expression, block_id))
+                    .collect::<Result<Vec<_>>>()?;
+                let having = grouping
+                    .having
+                    .as_ref()
+                    .map(|expression| -> Result<Vec<PlanExpr>> {
+                        let mut predicates = Vec::new();
+                        split_hir_predicate(
+                            context.lower_query_expr(expression, block_id)?,
+                            None,
+                            &mut predicates,
+                        );
+                        Ok(predicates
+                            .into_iter()
+                            .map(|predicate| predicate.expr)
+                            .collect::<Vec<_>>())
+                    })
+                    .transpose()?;
+                plan.group_by = Some(GroupBy {
+                    sort_order: vec![ast::SortOrder::Asc; exprs.len()],
+                    nulls_order: vec![None; exprs.len()],
+                    exprs,
+                    sort_elided: false,
+                    having,
+                });
+            }
+            plan.order_by = lower_hir_query_order_terms(context, block_id, query_order_by)?;
+            (plan.limit, plan.offset) = lower_hir_query_limit(context, block_id, query_limit)?;
+        }
+        hir::QueryBlockBody::Values { rows } => {
+            if !query_order_by.is_empty() {
+                crate::bail_parse_error!("ORDER BY clause is not allowed with VALUES clause");
+            }
+            if query_limit.is_some() {
+                crate::bail_parse_error!("LIMIT clause is not allowed with VALUES clause");
+            }
+            plan.values = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|expression| context.lower_query_expr(expression, block_id))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?;
+        }
+    }
+
+    remove_duplicate_hir_order_terms(&mut plan.order_by);
+    let (mut windows, aggregate_count_without_order_by) =
+        collect_hir_aggregates_and_windows(&mut plan)?;
+    if !plan.aggregates.is_empty()
+        && plan
+            .group_by
+            .as_ref()
+            .is_none_or(|group_by| group_by.exprs.is_empty())
+        && windows.is_empty()
+    {
+        // An ungrouped aggregate produces one row, so ORDER BY cannot change
+        // its result. Aggregates found only in the removed terms are not live
+        // plan operations; in particular, their subqueries are intentionally
+        // absent from the subquery preparation that follows.
+        plan.order_by.clear();
+        plan.aggregates.truncate(aggregate_count_without_order_by);
+    }
+    compute_hir_group_by_sort_order(&mut plan)?;
+    register_hir_select_usage(context, &mut plan)?;
+    prepare_hir_select_subqueries(context, &mut plan)?;
+    super::subquery::finalize_hir_select_subqueries(&mut plan);
+    validate_hir_select_vector_sizes(&plan)?;
+    super::window::plan_windows(context.program, &mut plan, &mut windows)?;
+    Ok(plan)
+}
+
+fn lower_hir_order_terms(
+    context: &HirPlanContext<'_>,
+    terms: &[hir::OrderTerm],
+) -> Result<Vec<PlanOrderTerm>> {
+    terms
+        .iter()
+        .map(|term| {
+            Ok(PlanOrderTerm {
+                expr: context.lower_expr(&term.expr)?,
+                order: term.order,
+                nulls: term.nulls,
+            })
+        })
+        .collect()
+}
+
+fn lower_hir_query_order_terms(
+    context: &HirPlanContext<'_>,
+    block: hir::QueryBlockId,
+    terms: &[hir::OrderTerm],
+) -> Result<Vec<PlanOrderTerm>> {
+    terms
+        .iter()
+        .map(|term| {
+            Ok(PlanOrderTerm {
+                expr: context.lower_query_expr(&term.expr, block)?,
+                order: term.order,
+                nulls: term.nulls,
+            })
+        })
+        .collect()
+}
+
+fn lower_hir_limit(
+    context: &HirPlanContext<'_>,
+    limit: Option<&hir::Limit>,
+) -> Result<(Option<PlanExpr>, Option<PlanExpr>)> {
+    let Some(limit) = limit else {
+        return Ok((None, None));
+    };
+    Ok((
+        Some(context.lower_expr(&limit.limit)?),
+        limit
+            .offset
+            .as_ref()
+            .map(|offset| context.lower_expr(offset))
+            .transpose()?,
+    ))
+}
+
+fn lower_hir_query_limit(
+    context: &HirPlanContext<'_>,
+    block: hir::QueryBlockId,
+    limit: Option<&hir::Limit>,
+) -> Result<(Option<PlanExpr>, Option<PlanExpr>)> {
+    let Some(limit) = limit else {
+        return Ok((None, None));
+    };
+    Ok((
+        Some(context.lower_query_expr(&limit.limit, block)?),
+        limit
+            .offset
+            .as_ref()
+            .map(|offset| context.lower_query_expr(offset, block))
+            .transpose()?,
+    ))
+}
+
+fn remove_duplicate_hir_order_terms(order_by: &mut Vec<PlanOrderTerm>) {
+    let mut index = 0;
+    while index < order_by.len() {
+        if order_by[..index]
+            .iter()
+            .any(|previous| plan_exprs_equivalent(&previous.expr, &order_by[index].expr))
+        {
+            order_by.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn register_hir_select_usage(context: &HirPlanContext<'_>, plan: &mut SelectPlan) -> Result<()> {
+    let expressions = plan
+        .result_columns
+        .iter()
+        .map(|column| &column.expr)
+        .chain(plan.where_clause.iter().map(|term| &term.expr))
+        .chain(plan.order_by.iter().map(|term| &term.expr))
+        .chain(plan.group_by.iter().flat_map(|group_by| {
+            group_by
+                .exprs
+                .iter()
+                .chain(group_by.having.iter().flatten())
+        }))
+        .chain(plan.values.iter().flatten())
+        .chain(plan.limit.iter())
+        .chain(plan.offset.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    for expression in &expressions {
+        let mut outputs = plan_expr_dependencies(expression)?
+            .outputs
+            .into_iter()
+            .collect::<Vec<_>>();
+        outputs.sort_unstable();
+        for output in outputs {
+            plan.table_references
+                .add_outer_output(context.outer_output_reference(output)?);
+        }
+        plan.table_references.register_plan_expr_usage(expression)?;
+    }
+    Ok(())
+}
+
+fn prepare_hir_select_subqueries(
+    context: &mut HirPlanContext<'_>,
+    plan: &mut SelectPlan,
+) -> Result<()> {
+    let select_list = plan
+        .result_columns
+        .iter()
+        .map(|column| &column.expr)
+        .chain(plan.values.iter().flatten())
+        .collect::<Vec<_>>();
+    super::subquery::prepare_hir_expression_subqueries(
+        context,
+        &mut plan.table_references,
+        &select_list,
+        super::plan::SubqueryOrigin::SelectList,
+        &mut plan.non_from_clause_subqueries,
+    )?;
+    let where_clause = plan
+        .where_clause
+        .iter()
+        .map(|term| &term.expr)
+        .collect::<Vec<_>>();
+    super::subquery::prepare_hir_expression_subqueries(
+        context,
+        &mut plan.table_references,
+        &where_clause,
+        super::plan::SubqueryOrigin::SelectWhere,
+        &mut plan.non_from_clause_subqueries,
+    )?;
+    let group_by = plan
+        .group_by
+        .iter()
+        .flat_map(|group_by| group_by.exprs.iter())
+        .collect::<Vec<_>>();
+    super::subquery::prepare_hir_expression_subqueries(
+        context,
+        &mut plan.table_references,
+        &group_by,
+        super::plan::SubqueryOrigin::SelectGroupBy,
+        &mut plan.non_from_clause_subqueries,
+    )?;
+    let having = plan
+        .group_by
+        .iter()
+        .flat_map(|group_by| group_by.having.iter().flatten())
+        .collect::<Vec<_>>();
+    super::subquery::prepare_hir_expression_subqueries(
+        context,
+        &mut plan.table_references,
+        &having,
+        super::plan::SubqueryOrigin::SelectHaving,
+        &mut plan.non_from_clause_subqueries,
+    )?;
+    let order_by = plan
+        .order_by
+        .iter()
+        .map(|term| &term.expr)
+        .collect::<Vec<_>>();
+    super::subquery::prepare_hir_expression_subqueries(
+        context,
+        &mut plan.table_references,
+        &order_by,
+        super::plan::SubqueryOrigin::SelectOrderBy,
+        &mut plan.non_from_clause_subqueries,
+    )?;
+    let limit = plan
+        .limit
+        .iter()
+        .chain(plan.offset.iter())
+        .collect::<Vec<_>>();
+    super::subquery::prepare_hir_expression_subqueries(
+        context,
+        &mut plan.table_references,
+        &limit,
+        super::plan::SubqueryOrigin::SelectLimitOffset,
+        &mut plan.non_from_clause_subqueries,
+    )
+}
+
+fn validate_hir_select_vector_sizes(plan: &SelectPlan) -> Result<()> {
+    for expression in plan
+        .result_columns
+        .iter()
+        .map(|column| &column.expr)
+        .chain(plan.where_clause.iter().map(|term| &term.expr))
+        .chain(plan.order_by.iter().map(|term| &term.expr))
+        .chain(plan.group_by.iter().flat_map(|group_by| {
+            group_by
+                .exprs
+                .iter()
+                .chain(group_by.having.iter().flatten())
+        }))
+        .chain(plan.values.iter().flatten())
+        .chain(plan.limit.iter())
+        .chain(plan.offset.iter())
+    {
+        if plan_expr_vector_size(expression, plan)? != 1 {
+            crate::bail_parse_error!("row value misused");
+        }
+    }
+    for aggregate in &plan.aggregates {
+        for argument in &aggregate.args {
+            if plan_expr_vector_size(argument, plan)? != 1 {
+                crate::bail_parse_error!("row value misused");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_hir_aggregates_and_windows(plan: &mut SelectPlan) -> Result<(Vec<Window>, usize)> {
+    let before_order = plan
+        .result_columns
+        .iter()
+        .map(|column| column.expr.clone())
+        .chain(
+            plan.group_by
+                .iter()
+                .flat_map(|group_by| group_by.having.iter().flatten().cloned()),
+        )
+        .collect::<Vec<_>>();
+    let mut windows = Vec::new();
+    for expression in &before_order {
+        collect_hir_functions(expression, &mut plan.aggregates, &mut windows)?;
+    }
+
+    let aggregate_count_before_order = plan.aggregates.len();
+    let has_group_by = plan
+        .group_by
+        .as_ref()
+        .is_some_and(|group_by| !group_by.exprs.is_empty());
+    for term in &plan.order_by {
+        let aggregate_count = plan.aggregates.len();
+        collect_hir_functions(&term.expr, &mut plan.aggregates, &mut windows)?;
+        let added_aggregate = plan.aggregates.len() > aggregate_count;
+        if added_aggregate
+            && !plan.table_references.joined_tables().is_empty()
+            && !has_group_by
+            && aggregate_count_before_order == 0
+        {
+            crate::bail_parse_error!(
+                "misuse of aggregate: {}()",
+                plan.aggregates[aggregate_count].func
+            );
+        }
+    }
+
+    if let Some(group_by) = &plan.group_by {
+        if group_by.exprs.is_empty() && group_by.having.is_some() && plan.aggregates.is_empty() {
+            crate::bail_parse_error!("HAVING clause on a non-aggregate query");
+        }
+    }
+    Ok((windows, aggregate_count_before_order))
+}
+
+fn collect_hir_functions(
+    expression: &PlanExpr,
+    aggregates: &mut Vec<Aggregate>,
+    windows: &mut Vec<Window>,
+) -> Result<()> {
+    walk_plan_expr(expression, &mut |node| {
+        let PlanExpr::Function(function) = node else {
+            return Ok(PlanWalkControl::Continue);
+        };
+        let aggregate = resolved_hir_aggregate(function.function.value());
+        let window_only = match function.function.value() {
+            Func::Window(window) => Some(AccumulatorFunc::Window(window.clone())),
+            _ => None,
+        };
+        if function.window.is_some() || window_only.is_some() {
+            let accumulator = window_only.or_else(|| aggregate.clone().map(AccumulatorFunc::Agg));
+            let Some(accumulator) = accumulator else {
+                return Err(LimboError::InternalError(
+                    "resolved non-window function carries a window specification".to_string(),
+                ));
+            };
+            collect_hir_window_input_aggregates(function, aggregates)?;
+            add_hir_window_function(node, function, accumulator, windows)?;
+            return Ok(PlanWalkControl::SkipChildren);
+        }
+        if let Some(aggregate) = aggregate {
+            add_hir_aggregate(node, function, aggregate, aggregates)?;
+            return Ok(PlanWalkControl::SkipChildren);
+        }
+        Ok(PlanWalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+fn collect_hir_window_input_aggregates(
+    function: &super::plan_expr::PlanFunctionCall,
+    aggregates: &mut Vec<Aggregate>,
+) -> Result<()> {
+    let mut collect = |expression| collect_hir_group_aggregates(expression, aggregates);
+    for expression in &function.arguments {
+        collect(expression)?;
+    }
+    for term in function.argument_order.iter().chain(&function.within_group) {
+        collect(&term.expr)?;
+    }
+    if let Some(filter) = &function.filter {
+        collect(filter)?;
+    }
+    if let Some(window) = &function.window {
+        for expression in &window.partition_by {
+            collect(expression)?;
+        }
+        for term in &window.order_by {
+            collect(&term.expr)?;
+        }
+        if let Some(frame) = &window.frame {
+            if let super::plan_expr::PlanFrameBound::Following(expression)
+            | super::plan_expr::PlanFrameBound::Preceding(expression) = &frame.start
+            {
+                collect(expression)?;
+            }
+            if let Some(
+                super::plan_expr::PlanFrameBound::Following(expression)
+                | super::plan_expr::PlanFrameBound::Preceding(expression),
+            ) = &frame.end
+            {
+                collect(expression)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_hir_group_aggregates(
+    expression: &PlanExpr,
+    aggregates: &mut Vec<Aggregate>,
+) -> Result<()> {
+    walk_plan_expr(expression, &mut |node| {
+        let PlanExpr::Function(function) = node else {
+            return Ok(PlanWalkControl::Continue);
+        };
+        if function.window.is_some() || matches!(function.function.value(), Func::Window(_)) {
+            return Ok(PlanWalkControl::SkipChildren);
+        }
+        let Some(aggregate) = resolved_hir_aggregate(function.function.value()) else {
+            return Ok(PlanWalkControl::Continue);
+        };
+        add_hir_aggregate(node, function, aggregate, aggregates)?;
+        Ok(PlanWalkControl::SkipChildren)
+    })?;
+    Ok(())
+}
+
+fn resolved_hir_aggregate(function: &Func) -> Option<AggFunc> {
+    match function {
+        Func::Agg(aggregate) => Some(aggregate.clone()),
+        Func::External(external) if matches!(external.func, ExtFunc::Aggregate { .. }) => {
+            Some(AggFunc::External(Arc::new(external.func.clone())))
+        }
         _ => None,
     }
 }
 
-struct OrderedSetAggregate {
-    func: AggFunc,
-    // Matches `add_aggregate_if_not_exists`, which consumes `&[Box<Expr>]`.
-    #[allow(clippy::vec_box)]
-    args: Vec<Box<Expr>>,
-}
-
-/// Validates a `WITHIN GROUP (ORDER BY ...)` ordered-set aggregate and rewrites it into a
-/// uniform argument list for the rest of the pipeline: `[value]` for `mode`, or
-/// `[value, fraction]` for the percentile functions. `value` is the single ORDER BY
-/// expression; `fraction` is the direct argument.
-fn build_ordered_set_aggregate(
-    name: &ast::Name,
-    args: &[Box<Expr>],
-    distinctness: Option<&ast::Distinctness>,
-    order_by: &[ast::SortedColumn],
-    within_group: &[ast::SortedColumn],
-    filter_over: &ast::FunctionTail,
-    ordered_set_func: Option<AggFunc>,
-) -> Result<OrderedSetAggregate> {
-    let Some(func) = ordered_set_func else {
-        crate::bail_parse_error!(
-            "WITHIN GROUP is not supported for function {}()",
-            name.as_str()
-        );
-    };
-    if filter_over.over_clause.is_some() {
-        crate::bail_parse_error!(
-            "ordered-set aggregate {}() may not be used as a window function",
-            name.as_str()
-        );
-    }
-    if distinctness.is_some() {
-        crate::bail_parse_error!(
-            "DISTINCT is not supported for ordered-set aggregate {}()",
-            name.as_str()
-        );
-    }
-    if !order_by.is_empty() {
-        crate::bail_parse_error!(
-            "{}() does not accept an argument ORDER BY together with WITHIN GROUP",
-            name.as_str()
-        );
-    }
-    if within_group.len() != 1 {
-        crate::bail_parse_error!(
-            "WITHIN GROUP for {}() must specify exactly one ORDER BY expression",
-            name.as_str()
-        );
-    }
-    let sort_col = &within_group[0];
-    if matches!(sort_col.order, Some(ast::SortOrder::Desc)) || sort_col.nulls.is_some() {
-        crate::bail_parse_error!(
-            "DESC and NULLS ordering inside WITHIN GROUP are not supported yet"
-        );
-    }
-    let expected_direct_args = match func {
-        AggFunc::Mode => 0,
-        _ => 1, // percentile_cont / percentile_disc take the fraction
-    };
-    if args.len() != expected_direct_args {
-        crate::bail_parse_error!("wrong number of arguments to function {}()", name.as_str());
-    }
-    let mut new_args: Vec<Box<Expr>> = Vec::with_capacity(args.len() + 1);
-    new_args.push(sort_col.expr.clone());
-    new_args.extend(args.iter().cloned());
-    Ok(OrderedSetAggregate {
-        func,
-        args: new_args,
-    })
-}
-
-/// Validate the arm structure of a recursive CTE body and return the index of
-/// the first recursive arm. Errors mirror SQLite: a self-reference in the
-/// initial query or outside the recursive arm's top-level FROM is a circular
-/// reference; more than one reference per recursive arm is rejected.
-pub(crate) fn validate_recursive_cte_structure(cte_name: &str, select: &Select) -> Result<usize> {
-    let mut first_recursive_query_index = None;
-    let ref_counter = RecursiveRefCounter { cte_name };
-    // Nested CTEs defined at the body level are visible in every arm; bring
-    // them into scope so shadowing and use-through-nested-CTE references are
-    // counted the way name resolution will see them.
-    let mut ref_scope = RecursiveRefScope::new();
-    ref_counter.push_nested_ctes(select.with.as_ref(), &mut ref_scope);
-    for (query_index, query) in std::iter::once(&select.body.select)
-        .chain(
-            select
-                .body
-                .compounds
-                .iter()
-                .map(|compound| &compound.select),
-        )
-        .enumerate()
+fn add_hir_aggregate(
+    original_expr: &PlanExpr,
+    function: &super::plan_expr::PlanFunctionCall,
+    aggregate: AggFunc,
+    aggregates: &mut Vec<Aggregate>,
+) -> Result<()> {
+    if aggregates
+        .iter()
+        .any(|candidate| plan_exprs_equivalent(&candidate.original_expr, original_expr))
     {
-        let (top_level_from_count, total_count) = ref_counter.count_arm(query, &mut ref_scope);
-        if first_recursive_query_index.is_none() && total_count == 0 {
-            continue;
-        }
-        if query_index == 0 {
-            crate::bail_parse_error!("circular reference: {}", cte_name);
-        }
-        first_recursive_query_index.get_or_insert(query_index);
-        if top_level_from_count == 0 {
-            crate::bail_parse_error!("circular reference: {}", cte_name);
-        }
-        if top_level_from_count > 1 {
-            crate::bail_parse_error!("multiple references to recursive table: {}", cte_name);
-        }
-        if total_count > top_level_from_count {
-            crate::bail_parse_error!("multiple recursive references: {}", cte_name);
-        }
+        return Ok(());
     }
-    first_recursive_query_index.ok_or_else(|| {
-        crate::LimboError::InternalError(format!("recursive CTE {cte_name} has no recursive query"))
+    if !function.argument_order.is_empty() {
+        crate::bail_parse_error!("ORDER BY clause is not supported yet in aggregate functions");
+    }
+    let distinctness = Distinctness::from_ast(function.distinctness.as_ref());
+    let mut args = function.arguments.clone();
+    if !function.within_group.is_empty() {
+        if !matches!(
+            aggregate,
+            AggFunc::Mode | AggFunc::PercentileCont | AggFunc::PercentileDisc
+        ) {
+            crate::bail_parse_error!("WITHIN GROUP is not supported for this function");
+        }
+        if function.window.is_some() {
+            crate::bail_parse_error!("ordered-set aggregate may not be used as a window function");
+        }
+        if function.distinctness.is_some() {
+            crate::bail_parse_error!("DISTINCT is not supported for ordered-set aggregate");
+        }
+        if function.within_group.len() != 1 {
+            crate::bail_parse_error!("WITHIN GROUP must specify exactly one ORDER BY expression");
+        }
+        let order = &function.within_group[0];
+        if order.order == ast::SortOrder::Desc || order.nulls.is_some() {
+            crate::bail_parse_error!(
+                "DESC and NULLS ordering inside WITHIN GROUP are not supported yet"
+            );
+        }
+        let expected_direct_args = usize::from(!matches!(aggregate, AggFunc::Mode));
+        if args.len() != expected_direct_args {
+            crate::bail_parse_error!("wrong number of arguments to ordered-set aggregate");
+        }
+        args.insert(0, order.expr.clone());
+    } else if matches!(aggregate, AggFunc::Mode) {
+        crate::bail_parse_error!("mode() requires a WITHIN GROUP (ORDER BY ...) clause");
+    }
+    if distinctness.is_distinct() && args.len() != 1 {
+        crate::bail_parse_error!("DISTINCT aggregate functions must have exactly one argument");
+    }
+    aggregates.push(Aggregate {
+        func: aggregate,
+        args,
+        original_expr: original_expr.clone(),
+        distinctness,
+        filter_expr: function.filter.as_deref().cloned(),
+        fraction_reg: None,
+    });
+    Ok(())
+}
+
+fn add_hir_window_function(
+    original_expr: &PlanExpr,
+    function: &super::plan_expr::PlanFunctionCall,
+    accumulator: AccumulatorFunc,
+    windows: &mut Vec<Window>,
+) -> Result<()> {
+    if function.distinctness.is_some() {
+        crate::bail_parse_error!("DISTINCT is not supported for window functions");
+    }
+    if matches!(accumulator, AccumulatorFunc::Window(_)) && function.filter.is_some() {
+        crate::bail_parse_error!("FILTER clause may only be used with aggregate window functions");
+    }
+    if !function.within_group.is_empty() {
+        crate::bail_parse_error!("ordered-set aggregate may not be used as a window function");
+    }
+    let specification = function.window.as_ref().ok_or_else(|| {
+        LimboError::InternalError(
+            "resolved window function has no window specification".to_string(),
+        )
+    })?;
+    let planned = PlannedWindowSpec {
+        partition_by: specification.partition_by.clone(),
+        order_by: specification
+            .order_by
+            .iter()
+            .map(|term| (term.expr.clone(), term.order, term.nulls))
+            .collect(),
+    };
+    let frame = match &accumulator {
+        AccumulatorFunc::Window(window) => window
+            .coerced_frame()
+            .unwrap_or(plan_hir_window_frame(specification)?),
+        AccumulatorFunc::Agg(_) => plan_hir_window_frame(specification)?,
+    };
+    let window_index = windows
+        .iter()
+        .position(|window| window.is_equivalent_to_spec(&planned, &frame));
+    let window = match window_index {
+        Some(index) => &mut windows[index],
+        None => {
+            windows.push(Window::from_planned_spec(planned, frame));
+            windows.last_mut().expect("window was just inserted")
+        }
+    };
+    if !window
+        .functions
+        .iter()
+        .any(|candidate| plan_exprs_equivalent(&candidate.original_expr, original_expr))
+    {
+        window.functions.push(WindowFunction {
+            func: accumulator,
+            original_expr: original_expr.clone(),
+            rewritten: None,
+        });
+    }
+    Ok(())
+}
+
+fn plan_hir_window_frame(specification: &super::plan_expr::PlanWindowSpec) -> Result<Frame> {
+    let Some(frame) = &specification.frame else {
+        return Ok(Frame::default());
+    };
+    if frame
+        .exclude
+        .as_ref()
+        .is_some_and(|exclude| *exclude != ast::FrameExclude::NoOthers)
+    {
+        crate::bail_parse_error!("window frame EXCLUDE clauses are not supported yet");
+    }
+    Ok(Frame {
+        mode: frame.mode,
+        start: plan_hir_frame_boundary(&frame.start),
+        end: frame
+            .end
+            .as_ref()
+            .map(plan_hir_frame_boundary)
+            .unwrap_or(FrameBoundary::CurrentRow),
     })
 }
+
+fn plan_hir_frame_boundary(boundary: &super::plan_expr::PlanFrameBound) -> FrameBoundary {
+    match boundary {
+        super::plan_expr::PlanFrameBound::CurrentRow => FrameBoundary::CurrentRow,
+        super::plan_expr::PlanFrameBound::Following(expression) => {
+            FrameBoundary::Following(expression.clone())
+        }
+        super::plan_expr::PlanFrameBound::Preceding(expression) => {
+            FrameBoundary::Preceding(expression.clone())
+        }
+        super::plan_expr::PlanFrameBound::UnboundedFollowing => FrameBoundary::UnboundedFollowing,
+        super::plan_expr::PlanFrameBound::UnboundedPreceding => FrameBoundary::UnboundedPreceding,
+    }
+}
+
+fn compute_hir_group_by_sort_order(plan: &mut SelectPlan) -> Result<()> {
+    let Some(group_by) = &mut plan.group_by else {
+        return Ok(());
+    };
+    if group_by.exprs.is_empty() || plan.order_by.is_empty() {
+        return Ok(());
+    }
+    let only_aggregate_or_constant = plan.order_by.iter().all(|term| {
+        plan.aggregates
+            .iter()
+            .any(|aggregate| plan_exprs_equivalent(&aggregate.original_expr, &term.expr))
+            || plan_expr_dependencies(&term.expr)
+                .is_ok_and(|dependencies| dependencies.is_constant())
+    });
+    if only_aggregate_or_constant {
+        group_by.sort_order.fill(plan.order_by[0].order);
+        group_by.nulls_order.fill(plan.order_by[0].nulls);
+        return Ok(());
+    }
+    for (index, expression) in group_by.exprs.iter().enumerate() {
+        if let Some(term) = plan
+            .order_by
+            .iter()
+            .find(|term| plan_exprs_equivalent(&term.expr, expression))
+        {
+            group_by.sort_order[index] = term.order;
+            group_by.nulls_order[index] = term.nulls;
+        }
+    }
+    Ok(())
+}
+
+fn prepare_hir_recursive_cte_plan(
+    context: &mut HirPlanContext<'_>,
+    cte: &hir::Cte,
+    recursive: &hir::RecursiveCte,
+) -> Result<Plan> {
+    let mut initial_query = prepare_hir_query_plan(
+        context,
+        recursive.seed,
+        QueryDestination::placeholder_for_subquery(),
+    )?;
+    let explicit_columns = cte
+        .columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    // A compound query gets its public column identity from its left-most
+    // arm. Keep that identity when the recursive CTE overlays its stabilized
+    // semantic facts; the right-most arm is only an execution detail.
+    let mut result_columns = match &initial_query {
+        Plan::Select(select) => select.result_columns.clone(),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => left
+            .first()
+            .map(|(select, _)| select.result_columns.clone())
+            .unwrap_or_else(|| right_most.result_columns.clone()),
+        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {
+            return Err(LimboError::InternalError(
+                "recursive CTE seed is not a SELECT query".to_string(),
+            ));
+        }
+    };
+    if result_columns.len() != cte.columns.len() {
+        return Err(LimboError::InternalError(format!(
+            "recursive CTE '{}' has {} semantic columns but {} seed columns",
+            cte.name,
+            cte.columns.len(),
+            result_columns.len()
+        )));
+    }
+    for (result, semantic) in result_columns.iter_mut().zip(&cte.columns) {
+        result.name.clone_from(&semantic.name);
+        result.type_fact.clone_from(&semantic.type_fact);
+        result.affinity = if semantic.has_affinity {
+            PlanExprAffinity::with_affinity(semantic.affinity)
+        } else {
+            PlanExprAffinity::no_affinity()
+        };
+        result.collation.clone_from(&semantic.collation);
+        result.array_dimensions = type_fact_array_dimensions(&semantic.type_fact);
+    }
+
+    let mut previous_inputs = Vec::with_capacity(recursive.input_sources.len());
+    let mut input_table_ids = Vec::with_capacity(recursive.input_sources.len());
+    for source_id in &recursive.input_sources {
+        let source = context.document.source(*source_id).ok_or_else(|| {
+            LimboError::InternalError(format!("missing recursive input source {source_id}"))
+        })?;
+        let internal_id = context.identities.source(*source_id).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "missing plan identity for recursive input source {source_id}"
+            ))
+        })?;
+        let identifier = source.alias.clone().unwrap_or_else(|| source.name.clone());
+        let input = JoinedTable::new_recursive_cte_input(
+            identifier,
+            &result_columns,
+            internal_id,
+            Some(&explicit_columns),
+        )?;
+        input_table_ids.push(internal_id);
+        previous_inputs.push((
+            *source_id,
+            context.recursive_inputs.insert(*source_id, input),
+        ));
+    }
+
+    let arm_result = (|| {
+        let mut arms = Vec::with_capacity(recursive.arms.len());
+        for arm in &recursive.arms {
+            let plan = prepare_hir_query_plan(
+                context,
+                arm.query,
+                QueryDestination::placeholder_for_subquery(),
+            )?;
+            let Plan::Select(plan) = plan else {
+                return Err(LimboError::InternalError(format!(
+                    "recursive arm {} did not lower to one SELECT block",
+                    arm.query
+                )));
+            };
+            arms.push(plan);
+        }
+        Ok::<_, LimboError>(arms)
+    })();
+    for (source, previous) in previous_inputs {
+        match previous {
+            Some(previous) => {
+                context.recursive_inputs.insert(source, previous);
+            }
+            None => {
+                context.recursive_inputs.remove(&source);
+            }
+        }
+    }
+    let mut arms = arm_result?;
+    let right_most = arms.pop().ok_or_else(|| {
+        LimboError::InternalError(format!("recursive CTE '{}' has no recursive arm", cte.name))
+    })?;
+    let recursive_query = if arms.is_empty() {
+        Plan::Select(right_most)
+    } else {
+        Plan::CompoundSelect {
+            left: arms
+                .into_iter()
+                .map(|arm| (*arm, ast::CompoundOperator::UnionAll))
+                .collect(),
+            right_most,
+            limit: None,
+            offset: None,
+            order_by: Vec::new(),
+        }
+    };
+    reject_aggregates_and_windows_in_recursive_query(&recursive_query)?;
+
+    let first_operator = recursive
+        .arms
+        .first()
+        .map(|arm| arm.operator)
+        .ok_or_else(|| {
+            LimboError::InternalError(format!("recursive CTE '{}' has no operator", cte.name))
+        })?;
+    let union_all = match first_operator {
+        ast::CompoundOperator::UnionAll => true,
+        ast::CompoundOperator::Union => false,
+        ast::CompoundOperator::Except | ast::CompoundOperator::Intersect => {
+            crate::bail_parse_error!(
+                "recursive CTEs must use UNION ALL or UNION between the initial and recursive queries"
+            );
+        }
+    };
+    let (limit, offset) = lower_hir_limit(context, recursive.limit.as_ref())?;
+    let limit_expressions = limit.iter().chain(offset.iter()).collect::<Vec<_>>();
+    if !limit_expressions.is_empty() {
+        let limit_owner = match &mut initial_query {
+            Plan::Select(select) => select.as_mut(),
+            Plan::CompoundSelect { right_most, .. } => right_most.as_mut(),
+            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {
+                return Err(LimboError::InternalError(
+                    "recursive CTE seed is not a SELECT query".to_string(),
+                ));
+            }
+        };
+        super::subquery::prepare_hir_expression_subqueries(
+            context,
+            &mut limit_owner.table_references,
+            &limit_expressions,
+            super::plan::SubqueryOrigin::SelectLimitOffset,
+            &mut limit_owner.non_from_clause_subqueries,
+        )?;
+        for expression in limit_expressions {
+            if plan_expr_vector_size(expression, limit_owner)? != 1 {
+                crate::bail_parse_error!("row value misused");
+            }
+        }
+    }
+    let mut plan = Plan::RecursiveCte(Box::new(super::plan::RecursiveCtePlan {
+        name: cte.name.clone(),
+        initial_query: Box::new(initial_query),
+        recursive_query: Box::new(recursive_query),
+        result_columns,
+        comparison_collations: recursive.comparison_collations.clone(),
+        input_table_ids,
+        union_all,
+        limit,
+        offset,
+        queue_order: recursive
+            .queue_order
+            .iter()
+            .map(|term| super::plan::RecursiveCteOrderTerm {
+                result_column_index: term.output,
+                order: term.order,
+                nulls: term.nulls,
+                explicit_collation: term.explicit_collation.clone(),
+            })
+            .collect(),
+        query_destination: QueryDestination::placeholder_for_subquery(),
+    }));
+    super::subquery::mark_shared_cte_materialization_requirements_in_plan(&mut plan);
+    Ok(plan)
+}
+
+/// Valid ways to refer to the rowid of a btree table.
+pub const ROWID_STRS: [&str; 3] = ["rowid", "_rowid_", "oid"];
 
 fn reject_aggregates_and_windows_in_recursive_query(query: &Plan) -> Result<()> {
     match query {
@@ -1069,804 +2013,6 @@ fn reject_aggregates_and_windows_in_recursive_query(query: &Plan) -> Result<()> 
     Ok(())
 }
 
-fn transform_args_into_where_terms(
-    args: &[Box<Expr>],
-    internal_id: TableInternalId,
-    predicates: &mut Vec<Expr>,
-    table: &Table,
-) -> Result<()> {
-    let mut args_iter = args.iter();
-    let mut hidden_count = 0;
-    for (i, col) in table.columns().iter().enumerate() {
-        if !col.hidden() {
-            continue;
-        }
-        hidden_count += 1;
-
-        if let Some(arg_expr) = args_iter.next() {
-            let column_expr = Expr::Column {
-                database: None,
-                table: internal_id,
-                column: i,
-                is_rowid_alias: col.is_rowid_alias(),
-            };
-            let expr = match arg_expr.as_ref() {
-                Expr::Literal(Null) => Expr::IsNull(Box::new(column_expr)),
-                other => Expr::Binary(
-                    column_expr.into(),
-                    ast::Operator::Equals,
-                    other.clone().into(),
-                ),
-            };
-            predicates.push(expr);
-        }
-    }
-
-    if args_iter.next().is_some() {
-        return Err(crate::LimboError::ParseError(format!(
-            "Too many arguments for {}: expected at most {}, got {}",
-            table.get_name(),
-            hidden_count,
-            hidden_count + 1 + args_iter.count()
-        )));
-    }
-
-    Ok(())
-}
-// ── Bound planning: consume the output of the binding phase ──────────────
-//
-// These functions are the planner-side counterpart of [super::bind::BindContext].
-// The binder resolves all names and produces `Bound*` structures; the functions
-// below turn pre-bound CTE definitions and derived tables into planned
-// `JoinedTable`s, and fold already-bound JOIN constraints / vtab arguments into
-// WHERE terms. They perform no name resolution themselves.
-
-/// Plan all CTE definitions produced by the binder, in definition order.
-///
-/// Explicit column-count validation is deferred until the CTE is actually
-/// referenced (matching SQLite, where unreferenced CTEs with mismatched
-/// column counts don't error) — see [plan_one_bound_cte].
-pub fn plan_bound_ctes(
-    cte_definitions: Vec<(String, super::bind::CteEntry)>,
-    resolver: &Resolver,
-    program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
-) -> Result<rustc_hash::FxHashMap<String, JoinedTable>> {
-    plan_bound_ctes_with_outer_refs(
-        cte_definitions,
-        resolver,
-        program,
-        connection,
-        &[],
-        &Default::default(),
-    )
-}
-
-/// [plan_bound_ctes] with context from the enclosing scope: correlation refs
-/// (for recursive CTE bodies, which are planned raw) and already-planned CTEs
-/// from enclosing WITH clauses. The inherited CTEs seed the planned map so a
-/// nested CTE body that references a parent or sibling CTE can find it; a CTE
-/// defined here shadows an inherited one with the same name.
-pub fn plan_bound_ctes_with_outer_refs(
-    mut cte_definitions: Vec<(String, super::bind::CteEntry)>,
-    resolver: &Resolver,
-    program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
-    outer_query_refs: &[OuterQueryReference],
-    inherited_ctes: &rustc_hash::FxHashMap<String, JoinedTable>,
-) -> Result<rustc_hash::FxHashMap<String, JoinedTable>> {
-    let mut planned = inherited_ctes.clone();
-    // Track planning per definition index, not by map membership: an
-    // inherited entry with the same name must not stop the shadowing
-    // definition from being planned.
-    let mut done = vec![false; cte_definitions.len()];
-    for idx in 0..cte_definitions.len() {
-        plan_one_bound_cte(
-            idx,
-            &mut cte_definitions,
-            resolver,
-            program,
-            connection,
-            &mut planned,
-            &mut done,
-            outer_query_refs,
-        )?;
-    }
-    Ok(planned)
-}
-
-/// Plan derived tables (FROM-clause subqueries) from binder-provided bindings.
-///
-/// Each derived table's inner select is already bound. This function plans them
-/// and returns a map of `internal_id` → `JoinedTable` for use in
-/// [super::bind::BoundSelect::into_table_references_with_outer_refs]. Outer refs from the
-/// enclosing scope are propagated so correlated references inside a derived
-/// table stay visible.
-pub fn plan_derived_tables_with_outer_refs(
-    derived_bindings: rustc_hash::FxHashMap<TableInternalId, super::bind::BoundSubquery>,
-    planned_ctes: &mut rustc_hash::FxHashMap<String, JoinedTable>,
-    resolver: &Resolver,
-    program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
-    outer_query_refs: Vec<OuterQueryReference>,
-) -> Result<rustc_hash::FxHashMap<TableInternalId, JoinedTable>> {
-    let mut planned: rustc_hash::FxHashMap<TableInternalId, JoinedTable> = Default::default();
-
-    for (internal_id, bound_sq) in derived_bindings {
-        let subplan = plan_bound_subquery(
-            bound_sq,
-            resolver,
-            program,
-            connection,
-            outer_query_refs.clone(),
-            planned_ctes,
-            QueryDestination::placeholder_for_subquery(),
-        )?;
-
-        let jt = JoinedTable::new_subquery_from_plan(
-            String::new(), // identifier set later by scope_to_table_references
-            subplan,
-            None, // join_info set later
-            internal_id,
-            None,  // no explicit columns
-            None,  // not a CTE
-            false, // no materialize hint
-        )?;
-        planned.insert(internal_id, jt);
-    }
-
-    Ok(planned)
-}
-
-/// Add every planned CTE as a definition-only outer query reference on each
-/// `TableReferences`, skipping names already present. This lets subqueries
-/// inside the query reference CTEs from an enclosing WITH clause by name.
-pub fn add_planned_ctes_as_outer_refs(
-    table_refs: &mut [TableReferences],
-    planned_ctes: &rustc_hash::FxHashMap<String, JoinedTable>,
-) {
-    for tr in table_refs {
-        for (name, jt) in planned_ctes {
-            if tr.outer_query_refs().iter().any(|r| r.identifier == *name) {
-                continue;
-            }
-            tr.add_outer_query_reference(OuterQueryReference::cte_definition_only(
-                name.clone(),
-                jt.internal_id,
-                jt.table.clone(),
-            ));
-        }
-    }
-}
-
-/// Turn a [super::bind::BoundSelect] into ready-to-use [TableReferences],
-/// one per SELECT core (main first, then compounds).
-///
-/// This is the single place where bound output becomes table references:
-/// 1. plan the WITH-clause CTEs
-/// 2. make CTEs planned by enclosing scopes available by name
-/// 3. plan the FROM-clause subqueries (derived tables)
-/// 4. convert the bound scopes into `TableReferences` (with the caller's
-///    outer refs attached for correlation)
-/// 5. attach every planned CTE as a definition-only outer ref so subqueries
-///    can still reference them by name
-///
-/// Also returns the pre-bound expression subqueries, keyed by the id in the
-/// corresponding [ast::Expr::SubqueryResult], and any compound ORDER BY keys
-/// resolved by the binder.
-pub fn plan_bound_select_refs(
-    mut bound: super::bind::BoundSelect,
-    resolver: &Resolver,
-    program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
-    outer_query_refs: Vec<OuterQueryReference>,
-    inherited_ctes: &rustc_hash::FxHashMap<String, JoinedTable>,
-) -> Result<(
-    Vec<TableReferences>,
-    rustc_hash::FxHashMap<TableInternalId, super::bind::BoundSubquery>,
-    Option<Vec<super::plan::CompoundOrderByKey>>,
-)> {
-    let compound_order_by = bound.compound_order_by.take();
-    let cte_definitions = std::mem::take(&mut bound.cte_definitions);
-    let subquery_bindings = std::mem::take(&mut bound.subquery_bindings);
-    let derived_bindings = std::mem::take(&mut bound.derived_bindings);
-
-    let mut planned_ctes = plan_bound_ctes_with_outer_refs(
-        cte_definitions,
-        resolver,
-        program,
-        connection,
-        &outer_query_refs,
-        inherited_ctes,
-    )?;
-
-    let mut planned_derived = plan_derived_tables_with_outer_refs(
-        derived_bindings,
-        &mut planned_ctes,
-        resolver,
-        program,
-        connection,
-        outer_query_refs.clone(),
-    )?;
-
-    let mut table_refs = bound.into_table_references_with_outer_refs(
-        &mut planned_ctes,
-        &mut planned_derived,
-        outer_query_refs,
-    )?;
-
-    add_planned_ctes_as_outer_refs(&mut table_refs, &planned_ctes);
-
-    Ok((table_refs, subquery_bindings, compound_order_by))
-}
-
-/// Plan a pre-bound subquery ([super::bind::BoundSubquery]) into a [Plan]
-/// with no name resolution: [plan_bound_select_refs] followed by
-/// [prepare_select_plan] in bound mode.
-pub fn plan_bound_subquery(
-    bound_sq: super::bind::BoundSubquery,
-    resolver: &Resolver,
-    program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
-    outer_query_refs: Vec<OuterQueryReference>,
-    inherited_ctes: &rustc_hash::FxHashMap<String, JoinedTable>,
-    query_destination: QueryDestination,
-) -> Result<Plan> {
-    let (table_refs, bound_subqueries, compound_order_by) = plan_bound_select_refs(
-        bound_sq.inner_bound,
-        resolver,
-        program,
-        connection,
-        outer_query_refs,
-        inherited_ctes,
-    )?;
-    prepare_select_plan(
-        bound_sq.select,
-        resolver,
-        program,
-        crate::translate::select::SelectBinding {
-            table_refs: table_refs.into_iter(),
-            bound_subqueries,
-            compound_order_by,
-        },
-        query_destination,
-        connection,
-    )
-}
-
-/// Plan a recursive CTE from its pre-bound arms ([super::bind::RecursiveCteBinding]).
-///
-/// The binder resolved all names, including the self-reference: every
-/// recursive arm's reference to the CTE was bound to `binding.input_id`.
-/// Making that id resolve to the recursive input table only requires seeding
-/// the arms' planned-CTE map with the input table under the CTE's own name.
-/// Compound-operator validation and LIMIT still read the body in `select`;
-/// queue ordering is already resolved in `binding`.
-#[allow(clippy::too_many_arguments)]
-fn prepare_bound_recursive_cte_plan(
-    name: &str,
-    select: &Select,
-    binding: super::bind::RecursiveCteBinding,
-    explicit_columns: &[String],
-    resolver: &Resolver,
-    program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
-    outer_query_refs: &[OuterQueryReference],
-    inherited_ctes: &rustc_hash::FxHashMap<String, JoinedTable>,
-) -> Result<Plan> {
-    let super::bind::RecursiveCteBinding {
-        initial,
-        recursive_arms,
-        first_recursive_arm_index,
-        input_id,
-        queue_order,
-    } = binding;
-    let first_recursive_query_index = first_recursive_arm_index;
-
-    let recursive_compound_operator =
-        select.body.compounds[first_recursive_query_index - 1].operator;
-    let union_all = match recursive_compound_operator {
-        ast::CompoundOperator::UnionAll => true,
-        ast::CompoundOperator::Union => false,
-        ast::CompoundOperator::Except | ast::CompoundOperator::Intersect => {
-            crate::bail_parse_error!(
-                "recursive CTEs must use UNION ALL or UNION between the initial and recursive queries"
-            );
-        }
-    };
-    for compound in select
-        .body
-        .compounds
-        .iter()
-        .skip(first_recursive_query_index)
-    {
-        if compound.operator != recursive_compound_operator {
-            crate::bail_parse_error!("recursive CTE queries must use the same UNION operator");
-        }
-    }
-
-    let initial_query = plan_bound_subquery(
-        initial,
-        resolver,
-        program,
-        connection,
-        outer_query_refs.to_vec(),
-        inherited_ctes,
-        QueryDestination::placeholder_for_subquery(),
-    )?;
-
-    let explicit_columns = (!explicit_columns.is_empty()).then_some(explicit_columns);
-    if let Some(columns) = explicit_columns {
-        let result_column_count = initial_query.select_result_columns().len();
-        if columns.len() != result_column_count {
-            crate::bail_parse_error!(
-                "table {} has {} values for {} columns",
-                name,
-                result_column_count,
-                columns.len()
-            );
-        }
-    }
-
-    let input_table = JoinedTable::new_recursive_cte_input(
-        name.to_string(),
-        &initial_query,
-        input_id,
-        explicit_columns,
-    )?;
-    let input_table_id = input_table.internal_id;
-
-    // The self-reference in each arm is a scope table with
-    // ScopeTableSource::Cte under the CTE's own name; seeding the planned map
-    // with the input table makes scope conversion find it. All arms share
-    // input_table_id, so they all read the same recursive input cursor.
-    let mut arm_ctes = inherited_ctes.clone();
-    arm_ctes.insert(name.to_string(), input_table);
-
-    let mut arm_plans = Vec::with_capacity(recursive_arms.len());
-    for arm in recursive_arms {
-        let arm_plan = plan_bound_subquery(
-            arm,
-            resolver,
-            program,
-            connection,
-            outer_query_refs.to_vec(),
-            &arm_ctes,
-            QueryDestination::placeholder_for_subquery(),
-        )?;
-        let Plan::Select(arm_plan) = arm_plan else {
-            unreachable!("a single-arm SELECT plans to Plan::Select");
-        };
-        arm_plans.push(arm_plan);
-    }
-
-    let last_arm = arm_plans.pop().expect("at least one recursive arm");
-    for arm_plan in &arm_plans {
-        if arm_plan.result_columns.len() != last_arm.result_columns.len() {
-            crate::bail_parse_error!(
-                "SELECTs to the left and right of {} do not have the same number of result columns",
-                ast::CompoundOperator::UnionAll
-            );
-        }
-    }
-    let recursive_query = if arm_plans.is_empty() {
-        Plan::Select(last_arm)
-    } else {
-        Plan::CompoundSelect {
-            left: arm_plans
-                .into_iter()
-                .map(|plan| (*plan, ast::CompoundOperator::UnionAll))
-                .collect(),
-            right_most: last_arm,
-            limit: None,
-            offset: None,
-            order_by: None,
-        }
-    };
-
-    if initial_query.select_result_columns().len() != recursive_query.select_result_columns().len()
-    {
-        crate::bail_parse_error!(
-            "SELECTs to the left and right of {} do not have the same number of result columns",
-            recursive_compound_operator
-        );
-    }
-    reject_aggregates_and_windows_in_recursive_query(&recursive_query)?;
-
-    assert!(
-        select.order_by.is_empty(),
-        "recursive CTE ORDER BY must be consumed during binding"
-    );
-    // The binder already resolved the body-level LIMIT/OFFSET.
-    let (limit, offset) = select
-        .limit
-        .clone()
-        .map_or((None, None), |limit| (Some(limit.expr), limit.offset));
-
-    Ok(Plan::RecursiveCte(Box::new(
-        super::plan::RecursiveCtePlan {
-            name: name.to_string(),
-            initial_query: Box::new(initial_query),
-            recursive_query: Box::new(recursive_query),
-            input_table_id,
-            union_all,
-            limit,
-            offset,
-            queue_order,
-            query_destination: QueryDestination::placeholder_for_subquery(),
-        },
-    )))
-}
-
-/// Plan a single CTE using its pre-bound data from the binder.
-///
-/// The binder already resolved all names and column references in the CTE body.
-/// This function takes the pre-bound `inner_bound` and converts it into a plan
-/// without re-binding. Referenced sibling CTEs are planned recursively first
-/// to avoid exponential blowup on transitive dependencies.
-#[allow(clippy::too_many_arguments)]
-fn plan_one_bound_cte(
-    cte_idx: usize,
-    cte_definitions: &mut [(String, super::bind::CteEntry)],
-    resolver: &Resolver,
-    program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
-    planned: &mut rustc_hash::FxHashMap<String, JoinedTable>,
-    done: &mut [bool],
-    outer_query_refs: &[OuterQueryReference],
-) -> Result<()> {
-    if done[cte_idx] {
-        return Ok(());
-    }
-    done[cte_idx] = true;
-    // A poisoned entry (deferred binding error) was never referenced — the
-    // binder surfaces its error at any reference — so there is nothing to
-    // plan, matching SQLite's lazy resolution of unused CTE bodies.
-    if cte_definitions[cte_idx].1.bind_error.is_some() {
-        return Ok(());
-    }
-    // Copy metadata needed before mutably borrowing the entry.
-    let name = cte_definitions[cte_idx].0.clone();
-    let referenced_indices = cte_definitions[cte_idx].1.referenced_cte_indices.clone();
-
-    // Recursively plan referenced sibling CTEs first.
-    for &ref_idx in &referenced_indices {
-        plan_one_bound_cte(
-            ref_idx,
-            cte_definitions,
-            resolver,
-            program,
-            connection,
-            planned,
-            done,
-            outer_query_refs,
-        )?;
-    }
-
-    if cte_definitions[cte_idx].1.recursive {
-        let entry = &mut cte_definitions[cte_idx].1;
-        let binding = entry
-            .recursive_binding
-            .take()
-            .expect("recursive CTE binding should be present");
-        let select = entry.select.clone();
-        let explicit_columns = entry.explicit_columns.clone();
-        let cte_id = entry.cte_id;
-        let materialize_hint = entry.materialize_hint;
-
-        let plan = prepare_bound_recursive_cte_plan(
-            &name,
-            &select,
-            binding,
-            &explicit_columns,
-            resolver,
-            program,
-            connection,
-            outer_query_refs,
-            planned,
-        )?;
-        let explicit_cols = if explicit_columns.is_empty() {
-            None
-        } else {
-            Some(explicit_columns.as_slice())
-        };
-        let cte_table = JoinedTable::new_subquery_from_plan(
-            name.clone(),
-            plan,
-            None,
-            program.table_reference_counter.next(),
-            explicit_cols,
-            Some(cte_id),
-            materialize_hint,
-        )?;
-        planned.insert(name, cte_table);
-        return Ok(());
-    }
-
-    let entry = &mut cte_definitions[cte_idx].1;
-
-    // Take the pre-bound data produced by the binder. Already-planned sibling
-    // CTEs are passed as inherited: CTEs can be referenced not only from the
-    // FROM clause (tracked by referenced_cte_indices) but also from correlated
-    // subqueries within the CTE body.
-    let bound_sq = super::bind::BoundSubquery {
-        select: entry.select.clone(),
-        inner_bound: entry
-            .inner_bound
-            .take()
-            .expect("CTE inner binding should be present"),
-    };
-
-    // Circular references were rejected at bind time (ctes_being_bound in
-    // the binder), so planning a bound body cannot recurse into itself.
-    let cte_plan = plan_bound_subquery(
-        bound_sq,
-        resolver,
-        program,
-        connection,
-        outer_query_refs.to_vec(),
-        planned,
-        QueryDestination::placeholder_for_subquery(),
-    )?;
-
-    let entry = &cte_definitions[cte_idx].1;
-    let explicit_cols = if entry.explicit_columns.is_empty() {
-        None
-    } else {
-        // SQLite defers explicit column-count validation until the CTE is
-        // actually referenced; scope_to_table_references performs the check.
-        Some(entry.explicit_columns.as_slice())
-    };
-
-    let cte_table = JoinedTable::new_subquery_from_plan(
-        name.clone(),
-        cte_plan,
-        None,
-        program.table_reference_counter.next(),
-        explicit_cols,
-        Some(entry.cte_id),
-        entry.materialize_hint,
-    )?;
-
-    planned.insert(name, cte_table);
-    Ok(())
-}
-
-/// Break a pre-bound WHERE clause into [WhereTerm]s.
-///
-/// Bound-path counterpart of [parse_where]: the binder already resolved all
-/// identifiers (and rewrote BETWEEN into AND-connected comparisons), so this
-/// only needs to split at AND boundaries.
-pub fn parse_where_bound(
-    where_clause: Option<&Expr>,
-    out_where_clause: &mut Vec<WhereTerm>,
-) -> Result<()> {
-    if let Some(where_expr) = where_clause {
-        break_predicate_at_and_boundaries(where_expr, out_where_clause);
-    }
-    Ok(())
-}
-
-/// Fold pre-bound JOIN ON/USING constraints into [WhereTerm]s.
-///
-/// Bound-path counterpart of the constraint handling in [parse_join]: table
-/// resolution is already done and ON expressions are bound to `Expr::Column`.
-/// NATURAL joins were already transformed to USING by the binder.
-pub fn fold_join_constraints(
-    from: &ast::FromClause,
-    table_references: &mut TableReferences,
-    out_where_clause: &mut Vec<WhereTerm>,
-) -> Result<()> {
-    for (join_idx, join) in from.joins.iter().enumerate() {
-        // The first table is from.select (index 0 in joined_tables),
-        // joins start at index 1. This holds under right_join_swapped too:
-        // the binder swapped the tables so index 0 is the originally-right
-        // table and index 1 is the originally-left one, which carries the
-        // LeftOuter join_info — i.e. the outer table the ON/USING constraint
-        // must be tagged with is still at index 1.
-        let actual_table_idx = join_idx + 1;
-
-        let outer = table_references.joined_tables()[actual_table_idx]
-            .join_info
-            .as_ref()
-            .is_some_and(|j| j.is_outer());
-        let outer_table_id = table_references.joined_tables()[actual_table_idx].internal_id;
-
-        // NATURAL joins were rewritten to USING by the binder, but the
-        // operator still carries the flag. SQLite does not use HIDDEN columns
-        // for NATURAL joins, so natural-derived USING lookups must skip them
-        // on the left side (explicit USING may match hidden columns).
-        let natural = matches!(
-            &join.operator,
-            ast::JoinOperator::TypedJoin(Some(jt)) if jt.contains(JoinType::NATURAL)
-        );
-
-        match &join.constraint {
-            Some(ast::JoinConstraint::On(expr)) => {
-                let start_idx = out_where_clause.len();
-                break_predicate_at_and_boundaries(expr, out_where_clause);
-                for predicate in out_where_clause[start_idx..].iter_mut() {
-                    predicate.from_outer_join = if outer { Some(outer_table_id) } else { None };
-                }
-            }
-            Some(ast::JoinConstraint::Using(cols)) => {
-                // USING join is replaced with a list of equality predicates.
-                let right_table_idx = actual_table_idx;
-                turso_assert!(right_table_idx > 0);
-
-                for col_name in cols.iter() {
-                    let name_normalized = normalize_ident(col_name.as_str());
-
-                    // Scope the immutable borrows so mark_column_used below can
-                    // borrow table_references mutably.
-                    let (
-                        left_table_idx,
-                        left_table_id,
-                        left_col_idx,
-                        left_is_rowid_alias,
-                        right_col_idx,
-                        right_is_rowid_alias,
-                        right_table_internal_id,
-                    ) = {
-                        let tables = table_references.joined_tables();
-                        let left_tables = &tables[..right_table_idx];
-                        let right_table = &tables[right_table_idx];
-
-                        // Find column in left tables
-                        let mut left_col = None;
-                        for (left_table_offset, left_table) in left_tables.iter().enumerate() {
-                            left_col = left_table
-                                .columns()
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, col)| !natural || !col.hidden())
-                                .find(|(_, col)| {
-                                    col.name.as_deref().is_some_and(|name| {
-                                        name.eq_ignore_ascii_case(&name_normalized)
-                                    })
-                                })
-                                .map(|(idx, col)| {
-                                    (
-                                        left_table_offset,
-                                        left_table.internal_id,
-                                        idx,
-                                        col.is_rowid_alias(),
-                                    )
-                                });
-                            if left_col.is_some() {
-                                break;
-                            }
-                        }
-                        let Some((
-                            left_table_idx,
-                            left_table_id,
-                            left_col_idx,
-                            left_is_rowid_alias,
-                        )) = left_col
-                        else {
-                            crate::bail_parse_error!(
-                                "cannot join using column {} - column not present in both tables",
-                                col_name.as_str()
-                            );
-                        };
-
-                        // Find column in right table
-                        let right_col = right_table
-                            .columns()
-                            .iter()
-                            .enumerate()
-                            .find(|(_, col)| {
-                                col.name
-                                    .as_deref()
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&name_normalized))
-                            })
-                            .map(|(idx, col)| (idx, col.is_rowid_alias()));
-                        let Some((right_col_idx, right_is_rowid_alias)) = right_col else {
-                            crate::bail_parse_error!(
-                                "cannot join using column {} - column not present in both tables",
-                                col_name.as_str()
-                            );
-                        };
-
-                        (
-                            left_table_idx,
-                            left_table_id,
-                            left_col_idx,
-                            left_is_rowid_alias,
-                            right_col_idx,
-                            right_is_rowid_alias,
-                            right_table.internal_id,
-                        )
-                    };
-
-                    let expr = Expr::Binary(
-                        Box::new(Expr::Column {
-                            database: None,
-                            table: left_table_id,
-                            column: left_col_idx,
-                            is_rowid_alias: left_is_rowid_alias,
-                        }),
-                        ast::Operator::Equals,
-                        Box::new(Expr::Column {
-                            database: None,
-                            table: right_table_internal_id,
-                            column: right_col_idx,
-                            is_rowid_alias: right_is_rowid_alias,
-                        }),
-                    );
-
-                    let left_table: &mut JoinedTable = table_references
-                        .joined_tables_mut()
-                        .get_mut(left_table_idx)
-                        .unwrap();
-                    left_table.mark_column_used(left_col_idx);
-                    let right_table: &mut JoinedTable = table_references
-                        .joined_tables_mut()
-                        .get_mut(right_table_idx)
-                        .unwrap();
-                    right_table.mark_column_used(right_col_idx);
-
-                    out_where_clause.push(WhereTerm {
-                        expr,
-                        from_outer_join: if outer {
-                            Some(right_table_internal_id)
-                        } else {
-                            None
-                        },
-                        consumed: false,
-                    });
-                }
-            }
-            None => {}
-        }
-    }
-    Ok(())
-}
-
-/// Walk the FROM clause AST and generate virtual-table argument predicates.
-///
-/// `TableReferences` already contains the resolved `JoinedTable`s. For each
-/// `TableCall` node we find the matching joined table by identifier and call
-/// [transform_args_into_where_terms].
-pub fn collect_vtab_predicates(
-    from: &ast::FromClause,
-    table_references: &TableReferences,
-    vtab_predicates: &mut Vec<Expr>,
-) -> Result<()> {
-    collect_vtab_predicates_for_table(&from.select, table_references, vtab_predicates)?;
-    for join in &from.joins {
-        collect_vtab_predicates_for_table(&join.table, table_references, vtab_predicates)?;
-    }
-    Ok(())
-}
-
-fn collect_vtab_predicates_for_table(
-    select_table: &ast::SelectTable,
-    table_references: &TableReferences,
-    vtab_predicates: &mut Vec<Expr>,
-) -> Result<()> {
-    if let ast::SelectTable::TableCall(qualified_name, args, maybe_alias) = select_table {
-        if args.is_empty() {
-            return Ok(());
-        }
-        let table_name = normalize_ident(qualified_name.name.as_str());
-        let identifier = maybe_alias
-            .as_ref()
-            .map(|a| normalize_ident(a.name().as_str()))
-            .unwrap_or(table_name);
-
-        // Find the matching JoinedTable by identifier
-        let joined_table = table_references
-            .joined_tables()
-            .iter()
-            .find(|jt| jt.identifier == identifier);
-        if let Some(jt) = joined_table {
-            transform_args_into_where_terms(args, jt.internal_id, vtab_predicates, &jt.table)?;
-        }
-    }
-    Ok(())
-}
-
 /**
   Returns the earliest point at which a WHERE term can be evaluated.
   For expressions referencing tables, this is the innermost loop that contains a row for each
@@ -1881,12 +2027,15 @@ pub fn determine_where_to_eval_term(
     table_references: Option<&TableReferences>,
 ) -> Result<EvalAt> {
     if let Some(table_id) = term.from_outer_join {
-        return Ok(EvalAt::Loop(
-            join_order
-                .iter()
-                .position(|t| t.table_id == table_id)
-                .unwrap_or(usize::MAX),
-        ));
+        let loop_index = join_order
+            .iter()
+            .position(|table| table.table_id == table_id)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "outer-join source {table_id} is absent from the join order"
+                ))
+            })?;
+        return Ok(EvalAt::Loop(loop_index));
     }
 
     determine_where_to_eval_expr(&term.expr, join_order, subqueries, table_references)
@@ -1923,77 +2072,49 @@ pub type TableMask = BitSet;
 /// already been consumed, by relying on the cached outer reference ids.
 /// Used in the optimizer for constraint analysis.
 pub fn table_mask_from_expr(
-    top_level_expr: &Expr,
+    top_level_expr: &PlanExpr,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
 ) -> Result<TableMask> {
     let mut mask = TableMask::default();
-    walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
-        match expr {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                if let Some(table_idx) = table_references
-                    .joined_tables()
-                    .iter()
-                    .position(|t| t.internal_id == *table)
-                {
-                    mask.set(table_idx)?;
-                } else if table_references
-                    .find_outer_query_ref_by_internal_id(*table)
-                    .is_none()
-                {
-                    // Tables from outer query scopes are guaranteed to be 'in scope' for this query,
-                    // so they don't need to be added to the table mask. However, if the table is not found
-                    // in the outer scope either, then it's an invalid reference.
-                    crate::bail_parse_error!("table not found in joined_tables");
-                }
-            }
-            // Given something like WHERE t.a = (SELECT ...), we can only evaluate that expression
-            // when all both table 't' and all outer scope tables referenced by the subquery OR its nested subqueries are in scope.
-            // Hence, the tables referenced in subqueries must be added to the table mask.
-            Expr::SubqueryResult { subquery_id, .. } => {
-                let Some(subquery) = subqueries.iter().find(|s| s.internal_id == *subquery_id)
-                else {
-                    crate::bail_parse_error!("subquery not found");
-                };
-                match &subquery.state {
-                    SubqueryState::Unevaluated { plan } => {
-                        let outer_ref_ids = plan.as_ref().unwrap().used_outer_query_ref_ids();
-                        for outer_ref_id in &outer_ref_ids {
-                            if let Some(table_idx) = table_references
-                                .joined_tables()
-                                .iter()
-                                .position(|t| t.internal_id == *outer_ref_id)
-                            {
-                                mask.set(table_idx)?;
-                            }
-                        }
-                    }
-                    SubqueryState::Evaluated { outer_ref_ids, .. } => {
-                        // Now hash-join plans can now translate some correlated subqueries early, we
-                        // still revisit those predicates even though the plan has already been consumed.
-                        // Without this cache we'd panic or lose the knowledge that an outer table was required.
-                        //
-                        // Example: `SELECT t.a FROM t WHERE t.a = (SELECT MAX(x.a) FROM x WHERE x.b = t.b)`.
-                        // The outer expression `x.b = t.b` is visited after the subquery is translated,
-                        // so we need cached `outer_ref_ids` to realize that `t` must already be in scope.
-                        for outer_ref_id in outer_ref_ids {
-                            if let Some(table_idx) = table_references
-                                .joined_tables()
-                                .iter()
-                                .position(|t| t.internal_id == *outer_ref_id)
-                            {
-                                mask.set(table_idx)?;
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
+    let dependencies = plan_expr_dependencies(top_level_expr)?;
+
+    for source in dependencies.sources() {
+        add_source_to_table_mask(&mut mask, table_references, source)?;
+    }
+
+    for query in dependencies.subqueries {
+        let subquery = subqueries
+            .iter()
+            .find(|subquery| subquery.internal_id == query)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "resolved subquery {query} is absent from the plan scope"
+                ))
+            })?;
+        for source in subquery_outer_reference_ids(subquery) {
+            add_source_to_table_mask(&mut mask, table_references, source)?;
         }
-        Ok(WalkControl::Continue)
-    })?;
+    }
 
     Ok(mask)
+}
+
+fn add_source_to_table_mask(
+    mask: &mut TableMask,
+    table_references: &TableReferences,
+    source: PlanSourceId,
+) -> Result<()> {
+    match table_references.source_scope(source) {
+        Some(PlanSourceScope::Joined(table_index)) => mask.set(table_index)?,
+        Some(PlanSourceScope::OuterQuery | PlanSourceScope::Runtime) => {}
+        None => {
+            return Err(LimboError::InternalError(format!(
+                "resolved source {source} is absent from the plan scope"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Determines the earliest loop where an expression can be safely evaluated.
@@ -2002,168 +2123,105 @@ pub fn table_mask_from_expr(
 /// build table and map the condition to the probe loop where its rows are produced.
 /// Subquery references are also respected, even after their plans are consumed.
 pub fn determine_where_to_eval_expr(
-    top_level_expr: &Expr,
+    top_level_expr: &PlanExpr,
     join_order: &[JoinOrderMember],
     subqueries: &[NonFromClauseSubquery],
     table_references: Option<&TableReferences>,
 ) -> Result<EvalAt> {
-    // If the expression references no tables, it can be evaluated before any table loops are opened.
-    let mut eval_at: EvalAt = EvalAt::BeforeLoop;
-    walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
-        match expr {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                let Some(join_idx) = join_order.iter().position(|t| t.table_id == *table) else {
-                    // Table not found in join_order. Check if it's a hash join build table.
-                    // If so, we need to evaluate the condition at the probe table's loop position.
-                    if let Some(tables) = table_references {
-                        for (probe_idx, member) in join_order.iter().enumerate() {
-                            let probe_table = &tables.joined_tables()[member.original_idx];
-                            if let Operation::HashJoin(ref hj) = probe_table.op {
-                                let build_table = &tables.joined_tables()[hj.build_table_idx];
-                                if build_table.internal_id == *table {
-                                    // This table is the build side of a hash join.
-                                    // Evaluate the condition at the probe table's loop position.
-                                    eval_at = eval_at.max(EvalAt::Loop(probe_idx));
-                                    return Ok(WalkControl::Continue);
-                                }
-                            }
-                        }
-                    }
-                    // Must be an outer query reference; in that case, the table is already in scope.
-                    return Ok(WalkControl::Continue);
-                };
-                eval_at = eval_at.max(EvalAt::Loop(join_idx));
+    let dependencies = plan_expr_dependencies(top_level_expr)?;
+    let mut eval_at = EvalAt::BeforeLoop;
+
+    for source in dependencies.sources() {
+        if let Some(loop_idx) = source_loop_index(source, join_order, table_references)? {
+            eval_at = eval_at.max(EvalAt::Loop(loop_idx));
+        }
+    }
+
+    for query in dependencies.subqueries {
+        let subquery = subqueries
+            .iter()
+            .find(|subquery| subquery.internal_id == query)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "resolved subquery {query} is absent from the plan scope"
+                ))
+            })?;
+        match &subquery.state {
+            SubqueryState::Evaluated { evaluated_at, .. } => {
+                eval_at = eval_at.max(*evaluated_at);
             }
-            // Given something like WHERE t.a = (SELECT ...), we can only evaluate that expression
-            // when all both table 't' and all outer scope tables referenced by the subquery OR its nested subqueries are in scope.
-            Expr::SubqueryResult { subquery_id, .. } => {
-                let Some(subquery) = subqueries.iter().find(|s| s.internal_id == *subquery_id)
-                else {
-                    crate::bail_parse_error!("subquery not found");
-                };
-                match &subquery.state {
-                    SubqueryState::Evaluated { evaluated_at, .. } => {
-                        eval_at = eval_at.max(*evaluated_at);
-                    }
-                    SubqueryState::Unevaluated { plan } => {
-                        let outer_ref_ids = plan.as_ref().unwrap().used_outer_query_ref_ids();
-                        for outer_ref_id in &outer_ref_ids {
-                            let join_idx = join_order
-                                .iter()
-                                .position(|t| t.table_id == *outer_ref_id)
-                                .or_else(|| {
-                                    let tables = table_references?;
-                                    for (probe_idx, member) in join_order.iter().enumerate() {
-                                        let probe_table =
-                                            &tables.joined_tables()[member.original_idx];
-                                        if let Operation::HashJoin(ref hj) = probe_table.op {
-                                            let build_table =
-                                                &tables.joined_tables()[hj.build_table_idx];
-                                            if build_table.internal_id == *outer_ref_id {
-                                                return Some(probe_idx);
-                                            }
-                                        }
-                                    }
-                                    None
-                                });
-                            if let Some(join_idx) = join_idx {
-                                eval_at = eval_at.max(EvalAt::Loop(join_idx));
-                            }
-                        }
-                        return Ok(WalkControl::Continue);
+            SubqueryState::Unevaluated { .. } => {
+                for source in subquery_outer_reference_ids(subquery) {
+                    if let Some(loop_idx) = source_loop_index(source, join_order, table_references)?
+                    {
+                        eval_at = eval_at.max(EvalAt::Loop(loop_idx));
                     }
                 }
             }
-            _ => {}
         }
-        Ok(WalkControl::Continue)
-    })?;
+    }
 
     Ok(eval_at)
 }
 
-pub(crate) fn append_vtab_predicates_to_where_clause(
-    vtab_predicates: &mut Vec<Expr>,
-    table_references: &mut TableReferences,
-    out_where_clause: &mut Vec<WhereTerm>,
-) -> Result<()> {
-    // The argument expressions were already resolved by the binder when the
-    // TableCall arguments were bound.
-    for expr in vtab_predicates.drain(..) {
-        // Virtual table argument predicates (e.g. the 't2' in pragma_table_info('t2'))
-        // must be associated with the virtual table's outer join context if the table is
-        // the RHS of a LEFT JOIN. Otherwise the optimizer may incorrectly simplify the
-        // LEFT JOIN into an INNER JOIN, breaking NULL row emission for unmatched rows.
-        let from_outer_join = vtab_predicate_table_id(&expr).and_then(|table_id| {
-            table_references
-                .find_joined_table_by_internal_id(table_id)
-                .and_then(|table_ref| {
-                    table_ref
-                        .join_info
-                        .as_ref()
-                        .and_then(|join_info| join_info.is_outer().then_some(table_id))
-                })
-        });
-        out_where_clause.push(WhereTerm {
-            expr,
-            from_outer_join,
-            consumed: false,
-        });
-    }
-    Ok(())
+fn subquery_outer_reference_ids(subquery: &NonFromClauseSubquery) -> Vec<PlanSourceId> {
+    let mut sources = match &subquery.state {
+        SubqueryState::Unevaluated { plan } => plan
+            .as_ref()
+            .map(|plan| plan.used_outer_query_ref_ids())
+            .unwrap_or_default(),
+        SubqueryState::Evaluated { outer_ref_ids, .. } => outer_ref_ids.clone(),
+    };
+    sources.extend(
+        subquery
+            .outer_outputs
+            .iter()
+            .flat_map(|output| output.source_dependencies.iter().copied()),
+    );
+    sources.sort_unstable();
+    sources.dedup();
+    sources
 }
 
-/// Extract the table internal_id from a virtual table argument predicate.
-/// These are always of the form `Column { table, .. } = literal` or `IsNull(Column { table, .. })`.
-fn vtab_predicate_table_id(expr: &Expr) -> Option<TableInternalId> {
-    match expr {
-        Expr::Binary(lhs, _, _) | Expr::IsNull(lhs) => match lhs.as_ref() {
-            Expr::Column { table, .. } => Some(*table),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
-    predicate: &Expr,
-    out_predicates: &mut Vec<T>,
-) {
-    // Unwrap single-element parenthesized expressions recursively: ((expr)) -> expr.
-    // This is semantically equivalent since single-element Parenthesized is purely
-    // syntactic grouping. Multi-element Parenthesized (row values like (x, y)) are
-    // left as-is by unwrap_parens.
-    let predicate = unwrap_parens(predicate).unwrap_or(predicate);
-    match predicate {
-        Expr::Binary(left, ast::Operator::And, right) => {
-            break_predicate_at_and_boundaries(left, out_predicates);
-            break_predicate_at_and_boundaries(right, out_predicates);
-        }
-        _ => {
-            out_predicates.push(predicate.clone().into());
-        }
-    }
-}
-
-pub fn parse_row_id<F>(
-    column_name: &str,
-    table_id: TableInternalId,
-    fn_check: F,
-) -> Result<Option<Expr>>
-where
-    F: FnOnce() -> bool,
-{
-    if ROWID_STRS
+pub(crate) fn source_loop_index(
+    source: PlanSourceId,
+    join_order: &[JoinOrderMember],
+    table_references: Option<&TableReferences>,
+) -> Result<Option<usize>> {
+    if let Some(loop_index) = join_order
         .iter()
-        .any(|s| s.eq_ignore_ascii_case(column_name))
+        .position(|member| member.table_id == source)
     {
-        if fn_check() {
-            crate::bail_parse_error!("ROWID is ambiguous");
-        }
-
-        return Ok(Some(Expr::RowId {
-            database: None, // TODO: support different databases
-            table: table_id,
-        }));
+        return Ok(Some(loop_index));
     }
-    Ok(None)
+
+    let tables = table_references.ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "resolved source {source} has no plan scope for evaluation"
+        ))
+    })?;
+    if let Some(loop_index) = join_order
+        .iter()
+        .enumerate()
+        .find_map(|(probe_idx, member)| {
+            let probe_table = &tables.joined_tables()[member.original_idx];
+            let Operation::HashJoin(hash_join) = &probe_table.op else {
+                return None;
+            };
+            let build_table = &tables.joined_tables()[hash_join.build_table_idx];
+            (build_table.internal_id == source).then_some(probe_idx)
+        })
+    {
+        return Ok(Some(loop_index));
+    }
+
+    match tables.source_scope(source) {
+        Some(PlanSourceScope::OuterQuery | PlanSourceScope::Runtime) => Ok(None),
+        Some(PlanSourceScope::Joined(_)) => Err(LimboError::InternalError(format!(
+            "joined source {source} is absent from the join order"
+        ))),
+        None => Err(LimboError::InternalError(format!(
+            "resolved source {source} is absent from the plan scope"
+        ))),
+    }
 }

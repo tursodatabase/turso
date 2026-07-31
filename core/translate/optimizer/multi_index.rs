@@ -9,15 +9,14 @@
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Index, Schema};
 use crate::stats::AnalyzeStats;
-use crate::translate::expr::expr_references_any_subquery;
 use crate::translate::optimizer::access_method::{
     choose_best_btree_candidate, choose_best_in_seek_candidate, AccessMethod, AccessMethodParams,
     BranchReadMode, ChosenInSeekCandidate, ResidualConstraintMode,
 };
 use crate::translate::optimizer::constraints::{
     analyze_binary_term_for_index, can_use_partial_index, constraints_from_where_clause,
-    partial_index_predicate_terms, summarize_binary_term_for_index, Constraint, RangeConstraintRef,
-    TableConstraints,
+    partial_index_predicate_terms, summarize_binary_term_for_index, table_mask_from_plan_expr,
+    Constraint, RangeConstraintRef, TableConstraints,
 };
 use crate::translate::optimizer::cost::{
     estimate_cost_for_scan_or_seek, estimate_rows_per_seek, rows_per_leaf_page_for_index,
@@ -26,21 +25,21 @@ use crate::translate::optimizer::cost::{
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::optimizer::AvailableIndexes;
 use crate::translate::plan::{
-    BitSet, InSeekSource, JoinedTable, NonFromClauseSubquery, SetOperation, TableReferences,
-    UnionBranchPrePostFilters, WhereTerm,
+    BitSet, InSeekSource, JoinedTable, NonFromClauseSubquery, PlanIndex, PlanSubqueryType,
+    SetOperation, TableReferences, UnionBranchPrePostFilters, WhereTerm,
 };
-use crate::translate::planner::{table_mask_from_expr, TableMask};
+use crate::translate::plan_expr::{PlanExpr, PlanSourceId, PlanSubqueryExpr};
+use crate::translate::planner::TableMask;
 use crate::Result;
 use smallvec::SmallVec;
-use std::sync::Arc;
 use turso_macros::turso_assert_eq;
-use turso_parser::ast::{self, TableInternalId};
+use turso_parser::ast;
 
 #[derive(Debug, Clone)]
 /// Parameters for a single branch of a multi-index scan.
 pub struct MultiIndexBranchParams {
     /// The index to use for this branch, or None for rowid access.
-    pub index: Option<Arc<Index>>,
+    pub index: Option<PlanIndex>,
     /// How this branch probes the table/index.
     pub access: MultiIndexBranchAccessParams,
     /// Estimated number of rows from this branch.
@@ -72,19 +71,19 @@ struct AndClauseDecomposition {
 struct AndBranch {
     where_term_idx: usize,
     constraint: Constraint,
-    index: Option<Arc<Index>>,
+    index: Option<PlanIndex>,
     constraint_refs: Vec<RangeConstraintRef>,
 }
 
 struct AndBranchSummary {
     where_term_idx: usize,
     table_col_pos: Option<usize>,
-    index: Option<Arc<Index>>,
+    index: Option<PlanIndex>,
 }
 
 /// Internal branch representation while evaluating a candidate multi-index plan.
 struct MultiIdxBranch {
-    index: Option<Arc<Index>>,
+    index: Option<PlanIndex>,
     access: MultiIdxBranchAccess,
     cost: Cost,
     estimated_rows: f64,
@@ -105,9 +104,14 @@ enum MultiIdxBranchAccess {
 /// Flattens nested OR expressions into a list of disjuncts.
 ///
 /// For example, `(a OR b) OR c` becomes `[a, b, c]`.
-fn flatten_or_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
+fn flatten_or_expr(expr: &PlanExpr) -> Vec<&PlanExpr> {
     match expr {
-        ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
+        PlanExpr::Binary {
+            lhs,
+            operator: ast::Operator::Or,
+            rhs,
+            ..
+        } => {
             let mut result = flatten_or_expr(lhs);
             result.extend(flatten_or_expr(rhs));
             result
@@ -119,9 +123,14 @@ fn flatten_or_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
 /// Flattens nested AND expressions into a list of conjuncts.
 ///
 /// For example, `(a AND b) AND c` becomes `[a, b, c]`.
-fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
+fn flatten_and_expr(expr: &PlanExpr) -> Vec<&PlanExpr> {
     match expr {
-        ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
+        PlanExpr::Binary {
+            lhs,
+            operator: ast::Operator::And,
+            rhs,
+            ..
+        } => {
             let mut result = flatten_and_expr(lhs);
             result.extend(flatten_and_expr(rhs));
             result
@@ -146,8 +155,8 @@ fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
 /// terms.
 #[expect(clippy::too_many_arguments)]
 fn get_table_local_constraints_for_branch(
-    exprs: &[ast::Expr],
-    from_outer_join: Option<TableInternalId>,
+    exprs: &[PlanExpr],
+    from_outer_join: Option<PlanSourceId>,
     table_reference: &JoinedTable,
     table_references: &TableReferences,
     available_indexes: &AvailableIndexes,
@@ -185,7 +194,7 @@ fn get_table_local_constraints_for_branch(
             continue;
         }
         constraint.constraining_expr =
-            Some(constraint.get_constraining_expr(&synthetic_where_terms, Some(table_references)));
+            Some(constraint.get_constraining_expr(&synthetic_where_terms));
     }
     Ok((synthetic_where_terms, table_constraints))
 }
@@ -307,20 +316,26 @@ fn index_info_for_branch(
 }
 
 fn in_seek_source_from_expr(
-    expr: &ast::Expr,
+    expr: &PlanExpr,
     chosen: &ChosenInSeekCandidate,
+    subqueries: &[NonFromClauseSubquery],
 ) -> Option<InSeekSource> {
     match expr {
-        ast::Expr::InList { rhs, .. } => Some(InSeekSource::LiteralList {
-            values: rhs.iter().map(|e| *e.clone()).collect(),
+        PlanExpr::InList { values, .. } => Some(InSeekSource::LiteralList {
+            values: values.clone(),
             affinity: chosen.affinity,
         }),
-        ast::Expr::SubqueryResult {
-            query_type: ast::SubqueryType::In { cursor_id, .. },
-            ..
-        } => Some(InSeekSource::Subquery {
-            cursor_id: *cursor_id,
-        }),
+        PlanExpr::Subquery(PlanSubqueryExpr::In { query, .. }) => {
+            let subquery = subqueries
+                .iter()
+                .find(|subquery| subquery.internal_id == *query)?;
+            let PlanSubqueryType::In { cursor_id, .. } = &subquery.query_type else {
+                return None;
+            };
+            Some(InSeekSource::Subquery {
+                cursor_id: *cursor_id,
+            })
+        }
         _ => None,
     }
 }
@@ -336,6 +351,7 @@ fn choose_multi_index_branch_access(
     available_indexes: &AvailableIndexes,
     base_row_count: RowCountEstimate,
     analyze_stats: &AnalyzeStats,
+    subqueries: &[NonFromClauseSubquery],
     params: &CostModelParams,
 ) -> Result<Option<MultiIdxBranch>> {
     let chosen_seek = choose_best_btree_candidate(
@@ -365,7 +381,7 @@ fn choose_multi_index_branch_access(
             .expect("multi-index branches always have costable access");
             let analyze_ctx = AnalyzeCtx {
                 rhs_table,
-                index: chosen.index.as_ref(),
+                index: chosen.index.as_deref(),
                 stats: analyze_stats,
             };
             let branch_cost = estimate_cost_for_scan_or_seek(
@@ -413,6 +429,7 @@ fn choose_multi_index_branch_access(
         let Some(source) = in_seek_source_from_expr(
             &branch_terms[chosen_in_seek.constraint_idx].expr,
             &chosen_in_seek,
+            subqueries,
         ) else {
             return Ok(None);
         };
@@ -433,8 +450,8 @@ fn choose_multi_index_branch_access(
 
 /// Residual output from [`partition_residual_multi_or_exprs`].
 struct MultiOrResidualPrePostFilters {
-    pre_filter_exprs: Vec<ast::Expr>,
-    post_filter_exprs: Vec<ast::Expr>,
+    pre_filter_exprs: Vec<PlanExpr>,
+    post_filter_exprs: Vec<PlanExpr>,
     /// Combined table mask for `post_filter_exprs`.
     post_mask: TableMask,
 }
@@ -496,10 +513,13 @@ fn partition_residual_multi_or_exprs(
             continue;
         }
         let expr = &term.expr;
-        if expr_references_any_subquery(expr) {
+        if !crate::translate::plan_expr::plan_expr_dependencies(expr)?
+            .subqueries
+            .is_empty()
+        {
             return Ok(None);
         }
-        let mask = table_mask_from_expr(expr, table_references, subqueries)?;
+        let mask = table_mask_from_plan_expr(expr, table_references, subqueries)?;
         if lhs_mask.contains_all_set_bits_of(&mask) {
             pre_filter_exprs.push(expr.clone());
         } else {
@@ -523,7 +543,7 @@ fn partition_residual_multi_or_exprs(
 /// expression can be recognized as a single-table constraint.
 #[allow(clippy::too_many_arguments)]
 fn estimate_residual_expr_selectivity(
-    expr: &ast::Expr,
+    expr: &PlanExpr,
     rhs_table: &JoinedTable,
     table_references: &TableReferences,
     available_indexes: &AvailableIndexes,
@@ -531,12 +551,13 @@ fn estimate_residual_expr_selectivity(
     schema: &Schema,
     params: &CostModelParams,
 ) -> f64 {
-    let Ok(expr) = crate::translate::expr::unwrap_parens(expr) else {
-        return params.sel_other;
-    };
-
     match expr {
-        ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
+        PlanExpr::Binary {
+            lhs,
+            operator: ast::Operator::And,
+            rhs,
+            ..
+        } => {
             estimate_residual_expr_selectivity(
                 lhs,
                 rhs_table,
@@ -555,7 +576,12 @@ fn estimate_residual_expr_selectivity(
                 params,
             )
         }
-        ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
+        PlanExpr::Binary {
+            lhs,
+            operator: ast::Operator::Or,
+            rhs,
+            ..
+        } => {
             let lhs_selectivity = estimate_residual_expr_selectivity(
                 lhs,
                 rhs_table,
@@ -576,7 +602,10 @@ fn estimate_residual_expr_selectivity(
             );
             1.0 - (1.0 - lhs_selectivity) * (1.0 - rhs_selectivity)
         }
-        ast::Expr::Unary(ast::UnaryOperator::Not, inner) => {
+        PlanExpr::Unary {
+            operator: ast::UnaryOperator::Not,
+            expr: inner,
+        } => {
             1.0 - estimate_residual_expr_selectivity(
                 inner,
                 rhs_table,
@@ -618,7 +647,7 @@ fn estimate_residual_expr_selectivity(
 
 #[allow(clippy::too_many_arguments)]
 fn estimate_multi_or_residual_selectivity(
-    residual_exprs: &[ast::Expr],
+    residual_exprs: &[PlanExpr],
     rhs_table: &JoinedTable,
     table_references: &TableReferences,
     available_indexes: &AvailableIndexes,
@@ -780,7 +809,7 @@ fn analyze_and_terms_for_multi_index(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
-) -> Option<AndClauseDecomposition> {
+) -> Result<Option<AndClauseDecomposition>> {
     let table_id = table_reference.internal_id;
     let indexes = available_indexes.indexes_for_table(table_reference.internal_id);
     let rowid_alias_column = table_reference
@@ -797,7 +826,15 @@ fn analyze_and_terms_for_multi_index(
     let mut candidate_branches: Vec<AndBranchSummary> = Vec::new();
 
     for (where_term_idx, term) in where_clause.iter().enumerate() {
-        if term.consumed || matches!(&term.expr, ast::Expr::Binary(_, ast::Operator::Or, _)) {
+        if term.consumed
+            || matches!(
+                &term.expr,
+                PlanExpr::Binary {
+                    operator: ast::Operator::Or,
+                    ..
+                }
+            )
+        {
             continue;
         }
 
@@ -810,7 +847,8 @@ fn analyze_and_terms_for_multi_index(
             rowid_alias_column,
             table_references,
             subqueries,
-        ) else {
+        )?
+        else {
             continue;
         };
 
@@ -826,7 +864,7 @@ fn analyze_and_terms_for_multi_index(
     }
 
     if candidate_branches.len() < 2 {
-        return None;
+        return Ok(None);
     }
 
     // If a composite index already covers multiple constrained columns, prefer
@@ -862,7 +900,7 @@ fn analyze_and_terms_for_multi_index(
                 }
             }
             if columns_covered >= 2 {
-                return None;
+                return Ok(None);
             }
         }
     }
@@ -873,7 +911,7 @@ fn analyze_and_terms_for_multi_index(
     let mut seen_indexes: Vec<*const Index> = Vec::new();
     for branch in candidate_branches {
         if let Some(index) = branch.index.as_ref() {
-            let index_ptr = Arc::as_ptr(index);
+            let index_ptr = std::ptr::from_ref(index.value());
             if seen_indexes.contains(&index_ptr) {
                 continue;
             }
@@ -883,42 +921,40 @@ fn analyze_and_terms_for_multi_index(
     }
 
     if selected_branches.len() < 2 {
-        return None;
+        return Ok(None);
     }
 
-    let unique_branches = selected_branches
-        .into_iter()
-        .map(|branch| {
-            let analyzed = analyze_binary_term_for_index(
-                &where_clause[branch.where_term_idx].expr,
-                branch.where_term_idx,
-                table_id,
-                table_reference,
-                where_clause,
-                indexes,
-                rowid_alias_column,
-                table_references,
-                subqueries,
-                schema,
-                params,
-            )
-            .expect("multi-index prepass accepted a term that full analysis rejected");
+    let mut unique_branches = Vec::with_capacity(selected_branches.len());
+    for branch in selected_branches {
+        let analyzed = analyze_binary_term_for_index(
+            &where_clause[branch.where_term_idx].expr,
+            branch.where_term_idx,
+            table_id,
+            table_reference,
+            where_clause,
+            indexes,
+            rowid_alias_column,
+            table_references,
+            subqueries,
+            schema,
+            params,
+        )?
+        .expect("multi-index prepass accepted a term that full analysis rejected");
 
-            turso_assert_eq!(analyzed.constraint.table_col_pos, branch.table_col_pos);
+        turso_assert_eq!(analyzed.constraint.table_col_pos, branch.table_col_pos);
 
-            AndBranch {
-                where_term_idx: branch.where_term_idx,
-                constraint: analyzed.constraint,
-                index: analyzed.best_index,
-                constraint_refs: analyzed.constraint_refs,
-            }
-        })
-        .collect::<Vec<_>>();
+        unique_branches.push(AndBranch {
+            where_term_idx: branch.where_term_idx,
+            constraint: analyzed.constraint,
+            index: analyzed.best_index,
+            constraint_refs: analyzed.constraint_refs,
+        });
+    }
 
-    Some(AndClauseDecomposition {
+    Ok(Some(AndClauseDecomposition {
         term_indices: unique_branches.iter().map(|b| b.where_term_idx).collect(),
         branches: unique_branches,
-    })
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -946,7 +982,11 @@ pub fn consider_multi_index_union(
             continue;
         }
 
-        let ast::Expr::Binary(_, ast::Operator::Or, _) = &term.expr else {
+        let PlanExpr::Binary {
+            operator: ast::Operator::Or,
+            ..
+        } = &term.expr
+        else {
             continue;
         };
 
@@ -971,14 +1011,11 @@ pub fn consider_multi_index_union(
         let branches = disjuncts
             .into_iter()
             .map(|disjunct_expr| {
-                let Ok(disjunct_expr) = crate::translate::expr::unwrap_parens(disjunct_expr) else {
-                    return Ok(None);
-                };
                 let conjuncts = flatten_and_expr(disjunct_expr)
                     .into_iter()
                     .cloned()
                     .collect::<Vec<_>>();
-                let Some((synthetic_where_terms, table_constraints)) =
+                let (synthetic_where_terms, table_constraints) =
                     get_table_local_constraints_for_branch(
                         &conjuncts,
                         term.from_outer_join,
@@ -988,11 +1025,7 @@ pub fn consider_multi_index_union(
                         subqueries,
                         schema,
                         params,
-                    )
-                    .ok()
-                else {
-                    return Ok(None);
-                };
+                    )?;
                 let Some(mut chosen) = choose_multi_index_branch_access(
                     rhs_table,
                     &table_constraints,
@@ -1003,6 +1036,7 @@ pub fn consider_multi_index_union(
                     available_indexes,
                     base_row_count,
                     analyze_stats,
+                    subqueries,
                     params,
                 )?
                 else {
@@ -1089,7 +1123,8 @@ pub fn consider_multi_index_intersection(
         subqueries,
         schema,
         params,
-    ) else {
+    )?
+    else {
         return Ok(None);
     };
 
@@ -1119,7 +1154,7 @@ pub fn consider_multi_index_intersection(
             .expect("intersection branches always have costable access");
             let analyze_ctx = AnalyzeCtx {
                 rhs_table,
-                index: b.index.as_ref(),
+                index: b.index.as_deref(),
                 stats: analyze_stats,
             };
             MultiIdxBranch {
@@ -1197,16 +1232,16 @@ mod tests {
                 AvailableIndexes,
             },
             plan::{
-                ColumnUsedMask, JoinInfo, JoinType, JoinedTable, Operation, TableReferences,
-                WhereTerm,
+                ColumnUsedMask, JoinInfo, JoinType, JoinedTable, Operation, PlanIndexHint,
+                SourceReadPrograms, TableReferences, WhereTerm,
             },
+            plan_expr::{PlanExpr, PlanIdentityAllocator, PlanSourceId},
             planner::TableMask,
         },
-        vdbe::builder::TableRefIdCounter,
         MAIN_DB_ID,
     };
     use std::{collections::VecDeque, sync::Arc};
-    use turso_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
+    use turso_parser::ast::{self, Operator, SortOrder};
 
     struct TestColumn {
         name: String,
@@ -1259,13 +1294,15 @@ mod tests {
     fn create_table_reference(
         table: Arc<BTreeTable>,
         join_info: Option<JoinInfo>,
-        internal_id: TableInternalId,
+        internal_id: PlanSourceId,
     ) -> JoinedTable {
         let name = table.name.clone();
+        let column_count = table.columns().len();
         let table = Table::BTree(table);
         JoinedTable {
             op: Operation::default_scan_for(&table),
             table,
+            resolved_table: None,
             identifier: name,
             internal_id,
             join_info,
@@ -1273,27 +1310,32 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
-            indexed: None,
-            bound_index_method_patterns: Vec::new(),
-            bound_index_expressions: Vec::new(),
+            index_hint: PlanIndexHint::None,
+            index_method_patterns: Vec::new(),
+            index_expressions: Vec::new(),
+            read_programs: Arc::new(SourceReadPrograms::none(column_count)),
+            check_constraints: Vec::new(),
         }
     }
 
-    fn create_column_expr(table: TableInternalId, column: usize, is_rowid_alias: bool) -> Expr {
-        Expr::Column {
-            database: None,
-            table,
-            column,
-            is_rowid_alias,
+    fn create_column_expr(table: PlanSourceId, column: usize, is_rowid_alias: bool) -> PlanExpr {
+        let mut expression = PlanExpr::column(table, column);
+        if let PlanExpr::Column(column) = &mut expression {
+            column.rowid_alias = is_rowid_alias;
         }
+        expression
     }
 
-    fn create_numeric_literal(value: &str) -> Expr {
-        Expr::Literal(ast::Literal::Numeric(value.to_string()))
+    fn create_numeric_literal(value: &str) -> PlanExpr {
+        PlanExpr::literal(ast::Literal::Numeric(value.to_string()))
     }
 
-    fn create_string_literal(value: &str) -> Expr {
-        Expr::Literal(ast::Literal::String(value.to_string()))
+    fn create_string_literal(value: &str) -> PlanExpr {
+        PlanExpr::literal(ast::Literal::String(value.to_string()))
+    }
+
+    fn binary(lhs: Box<PlanExpr>, operator: Operator, rhs: Box<PlanExpr>) -> PlanExpr {
+        PlanExpr::binary(*lhs, operator, *rhs)
     }
 
     fn assert_is_multi_index(
@@ -1329,9 +1371,9 @@ mod tests {
             ],
         );
 
-        let mut table_id_counter = TableRefIdCounter::new();
+        let mut table_id_counter = PlanIdentityAllocator::new();
         let joined_tables = vec![
-            create_table_reference(link, None, table_id_counter.next()),
+            create_table_reference(link, None, table_id_counter.next_source()),
             create_table_reference(
                 item,
                 Some(JoinInfo {
@@ -1339,7 +1381,7 @@ mod tests {
                     using: vec![],
                     no_reorder: false,
                 }),
-                table_id_counter.next(),
+                table_id_counter.next_source(),
             ),
             create_table_reference(
                 meta,
@@ -1348,7 +1390,7 @@ mod tests {
                     using: vec![],
                     no_reorder: false,
                 }),
-                table_id_counter.next(),
+                table_id_counter.next_source(),
             ),
         ];
 
@@ -1374,7 +1416,7 @@ mod tests {
             })]),
         );
 
-        let lhs_link_src = Expr::Binary(
+        let lhs_link_src = binary(
             Box::new(create_column_expr(
                 joined_tables[LINK].internal_id,
                 0,
@@ -1383,7 +1425,7 @@ mod tests {
             Operator::Equals,
             Box::new(create_numeric_literal("1")),
         );
-        let lhs_link_dst_item_id = Expr::Binary(
+        let lhs_link_dst_item_id = binary(
             Box::new(create_column_expr(
                 joined_tables[LINK].internal_id,
                 1,
@@ -1396,7 +1438,7 @@ mod tests {
                 false,
             )),
         );
-        let rhs_link_dst = Expr::Binary(
+        let rhs_link_dst = binary(
             Box::new(create_column_expr(
                 joined_tables[LINK].internal_id,
                 1,
@@ -1405,7 +1447,7 @@ mod tests {
             Operator::Equals,
             Box::new(create_numeric_literal("1")),
         );
-        let rhs_link_src_item_id = Expr::Binary(
+        let rhs_link_src_item_id = binary(
             Box::new(create_column_expr(
                 joined_tables[LINK].internal_id,
                 0,
@@ -1418,7 +1460,7 @@ mod tests {
                 false,
             )),
         );
-        let future_meta_kind = Expr::Binary(
+        let future_meta_kind = binary(
             Box::new(create_column_expr(
                 joined_tables[META].internal_id,
                 1,
@@ -1428,8 +1470,8 @@ mod tests {
             Box::new(create_string_literal("entity")),
         );
 
-        let left_disjunct = Expr::Binary(
-            Box::new(Expr::Binary(
+        let left_disjunct = binary(
+            Box::new(binary(
                 Box::new(lhs_link_src),
                 Operator::And,
                 Box::new(lhs_link_dst_item_id),
@@ -1437,8 +1479,8 @@ mod tests {
             Operator::And,
             Box::new(future_meta_kind.clone()),
         );
-        let right_disjunct = Expr::Binary(
-            Box::new(Expr::Binary(
+        let right_disjunct = binary(
+            Box::new(binary(
                 Box::new(rhs_link_dst),
                 Operator::And,
                 Box::new(rhs_link_src_item_id),
@@ -1447,7 +1489,7 @@ mod tests {
             Box::new(future_meta_kind),
         );
         let where_clause = vec![WhereTerm {
-            expr: Expr::Binary(
+            expr: binary(
                 Box::new(left_disjunct),
                 Operator::Or,
                 Box::new(right_disjunct),
@@ -1496,8 +1538,12 @@ mod tests {
             ],
         );
 
-        let mut table_id_counter = TableRefIdCounter::new();
-        let joined_tables = vec![create_table_reference(item, None, table_id_counter.next())];
+        let mut table_id_counter = PlanIdentityAllocator::new();
+        let joined_tables = vec![create_table_reference(
+            item,
+            None,
+            table_id_counter.next_source(),
+        )];
         let item_id = joined_tables[0].internal_id;
 
         let mut available_indexes = AvailableIndexes::default();
@@ -1520,7 +1566,7 @@ mod tests {
 
         let where_clause = vec![
             WhereTerm {
-                expr: Expr::Binary(
+                expr: binary(
                     Box::new(create_column_expr(item_id, 0, true)),
                     Operator::Greater,
                     Box::new(create_numeric_literal("10")),
@@ -1529,7 +1575,7 @@ mod tests {
                 consumed: false,
             },
             WhereTerm {
-                expr: Expr::Binary(
+                expr: binary(
                     Box::new(create_column_expr(item_id, 1, false)),
                     Operator::Equals,
                     Box::new(create_numeric_literal("7")),
@@ -1591,9 +1637,9 @@ mod tests {
             ],
         );
 
-        let mut table_id_counter = TableRefIdCounter::new();
+        let mut table_id_counter = PlanIdentityAllocator::new();
         let joined_tables = vec![
-            create_table_reference(link, None, table_id_counter.next()),
+            create_table_reference(link, None, table_id_counter.next_source()),
             create_table_reference(
                 item,
                 Some(JoinInfo {
@@ -1601,7 +1647,7 @@ mod tests {
                     using: vec![],
                     no_reorder: false,
                 }),
-                table_id_counter.next(),
+                table_id_counter.next_source(),
             ),
         ];
 
@@ -1643,9 +1689,9 @@ mod tests {
             })]),
         );
 
-        let left_disjunct = Expr::Binary(
-            Box::new(Expr::Binary(
-                Box::new(Expr::Binary(
+        let left_disjunct = binary(
+            Box::new(binary(
+                Box::new(binary(
                     Box::new(create_column_expr(
                         joined_tables[LINK].internal_id,
                         0,
@@ -1655,7 +1701,7 @@ mod tests {
                     Box::new(create_numeric_literal("1")),
                 )),
                 Operator::And,
-                Box::new(Expr::Binary(
+                Box::new(binary(
                     Box::new(create_column_expr(
                         joined_tables[ITEM].internal_id,
                         0,
@@ -1670,7 +1716,7 @@ mod tests {
                 )),
             )),
             Operator::And,
-            Box::new(Expr::Binary(
+            Box::new(binary(
                 Box::new(create_column_expr(
                     joined_tables[ITEM].internal_id,
                     1,
@@ -1680,9 +1726,9 @@ mod tests {
                 Box::new(create_numeric_literal("7")),
             )),
         );
-        let right_disjunct = Expr::Binary(
-            Box::new(Expr::Binary(
-                Box::new(Expr::Binary(
+        let right_disjunct = binary(
+            Box::new(binary(
+                Box::new(binary(
                     Box::new(create_column_expr(
                         joined_tables[LINK].internal_id,
                         1,
@@ -1692,7 +1738,7 @@ mod tests {
                     Box::new(create_numeric_literal("1")),
                 )),
                 Operator::And,
-                Box::new(Expr::Binary(
+                Box::new(binary(
                     Box::new(create_column_expr(
                         joined_tables[ITEM].internal_id,
                         0,
@@ -1707,7 +1753,7 @@ mod tests {
                 )),
             )),
             Operator::And,
-            Box::new(Expr::Binary(
+            Box::new(binary(
                 Box::new(create_column_expr(
                     joined_tables[ITEM].internal_id,
                     1,
@@ -1719,7 +1765,7 @@ mod tests {
         );
 
         let where_clause = vec![WhereTerm {
-            expr: Expr::Binary(
+            expr: binary(
                 Box::new(left_disjunct),
                 Operator::Or,
                 Box::new(right_disjunct),
@@ -1787,9 +1833,9 @@ mod tests {
             ],
         );
 
-        let mut table_id_counter = TableRefIdCounter::new();
+        let mut table_id_counter = PlanIdentityAllocator::new();
         let joined_tables = vec![
-            create_table_reference(link, None, table_id_counter.next()),
+            create_table_reference(link, None, table_id_counter.next_source()),
             create_table_reference(
                 item,
                 Some(JoinInfo {
@@ -1797,7 +1843,7 @@ mod tests {
                     using: vec![],
                     no_reorder: false,
                 }),
-                table_id_counter.next(),
+                table_id_counter.next_source(),
             ),
         ];
 
@@ -1825,14 +1871,14 @@ mod tests {
         );
 
         let make_branch = |literal_col, join_col, item_kind: Option<&str>| {
-            let branch = Expr::Binary(
-                Box::new(Expr::Binary(
+            let branch = binary(
+                Box::new(binary(
                     Box::new(create_column_expr(link_id, literal_col, false)),
                     Operator::Equals,
                     Box::new(create_numeric_literal("1")),
                 )),
                 Operator::And,
-                Box::new(Expr::Binary(
+                Box::new(binary(
                     Box::new(create_column_expr(item_id, 0, false)),
                     Operator::Equals,
                     Box::new(create_column_expr(link_id, join_col, false)),
@@ -1840,10 +1886,10 @@ mod tests {
             );
 
             if let Some(kind) = item_kind {
-                Expr::Binary(
+                binary(
                     Box::new(branch),
                     Operator::And,
-                    Box::new(Expr::Binary(
+                    Box::new(binary(
                         Box::new(create_column_expr(item_id, 1, false)),
                         Operator::Equals,
                         Box::new(create_numeric_literal(kind)),
@@ -1855,7 +1901,7 @@ mod tests {
         };
         let make_join_expr = |item_kind: Option<&str>| {
             vec![WhereTerm {
-                expr: Expr::Binary(
+                expr: binary(
                     Box::new(make_branch(0, 1, item_kind)),
                     Operator::Or,
                     Box::new(make_branch(1, 0, item_kind)),

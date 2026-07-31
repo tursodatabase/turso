@@ -226,7 +226,9 @@ pub(crate) fn set_update_stmt_journal_flags(
         has_statement_conflict,
         or_conflict,
         btree_table.rowid_alias_conflict_clause,
-        plan.indexes_to_update.iter().map(|idx| idx.on_conflict),
+        plan.indexes_to_update
+            .iter()
+            .map(|idx| idx.value().on_conflict),
     );
 
     // Ephemeral tables (used for key mutation / Halloween protection) always scan all
@@ -247,8 +249,8 @@ pub(crate) fn set_update_stmt_journal_flags(
             .is_some_and(|c| c.notnull() && !c.is_rowid_alias())
     });
     let has_check = !btree_table.check_constraints.is_empty();
-    let has_unique =
-        !btree_table.unique_sets.is_empty() || plan.indexes_to_update.iter().any(|idx| idx.unique);
+    let has_unique = !btree_table.unique_sets.is_empty()
+        || plan.indexes_to_update.iter().any(|idx| idx.value().unique);
 
     let may_abort = has_triggers
         || has_fks
@@ -258,7 +260,7 @@ pub(crate) fn set_update_stmt_journal_flags(
             btree_table.rowid_alias_conflict_clause,
             plan.indexes_to_update
                 .iter()
-                .map(|idx| (idx.on_conflict, idx.unique)),
+                .map(|idx| (idx.value().on_conflict, idx.value().unique)),
             has_notnull_cols,
             has_check,
             has_unique,

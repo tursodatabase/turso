@@ -3,8 +3,7 @@ use crate::numeric::StrToF64;
 use crate::schema::ColDef;
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
-use crate::translate::plan::{BitSet, TableReferences};
-use crate::translate::planner::TableMask;
+use crate::translate::plan::BitSet;
 use crate::types::IOResult;
 use crate::IO;
 use crate::{
@@ -203,7 +202,8 @@ pub fn parse_schema_rows(
     schema: &mut Schema,
     syms: &SymbolTable,
     resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
-    dialect: &dyn crate::dialect::Dialect,
+    custom_types_enabled: bool,
+    dialect: std::sync::Arc<dyn crate::dialect::Dialect>,
 ) -> Result<IOResult<()>> {
     {
         let inner = state
@@ -239,7 +239,7 @@ pub fn parse_schema_rows(
                 dbsp_state_index_roots,
                 materialized_view_info,
                 resolve_attached_db,
-                dialect,
+                dialect.as_ref(),
             )
         }));
     }
@@ -260,6 +260,10 @@ pub fn parse_schema_rows(
         inner.materialized_view_info,
         inner.dbsp_state_roots,
         inner.dbsp_state_index_roots,
+        syms,
+        custom_types_enabled,
+        dialect,
+        None,
     )?;
 
     Ok(IOResult::Done(()))
@@ -424,36 +428,6 @@ pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
     }
 }
 
-/// Returns true if every Column/RowId table reference in `expr` is contained
-/// in `allowed`. Constants (no table refs) pass.
-pub(crate) fn expr_tables_subset_of(
-    expr: &Expr,
-    table_references: &TableReferences,
-    allowed: &TableMask,
-) -> bool {
-    let mut ok = true;
-    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
-        match e {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                if let Some(idx) = table_references
-                    .joined_tables()
-                    .iter()
-                    .position(|t| t.internal_id == *table)
-                {
-                    if !allowed.get(idx) {
-                        ok = false;
-                        return Ok(WalkControl::SkipChildren);
-                    }
-                }
-                // Outer query references are already in scope — allow them.
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    });
-    ok
-}
-
 pub fn try_substitute_parameters(
     pattern: &Expr,
     parameters: &HashMap<i32, Expr>,
@@ -548,10 +522,7 @@ pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i3
             captured.insert(var, expr.clone());
             Some(captured)
         }
-        (
-            Expr::Id(_) | Expr::Name(_) | Expr::Column { .. },
-            Expr::Id(_) | Expr::Name(_) | Expr::Column { .. },
-        ) => {
+        (Expr::Id(_) | Expr::Name(_), Expr::Id(_) | Expr::Name(_)) => {
             if pattern == query {
                 Some(captured)
             } else {
@@ -860,20 +831,6 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                     .zip(rhs2.iter())
                     .all(|(a, b)| exprs_are_equivalent(a, b))
         }
-        (
-            Expr::Column {
-                database: db1,
-                is_rowid_alias: r1,
-                table: tbl_1,
-                column: col_1,
-            },
-            Expr::Column {
-                database: db2,
-                is_rowid_alias: r2,
-                table: tbl_2,
-                column: col_2,
-            },
-        ) => tbl_1 == tbl_2 && col_1 == col_2 && db1 == db2 && r1 == r2,
         // fall back to naive equality check
         _ => expr1 == expr2,
     }
@@ -3425,10 +3382,10 @@ pub fn rewrite_column_references_if_needed(
                 rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
             }
             ast::ColumnConstraint::Check(expr) => {
-                crate::translate::bind::rename_schema_expr_identifiers(expr, from, to);
+                crate::schema_expr::rename_schema_expr_identifiers(expr, from, to);
             }
             ast::ColumnConstraint::Generated { expr, .. } => {
-                crate::translate::bind::rename_schema_expr_identifiers(expr, from, to);
+                crate::schema_expr::rename_schema_expr_identifiers(expr, from, to);
             }
             _ => {}
         }

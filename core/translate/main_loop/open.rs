@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::expr::translate_plan_expr;
 use crate::translate::main_loop::{conditions::LoopConditionEmitter, hash::HashProbeSetupEmitter};
 use crate::translate::{
     main_loop::close::AutoIndexBuild,
@@ -142,7 +143,7 @@ impl OpenLoop {
 
                                 for (argv_index, expr) in constraints.iter().enumerate() {
                                     let target_reg = start_reg + argv_index;
-                                    translate_expr(
+                                    translate_plan_expr(
                                         program,
                                         Some(table_references),
                                         expr,
@@ -275,7 +276,7 @@ impl OpenLoop {
                                 "Subqueries do not support rowid seeks"
                             );
                             let src_reg = program.alloc_register();
-                            translate_expr(
+                            translate_plan_expr(
                                 program,
                                 Some(table_references),
                                 cmp_expr,
@@ -320,7 +321,7 @@ impl OpenLoop {
                                     } = emit_autoindex(
                                         program,
                                         AutoIndexBuild {
-                                            index,
+                                            index: index.value(),
                                             table_cursor_id: table_cursor_id.expect(
                                                 "an ephemeral index must have a source table cursor",
                                             ),
@@ -331,7 +332,8 @@ impl OpenLoop {
                                             num_seek_keys,
                                             seek_def,
                                             affinity_str: plan::synthesized_seek_affinity_str(
-                                                index, seek_def,
+                                                index.value(),
+                                                seek_def,
                                             )
                                             .as_ref(),
                                             table_columns,
@@ -428,7 +430,7 @@ impl OpenLoop {
                                 program,
                                 table_references,
                                 &t_ctx.resolver,
-                                index.as_ref(),
+                                index.as_ref().map(|index| index.value()),
                                 source,
                             )?;
 
@@ -508,7 +510,7 @@ impl OpenLoop {
                     let start_reg = program.alloc_registers(query.arguments.len() + 1);
                     program.emit_int(query.pattern_idx as i64, start_reg);
                     for i in 0..query.arguments.len() {
-                        translate_expr(
+                        translate_plan_expr(
                             program,
                             Some(table_references),
                             &query.arguments[i],

@@ -124,7 +124,7 @@ use super::{
         exec_array_append, exec_array_cat, exec_array_contains, exec_array_contains_all,
         exec_array_overlap, exec_array_position, exec_array_prepend, exec_array_remove,
         exec_array_slice, exec_array_to_string, exec_string_to_array, make_array_from_registers,
-        parse_text_array, serialize_array_from_blob, values_to_record_blob,
+        parse_text_array, serialize_array_from_blob_with_rank, values_to_record_blob,
     },
     insn::{Cookie, RegisterOrLiteral, SortComparatorType},
     CommitState,
@@ -297,7 +297,7 @@ fn make_sort_comparator(
                     (_, ValueRef::Null) => Ordering::Greater,
                     (ValueRef::Blob(a_blob), ValueRef::Blob(b_blob)) => {
                         crate::vdbe::array::compare_arrays(a_blob, b_blob)
-                            .unwrap_or(Ordering::Equal)
+                            .unwrap_or_else(|_| a.partial_cmp(b).unwrap_or(Ordering::Equal))
                     }
                     (ValueRef::Text(a_text), ValueRef::Text(b_text)) => {
                         let a_vals = crate::vdbe::array::parse_text_array(a_text);
@@ -2259,7 +2259,14 @@ pub fn op_array_decode(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(ArrayDecode { reg }, insn);
+    load_insn!(
+        ArrayDecode {
+            reg,
+            dimensions,
+            rank_unbounded,
+        },
+        insn
+    );
 
     let val = state.registers[*reg].get_value();
     if matches!(val, Value::Null) {
@@ -2268,15 +2275,17 @@ pub fn op_array_decode(
     }
 
     let text = match val {
-        Value::Blob(b) if b.is_empty() => "{}".to_string(),
-        Value::Blob(b) => serialize_array_from_blob(b)?,
+        Value::Blob(b) if b.is_empty() => Some("{}".to_string()),
+        Value::Blob(b) => serialize_array_from_blob_with_rank(b, *dimensions, *rank_unbounded).ok(),
         _ => {
             // Not a blob — leave as-is (might be text from a function result)
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
     };
-    state.registers[*reg].set_text(Text::new(text))?;
+    if let Some(text) = text {
+        state.registers[*reg].set_text(Text::new(text))?;
+    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2668,25 +2677,37 @@ pub fn op_array_concat(
 
     let result = match (lhs_ref, rhs_ref) {
         (Value::Blob(lb), Value::Blob(rb)) => {
-            let mut elems_a = array_values_from_blob(lb)?;
-            let elems_b = array_values_from_blob(rb)?;
-            elems_a.extend(elems_b);
-            values_to_record_blob(&elems_a)?
+            match (array_values_from_blob(lb), array_values_from_blob(rb)) {
+                (Ok(mut elems_a), Ok(elems_b)) => {
+                    elems_a.extend(elems_b);
+                    values_to_record_blob(&elems_a)?
+                }
+                (Ok(mut elems), Err(_)) => {
+                    elems.push(rhs_ref.clone());
+                    values_to_record_blob(&elems)?
+                }
+                (Err(_), Ok(mut elems)) => {
+                    elems.insert(0, lhs_ref.clone());
+                    values_to_record_blob(&elems)?
+                }
+                (Err(_), Err(_)) => lhs_ref.exec_concat(rhs_ref)?,
+            }
         }
-        (Value::Blob(lb), _) => {
-            let mut elems = array_values_from_blob(lb)?;
-            elems.push(rhs_ref.clone());
-            values_to_record_blob(&elems)?
-        }
-        (_, Value::Blob(rb)) => {
-            let mut elems = array_values_from_blob(rb)?;
-            elems.insert(0, lhs_ref.clone());
-            values_to_record_blob(&elems)?
-        }
-        _ => {
-            // Neither is an array blob — fall back to string concat
-            Value::build_text(format!("{lhs_ref}{rhs_ref}"))
-        }
+        (Value::Blob(lb), _) => match array_values_from_blob(lb) {
+            Ok(mut elems) => {
+                elems.push(rhs_ref.clone());
+                values_to_record_blob(&elems)?
+            }
+            Err(_) => lhs_ref.exec_concat(rhs_ref)?,
+        },
+        (_, Value::Blob(rb)) => match array_values_from_blob(rb) {
+            Ok(mut elems) => {
+                elems.insert(0, lhs_ref.clone());
+                values_to_record_blob(&elems)?
+            }
+            Err(_) => lhs_ref.exec_concat(rhs_ref)?,
+        },
+        _ => lhs_ref.exec_concat(rhs_ref)?,
     };
 
     state.registers[*dest].set_value(result);
@@ -10035,7 +10056,7 @@ pub fn op_function(
                                 }
 
                                 for column in &mut columns {
-                                    crate::translate::bind::rename_schema_expr_identifiers(
+                                    crate::schema_expr::rename_schema_expr_identifiers(
                                         column.expr.as_mut(),
                                         &rename_from,
                                         column_def.col_name.as_str(),
@@ -10043,7 +10064,7 @@ pub fn op_function(
                                 }
 
                                 if let Some(ref mut wc) = where_clause {
-                                    crate::translate::bind::rename_schema_expr_identifiers(
+                                    crate::schema_expr::rename_schema_expr_identifiers(
                                         wc,
                                         &rename_from,
                                         column_def.col_name.as_str(),
@@ -10165,7 +10186,7 @@ pub fn op_function(
                                                 );
                                             }
                                             ast::TableConstraint::Check(ref mut expr) => {
-                                                crate::translate::bind::rename_schema_expr_identifiers(
+                                                crate::schema_expr::rename_schema_expr_identifiers(
                                                     expr,
                                                     &rename_from,
                                                     column_def.col_name.as_str(),
@@ -13225,7 +13246,7 @@ pub fn op_parse_schema(
 
     // If we have in-progress state, resume stepping through schema rows.
     if state.active_op_state.parse_schema().is_some() {
-        return op_parse_schema_step(state, &conn);
+        return op_parse_schema_step(program, state, &conn);
     }
 
     // set auto commit to false in order for parse schema to not commit changes as transaction state is stored in connection,
@@ -13308,13 +13329,14 @@ pub fn op_parse_schema(
     }));
 
     // Now begin stepping through the schema rows
-    op_parse_schema_step(state, &conn)
+    op_parse_schema_step(program, state, &conn)
 }
 
 /// Drive the inner schema statement one step at a time.
 /// Returns IO to the outer VDBE loop when the inner statement needs it,
 /// preserving all intermediate parsing state for resumption.
 fn op_parse_schema_step(
+    program: &Program,
     state: &mut ProgramState,
     conn: &Arc<Connection>,
 ) -> Result<InsnFunctionStepResult> {
@@ -13396,6 +13418,10 @@ fn op_parse_schema_step(
                     materialized_view_info,
                     dbsp_state_roots,
                     dbsp_state_index_roots,
+                    &syms,
+                    conn.experimental_custom_types_enabled(),
+                    conn.dialect(),
+                    Some(&program.prepared.incremental_view_templates),
                 );
 
                 // Store the modified schema back
@@ -14962,11 +14988,9 @@ pub fn op_rename_table(
 
                 // Rewrite table-qualified refs in CHECK constraints
                 for check in &mut btree.check_constraints {
-                    rewrite_check_expr_table_refs(
-                        &mut check.expr,
-                        &normalized_from,
-                        &normalized_to,
-                    );
+                    check
+                        .expr
+                        .rename_table_references(&normalized_from, &normalized_to)?;
                 }
 
                 normalized_to.clone_into(&mut btree.name);
@@ -15133,17 +15157,7 @@ pub fn op_drop_column(
                 .is_none_or(|col| normalize_ident(col) != normalize_ident(&col_name))
         });
 
-        crate::translate::bind::shift_generated_columns_after_drop(btree, *column_index)?;
-        // Shift SELF_TABLE positional references in surviving CHECK
-        // constraints (constraints referencing the dropped column itself were
-        // rejected during translation).
-        for check in &mut btree.check_constraints {
-            crate::translate::bind::shift_schema_expr_after_drop(
-                &mut check.expr,
-                *column_index,
-                false,
-            )?;
-        }
+        btree.remap_schema_expressions_after_drop(*column_index)?;
         Ok(())
     })??;
 
@@ -15164,14 +15178,15 @@ pub fn op_drop_column(
         Ok(())
     })?;
 
-    // Shift left pos_in_table in all indexes, and self-table placeholders in generated column
-    // expressions, to account for the dropped column. For example, if the dropped column had index
-    // 2, then anything that was indexed on column 3 or higher should be decremented by 1.
+    // Shift later index column positions and positional references in stored
+    // index expressions to account for the dropped column. For example, if the
+    // dropped column had index 2, then references to column 3 or higher move
+    // left by one.
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
             for index in indexes {
                 let index = Arc::get_mut(index).expect("this should be the only strong reference");
-                crate::translate::bind::shift_index_after_drop(index, *column_index)?;
+                index.remap_after_drop(*column_index)?;
             }
         }
         Ok(())
@@ -15255,7 +15270,8 @@ pub fn op_alter_column(
             db,
             table: table_name,
             column_index,
-            definition,
+            table_definition,
+            indexes,
             rename,
         },
         insn
@@ -15277,8 +15293,13 @@ pub fn op_alter_column(
             .expect("column being ALTERed should be named")
             .clone()
     });
-    let new_column = crate::schema::Column::try_from(definition.as_ref())?;
-    let new_name = definition.col_name.as_str().to_owned();
+    let new_name = table_definition
+        .columns()
+        .get(*column_index)
+        .and_then(|column| column.name.clone())
+        .ok_or_else(|| {
+            LimboError::InternalError("ALTER COLUMN replacement has no name".to_string())
+        })?;
 
     let view_rewrites: Vec<(usize, String, RewrittenView)> = if *rename {
         let target_db_name = conn.get_database_name_by_index(*db).ok_or_else(|| {
@@ -15331,171 +15352,98 @@ pub fn op_alter_column(
         Vec::new()
     };
 
+    let mut replacement_table = table_definition.as_ref().clone();
+    replacement_table.prepare_generated_columns()?;
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
+        {
+            let table = schema
+                .tables
+                .get(&normalized_table_name)
+                .expect("table being ALTERed should be in schema");
+            let Table::BTree(current_table) = table.as_ref() else {
+                panic!("only btree tables can be altered");
+            };
+            if normalize_ident(&replacement_table.name) != normalized_table_name
+                || replacement_table.root_page != current_table.root_page
+                || replacement_table.columns().len() != current_table.columns().len()
+                || replacement_table.has_rowid != current_table.has_rowid
+                || replacement_table.is_strict != current_table.is_strict
+            {
+                return Err(LimboError::InternalError(format!(
+                    "resolved ALTER COLUMN table no longer matches {}",
+                    current_table.name
+                )));
+            }
+        }
+
+        let current_index_count = schema
+            .indexes
+            .get(&normalized_table_name)
+            .map_or(0, |current| current.len());
+        if current_index_count != indexes.len() {
+            return Err(LimboError::InternalError(format!(
+                "resolved ALTER COLUMN indexes for {table_name} no longer match the schema"
+            )));
+        }
+        if let Some(current_indexes) = schema.indexes.get(&normalized_table_name) {
+            for current in current_indexes {
+                let Some(replacement) = indexes
+                    .iter()
+                    .find(|replacement| replacement.name.eq_ignore_ascii_case(&current.name))
+                else {
+                    return Err(LimboError::InternalError(format!(
+                        "resolved ALTER COLUMN is missing index {}",
+                        current.name
+                    )));
+                };
+                if replacement.root_page != current.root_page {
+                    return Err(LimboError::InternalError(format!(
+                        "resolved ALTER COLUMN index {} changed root page",
+                        current.name
+                    )));
+                }
+            }
+        }
+
+        if let Some(current_indexes) = schema.indexes.get_mut(&normalized_table_name) {
+            for current in current_indexes {
+                let replacement = indexes
+                    .iter()
+                    .find(|replacement| replacement.name.eq_ignore_ascii_case(&current.name))
+                    .expect("ALTER COLUMN index set was validated");
+                *current = replacement.clone();
+            }
+        }
+
         let table_arc = schema
             .tables
             .get_mut(&normalized_table_name)
             .expect("table being ALTERed should be in schema");
         let table = Arc::make_mut(table_arc);
-
-        let Table::BTree(ref mut btree_arc) = table else {
+        let Table::BTree(current_table) = table else {
             panic!("only btree tables can be altered");
         };
-        let btree = Arc::make_mut(btree_arc);
-        let existing_column_name = btree
-            .columns()
-            .get(*column_index)
-            .expect("column being ALTERed should be in schema");
-        let existing_column_name = existing_column_name
-            .name
-            .as_ref()
-            .expect("btree column should be named")
-            .clone();
-
-        // Update this table's indexes that reference the old column. Index
-        // expressions store column references in SELF_TABLE positional form,
-        // which is unaffected by a rename — only leftover raw identifiers
-        // (lenient schema load) and the display name need updating.
-        if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
-            let mut renamed_columns = btree.columns().to_vec();
-            if *rename {
-                if let Some(col) = renamed_columns.get_mut(*column_index) {
-                    col.name = Some(new_name.clone());
-                }
-            }
-            for idx in idxs {
-                let idx = Arc::make_mut(idx);
-                for ic in &mut idx.columns {
-                    if let Some(expr) = &mut ic.expr {
-                        crate::translate::bind::rename_schema_expr_identifiers(
-                            expr.as_mut(),
-                            &old_column_name,
-                            &new_name,
-                        );
-                        if ic.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL {
-                            ic.name =
-                                crate::translate::bind::render_schema_expr(expr, &renamed_columns)?;
-                        } else if ic.name.eq_ignore_ascii_case(&existing_column_name) {
-                            ic.name.clone_from(&new_name);
-                        }
-                    } else if ic.name.eq_ignore_ascii_case(&existing_column_name) {
-                        ic.name.clone_from(&new_name);
-                    }
-                }
-                // Update leftover raw identifiers in the partial index WHERE
-                // clause (SELF_TABLE references survive renames unchanged).
-                if let Some(ref mut wc) = idx.where_clause {
-                    crate::translate::bind::rename_schema_expr_identifiers(
-                        wc,
-                        &old_column_name,
-                        &new_name,
-                    );
-                }
-            }
-        }
-        let clears_autoincrement_sequence = !*rename
-            && btree.has_autoincrement
-            && btree
-                .columns()
-                .get(*column_index)
-                .is_some_and(|column| column.is_rowid_alias())
-            && !new_column.is_rowid_alias();
+        *current_table = Arc::new(replacement_table);
 
         if *rename {
-            btree.columns_mut()[*column_index].name = Some(new_name.clone());
-
-            // Refresh the cached sql in generated columns
-            let column_count = btree.columns().len();
-            for i in 0..column_count {
-                let cols_view = btree.columns();
-                if let Some(new_sql) = cols_view[i]
-                    .generated_expr()
-                    .map(|expr| crate::translate::bind::render_schema_expr(expr, cols_view))
-                    .transpose()?
-                {
-                    btree.columns_mut()[i].set_generated_original_sql(new_sql)
+            // Other tables own their foreign keys, so they are the only
+            // metadata outside the resolved replacement table that must be
+            // updated for a column rename.
+            for (name, table) in &mut schema.tables {
+                if normalize_ident(name) == normalized_table_name {
+                    continue;
                 }
-            }
-        } else {
-            btree.columns_mut()[*column_index] = new_column.clone();
-        }
-
-        btree.prepare_generated_columns()?;
-
-        // Keep primary_key_columns consistent (names may change on rename)
-        for (pk_name, _ord) in &mut btree.primary_key_columns {
-            if pk_name.eq_ignore_ascii_case(&old_column_name) {
-                pk_name.clone_from(&new_name);
-            }
-        }
-
-        // Update unique_sets to reflect the renamed column
-        for unique_set in &mut btree.unique_sets {
-            for (col_name, _) in &mut unique_set.columns {
-                if col_name.eq_ignore_ascii_case(&old_column_name) {
-                    col_name.clone_from(&new_name);
-                }
-            }
-        }
-
-        // Update CHECK constraint expressions to reference the new column name
-        let old_col_normalized = normalize_ident(&old_column_name);
-        for check in &mut btree.check_constraints {
-            crate::translate::bind::rename_schema_expr_identifiers(
-                &mut check.expr,
-                &old_col_normalized,
-                &new_name,
-            );
-            if let Some(ref mut col) = check.column {
-                if col.eq_ignore_ascii_case(&old_column_name) {
-                    col.clone_from(&new_name);
-                }
-            }
-        }
-
-        // Maintain rowid-alias bit after change/rename (INTEGER PRIMARY KEY)
-        if !*rename {
-            // recompute alias from `new_column`
-            btree.columns_mut()[*column_index].set_rowid_alias(new_column.is_rowid_alias());
-            if clears_autoincrement_sequence {
-                btree.has_autoincrement = false;
-            }
-        }
-
-        // Update this table's OWN foreign keys
-        for fk_arc in &mut btree.foreign_keys {
-            let fk = Arc::make_mut(fk_arc);
-            // child side: rename child column if it matches
-            for cc in &mut fk.child_columns {
-                if cc.eq_ignore_ascii_case(&old_column_name) {
-                    cc.clone_from(&new_name);
-                }
-            }
-            // parent side: if self-referencing, rename parent column too
-            if normalize_ident(&fk.parent_table) == normalized_table_name {
-                for pc in &mut fk.parent_columns {
-                    if pc.eq_ignore_ascii_case(&old_column_name) {
-                        pc.clone_from(&new_name);
-                    }
-                }
-            }
-        }
-
-        // fix OTHER tables that reference this table as parent
-        for (tname, t_arc) in schema.tables.iter_mut() {
-            if normalize_ident(tname) == normalized_table_name {
-                continue;
-            }
-            if let Table::BTree(ref mut child_btree_arc) = Arc::make_mut(t_arc) {
-                let child_btree = Arc::make_mut(child_btree_arc);
-                for fk_arc in &mut child_btree.foreign_keys {
-                    if normalize_ident(&fk_arc.parent_table) != normalized_table_name {
-                        continue;
-                    }
-                    let fk = Arc::make_mut(fk_arc);
-                    for pc in &mut fk.parent_columns {
-                        if pc.eq_ignore_ascii_case(&old_column_name) {
-                            pc.clone_from(&new_name);
+                if let Table::BTree(child_table) = Arc::make_mut(table) {
+                    let child_table = Arc::make_mut(child_table);
+                    for foreign_key in &mut child_table.foreign_keys {
+                        if normalize_ident(&foreign_key.parent_table) != normalized_table_name {
+                            continue;
+                        }
+                        let foreign_key = Arc::make_mut(foreign_key);
+                        for parent_column in &mut foreign_key.parent_columns {
+                            if parent_column.eq_ignore_ascii_case(&old_column_name) {
+                                parent_column.clone_from(&new_name);
+                            }
                         }
                     }
                 }

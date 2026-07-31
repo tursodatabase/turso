@@ -14,7 +14,7 @@ use crate::{
         expr::{
             emit_returning_results, emit_returning_scan_back, emit_table_column,
             restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
-            translate_expr_no_constant_opt, NoConstantOptReason, ReturningBufferCtx,
+            translate_plan_expr_no_constant_opt, NoConstantOptReason, ReturningBufferCtx,
         },
         fkeys::{
             build_index_affinity_string, emit_guarded_fk_decrement, open_read_index,
@@ -25,6 +25,7 @@ use crate::{
             DeletePlan, EvalAt, JoinOrderMember, JoinedTable, NonFromClauseSubquery, Operation,
             ResultSetColumn, Search, TableReferences,
         },
+        semantic::hir::ResolvedIndex,
         subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
         trigger_exec::{fire_trigger, TriggerContext},
     },
@@ -50,6 +51,9 @@ pub fn emit_program_for_delete(
         plan.table_references.joined_tables().len(),
         connection.db.opts.unsafe_testing,
     ));
+    t_ctx
+        .resolver
+        .bind_plan_subqueries(&plan.non_from_clause_subqueries);
 
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
@@ -69,7 +73,7 @@ pub fn emit_program_for_delete(
         });
         Some(ReturningBufferCtx {
             cursor_id: ret_cursor_id,
-            num_columns: plan.result_columns.len(),
+            result_columns: plan.result_columns.clone(),
         })
     } else {
         None
@@ -157,13 +161,11 @@ pub fn emit_program_for_delete(
             });
 
             // Open all indexes for writing (needed for DELETE)
-            let write_indices: Vec<_> = resolver.with_schema(table_ref.database_id, |s| {
-                s.get_indices(table_ref.table.get_name()).cloned().collect()
-            });
-            for index in &write_indices {
+            for resolved_index in &plan.indexes {
+                let index = resolved_index.handle();
                 let index_cursor_id = program.alloc_cursor_index(
                     Some(CursorKey::index(table_ref.internal_id, index.clone())),
-                    index,
+                    &index,
                 )?;
                 program.emit_insn(Insn::OpenWrite {
                     cursor_id: index_cursor_id,
@@ -203,6 +205,7 @@ pub fn emit_program_for_delete(
             &mut plan.table_references,
             &mut plan.non_from_clause_subqueries,
             &plan.result_columns,
+            &plan.indexes,
             rowid_reg,
             table_cursor_id,
             resolver,
@@ -246,6 +249,7 @@ pub fn emit_program_for_delete(
             &mut plan.table_references,
             &mut plan.non_from_clause_subqueries,
             &plan.result_columns,
+            &plan.indexes,
             resolver,
             returning_buffer.as_ref(),
         )?;
@@ -270,7 +274,7 @@ pub fn emit_program_for_delete(
     // RETURNING rows from being emitted (matching SQLite behavior).
     if let Some(ref buf) = returning_buffer {
         program.emit_insn(Insn::FkCheck { deferred: false });
-        emit_returning_scan_back(program, buf);
+        emit_returning_scan_back(program, buf, &plan.table_references, resolver)?;
     }
     // Finalize program
     program.result_columns = plan.result_columns;
@@ -428,6 +432,7 @@ fn emit_delete_insns<'a>(
     table_references: &mut TableReferences,
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
     result_columns: &'a [ResultSetColumn],
+    indexes: &[ResolvedIndex],
     resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
 ) -> Result<()> {
@@ -454,10 +459,10 @@ fn emit_delete_insns<'a>(
             }
             | Search::InSeek {
                 index: Some(index), ..
-            } => program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
+            } => program.resolve_cursor_id(&CursorKey::index(internal_id, index.handle())),
         },
         Operation::IndexMethodQuery(query) => {
-            program.resolve_cursor_id(&CursorKey::index(internal_id, query.index.clone()))
+            program.resolve_cursor_id(&CursorKey::index(internal_id, query.index.handle()))
         }
         Operation::HashJoin(_) => {
             unreachable!("access through HashJoin is not supported for delete statements")
@@ -538,33 +543,41 @@ fn emit_delete_insns<'a>(
 
     // Get the index that is being used to iterate the deletion loop, if there is one.
     let iteration_index = unsafe { &*table_reference }.op.index();
+    let iteration_resolved_index = iteration_index.map(|index| {
+        indexes
+            .iter()
+            .find(|resolved| std::ptr::eq(resolved.value(), index.as_ref()))
+            .expect("DELETE access index must be resolved by semantic analysis")
+    });
 
     // Capture iteration index key values BEFORE deleting the main table row,
     // since the main table cursor will be invalidated after deletion.
-    let iteration_idx_delete_ctx = if let Some(index) = iteration_index {
-        let iteration_index_cursor =
-            program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone()));
-        let num_regs = index.columns.len() + 1;
-        let start_reg = program.alloc_registers(num_regs);
-        for (reg_offset, column_index) in index.columns.iter().enumerate() {
-            emit_index_column_value_old_image(
-                program,
-                &t_ctx.resolver,
-                table_references,
-                main_table_cursor_id,
-                internal_id,
-                column_index,
-                start_reg + reg_offset,
-            )?;
-        }
-        program.emit_insn(Insn::RowId {
-            cursor_id: main_table_cursor_id,
-            dest: start_reg + num_regs - 1,
-        });
-        Some((iteration_index_cursor, start_reg, num_regs, index))
-    } else {
-        None
-    };
+    let iteration_idx_delete_ctx =
+        if let Some((index, resolved_index)) = iteration_index.zip(iteration_resolved_index) {
+            let iteration_index_cursor =
+                program.resolve_cursor_id(&CursorKey::index(internal_id, index.handle()));
+            let num_regs = index.columns.len() + 1;
+            let start_reg = program.alloc_registers(num_regs);
+            for reg_offset in 0..index.columns.len() {
+                emit_index_column_value_old_image(
+                    program,
+                    &t_ctx.resolver,
+                    table_references,
+                    unsafe { &*table_reference },
+                    resolved_index,
+                    reg_offset,
+                    main_table_cursor_id,
+                    start_reg + reg_offset,
+                )?;
+            }
+            program.emit_insn(Insn::RowId {
+                cursor_id: main_table_cursor_id,
+                dest: start_reg + num_regs - 1,
+            });
+            Some((iteration_index_cursor, start_reg, num_regs, resolved_index))
+        } else {
+            None
+        };
 
     emit_delete_row_common(
         connection,
@@ -577,7 +590,8 @@ fn emit_delete_insns<'a>(
         rowid_reg,
         columns_start_reg,
         main_table_cursor_id,
-        iteration_index,
+        indexes,
+        iteration_resolved_index,
         Some(cursor_id), // Use the cursor_id from the operation for virtual tables
         returning_buffer,
     )?;
@@ -589,7 +603,7 @@ fn emit_delete_insns<'a>(
             start_reg,
             num_regs,
             cursor_id: iteration_index_cursor,
-            raise_error_if_no_matching_entry: index.where_clause.is_none(),
+            raise_error_if_no_matching_entry: index.value().where_clause.is_none(),
         });
     }
     if let Some(limit_ctx) = t_ctx.limit_ctx {
@@ -621,18 +635,20 @@ fn emit_delete_row_common(
     rowid_reg: usize,
     columns_start_reg: Option<usize>, // must be provided when there are triggers or RETURNING
     main_table_cursor_id: usize,
-    skip_iteration_index: Option<&Arc<crate::schema::Index>>,
+    indexes: &[ResolvedIndex],
+    skip_iteration_index: Option<&ResolvedIndex>,
     virtual_table_cursor_id: Option<usize>,
     returning_buffer: Option<&ReturningBufferCtx>,
 ) -> Result<()> {
-    let internal_id = unsafe { (*table_reference).internal_id };
-    let table_name = unsafe { &*table_reference }.table.get_name();
+    let target_table = unsafe { &*table_reference };
+    let internal_id = target_table.internal_id;
+    let table_name = target_table.table.get_name();
 
     // Phase 1: Before Delete - build parent key registers and handle NoAction/Restrict.
     // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
-        let delete_db_id = unsafe { (*table_reference).database_id };
-        if let Some(table) = unsafe { &*table_reference }.btree() {
+        let delete_db_id = target_table.database_id;
+        if let Some(table) = target_table.btree() {
             let prepared = if t_ctx
                 .resolver
                 .with_schema(delete_db_id, |s| s.any_resolved_fks_referencing(table_name))
@@ -640,11 +656,10 @@ fn emit_delete_row_common(
                 ForeignKeyActions::prepare_fk_delete_actions(
                     program,
                     &mut t_ctx.resolver,
-                    table_name,
+                    target_table,
                     main_table_cursor_id,
                     rowid_reg,
                     None,
-                    delete_db_id,
                 )?
             } else {
                 ForeignKeyActions::default()
@@ -683,36 +698,29 @@ fn emit_delete_row_common(
         });
     } else {
         // Delete from all indexes before deleting from the main table.
-        let db_id = unsafe { (*table_reference).database_id };
-        let all_indices: Vec<_> = t_ctx
-            .resolver
-            .with_schema(db_id, |s| s.get_indices(table_name).cloned().collect());
-
         // Get indexes to delete from (skip the iteration index if specified)
-        let indexes_to_delete = all_indices
+        let indexes_to_delete = indexes
             .iter()
-            .filter(|index| {
-                skip_iteration_index
-                    .as_ref()
-                    .is_none_or(|skip_idx| !Arc::ptr_eq(skip_idx, index))
-            })
+            .filter(|index| skip_iteration_index.is_none_or(|skip_index| skip_index != *index))
             .map(|index| {
+                let handle = index.handle();
                 (
                     index.clone(),
-                    program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
+                    program.resolve_cursor_id(&CursorKey::index(internal_id, handle)),
                 )
             })
             .collect::<Vec<_>>();
 
         for (index, index_cursor_id) in indexes_to_delete {
-            let skip_delete_label = if index.where_clause.is_some() {
+            let index_value = index.value();
+            let skip_delete_label = if index_value.where_clause.is_some() {
                 let where_copy = unsafe { &*table_reference }
-                    .bound_partial_index_where(&index)
-                    .expect("binder provided the partial-index predicate")
+                    .partial_index_predicate(index_value)
+                    .expect("semantic HIR provided the partial-index predicate")
                     .clone();
                 let skip_label = program.allocate_label();
                 let reg = program.alloc_register();
-                translate_expr_no_constant_opt(
+                translate_plan_expr_no_constant_opt(
                     program,
                     Some(table_references),
                     &where_copy,
@@ -729,16 +737,17 @@ fn emit_delete_row_common(
             } else {
                 None
             };
-            let num_regs = index.columns.len() + 1;
+            let num_regs = index_value.columns.len() + 1;
             let start_reg = program.alloc_registers(num_regs);
-            for (reg_offset, column_index) in index.columns.iter().enumerate() {
+            for reg_offset in 0..index_value.columns.len() {
                 emit_index_column_value_old_image(
                     program,
                     &t_ctx.resolver,
                     table_references,
+                    unsafe { &*table_reference },
+                    &index,
+                    reg_offset,
                     main_table_cursor_id,
-                    internal_id,
-                    column_index,
                     start_reg + reg_offset,
                 )?;
             }
@@ -750,7 +759,7 @@ fn emit_delete_row_common(
                 start_reg,
                 num_regs,
                 cursor_id: index_cursor_id,
-                raise_error_if_no_matching_entry: index.where_clause.is_none(),
+                raise_error_if_no_matching_entry: index_value.where_clause.is_none(),
             });
             if let Some(label) = skip_delete_label {
                 program.preassign_label_to_next_insn(label);
@@ -804,8 +813,9 @@ fn emit_delete_row_common(
         let delete_table = unsafe { &*table_reference };
         let delete_layout = ColumnLayout::from_columns(delete_table.columns())?;
         let cache_state = seed_returning_row_image_in_cache(
-            program,
             table_references,
+            result_columns,
+            non_from_clause_subqueries,
             columns_start_reg,
             rowid_reg,
             &mut t_ctx.resolver,
@@ -870,6 +880,7 @@ fn emit_delete_insns_when_triggers_present(
     table_references: &mut TableReferences,
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
     result_columns: &[ResultSetColumn],
+    indexes: &[ResolvedIndex],
     rowid_reg: usize,
     main_table_cursor_id: usize,
     resolver: &Resolver,
@@ -947,10 +958,12 @@ fn emit_delete_insns_when_triggers_present(
                 .map(|i| columns_start_reg + i)
                 .chain(std::iter::once(rowid_reg))
                 .collect::<Vec<_>>();
+            let read_programs = Arc::clone(&unsafe { &*table_reference }.read_programs);
             // If the program has a trigger_conflict_override, propagate it to the trigger context.
             let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
                 TriggerContext::new_with_override_conflict(
                     btree_table,
+                    read_programs,
                     None, // No NEW for DELETE
                     Some(old_registers),
                     override_conflict,
@@ -958,6 +971,7 @@ fn emit_delete_insns_when_triggers_present(
             } else {
                 TriggerContext::new(
                     btree_table,
+                    read_programs,
                     None, // No NEW for DELETE
                     Some(old_registers),
                 )
@@ -995,6 +1009,7 @@ fn emit_delete_insns_when_triggers_present(
         rowid_reg,
         columns_start_reg,
         main_table_cursor_id,
+        indexes,
         None, // Don't skip any indexes when deleting from RowSet
         None, // Use main_table_cursor_id for virtual tables
         returning_buffer,
@@ -1017,11 +1032,13 @@ fn emit_delete_insns_when_triggers_present(
                 .map(|i| columns_start_reg + i)
                 .chain(std::iter::once(rowid_reg))
                 .collect::<Vec<_>>();
+            let read_programs = Arc::clone(&unsafe { &*table_reference }.read_programs);
             // If the program has a trigger_conflict_override, propagate it to the trigger context.
             let trigger_ctx_after =
                 if let Some(override_conflict) = program.trigger_conflict_override {
                     TriggerContext::new_with_override_conflict(
                         btree_table,
+                        read_programs,
                         None, // No NEW for DELETE
                         Some(old_registers),
                         override_conflict,
@@ -1029,6 +1046,7 @@ fn emit_delete_insns_when_triggers_present(
                 } else {
                     TriggerContext::new(
                         btree_table,
+                        read_programs,
                         None, // No NEW for DELETE
                         Some(old_registers),
                     )

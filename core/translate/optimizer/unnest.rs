@@ -33,14 +33,17 @@
 //! - [MYSQL-SEMIJOIN] https://dev.mysql.com/doc/refman/8.4/en/semijoins-antijoins.html
 
 use smallvec::SmallVec;
-use turso_parser::ast::{self, Expr, TableInternalId, UnaryOperator};
+use turso_parser::ast::{Literal, Operator, UnaryOperator};
 
-use crate::translate::plan::Plan;
+use crate::translate::plan::{Plan, PlanSubqueryType};
 
-use crate::function::{Deterministic, Func};
+use crate::function::Deterministic;
 use crate::translate::{
-    expr::{walk_expr, WalkControl},
     plan::{JoinInfo, JoinType, SelectPlan, SubqueryState, WhereTerm},
+    plan_expr::{
+        walk_plan_expr, PlanExpr as Expr, PlanSourceId, PlanSubqueryExpr, PlanSubqueryId,
+        PlanWalkControl,
+    },
 };
 use crate::Result;
 
@@ -56,7 +59,7 @@ pub fn unnest_exists_subqueries(plan: &mut SelectPlan) -> Result<()> {
             i += 1;
             continue;
         }
-        let is_exists = matches!(subquery.query_type, ast::SubqueryType::Exists { .. });
+        let is_exists = matches!(subquery.query_type, PlanSubqueryType::Exists { .. });
         if !is_exists {
             i += 1;
             continue;
@@ -109,13 +112,13 @@ fn try_unnest_exists(plan: &mut SelectPlan, subquery_idx: usize) -> bool {
     // 4. Extract correlation predicates from the inner WHERE clause.
     // These are predicates of the form `inner_col = outer_col` where one side
     // references an outer query ref and the other side references an inner table.
-    let outer_table_ids: Vec<TableInternalId> = inner_plan
+    let outer_table_ids: Vec<PlanSourceId> = inner_plan
         .table_references
         .outer_query_refs()
         .iter()
         .map(|r| r.internal_id)
         .collect();
-    let inner_table_ids: Vec<TableInternalId> = inner_plan
+    let inner_table_ids: Vec<PlanSourceId> = inner_plan
         .table_references
         .joined_tables()
         .iter()
@@ -151,7 +154,7 @@ fn try_unnest_exists(plan: &mut SelectPlan, subquery_idx: usize) -> bool {
     // WHERE filtering; moving such predicates across the boundary is not safe.
     // Example: correlating to nullable RHS columns can drop rows that should
     // survive as NULL-extended rows.
-    let mut nullable_outer_table_ids: Vec<TableInternalId> = Vec::new();
+    let mut nullable_outer_table_ids: Vec<PlanSourceId> = Vec::new();
     let joined = plan.table_references.joined_tables();
     for (i, t) in joined.iter().enumerate() {
         if let Some(ji) = &t.join_info {
@@ -209,15 +212,15 @@ fn try_unnest_exists(plan: &mut SelectPlan, subquery_idx: usize) -> bool {
 
     // The inner plan's result columns are dropped (a semi/anti-join only tests
     // for row existence, not column values). However, those result column
-    // expressions may contain bound parameters (e.g. `SELECT ?2 AS col`).
+    // expressions may contain parameters (e.g. `SELECT ?2 AS col`).
     // We must remember these so the emitter registers them in the program's
-    // parameter list; otherwise bind-time validation (`has_slot`) fails.
+    // parameter list; otherwise runtime parameter validation (`has_slot`) fails.
     for rc in &inner_plan.result_columns {
-        let _ = walk_expr(&rc.expr, &mut |e: &Expr| -> Result<WalkControl> {
-            if let Expr::Variable(variable) = e {
-                plan.phantom_params.push(variable.clone());
+        let _ = walk_plan_expr(&rc.expr, &mut |e: &Expr| -> Result<PlanWalkControl> {
+            if let Expr::Parameter(parameter) = e {
+                plan.phantom_params.push(parameter.clone());
             }
-            Ok(WalkControl::Continue)
+            Ok(PlanWalkControl::Continue)
         });
     }
 
@@ -318,7 +321,7 @@ struct ExistsWhereInfo {
 /// (e.g., inside OR, or referenced multiple times).
 fn find_exists_in_where(
     where_clause: &[WhereTerm],
-    subquery_id: TableInternalId,
+    subquery_id: PlanSubqueryId,
 ) -> Option<ExistsWhereInfo> {
     for (idx, term) in where_clause.iter().enumerate() {
         // Blocker ([PG-JOIN-ORDER]): OUTER JOIN ON terms cannot be rewritten as
@@ -327,13 +330,8 @@ fn find_exists_in_where(
         if term.from_outer_join.is_some() {
             continue;
         }
-        // Check for direct EXISTS reference: SubqueryResult { Exists }
-        if let Expr::SubqueryResult {
-            subquery_id: sid,
-            query_type: ast::SubqueryType::Exists { .. },
-            ..
-        } = &term.expr
-        {
+        // Check for direct EXISTS reference.
+        if let Expr::Subquery(PlanSubqueryExpr::Exists(sid)) = &term.expr {
             if *sid == subquery_id {
                 return Some(ExistsWhereInfo {
                     where_term_idx: idx,
@@ -341,14 +339,13 @@ fn find_exists_in_where(
                 });
             }
         }
-        // Check for NOT EXISTS: Unary(Not, SubqueryResult { Exists })
-        if let Expr::Unary(UnaryOperator::Not, inner) = &term.expr {
-            if let Expr::SubqueryResult {
-                subquery_id: sid,
-                query_type: ast::SubqueryType::Exists { .. },
-                ..
-            } = inner.as_ref()
-            {
+        // Check for NOT EXISTS: Unary(Not, Subquery(Exists))
+        if let Expr::Unary {
+            operator: UnaryOperator::Not,
+            expr: inner,
+        } = &term.expr
+        {
+            if let Expr::Subquery(PlanSubqueryExpr::Exists(sid)) = inner.as_ref() {
                 if *sid == subquery_id {
                     return Some(ExistsWhereInfo {
                         where_term_idx: idx,
@@ -368,18 +365,22 @@ fn find_exists_in_where(
 /// - Any expression that doesn't reference outer tables in non-equality positions
 fn is_valid_unnesting_predicate(
     expr: &Expr,
-    outer_table_ids: &[TableInternalId],
-    inner_table_ids: &[TableInternalId],
+    outer_table_ids: &[PlanSourceId],
+    inner_table_ids: &[PlanSourceId],
 ) -> bool {
     // Check if the expression references any outer tables.
     let mut has_outer_ref = false;
-    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
-        if let Expr::Column { table, .. } = e {
-            if outer_table_ids.contains(table) {
-                has_outer_ref = true;
-            }
+    let _ = walk_plan_expr(expr, &mut |e: &Expr| -> Result<PlanWalkControl> {
+        let source = match e {
+            Expr::Column(column) => Some(column.source),
+            Expr::MergedColumn(column) => Some(column.right.source),
+            Expr::RowId(source) => Some(*source),
+            _ => None,
+        };
+        if source.is_some_and(|source| outer_table_ids.contains(&source)) {
+            has_outer_ref = true;
         }
-        Ok(WalkControl::Continue)
+        Ok(PlanWalkControl::Continue)
     });
 
     if !has_outer_ref {
@@ -395,10 +396,16 @@ fn is_valid_unnesting_predicate(
 /// Check if an expression is a simple equality between an outer and inner column reference.
 fn is_correlation_equality(
     expr: &Expr,
-    outer_table_ids: &[TableInternalId],
-    inner_table_ids: &[TableInternalId],
+    outer_table_ids: &[PlanSourceId],
+    inner_table_ids: &[PlanSourceId],
 ) -> bool {
-    if let Expr::Binary(lhs, ast::Operator::Equals, rhs) = expr {
+    if let Expr::Binary {
+        lhs,
+        operator: Operator::Equals,
+        rhs,
+        ..
+    } = expr
+    {
         let lhs_tables = collect_table_refs(lhs);
         let rhs_tables = collect_table_refs(rhs);
 
@@ -419,15 +426,21 @@ fn is_correlation_equality(
 }
 
 /// Collect all table IDs referenced by column expressions in an expression tree.
-fn collect_table_refs(expr: &Expr) -> SmallVec<[TableInternalId; 2]> {
+fn collect_table_refs(expr: &Expr) -> SmallVec<[PlanSourceId; 2]> {
     let mut refs = SmallVec::new();
-    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
-        if let Expr::Column { table, .. } = e {
-            if !refs.contains(table) {
-                refs.push(*table);
+    let _ = walk_plan_expr(expr, &mut |e: &Expr| -> Result<PlanWalkControl> {
+        let source = match e {
+            Expr::Column(column) => Some(column.source),
+            Expr::MergedColumn(column) => Some(column.right.source),
+            Expr::RowId(source) => Some(*source),
+            _ => None,
+        };
+        if let Some(source) = source {
+            if !refs.contains(&source) {
+                refs.push(source);
             }
         }
-        Ok(WalkControl::Continue)
+        Ok(PlanWalkControl::Continue)
     });
     refs
 }
@@ -436,31 +449,19 @@ fn collect_table_refs(expr: &Expr) -> SmallVec<[TableInternalId; 2]> {
 /// (e.g. random(), changes(), last_insert_rowid()).
 fn contains_nondeterministic_function(expr: &Expr) -> bool {
     let mut found = false;
-    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
-        match e {
-            Expr::FunctionCall { name, args, .. } => {
-                if let Ok(Some(func)) = Func::resolve_function(name.as_str(), args.len()) {
-                    if !func.is_deterministic() {
-                        found = true;
-                    }
-                }
+    let _ = walk_plan_expr(expr, &mut |e: &Expr| -> Result<PlanWalkControl> {
+        if let Expr::Function(function) = e {
+            if !function.function.value().is_deterministic() {
+                found = true;
+                return Ok(PlanWalkControl::SkipChildren);
             }
-            Expr::FunctionCallStar { name, .. } => {
-                // Star functions like count(*) — resolve with 0 args
-                if let Ok(Some(func)) = Func::resolve_function(name.as_str(), 0) {
-                    if !func.is_deterministic() {
-                        found = true;
-                    }
-                }
-            }
-            _ => {}
         }
-        Ok(WalkControl::Continue)
+        Ok(PlanWalkControl::Continue)
     });
     found
 }
 
 /// Replace the WHERE term at the given index with a trivially-true expression.
 fn replace_exists_with_true(where_clause: &mut [WhereTerm], idx: usize) {
-    where_clause[idx].expr = Expr::Literal(ast::Literal::Numeric("1".to_string()));
+    where_clause[idx].expr = Expr::Literal(Literal::Numeric("1".to_string()));
 }

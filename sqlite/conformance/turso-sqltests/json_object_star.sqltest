@@ -190,3 +190,23 @@ expect {
     {"rowid":"my-rowid","data":999}
 }
 
+test virtual-table-insert-returning-is-unsupported {
+    INSERT INTO json_each(value) VALUES (1) RETURNING value;
+}
+expect error {
+    RETURNING is not supported for virtual tables
+}
+
+test virtual-table-update-returning-is-unsupported {
+    UPDATE json_each SET value = 1 RETURNING value;
+}
+expect error {
+    RETURNING is not supported for virtual tables
+}
+
+test virtual-table-delete-returning-is-unsupported {
+    DELETE FROM json_each RETURNING value;
+}
+expect error {
+    RETURNING is not supported for virtual tables
+}

@@ -2,17 +2,23 @@ use crate::alloc::vec;
 use crate::alloc::TursoFromIterator;
 use crate::alloc::*;
 use crate::function::{Deterministic, Func, ScalarFunc};
-use crate::incremental::view::IncrementalView;
+use crate::incremental::view::{IncrementalView, IncrementalViewTemplate};
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, operator::create_dbsp_state_index};
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::return_if_io;
+use crate::schema_expr::{
+    BuiltinSchemaExprResolver, DropRemap, ResolutionMode, SchemaColumn, SchemaExpr,
+    SchemaExprContext, SchemaExprProfile, SchemaExprResolver, SchemaTable, SchemaTypeParameter,
+    SchemaValueType, SelfColumn,
+};
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::index::{reject_explicit_nulls, resolve_index_method_parameters};
+use crate::translate::plan_expr::PlanCteId;
 use crate::translate::planner::ROWID_STRS;
 use crate::types::{IOResult, ImmutableRecord};
-use crate::util::{exprs_are_equivalent, normalize_ident};
+use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::CursorID;
 use crate::{turso_assert, turso_debug_assert};
@@ -209,6 +215,7 @@ pub struct StructFieldDef {
     pub name: String,
     pub base_affinity: Affinity,
     pub type_name: String,
+    pub array_dimensions: u32,
 }
 
 /// Definition for a STRUCT composite type.
@@ -224,6 +231,7 @@ pub struct UnionVariantDef {
     pub tag_index: u8,
     pub base_affinity: Affinity,
     pub type_name: String,
+    pub array_dimensions: u32,
 }
 
 /// Definition for a UNION discriminated union type.
@@ -237,14 +245,14 @@ pub struct UnionDef {
 
 /// The kind-specific payload of a custom type.
 #[derive(Debug, Clone)]
-pub enum TypeDefKind {
+pub(crate) enum TypeDefKind {
     Custom {
         params: std::vec::Vec<ast::TypeParam>,
         base: String,
-        encode: Option<Box<ast::Expr>>,
-        decode: Option<Box<ast::Expr>>,
+        encode: Option<Box<SchemaExpr>>,
+        decode: Option<Box<SchemaExpr>>,
         operators: std::vec::Vec<TypeOperator>,
-        default: Option<Box<ast::Expr>>,
+        default: Option<Box<SchemaExpr>>,
     },
     Struct(StructDef),
     Union(UnionDef),
@@ -275,9 +283,17 @@ impl ResolvedType {
     /// Find the first DEFAULT expression in the type chain (child first, then ancestors).
     /// Matches PostgreSQL: a child domain inherits the parent's DEFAULT when it
     /// doesn't declare its own.
-    pub fn default_expr(&self) -> Option<&ast::Expr> {
+    pub(crate) fn default_expr(&self) -> Option<&SchemaExpr> {
         self.chain.iter().find_map(|td| td.default_expr())
     }
+}
+
+/// A domain CHECK owns a semantic `value` input. It is specialized to a
+/// concrete table-column position when the constraint is copied to a table.
+#[derive(Debug, Clone)]
+pub(crate) struct DomainCheckConstraint {
+    pub(crate) name: Option<String>,
+    pub(crate) check: Box<SchemaExpr>,
 }
 
 #[derive(Debug, Clone)]
@@ -291,8 +307,8 @@ pub struct TypeDef {
     pub sql: String,
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
     /// Empty for regular CREATE TYPE definitions.
-    pub domain_checks: std::vec::Vec<ast::DomainConstraint>,
-    pub kind: TypeDefKind,
+    pub(crate) domain_checks: std::vec::Vec<DomainCheckConstraint>,
+    pub(crate) kind: TypeDefKind,
 }
 
 impl TypeDef {
@@ -323,7 +339,7 @@ impl TypeDef {
     }
 
     /// Returns the encode expression (Custom types only).
-    pub fn encode(&self) -> Option<&ast::Expr> {
+    pub(crate) fn encode(&self) -> Option<&SchemaExpr> {
         match &self.kind {
             TypeDefKind::Custom { encode, .. } => encode.as_deref(),
             _ => None,
@@ -331,7 +347,7 @@ impl TypeDef {
     }
 
     /// Returns the decode expression (Custom types only).
-    pub fn decode(&self) -> Option<&ast::Expr> {
+    pub(crate) fn decode(&self) -> Option<&SchemaExpr> {
         match &self.kind {
             TypeDefKind::Custom { decode, .. } => decode.as_deref(),
             _ => None,
@@ -363,7 +379,7 @@ impl TypeDef {
     }
 
     /// Returns the default expression (Custom types only).
-    pub fn default_expr(&self) -> Option<&ast::Expr> {
+    pub(crate) fn default_expr(&self) -> Option<&SchemaExpr> {
         match &self.kind {
             TypeDefKind::Custom { default, .. } => default.as_deref(),
             _ => None,
@@ -402,6 +418,8 @@ impl TypeDef {
         body: &ast::CreateTypeBody,
         is_builtin: bool,
         sql: String,
+        resolver: &dyn SchemaExprResolver,
+        mode: ResolutionMode,
     ) -> crate::Result<Self> {
         Ok(match body {
             ast::CreateTypeBody::CustomType {
@@ -411,22 +429,66 @@ impl TypeDef {
                 decode,
                 operators,
                 default,
-            } => Self {
-                name: type_name.to_string(),
-                is_builtin,
-                not_null: false,
-                is_domain: false,
-                sql,
-                domain_checks: std::vec::Vec::new(),
-                kind: TypeDefKind::Custom {
-                    params: params.clone(),
-                    base: base.clone(),
-                    encode: encode.clone(),
-                    decode: decode.clone(),
-                    operators: operators.clone(),
-                    default: default.clone(),
-                },
-            },
+            } => {
+                let type_parameters = type_transform_parameters(params, base);
+                let transform_context =
+                    SchemaExprContext::without_table().with_type_parameters(&type_parameters);
+                let encode = encode
+                    .as_deref()
+                    .map(|expr| {
+                        SchemaExpr::resolve(
+                            expr,
+                            SchemaExprProfile::TypeTransform,
+                            transform_context,
+                            resolver,
+                            mode,
+                        )
+                        .map(Box::new)
+                    })
+                    .transpose()?;
+                let decode = decode
+                    .as_deref()
+                    .map(|expr| {
+                        SchemaExpr::resolve(
+                            expr,
+                            SchemaExprProfile::TypeTransform,
+                            transform_context,
+                            resolver,
+                            mode,
+                        )
+                        .map(Box::new)
+                    })
+                    .transpose()?;
+                let default = default
+                    .as_deref()
+                    .map(|expr| {
+                        SchemaExpr::resolve(
+                            expr,
+                            SchemaExprProfile::Default,
+                            SchemaExprContext::without_table().with_expected_type(Some(type_name)),
+                            resolver,
+                            mode,
+                        )
+                        .map(Box::new)
+                    })
+                    .transpose()?;
+                Self {
+                    name: type_name.to_string(),
+                    is_builtin,
+                    not_null: false,
+                    is_domain: false,
+                    sql,
+                    domain_checks: std::vec::Vec::new(),
+                    kind: TypeDefKind::Custom {
+                        params: params.clone(),
+                        base: base.clone(),
+                        encode,
+                        decode,
+                        operators: operators.clone(),
+                        default,
+                    },
+                }
+            }
             ast::CreateTypeBody::Struct(fields) => {
                 let struct_fields: Vec<StructFieldDef> = fields
                     .iter()
@@ -434,6 +496,7 @@ impl TypeDef {
                         name: f.name.to_string(),
                         base_affinity: Affinity::affinity(&f.field_type.name),
                         type_name: f.field_type.name.clone(),
+                        array_dimensions: f.field_type.array_dimensions,
                     })
                     .try_collect()?;
                 Self {
@@ -463,6 +526,7 @@ impl TypeDef {
                         tag_index: i as u8,
                         base_affinity: Affinity::affinity(&f.field_type.name),
                         type_name: f.field_type.name.clone(),
+                        array_dimensions: f.field_type.array_dimensions,
                     })
                     .try_collect()?;
                 Self {
@@ -492,14 +556,44 @@ impl TypeDef {
         constraints: &[ast::DomainConstraint],
         default: Option<Box<ast::Expr>>,
         sql: String,
-    ) -> Self {
-        Self {
+        resolver: &dyn SchemaExprResolver,
+        mode: ResolutionMode,
+    ) -> Result<Self> {
+        let domain_checks = constraints
+            .iter()
+            .map(|constraint| {
+                Ok(DomainCheckConstraint {
+                    name: constraint.name.clone(),
+                    check: Box::new(SchemaExpr::resolve(
+                        &constraint.check,
+                        SchemaExprProfile::DomainCheck,
+                        SchemaExprContext::without_table().with_expected_type(Some(base_type)),
+                        resolver,
+                        mode,
+                    )?),
+                })
+            })
+            .collect::<Result<std::vec::Vec<_>>>()?;
+        let default = default
+            .as_deref()
+            .map(|expr| {
+                SchemaExpr::resolve(
+                    expr,
+                    SchemaExprProfile::Default,
+                    SchemaExprContext::without_table().with_expected_type(Some(domain_name)),
+                    resolver,
+                    mode,
+                )
+                .map(Box::new)
+            })
+            .transpose()?;
+        Ok(Self {
             name: domain_name.to_string(),
             is_builtin: false,
             not_null,
             is_domain: true,
             sql,
-            domain_checks: constraints.to_vec(),
+            domain_checks,
             kind: TypeDefKind::Custom {
                 params: std::vec::Vec::new(),
                 base: base_type.to_string(),
@@ -508,7 +602,7 @@ impl TypeDef {
                 operators: std::vec::Vec::new(),
                 default,
             },
-        }
+        })
     }
 
     /// The expected input type for `value` in this custom type.
@@ -534,6 +628,33 @@ impl TypeDef {
     pub fn to_sql(&self) -> &str {
         &self.sql
     }
+}
+
+fn type_transform_parameters(
+    parameters: &[ast::TypeParam],
+    base: &str,
+) -> std::vec::Vec<SchemaTypeParameter> {
+    let mut resolved = std::vec::Vec::with_capacity(parameters.len() + 1);
+    let value = parameters
+        .iter()
+        .find(|parameter| parameter.name.eq_ignore_ascii_case("value"));
+    resolved.push(SchemaTypeParameter::new(
+        "value",
+        Some(
+            value
+                .and_then(|parameter| parameter.ty.clone())
+                .unwrap_or_else(|| base.to_string()),
+        ),
+    ));
+    resolved.extend(
+        parameters
+            .iter()
+            .filter(|parameter| !parameter.name.eq_ignore_ascii_case("value"))
+            .map(|parameter| {
+                SchemaTypeParameter::new(parameter.name.clone(), parameter.ty.clone())
+            }),
+    );
+    resolved
 }
 
 /// Accumulators for schema loading - kept separate to avoid moving through state variants
@@ -794,7 +915,26 @@ impl Default for Schema {
     }
 }
 
-fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crate::Result<()> {
+struct BuiltinTypeSchemaExprResolver<'a> {
+    symbols: &'a SymbolTable,
+}
+
+impl SchemaExprResolver for BuiltinTypeSchemaExprResolver<'_> {
+    fn resolve_function(&self, name: &str, argument_count: usize) -> Result<Option<Func>> {
+        if let Some(function) = Func::resolve_function(name, argument_count)? {
+            return Ok(Some(function));
+        }
+        Ok(self
+            .symbols
+            .resolve_function(name, argument_count)
+            .map(Func::External))
+    }
+}
+
+fn bootstrap_builtin_types(
+    registry: &mut HashMap<String, Arc<TypeDef>>,
+    symbols: &SymbolTable,
+) -> crate::Result<()> {
     use turso_parser::ast::{Cmd, Stmt};
     use turso_parser::parser::Parser;
 
@@ -829,6 +969,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
     ];
 
+    let resolver = BuiltinTypeSchemaExprResolver { symbols };
     for sql in type_sqls {
         let mut parser = Parser::new(sql.as_bytes());
         let Ok(Some(Cmd::Stmt(Stmt::CreateType {
@@ -840,7 +981,14 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
             )));
         };
 
-        let type_def = TypeDef::from_create_type(&type_name, &body, true, sql.to_string())?;
+        let type_def = TypeDef::from_create_type(
+            &type_name,
+            &body,
+            true,
+            sql.to_string(),
+            &resolver,
+            ResolutionMode::Strict,
+        )?;
         registry.insert(type_name.to_lowercase(), Arc::new(type_def));
     }
 
@@ -856,6 +1004,48 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         }
     }
     Ok(())
+}
+
+struct CatalogSchemaExprResolver<'a> {
+    schema: &'a Schema,
+    symbols: Option<&'a SymbolTable>,
+}
+
+impl SchemaExprResolver for CatalogSchemaExprResolver<'_> {
+    fn resolve_function(&self, name: &str, argument_count: usize) -> Result<Option<Func>> {
+        if let Some(function) = Func::resolve_function(name, argument_count)? {
+            return Ok(Some(function));
+        }
+        Ok(self
+            .symbols
+            .and_then(|symbols| symbols.resolve_function(name, argument_count))
+            .map(Func::External))
+    }
+
+    fn resolve_collation(&self, name: &str) -> Result<CollationSeq> {
+        if let Some(collation) = self
+            .symbols
+            .and_then(|symbols| symbols.resolve_collation(name))
+        {
+            return Ok(collation);
+        }
+        CollationSeq::new(name)
+    }
+
+    fn resolve_type(&self, name: &str) -> Result<Option<SchemaValueType>> {
+        if let Some(resolved) = SchemaExprResolver::resolve_type(&BuiltinSchemaExprResolver, name)?
+        {
+            return Ok(Some(resolved));
+        }
+        Ok(self
+            .schema
+            .get_type_def_unchecked(name)
+            .map(|_| SchemaValueType::Custom(normalize_ident(name))))
+    }
+
+    fn resolve_custom_type(&self, name: &str) -> Result<Option<Arc<TypeDef>>> {
+        Ok(self.schema.get_type_def_unchecked(name).cloned())
+    }
 }
 
 impl Schema {
@@ -885,6 +1075,18 @@ impl Schema {
         enable_custom_types: bool,
         dialect: &dyn crate::dialect::Dialect,
     ) -> crate::Result<Self> {
+        let mut symbols = SymbolTable::new();
+        crate::ext::register_global_builtin_functions(&mut symbols);
+        Self::with_options_and_symbols(enable_custom_types, dialect, &symbols)
+    }
+
+    /// Create a schema using the supplied functions to resolve built-in type
+    /// transforms.
+    pub fn with_options_and_symbols(
+        enable_custom_types: bool,
+        dialect: &dyn crate::dialect::Dialect,
+        symbols: &SymbolTable,
+    ) -> crate::Result<Self> {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::default();
         #[cfg(feature = "conn_raw_api")]
         let mut table_names_by_root_page = HashMap::default();
@@ -906,7 +1108,7 @@ impl Schema {
         let incompatible_views = HashSet::default();
         let mut type_registry = HashMap::default();
         if enable_custom_types {
-            bootstrap_builtin_types(&mut type_registry)?;
+            bootstrap_builtin_types(&mut type_registry, symbols)?;
         }
         let mut schema = Self {
             tables,
@@ -1042,8 +1244,18 @@ impl Schema {
             Ok(Some(Cmd::Stmt(Stmt::CreateType {
                 type_name, body, ..
             }))) => {
-                let type_def =
-                    TypeDef::from_create_type(&type_name, &body, false, sql.to_string())?;
+                let resolver = CatalogSchemaExprResolver {
+                    schema: self,
+                    symbols: None,
+                };
+                let type_def = TypeDef::from_create_type(
+                    &type_name,
+                    &body,
+                    false,
+                    sql.to_string(),
+                    &resolver,
+                    ResolutionMode::PreserveUnresolved,
+                )?;
                 self.type_registry
                     .insert(type_name.to_lowercase(), Arc::new(type_def));
             }
@@ -1055,6 +1267,10 @@ impl Schema {
                 constraints,
                 ..
             }))) => {
+                let resolver = CatalogSchemaExprResolver {
+                    schema: self,
+                    symbols: None,
+                };
                 let type_def = TypeDef::from_domain(
                     &domain_name,
                     &base_type,
@@ -1062,7 +1278,9 @@ impl Schema {
                     &constraints,
                     default,
                     sql.to_string(),
-                );
+                    &resolver,
+                    ResolutionMode::PreserveUnresolved,
+                )?;
                 self.type_registry
                     .insert(domain_name.to_lowercase(), Arc::new(type_def));
             }
@@ -1103,10 +1321,48 @@ impl Schema {
             let mut modified = (*bt).clone();
             modified.resolve_custom_type_affinities(self);
             modified.propagate_domain_constraints(self)?;
+            let resolver = CatalogSchemaExprResolver {
+                schema: self,
+                symbols: None,
+            };
+            modified.resolve_schema_expressions(&resolver, ResolutionMode::PreserveUnresolved)?;
             tables.push((name.clone(), Arc::new(Table::BTree(Arc::new(modified)))));
         }
         for (name, table) in tables {
             self.tables.insert(name, table);
+        }
+
+        // Indexes are parsed before user-defined types are loaded. Retry the
+        // expressions they own now that table and type facts are complete.
+        let indexed_tables = self.indexes.keys().cloned().try_collect::<Vec<_>>()?;
+        let mut resolved_indexes = Vec::new();
+        for table_name in indexed_tables {
+            let table = self
+                .get_btree_table(&table_name)
+                .ok_or(LimboError::SchemaUpdated)?;
+            let resolver = CatalogSchemaExprResolver {
+                schema: self,
+                symbols: None,
+            };
+            let mut indexes = Vec::new();
+            for index in self
+                .indexes
+                .get(&table_name)
+                .ok_or(LimboError::SchemaUpdated)?
+            {
+                let mut index = (**index).clone();
+                index.resolve_schema_expressions(
+                    &table,
+                    &resolver,
+                    ResolutionMode::PreserveUnresolved,
+                )?;
+                indexes.try_push(Arc::new(index))?;
+            }
+            resolved_indexes.try_push((table_name, indexes))?;
+        }
+        for (table_name, indexes) in resolved_indexes {
+            self.indexes
+                .insert(table_name, VecDeque::try_from_iter(indexes)?);
         }
         Ok(())
     }
@@ -1510,9 +1766,17 @@ impl Schema {
         mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: &Arc<Pager>,
         syms: &SymbolTable,
-        dialect: &dyn crate::dialect::Dialect,
+        custom_types_enabled: bool,
+        dialect: Arc<dyn crate::dialect::Dialect>,
     ) -> Result<IOResult<()>> {
-        let result = self.make_from_btree_internal(state, mv_cursor, pager, syms, dialect);
+        let result = self.make_from_btree_internal(
+            state,
+            mv_cursor,
+            pager,
+            syms,
+            custom_types_enabled,
+            dialect,
+        );
         if result.is_err() {
             state.cleanup(pager);
         } else if let Ok(IOResult::Done(..)) = result {
@@ -1530,7 +1794,8 @@ impl Schema {
         mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: &Arc<Pager>,
         syms: &SymbolTable,
-        dialect: &dyn crate::dialect::Dialect,
+        custom_types_enabled: bool,
+        dialect: Arc<dyn crate::dialect::Dialect>,
     ) -> Result<IOResult<()>> {
         loop {
             tracing::debug!("make_from_btree: state.phase={:?}", state.phase);
@@ -1637,7 +1902,7 @@ impl Schema {
                         &mut acc.dbsp_state_index_roots,
                         &mut acc.materialized_view_info,
                         &|_| None,
-                        dialect,
+                        dialect.as_ref(),
                     )?;
 
                     state.phase = MakeFromBtreePhase::Advancing;
@@ -1673,6 +1938,10 @@ impl Schema {
                             acc.materialized_view_info,
                             acc.dbsp_state_roots,
                             acc.dbsp_state_index_roots,
+                            syms,
+                            custom_types_enabled,
+                            dialect.clone(),
+                            None,
                         )?;
 
                         state.phase = MakeFromBtreePhase::Done;
@@ -1763,6 +2032,7 @@ impl Schema {
                 })?;
             let index = Index::from_sql(
                 syms,
+                self,
                 &unparsed_sql_from_index.sql,
                 unparsed_sql_from_index.root_page,
                 table.as_ref(),
@@ -1893,6 +2163,12 @@ impl Schema {
         materialized_view_info: HashMap<String, (String, i64)>,
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
+        syms: &SymbolTable,
+        custom_types_enabled: bool,
+        dialect: Arc<dyn crate::Dialect>,
+        prepared_templates: Option<
+            &std::collections::HashMap<String, Arc<IncrementalViewTemplate>>,
+        >,
     ) -> Result<()> {
         for (view_name, (sql, main_root)) in materialized_view_info {
             // Look up the DBSP state root for this view
@@ -1929,10 +2205,29 @@ impl Schema {
                 }
             }
 
-            // Create the IncrementalView with all root pages
-            let incremental_view = IncrementalView::from_sql(
-                &sql,
-                self,
+            // CREATE supplies the exact HIR-derived template built during
+            // preparation. Reloaded definitions use the same analyzer against
+            // the current main-schema catalog instead of a schema-only resolver.
+            let template = if let Some(template) =
+                prepared_templates.and_then(|templates| templates.get(&normalize_ident(&view_name)))
+            {
+                template.clone()
+            } else {
+                let semantic_context =
+                    crate::translate::semantic::context::SemanticContext::for_main_schema_object(
+                        self,
+                        syms,
+                        custom_types_enabled,
+                        dialect.clone(),
+                    );
+                Arc::new(IncrementalViewTemplate::analyze_stored_sql(
+                    &semantic_context,
+                    &sql,
+                )?)
+            };
+            let incremental_view = IncrementalView::from_template(
+                view_name.clone(),
+                &template,
                 main_root,
                 dbsp_state_root,
                 dbsp_state_index_root,
@@ -1940,7 +2235,7 @@ impl Schema {
             let referenced_tables = incremental_view.get_referenced_table_names();
 
             // Create a BTreeTable for the materialized view
-            let cols = incremental_view.column_schema.flat_columns();
+            let cols = template.column_schema().flat_columns();
             let logical_to_physical_map =
                 BTreeTable::build_logical_to_physical_map(&cols, &[], true);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
@@ -3109,29 +3404,42 @@ pub struct CheckConstraint {
     /// Optional constraint name
     pub name: Option<String>,
     /// CHECK expression
-    pub expr: ast::Expr,
+    pub(crate) expr: SchemaExpr,
     /// Column name if this is a column-level CHECK constraint (defined inline with the column).
     /// None if this is a table-level CHECK constraint.
     pub column: Option<String>,
 }
 
 impl CheckConstraint {
-    pub fn new(name: Option<&ast::Name>, expr: &ast::Expr, column: Option<&str>) -> Self {
+    pub(crate) fn new(
+        name: Option<&ast::Name>,
+        expr: &ast::Expr,
+        column: Option<&str>,
+        strict_types: bool,
+    ) -> Self {
         Self {
             name: name.map(|n| n.as_str().to_string()),
-            expr: expr.clone(),
+            expr: SchemaExpr::preserve_unresolved(
+                expr.clone(),
+                SchemaExprProfile::Check { strict_types },
+            ),
             column: column.map(|s| s.to_string()),
         }
     }
 
     /// Returns the SQL representation of this CHECK constraint (e.g. `CHECK(x > 0)`).
-    /// `columns` renders `SELF_TABLE` positional references back to the current
-    /// column names.
+    /// `columns` renders positional schema-expression references back to the
+    /// current column names.
     pub fn sql(&self, columns: &[Column]) -> String {
-        match crate::translate::bind::render_schema_expr(&self.expr, columns) {
-            Ok(rendered) => format!("CHECK({rendered})"),
-            Err(_) => format!("CHECK({})", self.expr),
-        }
+        let names: std::vec::Vec<_> = columns
+            .iter()
+            .map(|column| column.name.as_deref().unwrap_or(""))
+            .collect();
+        let rendered = self
+            .expr
+            .render(&names)
+            .expect("stored CHECK column positions must match the owning table");
+        format!("CHECK({rendered})")
     }
 }
 
@@ -3180,8 +3488,14 @@ impl GeneratedColGraph {
             let GeneratedType::Virtual { ref expr, .. } = col.generated_type() else {
                 continue;
             };
+            let dependencies = expr.dependencies()?;
             let mut direct = BitSet::default();
-            crate::translate::bind::bind_generated_column_dependencies(expr, columns, &mut direct)?;
+            for &position in dependencies.columns() {
+                if position >= n {
+                    return Err(LimboError::SchemaUpdated);
+                }
+                direct.set(position)?;
+            }
             if direct.get(j) {
                 bail_parse_error!(
                     "generated column \"{}\" cannot reference itself",
@@ -3342,6 +3656,23 @@ impl BTreeTable {
         ColumnsMut { table: self }
     }
 
+    pub(crate) fn schema_expr_table(&self) -> SchemaTable {
+        SchemaTable::new(
+            self.name.clone(),
+            self.columns
+                .iter()
+                .map(|column| {
+                    SchemaColumn::new(
+                        column.name.as_deref().unwrap_or(""),
+                        column.is_rowid_alias(),
+                        (!column.ty_str.is_empty()).then(|| column.ty_str.clone()),
+                    )
+                })
+                .collect(),
+            self.has_rowid,
+        )
+    }
+
     /// Create a table reference for TypeCheck where custom type columns have
     /// their `ty_str` replaced with the base type name, and where virtual columns
     /// are skipped. This ensures TypeCheck validates the encoded value against the
@@ -3463,41 +3794,64 @@ impl BTreeTable {
         if !self.is_strict {
             return Ok(());
         }
-        // Collect new constraints and notnull flags to avoid borrowing issues
-        let mut new_checks = vec![];
-        let mut notnull_cols = vec![];
+        for column in 0..self.columns.len() {
+            self.propagate_domain_constraints_for_column(schema, column)?;
+        }
+        Ok(())
+    }
 
-        for (col_idx, col) in self.columns.iter().enumerate() {
-            let Ok(Some(resolved)) = schema.resolve_type_unchecked(&col.ty_str) else {
-                continue;
-            };
-            if !resolved.is_domain() {
-                continue;
-            }
-            let col_name = col.name.as_deref().unwrap_or("").to_string();
-            for td in &resolved.chain {
-                if td.not_null {
-                    notnull_cols.try_push(col_idx)?;
-                }
-                for (i, dc) in td.domain_checks.iter().enumerate() {
-                    let rewritten = crate::translate::bind::bind_domain_check(&dc.check, &col_name);
-                    let name = dc
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("{}_{}", td.name, i));
-                    new_checks.try_push(CheckConstraint {
-                        name: Some(name),
-                        expr: *rewritten,
-                        column: Some(col_name.clone()),
-                    })?;
-                }
-            }
+    /// Propagate a domain onto one newly added or replaced column without
+    /// duplicating constraints already owned by the rest of the table.
+    pub(crate) fn propagate_domain_constraints_for_column(
+        &mut self,
+        schema: &Schema,
+        column: usize,
+    ) -> Result<()> {
+        if !self.is_strict {
+            return Ok(());
+        }
+        let definition = self.columns.get(column).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "cannot propagate a domain onto missing column position {column}"
+            ))
+        })?;
+        let type_name = definition.ty_str.clone();
+        let column_name = definition.name.as_deref().unwrap_or("").to_string();
+        let is_rowid_alias = definition.is_rowid_alias();
+        let Ok(Some(resolved)) = schema.resolve_type_unchecked(&type_name) else {
+            return Ok(());
+        };
+        if !resolved.is_domain() {
+            return Ok(());
         }
 
-        for col_idx in notnull_cols {
-            self.columns[col_idx].set_notnull(true);
+        let mut not_null = false;
+        let mut checks = vec![];
+        for type_def in &resolved.chain {
+            not_null |= type_def.not_null;
+            for (check_index, domain_check) in type_def.domain_checks.iter().enumerate() {
+                let name = domain_check
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_{}", type_def.name, check_index));
+                let expression = match domain_check.check.as_valid() {
+                    Ok(expression) => SchemaExpr::Valid(
+                        expression
+                            .specialize_domain_value(SelfColumn::new(column, is_rowid_alias))?,
+                    ),
+                    Err(_) => (*domain_check.check).clone(),
+                };
+                checks.try_push(CheckConstraint {
+                    name: Some(name),
+                    expr: expression,
+                    column: Some(column_name.clone()),
+                })?;
+            }
         }
-        self.check_constraints.try_extend(new_checks)?;
+        if not_null {
+            self.columns[column].set_notnull(true);
+        }
+        self.check_constraints.try_extend(checks)?;
         Ok(())
     }
 
@@ -3578,6 +3932,20 @@ impl BTreeTable {
             if !column.ty_str.is_empty() {
                 sql.push(' ');
                 sql.push_str(&column.ty_str);
+                if !column.ty_params.is_empty() {
+                    sql.push('(');
+                    for (parameter_index, parameter) in column.ty_params.iter().enumerate() {
+                        if parameter_index > 0 {
+                            sql.push_str(", ");
+                        }
+                        sql.push_str(
+                            &parameter
+                                .render(&[] as &[&str])
+                                .expect("type parameters cannot refer to table columns"),
+                        );
+                    }
+                    sql.push(')');
+                }
                 if column.is_array() {
                     sql.push_str("[]");
                 }
@@ -3600,7 +3968,11 @@ impl BTreeTable {
 
             if let Some(default) = &column.default {
                 sql.push_str(" DEFAULT ");
-                sql.push_str(&default.to_string());
+                sql.push_str(
+                    &default
+                        .render(&[] as &[&str])
+                        .expect("column defaults cannot refer to table columns"),
+                );
             }
 
             if let GeneratedType::Virtual { original_sql, .. } = &column.generated_type() {
@@ -3806,25 +4178,116 @@ impl BTreeTable {
     }
 
     pub fn prepare_generated_columns(&mut self) -> Result<()> {
-        {
-            let mut guard = self.columns_mut();
-            for i in 0..guard.len() {
-                if guard[i].is_virtual_generated() {
-                    let mut expr = guard[i].generated_expr().cloned().unwrap();
-                    crate::translate::bind::bind_generated_column_expr(&mut expr, &guard)?;
-                    *guard[i].generated_expr_mut().unwrap() = expr;
-                }
+        self.resolve_schema_expressions(
+            &BuiltinSchemaExprResolver,
+            ResolutionMode::PreserveUnresolved,
+        )
+    }
+
+    /// Resolve every expression owned by this table against one immutable
+    /// table shape. Strict callers get a wholly compilable table; lenient
+    /// reload keeps only expressions whose names cannot currently be resolved.
+    pub(crate) fn resolve_schema_expressions(
+        &mut self,
+        resolver: &dyn SchemaExprResolver,
+        mode: ResolutionMode,
+    ) -> Result<()> {
+        let table = self.schema_expr_table();
+
+        for column in &mut self.columns {
+            let declared_type = (!column.ty_str.is_empty()).then(|| column.ty_str.clone());
+            let scalar_context = SchemaExprContext::without_table()
+                .with_expected_type(declared_type.as_deref())
+                .with_default_column_name(column.name.as_deref());
+            for parameter in &mut column.ty_params {
+                parameter.resolve_unresolved(SchemaExprContext::without_table(), resolver, mode)?;
+            }
+            if let Some(default) = &mut column.default {
+                default.resolve_unresolved(scalar_context, resolver, mode)?;
+            }
+            if let Some(generated) = column.generated_expr_mut() {
+                generated.resolve_unresolved(
+                    SchemaExprContext::for_table(&table)
+                        .with_expected_type(declared_type.as_deref()),
+                    resolver,
+                    mode,
+                )?;
             }
         }
-        // CHECK constraint expressions are resolved to the same SELF_TABLE
-        // positional form. Lenient: unknown names stay as identifiers and
-        // surface when the constraint is evaluated.
-        let mut checks = std::mem::replace(&mut self.check_constraints, TursoAllocExt::new());
-        for check in &mut checks {
-            crate::translate::bind::bind_index_schema_expr(&mut check.expr, self);
+
+        for check in &mut self.check_constraints {
+            if check.expr.profile() == SchemaExprProfile::DomainCheck {
+                let column = check
+                    .column
+                    .as_deref()
+                    .and_then(|name| table.find_column(name));
+                let expected_type = column.and_then(|(_, column)| column.declared_type());
+                check.expr.resolve_unresolved(
+                    SchemaExprContext::without_table().with_expected_type(expected_type),
+                    resolver,
+                    mode,
+                )?;
+                if check.expr.as_unresolved().is_some() {
+                    continue;
+                }
+                if check.expr.dependencies()?.uses_domain_value() {
+                    let Some((position, column)) = column else {
+                        return Err(LimboError::SchemaUpdated);
+                    };
+                    check.expr =
+                        SchemaExpr::Valid(check.expr.as_valid()?.specialize_domain_value(
+                            SelfColumn::new(position, column.is_rowid_alias()),
+                        )?);
+                }
+            } else {
+                check.expr.resolve_unresolved(
+                    SchemaExprContext::for_table(&table),
+                    resolver,
+                    mode,
+                )?;
+            }
         }
-        self.check_constraints = checks;
-        self.column_graph()?;
+
+        self.column_dependencies.0 = OnceLock::new();
+        let all_generated_resolved = self
+            .columns
+            .iter()
+            .filter_map(Column::generated_expr)
+            .all(|expr| expr.as_valid().is_ok());
+        if mode == ResolutionMode::Strict || all_generated_resolved {
+            self.column_graph()?;
+        }
+        Ok(())
+    }
+
+    /// Shift every owning-table column identity after one column is removed.
+    /// ALTER TABLE first proves that no surviving expression refers to the
+    /// removed position; this method then keeps later positions aligned with
+    /// the new table shape.
+    pub(crate) fn remap_schema_expressions_after_drop(
+        &mut self,
+        dropped_column: usize,
+    ) -> Result<()> {
+        for column in &mut self.columns {
+            let Some(expression) = column.generated_expr_mut() else {
+                continue;
+            };
+            if expression.remap_after_drop(dropped_column)? == DropRemap::UnresolvedSyntaxPreserved
+            {
+                return Err(LimboError::ParseError(
+                    "cannot drop a column while a generated expression is unresolved".to_string(),
+                ));
+            }
+        }
+        for check in &mut self.check_constraints {
+            if check.expr.remap_after_drop(dropped_column)? == DropRemap::UnresolvedSyntaxPreserved
+            {
+                return Err(LimboError::ParseError(
+                    "cannot drop a column while a CHECK constraint is unresolved".to_string(),
+                ));
+            }
+        }
+        self.column_dependencies.0 = OnceLock::new();
         Ok(())
     }
 
@@ -3958,7 +4421,7 @@ pub struct RecursiveCteInput {
 #[derive(Debug, Clone, Copy)]
 pub struct FromClauseSubqueryCteMetadata {
     /// Identity shared by all references to the same CTE definition.
-    pub id: usize,
+    pub id: PlanCteId,
     /// True when more than one read in the same query tree can reuse one
     /// materialized result for this CTE.
     pub shared_materialization: bool,
@@ -3967,7 +4430,7 @@ pub struct FromClauseSubqueryCteMetadata {
 }
 
 impl FromClauseSubquery {
-    pub fn cte_id(&self) -> Option<usize> {
+    pub fn cte_id(&self) -> Option<PlanCteId> {
         self.cte.map(|cte| cte.id)
     }
 
@@ -4001,13 +4464,6 @@ impl FromClauseSubquery {
 }
 
 fn collect_column_refs(expr: &Expr) -> HashSet<String> {
-    collect_column_dependencies_of_expr(expr, &[])
-}
-
-/// Extract all column name references from an expression as a set.
-/// `columns` is used to resolve pre-resolved `Expr::Column { SELF_TABLE }` back to names.
-//TODO all this usage of [normalize_ident] should be replaced with a proper [Identifier] domain type.
-pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> HashSet<String> {
     let mut refs = HashSet::default();
 
     let _ = walk_expr(expr, &mut |e| match e {
@@ -4019,18 +4475,7 @@ pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> H
             refs.insert(normalize_ident(col.as_str()));
             Ok(WalkControl::Continue)
         }
-        Expr::Column { table, column, .. } if table.is_self_table() => {
-            if let Some(col) = columns.get(*column) {
-                if let Some(name) = &col.name {
-                    refs.insert(normalize_ident(name));
-                }
-            }
-            Ok(WalkControl::Continue)
-        }
-        Expr::Subquery(_)
-        | Expr::Exists(_)
-        | Expr::InTable { .. }
-        | Expr::SubqueryResult { .. } => Ok(WalkControl::SkipChildren),
+        Expr::Subquery(_) | Expr::Exists(_) | Expr::InTable { .. } => Ok(WalkControl::SkipChildren),
         _ => Ok(WalkControl::Continue),
     });
 
@@ -4444,6 +4889,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         c.name.as_ref(),
                         expr,
                         None,
+                        is_strict,
                     ))?;
                 }
             }
@@ -4475,15 +4921,27 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     .map(|ast::Type { name, .. }| name)
                     .unwrap_or_default();
 
-                let ty_params: std::vec::Vec<Box<Expr>> = match col_type {
+                let ty_params: std::vec::Vec<Box<SchemaExpr>> = match col_type {
                     Some(ast::Type {
                         size: Some(ast::TypeSize::MaxSize(ref expr)),
                         ..
-                    }) => std::vec![expr.clone()],
+                    }) => std::vec![Box::new(SchemaExpr::preserve_unresolved(
+                        *expr.clone(),
+                        SchemaExprProfile::Default,
+                    ))],
                     Some(ast::Type {
                         size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
                         ..
-                    }) => std::vec![e1.clone(), e2.clone()],
+                    }) => std::vec![
+                        Box::new(SchemaExpr::preserve_unresolved(
+                            *e1.clone(),
+                            SchemaExprProfile::Default,
+                        )),
+                        Box::new(SchemaExpr::preserve_unresolved(
+                            *e2.clone(),
+                            SchemaExprProfile::Default,
+                        )),
+                    ],
                     _ => std::vec::Vec::new(),
                 };
 
@@ -4513,6 +4971,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 c_def.name.as_ref(),
                                 expr,
                                 Some(&name),
+                                is_strict,
                             ))?;
                         }
                         ast::ColumnConstraint::Generated { expr, typ } => {
@@ -5003,8 +5462,8 @@ impl ResolvedFkRef {
 pub struct Column {
     pub name: Option<String>,
     pub ty_str: String,
-    pub ty_params: std::vec::Vec<Box<Expr>>,
-    pub default: Option<Box<Expr>>,
+    pub(crate) ty_params: std::vec::Vec<Box<SchemaExpr>>,
+    pub(crate) default: Option<Box<SchemaExpr>>,
     generated_type: GeneratedType,
     raw: u32,
     explicit_notnull: bool,
@@ -5024,12 +5483,12 @@ pub struct ColDef {
 }
 
 #[derive(Debug, Clone)]
-pub enum GeneratedType {
-    /// `resolved` holds the expression with column references resolved to
-    /// `Expr::Column { table: SELF_TABLE }` for use at compile time.
+pub(crate) enum GeneratedType {
+    /// `expr` holds a positionally resolved schema expression for use at
+    /// compile time.
     /// `original_sql` preserves the original SQL text for `to_sql()` round-tripping.
     Virtual {
-        expr: Box<Expr>,
+        expr: Box<SchemaExpr>,
         original_sql: String,
     },
     // Stored { resolved: Box<Expr>, original_sql: String },
@@ -5135,10 +5594,22 @@ impl Column {
         col: Option<CollationSeq>,
         coldef: ColDef,
     ) -> Self {
+        let default = default.map(|expr| {
+            Box::new(SchemaExpr::preserve_unresolved(
+                *expr,
+                SchemaExprProfile::Default,
+            ))
+        });
         let generated_type = match generated {
             Some(expr) => {
                 let original_sql = expr.to_string();
-                GeneratedType::Virtual { expr, original_sql }
+                GeneratedType::Virtual {
+                    expr: Box::new(SchemaExpr::preserve_unresolved(
+                        *expr,
+                        SchemaExprProfile::GeneratedColumn,
+                    )),
+                    original_sql,
+                }
             }
             None => GeneratedType::NotGenerated,
         };
@@ -5251,7 +5722,7 @@ impl Column {
     }
 
     #[inline]
-    pub fn generated_type(&self) -> &GeneratedType {
+    pub(crate) fn generated_type(&self) -> &GeneratedType {
         &self.generated_type
     }
 
@@ -5266,7 +5737,7 @@ impl Column {
     }
 
     #[inline]
-    pub fn generated_expr(&self) -> Option<&Expr> {
+    pub(crate) fn generated_expr(&self) -> Option<&SchemaExpr> {
         match &self.generated_type {
             GeneratedType::Virtual { expr, .. } => Some(expr.as_ref()),
             GeneratedType::NotGenerated => None,
@@ -5274,7 +5745,7 @@ impl Column {
     }
 
     #[inline]
-    pub fn generated_expr_mut(&mut self) -> Option<&mut Expr> {
+    pub(crate) fn generated_expr_mut(&mut self) -> Option<&mut SchemaExpr> {
         match &mut self.generated_type {
             GeneratedType::Virtual { expr, .. } => Some(expr.as_mut()),
             GeneratedType::NotGenerated => None,
@@ -5399,15 +5870,27 @@ impl TryFrom<&ColumnDefinition> for Column {
             .map(|t| t.name.to_string())
             .unwrap_or_default();
 
-        let ty_params: std::vec::Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
+        let ty_params: std::vec::Vec<Box<SchemaExpr>> = match &value.col_type {
             Some(ast::Type {
                 size: Some(ast::TypeSize::MaxSize(ref expr)),
                 ..
-            }) => std::vec![expr.clone()],
+            }) => std::vec![Box::new(SchemaExpr::preserve_unresolved(
+                *expr.clone(),
+                SchemaExprProfile::Default,
+            ))],
             Some(ast::Type {
                 size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
                 ..
-            }) => std::vec![e1.clone(), e2.clone()],
+            }) => std::vec![
+                Box::new(SchemaExpr::preserve_unresolved(
+                    *e1.clone(),
+                    SchemaExprProfile::Default,
+                )),
+                Box::new(SchemaExpr::preserve_unresolved(
+                    *e2.clone(),
+                    SchemaExprProfile::Default,
+                )),
+            ],
             _ => std::vec::Vec::new(),
         };
 
@@ -5523,7 +6006,7 @@ pub struct Index {
     /// For example, WITHOUT ROWID tables and SELECT DISTINCT ephemeral indexes
     /// will not have a rowid.
     pub has_rowid: bool,
-    pub where_clause: Option<Box<Expr>>,
+    pub(crate) where_clause: Option<Box<SchemaExpr>>,
     pub index_method: Option<Arc<dyn IndexMethodAttachment>>,
     /// ON CONFLICT clause from the constraint definition (PRIMARY KEY or UNIQUE).
     pub on_conflict: Option<ResolveType>,
@@ -5541,9 +6024,9 @@ pub struct IndexColumn {
     /// b.pos_in_table == 1
     pub pos_in_table: usize,
     pub collation: Option<CollationSeq>,
-    pub default: Option<Box<Expr>>,
+    pub(crate) default: Option<Box<SchemaExpr>>,
     /// Expression for expression indexes. None for simple column indexes.
-    pub expr: Option<Box<Expr>>,
+    pub(crate) expr: Option<Box<SchemaExpr>>,
 }
 
 impl IndexColumn {
@@ -5586,6 +6069,7 @@ impl IndexColumn {
 impl Index {
     pub fn from_sql(
         syms: &SymbolTable,
+        schema: &Schema,
         sql: &str,
         root_page: i64,
         table: &BTreeTable,
@@ -5604,8 +6088,16 @@ impl Index {
                 ..
             })) => {
                 let index_name = normalize_ident(idx_name.name.as_str());
-                let index_columns =
-                    crate::translate::bind::bind_index_columns(table, &columns, None)?;
+                let resolver = CatalogSchemaExprResolver {
+                    schema,
+                    symbols: Some(syms),
+                };
+                let index_columns = resolve_index_columns(
+                    table,
+                    &columns,
+                    &resolver,
+                    ResolutionMode::PreserveUnresolved,
+                )?;
                 if let Some(using) = using {
                     if where_clause.is_some() {
                         bail_parse_error!("custom index module do not support partial indices");
@@ -5637,10 +6129,20 @@ impl Index {
                         on_conflict: None,
                     })
                 } else {
-                    let where_clause = where_clause.map(|mut wc| {
-                        crate::translate::bind::bind_index_schema_expr(&mut wc, table);
-                        wc
-                    });
+                    let table_context = table.schema_expr_table();
+                    let where_clause = where_clause
+                        .as_deref()
+                        .map(|predicate| {
+                            SchemaExpr::resolve(
+                                predicate,
+                                SchemaExprProfile::PartialIndexPredicate,
+                                SchemaExprContext::for_table(&table_context),
+                                &resolver,
+                                ResolutionMode::PreserveUnresolved,
+                            )
+                            .map(Box::new)
+                        })
+                        .transpose()?;
                     Ok(Index {
                         name: index_name,
                         table_name: normalize_ident(tbl_name.as_str()),
@@ -5662,6 +6164,73 @@ impl Index {
     /// Check if this is an expression index.
     pub fn is_expression_index(&self) -> bool {
         self.columns.iter().any(|c| c.expr.is_some())
+    }
+
+    pub(crate) fn resolve_schema_expressions(
+        &mut self,
+        table: &BTreeTable,
+        resolver: &dyn SchemaExprResolver,
+        mode: ResolutionMode,
+    ) -> Result<()> {
+        let table_context = table.schema_expr_table();
+        for column in &mut self.columns {
+            let expected_type = (column.pos_in_table != EXPR_INDEX_SENTINEL)
+                .then(|| table.columns.get(column.pos_in_table))
+                .flatten()
+                .and_then(|column| (!column.ty_str.is_empty()).then_some(column.ty_str.as_str()));
+            if let Some(default) = &mut column.default {
+                default.resolve_unresolved(
+                    SchemaExprContext::without_table().with_expected_type(expected_type),
+                    resolver,
+                    mode,
+                )?;
+            }
+            if let Some(expression) = &mut column.expr {
+                expression.resolve_unresolved(
+                    SchemaExprContext::for_table(&table_context).with_expected_type(expected_type),
+                    resolver,
+                    mode,
+                )?;
+            }
+        }
+        if let Some(predicate) = &mut self.where_clause {
+            predicate.resolve_unresolved(
+                SchemaExprContext::for_table(&table_context),
+                resolver,
+                mode,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Shift table-column positions retained by an index after DROP COLUMN.
+    /// References to the removed position must have been rejected before this
+    /// maintenance step runs.
+    pub(crate) fn remap_after_drop(&mut self, dropped_column: usize) -> Result<()> {
+        for column in &mut self.columns {
+            if column.pos_in_table != EXPR_INDEX_SENTINEL && column.pos_in_table > dropped_column {
+                column.pos_in_table -= 1;
+            }
+            if let Some(expression) = &mut column.expr {
+                if expression.remap_after_drop(dropped_column)?
+                    == DropRemap::UnresolvedSyntaxPreserved
+                {
+                    return Err(LimboError::ParseError(format!(
+                        "cannot drop a column while index {} has an unresolved expression",
+                        self.name
+                    )));
+                }
+            }
+        }
+        if let Some(predicate) = &mut self.where_clause {
+            if predicate.remap_after_drop(dropped_column)? == DropRemap::UnresolvedSyntaxPreserved {
+                return Err(LimboError::ParseError(format!(
+                    "cannot drop a column while partial index {} has an unresolved predicate",
+                    self.name
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// check if this is special backing_btree index created and managed by custom index_method
@@ -5787,19 +6356,107 @@ impl Index {
             .iter()
             .position(|c| c.pos_in_table == table_pos)
     }
+}
 
-    /// Given an expression, return the position in the index if it matches an expression index column.
-    /// Index expressions are stored with column references pre-resolved to `SELF_TABLE` form.
-    /// The binder rebases them to each query table id before planning. Generated-column-backed
-    /// index columns also carry
-    /// an expression (the column's defining expression) but are matched by column position, not here.
-    pub fn expression_to_index_pos(&self, expr: &Expr) -> Option<usize> {
-        self.columns.iter().position(|c| {
-            c.pos_in_table == EXPR_INDEX_SENTINEL
-                && c.expr
-                    .as_ref()
-                    .is_some_and(|e| exprs_are_equivalent(e, expr))
-        })
+pub(crate) fn resolve_index_columns(
+    table: &BTreeTable,
+    columns: &[ast::SortedColumn],
+    resolver: &dyn SchemaExprResolver,
+    mode: ResolutionMode,
+) -> Result<Vec<IndexColumn>> {
+    reject_explicit_nulls(columns)?;
+    let table_context = table.schema_expr_table();
+    let mut resolved = Vec::try_with_capacity_ext(columns.len())?;
+    for column in columns {
+        let order = column.order.unwrap_or(SortOrder::Asc);
+        let (explicit_collation, key) = index_key_collation(column.expr.as_ref(), resolver)?;
+        let key = crate::translate::expr::unwrap_parens(key)?;
+        if let Some((position, definition)) = simple_index_column(key, table) {
+            resolved
+                .push_within_capacity(IndexColumn {
+                    name: definition
+                        .name
+                        .clone()
+                        .expect("an indexed table column must have a name"),
+                    order,
+                    pos_in_table: position,
+                    collation: explicit_collation.or_else(|| definition.collation_opt()),
+                    default: definition.default.clone(),
+                    expr: definition.generated_expr().cloned().map(Box::new),
+                })
+                .expect("resolved index columns were preallocated");
+            continue;
+        }
+
+        // At the top level of an index key SQLite treats a quoted string as
+        // an old-style quoted column name. Parentheses and COLLATE do not
+        // change that rule; string literals nested in a larger expression
+        // remain ordinary literals.
+        if let ast::Expr::Literal(ast::Literal::String(name)) = key {
+            crate::bail_parse_error!("no such column: {}", name.trim_matches('\''));
+        }
+
+        let expression = SchemaExpr::resolve(
+            &column.expr,
+            SchemaExprProfile::IndexKey,
+            SchemaExprContext::for_table(&table_context),
+            resolver,
+            mode,
+        )?;
+        resolved
+            .push_within_capacity(IndexColumn {
+                name: column.expr.to_string(),
+                order,
+                pos_in_table: EXPR_INDEX_SENTINEL,
+                collation: explicit_collation,
+                default: None,
+                expr: Some(Box::new(expression)),
+            })
+            .expect("resolved index columns were preallocated");
+    }
+    Ok(resolved)
+}
+
+fn index_key_collation<'a>(
+    expression: &'a ast::Expr,
+    resolver: &dyn SchemaExprResolver,
+) -> Result<(Option<CollationSeq>, &'a ast::Expr)> {
+    let mut expression = expression;
+    let mut collation = None;
+    loop {
+        expression = crate::translate::expr::unwrap_parens(expression)?;
+        let ast::Expr::Collate(inner, name) = expression else {
+            return Ok((collation, expression));
+        };
+        if collation.is_none() {
+            let resolved = resolver.resolve_collation(name.as_str())?;
+            if resolved.is_custom() {
+                bail_parse_error!("custom collations are not supported in indexes");
+            }
+            collation = Some(resolved);
+        }
+        expression = inner;
+    }
+}
+
+fn simple_index_column<'a>(
+    expression: &ast::Expr,
+    table: &'a BTreeTable,
+) -> Option<(usize, &'a Column)> {
+    match expression {
+        ast::Expr::Id(name) | ast::Expr::Name(name) => table.get_column(name.as_str()),
+        ast::Expr::Literal(ast::Literal::String(name)) => table.get_column(name.trim_matches('\'')),
+        ast::Expr::Qualified(table_name, name)
+            if table_name.as_str().eq_ignore_ascii_case(&table.name) =>
+        {
+            table.get_column(name.as_str())
+        }
+        ast::Expr::DoublyQualified(_, table_name, name)
+            if table_name.as_str().eq_ignore_ascii_case(&table.name) =>
+        {
+            table.get_column(name.as_str())
+        }
+        _ => None,
     }
 }
 
@@ -6092,7 +6749,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
         let default = column.default.clone().unwrap();
-        assert_eq!(default.to_string(), "23");
+        assert_eq!(default.render(&[] as &[&str])?, "23");
         Ok(())
     }
 

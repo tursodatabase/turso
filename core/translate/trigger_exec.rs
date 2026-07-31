@@ -1,20 +1,19 @@
 use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
-use crate::translate::bind::TriggerProgramBinder;
-use crate::translate::plan::ColumnMask;
-use crate::translate::subquery::{
-    emit_non_from_clause_subquery, plan_subqueries_from_trigger_when_clause,
+use crate::translate::plan::{
+    ColumnMask, PlanRuntimeBindings, RuntimeRowBinding, RuntimeValueBinding, SourceReadPrograms,
 };
+use crate::translate::plan_expr::{PlanIdentityMap, PlanParameter};
+use crate::translate::semantic::hir::{HirDocument, TriggerEnvironment, TypeFact};
+use crate::translate::subquery::emit_non_from_clause_subquery;
 use crate::translate::{
-    emitter::Resolver,
-    expr::{self, translate_expr},
-    translate_inner, ProgramBuilder, ProgramBuilderOpts,
+    emitter::Resolver, expr::emit_plan_column_value_decode, ProgramBuilder, ProgramBuilderOpts,
 };
 use crate::util::normalize_ident;
-use crate::vdbe::affinity::Affinity;
 use crate::vdbe::insn::{Insn, Subprogram};
 use crate::vdbe::BranchOffset;
 use crate::{QueryMode, Result};
+use std::num::NonZeroU32;
 use turso_parser::ast::{self, TriggerEvent, TriggerTime};
 
 /// Context for trigger execution
@@ -22,6 +21,8 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime};
 pub struct TriggerContext {
     /// Table the trigger is attached to
     pub table: Arc<BTreeTable>,
+    /// Frozen programs for reading values from the firing statement's target.
+    pub read_programs: Arc<SourceReadPrograms>,
     /// NEW row registers (for INSERT/UPDATE). The last element is always the rowid.
     pub new_registers: Option<Vec<usize>>,
     /// OLD row registers (for UPDATE/DELETE). The last element is always the rowid.
@@ -41,11 +42,13 @@ pub struct TriggerContext {
 impl TriggerContext {
     pub fn new(
         table: Arc<BTreeTable>,
+        read_programs: Arc<SourceReadPrograms>,
         new_registers: Option<Vec<usize>>,
         old_registers: Option<Vec<usize>>,
     ) -> Self {
         Self {
             table,
+            read_programs,
             new_registers,
             old_registers,
             override_conflict: None,
@@ -56,11 +59,13 @@ impl TriggerContext {
     /// Create a trigger context for AFTER triggers where NEW values are encoded.
     pub fn new_after(
         table: Arc<BTreeTable>,
+        read_programs: Arc<SourceReadPrograms>,
         new_registers: Option<Vec<usize>>,
         old_registers: Option<Vec<usize>>,
     ) -> Self {
         Self {
             table,
+            read_programs,
             new_registers,
             old_registers,
             override_conflict: None,
@@ -73,12 +78,14 @@ impl TriggerContext {
     /// clauses should not suppress errors.
     pub fn new_with_override_conflict(
         table: Arc<BTreeTable>,
+        read_programs: Arc<SourceReadPrograms>,
         new_registers: Option<Vec<usize>>,
         old_registers: Option<Vec<usize>>,
         override_conflict: ast::ResolveType,
     ) -> Self {
         Self {
             table,
+            read_programs,
             new_registers,
             old_registers,
             override_conflict: Some(override_conflict),
@@ -89,18 +96,235 @@ impl TriggerContext {
     /// Create a trigger context with a conflict resolution override for AFTER triggers.
     pub fn new_after_with_override_conflict(
         table: Arc<BTreeTable>,
+        read_programs: Arc<SourceReadPrograms>,
         new_registers: Option<Vec<usize>>,
         old_registers: Option<Vec<usize>>,
         override_conflict: ast::ResolveType,
     ) -> Self {
         Self {
             table,
+            read_programs,
             new_registers,
             old_registers,
             override_conflict: Some(override_conflict),
             new_encoded: true,
         }
     }
+}
+
+/// Bind semantic NEW/OLD sources to the fixed parameter layout used by a
+/// trigger subprogram. Every visible column gets a slot, followed by that row
+/// image's rowid slot. NEW always comes before OLD.
+pub(crate) fn runtime_bindings_for_environment(
+    document: &HirDocument,
+    environment: &TriggerEnvironment,
+    identities: &PlanIdentityMap,
+) -> Result<PlanRuntimeBindings> {
+    fn next_parameter(next: &mut u32, type_fact: TypeFact) -> Result<PlanParameter> {
+        let index = NonZeroU32::new(*next).ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "trigger parameter indices must start at one".to_string(),
+            )
+        })?;
+        *next = next.checked_add(1).ok_or_else(|| {
+            crate::LimboError::InternalError("trigger parameter index overflow".to_string())
+        })?;
+        Ok(PlanParameter {
+            index,
+            name: None,
+            type_fact,
+        })
+    }
+
+    fn bind_row(
+        document: &HirDocument,
+        identities: &PlanIdentityMap,
+        bindings: &mut PlanRuntimeBindings,
+        source: super::semantic::hir::SourceId,
+        next: &mut u32,
+    ) -> Result<()> {
+        let source_definition = document.source(source).ok_or_else(|| {
+            crate::LimboError::InternalError(format!("missing trigger pseudo-source {source}"))
+        })?;
+        let plan_source = identities.source(source).ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "missing plan identity for trigger pseudo-source {source}"
+            ))
+        })?;
+        let columns = source_definition
+            .columns
+            .iter()
+            .map(|column| {
+                Ok(RuntimeValueBinding::Parameter(next_parameter(
+                    next,
+                    column.type_fact.clone(),
+                )?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let rowid = RuntimeValueBinding::Parameter(next_parameter(
+            next,
+            TypeFact::known(crate::schema::Type::Integer),
+        )?);
+        if bindings
+            .bind_row(
+                plan_source,
+                RuntimeRowBinding {
+                    columns,
+                    rowid: Some(rowid),
+                    read_programs: None,
+                },
+            )
+            .is_some()
+        {
+            return Err(crate::LimboError::InternalError(format!(
+                "trigger pseudo-source {source} was bound more than once"
+            )));
+        }
+        Ok(())
+    }
+
+    let mut bindings = PlanRuntimeBindings::default();
+    let mut next = 1;
+    if let Some(source) = environment.new_source {
+        bind_row(document, identities, &mut bindings, source, &mut next)?;
+    }
+    if let Some(source) = environment.old_source {
+        bind_row(document, identities, &mut bindings, source, &mut next)?;
+    }
+    Ok(bindings)
+}
+
+/// Bind a trigger predicate's semantic row images directly to the decoded
+/// parent registers. Predicates run in the parent program, before OP_Program
+/// enters the compiled trigger body, so they must not use subprogram
+/// parameters.
+fn runtime_register_bindings_for_environment(
+    document: &HirDocument,
+    environment: &TriggerEnvironment,
+    identities: &PlanIdentityMap,
+    ctx: &TriggerContext,
+) -> Result<PlanRuntimeBindings> {
+    fn bind_row(
+        document: &HirDocument,
+        identities: &PlanIdentityMap,
+        bindings: &mut PlanRuntimeBindings,
+        source: super::semantic::hir::SourceId,
+        registers: Option<&[usize]>,
+        image: &str,
+    ) -> Result<()> {
+        let source_definition = document.source(source).ok_or_else(|| {
+            crate::LimboError::InternalError(format!("missing trigger pseudo-source {source}"))
+        })?;
+        let registers = registers.ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "{image} is visible to trigger analysis but has no runtime registers"
+            ))
+        })?;
+        let expected = source_definition
+            .columns
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| {
+                crate::LimboError::InternalError("trigger register count overflow".to_string())
+            })?;
+        if registers.len() != expected {
+            return Err(crate::LimboError::InternalError(format!(
+                "{image} trigger row has {} registers, expected {expected}",
+                registers.len()
+            )));
+        }
+        let plan_source = identities.source(source).ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "missing plan identity for trigger pseudo-source {source}"
+            ))
+        })?;
+        let rowid = *registers
+            .last()
+            .expect("a validated trigger row includes its rowid register");
+        let row = RuntimeRowBinding {
+            columns: registers[..source_definition.columns.len()]
+                .iter()
+                .map(|register| RuntimeValueBinding::Register {
+                    register: *register,
+                    needs_decode: false,
+                })
+                .collect(),
+            rowid: Some(RuntimeValueBinding::Register {
+                register: rowid,
+                needs_decode: false,
+            }),
+            read_programs: None,
+        };
+        if bindings.bind_row(plan_source, row).is_some() {
+            return Err(crate::LimboError::InternalError(format!(
+                "trigger pseudo-source {source} was bound more than once"
+            )));
+        }
+        Ok(())
+    }
+
+    let mut bindings = PlanRuntimeBindings::default();
+    if let Some(source) = environment.new_source {
+        bind_row(
+            document,
+            identities,
+            &mut bindings,
+            source,
+            ctx.new_registers.as_deref(),
+            "NEW",
+        )?;
+    }
+    if let Some(source) = environment.old_source {
+        bind_row(
+            document,
+            identities,
+            &mut bindings,
+            source,
+            ctx.old_registers.as_deref(),
+            "OLD",
+        )?;
+    }
+    Ok(bindings)
+}
+
+/// Parent registers corresponding to [`runtime_bindings_for_environment`].
+/// Keeping this complete and positional makes command compilation independent
+/// of which NEW/OLD fields happen to be referenced by its syntax.
+pub(crate) fn trigger_parameter_registers(ctx: &TriggerContext) -> Result<Vec<usize>> {
+    fn append_row(
+        output: &mut Vec<usize>,
+        registers: &[usize],
+        column_count: usize,
+        image: &str,
+    ) -> Result<()> {
+        let expected = column_count.checked_add(1).ok_or_else(|| {
+            crate::LimboError::InternalError("trigger register count overflow".to_string())
+        })?;
+        if registers.len() != expected {
+            return Err(crate::LimboError::InternalError(format!(
+                "{image} trigger row has {} registers, expected {expected}",
+                registers.len()
+            )));
+        }
+        output.extend_from_slice(registers);
+        Ok(())
+    }
+
+    let column_count = ctx.table.columns().len();
+    let capacity = (usize::from(ctx.new_registers.is_some())
+        + usize::from(ctx.old_registers.is_some()))
+    .checked_mul(column_count + 1)
+    .ok_or_else(|| {
+        crate::LimboError::InternalError("trigger parameter count overflow".to_string())
+    })?;
+    let mut registers = Vec::with_capacity(capacity);
+    if let Some(new_registers) = ctx.new_registers.as_deref() {
+        append_row(&mut registers, new_registers, column_count, "NEW")?;
+    }
+    if let Some(old_registers) = ctx.old_registers.as_deref() {
+        append_row(&mut registers, old_registers, column_count, "OLD")?;
+    }
+    Ok(registers)
 }
 
 /// Execute trigger commands by compiling them as a subprogram and emitting Program instruction
@@ -134,26 +358,6 @@ fn execute_trigger_commands(
         connection: connection.clone(),
     };
 
-    let has_new = ctx.new_registers.is_some();
-    let has_old = ctx.old_registers.is_some();
-
-    // Ordinary non-main triggers need unqualified DML targets rewritten into the
-    // trigger's schema. Temp-backed triggers intentionally keep unqualified names
-    // unresolved so they can follow SQLite's normal temp/main lookup rules.
-    let db_name = if database_id == crate::MAIN_DB_ID || database_id == crate::TEMP_DB_ID {
-        None
-    } else {
-        resolver
-            .get_database_name_by_index(database_id)
-            .map(ast::Name::exact)
-    };
-    let trigger_binder = TriggerProgramBinder::new(
-        ctx.table.clone(),
-        has_new,
-        has_old,
-        ctx.override_conflict,
-        db_name,
-    );
     let mut subprogram_builder = ProgramBuilder::new_for_trigger(
         QueryMode::Normal,
         program.capture_data_changes_info().clone(),
@@ -172,25 +376,48 @@ fn execute_trigger_commands(
     } else {
         database_id
     };
+    let trigger_input = super::semantic::TriggerAnalysisInput {
+        database_id,
+        table: Arc::new(crate::schema::Table::BTree(ctx.table.clone())),
+        new_visible: ctx.new_registers.is_some(),
+        old_visible: ctx.old_registers.is_some(),
+        override_conflict: ctx.override_conflict,
+    };
+    let semantic_context = resolver
+        .semantic_context()
+        .for_trigger(trigger_database_id, trigger.name.clone())
+        .with_dml_policy(super::semantic::context::DmlPolicy::new(
+            connection.is_nested_stmt(),
+            connection.is_mvcc_bootstrap_connection(),
+            false,
+            connection.check_constraints_ignored(),
+        ));
     let prev_trigger_context = resolver.trigger_context.clone();
     resolver.set_trigger_context(trigger_database_id, trigger.name.clone());
     let compile_result = (|| -> Result<()> {
         for command in trigger.commands.iter() {
-            let stmt = trigger_binder.bind_command(command)?;
+            let document = super::semantic::analyze(
+                &semantic_context,
+                super::semantic::AnalyzeInput::TriggerCommand {
+                    syntax: command,
+                    trigger: &trigger_input,
+                },
+            )?;
+            let resets_change_count = matches!(
+                &document.root,
+                super::semantic::hir::HirRoot::Insert(_)
+                    | super::semantic::hir::HirRoot::Update(_)
+                    | super::semantic::hir::HirRoot::Delete(_)
+            );
             subprogram_builder.prologue();
-            translate_inner(
-                stmt,
+            super::translate_hir_document(
+                document,
                 resolver,
                 &mut subprogram_builder,
                 connection,
-                "trigger subprogram",
+                super::plan::QueryDestination::ResultRows,
             )?;
-            if matches!(
-                command,
-                ast::TriggerCmd::Insert { .. }
-                    | ast::TriggerCmd::Update { .. }
-                    | ast::TriggerCmd::Delete { .. }
-            ) {
+            if resets_change_count {
                 subprogram_builder.emit_insn(Insn::ResetCount);
             }
         }
@@ -227,8 +454,7 @@ fn execute_trigger_commands(
         }
     }
 
-    let param_registers = trigger_binder
-        .parameter_registers(ctx.new_registers.as_deref(), ctx.old_registers.as_deref());
+    let param_registers = trigger_parameter_registers(ctx)?;
 
     program.emit_insn(Insn::Program {
         param_registers,
@@ -429,56 +655,96 @@ pub fn fire_trigger(
     // So we can use the decoded registers directly, skipping N Copy + 1 Affinity per fire.
     let ctx = &decode_trigger_registers(program, resolver, ctx)?;
 
-    let saved_register_affinities = std::mem::take(&mut resolver.register_affinities);
-    let saved_register_collations = std::mem::take(&mut resolver.register_collations);
-    populate_trigger_register_affinities(resolver, ctx);
     let result = (|| -> Result<()> {
-        // Evaluate WHEN clause if present
-        if let Some(mut when_expr) = trigger.when_clause.clone() {
+        // Evaluate WHEN clause if present.
+        if let Some(when_expr) = trigger.when_clause.as_ref() {
             crate::stack::trace_stack!("when_clause");
-            let mut bound_subqueries = crate::translate::bind::bind_trigger_when_clause(
-                &mut when_expr,
-                ctx.table.clone(),
-                ctx.new_registers.as_deref(),
-                ctx.old_registers.as_deref(),
-                resolver,
-                program,
-            )?;
-
-            // Plan and emit any subqueries in the WHEN clause (e.g. IN (SELECT ...), EXISTS, scalar subqueries).
-            let mut subqueries = Vec::new();
-            plan_subqueries_from_trigger_when_clause(
-                program,
-                &mut subqueries,
-                &mut when_expr,
-                resolver,
-                connection,
-                &mut bound_subqueries,
-            )?;
-            // Emit the planned subqueries so their results are available when we evaluate the WHEN expression.
-            // Always treat these as correlated (no `Once` caching) because the WHEN clause is evaluated
-            // per-row, and trigger bodies may modify the tables referenced by the subquery between evaluations.
-            for subquery in &mut subqueries {
-                let plan = subquery.consume_plan(crate::translate::plan::EvalAt::BeforeLoop);
-                emit_non_from_clause_subquery(
-                    program,
-                    resolver,
-                    *plan,
-                    &subquery.query_type,
-                    true, // always re-evaluate: trigger WHEN is checked per-row
+            let trigger_database_id = if trigger.temporary {
+                crate::TEMP_DB_ID
+            } else {
+                database_id
+            };
+            let trigger_input = super::semantic::TriggerAnalysisInput {
+                database_id,
+                table: Arc::new(crate::schema::Table::BTree(ctx.table.clone())),
+                new_visible: ctx.new_registers.is_some(),
+                old_visible: ctx.old_registers.is_some(),
+                override_conflict: ctx.override_conflict,
+            };
+            let semantic_context = resolver
+                .semantic_context()
+                .for_trigger(trigger_database_id, trigger.name.clone())
+                .with_dml_policy(super::semantic::context::DmlPolicy::new(
+                    connection.is_nested_stmt(),
+                    connection.is_mvcc_bootstrap_connection(),
                     false,
-                )?;
-            }
-
-            let when_reg = program.alloc_register();
-            translate_expr(program, None, &when_expr, when_reg, resolver)?;
-
+                    connection.check_constraints_ignored(),
+                ));
+            let document = super::semantic::analyze(
+                &semantic_context,
+                super::semantic::AnalyzeInput::TriggerPredicate {
+                    syntax: when_expr,
+                    trigger: &trigger_input,
+                },
+            )?;
+            let identities = program.allocate_plan_identities(&document);
+            let super::semantic::hir::HirRoot::TriggerPredicate(predicate) = &document.root else {
+                return Err(crate::LimboError::InternalError(
+                    "trigger predicate analysis returned the wrong HIR root".to_string(),
+                ));
+            };
+            let when_expr = super::plan_expr::lower_hir_expr(&predicate.expression, &identities)
+                .map_err(|error| crate::LimboError::InternalError(error.to_string()))?;
+            let runtime_bindings = runtime_register_bindings_for_environment(
+                &document,
+                &predicate.environment,
+                &identities,
+                ctx,
+            )?;
             let skip_label = program.allocate_label();
-            program.emit_insn(Insn::IfNot {
-                reg: when_reg,
-                jump_if_null: true,
-                target_pc: skip_label,
-            });
+            resolver.with_plan_runtime_bindings(runtime_bindings, |resolver| {
+                let mut table_references = super::plan::TableReferences::new_empty();
+                let mut subqueries = Vec::new();
+                let mut hir_ctx =
+                    super::planner::HirPlanContext::new(&document, &identities, program);
+                super::subquery::prepare_hir_expression_subqueries(
+                    &mut hir_ctx,
+                    &mut table_references,
+                    &[&when_expr],
+                    super::plan::SubqueryOrigin::TriggerWhen,
+                    &mut subqueries,
+                )?;
+                drop(hir_ctx);
+                resolver.bind_plan_subqueries(&subqueries);
+
+                // A trigger WHEN predicate is evaluated for each candidate row.
+                // Do not let an uncorrelated subquery acquire a cross-row Once cache:
+                // an earlier trigger body may have changed the tables it reads.
+                for subquery in &mut subqueries {
+                    subquery.correlated = true;
+                    let plan = subquery.consume_plan(super::plan::EvalAt::BeforeLoop);
+                    emit_non_from_clause_subquery(
+                        program,
+                        resolver,
+                        *plan,
+                        &subquery.query_type,
+                        true,
+                        false,
+                    )?;
+                }
+                super::expr::translate_plan_condition_expr(
+                    program,
+                    None,
+                    &when_expr,
+                    super::expr::ConditionMetadata {
+                        jump_if_condition_is_true: false,
+                        jump_target_when_true: skip_label,
+                        jump_target_when_false: skip_label,
+                        jump_target_when_null: skip_label,
+                    },
+                    resolver,
+                )
+            })?;
 
             // Execute trigger commands if WHEN clause is true
             execute_trigger_commands(
@@ -507,8 +773,6 @@ pub fn fire_trigger(
 
         Ok(())
     })();
-    resolver.register_affinities = saved_register_affinities;
-    resolver.register_collations = saved_register_collations;
     result
 }
 
@@ -521,6 +785,57 @@ fn trigger_event_kind(event: &TriggerEvent) -> &'static str {
     }
 }
 
+/// Decode one encoded trigger row with the firing target's frozen read programs.
+/// Only scalar columns with an actual decoder need a copied register. Arrays
+/// remain in their plan-native record representation.
+fn decode_trigger_row_registers(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    ctx: &TriggerContext,
+    registers: &[usize],
+    image: &str,
+) -> Result<Vec<usize>> {
+    let column_count = ctx.table.columns().len();
+    let expected = column_count.checked_add(1).ok_or_else(|| {
+        crate::LimboError::InternalError("trigger register count overflow".to_string())
+    })?;
+    if registers.len() != expected {
+        return Err(crate::LimboError::InternalError(format!(
+            "{image} trigger row has {} registers, expected {expected}",
+            registers.len()
+        )));
+    }
+    if ctx.read_programs.column_type_programs.len() != column_count {
+        return Err(crate::LimboError::InternalError(format!(
+            "trigger target read programs have {} columns, expected {column_count}",
+            ctx.read_programs.column_type_programs.len()
+        )));
+    }
+
+    let mut decoded = Vec::with_capacity(expected);
+    for (column, source_register) in registers[..column_count].iter().copied().enumerate() {
+        let Some(programs) = &ctx.read_programs.column_type_programs[column] else {
+            decoded.push(source_register);
+            continue;
+        };
+        if programs.array.is_some() || programs.decode.is_empty() {
+            decoded.push(source_register);
+            continue;
+        }
+
+        let decoded_register = program.alloc_register();
+        program.emit_insn(Insn::Copy {
+            src_reg: source_register,
+            dst_reg: decoded_register,
+            extra_amount: 0,
+        });
+        emit_plan_column_value_decode(program, None, programs, decoded_register, resolver)?;
+        decoded.push(decoded_register);
+    }
+    decoded.push(registers[column_count]);
+    Ok(decoded)
+}
+
 /// Decode encoded custom type registers in a TriggerContext.
 /// OLD registers are always decoded (they always come from cursor reads on disk).
 /// NEW registers are decoded only when `ctx.new_encoded` is true (AFTER triggers).
@@ -529,29 +844,10 @@ fn decode_trigger_registers(
     resolver: &Resolver,
     ctx: &TriggerContext,
 ) -> Result<TriggerContext> {
-    if !ctx.table.is_strict {
-        // Non-STRICT tables never have custom type encoding
-        return Ok(TriggerContext {
-            table: ctx.table.clone(),
-            new_registers: ctx.new_registers.clone(),
-            old_registers: ctx.old_registers.clone(),
-            override_conflict: ctx.override_conflict,
-            new_encoded: false,
-        });
-    }
-
-    let columns = ctx.table.columns();
-
     let decoded_new = if ctx.new_encoded {
         if let Some(new_regs) = &ctx.new_registers {
-            let rowid_reg = *new_regs.last().expect("NEW registers must include rowid");
-            Some(expr::emit_trigger_decode_registers(
-                program,
-                resolver,
-                columns,
-                &|i| new_regs[i],
-                rowid_reg,
-                true, // is_strict
+            Some(decode_trigger_row_registers(
+                program, resolver, ctx, new_regs, "NEW",
             )?)
         } else {
             None
@@ -561,14 +857,8 @@ fn decode_trigger_registers(
     };
 
     let decoded_old = if let Some(old_regs) = &ctx.old_registers {
-        let rowid_reg = *old_regs.last().expect("OLD registers must include rowid");
-        Some(expr::emit_trigger_decode_registers(
-            program,
-            resolver,
-            columns,
-            &|i| old_regs[i],
-            rowid_reg,
-            true, // is_strict
+        Some(decode_trigger_row_registers(
+            program, resolver, ctx, old_regs, "OLD",
         )?)
     } else {
         None
@@ -576,43 +866,10 @@ fn decode_trigger_registers(
 
     Ok(TriggerContext {
         table: ctx.table.clone(),
+        read_programs: Arc::clone(&ctx.read_programs),
         new_registers: decoded_new,
         old_registers: decoded_old,
         override_conflict: ctx.override_conflict,
         new_encoded: false, // decoded now
     })
-}
-
-fn populate_trigger_register_affinities(resolver: &mut Resolver, ctx: &TriggerContext) {
-    populate_trigger_row_register_affinities(resolver, &ctx.table, ctx.new_registers.as_deref());
-    populate_trigger_row_register_affinities(resolver, &ctx.table, ctx.old_registers.as_deref());
-}
-
-// NEW/OLD columns don't have affinities, except for rowids and rowid aliases,
-// which have INTEGER affinity. See https://www.sqlite.org/forum/forumpost/819f2d6627
-fn populate_trigger_row_register_affinities(
-    resolver: &mut Resolver,
-    table: &BTreeTable,
-    row_registers: Option<&[usize]>,
-) {
-    let Some(registers) = row_registers else {
-        return;
-    };
-
-    for (idx, column) in table.columns().iter().enumerate() {
-        if !column.is_rowid_alias() {
-            continue;
-        }
-        if let Some(&register) = registers.get(idx) {
-            resolver
-                .register_affinities
-                .insert(register, Affinity::Integer);
-        }
-    }
-
-    if let Some(&rowid_register) = registers.last() {
-        resolver
-            .register_affinities
-            .insert(rowid_register, Affinity::Integer);
-    }
 }

@@ -1,5 +1,3 @@
-use turso_parser::ast;
-
 use crate::{
     function::{AccumulatorFunc, AggFunc},
     schema::Table,
@@ -15,11 +13,16 @@ use crate::{
 use super::{
     emitter::{OperationMode, Resolver, TranslateCtx},
     expr::{
-        resolve_expr, translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
+        translate_plan_condition_expr, translate_plan_expr, translate_plan_expr_no_constant_opt,
         ConditionMetadata, NoConstantOptReason,
     },
-    plan::{Aggregate, Distinctness, SelectPlan, TableReferences},
+    plan::{
+        Aggregate, Distinctness, NonFromClauseSubquery, SelectPlan, SubqueryEvalPhase,
+        TableReferences,
+    },
+    plan_expr::{plan_expr_collation, PlanExpr, PlanExprFactSource},
     result_row::emit_select_result,
+    subquery::emit_non_from_clause_subqueries_for_phase,
 };
 
 /// Emits the bytecode for processing an aggregate without a GROUP BY clause.
@@ -29,6 +32,7 @@ pub fn emit_ungrouped_aggregation<'a>(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx<'a>,
     plan: &'a SelectPlan,
+    output_subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
     let agg_start_reg = t_ctx.reg_agg_start.unwrap();
 
@@ -39,12 +43,12 @@ pub fn emit_ungrouped_aggregation<'a>(
             func: AccumulatorFunc::Agg(agg.func.clone()),
         });
     }
-    // we now have the agg results in (agg_start_reg..agg_start_reg + aggregates.len() - 1)
-    // we need to call translate_expr on each result column, but replace the expr with a register copy in case any part of the
-    // result column expression matches a) a group by column or b) an aggregation result.
+    // Aggregate results now occupy the contiguous aggregate-register range.
+    // Cache each aggregate expression so result-column translation copies its
+    // finalized value instead of evaluating the aggregate call again.
     for (i, agg) in plan.aggregates.iter().enumerate() {
-        t_ctx.resolver.cache_expr_reg(
-            std::borrow::Cow::Borrowed(&agg.original_expr),
+        t_ctx.resolver.cache_plan_expr_reg(
+            agg.original_expr.clone(),
             agg_start_reg + i,
             false,
             None,
@@ -52,54 +56,14 @@ pub fn emit_ungrouped_aggregation<'a>(
     }
     t_ctx.resolver.enable_expr_to_reg_cache();
 
-    // Allocate a label for the end (used by both HAVING and OFFSET to skip row emission)
-    let end_label = program.allocate_label();
-
-    // Handle HAVING clause without GROUP BY for ungrouped aggregation
-    if let Some(group_by) = &plan.group_by {
-        if group_by.exprs.is_empty() {
-            if let Some(having) = &group_by.having {
-                for expr in having.iter() {
-                    let if_true_target = program.allocate_label();
-                    translate_condition_expr(
-                        program,
-                        &plan.table_references,
-                        expr,
-                        ConditionMetadata {
-                            jump_if_condition_is_true: false,
-                            jump_target_when_false: end_label,
-                            jump_target_when_true: if_true_target,
-                            // treat null result as false
-                            jump_target_when_null: end_label,
-                        },
-                        &t_ctx.resolver,
-                    )?;
-                    program.preassign_label_to_next_insn(if_true_target);
-                }
-            }
-        }
-    }
-
-    // Handle OFFSET for ungrouped aggregates
-    // Since we only have one result row, either skip it (offset > 0) or emit it
-    if let Some(offset_reg) = t_ctx.reg_offset {
-        // If offset > 0, jump to end (skip the single row)
-        program.emit_insn(Insn::IfPos {
-            reg: offset_reg,
-            target_pc: end_label,
-            decrement_by: 0,
-        });
-    }
-
-    // If the loop never ran (once-flag is still 0), we need to evaluate non-aggregate columns now.
-    // This ensures literals return their values and column references return NULL (since no
-    // rows matched). The once-flag mechanism normally evaluates non-agg columns on first
-    // iteration, but if there were no iterations, we must do it here.
+    // If the loop never ran (once-flag is still 0), evaluate non-aggregate
+    // outputs before anything can read their runtime bindings. Output-phase
+    // subqueries and HAVING may both refer to these aliases.
     //
-    // We must emit NullRow for all table cursors first, because after a WHERE-filter
-    // jump-out the cursor may still be positioned on a valid (but non-matching) row.
-    // Without NullRow, Column instructions would read stale data from that row instead
-    // of returning NULL.
+    // We must emit NullRow for all table cursors first, because after a
+    // WHERE-filter jump-out a cursor may still be positioned on a valid (but
+    // non-matching) row. Without NullRow, an alias would expose stale data from
+    // that row instead of NULL.
     if let Some(once_flag) = t_ctx.reg_nonagg_emit_once_flag {
         let skip_nonagg_eval = program.allocate_label();
         // If once-flag is non-zero (loop ran at least once), skip evaluation
@@ -133,13 +97,12 @@ pub fn emit_ungrouped_aggregation<'a>(
                 }
             }
         }
-        // Evaluate non-aggregate columns now (with cursor in invalid state, columns return NULL)
         // Must use no_constant_opt to prevent constant hoisting which would place the label
         // after the hoisted constants, causing infinite loops in compound selects.
         let col_start = t_ctx.reg_result_cols_start.unwrap();
         for (i, rc) in plan.result_columns.iter().enumerate() {
             if !rc.contains_aggregates {
-                translate_expr_no_constant_opt(
+                translate_plan_expr_no_constant_opt(
                     program,
                     Some(&plan.table_references),
                     &rc.expr,
@@ -150,6 +113,55 @@ pub fn emit_ungrouped_aggregation<'a>(
             }
         }
         program.preassign_label_to_next_insn(skip_nonagg_eval);
+    }
+
+    emit_non_from_clause_subqueries_for_phase(
+        program,
+        &t_ctx.resolver,
+        output_subqueries,
+        &plan.join_order,
+        Some(&plan.table_references),
+        SubqueryEvalPhase::UngroupedAggregateOutput,
+        |_| true,
+    )?;
+
+    // Allocate a label for the end (used by both HAVING and OFFSET to skip row emission)
+    let end_label = program.allocate_label();
+
+    // Handle HAVING clause without GROUP BY for ungrouped aggregation
+    if let Some(group_by) = &plan.group_by {
+        if group_by.exprs.is_empty() {
+            if let Some(having) = &group_by.having {
+                for expr in having.iter() {
+                    let if_true_target = program.allocate_label();
+                    translate_plan_condition_expr(
+                        program,
+                        Some(&plan.table_references),
+                        expr,
+                        ConditionMetadata {
+                            jump_if_condition_is_true: false,
+                            jump_target_when_false: end_label,
+                            jump_target_when_true: if_true_target,
+                            // treat null result as false
+                            jump_target_when_null: end_label,
+                        },
+                        &t_ctx.resolver,
+                    )?;
+                    program.preassign_label_to_next_insn(if_true_target);
+                }
+            }
+        }
+    }
+
+    // Handle OFFSET for ungrouped aggregates
+    // Since we only have one result row, either skip it (offset > 0) or emit it
+    if let Some(offset_reg) = t_ctx.reg_offset {
+        // If offset > 0, jump to end (skip the single row)
+        program.emit_insn(Insn::IfPos {
+            reg: offset_reg,
+            target_pc: end_label,
+            decrement_by: 0,
+        });
     }
 
     // Emit the result row (if we didn't skip it due to HAVING or OFFSET)
@@ -181,30 +193,10 @@ pub fn emit_ungrouped_aggregation<'a>(
 /// (explicit COLLATE clause, then the column's table-defined collation, then
 /// BINARY). The result is stored on the AggStep instruction itself.
 pub(crate) fn agg_arg_collation(
-    referenced_tables: &TableReferences,
-    expr: &ast::Expr,
-    resolver: &Resolver,
-) -> CollationSeq {
-    // Check if this is a column expression with explicit COLLATE clause
-    if let ast::Expr::Collate(_, collation_name) = expr {
-        if let Ok(collation) = resolver.resolve_collation(collation_name.as_str()) {
-            return collation;
-        }
-        return CollationSeq::Binary;
-    }
-
-    // If no explicit collation, check if this is a column with table-defined collation
-    if let ast::Expr::Column { table, column, .. } = expr {
-        if let Some((_, table_ref)) = referenced_tables.find_table_by_internal_id(*table) {
-            if let Some(table_column) = table_ref.get_column_at(*column) {
-                if let Some(c) = table_column.collation_opt() {
-                    return c;
-                }
-            }
-        }
-    }
-
-    CollationSeq::Binary
+    expr: &PlanExpr,
+    facts: &impl PlanExprFactSource,
+) -> Result<CollationSeq> {
+    Ok(plan_expr_collation(expr, facts)?.unwrap_or(CollationSeq::Binary))
 }
 
 /// Emits the bytecode for handling duplicates in a distinct aggregate.
@@ -237,9 +229,9 @@ pub fn handle_distinct(
 ///
 /// * `Register`: arguments were pre-computed into contiguous registers
 ///   (used for GROUP BY without a sorter, where the main loop is already sorted).
-/// * `Expression`: arguments are evaluated on-the-fly from the original AST
+/// * `Expression`: plan expressions are evaluated on the fly
 ///   (used for ungrouped aggregates, window functions, and for the GROUP BY sorter
-///   path where leaf columns are cached in `expr_to_reg_cache` before evaluation).
+///   path where leaf columns are cached in the plan-expression register cache before evaluation).
 pub enum AggArgumentSource<'a> {
     Register {
         src_reg_start: usize,
@@ -247,7 +239,7 @@ pub enum AggArgumentSource<'a> {
     },
     Expression {
         func: &'a AggFunc,
-        args: &'a Vec<ast::Expr>,
+        args: &'a [PlanExpr],
         distinctness: &'a Distinctness,
     },
 }
@@ -262,7 +254,7 @@ impl<'a> AggArgumentSource<'a> {
 
     pub fn new_from_expression(
         func: &'a AggFunc,
-        args: &'a Vec<ast::Expr>,
+        args: &'a [PlanExpr],
         distinctness: &'a Distinctness,
     ) -> Self {
         Self::Expression {
@@ -286,7 +278,7 @@ impl<'a> AggArgumentSource<'a> {
         }
     }
 
-    pub fn arg_at(&self, idx: usize) -> &ast::Expr {
+    pub fn arg_at(&self, idx: usize) -> &PlanExpr {
         match self {
             AggArgumentSource::Register { aggregate, .. } => &aggregate.args[idx],
             AggArgumentSource::Expression { args, .. } => &args[idx],
@@ -314,7 +306,7 @@ impl<'a> AggArgumentSource<'a> {
                 ..
             } => Ok(*start_reg + arg_idx),
             AggArgumentSource::Expression { args, .. } => {
-                resolve_expr(program, Some(referenced_tables), &args[arg_idx], resolver)
+                resolve_plan_expr(program, referenced_tables, &args[arg_idx], resolver)
             }
         }
     }
@@ -337,6 +329,7 @@ pub fn translate_aggregation_step(
     agg_arg_source: AggArgumentSource,
     target_register: usize,
     resolver: &Resolver,
+    facts: &impl PlanExprFactSource,
     // For `percentile_cont` / `percentile_disc`: register pre-evaluated by
     // `InitLoop::emit`. `None` for any other aggregate.
     fraction_reg: Option<usize>,
@@ -361,7 +354,7 @@ pub fn translate_aggregation_step(
             target_register
         }
         AggFunc::Count0 => {
-            let expr = ast::Expr::Literal(ast::Literal::Numeric("1".to_string()));
+            let expr = PlanExpr::Literal(turso_parser::ast::Literal::Numeric("1".to_string()));
             let expr_reg = translate_const_arg(program, referenced_tables, resolver, &expr)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
@@ -399,7 +392,7 @@ pub fn translate_aggregation_step(
                 agg_arg_source.translate(program, referenced_tables, resolver, 1)?
             } else {
                 let delimiter_expr =
-                    ast::Expr::Literal(ast::Literal::String(String::from("\",\"")));
+                    PlanExpr::Literal(turso_parser::ast::Literal::String(String::from("\",\"")));
                 translate_const_arg(program, referenced_tables, resolver, &delimiter_expr)?
             };
 
@@ -424,9 +417,8 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
-            let comparator =
-                super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
+            let arg_collation = agg_arg_collation(expr, facts)?;
+            let comparator = super::order_by::custom_type_comparator(expr, facts);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -444,9 +436,8 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
-            let comparator =
-                super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
+            let arg_collation = agg_arg_collation(expr, facts)?;
+            let comparator = super::order_by::custom_type_comparator(expr, facts);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -570,7 +561,7 @@ pub fn translate_aggregation_step(
             let value_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             // Activate the value's collation so finalize can sort text correctly.
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
+            let arg_collation = agg_arg_collation(expr, facts)?;
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: value_reg,
@@ -593,7 +584,7 @@ pub fn translate_aggregation_step(
             let fraction_reg =
                 fraction_reg.expect("percentile fraction register must be set by InitLoop::emit");
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
+            let arg_collation = agg_arg_collation(expr, facts)?;
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: value_reg,
@@ -656,10 +647,31 @@ fn translate_const_arg(
     program: &mut ProgramBuilder,
     referenced_tables: &TableReferences,
     resolver: &Resolver,
-    expr: &ast::Expr,
+    expr: &PlanExpr,
 ) -> Result<usize> {
     let target_register = program.alloc_register();
-    translate_expr(
+    translate_plan_expr(
+        program,
+        Some(referenced_tables),
+        expr,
+        target_register,
+        resolver,
+    )
+}
+
+fn resolve_plan_expr(
+    program: &mut ProgramBuilder,
+    referenced_tables: &TableReferences,
+    expr: &PlanExpr,
+    resolver: &Resolver,
+) -> Result<usize> {
+    if let Some((register, needs_decode, _)) = resolver.resolve_cached_plan_expr_reg(expr) {
+        if !needs_decode {
+            return Ok(register);
+        }
+    }
+    let target_register = program.alloc_register();
+    translate_plan_expr(
         program,
         Some(referenced_tables),
         expr,

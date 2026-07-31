@@ -8,7 +8,7 @@ use std::{
 };
 
 use tracing::{instrument, Level};
-use turso_parser::ast::{fmt::ToTokens, Cmd};
+use turso_parser::ast::Cmd;
 
 use crate::alloc::TursoIteratorExt;
 use crate::{
@@ -16,7 +16,12 @@ use crate::{
     parameters,
     schema::Trigger,
     stats::refresh_analyze_stats,
-    translate::{self, display::PlanContext, emitter::TransactionMode, plan::BitSet},
+    translate::{
+        self,
+        emitter::TransactionMode,
+        plan::{BitSet, ResultColumnOrigin},
+        semantic::hir::OutputNameKind,
+    },
     turso_assert,
     vdbe::{
         self,
@@ -88,14 +93,12 @@ impl StatementOrigin {
 /// For a literal (`SELECT 42`, `SELECT 'x'`, `SELECT 3.14`), `declared_name`
 /// is the primitive that matches the literal's parsed value type
 /// (`"INTEGER"`, `"TEXT"`, `"REAL"`). For a typed expression — CAST, rowid,
-/// or anything else SQLite's affinity rules can pin down — it's the
+/// or another expression whose semantic result storage is known — it's the
 /// inferred primitive. In both cases `array_dimensions` is `0`, `base_type`
-/// is `None`, and `kind` is [`ColumnTypeKind::Builtin`]. When neither path
-/// produces a usable primitive (binary arithmetic that SQLite refuses to
-/// propagate through, BLOB literals, NULL literals, function calls without
-/// declared return affinity), `get_column_type_info` returns `Ok(None)`
-/// rather than fabricating a name — callers can fall through to their own
-/// default.
+/// is `None`, and `kind` is [`ColumnTypeKind::Builtin`]. When semantic
+/// analysis cannot determine a usable primitive (for example BLOB or NULL
+/// literals, or a function with no declared result type),
+/// `get_column_type_info` returns `Ok(None)` rather than fabricating a name.
 ///
 /// New fields may be added over time; the struct is marked
 /// `#[non_exhaustive]` so consumers must use struct-update or accessor
@@ -163,99 +166,9 @@ pub enum ColumnTypeKind {
     Union,
 }
 
-/// Recursively infer the result primitive of a non-table-column expression
-/// and return its uppercase name (`"INTEGER"`, `"REAL"`, `"TEXT"`,
-/// `"NUMERIC"`, `"BLOB"`) or `None` when no determination can be made.
-///
-/// Used by [`Statement::get_column_type_info`] to give wire-protocol layers
-/// a usable type for `SELECT 1+1`-style result columns. Goes beyond SQLite's
-/// `get_expr_affinity` (which deliberately stops at binary operators because
-/// SQLite's affinity model is about *column* coercion, not expression
-/// inference) by walking through arithmetic, bitwise, comparison, logical,
-/// and concat operators — letting `SELECT 42 + 1` report INT4 to a
-/// PostgreSQL client the way PG itself does.
-fn infer_expression_primitive(
-    expr: &turso_parser::ast::Expr,
-    referenced_tables: Option<&translate::plan::TableReferences>,
-) -> Option<&'static str> {
-    use turso_parser::ast::{Expr, Operator};
-
-    match expr {
-        // Bare literal: read the parsed concrete value type.
-        Expr::Literal(lit) => match translate::alter::literal_default_value(lit)
-            .ok()?
-            .value_type()
-        {
-            crate::types::ValueType::Integer => Some("INTEGER"),
-            crate::types::ValueType::Float => Some("REAL"),
-            crate::types::ValueType::Text => Some("TEXT"),
-            _ => None,
-        },
-        Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            infer_expression_primitive(exprs.first().unwrap(), referenced_tables)
-        }
-        Expr::Collate(inner, _) => infer_expression_primitive(inner, referenced_tables),
-        Expr::Unary(_, inner) => {
-            // Unary +/-/NOT preserve the operand's primitive (NOT on INTEGER
-            // is still INTEGER in SQLite).
-            infer_expression_primitive(inner, referenced_tables)
-        }
-        Expr::Binary(left, op, right) => match op {
-            // Arithmetic: widen INTEGER × INTEGER to INTEGER, anything mixed
-            // with REAL becomes REAL, fall through to NUMERIC otherwise.
-            Operator::Add
-            | Operator::Subtract
-            | Operator::Multiply
-            | Operator::Divide
-            | Operator::Modulus => {
-                let l = infer_expression_primitive(left, referenced_tables);
-                let r = infer_expression_primitive(right, referenced_tables);
-                Some(combine_arithmetic_primitive(l, r))
-            }
-            // Bitwise: result is always INTEGER in both SQLite and PG.
-            Operator::BitwiseAnd
-            | Operator::BitwiseOr
-            | Operator::BitwiseNot
-            | Operator::LeftShift
-            | Operator::RightShift => Some("INTEGER"),
-            // Comparison and logical: SQLite returns 0/1 INTEGER; tursopg
-            // maps INTEGER to BOOL at the wire layer for boolean columns,
-            // but the type the wire layer reports is still INTEGER here.
-            Operator::Equals
-            | Operator::NotEquals
-            | Operator::Less
-            | Operator::LessEquals
-            | Operator::Greater
-            | Operator::GreaterEquals
-            | Operator::Is
-            | Operator::IsNot
-            | Operator::And
-            | Operator::Or
-            | Operator::ArrayContains
-            | Operator::ArrayOverlap => Some("INTEGER"),
-            // Concat is always TEXT.
-            Operator::Concat => Some("TEXT"),
-            // JSON ops fall through to the affinity machinery — `->` returns
-            // JSON / blob, `->>` returns TEXT; the existing affinity rules
-            // give the correct answer.
-            Operator::ArrowRight | Operator::ArrowRightShift => affinity_to_primitive(
-                translate::expr::get_expr_affinity(expr, referenced_tables, None),
-            ),
-        },
-        Expr::RowId { .. } => Some("INTEGER"),
-        // CAST, column references, and anything else: defer to the affinity
-        // machinery, which handles these shapes correctly.
-        _ => affinity_to_primitive(translate::expr::get_expr_affinity(
-            expr,
-            referenced_tables,
-            None,
-        )),
-    }
-}
-
-/// Map [`crate::vdbe::affinity::Affinity`] to the uppercase primitive name
-/// `infer_expression_primitive` returns. `Blob` collapses to `None` because
-/// SQLite's "no determined affinity" sentinel isn't a usable wire type.
+/// Map a frozen expression affinity to the public uppercase primitive name.
+/// `Blob` remains absent for this API because it historically represented
+/// both BLOB affinity and "no inferred affinity".
 fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'static str> {
     match affinity {
         crate::vdbe::affinity::Affinity::Integer => Some("INTEGER"),
@@ -266,20 +179,15 @@ fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'
     }
 }
 
-/// Pick the widening primitive for an arithmetic binary op given each
-/// operand's inferred primitive. `INTEGER + INTEGER -> INTEGER`,
-/// `INTEGER + REAL -> REAL`, everything else collapses to `NUMERIC` (the
-/// safe wire default for a mixed-affinity numeric result).
-fn combine_arithmetic_primitive(
-    left: Option<&'static str>,
-    right: Option<&'static str>,
-) -> &'static str {
-    match (left, right) {
-        (Some("INTEGER"), Some("INTEGER")) => "INTEGER",
-        (Some("INTEGER"), Some("REAL"))
-        | (Some("REAL"), Some("INTEGER"))
-        | (Some("REAL"), Some("REAL")) => "REAL",
-        _ => "NUMERIC",
+/// Map a storage type fixed during semantic analysis to the public primitive
+/// name used by result metadata APIs.
+fn storage_type_to_primitive(storage: crate::schema::Type) -> Option<&'static str> {
+    match storage {
+        crate::schema::Type::Integer => Some("INTEGER"),
+        crate::schema::Type::Real => Some("REAL"),
+        crate::schema::Type::Text => Some("TEXT"),
+        crate::schema::Type::Numeric => Some("NUMERIC"),
+        crate::schema::Type::Null | crate::schema::Type::Blob => None,
     }
 }
 
@@ -935,66 +843,57 @@ impl Statement {
             QueryMode::Normal => {
                 let column = &self.program.result_columns.get(idx).expect("No column");
 
-                // 1. Explicit alias (AS clause) or SELECT * expansion always wins.
-                if let Some(alias) = &column.alias {
-                    return Cow::Borrowed(alias);
+                // A user-provided alias is already the final name and is not
+                // affected by the full/short-column-name pragmas.
+                if column.name_kind == OutputNameKind::ExplicitAlias {
+                    return Cow::Borrowed(column.name());
                 }
 
                 let full = self.program.connection.get_full_column_names();
                 let short = self.program.connection.get_short_column_names();
 
-                // 2. For column references, apply full/short column name logic.
-                match &column.expr {
-                    turso_parser::ast::Expr::Column {
-                        table,
-                        column: col_idx,
-                        ..
-                    } => {
-                        if full {
-                            // full_column_names=ON: use REAL_TABLE_NAME.COLUMN
-                            if let Some((_, table_ref)) = self
-                                .program
-                                .table_references
-                                .find_table_by_internal_id(*table)
-                            {
-                                let col_name = table_ref
-                                    .get_column_at(*col_idx)
-                                    .and_then(|c| c.name.as_deref())
-                                    .unwrap_or("?");
-                                return Cow::Owned(format!(
-                                    "{}.{}",
-                                    table_ref.get_name(),
-                                    col_name
-                                ));
-                            }
-                        }
-                        if short || full {
-                            // short_column_names=ON: use just COLUMN
-                            if let Some(name) = column.name(&self.program.table_references) {
-                                return Cow::Borrowed(name);
-                            }
-                        }
-                        // Both OFF: use original expression text
-                        if let Some(name) = &column.implicit_column_name {
-                            Cow::Borrowed(name.as_str())
-                        } else {
-                            let tables = [&self.program.table_references];
-                            let ctx = PlanContext(&tables);
-                            Cow::Owned(column.expr.displayer(&ctx).to_string())
+                if let Some(ResultColumnOrigin::Column {
+                    source,
+                    column: column_idx,
+                }) = column.origin
+                {
+                    let table = self
+                        .program
+                        .table_references
+                        .find_table_by_internal_id(source)
+                        .map(|(_, table)| table);
+                    let source_name = table
+                        .and_then(|table| table.get_column_at(column_idx))
+                        .and_then(|column| column.name.as_deref())
+                        .unwrap_or(column.name());
+
+                    // Star expansion uses the source alias in long-name mode.
+                    // An explicit column reference instead uses the real table
+                    // name, matching SQLite's pragma behavior.
+                    if column.name_kind == OutputNameKind::StarExpansion && full && !short {
+                        if let Some(joined) = self
+                            .program
+                            .table_references
+                            .find_joined_table_by_internal_id(source)
+                        {
+                            return Cow::Owned(format!("{}.{}", joined.identifier, source_name));
                         }
                     }
-                    _ => {
-                        // Non-column-ref: use implicit_column_name or displayer
-                        match column.name(&self.program.table_references) {
-                            Some(name) => Cow::Borrowed(name),
-                            None => {
-                                let tables = [&self.program.table_references];
-                                let ctx = PlanContext(&tables);
-                                Cow::Owned(column.expr.displayer(&ctx).to_string())
-                            }
+
+                    if column.name_kind == OutputNameKind::Inferred && full {
+                        if let Some(table) = table {
+                            return Cow::Owned(format!("{}.{}", table.get_name(), source_name));
                         }
+                    }
+
+                    if short || full || column.name_kind == OutputNameKind::StarExpansion {
+                        return Cow::Borrowed(source_name);
                     }
                 }
+
+                // Semantic analysis preserved the original expression text for
+                // inferred names, so no parser expression is needed here.
+                Cow::Borrowed(column.name())
             }
             QueryMode::Explain => Cow::Borrowed(EXPLAIN_COLUMNS[idx]),
             QueryMode::ExplainQueryPlan => Cow::Borrowed(EXPLAIN_QUERY_PLAN_COLUMNS[idx]),
@@ -1006,14 +905,13 @@ impl Statement {
             return None;
         }
         let column = &self.program.result_columns.get(idx).expect("No column");
-        match &column.expr {
-            turso_parser::ast::Expr::Column { table, .. } => self
-                .program
-                .table_references
-                .find_table_by_internal_id(*table)
-                .map(|(_, table_ref)| Cow::Borrowed(table_ref.get_name())),
-            _ => None,
-        }
+        let ResultColumnOrigin::Column { source, .. } = column.origin? else {
+            return None;
+        };
+        self.program
+            .table_references
+            .find_table_by_internal_id(source)
+            .map(|(_, table)| Cow::Borrowed(table.get_name()))
     }
 
     /// Returns the declared type of a result column.
@@ -1043,26 +941,15 @@ impl Statement {
             );
         }
         let column = &self.program.result_columns.get(idx).expect("No column");
-        match &column.expr {
-            turso_parser::ast::Expr::Column {
-                table,
-                column: column_idx,
-                ..
-            } => {
-                let (_, table_ref) = self
-                    .program
-                    .table_references
-                    .find_table_by_internal_id(*table)?;
-                let table_column = table_ref.get_column_at(*column_idx)?;
-                let ty_str = &table_column.ty_str;
-                if ty_str.is_empty() {
-                    None
-                } else {
-                    Some(ty_str.clone())
-                }
-            }
-            _ => None,
+        if !matches!(column.origin, Some(ResultColumnOrigin::Column { .. })) {
+            return None;
         }
+        column
+            .type_fact
+            .declared
+            .as_ref()
+            .map(|declared| declared.name.clone())
+            .filter(|name| !name.is_empty())
     }
 
     /// Returns rich type information for a result column.
@@ -1070,9 +957,9 @@ impl Statement {
     /// This is Turso's single entry point for "what is the type of this
     /// column?" — covering both **direct table-column references** (where the
     /// schema carries declared name, array depth, custom-type kind, and the
-    /// resolved primitive) and **computed expressions** (where the SQLite-
-    /// style affinity machinery infers a primitive type from the expression
-    /// shape). One call, one shape, regardless of which path applies.
+    /// resolved primitive) and **computed expressions** (where semantic
+    /// analysis has frozen a known result storage type). One call, one shape,
+    /// regardless of which path applies.
     ///
     /// ### Return value
     ///
@@ -1082,13 +969,12 @@ impl Statement {
     ///   `--experimental-custom-types` (or `DatabaseOpts::with_custom_types`)
     ///   before they can rely on it.
     /// - `Ok(None)` when the statement is in EXPLAIN mode, when `idx` is out
-    ///   of bounds, when the result column has no schema column behind it
-    ///   AND the affinity machinery returns `BLOB` (i.e. "no determined
-    ///   affinity"), or when a join/CTE reference can't be resolved.
+    ///   of bounds, or when the result column has no usable declared or
+    ///   semantic result type.
     /// - `Ok(Some(info))` otherwise. For a table-column reference, `info`
     ///   carries the declared name verbatim; for an expression, `declared_name`
-    ///   is the inferred-affinity primitive (`"INTEGER"`, `"TEXT"`, `"REAL"`,
-    ///   or `"NUMERIC"`) and `kind` is `Builtin`.
+    ///   is the known semantic result primitive (`"INTEGER"`, `"TEXT"`,
+    ///   `"REAL"`, or `"NUMERIC"`) and `kind` is `Builtin`.
     ///
     /// This is a Turso-specific API; it has no `sqlite3_*` counterpart. The
     /// returned struct is `#[non_exhaustive]` so additional metadata can be
@@ -1105,73 +991,46 @@ impl Statement {
         let Some(column) = self.program.result_columns.get(idx) else {
             return Ok(None);
         };
-        // Direct table-column reference: pull declared name, array depth, and
-        // any registered CREATE TYPE / CREATE DOMAIN resolution out of the
-        // schema. Anything else falls through to the expression-affinity
-        // inference path below.
-        if let turso_parser::ast::Expr::Column {
-            table,
-            column: column_idx,
-            ..
-        } = &column.expr
-        {
-            let Some((_, table_ref)) = self
-                .program
-                .table_references
-                .find_table_by_internal_id(*table)
-            else {
-                return Ok(None);
+        // Declared types and custom-type identities were frozen during
+        // semantic analysis. Statement metadata must not reopen the live
+        // schema after the plan has been prepared.
+        if let Some(declared) = column.type_fact.declared.as_ref() {
+            let (base_type, kind) = if let Some(custom) = declared.custom() {
+                let leaf = custom.value();
+                let kind = if leaf.is_struct() {
+                    ColumnTypeKind::Struct
+                } else if leaf.is_union() {
+                    ColumnTypeKind::Union
+                } else if leaf.is_domain {
+                    ColumnTypeKind::Domain
+                } else {
+                    ColumnTypeKind::Custom
+                };
+                let primitive = declared
+                    .custom_chain
+                    .last()
+                    .map(|definition| definition.value().base().to_uppercase())
+                    .unwrap_or_else(|| declared.storage.to_string());
+                (Some(primitive), kind)
+            } else {
+                (None, ColumnTypeKind::Builtin)
             };
-            let Some(table_column) = table_ref.get_column_at(*column_idx) else {
-                return Ok(None);
-            };
-            let declared_name = table_column.ty_str.clone();
-            let array_dimensions = table_column.array_dimensions();
-            let schema = self.program.connection.schema.read();
-            let resolved = schema
-                .resolve_type(&declared_name, table_ref.is_strict())
-                .ok()
-                .flatten();
-            // `kind` is computed from the leaf TypeDef in the resolution chain:
-            // STRUCT and UNION are tagged on `TypeDefKind`, DOMAIN is tagged
-            // separately on `TypeDef.is_domain`, and anything else registered
-            // through CREATE TYPE is a Custom. A column whose declared name
-            // does not appear in the type registry is a Builtin.
-            let (base_type, kind) = match resolved {
-                Some(resolved) => {
-                    let leaf = resolved.leaf();
-                    let kind = if leaf.is_struct() {
-                        ColumnTypeKind::Struct
-                    } else if leaf.is_union() {
-                        ColumnTypeKind::Union
-                    } else if leaf.is_domain {
-                        ColumnTypeKind::Domain
-                    } else {
-                        ColumnTypeKind::Custom
-                    };
-                    (Some(resolved.primitive.to_uppercase()), kind)
-                }
-                None => (None, ColumnTypeKind::Builtin),
-            };
-            drop(schema);
             return Ok(Some(ColumnTypeInfo {
-                declared_name,
-                array_dimensions,
+                declared_name: declared.name.clone(),
+                array_dimensions: declared.array_dimensions,
                 base_type,
                 kind,
             }));
         }
-        // Not a table column: infer the result primitive from the
-        // expression's shape (literal value type, operand types of a binary
-        // op, the CAST target, etc.).
-        let Some(name) =
-            infer_expression_primitive(&column.expr, Some(&self.program.table_references))
-        else {
+
+        // Literals and computed expressions carry their semantic storage
+        // result even when SQLite deliberately assigns them no affinity.
+        let Some(name) = column.type_fact.storage.and_then(storage_type_to_primitive) else {
             return Ok(None);
         };
         Ok(Some(ColumnTypeInfo {
             declared_name: name.to_string(),
-            array_dimensions: 0,
+            array_dimensions: column.array_dimensions,
             base_type: None,
             kind: ColumnTypeKind::Builtin,
         }))
@@ -1199,51 +1058,35 @@ impl Statement {
             );
         }
         let column = &self.program.result_columns.get(idx).expect("No column");
-        match &column.expr {
-            turso_parser::ast::Expr::Column {
-                table,
-                column: column_idx,
-                ..
-            } => {
-                let (_, table_ref) = self
-                    .program
-                    .table_references
-                    .find_table_by_internal_id(*table)?;
-                let table_column = table_ref.get_column_at(*column_idx)?;
-                match &table_column.ty() {
-                    crate::schema::Type::Integer => Some("INTEGER".to_string()),
-                    crate::schema::Type::Real => Some("REAL".to_string()),
-                    crate::schema::Type::Text => Some("TEXT".to_string()),
-                    crate::schema::Type::Blob => Some("BLOB".to_string()),
-                    crate::schema::Type::Numeric => Some("NUMERIC".to_string()),
-                    crate::schema::Type::Null => None,
-                }
-            }
-            _ => None,
+        if !matches!(column.origin, Some(ResultColumnOrigin::Column { .. })) {
+            return None;
+        }
+        match column.type_fact.storage? {
+            crate::schema::Type::Integer => Some("INTEGER".to_string()),
+            crate::schema::Type::Real => Some("REAL".to_string()),
+            crate::schema::Type::Text => Some("TEXT".to_string()),
+            crate::schema::Type::Blob => Some("BLOB".to_string()),
+            crate::schema::Type::Numeric => Some("NUMERIC".to_string()),
+            crate::schema::Type::Null => None,
         }
     }
 
-    /// Returns the inferred type affinity name for a result column by examining
-    /// the column expression. Unlike `get_column_decltype` which only works for
-    /// table columns, this works for arbitrary expressions (CAST, function calls,
-    /// literals, etc.) by inferring the type from the expression structure.
+    /// Returns the expression affinity frozen during semantic planning.
+    /// Unlike `get_column_decltype`, this is available for expressions with a
+    /// real SQLite affinity (for example a column or CAST). A known runtime
+    /// storage class alone, such as an integer literal, does not create an
+    /// affinity.
     pub fn get_column_inferred_type(&self, idx: usize) -> Option<String> {
         if self.query_mode != QueryMode::Normal {
             return None;
         }
         let column = &self.program.result_columns.get(idx)?;
-        let affinity = translate::expr::get_expr_affinity(
-            &column.expr,
-            Some(&self.program.table_references),
-            None,
-        );
-        match affinity {
-            crate::vdbe::affinity::Affinity::Integer => Some("INTEGER".to_string()),
-            crate::vdbe::affinity::Affinity::Real => Some("REAL".to_string()),
-            crate::vdbe::affinity::Affinity::Text => Some("TEXT".to_string()),
-            crate::vdbe::affinity::Affinity::Numeric => Some("NUMERIC".to_string()),
-            crate::vdbe::affinity::Affinity::Blob => None, // Blob means "no affinity"
-        }
+        column
+            .affinity
+            .has_affinity
+            .then(|| affinity_to_primitive(column.affinity.affinity))
+            .flatten()
+            .map(str::to_string)
     }
 
     pub fn parameters(&self) -> &parameters::Parameters {

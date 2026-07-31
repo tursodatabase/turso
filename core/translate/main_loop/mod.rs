@@ -1,4 +1,4 @@
-use turso_parser::ast::{Expr, SortOrder, TableInternalId};
+use turso_parser::ast::SortOrder;
 
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
@@ -6,11 +6,7 @@ use super::{
         InSeekMetadata, MaterializedBuildInputMode, MaterializedColumnRef, OperationMode, Resolver,
         TranslateCtx, UpdateRowSource,
     },
-    expr::{
-        expr_references_subquery_id, translate_condition_expr, translate_expr,
-        translate_expr_no_constant_opt, walk_expr, ConditionMetadata, NoConstantOptReason,
-        WalkControl,
-    },
+    expr::{ConditionMetadata, NoConstantOptReason},
     group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
     optimizer::{constraints::BinaryExprSide, Optimizable},
     order_by::sorter_insert,
@@ -25,18 +21,13 @@ use crate::{
     emit_explain,
     schema::{Index, IndexColumn, Table},
     translate::{
-        collate::{
-            get_collseq_from_expr_with_symbols, resolve_comparison_collseq_with_symbols,
-            CollationSeq,
-        },
+        collate::CollationSeq,
         emitter::{prepare_cdc_if_necessary, HashCtx},
-        expr::comparison_affinity,
-        planner::{table_mask_from_expr, TableMask},
+        planner::TableMask,
         result_row::emit_select_result,
     },
     turso_assert, turso_assert_eq,
     types::SeekOp,
-    util::expr_tables_subset_of,
     vdbe::{
         affinity::{self, Affinity},
         builder::{
@@ -48,7 +39,7 @@ use crate::{
     },
     Result,
 };
-use std::{borrow::Cow, collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 use turso_macros::turso_assert_some;
 
 mod body;

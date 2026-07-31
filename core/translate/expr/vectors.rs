@@ -25,7 +25,6 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             }
             1
         }
-        Expr::Register(_) => 1,
         Expr::Case {
             base,
             when_then_pairs,
@@ -80,11 +79,8 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             }
             1
         }
-        Expr::BoundCustomTypeFunction { call, .. } => expr_vector_size(call)?,
         Expr::FunctionCallStar { .. } => 1,
         Expr::Id(_) => 1,
-        Expr::Column { .. } => 1,
-        Expr::RowId { .. } => 1,
         Expr::InList { lhs, rhs, .. } => {
             let evs_lhs = expr_vector_size(lhs)?;
             for rhs in rhs.iter() {
@@ -152,11 +148,6 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             1
         }
         Expr::Variable(_) => 1,
-        Expr::SubqueryResult { query_type, .. } => match query_type {
-            SubqueryType::Exists { .. } => 1,
-            SubqueryType::In { .. } => 1,
-            SubqueryType::RowValue { num_regs, .. } => *num_regs,
-        },
         Expr::Default => 1,
         Expr::Array { .. } | Expr::Subscript { .. } => {
             unreachable!("Array and Subscript are desugared into function calls by the parser")

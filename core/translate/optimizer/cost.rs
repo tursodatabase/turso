@@ -1,6 +1,5 @@
 use crate::schema::Index;
 use crate::stats::AnalyzeStats;
-use crate::sync::Arc;
 use crate::translate::optimizer::constraints::RangeConstraintRef;
 use crate::translate::plan::JoinedTable;
 
@@ -218,7 +217,7 @@ impl std::ops::Deref for RowCountEstimate {
 /// otherwise falls through to heuristic selectivity multipliers.
 pub struct AnalyzeCtx<'a> {
     pub rhs_table: &'a JoinedTable,
-    pub index: Option<&'a Arc<Index>>,
+    pub index: Option<&'a Index>,
     pub stats: &'a AnalyzeStats,
 }
 

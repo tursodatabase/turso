@@ -2,11 +2,13 @@ use crate::sync::Arc;
 use crate::HashMap;
 
 use crate::ext::VTabImpl;
-use crate::function::{Deterministic, Func};
+use crate::function::Func;
 use crate::schema::{
-    create_table, translate_ident_to_string_literal, BTreeCharacteristics, BTreeTable, ColDef,
-    Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME,
-    TURSO_TYPES_TABLE_NAME,
+    create_table, BTreeCharacteristics, BTreeTable, ColDef, Column, SchemaObjectType, Table, Type,
+    TypeDef, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+};
+use crate::schema_expr::{
+    BuiltinSchemaExprResolver, ResolutionMode, SchemaExprResolver, SchemaValueType,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -14,9 +16,8 @@ use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
 };
-use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
-use crate::translate::plan::{Plan, QueryDestination};
+use crate::translate::plan::{Plan, QueryDestination, ResultSetColumn};
 use crate::translate::select::emit_select_plan;
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
@@ -34,31 +35,29 @@ use turso_ext::VTabKind;
 use turso_parser::ast;
 use turso_parser::ast::ColumnDefinition;
 
-fn validate_default_expr(expr: &ast::Expr, col: &ColumnDefinition) -> Result<()> {
-    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-        match e {
-            ast::Expr::Column { .. }
-            | ast::Expr::RowId { .. }
-            | ast::Expr::Name(_)
-            | ast::Expr::Qualified(_, _)
-            | ast::Expr::DoublyQualified(_, _, _)
-            | ast::Expr::Variable(_)
-            | ast::Expr::Raise(_, _)
-            | ast::Expr::Exists(_)
-            | ast::Expr::InSelect { .. }
-            | ast::Expr::InTable { .. }
-            | ast::Expr::Subquery(_)
-            | ast::Expr::SubqueryResult { .. }
-            | ast::Expr::Id(_) => {
-                bail_parse_error!(
-                    "default value of column [{}] is not constant",
-                    col.col_name.as_str()
-                );
-            }
-            _ => Ok(WalkControl::Continue),
+impl SchemaExprResolver for Resolver<'_> {
+    fn resolve_function(&self, name: &str, argument_count: usize) -> Result<Option<Func>> {
+        Resolver::resolve_function(self, name, argument_count)
+    }
+
+    fn resolve_collation(&self, name: &str) -> Result<crate::translate::collate::CollationSeq> {
+        Resolver::resolve_collation(self, name)
+    }
+
+    fn resolve_type(&self, name: &str) -> Result<Option<SchemaValueType>> {
+        if let Some(resolved) = SchemaExprResolver::resolve_type(&BuiltinSchemaExprResolver, name)?
+        {
+            return Ok(Some(resolved));
         }
-    })?;
-    Ok(())
+        Ok(self
+            .schema()
+            .get_type_def_unchecked(name)
+            .map(|_| SchemaValueType::Custom(normalize_ident(name))))
+    }
+
+    fn resolve_custom_type(&self, name: &str) -> Result<Option<Arc<crate::schema::TypeDef>>> {
+        Ok(self.schema().get_type_def_unchecked(name).cloned())
+    }
 }
 
 fn validate(
@@ -70,22 +69,14 @@ fn validate(
     if let ast::CreateTableBody::ColumnsAndConstraints {
         options,
         columns,
-        constraints,
+        constraints: _,
     } = &body
     {
-        let column_names: Vec<&str> = columns.iter().map(|c| c.col_name.as_str()).collect();
         for i in 0..columns.len() {
             let col_i = &columns[i];
             for constraint in &col_i.constraints {
                 match &constraint.constraint {
-                    ast::ColumnConstraint::Check(expr) => {
-                        crate::translate::bind::bind_check_constraint(
-                            expr,
-                            table_name,
-                            &column_names,
-                            resolver,
-                        )?;
-                    }
+                    ast::ColumnConstraint::Check(_) => {}
                     ast::ColumnConstraint::Generated { .. }
                         if !conn.experimental_generated_columns_enabled() =>
                     {
@@ -93,11 +84,7 @@ fn validate(
                             "Generated columns require --experimental-generated-columns flag"
                         );
                     }
-                    ast::ColumnConstraint::Default(expr) => {
-                        let expr =
-                            translate_ident_to_string_literal(expr).unwrap_or_else(|| expr.clone());
-                        validate_default_expr(&expr, col_i)?
-                    }
+                    ast::ColumnConstraint::Default(_) => {}
                     ast::ColumnConstraint::Collate { collation_name } => {
                         let collation = resolver.resolve_collation(collation_name.as_str())?;
                         if collation.is_custom() {
@@ -119,17 +106,6 @@ fn validate(
                 }
             }
         }
-        for constraint in constraints {
-            if let ast::TableConstraint::Check(ref expr) = constraint.constraint {
-                crate::translate::bind::bind_check_constraint(
-                    expr,
-                    table_name,
-                    &column_names,
-                    resolver,
-                )?;
-            }
-        }
-
         let is_strict = options.contains_strict();
 
         for c in columns {
@@ -203,30 +179,8 @@ fn validate(
             }
         }
 
-        // In STRICT tables, validate that CHECK constraint comparisons have
-        // compatible types. This catches type mismatches at CREATE TABLE time
-        // rather than producing wrong results at INSERT/UPDATE time.
-        if is_strict {
-            let col_refs: Vec<&ast::ColumnDefinition> = columns.iter().collect();
-            for col in columns {
-                for constraint in &col.constraints {
-                    if let ast::ColumnConstraint::Check(expr) = &constraint.constraint {
-                        crate::translate::bind::bind_strict_check_constraint(
-                            expr, &col_refs, resolver,
-                        )?;
-                    }
-                }
-            }
-            for constraint in constraints {
-                if let ast::TableConstraint::Check(ref expr) = constraint.constraint {
-                    crate::translate::bind::bind_strict_check_constraint(
-                        expr, &col_refs, resolver,
-                    )?;
-                }
-            }
-        }
-
-        let table = create_table(table_name, body, 0)?;
+        let mut table = create_table(table_name, body, 0)?;
+        table.resolve_schema_expressions(resolver, ResolutionMode::Strict)?;
         if !table.has_rowid {
             if table.has_autoincrement {
                 bail_parse_error!("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");
@@ -257,30 +211,47 @@ fn derive_ctas_schema(
     table_name: &str,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
-    connection: &Arc<Connection>,
+    _connection: &Arc<Connection>,
 ) -> Result<(CtasInfo, Vec<ColumnDefinition>)> {
-    let plan = crate::translate::select::bind_prepare_select_plan(
-        select,
-        resolver,
-        program,
+    let statement = ast::Stmt::Select(select);
+    let document = {
+        let context = resolver.semantic_context();
+        crate::translate::semantic::analyze(
+            &context,
+            crate::translate::semantic::AnalyzeInput::Statement(&statement),
+        )?
+    };
+    let query = match &document.root {
+        crate::translate::semantic::hir::HirRoot::Query(root) => root.query,
+        _ => {
+            return Err(crate::LimboError::InternalError(
+                "CTAS SELECT analysis returned a non-query root".to_string(),
+            ));
+        }
+    };
+    let identities = program.allocate_plan_identities(&document);
+    let mut context =
+        crate::translate::planner::HirPlanContext::new(&document, &identities, program);
+    let plan = crate::translate::planner::prepare_hir_query_plan(
+        &mut context,
+        query,
         QueryDestination::ResultRows,
-        connection,
     )?;
+    drop(context);
 
     // For compound selects, use the leftmost select's columns for naming (matching SQLite).
     // The planner guarantees `left` is always non-empty in a CompoundSelect.
-    let (result_columns, table_refs) = match &plan {
-        Plan::Select(sp) => (&sp.result_columns, &sp.table_references),
-        Plan::CompoundSelect { left, .. } => {
-            (&left[0].0.result_columns, &left[0].0.table_references)
-        }
-        _ => bail_parse_error!("unexpected plan type for CTAS"),
+    let result_columns = match &plan {
+        Plan::Select(sp) => &sp.result_columns,
+        Plan::CompoundSelect { left, .. } => &left[0].0.result_columns,
+        Plan::RecursiveCte(_) => plan.select_result_columns(),
+        Plan::Delete(_) | Plan::Update(_) => bail_parse_error!("unexpected plan type for CTAS"),
     };
 
     // Collect names first, then deduplicate using SQLite's :N suffix convention.
     let mut names: Vec<String> = result_columns
         .iter()
-        .map(|col| col.name_or_expr(table_refs))
+        .map(ResultSetColumn::name_or_expr)
         .collect();
 
     let mut seen: HashMap<String, usize> = HashMap::default();
@@ -297,7 +268,7 @@ fn derive_ctas_schema(
     let mut col_defs = Vec::with_capacity(result_columns.len());
 
     for (col, name) in result_columns.iter().zip(names) {
-        let ty = col.declared_type(table_refs);
+        let ty = col.declared_type();
 
         let quoted = quote_identifier(&name);
         if ty.is_empty() {
@@ -366,7 +337,9 @@ fn emit_ctas_insert(
 
     // Switch the plan's destination to coroutine yield mode.
     let dest = plan.select_query_destination_mut().ok_or_else(|| {
-        crate::LimboError::InternalError("CTAS plan must be a SELECT or CompoundSelect".into())
+        crate::LimboError::InternalError(
+            "CTAS plan must be a SELECT, compound SELECT, or recursive CTE".into(),
+        )
     })?;
     *dest = QueryDestination::CoroutineYield {
         yield_reg,
@@ -1814,55 +1787,6 @@ pub fn translate_drop_table(
     Ok(())
 }
 
-/// Validate an encode or decode expression for safety.
-/// Rejects subqueries, aggregates, and window functions.
-fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &Resolver) -> Result<()> {
-    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-        match e {
-            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
-                bail_parse_error!("subqueries prohibited in {kind} expressions");
-            }
-            ast::Expr::FunctionCall {
-                name,
-                args,
-                filter_over,
-                ..
-            } => {
-                if filter_over.over_clause.is_some() {
-                    bail_parse_error!("window functions prohibited in {kind} expressions");
-                }
-                if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
-                    if matches!(func, Func::Agg(..)) {
-                        bail_parse_error!(
-                            "aggregate functions prohibited in {kind} expressions: {}",
-                            name.as_str()
-                        );
-                    }
-                    // Reject known non-deterministic built-in functions.
-                    // External functions are excluded from this check since
-                    // they default to non-deterministic but may actually be
-                    // deterministic (e.g. uuid_blob).
-                    if !matches!(func, Func::External(_)) && !func.is_deterministic() {
-                        bail_parse_error!(
-                            "non-deterministic functions prohibited in {kind} expressions: {}",
-                            name.as_str()
-                        );
-                    }
-                }
-            }
-            ast::Expr::FunctionCallStar { name, .. } => {
-                bail_parse_error!(
-                    "aggregate functions prohibited in {kind} expressions: {}",
-                    name.as_str()
-                );
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(())
-}
-
 /// Shared persistence logic for CREATE TYPE / CREATE DOMAIN.
 /// Persists the type SQL into __turso_internal_types and registers it in memory.
 fn persist_type_definition(
@@ -1999,20 +1923,16 @@ pub fn translate_create_type(
         bail_parse_error!("type {normalized_name} already exists");
     }
 
-    // Validate encode/decode expressions for safety (only for custom types)
-    if let ast::CreateTypeBody::CustomType {
-        ref encode,
-        ref decode,
-        ..
-    } = body
-    {
-        if let Some(ref encode) = encode {
-            validate_type_expr(encode, "ENCODE", resolver)?;
-        }
-        if let Some(ref decode) = decode {
-            validate_type_expr(decode, "DECODE", resolver)?;
-        }
-    }
+    // Resolve the complete definition before persisting it. The stored form
+    // uses positional type parameters and cannot contain query-only syntax.
+    TypeDef::from_create_type(
+        &normalized_name,
+        body,
+        false,
+        String::new(),
+        resolver,
+        ResolutionMode::Strict,
+    )?;
 
     // Build canonical SQL (without IF NOT EXISTS) for persistence
     let sql = build_create_type_sql(&normalized_name, body);
@@ -2171,13 +2091,16 @@ pub fn translate_create_domain(
             .resolve_base_type_chain(&base_normalized)?;
     }
 
-    // Validate CHECK and DEFAULT expressions (reject subqueries, aggregates, etc.)
-    for c in constraints {
-        validate_type_expr(&c.check, "domain CHECK", resolver)?;
-    }
-    if let Some(ref def) = default {
-        validate_type_expr(def, "domain DEFAULT", resolver)?;
-    }
+    TypeDef::from_domain(
+        &normalized_name,
+        base_type,
+        not_null,
+        constraints,
+        default.clone(),
+        String::new(),
+        resolver,
+        ResolutionMode::Strict,
+    )?;
 
     // Build the CREATE DOMAIN SQL for persistence
     let sql = {

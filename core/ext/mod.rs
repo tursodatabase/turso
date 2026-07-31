@@ -209,6 +209,38 @@ pub(crate) unsafe extern "C" fn register_aggregate_function(
     ResultCode::OK
 }
 
+/// Register function-only built-ins before schema expressions are resolved.
+///
+/// Schema-dependent extensions are registered after the `Database` exists.
+pub(crate) fn register_global_builtin_functions(symbols: &mut SymbolTable) {
+    let mut ctx = ExtensionCtx {
+        syms: symbols,
+        schema: std::ptr::null_mut(),
+        prepare_context_generation: std::ptr::null(),
+    };
+    let mut ext_api = ExtensionApi {
+        ctx: (&mut ctx as *mut ExtensionCtx).cast(),
+        register_scalar_function: register_scalar_function_with_options,
+        register_aggregate_function,
+        unregister_function,
+        register_vtab_module,
+        #[cfg(feature = "fs")]
+        vfs_interface: turso_ext::VfsInterface {
+            register_vfs: dynamic::register_vfs,
+            builtin_vfs: std::ptr::null_mut(),
+            builtin_vfs_count: 0,
+        },
+    };
+
+    #[cfg(feature = "uuid")]
+    crate::uuid::register_extension(&mut ext_api);
+    #[cfg(feature = "time")]
+    crate::time::register_extension(&mut ext_api);
+    #[cfg(feature = "percentile")]
+    crate::percentile::register_extension(&mut ext_api);
+    crate::regexp::register_extension(&mut ext_api);
+}
+
 impl Database {
     #[cfg(feature = "fs")]
     #[allow(clippy::arc_with_non_send_sync, dead_code)]
@@ -282,15 +314,8 @@ impl Database {
             },
         };
 
-        #[cfg(feature = "uuid")]
-        crate::uuid::register_extension(&mut ext_api);
         #[cfg(feature = "series")]
         crate::series::register_extension(&mut ext_api);
-        #[cfg(feature = "time")]
-        crate::time::register_extension(&mut ext_api);
-        #[cfg(feature = "percentile")]
-        crate::percentile::register_extension(&mut ext_api);
-        crate::regexp::register_extension(&mut ext_api);
         #[cfg(feature = "fs")]
         {
             let vfslist = add_builtin_vfs_extensions(Some(ext_api)).map_err(|e| e.to_string())?;

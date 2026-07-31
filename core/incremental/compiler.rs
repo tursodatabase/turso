@@ -19,8 +19,8 @@ use crate::SqliteDialect;
 use crate::numeric::Numeric;
 use crate::sync::{atomic::Ordering, Arc};
 use crate::translate::logical::{
-    BinaryOperator, Column, ColumnInfo, JoinType as LogicalJoinType, LogicalExpr, LogicalPlan,
-    LogicalSchema, SchemaRef,
+    BinaryOperator, Column, ColumnInfo, JoinType as LogicalJoinType, LogicalColumnId, LogicalExpr,
+    LogicalPlan, LogicalSchema, SchemaRef,
 };
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Value};
 use crate::Pager;
@@ -845,6 +845,7 @@ impl DbspCircuit {
 /// Compiler from LogicalPlan to DBSP Circuit
 pub struct DbspCompiler {
     circuit: DbspCircuit,
+    next_temporary_column: usize,
 }
 
 impl DbspCompiler {
@@ -860,6 +861,7 @@ impl DbspCompiler {
                 internal_state_root,
                 internal_state_index_root,
             ),
+            next_temporary_column: usize::MAX,
         }
     }
 
@@ -880,12 +882,10 @@ impl DbspCompiler {
         left_schema: &LogicalSchema,
         right_schema: &LogicalSchema,
     ) -> Result<(Column, usize, Column, usize)> {
-        // Check all four possibilities to handle ambiguous column names
-        let first_in_left = left_schema.find_column(&first_col.name, first_col.table.as_deref());
-        let first_in_right = right_schema.find_column(&first_col.name, first_col.table.as_deref());
-        let second_in_left = left_schema.find_column(&second_col.name, second_col.table.as_deref());
-        let second_in_right =
-            right_schema.find_column(&second_col.name, second_col.table.as_deref());
+        let first_in_left = left_schema.find_column_id(first_col.id);
+        let first_in_right = right_schema.find_column_id(first_col.id);
+        let second_in_left = left_schema.find_column_id(second_col.id);
+        let second_in_right = right_schema.find_column_id(second_col.id);
 
         // Determine the correct pairing: one column must be from left, one from right
         if first_in_left.is_some() && second_in_right.is_some() {
@@ -1000,15 +1000,27 @@ impl DbspCompiler {
 
                     for col in &input_schema.columns {
                         projection_exprs.push(LogicalExpr::Column(Column {
+                            id: col.id,
                             name: col.name.clone(),
-                            table: None,
+                            table: col.table_alias.clone().or_else(|| col.table.clone()),
                         }));
                         dbsp_exprs.push(DbspExpr::Column(col.name.clone()));
                     }
 
                     // Now add the expression as a computed column
                     let temp_column_name = "__temp_filter_expr";
+                    let temp_column = Column {
+                        id: LogicalColumnId::Synthetic(self.next_temporary_column),
+                        name: temp_column_name.to_string(),
+                        table: None,
+                    };
+                    self.next_temporary_column = self
+                        .next_temporary_column
+                        .checked_sub(1)
+                        .expect("temporary logical column identity underflow");
                     let computed_expr = Self::extract_expression_from_predicate(&filter.predicate)?;
+                    let computed_type = Self::expression_type(&computed_expr, input_schema)?;
+                    dbsp_exprs.push(Self::compile_expr(&computed_expr)?);
                     projection_exprs.push(computed_expr);
 
                     // Compile the projection expressions
@@ -1044,11 +1056,15 @@ impl DbspCompiler {
                     // Create updated schema for the projection output
                     let mut proj_schema_columns = input_schema.columns.clone();
                     proj_schema_columns.push(ColumnInfo {
+                        id: temp_column.id,
                         name: temp_column_name.to_string(),
                         table: None,
                         database: None,
                         table_alias: None,
-                        ty: Type::Integer,  // Computed expressions default to Integer
+                        ty: computed_type,
+                        affinity: crate::vdbe::affinity::Affinity::Blob,
+                        has_affinity: false,
+                        collation: None,
                     });
                     let proj_schema = SchemaRef::new(LogicalSchema {
                         columns: proj_schema_columns,
@@ -1066,7 +1082,8 @@ impl DbspCompiler {
 
                     // Now create a filter that replaces the complex expression with the temp column
                     // but keeps all other conditions intact
-                    let replaced_predicate = Self::replace_complex_with_temp(&filter.predicate, temp_column_name)?;
+                    let replaced_predicate =
+                        Self::replace_complex_with_temp(&filter.predicate, &temp_column)?;
                     let filter_predicate = Self::compile_filter_predicate(&replaced_predicate, &proj_schema)?;
 
                     let filter_executable: Box<dyn IncrementalOperator> =
@@ -1085,9 +1102,14 @@ impl DbspCompiler {
                     let mut final_names = Vec::new();
                     let mut final_dbsp_exprs = Vec::new();
 
-                    for (i, column) in input_schema.columns.iter().enumerate() {
+                    for column in &input_schema.columns {
                         let col_name = &column.name;
-                        final_exprs.push(compiled_exprs[i].clone());
+                        let expr = LogicalExpr::Column(Column {
+                            id: column.id,
+                            name: column.name.clone(),
+                            table: column.table_alias.clone().or_else(|| column.table.clone()),
+                        });
+                        final_exprs.push(Self::compile_expression(&expr, &proj_schema)?.0);
                         final_aliases.push(None);
                         final_names.push(col_name.clone());
                         final_dbsp_exprs.push(DbspExpr::Column(col_name.clone()));
@@ -1139,11 +1161,7 @@ impl DbspCompiler {
                 // Compile the input first
                 let input_id = self.compile_plan(&agg.input)?;
 
-                // Get input column names
                 let input_schema = agg.input.schema();
-                let input_column_names: Vec<String> = input_schema.columns.iter()
-                    .map(|col| col.name.clone())
-                    .collect();
 
                 // Compile group by expressions to column indices
                 let mut group_by_indices = Vec::new();
@@ -1151,8 +1169,7 @@ impl DbspCompiler {
                 for expr in &agg.group_expr {
                     // For now, only support simple column references in GROUP BY
                     if let LogicalExpr::Column(col) = expr {
-                        // Find the column index in the input schema using qualified lookup
-                        let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                        let (col_idx, _) = input_schema.find_column_id(col.id)
                             .ok_or_else(|| LimboError::ParseError(
                                 format!("GROUP BY column '{}' not found in input", col.name)
                             ))?;
@@ -1168,7 +1185,12 @@ impl DbspCompiler {
                 // Compile aggregate expressions (both DISTINCT and regular)
                 let mut aggregate_functions = Vec::new();
                 for expr in &agg.aggr_expr {
-                    if let LogicalExpr::AggregateFunction { fun, args, distinct } = expr {
+                    if let LogicalExpr::AggregateFunction {
+                        fun,
+                        args,
+                        distinct,
+                        ..
+                    } = expr {
                         use crate::function::AggFunc;
                         use crate::incremental::aggregate_operator::AggregateFunction;
 
@@ -1180,7 +1202,7 @@ impl DbspCompiler {
                                         return Err(LimboError::ParseError("COUNT(DISTINCT) requires an argument".to_string()));
                                     }
                                     if let LogicalExpr::Column(col) = &args[0] {
-                                        let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                                        let (col_idx, _) = input_schema.find_column_id(col.id)
                                             .ok_or_else(|| LimboError::ParseError(
                                                 format!("COUNT(DISTINCT) column '{}' not found in input", col.name)
                                             ))?;
@@ -1200,7 +1222,7 @@ impl DbspCompiler {
                                 }
                                 // Extract column index from the argument
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                                    let (col_idx, _) = input_schema.find_column_id(col.id)
                                         .ok_or_else(|| LimboError::ParseError(
                                             format!("SUM column '{}' not found in input", col.name)
                                         ))?;
@@ -1220,7 +1242,7 @@ impl DbspCompiler {
                                     return Err(LimboError::ParseError("AVG requires an argument".to_string()));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                                    let (col_idx, _) = input_schema.find_column_id(col.id)
                                         .ok_or_else(|| LimboError::ParseError(
                                             format!("AVG column '{}' not found in input", col.name)
                                         ))?;
@@ -1240,7 +1262,7 @@ impl DbspCompiler {
                                     return Err(LimboError::ParseError("MIN requires an argument".to_string()));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                                    let (col_idx, _) = input_schema.find_column_id(col.id)
                                         .ok_or_else(|| LimboError::ParseError(
                                             format!("MIN column '{}' not found in input", col.name)
                                         ))?;
@@ -1256,7 +1278,7 @@ impl DbspCompiler {
                                     return Err(LimboError::ParseError("MAX requires an argument".to_string()));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                                    let (col_idx, _) = input_schema.find_column_id(col.id)
                                         .ok_or_else(|| LimboError::ParseError(
                                             format!("MAX column '{}' not found in input", col.name)
                                         ))?;
@@ -1283,11 +1305,10 @@ impl DbspCompiler {
                 let operator_id = self.circuit.next_id;
 
                 use crate::incremental::aggregate_operator::AggregateOperator;
-                let executable: Box<dyn IncrementalOperator> = Box::new(AggregateOperator::new(
+                let executable: Box<dyn IncrementalOperator> = Box::new(AggregateOperator::new_typed(
                     operator_id,
                     group_by_indices.clone(),
                     aggregate_functions.clone(),
-                    input_column_names,
                 )?);
 
                 let result_node_id = self.circuit.add_node(
@@ -1420,19 +1441,13 @@ impl DbspCompiler {
                 // Create GROUP BY indices for all columns
                 let group_by: Vec<usize> = (0..input_schema.columns.len()).collect();
 
-                // Column names for the operator
-                let input_column_names: Vec<String> = input_schema.columns.iter()
-                    .map(|col| col.name.clone())
-                    .collect();
-
                 // Create the aggregate operator with DISTINCT mode
                 let operator_id = self.circuit.next_id;
                 let executable: Box<dyn IncrementalOperator> = Box::new(
-                    AggregateOperator::new(
+                    AggregateOperator::new_typed(
                         operator_id,
                         group_by,
                         vec![], // Empty aggregates indicates plain DISTINCT
-                        input_column_names,
                     )?,
                 );
 
@@ -1607,6 +1622,98 @@ impl DbspCompiler {
         }
     }
 
+    fn expression_type(expr: &LogicalExpr, schema: &LogicalSchema) -> Result<Type> {
+        match expr {
+            LogicalExpr::Column(column) => schema
+                .find_column_id(column.id)
+                .map(|(_, column)| column.ty)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "logical column {:?} is absent from the expression input",
+                        column.id
+                    ))
+                }),
+            LogicalExpr::Literal(Value::Numeric(Numeric::Integer(_))) => Ok(Type::Integer),
+            LogicalExpr::Literal(Value::Numeric(Numeric::Float(_))) => Ok(Type::Real),
+            LogicalExpr::Literal(Value::Text(_)) => Ok(Type::Text),
+            LogicalExpr::Literal(Value::Blob(_)) => Ok(Type::Blob),
+            LogicalExpr::Literal(Value::Null) => Ok(Type::Null),
+            LogicalExpr::BinaryExpr { left, op, right } => match op {
+                BinaryOperator::Add
+                | BinaryOperator::Subtract
+                | BinaryOperator::Multiply
+                | BinaryOperator::Divide => {
+                    let left = Self::expression_type(left, schema)?;
+                    let right = Self::expression_type(right, schema)?;
+                    if left == Type::Real || right == Type::Real {
+                        Ok(Type::Real)
+                    } else if left == Type::Integer && right == Type::Integer {
+                        Ok(Type::Integer)
+                    } else {
+                        Ok(Type::Numeric)
+                    }
+                }
+                BinaryOperator::Concat | BinaryOperator::ArrowRight => Ok(Type::Text),
+                BinaryOperator::And
+                | BinaryOperator::Or
+                | BinaryOperator::Equals
+                | BinaryOperator::NotEquals
+                | BinaryOperator::Less
+                | BinaryOperator::LessEquals
+                | BinaryOperator::Greater
+                | BinaryOperator::GreaterEquals
+                | BinaryOperator::Is
+                | BinaryOperator::IsNot
+                | BinaryOperator::Modulus
+                | BinaryOperator::BitwiseAnd
+                | BinaryOperator::BitwiseOr
+                | BinaryOperator::LeftShift
+                | BinaryOperator::RightShift => Ok(Type::Integer),
+                _ => Ok(Type::Numeric),
+            },
+            LogicalExpr::UnaryExpr { op, expr } => match op {
+                turso_parser::ast::UnaryOperator::Not
+                | turso_parser::ast::UnaryOperator::BitwiseNot => Ok(Type::Integer),
+                _ => Self::expression_type(expr, schema),
+            },
+            LogicalExpr::AggregateFunction { result_type, .. }
+            | LogicalExpr::ScalarFunction { result_type, .. } => Ok(*result_type),
+            LogicalExpr::Case {
+                when_then,
+                else_expr,
+                ..
+            } => when_then
+                .first()
+                .map(|(_, expr)| Self::expression_type(expr, schema))
+                .or_else(|| {
+                    else_expr
+                        .as_ref()
+                        .map(|expr| Self::expression_type(expr, schema))
+                })
+                .unwrap_or(Ok(Type::Null)),
+            LogicalExpr::Alias { expr, .. } | LogicalExpr::Collate { expr, .. } => {
+                Self::expression_type(expr, schema)
+            }
+            LogicalExpr::IsNull { .. }
+            | LogicalExpr::Between { .. }
+            | LogicalExpr::InList { .. }
+            | LogicalExpr::InSubquery { .. }
+            | LogicalExpr::Exists { .. }
+            | LogicalExpr::Like { .. } => Ok(Type::Integer),
+            LogicalExpr::Cast { ty, .. } => Ok(*ty),
+            LogicalExpr::ScalarSubquery { plan, output } => plan
+                .schema()
+                .columns
+                .get(*output)
+                .map(|column| column.ty)
+                .ok_or_else(|| {
+                    LimboError::ParseError(
+                        "scalar subquery in incremental expression has no output".to_string(),
+                    )
+                }),
+        }
+    }
+
     /// Compile a logical expression to a CompiledExpression and optional alias
     fn compile_expression(
         expr: &LogicalExpr,
@@ -1619,19 +1726,9 @@ impl DbspCompiler {
             return Ok((compiled, Some(alias.clone())));
         }
 
-        // Convert LogicalExpr to AST Expr with proper column resolution
-        let ast_expr = Self::logical_to_ast_expr_with_schema(expr, input_schema)?;
-
-        // Extract column names from schema for CompiledExpression::compile
-        let input_column_names: Vec<String> = input_schema
-            .columns
-            .iter()
-            .map(|col| col.name.clone())
-            .collect();
-
-        // For all expressions (simple or complex), use CompiledExpression::compile
-        // This handles both trivial cases and complex VDBE compilation
-        // We need to set up the necessary context
+        // VDBE emission consumes the typed logical expression directly. The
+        // empty catalog below is only execution scaffolding; no semantic name
+        // or function lookup is performed here.
         use crate::sync::Arc;
         use crate::{Database, MemoryIO, SymbolTable};
 
@@ -1645,238 +1742,12 @@ impl DbspCompiler {
         // Create temporary symbol table
         let temp_syms = SymbolTable::new();
 
-        // Get a minimal schema for compilation (we don't need the full schema for expressions)
         let schema = crate::schema::Schema::new();
-
-        // Compile the expression using the existing CompiledExpression::compile
-        let compiled = CompiledExpression::compile(
-            &ast_expr,
-            &input_column_names,
-            &schema,
-            &temp_syms,
-            internal_conn,
-        )?;
+        let compiled =
+            CompiledExpression::compile(expr, input_schema, &schema, &temp_syms, internal_conn)?;
 
         Ok((compiled, None))
     }
-
-    /// Convert LogicalExpr to AST Expr with qualified column resolution
-    fn logical_to_ast_expr_with_schema(
-        expr: &LogicalExpr,
-        schema: &LogicalSchema,
-    ) -> Result<turso_parser::ast::Expr> {
-        use turso_parser::ast;
-
-        match expr {
-            LogicalExpr::Column(col) => {
-                // Find the column index using qualified lookup
-                let (idx, _) = schema
-                    .find_column(&col.name, col.table.as_deref())
-                    .ok_or_else(|| {
-                        LimboError::ParseError(format!(
-                            "Column '{}' with table {:?} not found in schema",
-                            col.name, col.table
-                        ))
-                    })?;
-                // Return a Register expression with the correct index
-                Ok(ast::Expr::Register(idx))
-            }
-            LogicalExpr::Literal(val) => {
-                let lit = match val {
-                    Value::Numeric(Numeric::Integer(i)) => ast::Literal::Numeric(i.to_string()),
-                    Value::Numeric(Numeric::Float(f)) => {
-                        ast::Literal::Numeric(f64::from(*f).to_string())
-                    }
-                    Value::Text(t) => {
-                        // Add quotes for string literals as translate_expr expects them
-                        // Also escape any single quotes in the string
-                        let escaped = t.to_string().replace('\'', "''");
-                        ast::Literal::String(format!("'{escaped}'"))
-                    }
-                    Value::Blob(b) => ast::Literal::Blob(format!("X'{}'", hex::encode(b))),
-                    Value::Null => ast::Literal::Null,
-                };
-                Ok(ast::Expr::Literal(lit))
-            }
-            LogicalExpr::BinaryExpr { left, op, right } => {
-                let left_expr = Self::logical_to_ast_expr_with_schema(left, schema)?;
-                let right_expr = Self::logical_to_ast_expr_with_schema(right, schema)?;
-                Ok(ast::Expr::Binary(
-                    Box::new(left_expr),
-                    *op,
-                    Box::new(right_expr),
-                ))
-            }
-            LogicalExpr::ScalarFunction { fun, args } => {
-                let ast_args: Result<Vec<_>> = args
-                    .iter()
-                    .map(|arg| Self::logical_to_ast_expr_with_schema(arg, schema))
-                    .collect();
-                let ast_args: Vec<Box<ast::Expr>> = ast_args?.into_iter().map(Box::new).collect();
-                Ok(ast::Expr::FunctionCall {
-                    name: ast::Name::exact(fun.clone()),
-                    distinctness: None,
-                    args: ast_args,
-                    order_by: Vec::new(),
-                    within_group: vec![],
-                    filter_over: ast::FunctionTail {
-                        filter_clause: None,
-                        over_clause: None,
-                    },
-                })
-            }
-            LogicalExpr::Alias { expr, .. } => {
-                // For conversion to AST, ignore the alias and convert the inner expression
-                Self::logical_to_ast_expr_with_schema(expr, schema)
-            }
-            LogicalExpr::AggregateFunction {
-                fun,
-                args,
-                distinct,
-            } => {
-                // Convert aggregate function to AST
-                let ast_args: Result<Vec<_>> = args
-                    .iter()
-                    .map(|arg| Self::logical_to_ast_expr_with_schema(arg, schema))
-                    .collect();
-                let ast_args: Vec<Box<ast::Expr>> = ast_args?.into_iter().map(Box::new).collect();
-
-                // Get the function name based on the aggregate type
-                let func_name = match fun {
-                    crate::function::AggFunc::Count => "COUNT",
-                    crate::function::AggFunc::Sum => "SUM",
-                    crate::function::AggFunc::Avg => "AVG",
-                    crate::function::AggFunc::Min => "MIN",
-                    crate::function::AggFunc::Max => "MAX",
-                    _ => {
-                        return Err(LimboError::ParseError(format!(
-                            "Unsupported aggregate function: {fun:?}"
-                        )))
-                    }
-                };
-
-                Ok(ast::Expr::FunctionCall {
-                    name: ast::Name::exact(func_name.to_string()),
-                    distinctness: if *distinct {
-                        Some(ast::Distinctness::Distinct)
-                    } else {
-                        None
-                    },
-                    args: ast_args,
-                    order_by: Vec::new(),
-                    within_group: vec![],
-                    filter_over: ast::FunctionTail {
-                        filter_clause: None,
-                        over_clause: None,
-                    },
-                })
-            }
-            LogicalExpr::Between {
-                expr,
-                low,
-                high,
-                negated,
-            } => {
-                // BETWEEN x AND y is rewritten as (expr >= x AND expr <= y)
-                // NOT BETWEEN x AND y is rewritten as (expr < x OR expr > y)
-                let expr_ast = Self::logical_to_ast_expr_with_schema(expr, schema)?;
-                let low_ast = Self::logical_to_ast_expr_with_schema(low, schema)?;
-                let high_ast = Self::logical_to_ast_expr_with_schema(high, schema)?;
-
-                if *negated {
-                    // NOT BETWEEN: (expr < low OR expr > high)
-                    Ok(ast::Expr::Binary(
-                        Box::new(ast::Expr::Binary(
-                            Box::new(expr_ast.clone()),
-                            ast::Operator::Less,
-                            Box::new(low_ast),
-                        )),
-                        ast::Operator::Or,
-                        Box::new(ast::Expr::Binary(
-                            Box::new(expr_ast),
-                            ast::Operator::Greater,
-                            Box::new(high_ast),
-                        )),
-                    ))
-                } else {
-                    // BETWEEN: (expr >= low AND expr <= high)
-                    Ok(ast::Expr::Binary(
-                        Box::new(ast::Expr::Binary(
-                            Box::new(expr_ast.clone()),
-                            ast::Operator::GreaterEquals,
-                            Box::new(low_ast),
-                        )),
-                        ast::Operator::And,
-                        Box::new(ast::Expr::Binary(
-                            Box::new(expr_ast),
-                            ast::Operator::LessEquals,
-                            Box::new(high_ast),
-                        )),
-                    ))
-                }
-            }
-            LogicalExpr::InList {
-                expr,
-                list,
-                negated,
-            } => {
-                let lhs = Box::new(Self::logical_to_ast_expr_with_schema(expr, schema)?);
-                let values: Result<Vec<_>> = list
-                    .iter()
-                    .map(|item| {
-                        let ast_expr = Self::logical_to_ast_expr_with_schema(item, schema)?;
-                        Ok(Box::new(ast_expr))
-                    })
-                    .collect();
-                Ok(ast::Expr::InList {
-                    lhs,
-                    not: *negated,
-                    rhs: values?,
-                })
-            }
-            LogicalExpr::Like {
-                expr,
-                pattern,
-                escape,
-                negated,
-            } => {
-                let lhs = Box::new(Self::logical_to_ast_expr_with_schema(expr, schema)?);
-                let rhs = Box::new(Self::logical_to_ast_expr_with_schema(pattern, schema)?);
-                let escape_expr = escape
-                    .map(|c| Box::new(ast::Expr::Literal(ast::Literal::String(c.to_string()))));
-                Ok(ast::Expr::Like {
-                    lhs,
-                    not: *negated,
-                    op: ast::LikeOperator::Like,
-                    rhs,
-                    escape: escape_expr,
-                })
-            }
-            LogicalExpr::IsNull { expr, negated } => {
-                let inner_expr = Box::new(Self::logical_to_ast_expr_with_schema(expr, schema)?);
-                if *negated {
-                    // IS NOT NULL needs to be represented differently
-                    Ok(ast::Expr::Unary(
-                        ast::UnaryOperator::Not,
-                        Box::new(ast::Expr::IsNull(inner_expr)),
-                    ))
-                } else {
-                    Ok(ast::Expr::IsNull(inner_expr))
-                }
-            }
-            LogicalExpr::Cast { expr, type_name } => {
-                let inner_expr = Box::new(Self::logical_to_ast_expr_with_schema(expr, schema)?);
-                Ok(ast::Expr::Cast {
-                    expr: inner_expr,
-                    type_name: type_name.clone(),
-                })
-            }
-            _ => Err(LimboError::ParseError(format!(
-                "Cannot convert LogicalExpr to AST Expr: {expr:?}"
-            ))),
-        }
-    }
-
     /// Check if a predicate contains expressions that need projection
     fn predicate_needs_projection(expr: &LogicalExpr) -> bool {
         match expr {
@@ -2000,16 +1871,13 @@ impl DbspCompiler {
     }
 
     /// Replace complex expressions in the predicate with references to the temp column
-    fn replace_complex_with_temp(
-        expr: &LogicalExpr,
-        temp_column_name: &str,
-    ) -> Result<LogicalExpr> {
+    fn replace_complex_with_temp(expr: &LogicalExpr, temp_column: &Column) -> Result<LogicalExpr> {
         match expr {
             LogicalExpr::BinaryExpr { left, op, right } => {
                 // Handle AND/OR - recursively process both sides
                 if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
-                    let new_left = Self::replace_complex_with_temp(left, temp_column_name)?;
-                    let new_right = Self::replace_complex_with_temp(right, temp_column_name)?;
+                    let new_left = Self::replace_complex_with_temp(left, temp_column)?;
+                    let new_right = Self::replace_complex_with_temp(right, temp_column)?;
                     return Ok(LogicalExpr::BinaryExpr {
                         left: Box::new(new_left),
                         op: *op,
@@ -2032,10 +1900,7 @@ impl DbspCompiler {
                     if !left_is_simple {
                         // Left side is complex - replace it with temp column
                         return Ok(LogicalExpr::BinaryExpr {
-                            left: Box::new(LogicalExpr::Column(Column {
-                                name: temp_column_name.to_string(),
-                                table: None,
-                            })),
+                            left: Box::new(LogicalExpr::Column(temp_column.clone())),
                             op: *op,
                             right: right.clone(),
                         });
@@ -2044,10 +1909,7 @@ impl DbspCompiler {
                         return Ok(LogicalExpr::BinaryExpr {
                             left: left.clone(),
                             op: *op,
-                            right: Box::new(LogicalExpr::Column(Column {
-                                name: temp_column_name.to_string(),
-                                table: None,
-                            })),
+                            right: Box::new(LogicalExpr::Column(temp_column.clone())),
                         });
                     } else {
                         // Both sides are simple, but the expression as a whole needs projection
@@ -2066,10 +1928,7 @@ impl DbspCompiler {
                 // The complex expression result is in the temp column
                 // We need to check if it's true (non-zero)
                 Ok(LogicalExpr::BinaryExpr {
-                    left: Box::new(LogicalExpr::Column(Column {
-                        name: temp_column_name.to_string(),
-                        table: None,
-                    })),
+                    left: Box::new(LogicalExpr::Column(temp_column.clone())),
                     op: BinaryOperator::Equals,
                     right: Box::new(LogicalExpr::Literal(Value::from_i64(1))), // true = 1 in SQL
                 })
@@ -2090,11 +1949,9 @@ impl DbspCompiler {
                 if let (LogicalExpr::Column(left_col), LogicalExpr::Column(right_col)) =
                     (left.as_ref(), right.as_ref())
                 {
-                    // Resolve both column names to indices
                     let left_idx = schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name == left_col.name)
+                        .find_column_id(left_col.id)
+                        .map(|(index, _)| index)
                         .ok_or_else(|| {
                             crate::LimboError::ParseError(format!(
                                 "Column '{}' not found in schema for filter",
@@ -2103,9 +1960,8 @@ impl DbspCompiler {
                         })?;
 
                     let right_idx = schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name == right_col.name)
+                        .find_column_id(right_col.id)
+                        .map(|(index, _)| index)
                         .ok_or_else(|| {
                             crate::LimboError::ParseError(format!(
                                 "Column '{}' not found in schema for filter",
@@ -2165,9 +2021,8 @@ impl DbspCompiler {
                 {
                     // Column-to-literal comparisons
                     let column_idx = schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name == col.name)
+                        .find_column_id(col.id)
+                        .map(|(index, _)| index)
                         .ok_or_else(|| {
                             crate::LimboError::ParseError(format!(
                                 "Column '{}' not found in schema for filter",
@@ -2247,9 +2102,8 @@ impl DbspCompiler {
                 // Extract column index from the inner expression
                 if let LogicalExpr::Column(col) = expr.as_ref() {
                     let column_idx = schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name == col.name)
+                        .find_column_id(col.id)
+                        .map(|(index, _)| index)
                         .ok_or_else(|| {
                             LimboError::ParseError(format!(
                                 "Column '{}' not found in schema for IS NULL filter",
@@ -2285,10 +2139,13 @@ mod tests {
     };
     use crate::storage::pager::CreateBTreeFlags;
     use crate::sync::Arc;
-    use crate::translate::logical::{ColumnInfo, LogicalPlanBuilder, LogicalSchema};
+    use crate::translate::logical::{
+        ColumnInfo, LogicalColumnId, LogicalPlanBuilder, LogicalSchema,
+    };
+    use crate::translate::semantic::{self, context::SemanticContext, hir::HirRoot, AnalyzeInput};
     use crate::util::IOExt;
     use crate::SqliteDialect;
-    use crate::{Database, MemoryIO, Pager, IO};
+    use crate::{Database, MemoryIO, Pager, SymbolTable, IO};
     use rustc_hash::FxHashSet as HashSet;
     use turso_parser::ast;
     use turso_parser::parser::Parser;
@@ -2617,8 +2474,20 @@ mod tests {
 
             match cmd {
                 ast::Cmd::Stmt(stmt) => {
-                    let mut builder = LogicalPlanBuilder::new(&schema);
-                    let logical_plan = builder.build_statement(&stmt).unwrap();
+                    let symbols = SymbolTable::new();
+                    let context = SemanticContext::for_main_schema_object(
+                        &schema,
+                        &symbols,
+                        false,
+                        Arc::new(SqliteDialect),
+                    );
+                    let document =
+                        semantic::analyze(&context, AnalyzeInput::Statement(&stmt)).unwrap();
+                    let HirRoot::Query(root) = &document.root else {
+                        panic!("compiler test SQL must analyze to a query")
+                    };
+                    let mut builder = LogicalPlanBuilder::new(&document);
+                    let logical_plan = builder.build_query(root.query).unwrap();
                     (
                         DbspCompiler::new(main_root_page, dbsp_state_page, dbsp_state_index_page)
                             .compile(&logical_plan)
@@ -4523,15 +4392,23 @@ mod tests {
         // Create a simple filter node
         let schema = Arc::new(LogicalSchema::new(vec![
             ColumnInfo {
+                id: LogicalColumnId::Synthetic(0),
                 name: "id".to_string(),
                 ty: Type::Integer,
+                affinity: crate::vdbe::affinity::Affinity::Integer,
+                has_affinity: true,
+                collation: None,
                 database: None,
                 table: None,
                 table_alias: None,
             },
             ColumnInfo {
+                id: LogicalColumnId::Synthetic(1),
                 name: "value".to_string(),
                 ty: Type::Integer,
+                affinity: crate::vdbe::affinity::Affinity::Integer,
+                has_affinity: true,
+                collation: None,
                 database: None,
                 table: None,
                 table_alias: None,
@@ -5822,341 +5699,5 @@ mod tests {
             .iter()
             .find(|(row, _)| row.values[0] == Value::from_i64(2));
         assert!(bob.is_none(), "Bob should be filtered out");
-    }
-
-    fn make_column_info(name: &str, ty: Type, table: &str) -> ColumnInfo {
-        ColumnInfo {
-            name: name.to_string(),
-            ty,
-            database: None,
-            table: Some(table.to_string()),
-            table_alias: None,
-        }
-    }
-
-    #[test]
-    fn test_resolve_join_columns_normal_order() {
-        // Normal case: left.id = right.id
-        let left_schema = LogicalSchema::new(vec![
-            ColumnInfo {
-                name: "id".to_string(),
-                ty: Type::Integer,
-                database: None,
-                table: Some("left".to_string()),
-                table_alias: None,
-            },
-            ColumnInfo {
-                name: "name".to_string(),
-                ty: Type::Text,
-                database: None,
-                table: Some("left".to_string()),
-                table_alias: None,
-            },
-        ]);
-        let right_schema = LogicalSchema::new(vec![
-            ColumnInfo {
-                name: "id".to_string(),
-                ty: Type::Integer,
-                database: None,
-                table: Some("right".to_string()),
-                table_alias: None,
-            },
-            ColumnInfo {
-                name: "value".to_string(),
-                ty: Type::Integer,
-                database: None,
-                table: Some("right".to_string()),
-                table_alias: None,
-            },
-        ]);
-
-        let left_col = Column {
-            name: "id".to_string(),
-            table: Some("left".to_string()),
-        };
-        let right_col = Column {
-            name: "id".to_string(),
-            table: Some("right".to_string()),
-        };
-
-        let result =
-            DbspCompiler::resolve_join_columns(&left_col, &right_col, &left_schema, &right_schema);
-        assert!(result.is_ok());
-        let (actual_left, left_idx, actual_right, right_idx) = result.unwrap();
-        assert_eq!(actual_left.name, "id");
-        assert_eq!(actual_left.table, Some("left".to_string()));
-        assert_eq!(left_idx, 0);
-        assert_eq!(actual_right.name, "id");
-        assert_eq!(actual_right.table, Some("right".to_string()));
-        assert_eq!(right_idx, 0);
-    }
-
-    #[test]
-    fn test_resolve_join_columns_swapped_order() {
-        // Swapped case: right.id = left.id
-        let left_schema = LogicalSchema::new(vec![
-            make_column_info("id", Type::Integer, "left"),
-            make_column_info("name", Type::Text, "left"),
-        ]);
-        let right_schema = LogicalSchema::new(vec![
-            make_column_info("id", Type::Integer, "right"),
-            make_column_info("value", Type::Integer, "right"),
-        ]);
-
-        let right_col = Column {
-            name: "id".to_string(),
-            table: Some("right".to_string()),
-        };
-        let left_col = Column {
-            name: "id".to_string(),
-            table: Some("left".to_string()),
-        };
-
-        let result =
-            DbspCompiler::resolve_join_columns(&right_col, &left_col, &left_schema, &right_schema);
-        assert!(result.is_ok());
-        let (actual_left, left_idx, actual_right, right_idx) = result.unwrap();
-        assert_eq!(actual_left.name, "id");
-        assert_eq!(actual_left.table, Some("left".to_string()));
-        assert_eq!(left_idx, 0);
-        assert_eq!(actual_right.name, "id");
-        assert_eq!(actual_right.table, Some("right".to_string()));
-        assert_eq!(right_idx, 0);
-    }
-
-    #[test]
-    fn test_resolve_join_columns_one_ambiguous_one_not() {
-        // Both tables have 'id', but only left has 'other_id'
-        let left_schema = LogicalSchema::new(vec![
-            make_column_info("id", Type::Integer, "left"),
-            make_column_info("other_id", Type::Integer, "left"),
-        ]);
-        let right_schema = LogicalSchema::new(vec![
-            make_column_info("id", Type::Integer, "right"),
-            make_column_info("value", Type::Integer, "right"),
-        ]);
-
-        // Unqualified 'id' with qualified 'left.other_id'
-        let id_col = Column {
-            name: "id".to_string(),
-            table: None,
-        };
-        let other_id_col = Column {
-            name: "other_id".to_string(),
-            table: Some("left".to_string()),
-        };
-
-        // id from right, other_id from left
-        let result =
-            DbspCompiler::resolve_join_columns(&id_col, &other_id_col, &left_schema, &right_schema);
-        assert!(result.is_ok());
-        let (actual_left, left_idx, actual_right, right_idx) = result.unwrap();
-        assert_eq!(actual_left.name, "other_id");
-        assert_eq!(left_idx, 1);
-        assert_eq!(actual_right.name, "id");
-        assert_eq!(right_idx, 0);
-    }
-
-    #[test]
-    fn test_resolve_join_columns_mixed_qualified() {
-        // One qualified, one unqualified, column exists on both sides
-        let left_schema = LogicalSchema::new(vec![
-            make_column_info("id", Type::Integer, "left"),
-            make_column_info("name", Type::Text, "left"),
-        ]);
-        let right_schema = LogicalSchema::new(vec![
-            make_column_info("id", Type::Integer, "right"),
-            make_column_info("name", Type::Text, "right"),
-        ]);
-
-        // Qualified left.id with unqualified name
-        let left_id = Column {
-            name: "id".to_string(),
-            table: Some("left".to_string()),
-        };
-        let name_unqualified = Column {
-            name: "name".to_string(),
-            table: None,
-        };
-
-        let result = DbspCompiler::resolve_join_columns(
-            &left_id,
-            &name_unqualified,
-            &left_schema,
-            &right_schema,
-        );
-        // left.id is explicitly from left, so unqualified 'name' must be resolved from right
-        assert!(result.is_ok());
-        let (actual_left, left_idx, actual_right, right_idx) = result.unwrap();
-        assert_eq!(actual_left.name, "id");
-        assert_eq!(left_idx, 0);
-        assert_eq!(actual_right.name, "name");
-        assert_eq!(right_idx, 1);
-    }
-
-    #[test]
-    fn test_resolve_join_columns_both_from_same_side() {
-        // Both columns from left table - should fail
-        let left_schema = LogicalSchema::new(vec![
-            make_column_info("id", Type::Integer, "left"),
-            make_column_info("other_id", Type::Integer, "left"),
-        ]);
-        let right_schema =
-            LogicalSchema::new(vec![make_column_info("value", Type::Integer, "right")]);
-
-        let left_id = Column {
-            name: "id".to_string(),
-            table: Some("left".to_string()),
-        };
-        let left_other_id = Column {
-            name: "other_id".to_string(),
-            table: Some("left".to_string()),
-        };
-
-        let result = DbspCompiler::resolve_join_columns(
-            &left_id,
-            &left_other_id,
-            &left_schema,
-            &right_schema,
-        );
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("must come from different input tables"));
-    }
-
-    #[test]
-    fn test_resolve_join_columns_nonexistent_column() {
-        // Column doesn't exist in either table
-        let left_schema = LogicalSchema::new(vec![make_column_info("id", Type::Integer, "left")]);
-        let right_schema =
-            LogicalSchema::new(vec![make_column_info("value", Type::Integer, "right")]);
-
-        let id_col = Column {
-            name: "id".to_string(),
-            table: None,
-        };
-        let nonexistent_col = Column {
-            name: "does_not_exist".to_string(),
-            table: None,
-        };
-
-        let result = DbspCompiler::resolve_join_columns(
-            &id_col,
-            &nonexistent_col,
-            &left_schema,
-            &right_schema,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_resolve_join_columns_both_qualified() {
-        // Both columns qualified - should work normally
-        let left_schema = LogicalSchema::new(vec![
-            make_column_info("id", Type::Integer, "left"),
-            make_column_info("name", Type::Text, "left"),
-        ]);
-        let right_schema = LogicalSchema::new(vec![
-            make_column_info("id", Type::Integer, "right"),
-            make_column_info("value", Type::Integer, "right"),
-        ]);
-
-        let left_id = Column {
-            name: "id".to_string(),
-            table: Some("left".to_string()),
-        };
-        let right_id = Column {
-            name: "id".to_string(),
-            table: Some("right".to_string()),
-        };
-
-        let result =
-            DbspCompiler::resolve_join_columns(&left_id, &right_id, &left_schema, &right_schema);
-        assert!(result.is_ok());
-        let (actual_left, left_idx, actual_right, right_idx) = result.unwrap();
-        assert_eq!(actual_left.name, "id");
-        assert_eq!(left_idx, 0);
-        assert_eq!(actual_right.name, "id");
-        assert_eq!(right_idx, 0);
-    }
-
-    #[test]
-    fn test_resolve_join_columns_both_unqualified_same_name() {
-        // Both columns unqualified with same name existing in both tables - should succeed
-        // (first match wins based on order of checking)
-        let left_schema = LogicalSchema::new(vec![make_column_info("id", Type::Integer, "left")]);
-        let right_schema = LogicalSchema::new(vec![make_column_info("id", Type::Integer, "right")]);
-
-        let id_col1 = Column {
-            name: "id".to_string(),
-            table: None,
-        };
-        let id_col2 = Column {
-            name: "id".to_string(),
-            table: None,
-        };
-
-        let result =
-            DbspCompiler::resolve_join_columns(&id_col1, &id_col2, &left_schema, &right_schema);
-        // Should succeed - unqualified 'id' matches in both schemas
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_resolve_join_columns_first_not_found() {
-        // First column doesn't exist anywhere
-        let left_schema = LogicalSchema::new(vec![make_column_info("id", Type::Integer, "left")]);
-        let right_schema =
-            LogicalSchema::new(vec![make_column_info("value", Type::Integer, "right")]);
-
-        let missing_col = Column {
-            name: "missing".to_string(),
-            table: None,
-        };
-        let value_col = Column {
-            name: "value".to_string(),
-            table: None,
-        };
-
-        let result = DbspCompiler::resolve_join_columns(
-            &missing_col,
-            &value_col,
-            &left_schema,
-            &right_schema,
-        );
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not found in either input"));
-    }
-
-    #[test]
-    fn test_resolve_join_columns_both_unqualified_different_names() {
-        // Both unqualified, each exists in only one table
-        let left_schema =
-            LogicalSchema::new(vec![make_column_info("left_id", Type::Integer, "left")]);
-        let right_schema =
-            LogicalSchema::new(vec![make_column_info("right_id", Type::Integer, "right")]);
-
-        let left_col = Column {
-            name: "left_id".to_string(),
-            table: None,
-        };
-        let right_col = Column {
-            name: "right_id".to_string(),
-            table: None,
-        };
-
-        let result =
-            DbspCompiler::resolve_join_columns(&left_col, &right_col, &left_schema, &right_schema);
-        assert!(result.is_ok());
-        let (actual_left, left_idx, actual_right, right_idx) = result.unwrap();
-        assert_eq!(actual_left.name, "left_id");
-        assert_eq!(left_idx, 0);
-        assert_eq!(actual_right.name, "right_id");
-        assert_eq!(right_idx, 0);
     }
 }

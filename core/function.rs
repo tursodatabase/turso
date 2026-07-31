@@ -542,7 +542,8 @@ impl WindowFunc {
     /// This is taken from SQLite's `sqlite3WindowUpdate` table at `window.c:699-708`.
     pub fn coerced_frame(&self) -> Option<crate::translate::plan::Frame> {
         use crate::translate::plan::{Frame, FrameBoundary};
-        use turso_parser::ast::{Expr, FrameMode, Literal};
+        use crate::translate::plan_expr::PlanExpr;
+        use turso_parser::ast::{FrameMode, Literal};
         match self {
             // Lag shares row_number's streaming frame even though its lookup
             // can point forward (negative offset): SQLite emits a row as soon
@@ -566,7 +567,7 @@ impl WindowFunc {
             }),
             Self::CumeDist => Some(Frame {
                 mode: FrameMode::Groups,
-                start: FrameBoundary::Following(Box::new(Expr::Literal(Literal::Numeric(
+                start: FrameBoundary::Following(Box::new(PlanExpr::Literal(Literal::Numeric(
                     "1".to_string(),
                 )))),
                 end: FrameBoundary::UnboundedFollowing,
@@ -676,6 +677,7 @@ impl PartialEq for AggFunc {
         match (self, other) {
             (Self::Avg, Self::Avg)
             | (Self::Count, Self::Count)
+            | (Self::Count0, Self::Count0)
             | (Self::GroupConcat, Self::GroupConcat)
             | (Self::Max, Self::Max)
             | (Self::Min, Self::Min)
@@ -686,6 +688,11 @@ impl PartialEq for AggFunc {
             | (Self::Mode, Self::Mode)
             | (Self::PercentileCont, Self::PercentileCont)
             | (Self::PercentileDisc, Self::PercentileDisc) => true,
+            #[cfg(feature = "json")]
+            (Self::JsonbGroupArray, Self::JsonbGroupArray)
+            | (Self::JsonGroupArray, Self::JsonGroupArray)
+            | (Self::JsonbGroupObject, Self::JsonbGroupObject)
+            | (Self::JsonGroupObject, Self::JsonGroupObject) => true,
             (Self::External(a), Self::External(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
@@ -1589,6 +1596,9 @@ impl Func {
             }
             // Aggregate functions with (*) syntax are handled separately in the planner
             Self::Agg(_) => false,
+            // SQLite accepts row_number(*) as the star spelling of its
+            // otherwise nullary row_number() window function.
+            Self::Window(WindowFunc::RowNumber) => true,
             Self::Window(_) => false,
             _ => false,
         }

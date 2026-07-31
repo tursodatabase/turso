@@ -2,7 +2,7 @@ use crate::{alloc, turso_assert, turso_assert_eq, turso_debug_assert, Result, Va
 
 use rustc_hash::FxHashMap as HashMap;
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
+use turso_parser::ast::{self, ResolveType, SortOrder};
 
 use crate::{
     index_method::IndexMethodAttachment,
@@ -12,32 +12,17 @@ use crate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
+        plan_expr::{
+            PlanCteId, PlanIdentityAllocator, PlanIdentityMap, PlanOutputId, PlanParameter,
+            PlanSourceId, PlanSubqueryId,
+        },
+        semantic::hir::HirDocument,
     },
     Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
 
-// Keep distinct hash-table ids far from table internal ids to avoid collisions.
+// Keep distinct hash-table IDs far from plan source IDs to avoid collisions.
 const HASH_TABLE_ID_BASE: usize = 1 << 30;
-
-#[derive(Default)]
-pub struct TableRefIdCounter {
-    next_free: ast::TableInternalId,
-}
-
-impl TableRefIdCounter {
-    pub fn new() -> Self {
-        Self {
-            next_free: TableInternalId::default(),
-        }
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> ast::TableInternalId {
-        let id = self.next_free;
-        self.next_free += 1;
-        id
-    }
-}
 
 use super::{
     affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, PrepareContext,
@@ -55,17 +40,18 @@ pub struct CursorKey {
     /// We cannot use e.g. the table query identifier (e.g. 'users' or 'u')
     /// because it might be ambiguous, e.g. this silly example:
     /// `SELECT * FROM t WHERE EXISTS (SELECT * from t)` <-- two different cursors, which 't' should we use as key?
-    ///  TableInternalIds are unique within a program, since there is one id per table reference.
-    pub table_reference_id: TableInternalId,
+    /// Plan source identities are unique within a program, since there is one
+    /// identity per table reference.
+    pub table_reference_id: PlanSourceId,
     /// The index, in case of an index cursor.
-    /// The combination of table internal id and index is enough to disambiguate.
+    /// The combination of plan source identity and index is enough to disambiguate.
     pub index: Option<Arc<Index>>,
     /// Whether this cursor is an special case build cursor.
     pub is_build: bool,
 }
 
 impl CursorKey {
-    pub fn table(table_reference_id: TableInternalId) -> Self {
+    pub fn table(table_reference_id: PlanSourceId) -> Self {
         Self {
             table_reference_id,
             index: None,
@@ -73,7 +59,7 @@ impl CursorKey {
         }
     }
 
-    pub fn index(table_reference_id: TableInternalId, index: Arc<Index>) -> Self {
+    pub fn index(table_reference_id: PlanSourceId, index: Arc<Index>) -> Self {
         Self {
             table_reference_id,
             index: Some(index),
@@ -83,7 +69,7 @@ impl CursorKey {
 
     /// Create a cursor key for hash join build operations.
     /// This creates a separate cursor from the regular table cursor.
-    pub fn hash_build(table_reference_id: TableInternalId) -> Self {
+    pub fn hash_build(table_reference_id: PlanSourceId) -> Self {
         Self {
             table_reference_id,
             index: None,
@@ -104,19 +90,6 @@ impl CursorKey {
             _ => false,
         }
     }
-}
-
-/// Context for resolving `Expr::Column` that has a `TableInternalId::SELF_TABLE` placeholder.
-#[derive(Clone)]
-pub enum SelfTableContext {
-    ForSelect {
-        table_ref_id: TableInternalId,
-        referenced_tables: TableReferences,
-    },
-    ForDML {
-        dml_ctx: DmlColumnContext,
-        table: Arc<BTreeTable>,
-    },
 }
 
 #[derive(Clone)]
@@ -214,13 +187,16 @@ pub struct ProgramBuilder {
     pub insns: Vec<(Insn, usize)>,
     /// Registry of materialized CTEs, keyed by cte_id.
     /// Used to share materialized data across multiple CTE references via OpenDup.
-    materialized_ctes: HashMap<usize, MaterializedCteInfo>,
-    /// Stack of CTE names currently being planned. Used to detect circular
-    /// references in non-recursive CTEs and to prevent fallthrough to schema
-    /// resolution for same-named tables/views.
+    materialized_ctes: HashMap<PlanCteId, MaterializedCteInfo>,
+    /// Root-independent incremental plans keyed by normalized materialized-view name.
+    incremental_view_templates:
+        std::collections::HashMap<String, Arc<crate::incremental::view::IncrementalViewTemplate>>,
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
-    pub table_reference_counter: TableRefIdCounter,
+    /// Canonical identity stream for every source, output, subquery, and CTE in
+    /// the program. HIR lowering and planner-created scratch objects must
+    /// allocate from this same owner so identities cannot collide.
+    plan_identity_allocator: PlanIdentityAllocator,
     /// Curr collation sequence. Bool indicates whether it was set by a COLLATE expr
     collation: Option<(CollationSeq, bool)>,
     capture_data_changes_info: Option<CaptureDataChangesInfo>,
@@ -236,9 +212,10 @@ pub struct ProgramBuilder {
     write_database_cookies: HashMap<usize, u32>,
     /// Schema cookies for attached databases opened for reading.
     read_database_cookies: HashMap<usize, u32>,
-    /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
+    /// Temporary cursor overrides map plan source IDs to cursor IDs that should
+    /// be used instead of the normal resolution.
     /// This allows for things like hash build to use a separate cursor for iterating the same table.
-    cursor_overrides: HashMap<usize, CursorID>,
+    cursor_overrides: HashMap<PlanSourceId, CursorID>,
     /// Maps identifier names to registers for custom type encode/decode expressions.
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
@@ -247,9 +224,9 @@ pub struct ProgramBuilder {
     hash_build_signatures: HashMap<usize, HashBuildSignature>,
     /// Hash tables to keep open across subplans (e.g. materialization).
     hash_tables_to_keep_open: BitSet,
-    /// Maps table internal_id to result_columns_start_reg for FROM clause subqueries.
+    /// Maps plan source identities to result-column base registers for FROM-clause subqueries.
     /// Used when nested subqueries need to reference columns from outer query subqueries.
-    subquery_result_regs: HashMap<TableInternalId, usize>,
+    subquery_result_regs: HashMap<PlanSourceId, usize>,
     /// The mode in which the query is being executed.
     query_mode: QueryMode,
     pub flags: ProgramBuilderFlags,
@@ -271,9 +248,6 @@ pub struct ProgramBuilder {
     /// This is used in UPSERT DO UPDATE context to ensure nested trigger's OR IGNORE/REPLACE
     /// clauses don't suppress errors.
     pub trigger_conflict_override: Option<ResolveType>,
-    /// Counter for CTE identity tracking. Each CTE definition gets a unique ID
-    /// so that multiple references to the same CTE can share materialized data.
-    next_cte_id: usize,
     /// Counter for subquery numbering in EXPLAIN QUERY PLAN output.
     next_subquery_eqp_id: usize,
 }
@@ -386,7 +360,7 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
-    /// When set, translate_expr will skip custom type decode for Expr::Column.
+    /// When set, plan expression emission skips custom type decoding for column reads.
     /// This is used when building ORDER BY sort keys so the sorter compares
     /// encoded (on-disk) values. Decode is presentation-only.
     pub const fn suppress_custom_type_decode(self) -> bool {
@@ -571,6 +545,22 @@ macro_rules! emit_explain {
 }
 
 impl ProgramBuilder {
+    pub fn allocate_plan_identities(&mut self, document: &HirDocument) -> PlanIdentityMap {
+        PlanIdentityMap::allocate_document(document, &mut self.plan_identity_allocator)
+    }
+
+    pub fn next_plan_source_id(&mut self) -> PlanSourceId {
+        self.plan_identity_allocator.next_source()
+    }
+
+    pub fn next_plan_output_id(&mut self) -> PlanOutputId {
+        self.plan_identity_allocator.next_output()
+    }
+
+    pub fn next_plan_subquery_id(&mut self) -> PlanSubqueryId {
+        self.plan_identity_allocator.next_subquery()
+    }
+
     /// Register an `ast::Variable` in the parameter list. Returns the
     /// `NonZeroUsize` index for use in `Insn::Variable`.
     pub fn register_variable(&mut self, variable: &ast::Variable) -> NonZeroUsize {
@@ -579,6 +569,22 @@ impl ProgramBuilder {
             .try_into()
             .expect("variable index must be non-zero");
         if let Some(name) = variable.name.as_deref() {
+            self.parameters.push_named_at(name, index);
+        } else {
+            self.parameters.push_index(index);
+        }
+        index
+    }
+
+    /// Register a resolved plan parameter without reconstructing parser
+    /// syntax. Semantic analysis has already assigned its stable SQL index and
+    /// optional spelling.
+    pub fn register_plan_parameter(&mut self, parameter: &PlanParameter) -> NonZeroUsize {
+        let index = usize::try_from(parameter.index.get())
+            .expect("u32 parameter index must fit into usize")
+            .try_into()
+            .expect("parameter index must be non-zero");
+        if let Some(name) = parameter.name.as_deref() {
             self.parameters.push_named_at(name, index);
         } else {
             self.parameters.push_index(index);
@@ -638,7 +644,7 @@ impl ProgramBuilder {
         is_subprogram: bool,
     ) -> Self {
         Self {
-            table_reference_counter: TableRefIdCounter::new(),
+            plan_identity_allocator: PlanIdentityAllocator::new(),
             next_free_register: 1,
             next_free_cursor_id: 0,
             next_hash_table_id: HASH_TABLE_ID_BASE,
@@ -675,8 +681,8 @@ impl ProgramBuilder {
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
             subquery_result_regs: HashMap::default(),
-            next_cte_id: 0,
             materialized_ctes: HashMap::default(),
+            incremental_view_templates: std::collections::HashMap::default(),
             next_subquery_eqp_id: 1,
         }
     }
@@ -696,23 +702,26 @@ impl ProgramBuilder {
         id
     }
 
-    /// Allocate a unique CTE identity. Each CTE definition in a query gets a unique ID
-    /// so that multiple references to the same CTE can share materialized data via OpenDup.
-    pub const fn alloc_cte_id(&mut self) -> usize {
-        let id = self.next_cte_id;
-        self.next_cte_id += 1;
-        id
-    }
-
     /// Check if a CTE has already been materialized.
     /// Returns the materialization info if the CTE cursor can be shared via OpenDup.
-    pub fn get_materialized_cte(&self, cte_id: usize) -> Option<&MaterializedCteInfo> {
+    pub fn get_materialized_cte(&self, cte_id: PlanCteId) -> Option<&MaterializedCteInfo> {
         self.materialized_ctes.get(&cte_id)
     }
 
     /// Register a materialized CTE so that subsequent references can share it via OpenDup.
-    pub fn register_materialized_cte(&mut self, cte_id: usize, info: MaterializedCteInfo) {
+    pub fn register_materialized_cte(&mut self, cte_id: PlanCteId, info: MaterializedCteInfo) {
         self.materialized_ctes.insert(cte_id, info);
+    }
+
+    /// Retain a root-independent incremental plan until statement execution
+    /// supplies the materialized view's storage roots.
+    pub fn register_incremental_view_template(
+        &mut self,
+        view_name: &str,
+        template: Arc<crate::incremental::view::IncrementalViewTemplate>,
+    ) {
+        self.incremental_view_templates
+            .insert(crate::util::normalize_ident(view_name), template);
     }
 
     pub const fn set_resolve_type(&mut self, resolve_type: ResolveType) {
@@ -770,16 +779,16 @@ impl ProgramBuilder {
         self.hash_build_signatures.remove(&hash_table_id);
     }
 
-    /// Store the result_columns_start_reg for a FROM clause subquery by its internal_id.
+    /// Store the result-column base register for a FROM-clause subquery by source identity.
     /// Used so nested subqueries can access columns from outer query subqueries.
-    pub fn set_subquery_result_reg(&mut self, internal_id: TableInternalId, result_reg: usize) {
-        self.subquery_result_regs.insert(internal_id, result_reg);
+    pub fn set_subquery_result_reg(&mut self, source: PlanSourceId, result_reg: usize) {
+        self.subquery_result_regs.insert(source, result_reg);
     }
 
-    /// Look up the result_columns_start_reg for a FROM clause subquery by its internal_id.
+    /// Look up a FROM-clause subquery's result-column base register by source identity.
     /// Returns None if the subquery hasn't been emitted yet.
-    pub fn get_subquery_result_reg(&self, internal_id: TableInternalId) -> Option<usize> {
-        self.subquery_result_regs.get(&internal_id).copied()
+    pub fn get_subquery_result_reg(&self, source: PlanSourceId) -> Option<usize> {
+        self.subquery_result_regs.get(&source).copied()
     }
 
     /// Mark that this statement may modify/insert multiple rows (mirrors SQLite's sqlite3MultiWrite).
@@ -967,13 +976,17 @@ impl ProgramBuilder {
     }
 
     pub fn add_pragma_result_column(&mut self, col_name: String) {
-        // TODO figure out a better type definition for ResultSetColumn
-        // or invent another way to set pragma result columns
-        let expr = ast::Expr::Id(ast::Name::empty());
+        let id = self.next_plan_output_id();
         self.result_columns.push(ResultSetColumn {
-            expr,
-            alias: Some(col_name),
-            implicit_column_name: None,
+            id,
+            name: col_name,
+            name_kind: crate::translate::semantic::hir::OutputNameKind::ExplicitAlias,
+            origin: None,
+            type_fact: crate::translate::semantic::hir::TypeFact::dynamic(),
+            affinity: crate::translate::plan_expr::PlanExprAffinity::no_affinity(),
+            collation: None,
+            array_dimensions: 0,
+            expr: crate::translate::plan_expr::PlanExpr::literal(ast::Literal::Null),
             contains_aggregates: false,
         });
     }
@@ -1470,13 +1483,13 @@ impl ProgramBuilder {
 
     /// Set a cursor override for a table. When resolving a table cursor for this table,
     /// the override cursor will be used instead of the normal resolution.
-    pub fn set_cursor_override(&mut self, table_ref_id: TableInternalId, cursor_id: CursorID) {
-        self.cursor_overrides.insert(table_ref_id.into(), cursor_id);
+    pub fn set_cursor_override(&mut self, table_ref_id: PlanSourceId, cursor_id: CursorID) {
+        self.cursor_overrides.insert(table_ref_id, cursor_id);
     }
 
     /// Clear the cursor override for a table.
-    pub fn clear_cursor_override(&mut self, table_ref_id: TableInternalId) {
-        self.cursor_overrides.remove(&table_ref_id.into());
+    pub fn clear_cursor_override(&mut self, table_ref_id: PlanSourceId) {
+        self.cursor_overrides.remove(&table_ref_id);
     }
 
     /// Clear all cursor overrides.
@@ -1485,8 +1498,8 @@ impl ProgramBuilder {
     }
 
     /// Check if a cursor override is active for a given table.
-    pub fn has_cursor_override(&self, table_ref_id: TableInternalId) -> bool {
-        self.cursor_overrides.contains_key(&table_ref_id.into())
+    pub fn has_cursor_override(&self, table_ref_id: PlanSourceId) -> bool {
+        self.cursor_overrides.contains_key(&table_ref_id)
     }
 
     // translate [CursorKey] to cursor id
@@ -1495,8 +1508,7 @@ impl ProgramBuilder {
         // Index cursor lookups are not overridden because when a cursor override is active,
         // the calling code (translate_expr) should skip index logic entirely.
         if key.index.is_none() && !key.is_build {
-            let table_id: usize = key.table_reference_id.into();
-            if let Some(&cursor_id) = self.cursor_overrides.get(&table_id) {
+            if let Some(&cursor_id) = self.cursor_overrides.get(&key.table_reference_id) {
                 return Some(cursor_id);
             }
         }
@@ -1516,14 +1528,14 @@ impl ProgramBuilder {
     /// table cursor, index cursor, or both were opened for that table reference.
     /// Hence: currently we first try to resolve a table cursor, and if that fails,
     /// we resolve an index cursor via this method.
-    pub fn resolve_any_index_cursor_id_for_table(&self, table_ref_id: TableInternalId) -> CursorID {
+    pub fn resolve_any_index_cursor_id_for_table(&self, table_ref_id: PlanSourceId) -> CursorID {
         self.resolve_any_index_cursor_id_for_table_safe(table_ref_id)
             .unwrap_or_else(|| panic!("No index cursor found for table {table_ref_id}"))
     }
 
     pub fn resolve_any_index_cursor_id_for_table_safe(
         &self,
-        table_ref_id: TableInternalId,
+        table_ref_id: PlanSourceId,
     ) -> Option<CursorID> {
         self.cursor_ref.iter().position(|(k, _)| {
             k.as_ref()
@@ -1952,6 +1964,7 @@ impl ProgramBuilder {
             readonly: self.flags.readonly(),
             result_columns: self.result_columns,
             table_references: self.table_references,
+            incremental_view_templates: self.incremental_view_templates,
             sql: sql.to_string(),
             needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
                 needs_stmt_subtransactions,

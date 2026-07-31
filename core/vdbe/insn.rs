@@ -662,6 +662,8 @@ pub enum Insn {
     /// Input: reg = record-format BLOB. Output: reg = PG array text like '{1,2,3}'.
     ArrayDecode {
         reg: usize,
+        dimensions: u32,
+        rank_unbounded: bool,
     },
 
     /// Access element at index from a record-format array BLOB.
@@ -1764,7 +1766,8 @@ pub enum Insn {
         db: usize,
         table: String,
         column_index: usize,
-        definition: Box<turso_parser::ast::ColumnDefinition>,
+        table_definition: Box<BTreeTable>,
+        indexes: Vec<Arc<Index>>,
         rename: bool,
     },
     /// Try to set the maximum page count for database P1 to the value in P3.

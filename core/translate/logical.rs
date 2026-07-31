@@ -6,36 +6,37 @@
 //! to an execution plan (e.g., DBSP circuits).
 //!
 //! The main entry point is `LogicalPlanBuilder` which constructs logical plans
-//! from SQL AST nodes.
-use crate::function::AggFunc;
-use crate::numeric::Numeric;
-use crate::schema::{Schema, Type};
+//! from resolved semantic HIR.
+use crate::function::{AggFunc, Deterministic, Func};
+use crate::schema::Type;
 use crate::sync::Arc;
-use crate::turso_assert_ne;
+use crate::translate::semantic::hir::{
+    self, CteId, HirDocument, OutputId, QueryBlockId, QueryId, SourceId,
+};
 use crate::types::Value;
+use crate::vdbe::affinity::Affinity;
 use crate::{LimboError, Result};
 use rustc_hash::FxHashMap as HashMap;
 use std::fmt::{self, Display, Formatter};
-use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast;
 
-/// Result type for preprocessing aggregate expressions
-type PreprocessAggregateResult = (
-    bool,             // needs_pre_projection
-    Vec<LogicalExpr>, // pre_projection_exprs
-    Vec<ColumnInfo>,  // pre_projection_schema
-    Vec<LogicalExpr>, // modified_aggr_exprs
-    Vec<LogicalExpr>, // modified_group_exprs
-);
-
-/// Result type for parsing join conditions
-type JoinConditionsResult = (Vec<(LogicalExpr, LogicalExpr)>, Option<LogicalExpr>);
+/// Stable identity of a value in a logical row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LogicalColumnId {
+    Source(hir::ColumnRef),
+    Output(OutputId),
+    Synthetic(usize),
+}
 
 /// Information about a column in a logical schema
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnInfo {
+    pub id: LogicalColumnId,
     pub name: String,
     pub ty: Type,
+    pub affinity: crate::vdbe::affinity::Affinity,
+    pub has_affinity: bool,
+    pub collation: Option<hir::ResolvedCollation>,
     pub database: Option<String>,
     pub table: Option<String>,
     pub table_alias: Option<String>,
@@ -46,6 +47,7 @@ pub struct ColumnInfo {
 pub struct LogicalSchema {
     pub columns: Vec<ColumnInfo>,
 }
+
 /// A reference to a schema that can be shared between nodes
 pub type SchemaRef = Arc<LogicalSchema>;
 
@@ -64,42 +66,11 @@ impl LogicalSchema {
         self.columns.len()
     }
 
-    pub fn find_column(&self, name: &str, table: Option<&str>) -> Option<(usize, &ColumnInfo)> {
-        if let Some(table_ref) = table {
-            // Check if it's a database.table format
-            if table_ref.contains('.') {
-                let parts: Vec<&str> = table_ref.splitn(2, '.').collect();
-                if parts.len() == 2 {
-                    let db = parts[0];
-                    let tbl = parts[1];
-                    return self
-                        .columns
-                        .iter()
-                        .position(|c| {
-                            c.name == name
-                                && c.database.as_deref() == Some(db)
-                                && c.table.as_deref() == Some(tbl)
-                        })
-                        .map(|idx| (idx, &self.columns[idx]));
-                }
-            }
-
-            // Try to match against table alias first, then table name
-            self.columns
-                .iter()
-                .position(|c| {
-                    c.name == name
-                        && (c.table_alias.as_deref() == Some(table_ref)
-                            || c.table.as_deref() == Some(table_ref))
-                })
-                .map(|idx| (idx, &self.columns[idx]))
-        } else {
-            // Unqualified lookup - just match by name
-            self.columns
-                .iter()
-                .position(|c| c.name == name)
-                .map(|idx| (idx, &self.columns[idx]))
-        }
+    pub fn find_column_id(&self, id: LogicalColumnId) -> Option<(usize, &ColumnInfo)> {
+        self.columns
+            .iter()
+            .position(|column| column.id == id)
+            .map(|index| (index, &self.columns[index]))
     }
 }
 
@@ -226,6 +197,8 @@ pub struct Limit {
 /// Table scan operator
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableScan {
+    pub source: SourceId,
+    pub table: hir::ResolvedTable,
     pub table_name: String,
     pub alias: Option<String>,
     pub schema: SchemaRef,
@@ -263,13 +236,15 @@ pub struct Values {
 /// WITH clause - CTEs
 #[derive(Debug, Clone, PartialEq)]
 pub struct WithCTE {
-    pub ctes: HashMap<String, Arc<LogicalPlan>>,
+    pub ctes: HashMap<CteId, Arc<LogicalPlan>>,
     pub body: Arc<LogicalPlan>,
 }
 
 /// Reference to a CTE
 #[derive(Debug, Clone, PartialEq)]
 pub struct CTERef {
+    pub id: CteId,
+    pub source: SourceId,
     pub name: String,
     pub schema: SchemaRef,
 }
@@ -296,10 +271,16 @@ pub enum LogicalExpr {
     AggregateFunction {
         fun: AggregateFunction,
         args: Vec<LogicalExpr>,
+        arg_types: Vec<Type>,
         distinct: bool,
+        result_type: Type,
     },
     /// Scalar function call
-    ScalarFunction { fun: String, args: Vec<LogicalExpr> },
+    ScalarFunction {
+        function: hir::ResolvedFunction,
+        args: Vec<LogicalExpr>,
+        result_type: Type,
+    },
     /// CASE expression
     Case {
         expr: Option<Box<LogicalExpr>>,
@@ -324,7 +305,10 @@ pub enum LogicalExpr {
         negated: bool,
     },
     /// Scalar subquery
-    ScalarSubquery(Arc<LogicalPlan>),
+    ScalarSubquery {
+        plan: Arc<LogicalPlan>,
+        output: usize,
+    },
     /// Alias for an expression
     Alias {
         expr: Box<LogicalExpr>,
@@ -346,37 +330,32 @@ pub enum LogicalExpr {
     Like {
         expr: Box<LogicalExpr>,
         pattern: Box<LogicalExpr>,
-        escape: Option<char>,
+        escape: Option<Box<LogicalExpr>>,
         negated: bool,
+        operator: ast::LikeOperator,
+        function: hir::ResolvedFunction,
+        argument_count: usize,
     },
     /// CAST expression
     Cast {
         expr: Box<LogicalExpr>,
-        type_name: Option<ast::Type>,
+        name: String,
+        parameters: Vec<LogicalExpr>,
+        ty: Type,
+    },
+    /// Explicit collation chosen during semantic analysis.
+    Collate {
+        expr: Box<LogicalExpr>,
+        collation: hir::ResolvedCollation,
     },
 }
 
 /// Column reference
 #[derive(Debug, Clone, PartialEq)]
 pub struct Column {
+    pub id: LogicalColumnId,
     pub name: String,
     pub table: Option<String>,
-}
-
-impl Column {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            table: None,
-        }
-    }
-
-    pub fn with_table(name: impl Into<String>, table: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            table: Some(table.into()),
-        }
-    }
 }
 
 impl Display for Column {
@@ -385,16 +364,6 @@ impl Display for Column {
             Some(t) => write!(f, "{}.{}", t, self.name),
             None => write!(f, "{}", self.name),
         }
-    }
-}
-
-/// Strip alias wrapper from an expression, returning the underlying expression.
-/// This is useful when comparing expressions where one might be aliased and the other not,
-/// such as when matching SELECT expressions with GROUP BY expressions.
-pub fn strip_alias(expr: &LogicalExpr) -> &LogicalExpr {
-    match expr {
-        LogicalExpr::Alias { expr, .. } => expr,
-        _ => expr,
     }
 }
 
@@ -407,3792 +376,1589 @@ pub type UnaryOperator = ast::UnaryOperator;
 /// Type alias for aggregate functions
 pub type AggregateFunction = AggFunc;
 
-/// Compiler from AST to LogicalPlan
+/// Lowers one semantically resolved query into the logical representation used
+/// by the incremental compiler. The document is borrowed only while lowering;
+/// every object kept by the returned plan is owned.
 pub struct LogicalPlanBuilder<'a> {
-    schema: &'a Schema,
-    ctes: HashMap<String, Arc<LogicalPlan>>,
+    document: &'a HirDocument,
+    query_plans: HashMap<QueryId, Arc<LogicalPlan>>,
+    cte_plans: HashMap<CteId, Arc<LogicalPlan>>,
+    building_queries: Vec<QueryId>,
+    building_ctes: Vec<CteId>,
+    next_synthetic_column: usize,
 }
 
 impl<'a> LogicalPlanBuilder<'a> {
-    pub fn new(schema: &'a Schema) -> Self {
+    pub fn new(document: &'a HirDocument) -> Self {
         Self {
-            schema,
-            ctes: HashMap::default(),
+            document,
+            query_plans: HashMap::default(),
+            cte_plans: HashMap::default(),
+            building_queries: Vec::new(),
+            building_ctes: Vec::new(),
+            next_synthetic_column: 0,
         }
     }
 
-    /// Main entry point: compile a statement to a logical plan
-    pub fn build_statement(&mut self, stmt: &ast::Stmt) -> Result<LogicalPlan> {
-        match stmt {
-            ast::Stmt::Select(select) => self.build_select(select),
-            _ => Err(LimboError::ParseError(
-                "Only SELECT statements are currently supported in logical plans".to_string(),
-            )),
-        }
+    pub fn build_query(&mut self, query: QueryId) -> Result<LogicalPlan> {
+        Ok(self.build_query_shared(query)?.as_ref().clone())
     }
 
-    // Convert Name to String
-    fn name_to_string(name: &ast::Name) -> String {
-        name.as_str().to_string()
-    }
-
-    // Build a SELECT statement
-    // Build a logical plan from a SELECT statement
-    fn build_select(&mut self, select: &ast::Select) -> Result<LogicalPlan> {
-        // Handle WITH clause if present
-        if let Some(with) = &select.with {
-            return self.build_with_cte(with, select);
+    fn build_query_shared(&mut self, query_id: QueryId) -> Result<Arc<LogicalPlan>> {
+        if let Some(plan) = self.query_plans.get(&query_id) {
+            return Ok(plan.clone());
         }
-
-        // Build the main query body
-        let order_by = &select.order_by;
-        let limit = &select.limit;
-        self.build_select_body(&select.body, order_by, limit)
-    }
-
-    // Build WITH CTE
-    fn build_with_cte(&mut self, with: &ast::With, select: &ast::Select) -> Result<LogicalPlan> {
-        let mut cte_plans = HashMap::default();
-
-        // Build each CTE
-        for cte in &with.ctes {
-            let cte_plan = self.build_select(&cte.select)?;
-            let cte_name = Self::name_to_string(&cte.tbl_name);
-            cte_plans.insert(cte_name.clone(), Arc::new(cte_plan));
-            self.ctes
-                .insert(cte_name.clone(), cte_plans[&cte_name].clone());
+        if self.building_queries.contains(&query_id) {
+            return Err(LimboError::ParseError(format!(
+                "recursive query {query_id} is not supported by incremental views"
+            )));
         }
+        let query = self.document.query(query_id).cloned().ok_or_else(|| {
+            LimboError::InternalError(format!("semantic HIR has no query {query_id}"))
+        })?;
 
-        // Build the main body with CTEs available
-        let order_by = &select.order_by;
-        let limit = &select.limit;
-        let body = self.build_select_body(&select.body, order_by, limit)?;
-
-        // Clear CTEs from builder context
-        for cte in &with.ctes {
-            self.ctes.remove(&Self::name_to_string(&cte.tbl_name));
-        }
-
-        Ok(LogicalPlan::WithCTE(WithCTE {
-            ctes: cte_plans,
-            body: Arc::new(body),
-        }))
-    }
-
-    // Build SELECT body
-    fn build_select_body(
-        &mut self,
-        body: &ast::SelectBody,
-        order_by: &[ast::SortedColumn],
-        limit: &Option<ast::Limit>,
-    ) -> Result<LogicalPlan> {
-        let mut plan = self.build_one_select(&body.select)?;
-
-        // Handle compound operators (UNION, INTERSECT, EXCEPT)
-        if !body.compounds.is_empty() {
-            for compound in &body.compounds {
-                let right = self.build_one_select(&compound.select)?;
-                plan = Self::build_compound(plan, right, &compound.operator)?;
-            }
-        }
-
-        // Apply ORDER BY
-        if !order_by.is_empty() {
-            plan = self.build_sort(plan, order_by)?;
-        }
-
-        // Apply LIMIT
-        if let Some(limit) = limit {
-            plan = Self::build_limit(plan, limit)?;
-        }
-
+        self.building_queries.push(query_id);
+        let result = self.build_query_uncached(&query);
+        self.building_queries.pop();
+        let plan = Arc::new(result?);
+        self.query_plans.insert(query_id, plan.clone());
         Ok(plan)
     }
 
-    // Build a single SELECT (without compounds)
-    fn build_one_select(&mut self, select: &ast::OneSelect) -> Result<LogicalPlan> {
-        match select {
-            ast::OneSelect::Select {
-                distinctness,
-                columns,
-                from,
-                where_clause,
-                group_by,
-                window_clause: _,
-            } => {
-                // Start with FROM clause
-                let mut plan = if let Some(from) = from {
-                    self.build_from(from)?
-                } else {
-                    // No FROM clause - single row
-                    LogicalPlan::EmptyRelation(EmptyRelation {
-                        produce_one_row: true,
-                        schema: Arc::new(LogicalSchema::empty()),
-                    })
-                };
-
-                // Apply WHERE
-                if let Some(where_expr) = where_clause {
-                    let predicate = self.build_expr(where_expr, plan.schema())?;
-                    plan = LogicalPlan::Filter(Filter {
-                        input: Arc::new(plan),
-                        predicate,
-                    });
-                }
-
-                // Apply GROUP BY and aggregations
-                if let Some(group_by) = group_by {
-                    plan = self.build_aggregate(plan, group_by, columns)?;
-                } else if Self::has_aggregates(columns) {
-                    // Aggregation without GROUP BY
-                    plan = self.build_aggregate_no_group(plan, columns)?;
-                } else {
-                    // Regular projection
-                    plan = self.build_projection(plan, columns)?;
-                }
-
-                // Apply HAVING (part of GROUP BY)
-                if let Some(ref group_by) = group_by {
-                    if let Some(ref having_expr) = group_by.having {
-                        let predicate = self.build_expr(having_expr, plan.schema())?;
-                        plan = LogicalPlan::Filter(Filter {
-                            input: Arc::new(plan),
-                            predicate,
-                        });
-                    }
-                }
-
-                // Apply DISTINCT
-                if distinctness.is_some() {
-                    plan = LogicalPlan::Distinct(Distinct {
-                        input: Arc::new(plan),
-                    });
-                }
-
-                Ok(plan)
-            }
-            ast::OneSelect::Values(values) => self.build_values(values),
-        }
-    }
-
-    // Build FROM clause
-    fn build_from(&mut self, from: &ast::FromClause) -> Result<LogicalPlan> {
-        let mut plan = { self.build_select_table(&from.select)? };
-
-        // Handle JOINs
-        if !from.joins.is_empty() {
-            for join in &from.joins {
-                let right = self.build_select_table(&join.table)?;
-                plan = self.build_join(plan, right, &join.operator, &join.constraint)?;
-            }
+    fn build_query_uncached(&mut self, query: &hir::Query) -> Result<LogicalPlan> {
+        for cte in &query.reachable_ctes {
+            self.build_cte(*cte)?;
         }
 
-        Ok(plan)
-    }
-
-    // Build a table reference
-    fn build_select_table(&mut self, table: &ast::SelectTable) -> Result<LogicalPlan> {
-        match table {
-            ast::SelectTable::Table(name, alias, _indexed) => {
-                let table_alias = alias.as_ref().map(|a| Self::name_to_string(a.name()));
-                match crate::translate::bind::bind_logical_source(
-                    name,
-                    self.ctes.keys().map(String::as_str),
-                    self.schema,
-                )? {
-                    crate::translate::bind::BoundLogicalSource::CommonTableExpression { name } => {
-                        let cte_plan = self
-                            .ctes
-                            .get(&name)
-                            .expect("bound CTE name must identify a visible CTE");
-                        Ok(LogicalPlan::CTERef(CTERef {
-                            name,
-                            schema: cte_plan.schema().clone(),
-                        }))
-                    }
-                    crate::translate::bind::BoundLogicalSource::Table {
-                        database,
-                        name,
-                        table,
-                    } => {
-                        let columns = table
-                            .columns()
-                            .iter()
-                            .filter_map(|column| {
-                                column.name.as_ref().map(|name| ColumnInfo {
-                                    name: name.clone(),
-                                    ty: column.ty(),
-                                    database: database.clone(),
-                                    table: Some(table.get_name().to_string()),
-                                    table_alias: table_alias.clone(),
-                                })
-                            })
-                            .collect();
-                        Ok(LogicalPlan::TableScan(TableScan {
-                            table_name: name,
-                            alias: table_alias,
-                            schema: Arc::new(LogicalSchema::new(columns)),
-                            projection: None,
-                        }))
-                    }
+        let mut plan = self.build_query_block(query.first)?;
+        for arm in &query.compounds {
+            let right = self.build_query_block(arm.block)?;
+            let all = match arm.operator {
+                ast::CompoundOperator::Union => false,
+                ast::CompoundOperator::UnionAll => true,
+                ast::CompoundOperator::Except | ast::CompoundOperator::Intersect => {
+                    return Err(LimboError::ParseError(format!(
+                        "{:?} is not supported by incremental views",
+                        arm.operator
+                    )));
                 }
-            }
-            ast::SelectTable::Select(subquery, _alias) => self.build_select(subquery),
-            ast::SelectTable::TableCall(_, _, _) => Err(LimboError::ParseError(
-                "Table-valued functions are not supported in logical plans".to_string(),
-            )),
-            ast::SelectTable::Sub(_, _) => Err(LimboError::ParseError(
-                "Subquery in FROM clause not yet supported".to_string(),
-            )),
-        }
-    }
-
-    // Build JOIN
-    fn build_join(
-        &mut self,
-        left: LogicalPlan,
-        right: LogicalPlan,
-        op: &ast::JoinOperator,
-        constraint: &Option<ast::JoinConstraint>,
-    ) -> Result<LogicalPlan> {
-        // Determine join type
-        let join_type = match op {
-            ast::JoinOperator::Comma => JoinType::Cross, // Comma is essentially a cross join
-            ast::JoinOperator::TypedJoin(Some(jt)) => {
-                // Check the join type flags
-                // Note: JoinType can have multiple flags set
-                if jt.contains(ast::JoinType::NATURAL) {
-                    // Natural joins need special handling - find common columns
-                    return self.build_natural_join(left, right, JoinType::Inner);
-                } else if jt.contains(ast::JoinType::LEFT)
-                    && jt.contains(ast::JoinType::RIGHT)
-                    && jt.contains(ast::JoinType::OUTER)
-                {
-                    // FULL OUTER JOIN (has LEFT, RIGHT, and OUTER)
-                    JoinType::Full
-                } else if jt.contains(ast::JoinType::LEFT) && jt.contains(ast::JoinType::OUTER) {
-                    JoinType::Left
-                } else if jt.contains(ast::JoinType::RIGHT) && jt.contains(ast::JoinType::OUTER) {
-                    JoinType::Right
-                } else if jt.contains(ast::JoinType::OUTER)
-                    && !jt.contains(ast::JoinType::LEFT)
-                    && !jt.contains(ast::JoinType::RIGHT)
-                {
-                    // Plain OUTER JOIN should also be FULL
-                    JoinType::Full
-                } else if jt.contains(ast::JoinType::LEFT) {
-                    JoinType::Left
-                } else if jt.contains(ast::JoinType::RIGHT) {
-                    JoinType::Right
-                } else if jt.contains(ast::JoinType::CROSS)
-                    || (jt.contains(ast::JoinType::INNER) && jt.contains(ast::JoinType::CROSS))
-                {
-                    JoinType::Cross
-                } else {
-                    JoinType::Inner // Default to inner
-                }
-            }
-            ast::JoinOperator::TypedJoin(None) => JoinType::Inner, // Default JOIN is INNER JOIN
-        };
-
-        // Build join conditions
-        let (on_conditions, filter) = match constraint {
-            Some(ast::JoinConstraint::On(expr)) => {
-                // Parse ON clause into equijoin conditions and filters
-                self.parse_join_conditions(expr, left.schema(), right.schema())?
-            }
-            Some(ast::JoinConstraint::Using(columns)) => {
-                // Build equijoin conditions from USING clause
-                let on = self.build_using_conditions(columns, left.schema(), right.schema())?;
-                (on, None)
-            }
-            None => {
-                // Cross join or natural join
-                (Vec::new(), None)
-            }
-        };
-
-        // Build combined schema
-        let schema = self.build_join_schema(&left, &right, &join_type)?;
-
-        Ok(LogicalPlan::Join(Join {
-            left: Arc::new(left),
-            right: Arc::new(right),
-            join_type,
-            on: on_conditions,
-            filter,
-            schema,
-        }))
-    }
-
-    // Helper: Parse join conditions into equijoins and filters
-    fn parse_join_conditions(
-        &mut self,
-        expr: &ast::Expr,
-        left_schema: &SchemaRef,
-        right_schema: &SchemaRef,
-    ) -> Result<JoinConditionsResult> {
-        // For now, we'll handle simple equality conditions
-        // More complex conditions will go into the filter
-        let mut equijoins = Vec::new();
-        let mut filters = Vec::new();
-
-        // Try to extract equijoin conditions from the expression
-        self.extract_equijoin_conditions(
-            expr,
-            left_schema,
-            right_schema,
-            &mut equijoins,
-            &mut filters,
-        )?;
-
-        let filter = if filters.is_empty() {
-            None
-        } else {
-            // Combine multiple filters with AND
-            Some(
-                filters
-                    .into_iter()
-                    .reduce(|acc, e| LogicalExpr::BinaryExpr {
-                        left: Box::new(acc),
-                        op: BinaryOperator::And,
-                        right: Box::new(e),
-                    })
-                    .unwrap(),
-            )
-        };
-
-        Ok((equijoins, filter))
-    }
-
-    // Helper: Extract equijoin conditions from expression
-    fn extract_equijoin_conditions(
-        &mut self,
-        expr: &ast::Expr,
-        left_schema: &SchemaRef,
-        right_schema: &SchemaRef,
-        equijoins: &mut Vec<(LogicalExpr, LogicalExpr)>,
-        filters: &mut Vec<LogicalExpr>,
-    ) -> Result<()> {
-        match expr {
-            ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) => {
-                // Check if this is an equijoin condition (left.col = right.col)
-                let left_expr = self.build_expr(lhs, left_schema)?;
-                let right_expr = self.build_expr(rhs, right_schema)?;
-
-                // For simplicity, we'll check if one references left and one references right
-                // In a real implementation, we'd need more sophisticated column resolution
-                equijoins.push((left_expr, right_expr));
-            }
-            ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
-                // Recursively extract from AND conditions
-                self.extract_equijoin_conditions(
-                    lhs,
-                    left_schema,
-                    right_schema,
-                    equijoins,
-                    filters,
-                )?;
-                self.extract_equijoin_conditions(
-                    rhs,
-                    left_schema,
-                    right_schema,
-                    equijoins,
-                    filters,
-                )?;
-            }
-            _ => {
-                // Other conditions go into the filter
-                // We need a combined schema to build the expression
-                let combined_schema = self.combine_schemas(left_schema, right_schema)?;
-                let filter_expr = self.build_expr(expr, &combined_schema)?;
-                filters.push(filter_expr);
-            }
-        }
-        Ok(())
-    }
-
-    // Helper: Build equijoin conditions from USING clause
-    fn build_using_conditions(
-        &mut self,
-        columns: &[ast::Name],
-        left_schema: &SchemaRef,
-        right_schema: &SchemaRef,
-    ) -> Result<Vec<(LogicalExpr, LogicalExpr)>> {
-        let mut conditions = Vec::new();
-
-        for col_name in columns {
-            let name = Self::name_to_string(col_name);
-
-            // Find the column in both schemas
-            let _left_idx = left_schema
-                .columns
-                .iter()
-                .position(|col| col.name == name)
-                .ok_or_else(|| {
-                    LimboError::ParseError(format!("Column {name} not found in left table"))
-                })?;
-            let _right_idx = right_schema
-                .columns
-                .iter()
-                .position(|col| col.name == name)
-                .ok_or_else(|| {
-                    LimboError::ParseError(format!("Column {name} not found in right table"))
-                })?;
-
-            conditions.push((
-                LogicalExpr::Column(Column {
-                    name: name.clone(),
-                    table: None, // Will be resolved later
-                }),
-                LogicalExpr::Column(Column {
-                    name,
-                    table: None, // Will be resolved later
-                }),
-            ));
-        }
-
-        Ok(conditions)
-    }
-
-    // Helper: Build natural join by finding common columns
-    fn build_natural_join(
-        &mut self,
-        left: LogicalPlan,
-        right: LogicalPlan,
-        join_type: JoinType,
-    ) -> Result<LogicalPlan> {
-        let left_schema = left.schema();
-        let right_schema = right.schema();
-
-        // Find common column names
-        let mut common_columns = Vec::new();
-        for left_col in &left_schema.columns {
-            if right_schema
-                .columns
-                .iter()
-                .any(|col| col.name == left_col.name)
-            {
-                common_columns.push(ast::Name::exact(left_col.name.clone()));
-            }
-        }
-
-        if common_columns.is_empty() {
-            // Natural join with no common columns becomes a cross join
-            let schema = self.build_join_schema(&left, &right, &JoinType::Cross)?;
-            return Ok(LogicalPlan::Join(Join {
-                left: Arc::new(left),
-                right: Arc::new(right),
-                join_type: JoinType::Cross,
-                on: Vec::new(),
-                filter: None,
-                schema,
-            }));
-        }
-
-        // Build equijoin conditions for common columns
-        let on = self.build_using_conditions(&common_columns, left_schema, right_schema)?;
-        let schema = self.build_join_schema(&left, &right, &join_type)?;
-
-        Ok(LogicalPlan::Join(Join {
-            left: Arc::new(left),
-            right: Arc::new(right),
-            join_type,
-            on,
-            filter: None,
-            schema,
-        }))
-    }
-
-    // Helper: Build schema for join result
-    fn build_join_schema(
-        &self,
-        left: &LogicalPlan,
-        right: &LogicalPlan,
-        _join_type: &JoinType,
-    ) -> Result<SchemaRef> {
-        let left_schema = left.schema();
-        let right_schema = right.schema();
-
-        // Concatenate the schemas, preserving all column information
-        let mut columns = Vec::new();
-
-        // Keep all columns from left with their table info
-        for col in &left_schema.columns {
-            columns.push(col.clone());
-        }
-
-        // Keep all columns from right with their table info
-        for col in &right_schema.columns {
-            columns.push(col.clone());
-        }
-
-        Ok(Arc::new(LogicalSchema::new(columns)))
-    }
-
-    // Helper: Combine two schemas for expression building
-    fn combine_schemas(&self, left: &SchemaRef, right: &SchemaRef) -> Result<SchemaRef> {
-        let mut columns = left.columns.clone();
-        columns.extend(right.columns.clone());
-        Ok(Arc::new(LogicalSchema::new(columns)))
-    }
-
-    // Build projection
-    fn build_projection(
-        &mut self,
-        input: LogicalPlan,
-        columns: &[ast::ResultColumn],
-    ) -> Result<LogicalPlan> {
-        let input_schema = input.schema();
-        let mut proj_exprs = Vec::new();
-        let mut schema_columns = Vec::new();
-
-        for col in columns {
-            match col {
-                ast::ResultColumn::Expr(expr, alias) => {
-                    let logical_expr = self.build_expr(expr, input_schema)?;
-                    let explicit_alias = alias.as_ref().filter(|a| a.is_explicit());
-                    let col_name = match explicit_alias {
-                        Some(as_alias) => Self::name_to_string(as_alias.name()),
-                        None => Self::expr_to_column_name(expr),
-                    };
-                    let col_type = Self::infer_expr_type(&logical_expr, input_schema)?;
-
-                    schema_columns.push(ColumnInfo {
-                        name: col_name.clone(),
-                        ty: col_type,
-                        database: None,
-                        table: None,
-                        table_alias: None,
-                    });
-
-                    if let Some(as_alias) = explicit_alias {
-                        let alias_name = Self::name_to_string(as_alias.name());
-                        proj_exprs.push(LogicalExpr::Alias {
-                            expr: Box::new(logical_expr),
-                            alias: alias_name,
-                        });
-                    } else {
-                        proj_exprs.push(logical_expr);
-                    }
-                }
-                ast::ResultColumn::Star => {
-                    // Expand * to all columns
-                    for col in &input_schema.columns {
-                        proj_exprs.push(LogicalExpr::Column(Column::new(col.name.clone())));
-                        schema_columns.push(col.clone());
-                    }
-                }
-                ast::ResultColumn::TableStar(table) => {
-                    // Expand table.* to all columns from that table
-                    let table_name = Self::name_to_string(table);
-                    for col in &input_schema.columns {
-                        // Simple check - would need proper table tracking in real implementation
-                        proj_exprs.push(LogicalExpr::Column(Column::with_table(
-                            col.name.clone(),
-                            table_name.clone(),
-                        )));
-                        schema_columns.push(col.clone());
-                    }
-                }
-            }
-        }
-
-        Ok(LogicalPlan::Projection(Projection {
-            input: Arc::new(input),
-            exprs: proj_exprs,
-            schema: Arc::new(LogicalSchema::new(schema_columns)),
-        }))
-    }
-
-    // Helper function to preprocess aggregate expressions that contain complex arguments
-    // Returns: (needs_pre_projection, pre_projection_exprs, pre_projection_schema, modified_aggr_exprs)
-    //
-    // This will be used in expressions like select sum(hex(a + 2)) from tbl => hex(a + 2) is a
-    // pre-projection.
-    //
-    // Another alternative is to always generate a projection together with an aggregation, and
-    // just have "a" be the identity projection if we don't have a complex case. But that's quite
-    // wasteful.
-    fn preprocess_aggregate_expressions(
-        aggr_exprs: &[LogicalExpr],
-        group_exprs: &[LogicalExpr],
-        input_schema: &SchemaRef,
-    ) -> Result<PreprocessAggregateResult> {
-        let mut needs_pre_projection = false;
-        let mut pre_projection_exprs = Vec::new();
-        let mut pre_projection_schema = Vec::new();
-        let mut modified_aggr_exprs = Vec::new();
-        let mut modified_group_exprs = Vec::new();
-        let mut projected_col_counter = 0;
-
-        // First, add all group by expressions to the pre-projection
-        for expr in group_exprs {
-            if let LogicalExpr::Column(col) = expr {
-                pre_projection_exprs.push(expr.clone());
-                let col_type = Self::infer_expr_type(expr, input_schema)?;
-                pre_projection_schema.push(ColumnInfo {
-                    name: col.name.clone(),
-                    ty: col_type,
-                    database: None,
-                    table: col.table.clone(),
-                    table_alias: None,
-                });
-                // Column references stay as-is in the modified group expressions
-                modified_group_exprs.push(expr.clone());
-            } else {
-                // Complex group by expression - project it
-                needs_pre_projection = true;
-                let proj_col_name = format!("__group_proj_{projected_col_counter}");
-                projected_col_counter += 1;
-                pre_projection_exprs.push(expr.clone());
-                let col_type = Self::infer_expr_type(expr, input_schema)?;
-                pre_projection_schema.push(ColumnInfo {
-                    name: proj_col_name.clone(),
-                    ty: col_type,
-                    database: None,
-                    table: None,
-                    table_alias: None,
-                });
-                // Replace complex expression with reference to projected column
-                modified_group_exprs.push(LogicalExpr::Column(Column {
-                    name: proj_col_name,
-                    table: None,
-                }));
-            }
-        }
-
-        // Check each aggregate expression
-        for agg_expr in aggr_exprs {
-            if let LogicalExpr::AggregateFunction {
-                fun,
-                args,
-                distinct,
-            } = agg_expr
-            {
-                let mut modified_args = Vec::new();
-                for arg in args {
-                    // Check if the argument is a simple column reference or a complex expression
-                    match arg {
-                        LogicalExpr::Column(_) => {
-                            // Simple column - just use it
-                            modified_args.push(arg.clone());
-                            // Make sure the column is in the pre-projection
-                            if !pre_projection_exprs.iter().any(|e| e == arg) {
-                                pre_projection_exprs.push(arg.clone());
-                                let col_type = Self::infer_expr_type(arg, input_schema)?;
-                                if let LogicalExpr::Column(col) = arg {
-                                    pre_projection_schema.push(ColumnInfo {
-                                        name: col.name.clone(),
-                                        ty: col_type,
-                                        database: None,
-                                        table: col.table.clone(),
-                                        table_alias: None,
-                                    });
-                                }
-                            }
-                        }
-                        _ => {
-                            // Complex expression - we need to project it first
-                            needs_pre_projection = true;
-                            let proj_col_name = format!("__agg_arg_proj_{projected_col_counter}");
-                            projected_col_counter += 1;
-
-                            // Add the expression to the pre-projection
-                            pre_projection_exprs.push(arg.clone());
-                            let col_type = Self::infer_expr_type(arg, input_schema)?;
-                            pre_projection_schema.push(ColumnInfo {
-                                name: proj_col_name.clone(),
-                                ty: col_type,
-                                database: None,
-                                table: None,
-                                table_alias: None,
-                            });
-
-                            // In the aggregate, reference the projected column
-                            modified_args.push(LogicalExpr::Column(Column::new(proj_col_name)));
-                        }
-                    }
-                }
-
-                // Create the modified aggregate expression
-                modified_aggr_exprs.push(LogicalExpr::AggregateFunction {
-                    fun: fun.clone(),
-                    args: modified_args,
-                    distinct: *distinct,
-                });
-            } else {
-                modified_aggr_exprs.push(agg_expr.clone());
-            }
-        }
-
-        Ok((
-            needs_pre_projection,
-            pre_projection_exprs,
-            pre_projection_schema,
-            modified_aggr_exprs,
-            modified_group_exprs,
-        ))
-    }
-
-    // Build aggregate with GROUP BY
-    fn build_aggregate(
-        &mut self,
-        input: LogicalPlan,
-        group_by: &ast::GroupBy,
-        columns: &[ast::ResultColumn],
-    ) -> Result<LogicalPlan> {
-        let input_schema = input.schema();
-
-        // Build grouping expressions
-        let mut group_exprs = Vec::new();
-        for expr in &group_by.exprs {
-            group_exprs.push(self.build_expr(expr, input_schema)?);
-        }
-
-        // Use the unified aggregate builder
-        self.build_aggregate_internal(input, group_exprs, columns)
-    }
-
-    // Build aggregate without GROUP BY
-    fn build_aggregate_no_group(
-        &mut self,
-        input: LogicalPlan,
-        columns: &[ast::ResultColumn],
-    ) -> Result<LogicalPlan> {
-        // Use the unified aggregate builder with empty group expressions
-        self.build_aggregate_internal(input, vec![], columns)
-    }
-
-    // Unified internal aggregate builder that handles both GROUP BY and non-GROUP BY cases
-    fn build_aggregate_internal(
-        &mut self,
-        input: LogicalPlan,
-        group_exprs: Vec<LogicalExpr>,
-        columns: &[ast::ResultColumn],
-    ) -> Result<LogicalPlan> {
-        let input_schema = input.schema();
-        let has_group_by = !group_exprs.is_empty();
-
-        // First pass: build a map of aliases to expressions from the SELECT list
-        // and a vector of SELECT expressions for positional references
-        // This allows GROUP BY to reference SELECT aliases (e.g., GROUP BY year)
-        // or positions (e.g., GROUP BY 1)
-        let mut alias_to_expr = HashMap::default();
-        let mut select_exprs = Vec::new();
-        for col in columns {
-            if let ast::ResultColumn::Expr(expr, alias) = col {
-                let logical_expr = self.build_expr(expr, input_schema)?;
-                select_exprs.push(logical_expr.clone());
-
-                if let Some(alias) = alias.as_ref().filter(|a| a.is_explicit()) {
-                    alias_to_expr.insert(Self::name_to_string(alias.name()), logical_expr);
-                }
-            }
-        }
-
-        // Resolve GROUP BY expressions: replace column references that match SELECT aliases
-        // or integer literals that represent positions
-        let group_exprs = group_exprs
-            .into_iter()
-            .map(|expr| {
-                // Check for positional reference (integer literal)
-                if let LogicalExpr::Literal(crate::types::Value::Numeric(
-                    crate::Numeric::Integer(pos),
-                )) = &expr
-                {
-                    // SQLite uses 1-based indexing
-                    if *pos > 0 && (*pos as usize) <= select_exprs.len() {
-                        return select_exprs[(*pos as usize) - 1].clone();
-                    }
-                }
-
-                // Check for alias reference (unqualified column name)
-                if let LogicalExpr::Column(col) = &expr {
-                    if col.table.is_none() {
-                        // Unqualified column - check if it matches an alias
-                        if let Some(aliased_expr) = alias_to_expr.get(&col.name) {
-                            return aliased_expr.clone();
-                        }
-                    }
-                }
-                expr
-            })
-            .collect::<Vec<_>>();
-
-        // Build aggregate expressions and projection expressions
-        let mut aggr_exprs = Vec::new();
-        let mut projection_exprs = Vec::new();
-        let mut aggregate_schema_columns = Vec::new();
-
-        // First, add GROUP BY columns to the aggregate output schema
-        // These are always part of the aggregate operator's output
-        for group_expr in &group_exprs {
-            match group_expr {
-                LogicalExpr::Column(col) => {
-                    // For column references in GROUP BY, preserve the original column info
-                    if let Some((_, col_info)) =
-                        input_schema.find_column(&col.name, col.table.as_deref())
-                    {
-                        // Preserve the column with all its table information
-                        aggregate_schema_columns.push(col_info.clone());
-                    } else {
-                        // Fallback if column not found (shouldn't happen)
-                        let col_type = Self::infer_expr_type(group_expr, input_schema)?;
-                        aggregate_schema_columns.push(ColumnInfo {
-                            name: col.name.clone(),
-                            ty: col_type,
-                            database: None,
-                            table: col.table.clone(),
-                            table_alias: None,
-                        });
-                    }
-                }
-                _ => {
-                    // For complex GROUP BY expressions, generate a name
-                    let col_name = format!("__group_{}", aggregate_schema_columns.len());
-                    let col_type = Self::infer_expr_type(group_expr, input_schema)?;
-                    aggregate_schema_columns.push(ColumnInfo {
-                        name: col_name,
-                        ty: col_type,
-                        database: None,
-                        table: None,
-                        table_alias: None,
-                    });
-                }
-            }
-        }
-
-        // Track aggregates we've already seen to avoid duplicates
-        let mut aggregate_map: HashMap<String, String> = HashMap::default();
-
-        for col in columns {
-            match col {
-                ast::ResultColumn::Expr(expr, alias) => {
-                    let logical_expr = self.build_expr(expr, input_schema)?;
-
-                    // Determine the column name for this expression
-                    let col_name = match alias.as_ref().filter(|a| a.is_explicit()) {
-                        Some(as_alias) => Self::name_to_string(as_alias.name()),
-                        None => Self::expr_to_column_name(expr),
-                    };
-
-                    // Check if the TOP-LEVEL expression is an aggregate
-                    // We only care about immediate aggregates, not nested ones
-                    if Self::is_aggregate_expr(&logical_expr) {
-                        // Pure aggregate function - check if we've seen it before
-                        let agg_key = format!("{logical_expr:?}");
-
-                        let agg_col_name = if let Some(existing_name) = aggregate_map.get(&agg_key)
-                        {
-                            // Reuse existing aggregate
-                            existing_name.clone()
-                        } else {
-                            // New aggregate - add it
-                            let col_type = Self::infer_expr_type(&logical_expr, input_schema)?;
-                            aggregate_schema_columns.push(ColumnInfo {
-                                name: col_name.clone(),
-                                ty: col_type,
-                                database: None,
-                                table: None,
-                                table_alias: None,
-                            });
-                            aggr_exprs.push(logical_expr);
-                            aggregate_map.insert(agg_key, col_name.clone());
-                            col_name.clone()
-                        };
-
-                        // In the projection, reference this aggregate by name
-                        projection_exprs.push(LogicalExpr::Column(Column {
-                            name: agg_col_name,
-                            table: None,
-                        }));
-                    } else if Self::contains_aggregate(&logical_expr) {
-                        // This is an expression that contains an aggregate somewhere
-                        // (e.g., sum(a + 2) * 2)
-                        // We need to extract aggregates and replace them with column references
-                        let (processed_expr, extracted_aggs) =
-                            Self::extract_and_replace_aggregates_with_dedup(
-                                logical_expr,
-                                &mut aggregate_map,
-                            )?;
-
-                        // Add only new aggregates
-                        for (agg_expr, agg_name) in extracted_aggs {
-                            let agg_type = Self::infer_expr_type(&agg_expr, input_schema)?;
-                            aggregate_schema_columns.push(ColumnInfo {
-                                name: agg_name,
-                                ty: agg_type,
-                                database: None,
-                                table: None,
-                                table_alias: None,
-                            });
-                            aggr_exprs.push(agg_expr);
-                        }
-
-                        // Add the processed expression (with column refs) to projection
-                        projection_exprs.push(processed_expr);
-                    } else {
-                        // Non-aggregate expression - validation depends on GROUP BY presence
-                        if has_group_by {
-                            // With GROUP BY: only allow constants and grouped columns
-                            // TODO: SQLite actually allows any column here and returns the value from
-                            // the first row encountered in each group. We should support this in the
-                            // future for full SQLite compatibility, but for now we're stricter to
-                            // simplify the DBSP compilation.
-                            if !Self::is_constant_expr(&logical_expr)
-                                && !Self::is_valid_in_group_by(&logical_expr, &group_exprs)
-                            {
-                                return Err(LimboError::ParseError(format!(
-                                    "Column '{col_name}' must appear in the GROUP BY clause or be used in an aggregate function"
-                                )));
-                            }
-
-                            // If this expression matches a GROUP BY expression, replace it with a reference
-                            // to the corresponding column in the aggregate output
-                            let logical_expr_stripped = strip_alias(&logical_expr);
-                            if let Some(group_idx) = group_exprs
-                                .iter()
-                                .position(|g| logical_expr_stripped == strip_alias(g))
-                            {
-                                // Reference the GROUP BY column in the aggregate output by its name
-                                let group_col_name = &aggregate_schema_columns[group_idx].name;
-                                projection_exprs.push(LogicalExpr::Column(Column {
-                                    name: group_col_name.clone(),
-                                    table: None,
-                                }));
-                            } else {
-                                projection_exprs.push(logical_expr);
-                            }
-                        } else {
-                            // Without GROUP BY: only allow constant expressions
-                            // TODO: SQLite allows any column here and returns a value from an
-                            // arbitrary row. We should support this for full compatibility,
-                            // but for now we're stricter to simplify DBSP compilation.
-                            if !Self::is_constant_expr(&logical_expr) {
-                                return Err(LimboError::ParseError(format!(
-                                    "Column '{col_name}' must be used in an aggregate function when using aggregates without GROUP BY"
-                                )));
-                            }
-                            projection_exprs.push(logical_expr);
-                        }
-                    }
-                }
-                _ => {
-                    let error_msg = if has_group_by {
-                        "* not supported with GROUP BY".to_string()
-                    } else {
-                        "* not supported with aggregate functions".to_string()
-                    };
-                    return Err(LimboError::ParseError(error_msg));
-                }
-            }
-        }
-
-        // Check if any aggregate functions have complex expressions as arguments
-        // or if GROUP BY has complex expressions
-        // If so, we need to insert a projection before the aggregate
-        let (
-            needs_pre_projection,
-            pre_projection_exprs,
-            pre_projection_schema,
-            modified_aggr_exprs,
-            modified_group_exprs,
-        ) = Self::preprocess_aggregate_expressions(&aggr_exprs, &group_exprs, input_schema)?;
-
-        // Build the final schema for the projection
-        let mut projection_schema_columns = Vec::new();
-        for (i, expr) in projection_exprs.iter().enumerate() {
-            let col_name = if i < columns.len() {
-                match &columns[i] {
-                    ast::ResultColumn::Expr(e, alias) => {
-                        match alias.as_ref().filter(|a| a.is_explicit()) {
-                            Some(as_alias) => Self::name_to_string(as_alias.name()),
-                            None => Self::expr_to_column_name(e),
-                        }
-                    }
-                    _ => format!("col_{i}"),
-                }
-            } else {
-                format!("col_{i}")
             };
-
-            // For type inference, we need the aggregate schema for column references
-            let aggregate_schema = LogicalSchema::new(aggregate_schema_columns.clone());
-            let col_type = Self::infer_expr_type(expr, &Arc::new(aggregate_schema))?;
-            projection_schema_columns.push(ColumnInfo {
-                name: col_name,
-                ty: col_type,
-                database: None,
-                table: None,
-                table_alias: None,
+            if plan.schema().column_count() != right.schema().column_count() {
+                return Err(LimboError::InternalError(format!(
+                    "semantic HIR compound query {} has mismatched row widths",
+                    query.id
+                )));
+            }
+            let schema = self.schema_from_output_ids(&query.output)?;
+            plan = LogicalPlan::Union(Union {
+                inputs: vec![Arc::new(plan), Arc::new(right)],
+                all,
+                schema,
             });
         }
 
-        // Create the input plan (with pre-projection if needed)
-        let aggregate_input = if needs_pre_projection {
-            Arc::new(LogicalPlan::Projection(Projection {
-                input: Arc::new(input),
-                exprs: pre_projection_exprs,
-                schema: Arc::new(LogicalSchema::new(pre_projection_schema)),
-            }))
-        } else {
-            Arc::new(input)
-        };
-
-        // Use modified aggregate and group expressions if we inserted a pre-projection
-        let final_aggr_exprs = if needs_pre_projection {
-            modified_aggr_exprs
-        } else {
-            aggr_exprs
-        };
-        let final_group_exprs = if needs_pre_projection {
-            modified_group_exprs
-        } else {
-            group_exprs
-        };
-
-        // Check if we need the outer projection
-        // We need a projection if:
-        // 1. We have expressions that compute new values (e.g., SUM(x) * 2)
-        // 2. We're selecting a different set of columns than GROUP BY + aggregates
-        // 3. We're reordering columns from their natural aggregate output order
-        let needs_outer_projection = {
-            // Check for complex expressions
-            let has_complex_exprs = projection_exprs
-                .iter()
-                .any(|expr| !matches!(expr, LogicalExpr::Column(_)));
-
-            if has_complex_exprs {
-                true
-            } else {
-                // Check if we're selecting exactly what aggregate outputs in the same order
-                // The aggregate outputs: all GROUP BY columns, then all aggregate expressions
-                // The projection might select a subset or reorder these
-
-                if projection_exprs.len() != aggregate_schema_columns.len() {
-                    // Different number of columns
-                    true
-                } else {
-                    // Check if columns match in order and name
-                    !projection_exprs.iter().zip(&aggregate_schema_columns).all(
-                        |(expr, agg_col)| {
-                            if let LogicalExpr::Column(col) = expr {
-                                col.name == agg_col.name
-                            } else {
-                                false
-                            }
-                        },
-                    )
-                }
-            }
-        };
-
-        // Create the aggregate node with its natural schema
-        let aggregate_plan = LogicalPlan::Aggregate(Aggregate {
-            input: aggregate_input,
-            group_expr: final_group_exprs,
-            aggr_expr: final_aggr_exprs,
-            schema: Arc::new(LogicalSchema::new(aggregate_schema_columns)),
-        });
-
-        if needs_outer_projection {
-            Ok(LogicalPlan::Projection(Projection {
-                input: Arc::new(aggregate_plan),
-                exprs: projection_exprs,
-                schema: Arc::new(LogicalSchema::new(projection_schema_columns)),
-            }))
-        } else {
-            // No projection needed - aggregate output matches what we want
-            Ok(aggregate_plan)
-        }
-    }
-
-    /// Build VALUES clause
-    #[allow(clippy::vec_box)]
-    fn build_values(&mut self, values: &[Vec<Box<ast::Expr>>]) -> Result<LogicalPlan> {
-        if values.is_empty() {
-            return Err(LimboError::ParseError("Empty VALUES clause".to_string()));
-        }
-
-        let mut rows = Vec::new();
-        let first_row_len = values[0].len();
-
-        // Infer schema from first row
-        let mut schema_columns = Vec::new();
-        for (i, _) in values[0].iter().enumerate() {
-            schema_columns.push(ColumnInfo {
-                name: format!("column{}", i + 1),
-                ty: Type::Text,
-                database: None,
-                table: None,
-                table_alias: None,
-            });
-        }
-
-        for row in values {
-            if row.len() != first_row_len {
-                return Err(LimboError::ParseError(
-                    "All rows in VALUES must have the same number of columns".to_string(),
-                ));
-            }
-
-            let mut logical_row = Vec::new();
-            for expr in row {
-                // VALUES doesn't have input schema
-                let empty_schema = Arc::new(LogicalSchema::empty());
-                logical_row.push(self.build_expr(expr, &empty_schema)?);
-            }
-            rows.push(logical_row);
-        }
-
-        Ok(LogicalPlan::Values(Values {
-            rows,
-            schema: Arc::new(LogicalSchema::new(schema_columns)),
-        }))
-    }
-
-    // Build SORT
-    fn build_sort(
-        &mut self,
-        input: LogicalPlan,
-        exprs: &[ast::SortedColumn],
-    ) -> Result<LogicalPlan> {
-        let input_schema = input.schema();
-        let mut sort_exprs = Vec::new();
-
-        for sorted_col in exprs {
-            let expr = self.build_expr(&sorted_col.expr, input_schema)?;
-            sort_exprs.push(SortExpr {
-                expr,
-                asc: sorted_col.order != Some(ast::SortOrder::Desc),
-                nulls_first: sorted_col.nulls == Some(ast::NullsOrder::First),
-            });
-        }
-
-        Ok(LogicalPlan::Sort(Sort {
-            input: Arc::new(input),
-            exprs: sort_exprs,
-        }))
-    }
-
-    // Build LIMIT
-    fn build_limit(input: LogicalPlan, limit: &ast::Limit) -> Result<LogicalPlan> {
-        let fetch = match limit.expr.as_ref() {
-            ast::Expr::Literal(ast::Literal::Numeric(s)) => s.parse::<usize>().ok(),
-            _ => {
-                return Err(LimboError::ParseError(
-                    "LIMIT must be a literal integer".to_string(),
-                ));
-            }
-        };
-
-        let skip = if let Some(offset) = &limit.offset {
-            match offset.as_ref() {
-                ast::Expr::Literal(ast::Literal::Numeric(s)) => s.parse::<usize>().ok(),
-                _ => {
-                    return Err(LimboError::ParseError(
-                        "OFFSET must be a literal integer".to_string(),
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-
-        Ok(LogicalPlan::Limit(Limit {
-            input: Arc::new(input),
-            skip,
-            fetch,
-        }))
-    }
-
-    // Build compound operator (UNION, INTERSECT, EXCEPT)
-    fn build_compound(
-        left: LogicalPlan,
-        right: LogicalPlan,
-        op: &ast::CompoundOperator,
-    ) -> Result<LogicalPlan> {
-        // Check schema compatibility
-        if left.schema().column_count() != right.schema().column_count() {
-            return Err(LimboError::ParseError(
-                "UNION/INTERSECT/EXCEPT requires same number of columns".to_string(),
-            ));
-        }
-
-        let all = matches!(op, ast::CompoundOperator::UnionAll);
-
-        match op {
-            ast::CompoundOperator::Union | ast::CompoundOperator::UnionAll => {
-                let schema = left.schema().clone();
-                Ok(LogicalPlan::Union(Union {
-                    inputs: vec![Arc::new(left), Arc::new(right)],
-                    all,
-                    schema,
-                }))
-            }
-            _ => Err(LimboError::ParseError(
-                "INTERSECT and EXCEPT not yet supported in logical plans".to_string(),
-            )),
-        }
-    }
-
-    // Build expression from AST
-    fn build_expr(&mut self, expr: &ast::Expr, schema: &SchemaRef) -> Result<LogicalExpr> {
-        match expr {
-            ast::Expr::Id(_)
-            | ast::Expr::Name(_)
-            | ast::Expr::Qualified(_, _)
-            | ast::Expr::DoublyQualified(_, _, _) => {
-                let bound = crate::translate::bind::bind_logical_column(
-                    expr,
-                    schema.columns.iter().map(|column| {
-                        crate::translate::bind::LogicalScopeColumn {
-                            name: &column.name,
-                            database: column.database.as_deref(),
-                            table: column.table.as_deref(),
-                            table_alias: column.table_alias.as_deref(),
-                        }
-                    }),
-                )?
-                .expect("column expression matched above");
-                Ok(LogicalExpr::Column(Column {
-                    name: bound.name,
-                    table: bound.table,
-                }))
-            }
-
-            ast::Expr::Literal(lit) => Ok(LogicalExpr::Literal(Self::build_literal(lit)?)),
-
-            ast::Expr::Binary(lhs, op, rhs) => {
-                // Special case: IS NULL and IS NOT NULL
-                if matches!(op, ast::Operator::Is | ast::Operator::IsNot) {
-                    if let ast::Expr::Literal(ast::Literal::Null) = rhs.as_ref() {
-                        let expr = Box::new(self.build_expr(lhs, schema)?);
-                        return Ok(LogicalExpr::IsNull {
-                            expr,
-                            negated: matches!(op, ast::Operator::IsNot),
-                        });
-                    }
-                }
-
-                let left = Box::new(self.build_expr(lhs, schema)?);
-                let right = Box::new(self.build_expr(rhs, schema)?);
-                Ok(LogicalExpr::BinaryExpr {
-                    left,
-                    op: *op,
-                    right,
-                })
-            }
-
-            ast::Expr::Unary(op, expr) => {
-                let inner = Box::new(self.build_expr(expr, schema)?);
-                Ok(LogicalExpr::UnaryExpr {
-                    op: *op,
-                    expr: inner,
-                })
-            }
-
-            ast::Expr::FunctionCall {
-                name,
-                distinctness,
-                args,
-                filter_over,
-                ..
-            } => {
-                // Check for window functions (OVER clause)
-                if filter_over.over_clause.is_some() {
-                    return Err(LimboError::ParseError(
-                        "Unsupported expression type: window functions are not yet supported"
-                            .to_string(),
-                    ));
-                }
-
-                let func_name = Self::name_to_string(name);
-                let arg_count = args.len();
-                // Check if it's an aggregate function (considering argument count for min/max)
-                if let Some(agg_fun) = Self::parse_aggregate_function(&func_name, arg_count) {
-                    let distinct = distinctness.is_some();
-                    let arg_exprs = args
-                        .iter()
-                        .map(|e| self.build_expr(e, schema))
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok(LogicalExpr::AggregateFunction {
-                        fun: agg_fun,
-                        args: arg_exprs,
-                        distinct,
-                    })
-                } else {
-                    // Regular scalar function
-                    let arg_exprs = args
-                        .iter()
-                        .map(|e| self.build_expr(e, schema))
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok(LogicalExpr::ScalarFunction {
-                        fun: func_name,
-                        args: arg_exprs,
-                    })
-                }
-            }
-
-            ast::Expr::BoundCustomTypeFunction { call, .. } => self.build_expr(call, schema),
-
-            ast::Expr::FunctionCallStar { name, .. } => {
-                // Handle COUNT(*) and similar
-                let func_name = Self::name_to_string(name);
-                // FunctionCallStar always has 0 args (it's the * form)
-                if let Some(agg_fun) = Self::parse_aggregate_function(&func_name, 0) {
-                    Ok(LogicalExpr::AggregateFunction {
-                        fun: agg_fun,
-                        args: std::vec![],
-                        distinct: false,
-                    })
-                } else if let Ok(Some(func)) =
-                    crate::function::Func::resolve_function(&func_name, 0)
-                {
-                    // Check if this function supports star expansion (e.g., json_object, jsonb_object)
-                    if func.needs_star_expansion() {
-                        // Expand * to all columns as alternating key-value pairs
-                        let mut args = Vec::new();
-                        for col in &schema.columns {
-                            // Add column name as string literal
-                            args.push(LogicalExpr::Literal(crate::types::Value::Text(
-                                col.name.clone().into(),
-                            )));
-                            // Add column reference
-                            args.push(LogicalExpr::Column(Column::new(col.name.clone())));
-                        }
-                        Ok(LogicalExpr::ScalarFunction {
-                            fun: func_name,
-                            args,
-                        })
-                    } else {
-                        Err(LimboError::ParseError(format!(
-                            "Function {func_name}(*) is not supported"
-                        )))
-                    }
-                } else {
-                    Err(LimboError::ParseError(format!(
-                        "Function {func_name}(*) is not supported"
-                    )))
-                }
-            }
-
-            ast::Expr::Case {
-                base,
-                when_then_pairs,
-                else_expr,
-            } => {
-                let case_expr = if let Some(e) = base {
-                    Some(Box::new(self.build_expr(e, schema)?))
-                } else {
-                    None
+        if !query.order_by.is_empty() {
+            let mut exprs = Vec::with_capacity(query.order_by.len());
+            for term in &query.order_by {
+                let expr = match &term.expr {
+                    hir::Expr::Output(output) => self.output_column(*output)?,
+                    expr => self.build_expr(expr)?,
                 };
+                let asc = matches!(term.order, ast::SortOrder::Asc);
+                let nulls_first = match term.nulls {
+                    Some(ast::NullsOrder::First) => true,
+                    Some(ast::NullsOrder::Last) => false,
+                    None => asc,
+                };
+                exprs.push(SortExpr {
+                    expr,
+                    asc,
+                    nulls_first,
+                });
+            }
+            plan = LogicalPlan::Sort(Sort {
+                input: Arc::new(plan),
+                exprs,
+            });
+        }
 
-                let when_then_exprs = when_then_pairs
+        if let Some(limit) = &query.limit {
+            let fetch = Self::literal_limit(&limit.limit, "LIMIT")?;
+            let skip = limit
+                .offset
+                .as_ref()
+                .map(|offset| Self::literal_limit(offset, "OFFSET"))
+                .transpose()?;
+            plan = LogicalPlan::Limit(Limit {
+                input: Arc::new(plan),
+                skip,
+                fetch: Some(fetch),
+            });
+        }
+
+        Ok(plan)
+    }
+
+    fn build_query_block(&mut self, block_id: QueryBlockId) -> Result<LogicalPlan> {
+        let block = self
+            .document
+            .query_block(block_id)
+            .cloned()
+            .ok_or_else(|| {
+                LimboError::InternalError(format!("semantic HIR has no query block {block_id:?}"))
+            })?;
+        match &block.body {
+            hir::QueryBlockBody::Values { rows } => self.build_values(&block, rows),
+            hir::QueryBlockBody::Select {
+                distinctness,
+                filter,
+                grouping,
+                windows,
+            } => {
+                if !windows.is_empty() {
+                    return Err(LimboError::ParseError(
+                        "window definitions are not supported by incremental views".to_string(),
+                    ));
+                }
+                self.build_select_block(&block, *distinctness, filter.as_ref(), grouping.as_ref())
+            }
+        }
+    }
+
+    fn build_select_block(
+        &mut self,
+        block: &hir::QueryBlock,
+        distinctness: Option<ast::Distinctness>,
+        filter: Option<&hir::Expr>,
+        grouping: Option<&hir::Grouping>,
+    ) -> Result<LogicalPlan> {
+        let mut plan = match &block.from {
+            Some(from) => self.build_from(from)?,
+            None => LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row: true,
+                schema: Arc::new(LogicalSchema::empty()),
+            }),
+        };
+
+        if let Some(filter) = filter {
+            plan = LogicalPlan::Filter(Filter {
+                input: Arc::new(plan),
+                predicate: self.build_expr(filter)?,
+            });
+        }
+
+        let mut outputs = Vec::with_capacity(block.outputs.len());
+        for output in &block.outputs {
+            outputs.push(self.build_expr(&output.expr)?);
+        }
+        let having = grouping
+            .and_then(|grouping| grouping.having.as_ref())
+            .map(|expr| self.build_expr(expr))
+            .transpose()?;
+        let group_exprs = grouping
+            .map(|grouping| {
+                grouping
+                    .keys
                     .iter()
-                    .map(|(when, then)| {
+                    .map(|expr| {
                         Ok((
-                            self.build_expr(when, schema)?,
-                            self.build_expr(then, schema)?,
+                            self.build_expr(expr)?,
+                            self.finalize_type_fact(
+                                &self.expression_type_fact(expr),
+                                "GROUP BY expression",
+                            )?,
                         ))
                     })
-                    .collect::<Result<Vec<_>>>()?;
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
 
-                let else_result = if let Some(e) = else_expr {
-                    Some(Box::new(self.build_expr(e, schema)?))
-                } else {
-                    None
-                };
-
-                Ok(LogicalExpr::Case {
-                    expr: case_expr,
-                    when_then: when_then_exprs,
-                    else_expr: else_result,
-                })
+        let needs_aggregate = !group_exprs.is_empty()
+            || outputs.iter().any(Self::contains_aggregate)
+            || having.as_ref().is_some_and(Self::contains_aggregate);
+        let output_schema = self.schema_from_outputs(&block.outputs)?;
+        plan = if needs_aggregate {
+            self.build_aggregate_plan(plan, group_exprs, outputs, having, output_schema)?
+        } else {
+            if having.is_some() {
+                return Err(LimboError::InternalError(
+                    "semantic HIR contains HAVING without grouping or aggregation".to_string(),
+                ));
             }
+            LogicalPlan::Projection(Projection {
+                input: Arc::new(plan),
+                exprs: outputs,
+                schema: output_schema,
+            })
+        };
 
-            ast::Expr::InList { lhs, not, rhs } => {
-                let expr = Box::new(self.build_expr(lhs, schema)?);
-                let list = rhs
+        if matches!(distinctness, Some(ast::Distinctness::Distinct)) {
+            plan = LogicalPlan::Distinct(Distinct {
+                input: Arc::new(plan),
+            });
+        }
+        Ok(plan)
+    }
+
+    fn build_values(
+        &mut self,
+        block: &hir::QueryBlock,
+        rows: &[Vec<hir::Expr>],
+    ) -> Result<LogicalPlan> {
+        let expected = block.outputs.len();
+        let mut logical_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.len() != expected {
+                return Err(LimboError::InternalError(format!(
+                    "semantic HIR VALUES row has {} values but expected {expected}",
+                    row.len()
+                )));
+            }
+            logical_rows.push(
+                row.iter()
+                    .map(|expr| self.build_expr(expr))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        Ok(LogicalPlan::Values(Values {
+            rows: logical_rows,
+            schema: self.schema_from_outputs(&block.outputs)?,
+        }))
+    }
+
+    fn build_from(&mut self, from: &hir::From) -> Result<LogicalPlan> {
+        let mut plan = self.build_source(from.first)?;
+        for join in &from.joins {
+            let right = self.build_source(join.right)?;
+            let left_schema = plan.schema().clone();
+            let right_schema = right.schema().clone();
+            let (on, filter) = match &join.constraint {
+                hir::JoinConstraint::None => (Vec::new(), None),
+                hir::JoinConstraint::On(expr) => {
+                    let expr = self.build_expr(expr)?;
+                    Self::split_join_condition(expr, &left_schema, &right_schema)
+                }
+                hir::JoinConstraint::Using(columns) | hir::JoinConstraint::Natural(columns) => {
+                    let mut pairs = Vec::with_capacity(columns.len());
+                    for column in columns {
+                        pairs.push((
+                            self.build_expr(&column.left)?,
+                            self.column_for_ref(column.right)?,
+                        ));
+                    }
+                    (pairs, None)
+                }
+            };
+            let join_type = match join.kind {
+                hir::JoinKind::Comma => JoinType::Cross,
+                hir::JoinKind::Inner => JoinType::Inner,
+                hir::JoinKind::Cross => JoinType::Cross,
+                hir::JoinKind::Left => JoinType::Left,
+                hir::JoinKind::Right => JoinType::Right,
+                hir::JoinKind::Full => JoinType::Full,
+            };
+            let mut columns = left_schema.columns.clone();
+            columns.extend(right_schema.columns.clone());
+            plan = LogicalPlan::Join(Join {
+                left: Arc::new(plan),
+                right: Arc::new(right),
+                join_type,
+                on,
+                filter,
+                schema: Arc::new(LogicalSchema::new(columns)),
+            });
+        }
+        Ok(plan)
+    }
+
+    fn build_source(&mut self, source_id: SourceId) -> Result<LogicalPlan> {
+        let source = self.document.source(source_id).cloned().ok_or_else(|| {
+            LimboError::InternalError(format!("semantic HIR has no source {source_id}"))
+        })?;
+        match &source.kind {
+            hir::SourceKind::Table(table) => Ok(LogicalPlan::TableScan(TableScan {
+                source: source_id,
+                table: table.clone(),
+                table_name: table.value().get_name().to_string(),
+                alias: source.alias.clone(),
+                schema: self.schema_from_source(&source)?,
+                projection: None,
+            })),
+            hir::SourceKind::Derived(query) => {
+                let plan = self.build_query_shared(*query)?;
+                self.rebind_source(plan, &source)
+            }
+            hir::SourceKind::Cte(cte) => {
+                let plan = self.build_cte(*cte)?;
+                self.rebind_source(plan, &source)
+            }
+            hir::SourceKind::RecursiveInput(cte) => Err(LimboError::ParseError(format!(
+                "recursive CTE {cte} is not supported by incremental views"
+            ))),
+            hir::SourceKind::TableFunction { .. } => Err(LimboError::ParseError(
+                "table-valued functions are not supported by incremental views".to_string(),
+            )),
+            hir::SourceKind::SchemaExpression | hir::SourceKind::Pseudo { .. } => {
+                Err(LimboError::InternalError(format!(
+                    "non-query source {source_id} reached incremental query lowering"
+                )))
+            }
+        }
+    }
+
+    fn build_cte(&mut self, cte_id: CteId) -> Result<Arc<LogicalPlan>> {
+        if let Some(plan) = self.cte_plans.get(&cte_id) {
+            return Ok(plan.clone());
+        }
+        if self.building_ctes.contains(&cte_id) {
+            return Err(LimboError::ParseError(format!(
+                "recursive CTE {cte_id} is not supported by incremental views"
+            )));
+        }
+        let cte = self.document.cte(cte_id).cloned().ok_or_else(|| {
+            LimboError::InternalError(format!("semantic HIR has no CTE {cte_id}"))
+        })?;
+        self.building_ctes.push(cte_id);
+        let result = match cte.body {
+            hir::CteBody::Query(query) => self.build_query_shared(query),
+            hir::CteBody::Recursive(_) => Err(LimboError::ParseError(format!(
+                "recursive CTE '{}' is not supported by incremental views",
+                cte.name
+            ))),
+        };
+        self.building_ctes.pop();
+        let plan = result?;
+        self.cte_plans.insert(cte_id, plan.clone());
+        Ok(plan)
+    }
+
+    fn rebind_source(
+        &mut self,
+        input: Arc<LogicalPlan>,
+        source: &hir::Source,
+    ) -> Result<LogicalPlan> {
+        if input.schema().column_count() != source.columns.len() {
+            return Err(LimboError::InternalError(format!(
+                "source {} exposes {} columns but its query produces {}",
+                source.id,
+                source.columns.len(),
+                input.schema().column_count()
+            )));
+        }
+        let exprs = input
+            .schema()
+            .columns
+            .iter()
+            .map(|column| {
+                LogicalExpr::Column(Column {
+                    id: column.id,
+                    name: column.name.clone(),
+                    table: column.table_alias.clone().or_else(|| column.table.clone()),
+                })
+            })
+            .collect();
+        Ok(LogicalPlan::Projection(Projection {
+            input,
+            exprs,
+            schema: self.schema_from_source(source)?,
+        }))
+    }
+
+    fn split_join_condition(
+        expr: LogicalExpr,
+        left: &LogicalSchema,
+        right: &LogicalSchema,
+    ) -> (Vec<(LogicalExpr, LogicalExpr)>, Option<LogicalExpr>) {
+        let mut on = Vec::new();
+        let mut filters = Vec::new();
+        Self::collect_join_conditions(expr, left, right, &mut on, &mut filters);
+        let filter = filters
+            .into_iter()
+            .reduce(|left, right| LogicalExpr::BinaryExpr {
+                left: Box::new(left),
+                op: ast::Operator::And,
+                right: Box::new(right),
+            });
+        (on, filter)
+    }
+
+    fn collect_join_conditions(
+        expr: LogicalExpr,
+        left: &LogicalSchema,
+        right: &LogicalSchema,
+        on: &mut Vec<(LogicalExpr, LogicalExpr)>,
+        filters: &mut Vec<LogicalExpr>,
+    ) {
+        match expr {
+            LogicalExpr::BinaryExpr {
+                left: lhs,
+                op: ast::Operator::And,
+                right: rhs,
+            } => {
+                Self::collect_join_conditions(*lhs, left, right, on, filters);
+                Self::collect_join_conditions(*rhs, left, right, on, filters);
+            }
+            LogicalExpr::BinaryExpr {
+                left: lhs,
+                op: ast::Operator::Equals,
+                right: rhs,
+            } => {
+                let lhs_side = Self::column_side(&lhs, left, right);
+                let rhs_side = Self::column_side(&rhs, left, right);
+                match (lhs_side, rhs_side) {
+                    (Some(false), Some(true)) => on.push((*lhs, *rhs)),
+                    (Some(true), Some(false)) => on.push((*rhs, *lhs)),
+                    _ => filters.push(LogicalExpr::BinaryExpr {
+                        left: lhs,
+                        op: ast::Operator::Equals,
+                        right: rhs,
+                    }),
+                }
+            }
+            expr => filters.push(expr),
+        }
+    }
+
+    /// Returns false for the left input and true for the right input.
+    fn column_side(
+        expr: &LogicalExpr,
+        left: &LogicalSchema,
+        right: &LogicalSchema,
+    ) -> Option<bool> {
+        let LogicalExpr::Column(column) = expr else {
+            return None;
+        };
+        match (
+            left.find_column_id(column.id).is_some(),
+            right.find_column_id(column.id).is_some(),
+        ) {
+            (true, false) => Some(false),
+            (false, true) => Some(true),
+            _ => None,
+        }
+    }
+
+    fn build_aggregate_plan(
+        &mut self,
+        input: LogicalPlan,
+        group_exprs: Vec<(LogicalExpr, Type)>,
+        output_exprs: Vec<LogicalExpr>,
+        having: Option<LogicalExpr>,
+        output_schema: SchemaRef,
+    ) -> Result<LogicalPlan> {
+        let mut deduplicated_groups = Vec::with_capacity(group_exprs.len());
+        for group in group_exprs {
+            if !Self::can_share_expression(&group.0)
+                || !deduplicated_groups
                     .iter()
-                    .map(|e| self.build_expr(e, schema))
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(LogicalExpr::InList {
-                    expr,
-                    list,
-                    negated: *not,
+                    .any(|(expr, _): &(LogicalExpr, Type)| expr == &group.0)
+            {
+                deduplicated_groups.push(group);
+            }
+        }
+        let group_exprs = deduplicated_groups;
+        let original_groups = group_exprs
+            .iter()
+            .map(|(expr, _)| expr.clone())
+            .collect::<Vec<_>>();
+        let input_schema = input.schema().clone();
+        let mut pre_exprs = input_schema
+            .columns
+            .iter()
+            .map(|column| {
+                LogicalExpr::Column(Column {
+                    id: column.id,
+                    name: column.name.clone(),
+                    table: column.table_alias.clone().or_else(|| column.table.clone()),
                 })
-            }
+            })
+            .collect::<Vec<_>>();
+        let mut pre_columns = input_schema.columns.clone();
+        let original_pre_len = pre_exprs.len();
 
-            ast::Expr::InSelect { lhs, not, rhs } => {
-                let expr = Box::new(self.build_expr(lhs, schema)?);
-                let subquery = Arc::new(self.build_select(rhs)?);
-                Ok(LogicalExpr::InSubquery {
-                    expr,
-                    subquery,
-                    negated: *not,
+        let mut normalized_groups = Vec::with_capacity(group_exprs.len());
+        for (expr, ty) in group_exprs {
+            normalized_groups.push(self.precompute_expression(
+                expr,
+                ty,
+                "group",
+                &mut pre_exprs,
+                &mut pre_columns,
+            ));
+        }
+
+        // Assign every aggregate expression its output slot while extracting it
+        // from scalar expressions. Aggregate functions belong to the Aggregate
+        // node; projections and HAVING consume only the resulting columns.
+        // Doing both actions in one traversal avoids relying on expression
+        // equality to find the same aggregate again during a later rewrite.
+        let mut aggregates = Vec::new();
+        let output_exprs = output_exprs
+            .into_iter()
+            .map(|expr| self.extract_aggregates(expr, &mut aggregates))
+            .collect::<Vec<_>>();
+        let having = having.map(|expr| self.extract_aggregates(expr, &mut aggregates));
+
+        let mut normalized_aggregates = Vec::with_capacity(aggregates.len());
+        let mut aggregate_outputs = Vec::with_capacity(aggregates.len());
+        for (aggregate, column) in aggregates {
+            let LogicalExpr::AggregateFunction {
+                fun,
+                args,
+                arg_types,
+                distinct,
+                result_type,
+            } = aggregate
+            else {
+                unreachable!("aggregate extraction returned a non-aggregate expression")
+            };
+            if args.len() != arg_types.len() {
+                return Err(LimboError::InternalError(
+                    "semantic aggregate arguments and type facts have different lengths"
+                        .to_string(),
+                ));
+            }
+            let normalized_args = args
+                .into_iter()
+                .zip(arg_types.iter().copied())
+                .map(|(expr, ty)| {
+                    self.precompute_expression(
+                        expr,
+                        ty,
+                        "aggregate_arg",
+                        &mut pre_exprs,
+                        &mut pre_columns,
+                    )
                 })
-            }
+                .collect();
+            // HIR records SQLite's semantic SUM type as NUMERIC because the
+            // result can be integer or real. The current incremental
+            // aggregate stores and emits its running sum as f64, so this
+            // internal row slot has a concrete REAL storage type. The final
+            // projection still exposes the semantic HIR output type.
+            let physical_result_type = if matches!(&fun, AggFunc::Sum) {
+                Type::Real
+            } else {
+                result_type
+            };
+            aggregate_outputs.push((column, physical_result_type));
+            normalized_aggregates.push(LogicalExpr::AggregateFunction {
+                fun,
+                args: normalized_args,
+                arg_types,
+                distinct,
+                result_type,
+            });
+        }
 
-            ast::Expr::Exists(select) => {
-                let subquery = Arc::new(self.build_select(select)?);
-                Ok(LogicalExpr::Exists {
-                    subquery,
-                    negated: false,
-                })
-            }
+        let aggregate_input = if pre_exprs.len() == original_pre_len {
+            Arc::new(input)
+        } else {
+            Arc::new(LogicalPlan::Projection(Projection {
+                input: Arc::new(input),
+                exprs: pre_exprs,
+                schema: Arc::new(LogicalSchema::new(pre_columns.clone())),
+            }))
+        };
+        let pre_schema = aggregate_input.schema().clone();
 
-            ast::Expr::Subquery(select) => {
-                let subquery = Arc::new(self.build_select(select)?);
-                Ok(LogicalExpr::ScalarSubquery(subquery))
-            }
+        let mut aggregate_columns = Vec::new();
+        let mut group_replacements = Vec::new();
+        for group in &normalized_groups {
+            let LogicalExpr::Column(column) = group else {
+                unreachable!("precomputed grouping expression is not a column")
+            };
+            let (_, info) = pre_schema.find_column_id(column.id).ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "precomputed grouping column {:?} is absent from its schema",
+                    column.id
+                ))
+            })?;
+            aggregate_columns.push(info.clone());
+        }
+        group_replacements.extend(
+            original_groups
+                .into_iter()
+                .zip(normalized_groups.iter().cloned()),
+        );
 
-            ast::Expr::IsNull(lhs) => {
-                let expr = Box::new(self.build_expr(lhs, schema)?);
-                Ok(LogicalExpr::IsNull {
-                    expr,
-                    negated: false,
-                })
-            }
+        for (column, physical_result_type) in aggregate_outputs {
+            aggregate_columns.push(ColumnInfo {
+                id: column.id,
+                name: column.name.clone(),
+                ty: physical_result_type,
+                affinity: crate::vdbe::affinity::Affinity::Blob,
+                has_affinity: false,
+                collation: None,
+                database: None,
+                table: None,
+                table_alias: None,
+            });
+        }
 
-            ast::Expr::NotNull(lhs) => {
-                let expr = Box::new(self.build_expr(lhs, schema)?);
-                Ok(LogicalExpr::IsNull {
-                    expr,
-                    negated: true,
-                })
-            }
+        let aggregate_schema = Arc::new(LogicalSchema::new(aggregate_columns));
+        let mut plan = LogicalPlan::Aggregate(Aggregate {
+            input: aggregate_input,
+            group_expr: normalized_groups.clone(),
+            aggr_expr: normalized_aggregates,
+            schema: aggregate_schema.clone(),
+        });
 
-            ast::Expr::Between {
+        if let Some(having) = having {
+            let predicate = Self::rewrite_groups_after_aggregate(having, &group_replacements);
+            Self::require_columns_in_schema(&predicate, &aggregate_schema)?;
+            plan = LogicalPlan::Filter(Filter {
+                input: Arc::new(plan),
+                predicate,
+            });
+        }
+
+        let rewritten_outputs = output_exprs
+            .into_iter()
+            .map(|expr| Self::rewrite_groups_after_aggregate(expr, &group_replacements))
+            .collect::<Vec<_>>();
+        for expr in &rewritten_outputs {
+            Self::require_columns_in_schema(expr, &aggregate_schema)?;
+        }
+        Ok(LogicalPlan::Projection(Projection {
+            input: Arc::new(plan),
+            exprs: rewritten_outputs,
+            schema: output_schema,
+        }))
+    }
+
+    fn precompute_expression(
+        &mut self,
+        expr: LogicalExpr,
+        ty: Type,
+        prefix: &str,
+        expressions: &mut Vec<LogicalExpr>,
+        columns: &mut Vec<ColumnInfo>,
+    ) -> LogicalExpr {
+        if matches!(&expr, LogicalExpr::Column(_)) {
+            return expr;
+        }
+        if Self::can_share_expression(&expr) {
+            if let Some(index) = expressions.iter().position(|existing| existing == &expr) {
+                let column = &columns[index];
+                return LogicalExpr::Column(Column {
+                    id: column.id,
+                    name: column.name.clone(),
+                    table: column.table_alias.clone().or_else(|| column.table.clone()),
+                });
+            }
+        }
+        let column = self.synthetic_column(prefix);
+        expressions.push(expr);
+        columns.push(ColumnInfo {
+            id: column.id,
+            name: column.name.clone(),
+            ty,
+            affinity: crate::vdbe::affinity::Affinity::Blob,
+            has_affinity: false,
+            collation: None,
+            database: None,
+            table: None,
+            table_alias: None,
+        });
+        LogicalExpr::Column(column)
+    }
+
+    fn synthetic_column(&mut self, prefix: &str) -> Column {
+        let index = self.next_synthetic_column;
+        self.next_synthetic_column += 1;
+        Column {
+            id: LogicalColumnId::Synthetic(index),
+            name: format!("__{prefix}_{index}"),
+            table: None,
+        }
+    }
+
+    fn extract_aggregates(
+        &mut self,
+        expr: LogicalExpr,
+        aggregates: &mut Vec<(LogicalExpr, Column)>,
+    ) -> LogicalExpr {
+        Self::rewrite_expression(expr, &mut |expr| {
+            if !matches!(expr, LogicalExpr::AggregateFunction { .. }) {
+                return None;
+            }
+            // Sharing a slot is only an optimization. If equality does not
+            // recognize two equivalent aggregates, each gets a valid slot.
+            if Self::can_share_expression(expr) {
+                if let Some((_, column)) =
+                    aggregates.iter().find(|(aggregate, _)| aggregate == expr)
+                {
+                    return Some(LogicalExpr::Column(column.clone()));
+                }
+            }
+            let column = self.synthetic_column("agg");
+            aggregates.push((expr.clone(), column.clone()));
+            Some(LogicalExpr::Column(column))
+        })
+    }
+
+    fn contains_aggregate(expr: &LogicalExpr) -> bool {
+        if matches!(expr, LogicalExpr::AggregateFunction { .. }) {
+            return true;
+        }
+        let mut found = false;
+        Self::for_each_child(expr, |child| found |= Self::contains_aggregate(child));
+        found
+    }
+
+    fn for_each_child(expr: &LogicalExpr, mut visit: impl FnMut(&LogicalExpr)) {
+        match expr {
+            LogicalExpr::BinaryExpr { left, right, .. } => {
+                visit(left);
+                visit(right);
+            }
+            LogicalExpr::UnaryExpr { expr, .. }
+            | LogicalExpr::Alias { expr, .. }
+            | LogicalExpr::IsNull { expr, .. }
+            | LogicalExpr::Collate { expr, .. } => visit(expr),
+            LogicalExpr::Cast {
+                expr, parameters, ..
+            } => {
+                visit(expr);
+                for parameter in parameters {
+                    visit(parameter);
+                }
+            }
+            LogicalExpr::AggregateFunction { args, .. }
+            | LogicalExpr::ScalarFunction { args, .. } => {
+                for arg in args {
+                    visit(arg);
+                }
+            }
+            LogicalExpr::Case {
+                expr,
+                when_then,
+                else_expr,
+            } => {
+                if let Some(expr) = expr {
+                    visit(expr);
+                }
+                for (when, then) in when_then {
+                    visit(when);
+                    visit(then);
+                }
+                if let Some(expr) = else_expr {
+                    visit(expr);
+                }
+            }
+            LogicalExpr::InList { expr, list, .. } => {
+                visit(expr);
+                for value in list {
+                    visit(value);
+                }
+            }
+            LogicalExpr::InSubquery { expr, .. } => visit(expr),
+            LogicalExpr::Between {
+                expr, low, high, ..
+            } => {
+                visit(expr);
+                visit(low);
+                visit(high);
+            }
+            LogicalExpr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                visit(expr);
+                visit(pattern);
+                if let Some(escape) = escape {
+                    visit(escape);
+                }
+            }
+            LogicalExpr::Column(_)
+            | LogicalExpr::Literal(_)
+            | LogicalExpr::Exists { .. }
+            | LogicalExpr::ScalarSubquery { .. } => {}
+        }
+    }
+
+    /// Whether two structurally equal occurrences may share one evaluation.
+    /// Subqueries and nondeterministic scalar calls stay occurrence-local even
+    /// when their syntax is identical.
+    fn can_share_expression(expr: &LogicalExpr) -> bool {
+        match expr {
+            LogicalExpr::ScalarFunction { function, args, .. } => {
+                function.value().is_deterministic() && args.iter().all(Self::can_share_expression)
+            }
+            LogicalExpr::AggregateFunction { fun, args, .. } => {
+                !matches!(fun, AggFunc::External(_)) && args.iter().all(Self::can_share_expression)
+            }
+            LogicalExpr::Like {
+                function,
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                function.value().is_deterministic()
+                    && Self::can_share_expression(expr)
+                    && Self::can_share_expression(pattern)
+                    && escape.as_deref().is_none_or(Self::can_share_expression)
+            }
+            LogicalExpr::Exists { .. }
+            | LogicalExpr::ScalarSubquery { .. }
+            | LogicalExpr::InSubquery { .. } => false,
+            LogicalExpr::Column(_) | LogicalExpr::Literal(_) => true,
+            _ => {
+                let mut shareable = true;
+                Self::for_each_child(expr, |child| {
+                    shareable &= Self::can_share_expression(child);
+                });
+                shareable
+            }
+        }
+    }
+
+    fn rewrite_groups_after_aggregate(
+        expr: LogicalExpr,
+        groups: &[(LogicalExpr, LogicalExpr)],
+    ) -> LogicalExpr {
+        Self::rewrite_expression(expr, &mut |expr| {
+            groups
+                .iter()
+                .find(|(value, _)| Self::can_share_expression(value) && value == expr)
+                .map(|(_, replacement)| replacement.clone())
+        })
+    }
+
+    fn rewrite_expression(
+        expr: LogicalExpr,
+        rewrite: &mut impl FnMut(&LogicalExpr) -> Option<LogicalExpr>,
+    ) -> LogicalExpr {
+        if let Some(replacement) = rewrite(&expr) {
+            return replacement;
+        }
+        match expr {
+            LogicalExpr::BinaryExpr { left, op, right } => LogicalExpr::BinaryExpr {
+                left: Box::new(Self::rewrite_expression(*left, rewrite)),
+                op,
+                right: Box::new(Self::rewrite_expression(*right, rewrite)),
+            },
+            LogicalExpr::UnaryExpr { op, expr } => LogicalExpr::UnaryExpr {
+                op,
+                expr: Box::new(Self::rewrite_expression(*expr, rewrite)),
+            },
+            LogicalExpr::AggregateFunction {
+                fun,
+                args,
+                arg_types,
+                distinct,
+                result_type,
+            } => LogicalExpr::AggregateFunction {
+                fun,
+                args: args
+                    .into_iter()
+                    .map(|arg| Self::rewrite_expression(arg, rewrite))
+                    .collect(),
+                arg_types,
+                distinct,
+                result_type,
+            },
+            LogicalExpr::ScalarFunction {
+                function,
+                args,
+                result_type,
+            } => LogicalExpr::ScalarFunction {
+                function,
+                args: args
+                    .into_iter()
+                    .map(|arg| Self::rewrite_expression(arg, rewrite))
+                    .collect(),
+                result_type,
+            },
+            LogicalExpr::Case {
+                expr,
+                when_then,
+                else_expr,
+            } => LogicalExpr::Case {
+                expr: expr.map(|expr| Box::new(Self::rewrite_expression(*expr, rewrite))),
+                when_then: when_then
+                    .into_iter()
+                    .map(|(when, then)| {
+                        (
+                            Self::rewrite_expression(when, rewrite),
+                            Self::rewrite_expression(then, rewrite),
+                        )
+                    })
+                    .collect(),
+                else_expr: else_expr.map(|expr| Box::new(Self::rewrite_expression(*expr, rewrite))),
+            },
+            LogicalExpr::InList {
+                expr,
+                list,
+                negated,
+            } => LogicalExpr::InList {
+                expr: Box::new(Self::rewrite_expression(*expr, rewrite)),
+                list: list
+                    .into_iter()
+                    .map(|expr| Self::rewrite_expression(expr, rewrite))
+                    .collect(),
+                negated,
+            },
+            LogicalExpr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => LogicalExpr::InSubquery {
+                expr: Box::new(Self::rewrite_expression(*expr, rewrite)),
+                subquery,
+                negated,
+            },
+            LogicalExpr::Alias { expr, alias } => LogicalExpr::Alias {
+                expr: Box::new(Self::rewrite_expression(*expr, rewrite)),
+                alias,
+            },
+            LogicalExpr::IsNull { expr, negated } => LogicalExpr::IsNull {
+                expr: Box::new(Self::rewrite_expression(*expr, rewrite)),
+                negated,
+            },
+            LogicalExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => LogicalExpr::Between {
+                expr: Box::new(Self::rewrite_expression(*expr, rewrite)),
+                low: Box::new(Self::rewrite_expression(*low, rewrite)),
+                high: Box::new(Self::rewrite_expression(*high, rewrite)),
+                negated,
+            },
+            LogicalExpr::Like {
+                expr,
+                pattern,
+                escape,
+                negated,
+                operator,
+                function,
+                argument_count,
+            } => LogicalExpr::Like {
+                expr: Box::new(Self::rewrite_expression(*expr, rewrite)),
+                pattern: Box::new(Self::rewrite_expression(*pattern, rewrite)),
+                escape: escape.map(|expr| Box::new(Self::rewrite_expression(*expr, rewrite))),
+                negated,
+                operator,
+                function,
+                argument_count,
+            },
+            LogicalExpr::Cast {
+                expr,
+                name,
+                parameters,
+                ty,
+            } => LogicalExpr::Cast {
+                expr: Box::new(Self::rewrite_expression(*expr, rewrite)),
+                name,
+                parameters: parameters
+                    .into_iter()
+                    .map(|parameter| Self::rewrite_expression(parameter, rewrite))
+                    .collect(),
+                ty,
+            },
+            LogicalExpr::Collate { expr, collation } => LogicalExpr::Collate {
+                expr: Box::new(Self::rewrite_expression(*expr, rewrite)),
+                collation,
+            },
+            LogicalExpr::Column(column) => LogicalExpr::Column(column),
+            LogicalExpr::Literal(value) => LogicalExpr::Literal(value),
+            LogicalExpr::Exists { subquery, negated } => LogicalExpr::Exists { subquery, negated },
+            LogicalExpr::ScalarSubquery { plan, output } => {
+                LogicalExpr::ScalarSubquery { plan, output }
+            }
+        }
+    }
+
+    fn require_columns_in_schema(expr: &LogicalExpr, schema: &LogicalSchema) -> Result<()> {
+        if let LogicalExpr::Column(column) = expr {
+            if schema.find_column_id(column.id).is_none() {
+                return Err(LimboError::ParseError(format!(
+                    "column '{}' is neither grouped nor aggregated",
+                    column.name
+                )));
+            }
+            return Ok(());
+        }
+        let mut result = Ok(());
+        Self::for_each_child(expr, |child| {
+            if result.is_ok() {
+                result = Self::require_columns_in_schema(child, schema);
+            }
+        });
+        result
+    }
+
+    fn build_expr(&mut self, expr: &hir::Expr) -> Result<LogicalExpr> {
+        match expr {
+            hir::Expr::Literal(literal) => Ok(LogicalExpr::Literal(Self::literal_value(literal)?)),
+            hir::Expr::Column(column) => self.column_for_ref(*column),
+            hir::Expr::MergedColumn(column) => {
+                let left = self.build_expr(&column.left)?;
+                let right = self.column_for_ref(column.right)?;
+                match column.value {
+                    hir::MergedColumnValue::Left => Ok(left),
+                    hir::MergedColumnValue::Right => Ok(right),
+                    hir::MergedColumnValue::Coalesce => Ok(LogicalExpr::Case {
+                        expr: None,
+                        when_then: vec![(
+                            LogicalExpr::IsNull {
+                                expr: Box::new(left.clone()),
+                                negated: true,
+                            },
+                            left,
+                        )],
+                        else_expr: Some(Box::new(right)),
+                    }),
+                }
+            }
+            hir::Expr::Output(output) => {
+                let output = self.document.output(*output).cloned().ok_or_else(|| {
+                    LimboError::InternalError(format!("semantic HIR has no output {output:?}"))
+                })?;
+                self.build_expr(&output.expr)
+            }
+            hir::Expr::Unary { operator, expr } => Ok(LogicalExpr::UnaryExpr {
+                op: *operator,
+                expr: Box::new(self.build_expr(expr)?),
+            }),
+            hir::Expr::Binary {
                 lhs,
-                not,
+                operator,
+                rhs,
+                custom,
+            } => {
+                if custom.is_some() {
+                    return Err(LimboError::ParseError(
+                        "custom-type operators are not supported by incremental views".to_string(),
+                    ));
+                }
+                Ok(LogicalExpr::BinaryExpr {
+                    left: Box::new(self.build_expr(lhs)?),
+                    op: *operator,
+                    right: Box::new(self.build_expr(rhs)?),
+                })
+            }
+            hir::Expr::Between {
+                expr,
+                negated,
                 start,
                 end,
-            } => {
-                let expr = Box::new(self.build_expr(lhs, schema)?);
-                let low = Box::new(self.build_expr(start, schema)?);
-                let high = Box::new(self.build_expr(end, schema)?);
-                Ok(LogicalExpr::Between {
-                    expr,
-                    low,
-                    high,
-                    negated: *not,
+            } => Ok(LogicalExpr::Between {
+                expr: Box::new(self.build_expr(expr)?),
+                low: Box::new(self.build_expr(start)?),
+                high: Box::new(self.build_expr(end)?),
+                negated: *negated,
+            }),
+            hir::Expr::Case {
+                base,
+                when_then,
+                else_expr,
+            } => Ok(LogicalExpr::Case {
+                expr: base
+                    .as_ref()
+                    .map(|expr| self.build_expr(expr).map(Box::new))
+                    .transpose()?,
+                when_then: when_then
+                    .iter()
+                    .map(|(when, then)| Ok((self.build_expr(when)?, self.build_expr(then)?)))
+                    .collect::<Result<Vec<_>>>()?,
+                else_expr: else_expr
+                    .as_ref()
+                    .map(|expr| self.build_expr(expr).map(Box::new))
+                    .transpose()?,
+            }),
+            hir::Expr::Cast { expr, target } => {
+                if target.array_dimensions > 0 {
+                    return Err(LimboError::ParseError(format!(
+                        "cast target '{}' is not supported by incremental views",
+                        target.name
+                    )));
+                }
+                let ty = self.finalize_type_fact(&target.type_fact, "CAST result")?;
+                Ok(LogicalExpr::Cast {
+                    expr: Box::new(self.build_expr(expr)?),
+                    name: target.name.clone(),
+                    parameters: target
+                        .parameters
+                        .iter()
+                        .map(|parameter| self.build_expr(parameter))
+                        .collect::<Result<Vec<_>>>()?,
+                    ty,
                 })
             }
-
-            ast::Expr::Like {
+            hir::Expr::Collate { expr, collation } => Ok(LogicalExpr::Collate {
+                expr: Box::new(self.build_expr(expr)?),
+                collation: collation.clone(),
+            }),
+            hir::Expr::Function(call) => self.build_function(call),
+            hir::Expr::IsNull(expr) => Ok(LogicalExpr::IsNull {
+                expr: Box::new(self.build_expr(expr)?),
+                negated: false,
+            }),
+            hir::Expr::NotNull(expr) => Ok(LogicalExpr::IsNull {
+                expr: Box::new(self.build_expr(expr)?),
+                negated: true,
+            }),
+            hir::Expr::InList {
                 lhs,
-                not,
-                op: _,
+                negated,
+                values,
+            } => Ok(LogicalExpr::InList {
+                expr: Box::new(self.build_expr(lhs)?),
+                list: values
+                    .iter()
+                    .map(|expr| self.build_expr(expr))
+                    .collect::<Result<Vec<_>>>()?,
+                negated: *negated,
+            }),
+            hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, output }) => {
+                Ok(LogicalExpr::ScalarSubquery {
+                    plan: self.build_query_shared(*query)?,
+                    output: *output,
+                })
+            }
+            hir::Expr::Subquery(hir::SubqueryExpr::Exists(query)) => Ok(LogicalExpr::Exists {
+                subquery: self.build_query_shared(*query)?,
+                negated: false,
+            }),
+            hir::Expr::Subquery(hir::SubqueryExpr::In {
+                lhs,
+                query,
+                negated,
+            }) => Ok(LogicalExpr::InSubquery {
+                expr: Box::new(self.build_expr(lhs)?),
+                subquery: self.build_query_shared(*query)?,
+                negated: *negated,
+            }),
+            hir::Expr::Like {
+                lhs,
+                negated,
+                operator,
+                function,
+                argument_count,
                 rhs,
                 escape,
-            } => {
-                let expr = Box::new(self.build_expr(lhs, schema)?);
-                let pattern = Box::new(self.build_expr(rhs, schema)?);
-                let escape_char = escape.as_ref().and_then(|e| {
-                    if let ast::Expr::Literal(ast::Literal::String(s)) = e.as_ref() {
-                        s.chars().next()
-                    } else {
-                        None
-                    }
-                });
-                Ok(LogicalExpr::Like {
-                    expr,
-                    pattern,
-                    escape: escape_char,
-                    negated: *not,
-                })
-            }
-
-            ast::Expr::Parenthesized(exprs) => {
-                // the assumption is that there is at least one parenthesis here.
-                // If this is not true, then I don't understand this code and can't be trusted.
-                turso_assert_ne!(exprs.len(), 0);
-                // Multiple expressions in parentheses is unusual but handle it
-                // by building the first one (SQLite behavior)
-                self.build_expr(&exprs[0], schema)
-            }
-
-            ast::Expr::Cast { expr, type_name } => {
-                let inner = self.build_expr(expr, schema)?;
-                Ok(LogicalExpr::Cast {
-                    expr: Box::new(inner),
-                    type_name: type_name.clone(),
-                })
-            }
-
-            _ => Err(LimboError::ParseError(format!(
-                "Unsupported expression type in logical plan: {expr:?}"
+            } => Ok(LogicalExpr::Like {
+                expr: Box::new(self.build_expr(lhs)?),
+                pattern: Box::new(self.build_expr(rhs)?),
+                escape: escape
+                    .as_ref()
+                    .map(|expr| self.build_expr(expr).map(Box::new))
+                    .transpose()?,
+                negated: *negated,
+                operator: *operator,
+                function: function.clone(),
+                argument_count: *argument_count,
+            }),
+            hir::Expr::Parameter(_) => Err(LimboError::ParseError(
+                "parameters are not supported in incremental view definitions".to_string(),
+            )),
+            hir::Expr::RowId(_) => Err(LimboError::ParseError(
+                "rowid expressions are not supported by incremental views".to_string(),
+            )),
+            hir::Expr::Row(_)
+            | hir::Expr::Array(_)
+            | hir::Expr::Subscript { .. }
+            | hir::Expr::FieldAccess(_)
+            | hir::Expr::Raise { .. } => Err(LimboError::ParseError(format!(
+                "expression is not supported by incremental views: {expr:?}"
             ))),
         }
     }
 
-    /// Build literal value
-    fn build_literal(lit: &ast::Literal) -> Result<Value> {
-        match lit {
-            ast::Literal::Null => Ok(Value::Null),
-            ast::Literal::True => Ok(Value::from_i64(1)),
-            ast::Literal::False => Ok(Value::from_i64(0)),
-            ast::Literal::Keyword(k) => {
-                let k_bytes = k.as_bytes();
-                match_ignore_ascii_case!(match k_bytes {
-                    b"true" => Ok(Value::from_i64(1)),  // SQLite uses int for bool
-                    b"false" => Ok(Value::from_i64(0)), // SQLite uses int for bool
-                    _ => Ok(Value::Text(k.clone().into())),
+    fn build_function(&mut self, call: &hir::FunctionCall) -> Result<LogicalExpr> {
+        if !call.argument_order.is_empty()
+            || !call.within_group.is_empty()
+            || call.filter.is_some()
+            || call.window.is_some()
+            || call.custom_type_operation.is_some()
+            || call.sequence_operation.is_some()
+        {
+            return Err(LimboError::ParseError(format!(
+                "function '{}' uses syntax not supported by incremental views",
+                call.function.value()
+            )));
+        }
+        let args = call
+            .arguments
+            .iter()
+            .map(|expr| self.build_expr(expr))
+            .collect::<Result<Vec<_>>>()?;
+        let result_type = self.finalize_type_fact(&call.result_type, "function result")?;
+        match call.function.value() {
+            Func::Agg(fun) => {
+                let arg_types = call
+                    .arguments
+                    .iter()
+                    .map(|expr| {
+                        self.finalize_type_fact(
+                            &self.expression_type_fact(expr),
+                            "aggregate argument",
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(LogicalExpr::AggregateFunction {
+                    fun: fun.clone(),
+                    args,
+                    arg_types,
+                    distinct: matches!(call.distinctness, Some(ast::Distinctness::Distinct)),
+                    result_type,
                 })
             }
-            ast::Literal::Numeric(s) => {
-                if let Ok(i) = s.parse::<i64>() {
-                    Ok(Value::from_i64(i))
-                } else if let Ok(f) = s.parse::<f64>() {
-                    Ok(Value::from_f64(f))
-                } else {
-                    Ok(Value::Text(s.clone().into()))
-                }
-            }
-            ast::Literal::String(s) => {
-                // Strip surrounding quotes from the SQL literal
-                // The parser includes quotes in the string value
-                let unquoted = if s.starts_with('\'') && s.ends_with('\'') && s.len() > 1 {
-                    &s[1..s.len() - 1]
-                } else {
-                    s.as_str()
-                };
-                Ok(Value::Text(unquoted.to_string().into()))
-            }
-            ast::Literal::Blob(b) => Ok(Value::from_slice(ast::blob_literal_hex(b).as_bytes())?),
-            ast::Literal::CurrentDate
-            | ast::Literal::CurrentTime
-            | ast::Literal::CurrentTimestamp => Err(LimboError::ParseError(
-                "Temporal literals not yet supported".to_string(),
+            Func::Window(_) => Err(LimboError::ParseError(
+                "window functions are not supported by incremental views".to_string(),
             )),
+            _ => Ok(LogicalExpr::ScalarFunction {
+                function: call.function.clone(),
+                args,
+                result_type,
+            }),
         }
     }
 
-    /// Parse aggregate function name (considering argument count for min/max)
-    fn parse_aggregate_function(name: &str, arg_count: usize) -> Option<AggregateFunction> {
-        let name_bytes = name.as_bytes();
-        match_ignore_ascii_case!(match name_bytes {
-            b"COUNT" => Some(AggFunc::Count),
-            b"SUM" => Some(AggFunc::Sum),
-            b"AVG" => Some(AggFunc::Avg),
-            // MIN and MAX are only aggregates with 1 argument
-            // With 2+ arguments, they're scalar functions
-            b"MIN" if arg_count == 1 => Some(AggFunc::Min),
-            b"MAX" if arg_count == 1 => Some(AggFunc::Max),
-            b"GROUP_CONCAT" => Some(AggFunc::GroupConcat),
-            b"STRING_AGG" => Some(AggFunc::StringAgg),
-            b"TOTAL" => Some(AggFunc::Total),
-            b"ARRAY_AGG" => Some(AggFunc::ArrayAgg),
-            _ => None,
+    fn column_for_ref(&self, reference: hir::ColumnRef) -> Result<LogicalExpr> {
+        let source = self.document.source(reference.source).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "semantic HIR column refers to missing source {}",
+                reference.source
+            ))
+        })?;
+        let column = source.columns.get(reference.column).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "semantic HIR column {} is outside source {}",
+                reference.column, reference.source
+            ))
+        })?;
+        Ok(LogicalExpr::Column(Column {
+            id: LogicalColumnId::Source(reference),
+            name: column.name.clone(),
+            table: source.alias.clone().or_else(|| Some(source.name.clone())),
+        }))
+    }
+
+    fn output_column(&self, output_id: OutputId) -> Result<LogicalExpr> {
+        let output = self.document.output(output_id).ok_or_else(|| {
+            LimboError::InternalError(format!("semantic HIR has no output {output_id:?}"))
+        })?;
+        Ok(LogicalExpr::Column(Column {
+            id: LogicalColumnId::Output(output_id),
+            name: output.name.clone(),
+            table: None,
+        }))
+    }
+
+    fn schema_from_source(&self, source: &hir::Source) -> Result<SchemaRef> {
+        source
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                Ok(ColumnInfo {
+                    id: LogicalColumnId::Source(hir::ColumnRef {
+                        source: source.id,
+                        column: index,
+                    }),
+                    name: column.name.clone(),
+                    ty: self.finalize_type_fact(
+                        &column.type_fact,
+                        &format!("column '{}.{}'", source.name, column.name),
+                    )?,
+                    affinity: column.affinity,
+                    has_affinity: column.has_affinity,
+                    collation: column.collation.clone(),
+                    database: None,
+                    table: Some(source.name.clone()),
+                    table_alias: source.alias.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(LogicalSchema::new)
+            .map(Arc::new)
+    }
+
+    fn schema_from_outputs(&self, outputs: &[hir::Output]) -> Result<SchemaRef> {
+        outputs
+            .iter()
+            .map(|output| {
+                Ok(ColumnInfo {
+                    id: LogicalColumnId::Output(output.id),
+                    name: output.name.clone(),
+                    ty: self.finalize_type_fact(
+                        &output.type_fact,
+                        &format!("output '{}'", output.name),
+                    )?,
+                    affinity: output.affinity,
+                    has_affinity: output.has_affinity,
+                    collation: output.collation.clone(),
+                    database: None,
+                    table: None,
+                    table_alias: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(LogicalSchema::new)
+            .map(Arc::new)
+    }
+
+    fn schema_from_output_ids(&self, outputs: &[OutputId]) -> Result<SchemaRef> {
+        outputs
+            .iter()
+            .map(|output| {
+                self.document.output(*output).cloned().ok_or_else(|| {
+                    LimboError::InternalError(format!("semantic HIR has no output {output:?}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+            .and_then(|outputs| self.schema_from_outputs(&outputs))
+    }
+
+    fn finalize_type_fact(&self, fact: &hir::TypeFact, context: &str) -> Result<Type> {
+        if fact.is_array() {
+            return Err(LimboError::ParseError(format!(
+                "{context} has an array type, which incremental views do not support"
+            )));
+        }
+        if let Some(declared) = &fact.declared {
+            if declared.custom().is_some() {
+                return Err(LimboError::ParseError(format!(
+                    "{context} has custom type '{}', which incremental views do not support",
+                    declared.name
+                )));
+            }
+        }
+        fact.storage.ok_or_else(|| {
+            LimboError::ParseError(format!(
+                "{context} has a dynamic type; incremental views require a concrete storage type"
+            ))
         })
     }
 
-    // Check if expression contains aggregates
-    fn has_aggregates(columns: &[ast::ResultColumn]) -> bool {
-        for col in columns {
-            if let ast::ResultColumn::Expr(expr, _) = col {
-                if Self::expr_has_aggregate(expr) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    // Check if AST expression contains aggregates
-    fn expr_has_aggregate(expr: &ast::Expr) -> bool {
+    fn expression_type_fact(&self, expr: &hir::Expr) -> hir::TypeFact {
         match expr {
-            ast::Expr::FunctionCall { name, args, .. } => {
-                // Check if the function itself is an aggregate (considering arg count for min/max)
-                let arg_count = args.len();
-                if Self::parse_aggregate_function(&Self::name_to_string(name), arg_count).is_some()
+            hir::Expr::Literal(literal) => match literal {
+                ast::Literal::Numeric(value)
+                    if value
+                        .as_bytes()
+                        .iter()
+                        .any(|byte| matches!(byte, b'.' | b'e' | b'E')) =>
                 {
-                    return true;
+                    hir::TypeFact::known(Type::Real)
                 }
-                // Also check if any arguments contain aggregates (for nested functions like HEX(SUM(...)))
-                args.iter().any(|arg| Self::expr_has_aggregate(arg))
-            }
-            ast::Expr::BoundCustomTypeFunction { call, .. } => Self::expr_has_aggregate(call),
-            ast::Expr::FunctionCallStar { name, .. } => {
-                // FunctionCallStar always has 0 args
-                Self::parse_aggregate_function(&Self::name_to_string(name), 0).is_some()
-            }
-            ast::Expr::Binary(lhs, _, rhs) => {
-                Self::expr_has_aggregate(lhs) || Self::expr_has_aggregate(rhs)
-            }
-            ast::Expr::Unary(_, e) => Self::expr_has_aggregate(e),
-            ast::Expr::Case {
-                when_then_pairs,
-                else_expr,
+                ast::Literal::Numeric(_) | ast::Literal::True | ast::Literal::False => {
+                    hir::TypeFact::known(Type::Integer)
+                }
+                ast::Literal::String(_)
+                | ast::Literal::Keyword(_)
+                | ast::Literal::CurrentDate
+                | ast::Literal::CurrentTime
+                | ast::Literal::CurrentTimestamp => hir::TypeFact::known(Type::Text),
+                ast::Literal::Blob(_) => hir::TypeFact::known(Type::Blob),
+                ast::Literal::Null => hir::TypeFact::known(Type::Null),
+            },
+            hir::Expr::Parameter(parameter) => parameter.type_fact.clone(),
+            hir::Expr::Column(reference) => self
+                .document
+                .source(reference.source)
+                .and_then(|source| source.columns.get(reference.column))
+                .map(|column| column.type_fact.clone())
+                .unwrap_or_default(),
+            hir::Expr::MergedColumn(column) => column.type_fact.clone(),
+            hir::Expr::RowId(_) => hir::TypeFact::known(Type::Integer),
+            hir::Expr::Output(output) => self
+                .document
+                .output(*output)
+                .map(|output| output.type_fact.clone())
+                .unwrap_or_default(),
+            hir::Expr::Cast { target, .. } => target.type_fact.clone(),
+            hir::Expr::Function(call) => call.result_type.clone(),
+            hir::Expr::FieldAccess(access) => access.result_type.clone(),
+            hir::Expr::Collate { expr, .. } => self.expression_type_fact(expr),
+            hir::Expr::Unary {
+                operator: ast::UnaryOperator::Not | ast::UnaryOperator::BitwiseNot,
                 ..
-            } => {
-                when_then_pairs
+            } => hir::TypeFact::known(Type::Integer),
+            hir::Expr::Unary { expr, .. } => self.expression_type_fact(expr),
+            hir::Expr::IsNull(_)
+            | hir::Expr::NotNull(_)
+            | hir::Expr::Like { .. }
+            | hir::Expr::Between { .. }
+            | hir::Expr::InList { .. }
+            | hir::Expr::Subquery(hir::SubqueryExpr::Exists(_))
+            | hir::Expr::Subquery(hir::SubqueryExpr::In { .. }) => {
+                hir::TypeFact::known(Type::Integer)
+            }
+            hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, output }) => self
+                .document
+                .query(*query)
+                .and_then(|query| query.output.get(*output))
+                .and_then(|output| self.document.output(*output))
+                .map(|output| output.type_fact.clone())
+                .unwrap_or_default(),
+            hir::Expr::Array(elements) => hir::TypeFact::array_literal_result(
+                elements
                     .iter()
-                    .any(|(w, t)| Self::expr_has_aggregate(w) || Self::expr_has_aggregate(t))
-                    || else_expr
-                        .as_ref()
-                        .is_some_and(|e| Self::expr_has_aggregate(e))
+                    .map(|element| self.expression_type_fact(element)),
+            ),
+            hir::Expr::Subscript { base, .. } => {
+                let mut fact = self.expression_type_fact(base);
+                if !fact.is_array() {
+                    return hir::TypeFact::dynamic();
+                }
+                fact.array_dimensions = fact.array_dimensions.saturating_sub(1);
+                if let Some(declared) = fact.declared.as_mut() {
+                    declared.array_dimensions = declared.array_dimensions.saturating_sub(1);
+                    declared.storage = if declared.array_dimensions == 0 {
+                        match Affinity::affinity(&declared.name) {
+                            Affinity::Integer => Type::Integer,
+                            Affinity::Text => Type::Text,
+                            Affinity::Blob => Type::Blob,
+                            Affinity::Real => Type::Real,
+                            Affinity::Numeric => Type::Numeric,
+                        }
+                    } else {
+                        Type::Blob
+                    };
+                    fact.storage = Some(declared.storage);
+                } else if fact.is_array() {
+                    fact.storage = Some(Type::Blob);
+                } else {
+                    fact.storage = None;
+                }
+                fact
             }
-            ast::Expr::Parenthesized(exprs) => {
-                // Check if any parenthesized expression contains an aggregate
-                exprs.iter().any(|e| Self::expr_has_aggregate(e))
+            hir::Expr::Binary {
+                lhs,
+                operator:
+                    ast::Operator::Add
+                    | ast::Operator::Subtract
+                    | ast::Operator::Multiply
+                    | ast::Operator::Divide,
+                rhs,
+                ..
+            } => hir::TypeFact::arithmetic_result(
+                &self.expression_type_fact(lhs),
+                &self.expression_type_fact(rhs),
+            ),
+            hir::Expr::Binary {
+                operator:
+                    ast::Operator::Modulus
+                    | ast::Operator::BitwiseAnd
+                    | ast::Operator::BitwiseOr
+                    | ast::Operator::LeftShift
+                    | ast::Operator::RightShift,
+                ..
+            } => hir::TypeFact::known(Type::Integer),
+            hir::Expr::Binary {
+                lhs,
+                operator: ast::Operator::Concat,
+                rhs,
+                ..
+            } => hir::TypeFact::concat_result(
+                &self.expression_type_fact(lhs),
+                &self.expression_type_fact(rhs),
+            ),
+            hir::Expr::Binary {
+                operator: ast::Operator::ArrowRight,
+                ..
+            } => hir::TypeFact::known(Type::Text),
+            hir::Expr::Binary { operator, .. }
+                if matches!(
+                    operator,
+                    ast::Operator::And
+                        | ast::Operator::Or
+                        | ast::Operator::Equals
+                        | ast::Operator::NotEquals
+                        | ast::Operator::Less
+                        | ast::Operator::LessEquals
+                        | ast::Operator::Greater
+                        | ast::Operator::GreaterEquals
+                        | ast::Operator::Is
+                        | ast::Operator::IsNot
+                ) =>
+            {
+                hir::TypeFact::known(Type::Integer)
             }
-            _ => false,
-        }
-    }
-
-    // Check if logical expression is an aggregate
-    fn is_aggregate_expr(expr: &LogicalExpr) -> bool {
-        match expr {
-            LogicalExpr::AggregateFunction { .. } => true,
-            LogicalExpr::Alias { expr, .. } => Self::is_aggregate_expr(expr),
-            _ => false,
-        }
-    }
-
-    // Check if logical expression contains an aggregate anywhere
-    fn contains_aggregate(expr: &LogicalExpr) -> bool {
-        match expr {
-            LogicalExpr::AggregateFunction { .. } => true,
-            LogicalExpr::Alias { expr, .. } => Self::contains_aggregate(expr),
-            LogicalExpr::BinaryExpr { left, right, .. } => {
-                Self::contains_aggregate(left) || Self::contains_aggregate(right)
-            }
-            LogicalExpr::UnaryExpr { expr, .. } => Self::contains_aggregate(expr),
-            LogicalExpr::ScalarFunction { args, .. } => args.iter().any(Self::contains_aggregate),
-            LogicalExpr::Case {
+            hir::Expr::Case {
                 when_then,
                 else_expr,
                 ..
             } => {
-                when_then
-                    .iter()
-                    .any(|(w, t)| Self::contains_aggregate(w) || Self::contains_aggregate(t))
-                    || else_expr
-                        .as_ref()
-                        .is_some_and(|e| Self::contains_aggregate(e))
-            }
-            _ => false,
-        }
-    }
-
-    // Check if an expression is a constant (contains only literals)
-    fn is_constant_expr(expr: &LogicalExpr) -> bool {
-        match expr {
-            LogicalExpr::Literal(_) => true,
-            LogicalExpr::BinaryExpr { left, right, .. } => {
-                Self::is_constant_expr(left) && Self::is_constant_expr(right)
-            }
-            LogicalExpr::UnaryExpr { expr, .. } => Self::is_constant_expr(expr),
-            LogicalExpr::ScalarFunction { args, .. } => args.iter().all(Self::is_constant_expr),
-            LogicalExpr::Alias { expr, .. } => Self::is_constant_expr(expr),
-            _ => false,
-        }
-    }
-
-    // Check if an expression is valid in GROUP BY context
-    // An expression is valid if it's:
-    // 1. A constant literal
-    // 2. An aggregate function
-    // 3. A grouping column (or expression involving only grouping columns)
-    fn is_valid_in_group_by(expr: &LogicalExpr, group_exprs: &[LogicalExpr]) -> bool {
-        // First check if the entire expression appears in GROUP BY
-        // Strip aliases before comparing since SELECT might have aliases but GROUP BY might not
-        let expr_stripped = strip_alias(expr);
-        if group_exprs.iter().any(|g| expr_stripped == strip_alias(g)) {
-            return true;
-        }
-
-        // If not, check recursively based on expression type
-        match expr {
-            LogicalExpr::Literal(_) => true, // Constants are always valid
-            LogicalExpr::AggregateFunction { .. } => true, // Aggregates are valid
-            LogicalExpr::Column(col) => {
-                // Check if this column is in the GROUP BY
-                group_exprs.iter().any(|g| match g {
-                    LogicalExpr::Column(gcol) => gcol.name == col.name,
-                    _ => false,
-                })
-            }
-            LogicalExpr::BinaryExpr { left, right, .. } => {
-                // Both sides must be valid
-                Self::is_valid_in_group_by(left, group_exprs)
-                    && Self::is_valid_in_group_by(right, group_exprs)
-            }
-            LogicalExpr::UnaryExpr { expr, .. } => Self::is_valid_in_group_by(expr, group_exprs),
-            LogicalExpr::ScalarFunction { args, .. } => {
-                // All arguments must be valid
-                args.iter()
-                    .all(|arg| Self::is_valid_in_group_by(arg, group_exprs))
-            }
-            LogicalExpr::Alias { expr, .. } => Self::is_valid_in_group_by(expr, group_exprs),
-            _ => false, // Other expressions are not valid
-        }
-    }
-
-    // Extract aggregates from an expression and replace them with column references, with deduplication
-    // Returns the modified expression and a list of NEW (aggregate_expr, column_name) pairs
-    fn extract_and_replace_aggregates_with_dedup(
-        expr: LogicalExpr,
-        aggregate_map: &mut HashMap<String, String>,
-    ) -> Result<(LogicalExpr, Vec<(LogicalExpr, String)>)> {
-        let mut new_aggregates = Vec::new();
-        let mut counter = aggregate_map.len();
-        let new_expr = Self::replace_aggregates_with_columns_dedup(
-            expr,
-            &mut new_aggregates,
-            aggregate_map,
-            &mut counter,
-        )?;
-        Ok((new_expr, new_aggregates))
-    }
-
-    // Recursively replace aggregate functions with column references, with deduplication
-    fn replace_aggregates_with_columns_dedup(
-        expr: LogicalExpr,
-        new_aggregates: &mut Vec<(LogicalExpr, String)>,
-        aggregate_map: &mut HashMap<String, String>,
-        counter: &mut usize,
-    ) -> Result<LogicalExpr> {
-        match expr {
-            LogicalExpr::AggregateFunction { .. } => {
-                // Found an aggregate - check if we've seen it before
-                let agg_key = format!("{expr:?}");
-
-                let col_name = if let Some(existing_name) = aggregate_map.get(&agg_key) {
-                    // Reuse existing aggregate
-                    existing_name.clone()
-                } else {
-                    // New aggregate
-                    let col_name = format!("__agg_{}", *counter);
-                    *counter += 1;
-                    aggregate_map.insert(agg_key, col_name.clone());
-                    new_aggregates.push((expr, col_name.clone()));
-                    col_name
-                };
-
-                Ok(LogicalExpr::Column(Column {
-                    name: col_name,
-                    table: None,
-                }))
-            }
-            LogicalExpr::BinaryExpr { left, op, right } => {
-                let new_left = Self::replace_aggregates_with_columns_dedup(
-                    *left,
-                    new_aggregates,
-                    aggregate_map,
-                    counter,
-                )?;
-                let new_right = Self::replace_aggregates_with_columns_dedup(
-                    *right,
-                    new_aggregates,
-                    aggregate_map,
-                    counter,
-                )?;
-                Ok(LogicalExpr::BinaryExpr {
-                    left: Box::new(new_left),
-                    op,
-                    right: Box::new(new_right),
-                })
-            }
-            LogicalExpr::UnaryExpr { op, expr } => {
-                let new_expr = Self::replace_aggregates_with_columns_dedup(
-                    *expr,
-                    new_aggregates,
-                    aggregate_map,
-                    counter,
-                )?;
-                Ok(LogicalExpr::UnaryExpr {
-                    op,
-                    expr: Box::new(new_expr),
-                })
-            }
-            LogicalExpr::ScalarFunction { fun, args } => {
-                let mut new_args = Vec::new();
-                for arg in args {
-                    new_args.push(Self::replace_aggregates_with_columns_dedup(
-                        arg,
-                        new_aggregates,
-                        aggregate_map,
-                        counter,
-                    )?);
+                let mut results = Vec::with_capacity(when_then.len() + else_expr.iter().count());
+                results.extend(
+                    when_then
+                        .iter()
+                        .map(|(_, result)| self.expression_type_fact(result)),
+                );
+                if let Some(else_expr) = else_expr {
+                    results.push(self.expression_type_fact(else_expr));
                 }
-                Ok(LogicalExpr::ScalarFunction {
-                    fun,
-                    args: new_args,
-                })
+                hir::TypeFact::selected_value_result(&results)
             }
-            LogicalExpr::Case {
-                expr: case_expr,
-                when_then,
-                else_expr,
-            } => {
-                let new_case_expr = if let Some(e) = case_expr {
-                    Some(Box::new(Self::replace_aggregates_with_columns_dedup(
-                        *e,
-                        new_aggregates,
-                        aggregate_map,
-                        counter,
-                    )?))
-                } else {
-                    None
-                };
-
-                let mut new_when_then = Vec::new();
-                for (when, then) in when_then {
-                    let new_when = Self::replace_aggregates_with_columns_dedup(
-                        when,
-                        new_aggregates,
-                        aggregate_map,
-                        counter,
-                    )?;
-                    let new_then = Self::replace_aggregates_with_columns_dedup(
-                        then,
-                        new_aggregates,
-                        aggregate_map,
-                        counter,
-                    )?;
-                    new_when_then.push((new_when, new_then));
-                }
-
-                let new_else = if let Some(e) = else_expr {
-                    Some(Box::new(Self::replace_aggregates_with_columns_dedup(
-                        *e,
-                        new_aggregates,
-                        aggregate_map,
-                        counter,
-                    )?))
-                } else {
-                    None
-                };
-
-                Ok(LogicalExpr::Case {
-                    expr: new_case_expr,
-                    when_then: new_when_then,
-                    else_expr: new_else,
-                })
-            }
-            LogicalExpr::Alias { expr, alias } => {
-                let new_expr = Self::replace_aggregates_with_columns_dedup(
-                    *expr,
-                    new_aggregates,
-                    aggregate_map,
-                    counter,
-                )?;
-                Ok(LogicalExpr::Alias {
-                    expr: Box::new(new_expr),
-                    alias,
-                })
-            }
-            // Other expressions - keep as is
-            _ => Ok(expr),
+            _ => hir::TypeFact::dynamic(),
         }
     }
 
-    // Get column name from expression
-    fn expr_to_column_name(expr: &ast::Expr) -> String {
-        match expr {
-            ast::Expr::Id(name) => Self::name_to_string(name),
-            ast::Expr::Qualified(_, col) => Self::name_to_string(col),
-            ast::Expr::FunctionCall { name, .. } => Self::name_to_string(name),
-            ast::Expr::BoundCustomTypeFunction { call, .. } => Self::expr_to_column_name(call),
-            ast::Expr::FunctionCallStar { name, .. } => {
-                format!("{}(*)", Self::name_to_string(name))
+    fn literal_value(literal: &ast::Literal) -> Result<Value> {
+        match literal {
+            ast::Literal::Null => Ok(Value::Null),
+            ast::Literal::True => Ok(Value::from_i64(1)),
+            ast::Literal::False => Ok(Value::from_i64(0)),
+            ast::Literal::Numeric(value) => crate::util::parse_numeric_literal(value),
+            ast::Literal::String(value) => Ok(Value::Text(
+                crate::translate::expr::sanitize_string(value).into(),
+            )),
+            ast::Literal::Blob(value) => {
+                let bytes = ast::blob_literal_hex(value)
+                    .as_bytes()
+                    .chunks_exact(2)
+                    .map(|pair| {
+                        let pair = std::str::from_utf8(pair).map_err(|error| {
+                            LimboError::ParseError(format!("invalid blob literal: {error}"))
+                        })?;
+                        u8::from_str_radix(pair, 16).map_err(|error| {
+                            LimboError::ParseError(format!("invalid blob literal: {error}"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Value::from_slice(&bytes)?)
             }
-            _ => "expr".to_string(),
-        }
-    }
-
-    // Infer expression type
-    fn infer_expr_type(expr: &LogicalExpr, schema: &SchemaRef) -> Result<Type> {
-        match expr {
-            LogicalExpr::Column(col) => {
-                if let Some((_, col_info)) = schema.find_column(&col.name, col.table.as_deref()) {
-                    Ok(col_info.ty)
-                } else {
-                    Ok(Type::Text)
-                }
-            }
-            LogicalExpr::Literal(Value::Numeric(Numeric::Integer(_))) => Ok(Type::Integer),
-            LogicalExpr::Literal(Value::Numeric(Numeric::Float(_))) => Ok(Type::Real),
-            LogicalExpr::Literal(Value::Text(_)) => Ok(Type::Text),
-            LogicalExpr::Literal(Value::Null) => Ok(Type::Null),
-            LogicalExpr::Literal(Value::Blob(_)) => Ok(Type::Blob),
-            LogicalExpr::BinaryExpr { op, left, right } => {
-                match op {
-                    ast::Operator::Add | ast::Operator::Subtract | ast::Operator::Multiply => {
-                        // Infer types of operands to match SQLite/Numeric behavior
-                        let left_type = Self::infer_expr_type(left, schema)?;
-                        let right_type = Self::infer_expr_type(right, schema)?;
-
-                        // Integer op Integer = Integer (matching core/numeric/mod.rs behavior)
-                        // Any operation with Real = Real
-                        match (left_type, right_type) {
-                            (Type::Integer, Type::Integer) => Ok(Type::Integer),
-                            (Type::Integer, Type::Real)
-                            | (Type::Real, Type::Integer)
-                            | (Type::Real, Type::Real) => Ok(Type::Real),
-                            (Type::Null, _) | (_, Type::Null) => Ok(Type::Null),
-                            // For Text/Blob, SQLite coerces to numeric, defaulting to Real
-                            _ => Ok(Type::Real),
-                        }
-                    }
-                    ast::Operator::Divide => {
-                        // Division always produces Real in SQLite
-                        Ok(Type::Real)
-                    }
-                    ast::Operator::Modulus => {
-                        // Modulus follows same rules as other arithmetic ops
-                        let left_type = Self::infer_expr_type(left, schema)?;
-                        let right_type = Self::infer_expr_type(right, schema)?;
-                        match (left_type, right_type) {
-                            (Type::Integer, Type::Integer) => Ok(Type::Integer),
-                            _ => Ok(Type::Real),
-                        }
-                    }
-                    ast::Operator::Equals
-                    | ast::Operator::NotEquals
-                    | ast::Operator::Less
-                    | ast::Operator::LessEquals
-                    | ast::Operator::Greater
-                    | ast::Operator::GreaterEquals
-                    | ast::Operator::And
-                    | ast::Operator::Or
-                    | ast::Operator::Is
-                    | ast::Operator::IsNot => Ok(Type::Integer),
-                    ast::Operator::Concat => Ok(Type::Text),
-                    _ => Ok(Type::Text), // Default for other operators
-                }
-            }
-            LogicalExpr::UnaryExpr { op, expr } => match op {
-                ast::UnaryOperator::Not => Ok(Type::Integer),
-                ast::UnaryOperator::Negative | ast::UnaryOperator::Positive => {
-                    Self::infer_expr_type(expr, schema)
-                }
-                ast::UnaryOperator::BitwiseNot => Ok(Type::Integer),
-            },
-            LogicalExpr::AggregateFunction { fun, .. } => match fun {
-                AggFunc::Count | AggFunc::Count0 => Ok(Type::Integer),
-                AggFunc::Sum | AggFunc::Avg | AggFunc::Total => Ok(Type::Real),
-                AggFunc::Min | AggFunc::Max => Ok(Type::Text),
-                AggFunc::GroupConcat | AggFunc::StringAgg => Ok(Type::Text),
-                AggFunc::ArrayAgg => Ok(Type::Blob),
-                AggFunc::PercentileCont => Ok(Type::Real),
-                // mode/percentile_disc return an element of the ordered set, whose
-                // type is not known statically.
-                AggFunc::Mode | AggFunc::PercentileDisc => Ok(Type::Text),
-                #[cfg(feature = "json")]
-                AggFunc::JsonbGroupArray
-                | AggFunc::JsonGroupArray
-                | AggFunc::JsonbGroupObject
-                | AggFunc::JsonGroupObject => Ok(Type::Text),
-                AggFunc::External(_) => Ok(Type::Text), // Default for external
-            },
-            LogicalExpr::Alias { expr, .. } => Self::infer_expr_type(expr, schema),
-            LogicalExpr::IsNull { .. } => Ok(Type::Integer),
-            LogicalExpr::InList { .. } | LogicalExpr::InSubquery { .. } => Ok(Type::Integer),
-            LogicalExpr::Exists { .. } => Ok(Type::Integer),
-            LogicalExpr::Between { .. } => Ok(Type::Integer),
-            LogicalExpr::Like { .. } => Ok(Type::Integer),
-            _ => Ok(Type::Text),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::alloc::vec;
-    use crate::schema::{
-        BTreeCharacteristics, BTreeTable, ColDef, Column as SchemaColumn, Schema, Type,
-    };
-    use turso_parser::parser::Parser;
-
-    fn create_test_schema() -> Schema {
-        let mut schema = Schema::new();
-
-        // Create users table
-        let columns = vec![
-            SchemaColumn::new(
-                Some("id".to_string()),
-                "INTEGER".to_string(),
-                None,
-                None,
-                Type::Integer,
-                None,
-                ColDef {
-                    primary_key: true,
-                    rowid_alias: true,
-                    notnull: true,
-                    ..Default::default()
-                },
-            ),
-            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-            SchemaColumn::new_default_integer(Some("age".to_string()), "INTEGER".to_string(), None),
-            SchemaColumn::new_default_text(Some("email".to_string()), "TEXT".to_string(), None),
-        ];
-        let users_table = BTreeTable::new(
-            2,
-            "users".to_string(),
-            vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
-            columns,
-            BTreeCharacteristics::HAS_ROWID,
-            vec![],
-            vec![],
-            vec![],
-            None,
-        );
-        schema
-            .add_btree_table(Arc::new(users_table))
-            .expect("Test setup: failed to add users table");
-
-        // Create orders table
-        let columns = vec![
-            SchemaColumn::new(
-                Some("id".to_string()),
-                "INTEGER".to_string(),
-                None,
-                None,
-                Type::Integer,
-                None,
-                ColDef {
-                    primary_key: true,
-                    rowid_alias: true,
-                    notnull: true,
-                    ..Default::default()
-                },
-            ),
-            SchemaColumn::new_default_integer(
-                Some("user_id".to_string()),
-                "INTEGER".to_string(),
-                None,
-            ),
-            SchemaColumn::new_default_text(Some("product".to_string()), "TEXT".to_string(), None),
-            SchemaColumn::new(
-                Some("amount".to_string()),
-                "REAL".to_string(),
-                None,
-                None,
-                Type::Real,
-                None,
-                ColDef::default(),
-            ),
-        ];
-        let orders_table = BTreeTable::new(
-            3,
-            "orders".to_string(),
-            vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
-            columns,
-            BTreeCharacteristics::HAS_ROWID,
-            vec![],
-            vec![],
-            vec![],
-            None,
-        );
-        schema
-            .add_btree_table(Arc::new(orders_table))
-            .expect("Test setup: failed to add orders table");
-
-        // Create products table
-        let columns = vec![
-            SchemaColumn::new(
-                Some("id".to_string()),
-                "INTEGER".to_string(),
-                None,
-                None,
-                Type::Integer,
-                None,
-                ColDef {
-                    primary_key: true,
-                    rowid_alias: true,
-                    notnull: true,
-                    ..Default::default()
-                },
-            ),
-            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-            SchemaColumn::new(
-                Some("price".to_string()),
-                "REAL".to_string(),
-                None,
-                None,
-                Type::Real,
-                None,
-                ColDef::default(),
-            ),
-            SchemaColumn::new_default_integer(
-                Some("product_id".to_string()),
-                "INTEGER".to_string(),
-                None,
-            ),
-        ];
-        let products_table = BTreeTable::new(
-            4,
-            "products".to_string(),
-            vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
-            columns,
-            BTreeCharacteristics::HAS_ROWID,
-            vec![],
-            vec![],
-            vec![],
-            None,
-        );
-        schema
-            .add_btree_table(Arc::new(products_table))
-            .expect("Test setup: failed to add products table");
-
-        schema
-    }
-
-    fn parse_and_build(sql: &str, schema: &Schema) -> Result<LogicalPlan> {
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser
-            .next()
-            .ok_or_else(|| LimboError::ParseError("Empty statement".to_string()))?
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
-        match cmd {
-            ast::Cmd::Stmt(stmt) => {
-                let mut builder = LogicalPlanBuilder::new(schema);
-                builder.build_statement(&stmt)
-            }
-            _ => Err(LimboError::ParseError(
-                "Only SQL statements are supported".to_string(),
+            ast::Literal::Keyword(value) => Ok(Value::Text(value.clone().into())),
+            ast::Literal::CurrentDate
+            | ast::Literal::CurrentTime
+            | ast::Literal::CurrentTimestamp => Err(LimboError::ParseError(
+                "current-time literals are not supported by incremental views".to_string(),
             )),
         }
     }
 
-    #[test]
-    fn test_simple_select() {
-        let schema = create_test_schema();
-        let sql = "SELECT id, name FROM users";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                assert_eq!(proj.exprs.len(), 2);
-                assert!(matches!(proj.exprs[0], LogicalExpr::Column(_)));
-                assert!(matches!(proj.exprs[1], LogicalExpr::Column(_)));
-
-                match &*proj.input {
-                    LogicalPlan::TableScan(scan) => {
-                        assert_eq!(scan.table_name, "users");
-                    }
-                    _ => panic!("Expected TableScan"),
-                }
-            }
-            _ => panic!("Expected Projection"),
-        }
-    }
-
-    #[test]
-    fn test_select_with_filter() {
-        let schema = create_test_schema();
-        let sql = "SELECT name FROM users WHERE age > 18";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                assert_eq!(proj.exprs.len(), 1);
-
-                match &*proj.input {
-                    LogicalPlan::Filter(filter) => {
-                        assert!(matches!(
-                            filter.predicate,
-                            LogicalExpr::BinaryExpr {
-                                op: ast::Operator::Greater,
-                                ..
-                            }
-                        ));
-
-                        match &*filter.input {
-                            LogicalPlan::TableScan(scan) => {
-                                assert_eq!(scan.table_name, "users");
-                            }
-                            _ => panic!("Expected TableScan"),
-                        }
-                    }
-                    _ => panic!("Expected Filter"),
-                }
-            }
-            _ => panic!("Expected Projection"),
-        }
-    }
-
-    #[test]
-    fn test_aggregate_with_group_by() {
-        let schema = create_test_schema();
-        let sql = "SELECT user_id, SUM(amount) FROM orders GROUP BY user_id";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Aggregate(agg) => {
-                assert_eq!(agg.group_expr.len(), 1);
-                assert_eq!(agg.aggr_expr.len(), 1);
-                assert_eq!(agg.schema.column_count(), 2);
-
-                assert!(matches!(
-                    agg.aggr_expr[0],
-                    LogicalExpr::AggregateFunction {
-                        fun: AggFunc::Sum,
-                        ..
-                    }
-                ));
-
-                match &*agg.input {
-                    LogicalPlan::TableScan(scan) => {
-                        assert_eq!(scan.table_name, "orders");
-                    }
-                    _ => panic!("Expected TableScan"),
-                }
-            }
-            _ => panic!("Expected Aggregate (no projection)"),
-        }
-    }
-
-    #[test]
-    fn test_aggregate_without_group_by() {
-        let schema = create_test_schema();
-        let sql = "SELECT COUNT(*), MAX(age) FROM users";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Aggregate(agg) => {
-                assert_eq!(agg.group_expr.len(), 0);
-                assert_eq!(agg.aggr_expr.len(), 2);
-                assert_eq!(agg.schema.column_count(), 2);
-
-                assert!(matches!(
-                    agg.aggr_expr[0],
-                    LogicalExpr::AggregateFunction {
-                        fun: AggFunc::Count,
-                        ..
-                    }
-                ));
-
-                assert!(matches!(
-                    agg.aggr_expr[1],
-                    LogicalExpr::AggregateFunction {
-                        fun: AggFunc::Max,
-                        ..
-                    }
-                ));
-            }
-            _ => panic!("Expected Aggregate (no projection)"),
-        }
-    }
-
-    #[test]
-    fn test_order_by() {
-        let schema = create_test_schema();
-        let sql = "SELECT name FROM users ORDER BY age DESC, name ASC";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Sort(sort) => {
-                assert_eq!(sort.exprs.len(), 2);
-                assert!(!sort.exprs[0].asc); // DESC
-                assert!(sort.exprs[1].asc); // ASC
-
-                match &*sort.input {
-                    LogicalPlan::Projection(_) => {}
-                    _ => panic!("Expected Projection"),
-                }
-            }
-            _ => panic!("Expected Sort"),
-        }
-    }
-
-    #[test]
-    fn test_limit_offset() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM users LIMIT 10 OFFSET 5";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Limit(limit) => {
-                assert_eq!(limit.fetch, Some(10));
-                assert_eq!(limit.skip, Some(5));
-            }
-            _ => panic!("Expected Limit"),
-        }
-    }
-
-    #[test]
-    fn test_order_by_with_limit() {
-        let schema = create_test_schema();
-        let sql = "SELECT name FROM users ORDER BY age DESC LIMIT 5";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        // Should produce: Limit -> Sort -> Projection -> TableScan
-        match plan {
-            LogicalPlan::Limit(limit) => {
-                assert_eq!(limit.fetch, Some(5));
-                assert_eq!(limit.skip, None);
-
-                match &*limit.input {
-                    LogicalPlan::Sort(sort) => {
-                        assert_eq!(sort.exprs.len(), 1);
-                        assert!(!sort.exprs[0].asc); // DESC
-
-                        match &*sort.input {
-                            LogicalPlan::Projection(_) => {}
-                            _ => panic!("Expected Projection under Sort"),
-                        }
-                    }
-                    _ => panic!("Expected Sort under Limit"),
-                }
-            }
-            _ => panic!("Expected Limit at top level"),
-        }
-    }
-
-    #[test]
-    fn test_distinct() {
-        let schema = create_test_schema();
-        let sql = "SELECT DISTINCT name FROM users";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Distinct(distinct) => match &*distinct.input {
-                LogicalPlan::Projection(_) => {}
-                _ => panic!("Expected Projection"),
+    fn literal_limit(expr: &hir::Expr, context: &str) -> Result<usize> {
+        let value = match expr {
+            hir::Expr::Literal(ast::Literal::Numeric(value)) => value.parse::<i64>().ok(),
+            hir::Expr::Unary {
+                operator: ast::UnaryOperator::Positive,
+                expr,
+            } => match expr.as_ref() {
+                hir::Expr::Literal(ast::Literal::Numeric(value)) => value.parse::<i64>().ok(),
+                _ => None,
             },
-            _ => panic!("Expected Distinct"),
+            _ => None,
         }
-    }
-
-    #[test]
-    fn test_union() {
-        let schema = create_test_schema();
-        let sql = "SELECT id FROM users UNION SELECT user_id FROM orders";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Union(union) => {
-                assert!(!union.all);
-                assert_eq!(union.inputs.len(), 2);
-            }
-            _ => panic!("Expected Union"),
-        }
-    }
-
-    #[test]
-    fn test_union_all() {
-        let schema = create_test_schema();
-        let sql = "SELECT id FROM users UNION ALL SELECT user_id FROM orders";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Union(union) => {
-                assert!(union.all);
-                assert_eq!(union.inputs.len(), 2);
-            }
-            _ => panic!("Expected Union"),
-        }
-    }
-
-    #[test]
-    fn test_union_with_order_by() {
-        let schema = create_test_schema();
-        let sql = "SELECT id, name FROM users UNION SELECT user_id, name FROM orders ORDER BY id";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Sort(sort) => {
-                assert_eq!(sort.exprs.len(), 1);
-                assert!(sort.exprs[0].asc); // Default ASC
-
-                match &*sort.input {
-                    LogicalPlan::Union(union) => {
-                        assert!(!union.all); // UNION (not UNION ALL)
-                        assert_eq!(union.inputs.len(), 2);
-                    }
-                    _ => panic!("Expected Union under Sort"),
-                }
-            }
-            _ => panic!("Expected Sort at top level"),
-        }
-    }
-
-    #[test]
-    fn test_with_cte() {
-        let schema = create_test_schema();
-        let sql = "WITH active_users AS (SELECT * FROM users WHERE age > 18) SELECT name FROM active_users";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::WithCTE(with) => {
-                assert_eq!(with.ctes.len(), 1);
-                assert!(with.ctes.contains_key("active_users"));
-
-                let cte = &with.ctes["active_users"];
-                match &**cte {
-                    LogicalPlan::Projection(proj) => match &*proj.input {
-                        LogicalPlan::Filter(_) => {}
-                        _ => panic!("Expected Filter in CTE"),
-                    },
-                    _ => panic!("Expected Projection in CTE"),
-                }
-
-                match &*with.body {
-                    LogicalPlan::Projection(proj) => match &*proj.input {
-                        LogicalPlan::CTERef(cte_ref) => {
-                            assert_eq!(cte_ref.name, "active_users");
-                        }
-                        _ => panic!("Expected CTERef"),
-                    },
-                    _ => panic!("Expected Projection in body"),
-                }
-            }
-            _ => panic!("Expected WithCTE"),
-        }
-    }
-
-    #[test]
-    fn test_case_expression() {
-        let schema = create_test_schema();
-        let sql = "SELECT CASE WHEN age < 18 THEN 'minor' WHEN age < 65 THEN 'adult' ELSE 'senior' END FROM users";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                assert_eq!(proj.exprs.len(), 1);
-                assert!(matches!(proj.exprs[0], LogicalExpr::Case { .. }));
-            }
-            _ => panic!("Expected Projection"),
-        }
-    }
-
-    #[test]
-    fn test_in_list() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM users WHERE id IN (1, 2, 3)";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => match &*proj.input {
-                LogicalPlan::Filter(filter) => match &filter.predicate {
-                    LogicalExpr::InList { list, negated, .. } => {
-                        assert!(!negated);
-                        assert_eq!(list.len(), 3);
-                    }
-                    _ => panic!("Expected InList"),
-                },
-                _ => panic!("Expected Filter"),
-            },
-            _ => panic!("Expected Projection"),
-        }
-    }
-
-    #[test]
-    fn test_in_subquery() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders)";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => match &*proj.input {
-                LogicalPlan::Filter(filter) => {
-                    assert!(matches!(filter.predicate, LogicalExpr::InSubquery { .. }));
-                }
-                _ => panic!("Expected Filter"),
-            },
-            _ => panic!("Expected Projection"),
-        }
-    }
-
-    #[test]
-    fn test_exists_subquery() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => match &*proj.input {
-                LogicalPlan::Filter(filter) => {
-                    assert!(matches!(filter.predicate, LogicalExpr::Exists { .. }));
-                }
-                _ => panic!("Expected Filter"),
-            },
-            _ => panic!("Expected Projection"),
-        }
-    }
-
-    #[test]
-    fn test_between() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM users WHERE age BETWEEN 18 AND 65";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => match &*proj.input {
-                LogicalPlan::Filter(filter) => match &filter.predicate {
-                    LogicalExpr::Between { negated, .. } => {
-                        assert!(!negated);
-                    }
-                    _ => panic!("Expected Between"),
-                },
-                _ => panic!("Expected Filter"),
-            },
-            _ => panic!("Expected Projection"),
-        }
-    }
-
-    #[test]
-    fn test_like() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM users WHERE name LIKE 'John%'";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => match &*proj.input {
-                LogicalPlan::Filter(filter) => match &filter.predicate {
-                    LogicalExpr::Like {
-                        negated, escape, ..
-                    } => {
-                        assert!(!negated);
-                        assert!(escape.is_none());
-                    }
-                    _ => panic!("Expected Like"),
-                },
-                _ => panic!("Expected Filter"),
-            },
-            _ => panic!("Expected Projection"),
-        }
-    }
-
-    #[test]
-    fn test_is_null() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM users WHERE email IS NULL";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => match &*proj.input {
-                LogicalPlan::Filter(filter) => match &filter.predicate {
-                    LogicalExpr::IsNull { negated, .. } => {
-                        assert!(!negated);
-                    }
-                    _ => panic!("Expected IsNull, got: {:?}", filter.predicate),
-                },
-                _ => panic!("Expected Filter"),
-            },
-            _ => panic!("Expected Projection"),
-        }
-    }
-
-    #[test]
-    fn test_is_not_null() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM users WHERE email IS NOT NULL";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => match &*proj.input {
-                LogicalPlan::Filter(filter) => match &filter.predicate {
-                    LogicalExpr::IsNull { negated, .. } => {
-                        assert!(negated);
-                    }
-                    _ => panic!("Expected IsNull"),
-                },
-                _ => panic!("Expected Filter"),
-            },
-            _ => panic!("Expected Projection"),
-        }
-    }
-
-    #[test]
-    fn test_values_clause() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM (VALUES (1, 'a'), (2, 'b'))";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => match &*proj.input {
-                LogicalPlan::Values(values) => {
-                    assert_eq!(values.rows.len(), 2);
-                    assert_eq!(values.rows[0].len(), 2);
-                }
-                _ => panic!("Expected Values"),
-            },
-            _ => panic!("Expected Projection"),
-        }
-    }
-
-    #[test]
-    fn test_complex_expression_with_aggregation() {
-        // Test: SELECT sum(id + 2) * 2 FROM orders GROUP BY user_id
-        let schema = create_test_schema();
-
-        // Test the complex case: sum((id + 2)) * 2 with parentheses
-        let sql = "SELECT sum((id + 2)) * 2 FROM orders GROUP BY user_id";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                assert_eq!(proj.exprs.len(), 1);
-                match &proj.exprs[0] {
-                    LogicalExpr::BinaryExpr { left, op, right } => {
-                        assert_eq!(*op, BinaryOperator::Multiply);
-                        assert!(matches!(**left, LogicalExpr::Column(_)));
-                        assert!(matches!(**right, LogicalExpr::Literal(_)));
-                    }
-                    _ => panic!("Expected BinaryExpr in projection"),
-                }
-
-                match &*proj.input {
-                    LogicalPlan::Aggregate(agg) => {
-                        assert_eq!(agg.group_expr.len(), 1);
-
-                        assert_eq!(agg.aggr_expr.len(), 1);
-                        match &agg.aggr_expr[0] {
-                            LogicalExpr::AggregateFunction { fun, args, .. } => {
-                                assert_eq!(*fun, AggregateFunction::Sum);
-                                assert_eq!(args.len(), 1);
-                                match &args[0] {
-                                    LogicalExpr::Column(col) => {
-                                        assert!(col.name.starts_with("__agg_arg_proj_"));
-                                    }
-                                    _ => panic!(
-                                        "Expected Column reference to projected expression in aggregate args, got {:?}",
-                                        args[0]
-                                    ),
-                                }
-                            }
-                            _ => panic!("Expected AggregateFunction"),
-                        }
-
-                        match &*agg.input {
-                            LogicalPlan::Projection(inner_proj) => {
-                                assert!(inner_proj.exprs.len() >= 2);
-                                let has_binary_add = inner_proj.exprs.iter().any(|e| {
-                                    matches!(
-                                        e,
-                                        LogicalExpr::BinaryExpr {
-                                            op: BinaryOperator::Add,
-                                            ..
-                                        }
-                                    )
-                                });
-                                assert!(
-                                    has_binary_add,
-                                    "Should have id + 2 expression in inner projection"
-                                );
-                            }
-                            _ => panic!("Expected Projection as input to Aggregate"),
-                        }
-                    }
-                    _ => panic!("Expected Aggregate under Projection"),
-                }
-            }
-            _ => panic!("Expected Projection at top level"),
-        }
-    }
-
-    #[test]
-    fn test_function_on_aggregate_result() {
-        let schema = create_test_schema();
-
-        let sql = "SELECT abs(sum(id)) FROM orders GROUP BY user_id";
-        let plan = parse_and_build(sql, &schema).unwrap();
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                assert_eq!(proj.exprs.len(), 1);
-                match &proj.exprs[0] {
-                    LogicalExpr::ScalarFunction { fun, args } => {
-                        assert_eq!(fun, "abs");
-                        assert_eq!(args.len(), 1);
-                        assert!(matches!(args[0], LogicalExpr::Column(_)));
-                    }
-                    _ => panic!("Expected ScalarFunction in projection"),
-                }
-            }
-            _ => panic!("Expected Projection"),
-        }
-    }
-
-    #[test]
-    fn test_multiple_aggregates_with_arithmetic() {
-        let schema = create_test_schema();
-
-        let sql = "SELECT sum(id) * 2 + count(*) FROM orders GROUP BY user_id";
-        let plan = parse_and_build(sql, &schema).unwrap();
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                assert_eq!(proj.exprs.len(), 1);
-                match &proj.exprs[0] {
-                    LogicalExpr::BinaryExpr { op, .. } => {
-                        assert_eq!(*op, BinaryOperator::Add);
-                    }
-                    _ => panic!("Expected BinaryExpr"),
-                }
-
-                match &*proj.input {
-                    LogicalPlan::Aggregate(agg) => {
-                        assert_eq!(agg.aggr_expr.len(), 2);
-                    }
-                    _ => panic!("Expected Aggregate"),
-                }
-            }
-            _ => panic!("Expected Projection"),
-        }
-    }
-
-    #[test]
-    fn test_projection_aggregation_projection() {
-        let schema = create_test_schema();
-
-        // This tests: projection -> aggregation -> projection
-        // The inner projection computes (id + 2), then we aggregate sum(), then apply abs()
-        let sql = "SELECT abs(sum(id + 2)) FROM orders GROUP BY user_id";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        // Should produce: Projection(abs) -> Aggregate(sum) -> Projection(id + 2) -> TableScan
-        match plan {
-            LogicalPlan::Projection(outer_proj) => {
-                assert_eq!(outer_proj.exprs.len(), 1);
-
-                // Outer projection should apply abs() function
-                match &outer_proj.exprs[0] {
-                    LogicalExpr::ScalarFunction { fun, args } => {
-                        assert_eq!(fun, "abs");
-                        assert_eq!(args.len(), 1);
-                        assert!(matches!(args[0], LogicalExpr::Column(_)));
-                    }
-                    _ => panic!("Expected abs() function in outer projection"),
-                }
-
-                // Next should be the Aggregate
-                match &*outer_proj.input {
-                    LogicalPlan::Aggregate(agg) => {
-                        assert_eq!(agg.group_expr.len(), 1);
-                        assert_eq!(agg.aggr_expr.len(), 1);
-
-                        // The aggregate should be summing a column reference
-                        match &agg.aggr_expr[0] {
-                            LogicalExpr::AggregateFunction { fun, args, .. } => {
-                                assert_eq!(*fun, AggregateFunction::Sum);
-                                assert_eq!(args.len(), 1);
-
-                                // Should reference the projected column
-                                match &args[0] {
-                                    LogicalExpr::Column(col) => {
-                                        assert!(col.name.starts_with("__agg_arg_proj_"));
-                                    }
-                                    _ => panic!("Expected column reference in aggregate"),
-                                }
-                            }
-                            _ => panic!("Expected AggregateFunction"),
-                        }
-
-                        // Input to aggregate should be a projection computing id + 2
-                        match &*agg.input {
-                            LogicalPlan::Projection(inner_proj) => {
-                                // Should have at least the group column and the computed expression
-                                assert!(inner_proj.exprs.len() >= 2);
-
-                                // Check for the id + 2 expression
-                                let has_add_expr = inner_proj.exprs.iter().any(|e| {
-                                    matches!(
-                                        e,
-                                        LogicalExpr::BinaryExpr {
-                                            op: BinaryOperator::Add,
-                                            ..
-                                        }
-                                    )
-                                });
-                                assert!(
-                                    has_add_expr,
-                                    "Should have id + 2 expression in inner projection"
-                                );
-                            }
-                            _ => panic!("Expected inner Projection under Aggregate"),
-                        }
-                    }
-                    _ => panic!("Expected Aggregate under outer Projection"),
-                }
-            }
-            _ => panic!("Expected Projection at top level"),
-        }
-    }
-
-    #[test]
-    fn test_group_by_validation_allow_grouped_column() {
-        let schema = create_test_schema();
-
-        // Test that grouped columns are allowed
-        let sql = "SELECT user_id, COUNT(*) FROM orders GROUP BY user_id";
-        let result = parse_and_build(sql, &schema);
-
-        assert!(result.is_ok(), "Should allow grouped column in SELECT");
-    }
-
-    #[test]
-    fn test_group_by_validation_allow_constants() {
-        let schema = create_test_schema();
-
-        // Test that simple constants are allowed even when not grouped
-        let sql = "SELECT user_id, 42, COUNT(*) FROM orders GROUP BY user_id";
-        let result = parse_and_build(sql, &schema);
-
-        assert!(
-            result.is_ok(),
-            "Should allow simple constants in SELECT with GROUP BY"
-        );
-
-        let sql_complex = "SELECT user_id, (100 + 50) * 2, COUNT(*) FROM orders GROUP BY user_id";
-        let result_complex = parse_and_build(sql_complex, &schema);
-
-        assert!(
-            result_complex.is_ok(),
-            "Should allow complex constant expressions in SELECT with GROUP BY"
-        );
-    }
-
-    #[test]
-    fn test_parenthesized_aggregate_expressions() {
-        let schema = create_test_schema();
-
-        let sql = "SELECT 25, (MAX(id) / 3), 39 FROM orders";
-        let result = parse_and_build(sql, &schema);
-
-        assert!(
-            result.is_ok(),
-            "Should handle parenthesized aggregate expressions"
-        );
-
-        let plan = result.unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                assert_eq!(proj.exprs.len(), 3);
-
-                assert!(matches!(
-                    proj.exprs[0],
-                    LogicalExpr::Literal(Value::Numeric(Numeric::Integer(25)))
-                ));
-
-                match &proj.exprs[1] {
-                    LogicalExpr::BinaryExpr { left, op, right } => {
-                        assert_eq!(*op, BinaryOperator::Divide);
-                        assert!(matches!(&**left, LogicalExpr::Column(_)));
-                        assert!(matches!(
-                            &**right,
-                            LogicalExpr::Literal(Value::Numeric(Numeric::Integer(3)))
-                        ));
-                    }
-                    _ => panic!("Expected BinaryExpr for (MAX(id) / 3)"),
-                }
-
-                assert!(matches!(
-                    proj.exprs[2],
-                    LogicalExpr::Literal(Value::Numeric(Numeric::Integer(39)))
-                ));
-
-                match &*proj.input {
-                    LogicalPlan::Aggregate(agg) => {
-                        assert_eq!(agg.aggr_expr.len(), 1);
-                        assert!(matches!(
-                            agg.aggr_expr[0],
-                            LogicalExpr::AggregateFunction {
-                                fun: AggFunc::Max,
-                                ..
-                            }
-                        ));
-                    }
-                    _ => panic!("Expected Aggregate node under Projection"),
-                }
-            }
-            _ => panic!("Expected Projection at top level"),
-        }
-    }
-
-    #[test]
-    fn test_duplicate_aggregate_reuse() {
-        let schema = create_test_schema();
-
-        let sql = "SELECT (COUNT(*) - 225), 30, COUNT(*) FROM orders";
-        let result = parse_and_build(sql, &schema);
-
-        assert!(result.is_ok(), "Should handle duplicate aggregates");
-
-        let plan = result.unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                assert_eq!(proj.exprs.len(), 3);
-
-                match &proj.exprs[0] {
-                    LogicalExpr::BinaryExpr { left, op, right } => {
-                        assert_eq!(*op, BinaryOperator::Subtract);
-                        match &**left {
-                            LogicalExpr::Column(col) => {
-                                assert!(col.name.starts_with("__agg_") || col.name == "COUNT(*)");
-                            }
-                            _ => panic!("Expected Column reference for COUNT(*)"),
-                        }
-                        assert!(matches!(
-                            &**right,
-                            LogicalExpr::Literal(Value::Numeric(Numeric::Integer(225)))
-                        ));
-                    }
-                    _ => panic!("Expected BinaryExpr for (COUNT(*) - 225)"),
-                }
-
-                assert!(matches!(
-                    proj.exprs[1],
-                    LogicalExpr::Literal(Value::Numeric(Numeric::Integer(30)))
-                ));
-
-                match &proj.exprs[2] {
-                    LogicalExpr::Column(col) => {
-                        assert!(col.name.starts_with("__agg_") || col.name == "COUNT(*)");
-                    }
-                    _ => panic!("Expected Column reference for COUNT(*)"),
-                }
-
-                match &*proj.input {
-                    LogicalPlan::Aggregate(agg) => {
-                        assert_eq!(
-                            agg.aggr_expr.len(),
-                            1,
-                            "Should have only one COUNT(*) aggregate"
-                        );
-                        assert!(matches!(
-                            agg.aggr_expr[0],
-                            LogicalExpr::AggregateFunction {
-                                fun: AggFunc::Count,
-                                ..
-                            }
-                        ));
-                    }
-                    _ => panic!("Expected Aggregate node under Projection"),
-                }
-            }
-            _ => panic!("Expected Projection at top level"),
-        }
-    }
-
-    #[test]
-    fn test_aggregate_without_group_by_allow_constants() {
-        let schema = create_test_schema();
-
-        // Test that constants are allowed with aggregates even without GROUP BY
-        let sql = "SELECT 42, COUNT(*), MAX(amount) FROM orders";
-        let result = parse_and_build(sql, &schema);
-
-        assert!(
-            result.is_ok(),
-            "Should allow simple constants with aggregates without GROUP BY"
-        );
-
-        // Test complex constant expressions
-        let sql_complex = "SELECT (9 / 6) % 5, COUNT(*), MAX(amount) FROM orders";
-        let result_complex = parse_and_build(sql_complex, &schema);
-
-        assert!(
-            result_complex.is_ok(),
-            "Should allow complex constant expressions with aggregates without GROUP BY"
-        );
-    }
-
-    #[test]
-    fn test_aggregate_without_group_by_creates_aggregate_node() {
-        let schema = create_test_schema();
-
-        // Test that aggregate without GROUP BY creates proper Aggregate node
-        let sql = "SELECT MAX(amount) FROM orders";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        // Should be: Aggregate -> TableScan (no projection needed for simple aggregate)
-        match plan {
-            LogicalPlan::Aggregate(agg) => {
-                assert_eq!(agg.group_expr.len(), 0, "Should have no group expressions");
-                assert_eq!(
-                    agg.aggr_expr.len(),
-                    1,
-                    "Should have one aggregate expression"
-                );
-                assert_eq!(
-                    agg.schema.column_count(),
-                    1,
-                    "Schema should have one column"
-                );
-            }
-            _ => panic!("Expected Aggregate at top level (no projection)"),
-        }
-    }
-
-    #[test]
-    fn test_scalar_vs_aggregate_function_classification() {
-        let schema = create_test_schema();
-
-        // Test MIN/MAX with 1 argument - should be aggregate
-        let sql = "SELECT MIN(amount) FROM orders";
-        let plan = parse_and_build(sql, &schema).unwrap();
-        match plan {
-            LogicalPlan::Aggregate(agg) => {
-                assert_eq!(agg.aggr_expr.len(), 1, "MIN(x) should be an aggregate");
-                match &agg.aggr_expr[0] {
-                    LogicalExpr::AggregateFunction { fun, args, .. } => {
-                        assert!(matches!(fun, AggFunc::Min));
-                        assert_eq!(args.len(), 1);
-                    }
-                    _ => panic!("Expected AggregateFunction"),
-                }
-            }
-            _ => panic!("Expected Aggregate node for MIN(x)"),
-        }
-
-        // Test MIN/MAX with 2 arguments - should be scalar in projection
-        let sql = "SELECT MIN(amount, user_id) FROM orders";
-        let plan = parse_and_build(sql, &schema).unwrap();
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                assert_eq!(proj.exprs.len(), 1, "Should have one projection expression");
-                match &proj.exprs[0] {
-                    LogicalExpr::ScalarFunction { fun, args } => {
-                        assert_eq!(
-                            fun.to_lowercase(),
-                            "min",
-                            "MIN(x,y) should be a scalar function"
-                        );
-                        assert_eq!(args.len(), 2);
-                    }
-                    _ => panic!("Expected ScalarFunction for MIN(x,y)"),
-                }
-            }
-            _ => panic!("Expected Projection node for scalar MIN(x,y)"),
-        }
-
-        // Test MAX with 3 arguments - should be scalar
-        let sql = "SELECT MAX(amount, user_id, id) FROM orders";
-        let plan = parse_and_build(sql, &schema).unwrap();
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                assert_eq!(proj.exprs.len(), 1);
-                match &proj.exprs[0] {
-                    LogicalExpr::ScalarFunction { fun, args } => {
-                        assert_eq!(
-                            fun.to_lowercase(),
-                            "max",
-                            "MAX(x,y,z) should be a scalar function"
-                        );
-                        assert_eq!(args.len(), 3);
-                    }
-                    _ => panic!("Expected ScalarFunction for MAX(x,y,z)"),
-                }
-            }
-            _ => panic!("Expected Projection node for scalar MAX(x,y,z)"),
-        }
-
-        // Test that MIN with 0 args is treated as scalar (will fail later in execution)
-        let sql = "SELECT MIN() FROM orders";
-        let plan = parse_and_build(sql, &schema).unwrap();
-        match plan {
-            LogicalPlan::Projection(proj) => match &proj.exprs[0] {
-                LogicalExpr::ScalarFunction { fun, args } => {
-                    assert_eq!(fun.to_lowercase(), "min");
-                    assert_eq!(args.len(), 0, "MIN() should be scalar with 0 args");
-                }
-                _ => panic!("Expected ScalarFunction for MIN()"),
-            },
-            _ => panic!("Expected Projection for MIN()"),
-        }
-
-        // Test other functions that are always aggregate (COUNT, SUM, AVG)
-        let sql = "SELECT COUNT(*), SUM(amount), AVG(amount) FROM orders";
-        let plan = parse_and_build(sql, &schema).unwrap();
-        match plan {
-            LogicalPlan::Aggregate(agg) => {
-                assert_eq!(agg.aggr_expr.len(), 3, "Should have 3 aggregate functions");
-                for expr in &agg.aggr_expr {
-                    assert!(matches!(expr, LogicalExpr::AggregateFunction { .. }));
-                }
-            }
-            _ => panic!("Expected Aggregate node"),
-        }
-
-        // Test scalar functions that are never aggregates (ABS, ROUND, etc.)
-        let sql = "SELECT ABS(amount), ROUND(amount), LENGTH(product) FROM orders";
-        let plan = parse_and_build(sql, &schema).unwrap();
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                assert_eq!(proj.exprs.len(), 3, "Should have 3 scalar functions");
-                for expr in &proj.exprs {
-                    match expr {
-                        LogicalExpr::ScalarFunction { .. } => {}
-                        _ => panic!("Expected all ScalarFunctions"),
-                    }
-                }
-            }
-            _ => panic!("Expected Projection node for scalar functions"),
-        }
-    }
-
-    #[test]
-    fn test_mixed_aggregate_and_group_columns() {
-        let schema = create_test_schema();
-
-        // When selecting both aggregate and grouping columns
-        let sql = "SELECT user_id, sum(id) FROM orders GROUP BY user_id";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        // No projection needed - aggregate outputs exactly what we select
-        match plan {
-            LogicalPlan::Aggregate(agg) => {
-                assert_eq!(agg.group_expr.len(), 1);
-                assert_eq!(agg.aggr_expr.len(), 1);
-                assert_eq!(agg.schema.column_count(), 2);
-            }
-            _ => panic!("Expected Aggregate (no projection)"),
-        }
-    }
-
-    #[test]
-    fn test_scalar_function_wrapping_aggregate_no_group_by() {
-        // Test: SELECT HEX(SUM(age + 2)) FROM users
-        // Expected structure:
-        // Projection { exprs: [ScalarFunction(HEX, [Column])] }
-        //   -> Aggregate { aggr_expr: [Sum(BinaryExpr(age + 2))], group_expr: [] }
-        //     -> Projection { exprs: [BinaryExpr(age + 2)] }
-        //       -> TableScan("users")
-
-        let schema = create_test_schema();
-        let sql = "SELECT HEX(SUM(age + 2)) FROM users";
-        let mut parser = Parser::new(sql.as_bytes());
-        let stmt = parser.next().unwrap().unwrap();
-
-        let plan = match stmt {
-            ast::Cmd::Stmt(stmt) => {
-                let mut builder = LogicalPlanBuilder::new(&schema);
-                builder.build_statement(&stmt).unwrap()
-            }
-            _ => panic!("Expected SQL statement"),
-        };
-
-        match &plan {
-            LogicalPlan::Projection(proj) => {
-                assert_eq!(proj.exprs.len(), 1, "Should have one expression");
-
-                match &proj.exprs[0] {
-                    LogicalExpr::ScalarFunction { fun, args } => {
-                        assert_eq!(fun, "HEX", "Outer function should be HEX");
-                        assert_eq!(args.len(), 1, "HEX should have one argument");
-
-                        match &args[0] {
-                            LogicalExpr::Column(_) => {}
-                            LogicalExpr::AggregateFunction { .. } => {
-                                panic!(
-                                    "Aggregate function should not be embedded in projection! It should be in a separate Aggregate operator"
-                                );
-                            }
-                            _ => panic!(
-                                "Expected column reference as argument to HEX, got: {:?}",
-                                args[0]
-                            ),
-                        }
-                    }
-                    _ => panic!("Expected ScalarFunction (HEX), got: {:?}", proj.exprs[0]),
-                }
-
-                match &*proj.input {
-                    LogicalPlan::Aggregate(agg) => {
-                        assert_eq!(agg.group_expr.len(), 0, "Should have no GROUP BY");
-                        assert_eq!(
-                            agg.aggr_expr.len(),
-                            1,
-                            "Should have one aggregate expression"
-                        );
-
-                        match &agg.aggr_expr[0] {
-                            LogicalExpr::AggregateFunction {
-                                fun,
-                                args,
-                                distinct,
-                            } => {
-                                assert_eq!(*fun, crate::function::AggFunc::Sum, "Should be SUM");
-                                assert!(!distinct, "Should not be DISTINCT");
-                                assert_eq!(args.len(), 1, "SUM should have one argument");
-
-                                match &args[0] {
-                                    LogicalExpr::Column(col) => {
-                                        // When aggregate arguments are complex, they get pre-projected
-                                        assert!(
-                                            col.name.starts_with("__agg_arg_proj_"),
-                                            "Should reference pre-projected column, got: {}",
-                                            col.name
-                                        );
-                                    }
-                                    LogicalExpr::BinaryExpr { left, op, right } => {
-                                        // Simple case without pre-projection (shouldn't happen with current implementation)
-                                        assert_eq!(*op, ast::Operator::Add, "Should be addition");
-
-                                        match (&**left, &**right) {
-                                            (
-                                                LogicalExpr::Column(col),
-                                                LogicalExpr::Literal(val),
-                                            ) => {
-                                                assert_eq!(
-                                                    col.name, "age",
-                                                    "Should reference age column"
-                                                );
-                                                assert_eq!(
-                                                    *val,
-                                                    Value::from_i64(2),
-                                                    "Should add 2"
-                                                );
-                                            }
-                                            _ => panic!("Expected age + 2"),
-                                        }
-                                    }
-                                    _ => panic!(
-                                        "Expected Column reference or BinaryExpr for aggregate argument, got: {:?}",
-                                        args[0]
-                                    ),
-                                }
-                            }
-                            _ => panic!("Expected AggregateFunction"),
-                        }
-
-                        match &*agg.input {
-                            LogicalPlan::TableScan(scan) => {
-                                assert_eq!(scan.table_name, "users");
-                            }
-                            LogicalPlan::Projection(proj) => match &*proj.input {
-                                LogicalPlan::TableScan(scan) => {
-                                    assert_eq!(scan.table_name, "users");
-                                }
-                                _ => panic!("Expected TableScan under projection"),
-                            },
-                            _ => panic!("Expected TableScan or Projection under Aggregate"),
-                        }
-                    }
-                    _ => panic!(
-                        "Expected Aggregate operator under Projection, got: {:?}",
-                        proj.input
-                    ),
-                }
-            }
-            _ => panic!("Expected Projection as top-level operator, got: {plan:?}"),
-        }
-    }
-
-    // ===== JOIN TESTS =====
-
-    #[test]
-    fn test_inner_join() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM users u INNER JOIN orders o ON u.id = o.user_id";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                match &*proj.input {
-                    LogicalPlan::Join(join) => {
-                        assert_eq!(join.join_type, JoinType::Inner);
-                        assert!(!join.on.is_empty(), "Should have join conditions");
-
-                        // Check left input is users
-                        match &*join.left {
-                            LogicalPlan::TableScan(scan) => {
-                                assert_eq!(scan.table_name, "users");
-                            }
-                            _ => panic!("Expected TableScan for left input"),
-                        }
-
-                        // Check right input is orders
-                        match &*join.right {
-                            LogicalPlan::TableScan(scan) => {
-                                assert_eq!(scan.table_name, "orders");
-                            }
-                            _ => panic!("Expected TableScan for right input"),
-                        }
-                    }
-                    _ => panic!("Expected Join under Projection"),
-                }
-            }
-            _ => panic!("Expected Projection at top level"),
-        }
-    }
-
-    #[test]
-    fn test_left_join() {
-        let schema = create_test_schema();
-        let sql = "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                assert_eq!(proj.exprs.len(), 2); // name and amount
-                match &*proj.input {
-                    LogicalPlan::Join(join) => {
-                        assert_eq!(join.join_type, JoinType::Left);
-                        assert!(!join.on.is_empty(), "Should have join conditions");
-                    }
-                    _ => panic!("Expected Join under Projection"),
-                }
-            }
-            _ => panic!("Expected Projection at top level"),
-        }
-    }
-
-    #[test]
-    fn test_right_join() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM orders o RIGHT JOIN users u ON o.user_id = u.id";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => match &*proj.input {
-                LogicalPlan::Join(join) => {
-                    assert_eq!(join.join_type, JoinType::Right);
-                    assert!(!join.on.is_empty(), "Should have join conditions");
-                }
-                _ => panic!("Expected Join under Projection"),
-            },
-            _ => panic!("Expected Projection at top level"),
-        }
-    }
-
-    #[test]
-    fn test_full_outer_join() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM users u FULL OUTER JOIN orders o ON u.id = o.user_id";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => match &*proj.input {
-                LogicalPlan::Join(join) => {
-                    assert_eq!(join.join_type, JoinType::Full);
-                    assert!(!join.on.is_empty(), "Should have join conditions");
-                }
-                _ => panic!("Expected Join under Projection"),
-            },
-            _ => panic!("Expected Projection at top level"),
-        }
-    }
-
-    #[test]
-    fn test_cross_join() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM users CROSS JOIN orders";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => match &*proj.input {
-                LogicalPlan::Join(join) => {
-                    assert_eq!(join.join_type, JoinType::Cross);
-                    assert!(join.on.is_empty(), "Cross join should have no conditions");
-                    assert!(join.filter.is_none(), "Cross join should have no filter");
-                }
-                _ => panic!("Expected Join under Projection"),
-            },
-            _ => panic!("Expected Projection at top level"),
-        }
-    }
-
-    #[test]
-    fn test_join_with_multiple_conditions() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.user_id AND u.age > 18";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                match &*proj.input {
-                    LogicalPlan::Join(join) => {
-                        assert_eq!(join.join_type, JoinType::Inner);
-                        // Should have at least one equijoin condition
-                        assert!(!join.on.is_empty(), "Should have join conditions");
-                        // Additional conditions may be in filter
-                        // The exact distribution depends on our implementation
-                    }
-                    _ => panic!("Expected Join under Projection"),
-                }
-            }
-            _ => panic!("Expected Projection at top level"),
-        }
-    }
-
-    #[test]
-    fn test_join_using_clause() {
-        let schema = create_test_schema();
-        // Note: Both tables should have an 'id' column for this to work
-        let sql = "SELECT * FROM users JOIN orders USING (id)";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => match &*proj.input {
-                LogicalPlan::Join(join) => {
-                    assert_eq!(join.join_type, JoinType::Inner);
-                    assert!(
-                        !join.on.is_empty(),
-                        "USING clause should create join conditions"
-                    );
-                }
-                _ => panic!("Expected Join under Projection"),
-            },
-            _ => panic!("Expected Projection at top level"),
-        }
-    }
-
-    #[test]
-    fn test_natural_join() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM users NATURAL JOIN orders";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                match &*proj.input {
-                    LogicalPlan::Join(join) => {
-                        // Natural join finds common columns (id in this case)
-                        // If no common columns, it becomes a cross join
-                        assert!(
-                            !join.on.is_empty() || join.join_type == JoinType::Cross,
-                            "Natural join should either find common columns or become cross join"
-                        );
-                    }
-                    _ => panic!("Expected Join under Projection"),
-                }
-            }
-            _ => panic!("Expected Projection at top level"),
-        }
-    }
-
-    #[test]
-    fn test_three_way_join() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM users u
-                   JOIN orders o ON u.id = o.user_id
-                   JOIN products p ON o.product_id = p.id";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                match &*proj.input {
-                    LogicalPlan::Join(join2) => {
-                        // Second join (with products)
-                        assert_eq!(join2.join_type, JoinType::Inner);
-                        match &*join2.left {
-                            LogicalPlan::Join(join1) => {
-                                // First join (users with orders)
-                                assert_eq!(join1.join_type, JoinType::Inner);
-                            }
-                            _ => panic!("Expected nested Join for three-way join"),
-                        }
-                    }
-                    _ => panic!("Expected Join under Projection"),
-                }
-            }
-            _ => panic!("Expected Projection at top level"),
-        }
-    }
-
-    #[test]
-    fn test_mixed_join_types() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM users u
-                   LEFT JOIN orders o ON u.id = o.user_id
-                   INNER JOIN products p ON o.product_id = p.id";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                match &*proj.input {
-                    LogicalPlan::Join(join2) => {
-                        // Second join should be INNER
-                        assert_eq!(join2.join_type, JoinType::Inner);
-                        match &*join2.left {
-                            LogicalPlan::Join(join1) => {
-                                // First join should be LEFT
-                                assert_eq!(join1.join_type, JoinType::Left);
-                            }
-                            _ => panic!("Expected nested Join"),
-                        }
-                    }
-                    _ => panic!("Expected Join under Projection"),
-                }
-            }
-            _ => panic!("Expected Projection at top level"),
-        }
-    }
-
-    #[test]
-    fn test_join_with_filter() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > 100";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                match &*proj.input {
-                    LogicalPlan::Filter(filter) => {
-                        // WHERE clause creates a Filter above the Join
-                        match &*filter.input {
-                            LogicalPlan::Join(join) => {
-                                assert_eq!(join.join_type, JoinType::Inner);
-                            }
-                            _ => panic!("Expected Join under Filter"),
-                        }
-                    }
-                    _ => panic!("Expected Filter under Projection"),
-                }
-            }
-            _ => panic!("Expected Projection at top level"),
-        }
-    }
-
-    #[test]
-    fn test_join_with_projection() {
-        let schema = create_test_schema();
-        let sql = "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(proj) => {
-                assert_eq!(proj.exprs.len(), 2); // u.name and o.amount
-                match &*proj.input {
-                    LogicalPlan::Join(join) => {
-                        assert_eq!(join.join_type, JoinType::Inner);
-                    }
-                    _ => panic!("Expected Join under Projection"),
-                }
-            }
-            _ => panic!("Expected Projection at top level"),
-        }
-    }
-
-    #[test]
-    fn test_join_with_aggregation() {
-        let schema = create_test_schema();
-        let sql = "SELECT u.name, SUM(o.amount)
-                   FROM users u JOIN orders o ON u.id = o.user_id
-                   GROUP BY u.name";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Aggregate(agg) => {
-                assert_eq!(agg.group_expr.len(), 1); // GROUP BY u.name
-                assert_eq!(agg.aggr_expr.len(), 1); // SUM(o.amount)
-                match &*agg.input {
-                    LogicalPlan::Join(join) => {
-                        assert_eq!(join.join_type, JoinType::Inner);
-                    }
-                    _ => panic!("Expected Join under Aggregate"),
-                }
-            }
-            _ => panic!("Expected Aggregate"),
-        }
-    }
-
-    #[test]
-    fn test_join_with_order_by() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.amount DESC";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Sort(sort) => {
-                assert_eq!(sort.exprs.len(), 1);
-                assert!(!sort.exprs[0].asc); // DESC
-                match &*sort.input {
-                    LogicalPlan::Projection(proj) => match &*proj.input {
-                        LogicalPlan::Join(join) => {
-                            assert_eq!(join.join_type, JoinType::Inner);
-                        }
-                        _ => panic!("Expected Join under Projection"),
-                    },
-                    _ => panic!("Expected Projection under Sort"),
-                }
-            }
-            _ => panic!("Expected Sort at top level"),
-        }
-    }
-
-    #[test]
-    fn test_join_in_subquery() {
-        let schema = create_test_schema();
-        let sql = "SELECT * FROM (
-                     SELECT u.id, u.name, o.amount
-                     FROM users u JOIN orders o ON u.id = o.user_id
-                   ) WHERE amount > 100";
-        let plan = parse_and_build(sql, &schema).unwrap();
-
-        match plan {
-            LogicalPlan::Projection(outer_proj) => match &*outer_proj.input {
-                LogicalPlan::Filter(filter) => match &*filter.input {
-                    LogicalPlan::Projection(inner_proj) => match &*inner_proj.input {
-                        LogicalPlan::Join(join) => {
-                            assert_eq!(join.join_type, JoinType::Inner);
-                        }
-                        _ => panic!("Expected Join in subquery"),
-                    },
-                    _ => panic!("Expected Projection for subquery"),
-                },
-                _ => panic!("Expected Filter"),
-            },
-            _ => panic!("Expected Projection at top level"),
-        }
-    }
-
-    #[test]
-    fn test_join_ambiguous_column() {
-        let schema = create_test_schema();
-        // Both users and orders have an 'id' column
-        let sql = "SELECT id FROM users JOIN orders ON users.id = orders.user_id";
-        let result = parse_and_build(sql, &schema);
-        // This might error or succeed depending on how we handle ambiguous columns
-        // For now, just check that parsing completes
-        match result {
-            Ok(_) => {
-                // If successful, the implementation handles ambiguous columns somehow
-            }
-            Err(_) => {
-                // If error, the implementation rejects ambiguous columns
-            }
-        }
-    }
-
-    // Tests for strip_alias function
-    #[test]
-    fn test_strip_alias_with_alias() {
-        let inner_expr = LogicalExpr::Column(Column::new("test"));
-        let aliased = LogicalExpr::Alias {
-            expr: Box::new(inner_expr.clone()),
-            alias: "my_alias".to_string(),
-        };
-
-        let stripped = strip_alias(&aliased);
-        assert_eq!(stripped, &inner_expr);
-    }
-
-    #[test]
-    fn test_strip_alias_without_alias() {
-        let expr = LogicalExpr::Column(Column::new("test"));
-        let stripped = strip_alias(&expr);
-        assert_eq!(stripped, &expr);
-    }
-
-    #[test]
-    fn test_strip_alias_literal() {
-        let expr = LogicalExpr::Literal(Value::from_i64(42));
-        let stripped = strip_alias(&expr);
-        assert_eq!(stripped, &expr);
-    }
-
-    #[test]
-    fn test_strip_alias_scalar_function() {
-        let expr = LogicalExpr::ScalarFunction {
-            fun: "substr".to_string(),
-            args: std::vec![
-                LogicalExpr::Column(Column::new("name")),
-                LogicalExpr::Literal(Value::from_i64(1)),
-                LogicalExpr::Literal(Value::from_i64(4)),
-            ],
-        };
-        let stripped = strip_alias(&expr);
-        assert_eq!(stripped, &expr);
-    }
-
-    #[test]
-    fn test_strip_alias_nested_alias() {
-        // Test that strip_alias only removes the outermost alias
-        let inner_expr = LogicalExpr::Column(Column::new("test"));
-        let inner_alias = LogicalExpr::Alias {
-            expr: Box::new(inner_expr.clone()),
-            alias: "inner_alias".to_string(),
-        };
-        let outer_alias = LogicalExpr::Alias {
-            expr: Box::new(inner_alias.clone()),
-            alias: "outer_alias".to_string(),
-        };
-
-        let stripped = strip_alias(&outer_alias);
-        assert_eq!(stripped, &inner_alias);
-
-        // Stripping again should give us the inner expression
-        let double_stripped = strip_alias(stripped);
-        assert_eq!(double_stripped, &inner_expr);
-    }
-
-    #[test]
-    fn test_strip_alias_comparison_with_alias() {
-        // Test that two expressions match when one has an alias and one doesn't
-        let base_expr = LogicalExpr::ScalarFunction {
-            fun: "substr".to_string(),
-            args: std::vec![
-                LogicalExpr::Column(Column::new("orderdate")),
-                LogicalExpr::Literal(Value::from_i64(1)),
-                LogicalExpr::Literal(Value::from_i64(4)),
-            ],
-        };
-
-        let aliased_expr = LogicalExpr::Alias {
-            expr: Box::new(base_expr.clone()),
-            alias: "year".to_string(),
-        };
-
-        // Without strip_alias, they wouldn't match
-        assert_ne!(&aliased_expr, &base_expr);
-
-        // With strip_alias, they should match
-        assert_eq!(strip_alias(&aliased_expr), &base_expr);
-        assert_eq!(strip_alias(&base_expr), &base_expr);
-    }
-
-    #[test]
-    fn test_strip_alias_binary_expr() {
-        let expr = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column(Column::new("a"))),
-            op: BinaryOperator::Add,
-            right: Box::new(LogicalExpr::Literal(Value::from_i64(1))),
-        };
-        let stripped = strip_alias(&expr);
-        assert_eq!(stripped, &expr);
-    }
-
-    #[test]
-    fn test_strip_alias_aggregate_function() {
-        let expr = LogicalExpr::AggregateFunction {
-            fun: AggFunc::Sum,
-            args: std::vec![LogicalExpr::Column(Column::new("amount"))],
-            distinct: false,
-        };
-        let stripped = strip_alias(&expr);
-        assert_eq!(stripped, &expr);
-    }
-
-    #[test]
-    fn test_strip_alias_comparison_multiple_expressions() {
-        // Test comparing a list of expressions with and without aliases
-        let expr1 = LogicalExpr::Column(Column::new("a"));
-        let expr2 = LogicalExpr::ScalarFunction {
-            fun: "substr".to_string(),
-            args: std::vec![
-                LogicalExpr::Column(Column::new("b")),
-                LogicalExpr::Literal(Value::from_i64(1)),
-                LogicalExpr::Literal(Value::from_i64(4)),
-            ],
-        };
-
-        let aliased1 = LogicalExpr::Alias {
-            expr: Box::new(expr1.clone()),
-            alias: "col_a".to_string(),
-        };
-        let aliased2 = LogicalExpr::Alias {
-            expr: Box::new(expr2.clone()),
-            alias: "year".to_string(),
-        };
-
-        let select_exprs = [aliased1, aliased2];
-        let group_exprs = [expr1, expr2];
-
-        // Verify that stripping aliases allows matching
-        for (select_expr, group_expr) in select_exprs.iter().zip(group_exprs.iter()) {
-            assert_eq!(strip_alias(select_expr), group_expr);
-        }
+        .ok_or_else(|| {
+            LimboError::ParseError(format!(
+                "incremental views require {context} to be a non-negative integer literal"
+            ))
+        })?;
+        usize::try_from(value).map_err(|_| {
+            LimboError::ParseError(format!(
+                "incremental views require {context} to be a non-negative integer literal"
+            ))
+        })
     }
 }

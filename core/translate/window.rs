@@ -1,43 +1,150 @@
 use crate::alloc::TursoSliceExt;
-use crate::function::{AccumulatorFunc, WindowFunc};
+use crate::function::{AccumulatorFunc, Deterministic, ExtFunc, Func, WindowFunc};
 use crate::schema::{BTreeCharacteristics, BTreeTable, Table};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
-use crate::translate::collate::{get_collseq_from_expr, CollationSeq};
-use crate::translate::emitter::{Resolver, TranslateCtx};
+use crate::translate::collate::CollationSeq;
+use crate::translate::emitter::TranslateCtx;
 use crate::translate::expr::{
-    expr_contains_nondeterministic_scalar_function, translate_expr, translate_expr_no_constant_opt,
-    walk_expr, walk_expr_mut, NoConstantOptReason, WalkControl,
+    translate_plan_expr, translate_plan_expr_no_constant_opt, NoConstantOptReason,
 };
 use crate::translate::order_by::EmitOrderBy;
 use crate::translate::plan::{
-    Aggregate, Distinctness, JoinOrderMember, JoinedTable, QueryDestination, ResultSetColumn,
-    RewrittenWindowCall, SelectPlan, TableReferences, Window, WindowFunction,
+    Aggregate, Distinctness, JoinOrderMember, JoinedTable, PlanOutputFact, QueryDestination,
+    ResultColumnOrigin, ResultSetColumn, RewrittenWindowCall, SelectPlan, SubqueryOrigin,
+    TableReferences, Window, WindowFunction,
 };
-use crate::translate::planner::resolve_window_and_aggregate_functions;
+use crate::translate::plan_expr::{
+    plan_expr_affinity, plan_expr_array_dimensions, plan_expr_collation,
+    plan_expr_contains_aggregate, plan_expr_explicit_collation, plan_expr_type_fact,
+    plan_exprs_are_equivalent, plan_function_is_window, walk_plan_expr, walk_plan_expr_mut,
+    PlanColumnRef, PlanExpr, PlanExprAffinity, PlanExprFactSource, PlanOrderTerm, PlanOutputId,
+    PlanSourceId, PlanSubqueryExpr, PlanSubqueryId, PlanWalkControl,
+};
 use crate::translate::result_row::emit_select_result;
-use crate::translate::subquery::plan_subqueries_from_select_plan;
+use crate::translate::semantic::hir::{OutputNameKind, ResolvedCollation, TypeFact};
 use crate::types::KeyInfo;
-use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
     to_u32, {InsertFlags, Insn},
 };
 use crate::vdbe::{BranchOffset, CursorID};
-use crate::Connection;
 use crate::Result;
 use crate::{turso_assert, turso_assert_eq};
+use rustc_hash::FxHashMap as HashMap;
 use std::mem;
-use turso_parser::ast::Name;
-use turso_parser::ast::{Expr, Literal, Over, SortOrder, TableInternalId};
+use turso_parser::ast::{Literal, SortOrder};
 
 const SUBQUERY_DATABASE_ID: usize = 0;
 
 struct WindowSubqueryContext<'a> {
-    resolver: &'a Resolver<'a>,
-    subquery_order_by: &'a mut Vec<(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)>,
+    facts: &'a WindowExprFacts,
+    subquery_order_by: &'a mut Vec<PlanOrderTerm>,
     subquery_result_columns: &'a mut Vec<ResultSetColumn>,
-    subquery_id: &'a TableInternalId,
+    subquery_id: PlanSourceId,
+}
+
+/// Expression facts that must survive while the owning plan is split into
+/// nested window layers. Column facts live directly on `PlanExpr`; only output
+/// and scalar-subquery references need this small snapshot.
+#[derive(Default)]
+struct WindowExprFacts {
+    outputs: HashMap<PlanOutputId, PlanOutputFact>,
+    subqueries: HashMap<PlanSubqueryId, Vec<PlanOutputFact>>,
+}
+
+impl WindowExprFacts {
+    fn from_plan(plan: &SelectPlan) -> Self {
+        Self {
+            outputs: plan
+                .result_columns
+                .iter()
+                .map(|column| (column.id, PlanOutputFact::from(column)))
+                .collect(),
+            subqueries: plan
+                .non_from_clause_subqueries
+                .iter()
+                .map(|subquery| (subquery.internal_id, subquery.output_facts.clone()))
+                .collect(),
+        }
+    }
+
+    fn resolved_collation(&self, expr: &PlanExpr) -> Result<Option<ResolvedCollation>> {
+        fn inherited(expr: &PlanExpr, facts: &WindowExprFacts) -> Option<ResolvedCollation> {
+            match expr {
+                PlanExpr::Column(column) => column.collation.clone(),
+                PlanExpr::MergedColumn(column) => column.collation.clone(),
+                PlanExpr::Output(output) => facts
+                    .outputs
+                    .get(output)
+                    .and_then(|fact| fact.collation.clone()),
+                PlanExpr::Subquery(PlanSubqueryExpr::Scalar { query, output }) => facts
+                    .subqueries
+                    .get(query)
+                    .and_then(|facts| facts.get(*output))
+                    .and_then(|fact| fact.collation.clone()),
+                PlanExpr::Unary {
+                    operator: turso_parser::ast::UnaryOperator::Positive,
+                    expr,
+                }
+                | PlanExpr::Cast { expr, .. } => inherited(expr, facts),
+                _ => None,
+            }
+        }
+
+        Ok(plan_expr_explicit_collation(expr)?.or_else(|| inherited(expr, self)))
+    }
+}
+
+impl PlanExprFactSource for WindowExprFacts {
+    fn output_type_fact(&self, output: PlanOutputId) -> Option<TypeFact> {
+        self.outputs.get(&output).map(|fact| fact.type_fact.clone())
+    }
+
+    fn subquery_output_type_fact(&self, query: PlanSubqueryId, output: usize) -> Option<TypeFact> {
+        self.subqueries
+            .get(&query)?
+            .get(output)
+            .map(|fact| fact.type_fact.clone())
+    }
+
+    fn subquery_width(&self, query: PlanSubqueryId) -> Option<usize> {
+        self.subqueries.get(&query).map(Vec::len)
+    }
+
+    fn output_affinity(&self, output: PlanOutputId) -> Option<PlanExprAffinity> {
+        self.outputs.get(&output).map(|fact| fact.affinity)
+    }
+
+    fn subquery_output_affinity(
+        &self,
+        query: PlanSubqueryId,
+        output: usize,
+    ) -> Option<PlanExprAffinity> {
+        self.subqueries
+            .get(&query)?
+            .get(output)
+            .map(|fact| fact.affinity)
+    }
+
+    fn output_collation(&self, output: PlanOutputId) -> Option<CollationSeq> {
+        self.outputs
+            .get(&output)
+            .and_then(|fact| fact.collation.as_ref())
+            .map(|collation| *collation.value())
+    }
+
+    fn subquery_output_collation(
+        &self,
+        query: PlanSubqueryId,
+        output: usize,
+    ) -> Option<CollationSeq> {
+        self.subqueries
+            .get(&query)?
+            .get(output)
+            .and_then(|fact| fact.collation.as_ref())
+            .map(|collation| *collation.value())
+    }
 }
 
 /// Rewrite a `SELECT` plan for window function processing.
@@ -96,13 +203,7 @@ struct WindowSubqueryContext<'a> {
 pub fn plan_windows(
     program: &mut ProgramBuilder,
     plan: &mut SelectPlan,
-    resolver: &Resolver,
-    connection: &Arc<Connection>,
     windows: &mut Vec<Window>,
-    bound_subqueries: &mut rustc_hash::FxHashMap<
-        turso_parser::ast::TableInternalId,
-        crate::translate::bind::BoundSubquery,
-    >,
 ) -> crate::Result<()> {
     // Remove named windows that are not referenced by any function, as they can be ignored.
     windows.retain(|w| !w.functions.is_empty());
@@ -115,41 +216,16 @@ pub fn plan_windows(
         );
     }
 
-    prepare_window_subquery(
-        program,
-        plan,
-        resolver,
-        connection,
-        windows,
-        0,
-        bound_subqueries,
-    )
+    prepare_window_subquery(program, plan, windows, 0)
 }
 
 fn prepare_window_subquery(
     program: &mut ProgramBuilder,
     outer_plan: &mut SelectPlan,
-    resolver: &Resolver,
-    connection: &Arc<Connection>,
     windows: &mut Vec<Window>,
     processed_window_count: usize,
-    bound_subqueries: &mut rustc_hash::FxHashMap<
-        turso_parser::ast::TableInternalId,
-        crate::translate::bind::BoundSubquery,
-    >,
 ) -> crate::Result<()> {
     if windows.is_empty() {
-        // The innermost plan holds the original FROM/WHERE/GROUP BY plus any
-        // raw subquery expressions pushed down from outer window layers.
-        // Plan them now so they become SubqueryResult nodes with entries in
-        // non_from_clause_subqueries.
-        plan_subqueries_from_select_plan(
-            program,
-            outer_plan,
-            resolver,
-            connection,
-            bound_subqueries,
-        )?;
         return Ok(());
     }
 
@@ -161,43 +237,31 @@ fn prepare_window_subquery(
     let mut current_window = windows.remove(0);
     let mut subquery_result_columns = Vec::new();
     let mut subquery_order_by = Vec::new();
-    let subquery_id = program.table_reference_counter.next();
+    let subquery_id = program.next_plan_source_id();
+    let facts = WindowExprFacts::from_plan(outer_plan);
 
     if current_window.name.is_none() {
-        // This is part of normalizing the window definition. The remaining logic lives in
-        // `rewrite_expr_referencing_current_window`, which replaces inline window definitions
-        // with references by name.
-        //
-        // The goal is to always work with named windows instead of a mix of named and
-        // inline ones. This way, we don’t need to rewrite expressions embedded in inline
-        // definitions (there might be many equivalent definitions per subquery). Instead,
-        // we rewrite the named definition once, and all associated window functions
-        // require no additional processing.
-        //
-        // At this stage, window definitions and window functions are already bound,
-        // so this normalization is purely to keep the plan valid.
-        //
-        // If the generated name is not unique across the entire query, that’s acceptable —
-        // the final plan always associates exactly one window with one subquery.
+        // Names are only used for stable ephemeral-table labels after semantic
+        // lowering. Window-call behavior itself is already fully resolved.
         current_window.name = Some(format!("window_{processed_window_count}"));
     }
 
     let mut ctx = WindowSubqueryContext {
-        resolver,
+        facts: &facts,
         subquery_order_by: &mut subquery_order_by,
         subquery_result_columns: &mut subquery_result_columns,
-        subquery_id: &subquery_id,
+        subquery_id,
     };
 
     // Build the ORDER BY clause for the subquery by concatenating the window’s PARTITION BY
     // columns with its ORDER BY columns.This ensures that rows in the subquery are returned
     // in the correct order for partitioning and window function evaluation.
     for expr in current_window.partition_by.iter_mut() {
-        append_order_by(outer_plan, expr, &SortOrder::Asc, None, &mut ctx)?;
-        current_window.deduplicated_partition_by_len = Some(ctx.subquery_result_columns.len())
+        append_order_by(program, expr, SortOrder::Asc, None, &mut ctx)?;
     }
+    current_window.deduplicated_partition_by_len = Some(ctx.subquery_result_columns.len());
     for (expr, order, nulls) in current_window.order_by.iter_mut() {
-        append_order_by(outer_plan, expr, order, *nulls, &mut ctx)?;
+        append_order_by(program, expr, *order, *nulls, &mut ctx)?;
     }
 
     // Rewrite expressions from the outer query’s result columns and ORDER BY clause so that
@@ -205,16 +269,18 @@ fn prepare_window_subquery(
     // subquery’s result columns.
     for col in outer_plan.result_columns.iter_mut() {
         rewrite_terminal_expr(
-            &mut outer_plan.aggregates,
+            program,
+            &outer_plan.aggregates,
             &mut col.expr,
             &mut current_window,
             &mut ctx,
         )?;
     }
-    for (expr, _, _) in outer_plan.order_by.iter_mut() {
+    for term in outer_plan.order_by.iter_mut() {
         rewrite_terminal_expr(
-            &mut outer_plan.aggregates,
-            expr,
+            program,
+            &outer_plan.aggregates,
+            &mut term.expr,
             &mut current_window,
             &mut ctx,
         )?;
@@ -223,24 +289,32 @@ fn prepare_window_subquery(
     // When there is no ORDER BY or PARTITION BY clause, the window function takes zero arguments,
     // and no other columns are selected (e.g., "SELECT count() OVER () FROM products"),
     // `subquery_result_columns` may be empty. Add a constant expression to keep the query valid.
-    if subquery_result_columns.is_empty() {
-        subquery_result_columns.push(ResultSetColumn {
-            expr: Expr::Literal(Literal::Numeric("0".to_string())),
-            alias: None,
-            implicit_column_name: None,
-            contains_aggregates: false,
-        });
+    if ctx.subquery_result_columns.is_empty() {
+        let mut fallback = PlanExpr::Literal(Literal::Numeric("0".to_string()));
+        push_new_subquery_column(&mut fallback, program, &mut ctx, false)?;
     }
+    drop(ctx);
+
+    // Every non-FROM subquery except LIMIT/OFFSET now belongs to the inner
+    // layer: its expression either moved wholesale (WHERE/GROUP/HAVING) or
+    // became one of the inner result expressions above. LIMIT/OFFSET remains
+    // on the outermost layer and keeps its own subquery descriptors there.
+    let (outer_subqueries, inner_subqueries) =
+        mem::take(&mut outer_plan.non_from_clause_subqueries)
+            .into_iter()
+            .partition(|subquery| matches!(subquery.origin, SubqueryOrigin::SelectLimitOffset));
+    outer_plan.non_from_clause_subqueries = outer_subqueries;
 
     let new_join_order = vec![JoinOrderMember {
         table_id: subquery_id,
         original_idx: 0,
         is_outer: false,
     }];
-    let new_table_references = TableReferences::new(
+    let mut new_table_references = TableReferences::new(
         vec![],
         outer_plan.table_references.outer_query_refs().to_vec(),
     );
+    new_table_references.extend_runtime_sources_from(&outer_plan.table_references);
 
     let mut inner_plan = SelectPlan {
         join_order: mem::replace(&mut outer_plan.join_order, new_join_order),
@@ -257,7 +331,7 @@ fn prepare_window_subquery(
         distinctness: Distinctness::NonDistinct,
         values: vec![],
         window: None,
-        non_from_clause_subqueries: vec![],
+        non_from_clause_subqueries: inner_subqueries,
         input_cardinality_hint: None,
         estimated_output_rows: None,
         simple_aggregate: None,
@@ -267,11 +341,8 @@ fn prepare_window_subquery(
     prepare_window_subquery(
         program,
         &mut inner_plan,
-        resolver,
-        connection,
         windows,
         processed_window_count + 1,
-        bound_subqueries,
     )?;
 
     let subquery = JoinedTable::new_subquery(
@@ -297,9 +368,9 @@ fn prepare_window_subquery(
 }
 
 fn append_order_by(
-    plan: &mut SelectPlan,
-    expr: &mut Expr,
-    sort_order: &SortOrder,
+    program: &mut ProgramBuilder,
+    expr: &mut PlanExpr,
+    sort_order: SortOrder,
     nulls_order: Option<turso_parser::ast::NullsOrder>,
     ctx: &mut WindowSubqueryContext,
 ) -> crate::Result<()> {
@@ -310,108 +381,139 @@ fn append_order_by(
     let already_exists = ctx
         .subquery_order_by
         .iter()
-        .any(|(existing, _, _)| exprs_are_equivalent(existing, expr));
+        .any(|existing| plan_exprs_are_equivalent(&existing.expr, expr));
     if !already_exists {
-        ctx.subquery_order_by
-            .push((Box::new(expr.clone()), *sort_order, nulls_order));
+        ctx.subquery_order_by.push(PlanOrderTerm {
+            expr: expr.clone(),
+            order: sort_order,
+            nulls: nulls_order,
+        });
     }
 
-    let contains_aggregates = resolve_window_and_aggregate_functions(
-        expr,
-        ctx.resolver,
-        &mut plan.aggregates,
-        None,
-        &mut [],
-    )?;
-    rewrite_expr_as_subquery_column(expr, ctx, contains_aggregates);
+    let contains_aggregates = plan_expr_contains_aggregate(expr)?;
+    rewrite_expr_as_subquery_column(expr, program, ctx, contains_aggregates)?;
     Ok(())
 }
 
 fn rewrite_terminal_expr(
-    aggregates: &mut Vec<Aggregate>,
-    top_level_expr: &mut Expr,
+    program: &mut ProgramBuilder,
+    aggregates: &[Aggregate],
+    top_level_expr: &mut PlanExpr,
     current_window: &mut Window,
     ctx: &mut WindowSubqueryContext,
-) -> crate::Result<WalkControl> {
-    walk_expr_mut(
+) -> crate::Result<PlanWalkControl> {
+    walk_plan_expr_mut(
         top_level_expr,
-        &mut |expr: &mut Expr| -> crate::Result<WalkControl> {
+        &mut |expr: &mut PlanExpr| -> crate::Result<PlanWalkControl> {
             match expr {
-                Expr::FunctionCall { filter_over, .. }
-                | Expr::FunctionCallStar { filter_over, .. } => {
-                    if filter_over.over_clause.is_none() {
-                        // If the expression is a standard aggregate (non-window), push it down
-                        // to the subquery.
-                        if aggregates
-                            .iter()
-                            .any(|a| exprs_are_equivalent(&a.original_expr, expr))
-                        {
-                            rewrite_expr_as_subquery_column(expr, ctx, true);
-                        }
-                    } else if let Some(window_function) =
-                        find_window_function_entry(&mut current_window.functions, expr)
+                PlanExpr::Function(function) if !plan_function_is_window(function) => {
+                    // If the expression is a standard aggregate (non-window), push it down
+                    // to the subquery.
+                    if aggregates
+                        .iter()
+                        .any(|aggregate| plan_exprs_are_equivalent(&aggregate.original_expr, expr))
                     {
+                        rewrite_expr_as_subquery_column(expr, program, ctx, true)?;
+                        return Ok(PlanWalkControl::SkipChildren);
+                    }
+                }
+                PlanExpr::Function(_) => {
+                    if let Some(window_function_index) =
+                        find_window_function_entry(&current_window.functions, expr)
+                    {
+                        let window_function_index = prepare_window_function_occurrence(
+                            &mut current_window.functions,
+                            window_function_index,
+                            expr,
+                        )?;
+                        let window_function = &mut current_window.functions[window_function_index];
                         // Window function tied to the current window: rewrite its
                         // children to reference the subquery, not the call itself.
                         if let Some(rewritten) = &window_function.rewritten {
                             *expr = rewritten.expr.clone();
                         } else {
-                            let window_name = current_window
-                                .name
-                                .clone()
-                                .expect("current_window must always have a name here");
                             window_function.rewritten =
-                                Some(rewrite_expr_referencing_current_window(
-                                    aggregates,
-                                    window_name,
-                                    ctx,
-                                    expr,
-                                )?);
+                                Some(rewrite_expr_referencing_current_window(program, ctx, expr)?);
                         }
-                        return Ok(WalkControl::SkipChildren);
+                        return Ok(PlanWalkControl::SkipChildren);
                     } else {
                         // Window function referencing a different window. Push the
                         // whole expression to the subquery; it will be rewritten later.
-                        rewrite_expr_as_subquery_column(expr, ctx, false);
+                        rewrite_expr_as_subquery_column(expr, program, ctx, false)?;
+                        return Ok(PlanWalkControl::SkipChildren);
                     }
                 }
-                Expr::RowId { .. } | Expr::Column { .. } => {
-                    rewrite_expr_as_subquery_column(expr, ctx, false);
+                PlanExpr::RowId(_)
+                | PlanExpr::Column(_)
+                | PlanExpr::MergedColumn(_)
+                | PlanExpr::Output(_) => {
+                    rewrite_expr_as_subquery_column(expr, program, ctx, false)?;
+                    return Ok(PlanWalkControl::SkipChildren);
                 }
-                Expr::SubqueryResult { .. }
-                | Expr::Exists(..)
-                | Expr::InSelect { .. }
-                | Expr::Subquery(..) => {
-                    rewrite_expr_as_subquery_column(expr, ctx, false);
-                    return Ok(WalkControl::SkipChildren);
+                PlanExpr::Subquery(_) => {
+                    rewrite_expr_as_subquery_column(expr, program, ctx, false)?;
+                    return Ok(PlanWalkControl::SkipChildren);
                 }
                 _ => {}
             }
 
-            Ok(WalkControl::Continue)
+            Ok(PlanWalkControl::Continue)
         },
     )
 }
 
 /// Find the `WindowFunction` entry that this expression corresponds to.
-/// Returns an entry that has not been rewritten yet when one exists.
-fn find_window_function_entry<'a>(
-    functions: &'a mut [WindowFunction],
-    expr: &Expr,
-) -> Option<&'a mut WindowFunction> {
+/// Prefer an entry that has not been rewritten yet.
+fn find_window_function_entry(functions: &[WindowFunction], expr: &PlanExpr) -> Option<usize> {
     let mut fallback = None;
-    let mut chosen = None;
     for (i, f) in functions.iter().enumerate() {
-        if !exprs_are_equivalent(&f.original_expr, expr) {
+        if !plan_exprs_are_equivalent(&f.original_expr, expr) {
             continue;
         }
         if f.rewritten.is_none() {
-            chosen = Some(i);
-            break;
+            return Some(i);
         }
         fallback.get_or_insert(i);
     }
-    functions.get_mut(chosen.or(fallback)?)
+    fallback
+}
+
+/// Give each SQL occurrence containing a nondeterministic scalar call its own
+/// window accumulator and source-subquery columns. Structurally equal,
+/// deterministic calls keep sharing the cached rewrite.
+fn prepare_window_function_occurrence(
+    functions: &mut Vec<WindowFunction>,
+    matched_index: usize,
+    expr: &PlanExpr,
+) -> Result<usize> {
+    if functions[matched_index].rewritten.is_none()
+        || !window_function_has_nondeterministic_input(expr)?
+    {
+        return Ok(matched_index);
+    }
+
+    let mut occurrence = functions[matched_index].clone();
+    occurrence.original_expr = expr.clone();
+    occurrence.rewritten = None;
+    functions.push(occurrence);
+    Ok(functions.len() - 1)
+}
+
+fn window_function_has_nondeterministic_input(expr: &PlanExpr) -> Result<bool> {
+    let PlanExpr::Function(function) = expr else {
+        unreachable!("only window functions are matched to window entries")
+    };
+    for argument in &function.arguments {
+        if plan_expr_contains_nondeterministic_scalar_function(argument)? {
+            return Ok(true);
+        }
+    }
+    if let Some(filter) = function.filter.as_deref() {
+        if plan_expr_contains_nondeterministic_scalar_function(filter)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Add `expr` as an output column of the source subquery (the one being built
@@ -419,18 +521,49 @@ fn find_window_function_entry<'a>(
 /// existing equivalent column when `expr` is deterministic; nondeterministic
 /// calls (e.g. `random()`) get a fresh column on every occurrence.
 fn push_into_source_subquery(
-    expr: &mut Expr,
-    aggregates: &mut Vec<Aggregate>,
+    program: &mut ProgramBuilder,
+    expr: &mut PlanExpr,
     ctx: &mut WindowSubqueryContext,
 ) -> crate::Result<()> {
-    let contains_aggregates =
-        resolve_window_and_aggregate_functions(expr, ctx.resolver, aggregates, None, &mut [])?;
-    if expr_contains_nondeterministic_scalar_function(expr, ctx.resolver)? {
-        push_new_subquery_column(expr, ctx, contains_aggregates);
+    let contains_aggregates = plan_expr_contains_aggregate(expr)?;
+    if plan_expr_contains_nondeterministic_scalar_function(expr)? {
+        push_new_subquery_column(expr, program, ctx, contains_aggregates)?;
     } else {
-        rewrite_expr_as_subquery_column(expr, ctx, contains_aggregates);
+        rewrite_expr_as_subquery_column(expr, program, ctx, contains_aggregates)?;
     }
     Ok(())
+}
+
+fn plan_expr_contains_nondeterministic_scalar_function(expr: &PlanExpr) -> Result<bool> {
+    let mut found = false;
+    walk_plan_expr(expr, &mut |expr| {
+        let nondeterministic = match expr {
+            PlanExpr::Function(function) => {
+                function.sequence_operation.is_some()
+                    || match function.function.value() {
+                        Func::Agg(_) | Func::Window(_) => false,
+                        Func::External(external)
+                            if matches!(external.func, ExtFunc::Aggregate { .. }) =>
+                        {
+                            false
+                        }
+                        function => !function.is_deterministic(),
+                    }
+            }
+            PlanExpr::Binary {
+                custom: Some(custom),
+                ..
+            } => !custom.function.value().is_deterministic(),
+            PlanExpr::Like { function, .. } => !function.value().is_deterministic(),
+            _ => false,
+        };
+        if nondeterministic {
+            found = true;
+            return Ok(PlanWalkControl::SkipChildren);
+        }
+        Ok(PlanWalkControl::Continue)
+    })?;
+    Ok(found)
 }
 
 /// Rewrite a window function call `expr` so its arguments and FILTER predicate
@@ -438,37 +571,25 @@ fn push_into_source_subquery(
 /// `ctx`). Returns the rewritten form, ready to be stored on the matching
 /// `WindowFunction`.
 fn rewrite_expr_referencing_current_window(
-    aggregates: &mut Vec<Aggregate>,
-    window_name: String,
+    program: &mut ProgramBuilder,
     ctx: &mut WindowSubqueryContext,
-    expr: &mut Expr,
+    expr: &mut PlanExpr,
 ) -> crate::Result<RewrittenWindowCall> {
-    let filter_over = match expr {
-        Expr::FunctionCall {
-            args,
-            order_by,
-            within_group: _,
-            filter_over,
-            ..
-        } => {
-            for arg in args.iter_mut() {
-                push_into_source_subquery(arg, aggregates, ctx)?;
-            }
-            turso_assert!(
-                order_by.is_empty(),
-                "ORDER BY in window functions is not supported"
-            );
-            filter_over
-        }
-        Expr::FunctionCallStar { filter_over, .. } => filter_over,
+    let function = match expr {
+        PlanExpr::Function(function) => function,
         _ => unreachable!("only functions can reference windows"),
     };
-
-    if let Some(filter_expr) = filter_over.filter_clause.as_deref_mut() {
-        push_into_source_subquery(filter_expr, aggregates, ctx)?;
+    for argument in &mut function.arguments {
+        push_into_source_subquery(program, argument, ctx)?;
     }
-    let filter_expr = filter_over.filter_clause.as_deref().cloned();
-    filter_over.over_clause = Some(Over::Name(Name::exact(window_name)));
+    turso_assert!(
+        function.argument_order.is_empty(),
+        "ORDER BY in window functions is not supported"
+    );
+    if let Some(filter_expr) = function.filter.as_deref_mut() {
+        push_into_source_subquery(program, filter_expr, ctx)?;
+    }
+    let filter_expr = function.filter.as_deref().cloned();
     Ok(RewrittenWindowCall {
         expr: expr.clone(),
         filter_expr,
@@ -478,48 +599,81 @@ fn rewrite_expr_referencing_current_window(
 /// Rewrites an expression into a reference to a subquery column. If an
 /// equivalent expression was already pushed down, reuses its column index.
 fn rewrite_expr_as_subquery_column(
-    expr: &mut Expr,
+    expr: &mut PlanExpr,
+    program: &mut ProgramBuilder,
     ctx: &mut WindowSubqueryContext,
     contains_aggregates: bool,
-) {
+) -> Result<()> {
     if let Some(pos) = ctx
         .subquery_result_columns
         .iter()
-        .position(|col| exprs_are_equivalent(&col.expr, expr))
+        .position(|col| plan_exprs_are_equivalent(&col.expr, expr))
     {
-        *expr = Expr::Column {
-            database: Some(SUBQUERY_DATABASE_ID),
-            table: *ctx.subquery_id,
-            column: pos,
-            is_rowid_alias: false,
-        };
+        *expr = subquery_column_reference(ctx, pos);
     } else {
-        push_new_subquery_column(expr, ctx, contains_aggregates);
+        push_new_subquery_column(expr, program, ctx, contains_aggregates)?;
     }
+    Ok(())
 }
 
 /// Pushes `expr` as a fresh subquery column even if an equivalent column
 /// already exists. Use this for expressions containing nondeterministic calls
 /// like `random()`, which SQLite evaluates separately at each SQL occurrence.
 fn push_new_subquery_column(
-    expr: &mut Expr,
+    expr: &mut PlanExpr,
+    program: &mut ProgramBuilder,
     ctx: &mut WindowSubqueryContext,
     contains_aggregates: bool,
-) {
+) -> Result<()> {
     let column_idx = ctx.subquery_result_columns.len();
-    let subquery_ref = Expr::Column {
-        database: Some(SUBQUERY_DATABASE_ID),
-        table: *ctx.subquery_id,
-        column: column_idx,
-        is_rowid_alias: false,
+    let type_fact = plan_expr_type_fact(expr, ctx.facts);
+    let affinity = plan_expr_affinity(expr, ctx.facts);
+    let collation = ctx.facts.resolved_collation(expr)?;
+    let array_dimensions = plan_expr_array_dimensions(expr, ctx.facts);
+    let origin = match expr {
+        PlanExpr::Column(column) => Some(ResultColumnOrigin::Column {
+            source: column.source,
+            column: column.column,
+        }),
+        PlanExpr::RowId(source) => Some(ResultColumnOrigin::RowId { source: *source }),
+        _ => None,
     };
+    let subquery_ref = PlanExpr::Column(PlanColumnRef {
+        source: ctx.subquery_id,
+        column: column_idx,
+        rowid_alias: false,
+        type_fact: type_fact.clone(),
+        affinity: affinity.affinity,
+        has_affinity: affinity.has_affinity,
+        collation: collation.clone(),
+    });
     let subquery_expr = mem::replace(expr, subquery_ref);
     ctx.subquery_result_columns.push(ResultSetColumn {
+        id: program.next_plan_output_id(),
+        name: format!("window_column_{column_idx}"),
+        name_kind: OutputNameKind::Inferred,
+        origin,
+        type_fact,
+        affinity,
+        collation,
+        array_dimensions,
         expr: subquery_expr,
-        alias: None,
-        implicit_column_name: None,
         contains_aggregates,
     });
+    Ok(())
+}
+
+fn subquery_column_reference(ctx: &WindowSubqueryContext<'_>, column_idx: usize) -> PlanExpr {
+    let output = &ctx.subquery_result_columns[column_idx];
+    PlanExpr::Column(PlanColumnRef {
+        source: ctx.subquery_id,
+        column: column_idx,
+        rowid_alias: false,
+        type_fact: output.type_fact.clone(),
+        affinity: output.affinity.affinity,
+        has_affinity: output.affinity.has_affinity,
+        collation: output.collation.clone(),
+    })
 }
 
 #[derive(Debug)]
@@ -531,7 +685,7 @@ pub struct WindowMetadata<'a> {
     pub src_column_count: usize,
     /// Maps expressions in the current query that reference subquery columns
     /// to their corresponding column indexes in the subquery’s result.
-    pub expressions_referencing_subquery: Vec<(&'a Expr, usize)>,
+    pub expressions_referencing_subquery: Vec<(&'a PlanExpr, usize)>,
     pub buffer_table_name: String,
 }
 
@@ -658,15 +812,12 @@ pub struct WindowCursors {
 /// `emit_window_op`); `sort_order` and `nulls_order` are left at their
 /// `Insn::Compare` defaults — the peer check only inspects equality, not
 /// ordering direction.
-fn build_order_by_key_info(
-    window: &Window,
-    table_references: &crate::translate::plan::TableReferences,
-) -> crate::Result<Vec<KeyInfo>> {
+fn build_order_by_key_info(window: &Window, plan: &SelectPlan) -> crate::Result<Vec<KeyInfo>> {
     window
         .order_by
         .iter()
         .map(|(expr, _, _)| {
-            let collation = get_collseq_from_expr(expr, table_references)?.unwrap_or_default();
+            let collation = plan_expr_collation(expr, plan)?.unwrap_or_default();
             Ok(KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation,
@@ -684,7 +835,7 @@ impl EmitWindow {
         window: &'a Window,
         plan: &SelectPlan,
         result_columns: &'a [ResultSetColumn],
-        order_by: &'a [(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)],
+        order_by: &'a [PlanOrderTerm],
     ) -> crate::Result<()> {
         let joined_tables = &plan.joined_tables();
         turso_assert_eq!(joined_tables.len(), 1, "expected only one joined table");
@@ -808,7 +959,7 @@ impl EmitWindow {
         }
 
         // Window function processing is similar to aggregation processing in how results are mapped
-        // to registers. Each function expression is stored in `expr_to_reg_cache` along with its
+        // to registers. Each function expression is stored in the plan-expression cache with its
         // result register. Later, when bytecode generation encounters the expression, the value is
         // copied from the result register instead of generating code to evaluate the expression.
         let reg_acc_start = program.alloc_registers(window_function_count);
@@ -817,8 +968,8 @@ impl EmitWindow {
             // Cache by the rewritten form (when available) so lookups against the
             // result-column / ORDER-BY expressions — which were rewritten to
             // reference this window's subquery — find the cached register.
-            t_ctx.resolver.cache_expr_reg(
-                std::borrow::Cow::Borrowed(func.current_expr()),
+            t_ctx.resolver.cache_plan_expr_reg(
+                func.current_expr().clone(),
                 reg_acc_result_start + i,
                 false,
                 None,
@@ -832,15 +983,15 @@ impl EmitWindow {
         let expressions_referencing_subquery = collect_expressions_referencing_subquery(
             result_columns,
             order_by,
-            &src_table.internal_id,
+            src_table.internal_id,
         )?;
         let reg_col_start = program.alloc_registers(expressions_referencing_subquery.len());
         for (i, (expr, _)) in expressions_referencing_subquery.iter().enumerate() {
-            t_ctx.resolver.cache_scalar_expr_reg(
-                std::borrow::Cow::Borrowed(expr),
+            t_ctx.resolver.cache_plan_scalar_expr_reg(
+                (**expr).clone(),
                 reg_col_start + i,
                 false,
-                &plan.table_references,
+                plan,
             )?;
         }
 
@@ -1022,7 +1173,7 @@ impl EmitWindow {
                     unreachable!("start_offset_reg is only allocated when frame.start is Following")
                 }
             };
-            translate_expr_no_constant_opt(
+            translate_plan_expr_no_constant_opt(
                 program,
                 Some(&plan.table_references),
                 offset_expr,
@@ -1094,7 +1245,7 @@ impl EmitWindow {
             // through all peer-equal buffered rows in `emit_window_op`.
             let label_step_body = program.allocate_label();
             program.add_comment(program.offset(), "compare ORDER BY columns to detect peer");
-            let compare_key_info = build_order_by_key_info(window, &plan.table_references)?;
+            let compare_key_info = build_order_by_key_info(window, plan)?;
             // Source-row peer pre-check — skip AGGSTEP / RETURN_ROW when
             // the new source row is in the same peer group as the
             // previous one. Uses `peer_end_reg` as the reference (which
@@ -1162,42 +1313,39 @@ fn alloc_optional_registers(program: &mut ProgramBuilder, count: usize) -> Optio
 
 fn collect_expressions_referencing_subquery<'a>(
     result_columns: &'a [ResultSetColumn],
-    order_by: &'a [(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)],
-    subquery_id: &TableInternalId,
-) -> crate::Result<Vec<(&'a Expr, usize)>> {
-    let mut expressions_referencing_subquery: Vec<(&'a Expr, usize)> = Vec::new();
+    order_by: &'a [PlanOrderTerm],
+    subquery_id: PlanSourceId,
+) -> crate::Result<Vec<(&'a PlanExpr, usize)>> {
+    let mut expressions_referencing_subquery: Vec<(&'a PlanExpr, usize)> = Vec::new();
 
     for root_expr in result_columns
         .iter()
         .map(|col| &col.expr)
-        .chain(order_by.iter().map(|(e, _, _)| e.as_ref()))
+        .chain(order_by.iter().map(|term| &term.expr))
     {
-        walk_expr(
+        walk_plan_expr(
             root_expr,
-            &mut |expr: &Expr| -> crate::Result<WalkControl> {
+            &mut |expr: &PlanExpr| -> crate::Result<PlanWalkControl> {
                 match expr {
-                    Expr::FunctionCall { filter_over, .. }
-                    | Expr::FunctionCallStar { filter_over, .. } => {
-                        if filter_over.over_clause.is_some() {
-                            return Ok(WalkControl::SkipChildren);
-                        }
+                    PlanExpr::Function(function) if plan_function_is_window(function) => {
+                        return Ok(PlanWalkControl::SkipChildren);
                     }
-                    Expr::Column { column, table, .. } => {
+                    PlanExpr::Column(column) => {
                         turso_assert_eq!(
-                            table,
+                            column.source,
                             subquery_id,
                             "only subquery columns can be referenced"
                         );
                         if expressions_referencing_subquery
                             .iter()
-                            .all(|(_, existing_column)| column != existing_column)
+                            .all(|(_, existing_column)| column.column != *existing_column)
                         {
-                            expressions_referencing_subquery.push((expr, *column));
+                            expressions_referencing_subquery.push((expr, column.column));
                         }
                     }
                     _ => {}
                 };
-                Ok(WalkControl::Continue)
+                Ok(PlanWalkControl::Continue)
             },
         )?;
     }
@@ -1238,16 +1386,16 @@ fn emit_flush_buffer_if_new_partition(
             .enumerate()
             .take(partition_by_len)
         {
-            // After rewriting, partition_by entries are Expr::Column references to the
+            // After rewriting, partition_by entries are PlanExpr::Column references to the
             // subquery. Duplicates reference the same column index, so we find the entry
             // that references column i (the i-th unique partition column) to get the
             // correct collation.
             let expr = window
                 .partition_by
                 .iter()
-                .find(|e| matches!(e, Expr::Column { column, .. } if *column == i))
+                .find(|expr| matches!(expr, PlanExpr::Column(column) if column.column == i))
                 .unwrap_or(&window.partition_by[i]);
-            let maybe_collation = get_collseq_from_expr(expr, &plan.table_references)?;
+            let maybe_collation = plan_expr_collation(expr, plan)?;
             c.collation = maybe_collation.unwrap_or_default();
         }
         program.emit_insn(Insn::Compare {
@@ -1296,9 +1444,9 @@ fn emit_load_order_by_columns(
         // here by copying the values into an array of registers.
         for (i, (expr, _, _)) in window.order_by.iter().enumerate() {
             match expr {
-                Expr::Column { column, .. } => {
+                PlanExpr::Column(column) => {
                     program.emit_insn(Insn::Copy {
-                        src_reg: registers.src_columns_start + column,
+                        src_reg: registers.src_columns_start + column.column,
                         dst_reg: reg_new_order_by_columns_start + i,
                         extra_amount: 0,
                     });
@@ -1565,10 +1713,10 @@ fn emit_window_op(
         // percent_rank / cume_dist.
         let temp_start = program.alloc_registers(order_by_len);
         for (i, (expr, _, _)) in window.order_by.iter().enumerate() {
-            if let Expr::Column { column, .. } = expr {
+            if let PlanExpr::Column(column) = expr {
                 program.emit_insn(Insn::Column {
                     cursor_id: cursor_for_op,
-                    column: *column,
+                    column: column.column,
                     dest: temp_start + i,
                     default: None,
                 });
@@ -1576,7 +1724,7 @@ fn emit_window_op(
                 unreachable!("expected Column in window.order_by, got {:?}", expr);
             }
         }
-        let key_info = build_order_by_key_info(window, &plan.table_references)?;
+        let key_info = build_order_by_key_info(window, plan)?;
         let peer_ref = peer_ref_reg.expect(
             "per-cursor peer reference register must exist under RANGE/GROUPS with ORDER BY",
         );
@@ -1625,9 +1773,9 @@ fn emit_window_op(
 /// coroutine's register block (which holds the new-partition row being
 /// processed) isn't trampled while we drain the previous partition.
 ///
-/// Argument expressions are pushed into the resolver's expression cache
+/// Argument expressions are pushed into the resolver's plan-expression cache
 /// during the call so `translate_aggregation_step`'s recursive
-/// `translate_expr` resolves each `Expr::Column` to the arg-load register
+/// expression translation resolves each `PlanExpr::Column` to the arg-load register
 /// we just populated, instead of to `src_columns_start`. The cache is
 /// restored on the way out.
 fn emit_function_step(
@@ -1642,7 +1790,7 @@ fn emit_function_step(
 
     // Save cache state so the per-arg overrides we push below don't leak
     // out to other parts of the emit pipeline (e.g. emit_return_one_row).
-    let initial_cache_len = t_ctx.resolver.expr_to_reg_cache.len();
+    let initial_cache_len = t_ctx.resolver.plan_expr_to_reg_cache.len();
     let cache_was_enabled = t_ctx.resolver.expr_to_reg_cache_enabled;
 
     for (i, func) in window.functions.iter().enumerate() {
@@ -1659,33 +1807,29 @@ fn emit_function_step(
             continue;
         }
         let acc_reg = acc_start + i;
-        let args: Vec<Expr> = match func.current_expr() {
-            Expr::FunctionCall { args, .. } => args.iter().map(|a| (**a).clone()).collect(),
-            Expr::FunctionCallStar { .. } => vec![],
-            _ => unreachable!("window functions are FunctionCall or FunctionCallStar expressions"),
+        let args: Vec<PlanExpr> = match func.current_expr() {
+            PlanExpr::Function(function) => function.arguments.clone(),
+            _ => unreachable!("window functions are PlanExpr::Function expressions"),
         };
 
-        // Load each Expr::Column arg from the frame cursor into a fresh
-        // reg, then push a cache entry so translate_expr on that same Expr
+        // Load each PlanExpr::Column arg from the frame cursor into a fresh
+        // reg, then push a cache entry so expression translation on that same expression
         // resolves to the freshly-loaded reg. Args that aren't simple
         // column refs (rare after the planner rewrite) fall through to
-        // translate_expr's default path.
+        // normal expression emission.
         let arg_load_start = (!args.is_empty()).then(|| program.alloc_registers(args.len()));
         if let Some(base) = arg_load_start {
             for (j, arg) in args.iter().enumerate() {
-                if let Expr::Column { column, .. } = arg {
+                if let PlanExpr::Column(column) = arg {
                     program.emit_insn(Insn::Column {
                         cursor_id: read_csr,
-                        column: *column,
+                        column: column.column,
                         dest: base + j,
                         default: None,
                     });
-                    t_ctx.resolver.cache_expr_reg(
-                        std::borrow::Cow::Owned(arg.clone()),
-                        base + j,
-                        false,
-                        None,
-                    );
+                    t_ctx
+                        .resolver
+                        .cache_plan_expr_reg(arg.clone(), base + j, false, None);
                 }
             }
         }
@@ -1699,15 +1843,15 @@ fn emit_function_step(
                 {
                     let label = program.allocate_label();
                     let filter_reg = program.alloc_register();
-                    if let Expr::Column { column, .. } = filter_expr {
+                    if let PlanExpr::Column(column) = filter_expr {
                         program.emit_insn(Insn::Column {
                             cursor_id: read_csr,
-                            column: *column,
+                            column: column.column,
                             dest: filter_reg,
                             default: None,
                         });
                     } else {
-                        translate_expr(
+                        translate_plan_expr(
                             program,
                             Some(&plan.table_references),
                             filter_expr,
@@ -1735,6 +1879,7 @@ fn emit_function_step(
                     ),
                     acc_reg,
                     &t_ctx.resolver,
+                    plan,
                     None,
                 )?;
 
@@ -1760,7 +1905,10 @@ fn emit_function_step(
     // Restore expr-cache state so the per-function arg overrides don't
     // leak into later emit calls (e.g. emit_return_one_row's outer-query
     // result emission, which expects its own result_columns_start mapping).
-    t_ctx.resolver.expr_to_reg_cache.truncate(initial_cache_len);
+    t_ctx
+        .resolver
+        .plan_expr_to_reg_cache
+        .truncate(initial_cache_len);
     t_ctx.resolver.expr_to_reg_cache_enabled = cache_was_enabled;
 
     Ok(())
@@ -1840,13 +1988,13 @@ fn emit_lag_lead_lookup(
             .expect("csr_app must exist when a window contains lag / lead");
         let result_reg = acc_result_start + i;
 
-        let args: Vec<&Expr> = match func.current_expr() {
-            Expr::FunctionCall { args, .. } => args.iter().map(|a| a.as_ref()).collect(),
-            _ => unreachable!("lag / lead are always Expr::FunctionCall"),
+        let args = match func.current_expr() {
+            PlanExpr::Function(function) => &function.arguments,
+            _ => unreachable!("lag / lead are always PlanExpr::Function"),
         };
 
         let arg0_col = match args.first() {
-            Some(Expr::Column { column, .. }) => *column,
+            Some(PlanExpr::Column(column)) => column.column,
             other => unreachable!(
                 "lag/lead arg[0] must be a buffer column reference after planner rewrite, got {other:?}"
             ),
@@ -1858,10 +2006,10 @@ fn emit_lag_lead_lookup(
                 dest: result_reg,
                 dest_end: None,
             });
-        } else if let Expr::Column { column, .. } = args[2] {
+        } else if let PlanExpr::Column(column) = &args[2] {
             program.emit_insn(Insn::Column {
                 cursor_id: csr_current,
-                column: *column,
+                column: column.column,
                 dest: result_reg,
                 default: None,
             });
@@ -1885,8 +2033,8 @@ fn emit_lag_lead_lookup(
                 value: if is_lead { 1 } else { -1 },
             });
         } else {
-            let offset_col = match args[1] {
-                Expr::Column { column, .. } => *column,
+            let offset_col = match &args[1] {
+                PlanExpr::Column(column) => column.column,
                 other => unreachable!(
                     "lag/lead arg[1] must be a buffer column reference after planner rewrite, got {other:?}"
                 ),
@@ -1988,12 +2136,12 @@ fn emit_first_value_nth_value_lookup(
             .expect("csr_app must exist when a window contains first_value or nth_value");
         let result_reg = acc_result_start + i;
 
-        let args: Vec<&Expr> = match func.current_expr() {
-            Expr::FunctionCall { args, .. } => args.iter().map(|a| a.as_ref()).collect(),
-            _ => unreachable!("first_value / nth_value are always Expr::FunctionCall"),
+        let args = match func.current_expr() {
+            PlanExpr::Function(function) => &function.arguments,
+            _ => unreachable!("first_value / nth_value are always PlanExpr::Function"),
         };
         let arg_value_col = match args.first() {
-            Some(Expr::Column { column, .. }) => *column,
+            Some(PlanExpr::Column(column)) => column.column,
             other => unreachable!(
                 "first_value/nth_value arg[0] must be a subquery column ref \
                  after planner rewrite, got {other:?}"
@@ -2012,7 +2160,7 @@ fn emit_first_value_nth_value_lookup(
         let target_reg = program.alloc_register();
         if is_nth {
             let n_col = match args.get(1) {
-                Some(Expr::Column { column, .. }) => *column,
+                Some(PlanExpr::Column(column)) => column.column,
                 other => unreachable!(
                     "nth_value arg[1] must be a subquery column ref \
                      after planner rewrite, got {other:?}"

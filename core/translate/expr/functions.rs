@@ -6,7 +6,7 @@ use crate::vdbe::insn::{to_u32, InsertFlags, RegisterOrLiteral};
 /// The base logic for translating LIKE and GLOB expressions.
 /// The logic for handling "NOT LIKE" is different depending on whether the expression
 /// is a conditional jump or not. This is why the caller handles the "NOT LIKE" behavior;
-/// see [translate_condition_expr] and [translate_expr] for implementations.
+/// see [translate_plan_condition_expr] and [translate_expr] for implementations.
 pub(super) fn translate_like_base(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
@@ -220,7 +220,10 @@ pub(super) fn translate_sequence_function(
 ) -> Result<usize> {
     let is_nextval = matches!(&func_ctx.func, Func::Scalar(ScalarFunc::NextVal));
 
-    let seq_name_raw = extract_string_literal(&args[0])?;
+    let seq_name_raw = match args.first().map(Box::as_ref) {
+        Some(ast::Expr::Literal(ast::Literal::String(name))) => name.trim_matches('\'').to_string(),
+        _ => crate::bail_parse_error!("expected a string literal argument"),
+    };
     let (database_id, normalized_name) = if let Some((schema, name)) = seq_name_raw.split_once('.')
     {
         let schema_norm = normalize_ident(schema);

@@ -1,5 +1,7 @@
 use super::*;
+use crate::translate::expr::translate_plan_condition_expr;
 use crate::translate::plan::{MultiIndexBranch, MultiIndexBranchAccess};
+use crate::translate::plan_expr::PlanExpr;
 
 #[expect(clippy::too_many_arguments)]
 fn emit_multi_index_rowset_update(
@@ -51,7 +53,7 @@ fn emit_multi_index_or_residual_filters(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     table_references: &TableReferences,
-    residual_exprs: &[Expr],
+    residual_exprs: &[PlanExpr],
     jump_target: BranchOffset,
     index_cursor_id: Option<CursorID>,
     table_cursor_id: CursorID,
@@ -78,9 +80,9 @@ fn emit_multi_index_or_residual_filters(
             jump_target_when_false: jump_target,
             jump_target_when_null: jump_target,
         };
-        translate_condition_expr(
+        translate_plan_condition_expr(
             program,
-            table_references,
+            Some(table_references),
             residual_expr,
             condition_metadata,
             &t_ctx.resolver,
@@ -115,7 +117,7 @@ fn emit_seek_multi_index_branch(
     let branch_next = program.allocate_label();
     let is_index = branch.index.is_some();
     let branch_cursor_id = if let Some(index) = &branch.index {
-        program.resolve_cursor_id(&CursorKey::index(table.internal_id, index.clone()))
+        program.resolve_cursor_id(&CursorKey::index(table.internal_id, index.handle()))
     } else {
         table_cursor_id
     };
@@ -222,14 +224,15 @@ fn emit_in_seek_multi_index_branch(
     let MultiIndexBranchAccess::InSeek { source } = &branch.access else {
         unreachable!("IN-seek branch helper called for non-IN branch");
     };
-    let branch_cursor_id = branch.index.as_ref().map(|index| {
+    let branch_index = branch.index.as_ref().map(|index| index.handle());
+    let branch_cursor_id = branch_index.as_ref().map(|index| {
         program.resolve_cursor_id(&CursorKey::index(table.internal_id, index.clone()))
     });
     let ephemeral_cursor_id = open_in_seek_source_cursor(
         program,
         table_references,
         &t_ctx.resolver,
-        branch.index.as_ref(),
+        branch_index.as_deref(),
         source,
     )?;
 
@@ -478,13 +481,10 @@ pub(super) fn emit_multi_index_scan_loop(
         target_pc: skip_label,
     });
 
-    let rowid_expr = Expr::RowId {
-        database: None,
-        table: table.internal_id,
-    };
+    let rowid_expr = PlanExpr::RowId(table.internal_id);
     t_ctx
         .resolver
-        .cache_expr_reg(Cow::Owned(rowid_expr), rowid_reg, false, None);
+        .cache_plan_expr_reg(rowid_expr, rowid_reg, false, None);
 
     program.preassign_label_to_next_insn(skip_label);
     Ok(())

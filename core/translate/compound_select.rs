@@ -1,22 +1,34 @@
 use crate::alloc::TursoIteratorExt;
 use crate::schema::{Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
-use crate::translate::collate::get_collseq_from_expr;
 use crate::translate::emitter::{
     select::{emit_materialized_build_inputs, emit_query},
     LimitCtx, Resolver, TranslateCtx,
 };
-use crate::translate::expr::translate_expr;
-use crate::translate::order_by::{custom_type_comparator, sorter_insert};
-use crate::translate::plan::{CompoundOrderByKey, Plan, QueryDestination, SelectPlan};
-use crate::translate::result_row::emit_columns_to_destination;
+use crate::translate::expr::translate_plan_expr;
+use crate::translate::order_by::{custom_type_comparator_for_type_fact, sorter_insert};
+use crate::translate::plan::{
+    CompoundOrderByKey, EvalAt, Plan, QueryDestination, ResultSetColumn, SelectPlan,
+    SubqueryOrigin, TableReferences,
+};
+use crate::translate::plan_expr::{
+    plan_expr_collations, plan_exprs_are_equivalent, PlanExpr, PlanOrderTerm,
+};
+use crate::translate::result_row::emit_result_columns_to_destination;
+use crate::translate::subquery::emit_non_from_clause_subqueries_for_eval_at;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
 use crate::{emit_explain, LimboError};
 use tracing::instrument;
-use turso_parser::ast::{CompoundOperator, Expr, Literal, SortOrder};
+use turso_parser::ast::{CompoundOperator, Literal, SortOrder};
 
 use tracing::Level;
+
+#[derive(Clone, Copy)]
+struct CompoundResult<'a> {
+    columns: &'a [ResultSetColumn],
+    table_references: &'a TableReferences,
+}
 
 /// Emits bytecode for a compound SELECT statement (UNION, INTERSECT, EXCEPT, UNION ALL).
 /// Returns the result column start register when in coroutine mode (for CTE subqueries),
@@ -37,8 +49,12 @@ pub fn emit_program_for_compound_select(
     else {
         crate::bail_parse_error!("expected compound select plan");
     };
-    let has_order_by = order_by.is_some();
-    let order_by_owned = order_by.clone();
+    let has_order_by = !order_by.is_empty();
+    let order_by_owned = if has_order_by {
+        Some(resolve_compound_order_by(order_by, &left[0].0)?)
+    } else {
+        None
+    };
     let limit_owned = limit.clone();
     let offset_owned = offset.clone();
     let right_most_ctx = Box::new(TranslateCtx::new(
@@ -47,6 +63,18 @@ pub fn emit_program_for_compound_select(
         right_most.table_references.joined_tables().len(),
         false,
     ));
+    right_most_ctx
+        .resolver
+        .bind_plan_subqueries(&right_most.non_from_clause_subqueries);
+    emit_non_from_clause_subqueries_for_eval_at(
+        program,
+        &right_most_ctx.resolver,
+        &mut right_most.non_from_clause_subqueries,
+        &[],
+        Some(&right_most.table_references),
+        EvalAt::BeforeLoop,
+        |subquery| subquery.origin == SubqueryOrigin::SelectLimitOffset,
+    )?;
 
     // Each subselect shares the same limit_ctx and offset, because the LIMIT, OFFSET applies to
     // the entire compound select, not just a single subselect.
@@ -58,8 +86,8 @@ pub fn emit_program_for_compound_select(
             .as_ref()
             .map(|limit| {
                 let reg = program.alloc_register();
-                match limit.as_ref() {
-                    Expr::Literal(Literal::Numeric(n)) => {
+                match limit {
+                    PlanExpr::Literal(Literal::Numeric(n)) => {
                         if let Ok(value) = n.parse::<i64>() {
                             program.add_comment(program.offset(), "LIMIT counter");
                             program.emit_insn(Insn::Integer { value, dest: reg });
@@ -76,7 +104,7 @@ pub fn emit_program_for_compound_select(
                         }
                     }
                     _ => {
-                        _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver);
+                        translate_plan_expr(program, None, limit, reg, &right_most_ctx.resolver)?;
                         program.add_comment(program.offset(), "LIMIT counter");
                         program.emit_insn(Insn::MustBeInt {
                             reg,
@@ -95,8 +123,8 @@ pub fn emit_program_for_compound_select(
             .as_ref()
             .map(|offset_expr| {
                 let reg = program.alloc_register();
-                match offset_expr.as_ref() {
-                    Expr::Literal(Literal::Numeric(n)) => {
+                match offset_expr {
+                    PlanExpr::Literal(Literal::Numeric(n)) => {
                         // Compile-time constant offset
                         if let Ok(value) = n.parse::<i64>() {
                             program.emit_insn(Insn::Integer { value, dest: reg });
@@ -108,13 +136,13 @@ pub fn emit_program_for_compound_select(
                         }
                     }
                     _ => {
-                        _ = translate_expr(
+                        translate_plan_expr(
                             program,
                             None,
                             offset_expr,
                             reg,
                             &right_most_ctx.resolver,
-                        );
+                        )?;
                     }
                 }
                 program.add_comment(program.offset(), "OFFSET counter");
@@ -158,7 +186,10 @@ pub fn emit_program_for_compound_select(
         QueryDestination::CoroutineYield { .. }
         | QueryDestination::EphemeralTable { .. }
         | QueryDestination::RecursiveCteQueue { .. }
-        | QueryDestination::EphemeralIndex { .. } => Some(program.alloc_registers(num_result_cols)),
+        | QueryDestination::EphemeralIndex { .. }
+        | QueryDestination::RowValueSubqueryResult { .. } => {
+            Some(program.alloc_registers(num_result_cols))
+        }
         QueryDestination::ResultRows => None,
         other => {
             return Err(LimboError::InternalError(format!(
@@ -174,6 +205,11 @@ pub fn emit_program_for_compound_select(
     // `emit_compound_select` finishes — emission of nested subqueries (e.g. IN-subqueries)
     // calls `emit_program_for_select`, which clobbers `program.result_columns`.
     let leftmost_result_columns = left[0].0.result_columns.clone();
+    let leftmost_table_references = left[0].0.table_references.clone();
+    let compound_result = CompoundResult {
+        columns: &leftmost_result_columns,
+        table_references: &leftmost_table_references,
+    };
 
     // These must also be set because we make the decision to start a transaction based on whether
     // any tables are actually touched by the query. Previously this only used the rightmost subselect's
@@ -208,6 +244,7 @@ pub fn emit_program_for_compound_select(
             &limit_owned,
             &offset_owned,
             &right_most_ctx.resolver,
+            compound_result,
             limit_ctx,
             offset_reg,
             reg_result_cols_start,
@@ -221,7 +258,7 @@ pub fn emit_program_for_compound_select(
     // it to the inner plan's result columns). Restore to the leftmost subselect's columns
     // so `column_count`/column metadata reflect the compound query, and so that the
     // ORDER BY emitter below sees the correct columns.
-    program.result_columns = leftmost_result_columns;
+    program.result_columns = leftmost_result_columns.clone();
 
     // When ORDER BY is present, sort the collected results and emit to the real destination.
     if let (Some(order_by), Some(collection_cursor_id), Some(collection_idx)) =
@@ -233,10 +270,11 @@ pub fn emit_program_for_compound_select(
             collection_cursor_id,
             &collection_idx,
             num_result_cols,
-            limit_owned.as_deref(),
-            offset_owned.as_deref(),
+            limit_owned.as_ref(),
+            offset_owned.as_ref(),
             &real_query_destination,
             &right_most_ctx,
+            compound_result,
         )?;
         program.reg_result_cols_start = result_reg;
     } else {
@@ -255,6 +293,45 @@ pub fn emit_program_for_compound_select(
     Ok(program.reg_result_cols_start)
 }
 
+fn resolve_compound_order_by(
+    order_by: &[PlanOrderTerm],
+    leftmost: &SelectPlan,
+) -> crate::Result<Vec<CompoundOrderByKey>> {
+    order_by
+        .iter()
+        .enumerate()
+        .map(|(term_index, term)| {
+            let expression = without_plan_collate(&term.expr);
+            let result_column_index = leftmost
+                .result_columns
+                .iter()
+                .position(|column| {
+                    plan_exprs_are_equivalent(without_plan_collate(&column.expr), expression)
+                })
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "resolved compound ORDER BY term {} does not match a result column",
+                        term_index + 1
+                    ))
+                })?;
+            let explicit_collation = plan_expr_collations(&term.expr, leftmost)?.explicit;
+            Ok((
+                result_column_index,
+                term.order,
+                term.nulls,
+                explicit_collation,
+            ))
+        })
+        .collect()
+}
+
+fn without_plan_collate(mut expression: &PlanExpr) -> &PlanExpr {
+    while let PlanExpr::Collate { expr, .. } = expression {
+        expression = expr;
+    }
+    expression
+}
+
 // Emits bytecode for a compound SELECT statement. This function processes the rightmost part of
 // the compound SELECT and handles the left parts recursively based on the compound operator type.
 #[allow(clippy::too_many_arguments)]
@@ -262,9 +339,10 @@ fn emit_compound_select(
     program: &mut ProgramBuilder,
     left: &mut [(SelectPlan, CompoundOperator)],
     right_most: &mut SelectPlan,
-    limit: &Option<Box<Expr>>,
-    offset: &Option<Box<Expr>>,
+    limit: &Option<PlanExpr>,
+    offset: &Option<PlanExpr>,
     resolver: &Resolver,
+    compound_result: CompoundResult<'_>,
     limit_ctx: Option<LimitCtx>,
     offset_reg: Option<usize>,
     reg_result_cols_start: Option<usize>,
@@ -284,7 +362,18 @@ fn emit_compound_select(
         right_most.table_references.joined_tables().len(),
         false,
     ));
+    right_most_ctx
+        .resolver
+        .bind_plan_subqueries(&right_most.non_from_clause_subqueries);
     right_most_ctx.reg_result_cols_start = reg_result_cols_start;
+    if let Some(start_register) = reg_result_cols_start {
+        // A compound SELECT owns one output range shared by its arms. Install
+        // this arm's output identities before hash-build materialization, since
+        // a materialized subplan may read an alias from the owning arm.
+        right_most_ctx
+            .resolver
+            .bind_plan_outputs(&right_most.result_columns, start_register);
+    }
     match left.split_last_mut() {
         Some(((plan, operator), left)) => match operator {
             CompoundOperator::UnionAll => {
@@ -294,6 +383,7 @@ fn emit_compound_select(
                         | QueryDestination::CoroutineYield { .. }
                         | QueryDestination::EphemeralTable { .. }
                         | QueryDestination::RecursiveCteQueue { .. }
+                        | QueryDestination::RowValueSubqueryResult { .. }
                 ) {
                     plan.query_destination = right_most.query_destination.clone();
                 }
@@ -304,6 +394,7 @@ fn emit_compound_select(
                     limit,
                     offset,
                     resolver,
+                    compound_result,
                     limit_ctx,
                     offset_reg,
                     reg_result_cols_start,
@@ -360,6 +451,7 @@ fn emit_compound_select(
                     limit,
                     offset,
                     resolver,
+                    compound_result,
                     None,
                     None,
                     reg_result_cols_start,
@@ -388,6 +480,8 @@ fn emit_compound_select(
                         offset_reg,
                         reg_result_cols_start,
                         query_destination,
+                        compound_result,
+                        resolver,
                     )?;
                 }
             }
@@ -420,6 +514,7 @@ fn emit_compound_select(
                     limit,
                     offset,
                     resolver,
+                    compound_result,
                     None,
                     None,
                     reg_result_cols_start,
@@ -440,6 +535,8 @@ fn emit_compound_select(
                     offset_reg,
                     reg_result_cols_start,
                     &intersect_destination,
+                    compound_result,
+                    resolver,
                 )?;
             }
             CompoundOperator::Except => {
@@ -466,6 +563,7 @@ fn emit_compound_select(
                     limit,
                     offset,
                     resolver,
+                    compound_result,
                     None,
                     None,
                     reg_result_cols_start,
@@ -491,6 +589,8 @@ fn emit_compound_select(
                         offset_reg,
                         reg_result_cols_start,
                         query_destination,
+                        compound_result,
+                        resolver,
                     )?;
                 }
             }
@@ -527,24 +627,17 @@ fn create_dedupe_index(
         .result_columns
         .iter()
         .enumerate()
-        .map(|(i, c)| {
-            IndexColumn::new(
-                c.name(&right_select.table_references)
-                    .map(|n| n.to_string())
-                    .unwrap_or_default(),
-                i,
-            )
-        })
+        .map(|(i, c)| IndexColumn::new(c.name.clone(), i))
         .try_collect::<crate::alloc::Vec<_>>()?;
     for (i, column) in dedupe_columns.iter_mut().enumerate() {
-        let left_collation = get_collseq_from_expr(
-            &left_select.result_columns[i].expr,
-            &left_select.table_references,
-        )?;
-        let right_collation = get_collseq_from_expr(
-            &right_select.result_columns[i].expr,
-            &right_select.table_references,
-        )?;
+        let left_collation = left_select.result_columns[i]
+            .collation
+            .as_ref()
+            .map(|collation| *collation.value());
+        let right_collation = right_select.result_columns[i]
+            .collation
+            .as_ref()
+            .map(|collation| *collation.value());
         // Left precedence
         let collation = match (left_collation, right_collation) {
             (None, None) => None,
@@ -585,6 +678,8 @@ fn read_deduplicated_union_or_except_rows(
     offset_reg: Option<usize>,
     reg_result_cols_start: Option<usize>,
     query_destination: &QueryDestination,
+    compound_result: CompoundResult<'_>,
+    resolver: &Resolver,
 ) -> crate::Result<()> {
     let label_close = program.allocate_label();
     let label_dedupe_next = program.allocate_label();
@@ -613,11 +708,13 @@ fn read_deduplicated_union_or_except_rows(
             default: None,
         });
     }
-    emit_columns_to_destination(
+    emit_result_columns_to_destination(
         program,
         query_destination,
         dedupe_cols_start_reg,
-        dedupe_index.columns.len(),
+        compound_result.columns,
+        compound_result.table_references,
+        resolver,
     )?;
 
     if let Some(limit_ctx) = limit_ctx {
@@ -649,6 +746,8 @@ fn read_intersect_rows(
     offset_reg: Option<usize>,
     reg_result_cols_start: Option<usize>,
     query_destination: &QueryDestination,
+    compound_result: CompoundResult<'_>,
+    resolver: &Resolver,
 ) -> crate::Result<()> {
     let label_close = program.allocate_label();
     let label_loop_start = program.allocate_label();
@@ -691,7 +790,14 @@ fn read_intersect_rows(
         });
     }
 
-    emit_columns_to_destination(program, query_destination, cols_start_reg, column_count)?;
+    emit_result_columns_to_destination(
+        program,
+        query_destination,
+        cols_start_reg,
+        compound_result.columns,
+        compound_result.table_references,
+        resolver,
+    )?;
 
     if let Some(limit_ctx) = limit_ctx {
         program.emit_insn(Insn::DecrJumpZero {
@@ -748,10 +854,7 @@ fn create_collection_index(
         .iter()
         .enumerate()
         .map(|(i, c)| IndexColumn {
-            name: c
-                .name(&right_select.table_references)
-                .map(|n| n.to_string())
-                .unwrap_or_default(),
+            name: c.name.clone(),
             order: SortOrder::Asc,
             pos_in_table: i,
             default: None,
@@ -760,14 +863,14 @@ fn create_collection_index(
         })
         .try_collect::<crate::alloc::Vec<_>>()?;
     for (i, column) in columns.iter_mut().enumerate() {
-        let left_collation = get_collseq_from_expr(
-            &left_select.result_columns[i].expr,
-            &left_select.table_references,
-        )?;
-        let right_collation = get_collseq_from_expr(
-            &right_select.result_columns[i].expr,
-            &right_select.table_references,
-        )?;
+        let left_collation = left_select.result_columns[i]
+            .collation
+            .as_ref()
+            .map(|collation| *collation.value());
+        let right_collation = right_select.result_columns[i]
+            .collation
+            .as_ref()
+            .map(|collation| *collation.value());
         let collation = match (left_collation, right_collation) {
             (None, None) => None,
             (Some(coll), None) | (None, Some(coll)) => Some(coll),
@@ -806,10 +909,11 @@ fn emit_compound_order_by(
     collection_cursor_id: usize,
     collection_index: &Index,
     num_result_cols: usize,
-    limit: Option<&Expr>,
-    offset: Option<&Expr>,
+    limit: Option<&PlanExpr>,
+    offset: Option<&PlanExpr>,
     real_destination: &QueryDestination,
     right_most_ctx: &TranslateCtx,
+    compound_result: CompoundResult<'_>,
 ) -> crate::Result<Option<usize>> {
     // Open a Sorter with ORDER BY specifications.
     // Sorter layout: [sort_key_0, sort_key_1, ..., result_col_0, result_col_1, ...]
@@ -868,11 +972,7 @@ fn emit_compound_order_by(
         .iter()
         .map(|(col_idx, _, _, _)| {
             program.result_columns.get(*col_idx).and_then(|rc| {
-                custom_type_comparator(
-                    &rc.expr,
-                    &program.table_references,
-                    right_most_ctx.resolver.schema(),
-                )
+                custom_type_comparator_for_type_fact(&rc.type_fact, rc.array_dimensions)
             })
         })
         // No comparator needed for the sequence tie-breaker column
@@ -969,7 +1069,7 @@ fn emit_compound_order_by(
         .map(|limit_expr| {
             let reg = program.alloc_register();
             match limit_expr {
-                Expr::Literal(Literal::Numeric(n)) => {
+                PlanExpr::Literal(Literal::Numeric(n)) => {
                     if let Ok(value) = n.parse::<i64>() {
                         program.add_comment(program.offset(), "LIMIT counter");
                         program.emit_insn(Insn::Integer { value, dest: reg });
@@ -986,7 +1086,7 @@ fn emit_compound_order_by(
                     }
                 }
                 _ => {
-                    _ = translate_expr(program, None, limit_expr, reg, &right_most_ctx.resolver);
+                    translate_plan_expr(program, None, limit_expr, reg, &right_most_ctx.resolver)?;
                     program.add_comment(program.offset(), "LIMIT counter");
                     program.emit_insn(Insn::MustBeInt {
                         reg,
@@ -1002,7 +1102,7 @@ fn emit_compound_order_by(
         .map(|offset_expr| {
             let reg = program.alloc_register();
             match offset_expr {
-                Expr::Literal(Literal::Numeric(n)) => {
+                PlanExpr::Literal(Literal::Numeric(n)) => {
                     if let Ok(value) = n.parse::<i64>() {
                         program.emit_insn(Insn::Integer { value, dest: reg });
                     } else {
@@ -1013,7 +1113,7 @@ fn emit_compound_order_by(
                     }
                 }
                 _ => {
-                    _ = translate_expr(program, None, offset_expr, reg, &right_most_ctx.resolver);
+                    translate_plan_expr(program, None, offset_expr, reg, &right_most_ctx.resolver)?;
                 }
             }
             program.add_comment(program.offset(), "OFFSET counter");
@@ -1090,7 +1190,14 @@ fn emit_compound_order_by(
     }
 
     // Emit to real destination
-    emit_columns_to_destination(program, real_destination, result_start_reg, num_result_cols)?;
+    emit_result_columns_to_destination(
+        program,
+        real_destination,
+        result_start_reg,
+        compound_result.columns,
+        compound_result.table_references,
+        &right_most_ctx.resolver,
+    )?;
 
     // Apply LIMIT
     if let Some(limit_reg) = limit_ctx {

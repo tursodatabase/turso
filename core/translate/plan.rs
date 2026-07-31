@@ -6,15 +6,21 @@ use crate::{
         Schema, Table, Type, ROWID_SENTINEL,
     },
     translate::{
-        collate::{get_collseq_from_expr, CollationSeq},
+        collate::CollationSeq,
         emitter::UpdateRowSource,
-        expr::{as_binary_components, expr_data_type, get_expr_affinity, StorageClassMask},
-        expression_index::single_table_column_usage,
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
-        planner::determine_where_to_eval_term,
+        plan_expr::{
+            plan_expr_dependencies, plan_exprs_are_equivalent, walk_plan_expr,
+            walk_plan_expr_dependencies, PlanColumnRef, PlanColumnTypePrograms, PlanColumnUse,
+            PlanCteId, PlanExpr as Expr, PlanExprAffinity, PlanExprFactSource, PlanOrderTerm,
+            PlanOutputId, PlanParameter, PlanSourceId, PlanSubqueryId, PlanWalkControl,
+        },
+        planner::{determine_where_to_eval_term, source_loop_index},
+        semantic::hir::{
+            OutputNameKind, ResolvedCollation, ResolvedIndex, ResolvedTable, TypeFact,
+        },
     },
     types::SeekOp,
-    util::exprs_are_equivalent,
     vdbe::{
         affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder},
@@ -26,154 +32,430 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
-use turso_parser::ast::{
-    self, Expr, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder,
-    SubqueryType,
-};
-
-use turso_parser::ast::TableInternalId;
+use turso_parser::ast::{self, ResolveType, SortOrder};
 
 use super::emitter::OperationMode;
-
-/// Infer the Type from an expression's affinity.
-///
-/// Used for subquery result columns. SQLite derives column affinity from:
-/// - Column references: the declared column type
-/// - CAST expressions: the cast target type
-/// - Subqueries: recursively from the subquery's result expression
-/// - Literals: BLOB affinity (no affinity)
-///
-/// The affinity determines comparison behavior in IN expressions, etc.
-fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> Type {
-    let affinity = get_expr_affinity(expr, tables, None);
-    affinity.to_type()
-}
 
 /// Computes the affinity of column `i` of a compound (UNION/INTERSECT/EXCEPT)
 /// subquery, matching SQLite's `sqlite3SubqueryColumnTypes` (select.c).
 ///
 /// Scanning the arms left-to-right, the affinity is the first arm's affinity,
 /// skipping leading arms that have no affinity (adopting the next arm's). If
-/// every arm has no affinity the result is BLOB (none). Otherwise the column
+/// every arm has no affinity the result has no affinity. Otherwise the column
 /// keeps that affinity unless a later arm yields a conflicting datatype class
 /// (TEXT affinity + a numeric arm, or numeric affinity + a text arm), in which
-/// case it is downgraded to BLOB (none) so the column is compared by storage
+/// case it is downgraded to no affinity so the column is compared by storage
 /// class.
-fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
+fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> PlanExprAffinity {
     if arms.is_empty() {
-        return Affinity::Blob;
+        return PlanExprAffinity::no_affinity();
     }
     let col_affinity = |arm: &SelectPlan| {
         arm.result_columns
             .get(i)
-            .map(|rc| get_expr_affinity(&rc.expr, Some(&arm.table_references), None))
-            .unwrap_or(Affinity::Blob)
+            .map(|column| column.affinity)
+            .unwrap_or_else(PlanExprAffinity::no_affinity)
     };
     let col_data_type = |arm: &SelectPlan| {
         arm.result_columns
             .get(i)
-            .map(|rc| expr_data_type(&rc.expr, Some(&arm.table_references)))
-            .unwrap_or(StorageClassMask::from_null())
+            .map(ResultSetColumn::storage_classes)
+            .unwrap_or(StorageClassSet::EMPTY)
     };
 
     let mut affinity = col_affinity(arms[0]);
-    let mut data_types = StorageClassMask::from_null();
+    let mut data_types = StorageClassSet::EMPTY;
     let mut idx = 0;
     // Skip leading arms with no affinity, adopting the next arm's affinity.
-    while matches!(affinity, Affinity::Blob) && idx + 1 < arms.len() {
+    while !affinity.has_affinity && idx + 1 < arms.len() {
         data_types |= col_data_type(arms[idx]);
         idx += 1;
         affinity = col_affinity(arms[idx]);
     }
-    if matches!(affinity, Affinity::Blob) {
-        return Affinity::Blob;
+    if !affinity.has_affinity {
+        return PlanExprAffinity::no_affinity();
     }
-    // `affinity` is TEXT or numeric here; accumulate the remaining arms' classes.
+    // Accumulate the remaining arms' classes. A real BLOB affinity stays
+    // distinct from the absence of affinity even though neither conflicts
+    // with TEXT or numeric storage classes here.
     for &arm in &arms[idx + 1..] {
         data_types |= col_data_type(arm);
     }
-    match affinity {
-        Affinity::Text if data_types.has_numeric() => Affinity::Blob,
-        a if a.is_numeric() && data_types.has_text() => Affinity::Blob,
-        a => a,
+    match affinity.affinity {
+        Affinity::Text if data_types.has_numeric() => PlanExprAffinity::no_affinity(),
+        value if value.is_numeric() && data_types.has_text() => PlanExprAffinity::no_affinity(),
+        _ => affinity,
+    }
+}
+
+/// Storage classes a result expression can produce. This mirrors the small
+/// bitset SQLite uses while choosing compound-select affinity, but is derived
+/// once from semantic output facts rather than by walking parser syntax.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageClassSet(u8);
+
+impl StorageClassSet {
+    const EMPTY: Self = Self(0);
+    const NUMERIC: Self = Self(1 << 0);
+    const TEXT: Self = Self(1 << 1);
+    const BLOB: Self = Self(1 << 2);
+    const ALL: Self = Self(Self::NUMERIC.0 | Self::TEXT.0 | Self::BLOB.0);
+
+    const fn has_numeric(self) -> bool {
+        self.0 & Self::NUMERIC.0 != 0
+    }
+
+    const fn has_text(self) -> bool {
+        self.0 & Self::TEXT.0 != 0
+    }
+}
+
+impl std::ops::BitOrAssign for StorageClassSet {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ResultSetColumn {
-    /// `a + 1` in `SELECT a + 1 FROM t`
-    pub expr: ast::Expr,
-    /// `col` in `SELECT a AS col FROM t`
-    pub alias: Option<String>,
-    /// Original SQL expression text for display as column name.
-    /// Only used when there is no explicit alias and the expression is not
-    /// a simple column reference. This preserves the verbatim SQL text
-    /// (e.g. "f1+F2") as the column name, matching SQLite behavior.
-    pub implicit_column_name: Option<String>,
+    pub id: PlanOutputId,
+    /// Final SQLite result name, decided by semantic analysis.
+    pub name: String,
+    pub name_kind: OutputNameKind,
+    /// Resolved origin used by full/short-column-name metadata without
+    /// retaining a parser expression or consulting a live schema.
+    pub origin: Option<ResultColumnOrigin>,
+    pub type_fact: TypeFact,
+    /// SQLite expression affinity, kept separate from storage type because a
+    /// literal has a known storage class but deliberately has no affinity.
+    pub affinity: PlanExprAffinity,
+    /// Effective output collation fixed during semantic lowering.
+    pub collation: Option<ResolvedCollation>,
+    /// Number of array dimensions represented by the value. Kept as output
+    /// metadata so derived tables do not have to rediscover it from syntax.
+    pub array_dimensions: u32,
+    /// Resolved expression in this plan's identity space.
+    pub expr: Expr,
     // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
     pub contains_aggregates: bool,
 }
 
-impl ResultSetColumn {
-    pub fn name<'a>(&'a self, tables: &'a TableReferences) -> Option<&'a str> {
-        if let Some(alias) = &self.alias {
-            return Some(alias);
-        }
-        match &self.expr {
-            ast::Expr::Column { table, column, .. } => {
-                if let Some(joined_table_ref) = tables.find_joined_table_by_internal_id(*table) {
-                    if let Operation::IndexMethodQuery(module) = &joined_table_ref.op {
-                        if module.covered_columns.contains_key(column) {
-                            return None;
-                        }
-                    }
-                    joined_table_ref
-                        .table
-                        .get_column_at(*column)
-                        .unwrap()
-                        .name
-                        .as_deref()
-                } else {
-                    // Column references an outer query table (correlated subquery).
-                    let (_, table_ref) = tables.find_table_by_internal_id(*table)?;
-                    table_ref.get_column_at(*column)?.name.as_deref()
-                }
-            }
-            ast::Expr::RowId { table, .. } => {
-                // If there is a rowid alias column, use its name
-                let (_, table_ref) = tables.find_table_by_internal_id(*table)?;
-                if let Table::BTree(table) = &table_ref {
-                    if let Some(rowid_alias_column) = table.get_rowid_alias_column() {
-                        if let Some(name) = &rowid_alias_column.1.name {
-                            return Some(name);
-                        }
-                    }
-                }
+/// Runtime storage for a semantic row image such as NEW, OLD, or EXCLUDED.
+/// Ordinary table sources are read through `TableReferences`; only sources
+/// whose values live outside a cursor are present here.
+#[derive(Debug, Clone)]
+pub enum RuntimeValueBinding {
+    Register { register: usize, needs_decode: bool },
+    Parameter(PlanParameter),
+}
 
-                // If there is no rowid alias, use "rowid".
-                Some("rowid")
-            }
-            _ => self.implicit_column_name.as_deref(),
-        }
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeRowBinding {
+    pub columns: Vec<RuntimeValueBinding>,
+    pub rowid: Option<RuntimeValueBinding>,
+    /// Source-local decode programs for encoded register values. Fully decoded
+    /// rows and parameter-only schema-program inputs keep this empty.
+    pub read_programs: Option<Arc<SourceReadPrograms>>,
+}
+
+/// Materialized value and semantic facts for one plan output.
+///
+/// Unlike source columns, an output reference does not carry its facts inside
+/// `PlanExpr`, so both pieces are installed together when the output acquires
+/// a stable runtime location.
+#[derive(Debug, Clone)]
+pub struct RuntimeOutputBinding {
+    pub value: RuntimeValueBinding,
+    pub fact: PlanOutputFact,
+    pub definition: RuntimeOutputDefinition,
+}
+
+#[derive(Debug, Clone)]
+pub enum RuntimeOutputDefinition {
+    /// The owning SELECT's current expression, after physical rewrites.
+    Plan(Expr),
+    /// A value injected by an API boundary rather than computed by a SELECT.
+    ExternalInput,
+}
+
+/// Runtime storage chosen for one non-FROM subquery plus the output facts that
+/// remain valid after its physical plan has been consumed.
+#[derive(Debug, Clone)]
+pub struct RuntimeSubqueryBinding {
+    pub query_type: PlanSubqueryType,
+    pub output_facts: Vec<PlanOutputFact>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PlanRuntimeBindings {
+    rows: HashMap<PlanSourceId, RuntimeRowBinding>,
+    outputs: HashMap<PlanOutputId, RuntimeOutputBinding>,
+    subqueries: HashMap<PlanSubqueryId, RuntimeSubqueryBinding>,
+}
+
+impl PlanRuntimeBindings {
+    pub(crate) fn has_value_bindings(&self) -> bool {
+        !self.rows.is_empty() || !self.outputs.is_empty()
     }
 
-    /// Returns the column name, falling back to the expression's display form.
-    pub fn name_or_expr(&self, tables: &TableReferences) -> String {
-        self.name(tables)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| self.expr.to_string())
+    pub fn bind_row(
+        &mut self,
+        source: PlanSourceId,
+        binding: RuntimeRowBinding,
+    ) -> Option<RuntimeRowBinding> {
+        let has_encoded_register =
+            binding
+                .columns
+                .iter()
+                .chain(binding.rowid.iter())
+                .any(|value| {
+                    matches!(
+                        value,
+                        RuntimeValueBinding::Register {
+                            needs_decode: true,
+                            ..
+                        }
+                    )
+                });
+        assert!(
+            !has_encoded_register || binding.read_programs.is_some(),
+            "runtime row binding for {source} has encoded registers without source read programs"
+        );
+        self.rows.insert(source, binding)
+    }
+
+    pub fn row(&self, source: PlanSourceId) -> Option<&RuntimeRowBinding> {
+        self.rows.get(&source)
+    }
+
+    pub fn value(&self, source: PlanSourceId, column: usize) -> Option<&RuntimeValueBinding> {
+        self.row(source)?.columns.get(column)
+    }
+
+    pub fn rowid(&self, source: PlanSourceId) -> Option<&RuntimeValueBinding> {
+        self.row(source)?.rowid.as_ref()
+    }
+
+    pub fn read_programs(&self, source: PlanSourceId) -> Option<Arc<SourceReadPrograms>> {
+        self.row(source)?.read_programs.as_ref().map(Arc::clone)
+    }
+
+    pub fn bind_output(
+        &mut self,
+        output: PlanOutputId,
+        binding: RuntimeOutputBinding,
+    ) -> Option<RuntimeOutputBinding> {
+        self.outputs.insert(output, binding)
+    }
+
+    pub fn output(&self, output: PlanOutputId) -> Option<&RuntimeOutputBinding> {
+        self.outputs.get(&output)
+    }
+
+    pub fn bind_subquery(
+        &mut self,
+        subquery: PlanSubqueryId,
+        binding: RuntimeSubqueryBinding,
+    ) -> Option<RuntimeSubqueryBinding> {
+        self.subqueries.insert(subquery, binding)
+    }
+
+    pub fn subquery(&self, subquery: PlanSubqueryId) -> Option<&RuntimeSubqueryBinding> {
+        self.subqueries.get(&subquery)
+    }
+
+    pub fn extend(&mut self, other: Self) {
+        self.rows.extend(other.rows);
+        self.outputs.extend(other.outputs);
+        self.subqueries.extend(other.subqueries);
+    }
+}
+
+impl PlanExprFactSource for PlanRuntimeBindings {
+    fn output_type_fact(&self, output: PlanOutputId) -> Option<TypeFact> {
+        self.output(output)
+            .map(|binding| binding.fact.type_fact.clone())
+    }
+
+    fn subquery_output_type_fact(&self, query: PlanSubqueryId, output: usize) -> Option<TypeFact> {
+        self.subquery(query)?
+            .output_facts
+            .get(output)
+            .map(|fact| fact.type_fact.clone())
+    }
+
+    fn subquery_width(&self, query: PlanSubqueryId) -> Option<usize> {
+        self.subquery(query)
+            .map(|binding| binding.output_facts.len())
+    }
+
+    fn output_affinity(&self, output: PlanOutputId) -> Option<PlanExprAffinity> {
+        self.output(output).map(|binding| binding.fact.affinity)
+    }
+
+    fn subquery_output_affinity(
+        &self,
+        query: PlanSubqueryId,
+        output: usize,
+    ) -> Option<PlanExprAffinity> {
+        self.subquery(query)?
+            .output_facts
+            .get(output)
+            .map(|fact| fact.affinity)
+    }
+
+    fn output_collation(&self, output: PlanOutputId) -> Option<CollationSeq> {
+        self.output(output)
+            .and_then(|binding| binding.fact.collation.as_ref())
+            .map(|collation| *collation.value())
+    }
+
+    fn subquery_output_collation(
+        &self,
+        query: PlanSubqueryId,
+        output: usize,
+    ) -> Option<CollationSeq> {
+        self.subquery(query)?
+            .output_facts
+            .get(output)
+            .and_then(|fact| fact.collation.as_ref())
+            .map(|collation| *collation.value())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultColumnOrigin {
+    Column { source: PlanSourceId, column: usize },
+    RowId { source: PlanSourceId },
+}
+
+impl ResultSetColumn {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn name_or_expr(&self) -> String {
+        self.name.clone()
     }
 
     /// Returns the canonical short type name for this column's affinity,
     /// matching SQLite's `azType[]` in `createTableStmt()` (build.c).
-    pub fn declared_type(&self, tables: &TableReferences) -> &'static str {
-        get_expr_affinity(&self.expr, Some(tables), None).short_type_name()
+    pub fn declared_type(&self) -> &'static str {
+        // CTAS propagates the affinity of a declared source column or CAST,
+        // but it does not invent a declaration from a literal, function, or
+        // arithmetic result merely because its storage class is known.
+        match self
+            .type_fact
+            .declared
+            .as_ref()
+            .map(|declared| declared.storage)
+        {
+            Some(Type::Text) => "TEXT",
+            Some(Type::Numeric) => "NUM",
+            Some(Type::Integer) => "INT",
+            Some(Type::Real) => "REAL",
+            Some(Type::Null | Type::Blob) | None => "",
+        }
+    }
+
+    fn storage_classes(&self) -> StorageClassSet {
+        if self.affinity.has_affinity {
+            return if self.affinity.affinity.is_numeric() {
+                StorageClassSet(StorageClassSet::NUMERIC.0 | StorageClassSet::BLOB.0)
+            } else if self.affinity.affinity == Affinity::Text {
+                StorageClassSet(StorageClassSet::TEXT.0 | StorageClassSet::BLOB.0)
+            } else {
+                StorageClassSet::ALL
+            };
+        }
+
+        match self.type_fact.storage {
+            Some(Type::Null) => StorageClassSet::EMPTY,
+            Some(Type::Text) => StorageClassSet::TEXT,
+            Some(Type::Blob) => StorageClassSet::BLOB,
+            Some(Type::Numeric | Type::Integer | Type::Real) => StorageClassSet::NUMERIC,
+            None => StorageClassSet::ALL,
+        }
+    }
+}
+
+/// Output metadata that must outlive the physical plan which produced it.
+/// Non-FROM subquery plans are consumed during emission, but outer expression
+/// lowering still needs these facts afterward.
+#[derive(Debug, Clone)]
+pub struct PlanOutputFact {
+    pub type_fact: TypeFact,
+    pub affinity: PlanExprAffinity,
+    pub collation: Option<ResolvedCollation>,
+    pub array_dimensions: u32,
+}
+
+/// One result value read by a nested query from the query block that owns it.
+///
+/// The defining expression remains in the owning block. A child plan keeps the
+/// frozen facts and source dependencies needed for planning, then reads the
+/// owner's materialized register at runtime.
+#[derive(Debug, Clone)]
+pub struct PlanOuterOutputReference {
+    pub output: PlanOutputId,
+    pub definition: Expr,
+    pub fact: PlanOutputFact,
+    pub source_dependencies: Vec<PlanSourceId>,
+}
+
+impl From<&ResultSetColumn> for PlanOutputFact {
+    fn from(column: &ResultSetColumn) -> Self {
+        Self {
+            type_fact: column.type_fact.clone(),
+            affinity: column.affinity,
+            collation: column.collation.clone(),
+            array_dimensions: column.array_dimensions,
+        }
+    }
+}
+
+impl PlanOutputFact {
+    pub fn for_plan(plan: &Plan) -> Vec<Self> {
+        match plan {
+            Plan::Select(select) => select
+                .result_columns
+                .iter()
+                .map(PlanOutputFact::from)
+                .collect(),
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                let mut arms = left.iter().map(|(select, _)| select).collect::<Vec<_>>();
+                arms.push(right_most);
+                let first = left
+                    .first()
+                    .map(|(select, _)| &select.result_columns)
+                    .unwrap_or(&right_most.result_columns);
+                first
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| {
+                        let mut fact = PlanOutputFact::from(column);
+                        fact.affinity = compound_column_affinity(&arms, index);
+                        fact
+                    })
+                    .collect()
+            }
+            Plan::RecursiveCte(recursive) => recursive
+                .result_columns
+                .iter()
+                .map(PlanOutputFact::from)
+                .collect(),
+            Plan::Delete(_) | Plan::Update(_) => {
+                panic!("DML plan cannot provide query output facts")
+            }
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct GroupBy {
-    pub exprs: Vec<ast::Expr>,
+    pub exprs: Vec<Expr>,
     /// Sort direction for each GROUP BY key column. Always present once
     /// `compute_group_by_sort_order` has run; the outer optimizer reads
     /// this to derive the materialized CTE's output order.
@@ -186,7 +468,7 @@ pub struct GroupBy {
     /// query can still read the effective output order.
     pub sort_elided: bool,
     /// having clause split into a vec at 'AND' boundaries.
-    pub having: Option<Vec<ast::Expr>>,
+    pub having: Option<Vec<Expr>>,
 }
 
 /// In a query plan, WHERE clause conditions and JOIN conditions are all folded into a vector of WhereTerm.
@@ -198,7 +480,7 @@ pub struct GroupBy {
 #[derive(Debug, Clone)]
 pub struct WhereTerm {
     /// The original condition expression.
-    pub expr: ast::Expr,
+    pub expr: Expr,
     /// For normal JOIN conditions (ON or WHERE clauses), we break them up into individual [WhereTerm] conditions
     /// and let the optimizer determine when each should be evaluated based on the tables they reference.
     /// See e.g. [EvalAt].
@@ -215,10 +497,10 @@ pub struct WhereTerm {
     /// 3. For each t row where t.a = 2, emit the actual s values
     ///
     /// This means the condition must be evaluated during s's loop, regardless of which tables it references.
-    /// We track this requirement using [WhereTerm::from_outer_join], which contains the [TableInternalId] of the
+    /// We track this requirement using [WhereTerm::from_outer_join], which contains the [PlanSourceId] of the
     /// right-side table of the OUTER JOIN (in this case, s). When evaluating conditions, if [WhereTerm::from_outer_join]
     /// is set, we force evaluation to happen during that table's loop.
-    pub from_outer_join: Option<TableInternalId>,
+    pub from_outer_join: Option<PlanSourceId>,
     /// Whether the condition has been consumed by the optimizer in some way, and it should not be evaluated
     /// in the normal place where WHERE terms are evaluated.
     /// A term may have been consumed e.g. if:
@@ -380,10 +662,10 @@ pub enum Plan {
     CompoundSelect {
         left: Vec<(SelectPlan, ast::CompoundOperator)>,
         right_most: Box<SelectPlan>,
-        limit: Option<Box<Expr>>,
-        offset: Option<Box<Expr>>,
-        /// ORDER BY for compound selects, or `None` when the query has none.
-        order_by: Option<Vec<CompoundOrderByKey>>,
+        limit: Option<Expr>,
+        offset: Option<Expr>,
+        /// Resolved ORDER BY terms. Compound restrictions were validated in HIR.
+        order_by: Vec<PlanOrderTerm>,
     },
     /// Runs the initial query once, then runs the recursive query for each queued row.
     RecursiveCte(Box<RecursiveCtePlan>),
@@ -397,12 +679,31 @@ pub struct RecursiveCtePlan {
     pub name: String,
     pub initial_query: Box<Plan>,
     pub recursive_query: Box<Plan>,
-    pub input_table_id: TableInternalId,
+    /// Canonical outward-facing columns fixed by semantic analysis after the
+    /// seed and every recursive arm have been reconciled. The two child plans
+    /// are execution inputs, not competing metadata sources.
+    pub result_columns: Vec<ResultSetColumn>,
+    /// Collations used by the recursive queue and UNION deduplication. These
+    /// follow compound comparison precedence and may differ from the seed's
+    /// outward-facing column collation.
+    pub comparison_collations: Vec<Option<ResolvedCollation>>,
+    /// One physical source identity for each syntactic self-reference in the
+    /// recursive term, in stable HIR source order.
+    pub input_table_ids: Vec<PlanSourceId>,
     pub union_all: bool,
-    pub limit: Option<Box<Expr>>,
-    pub offset: Option<Box<Expr>>,
-    pub queue_order: Option<Vec<CompoundOrderByKey>>,
+    pub limit: Option<Expr>,
+    pub offset: Option<Expr>,
+    pub queue_order: Vec<RecursiveCteOrderTerm>,
     pub query_destination: QueryDestination,
+}
+
+/// Exact row-image values read from one source anywhere inside a physical
+/// plan. Column entries retain their semantic facts, so callers can bind raw
+/// registers without reopening the schema to recover type or collation data.
+#[derive(Clone, Debug, Default)]
+pub struct PlanRowDependency {
+    pub columns: Vec<PlanColumnRef>,
+    pub rowid: bool,
 }
 
 impl Plan {
@@ -462,7 +763,7 @@ impl Plan {
         match self {
             Plan::Select(select_plan) => &select_plan.result_columns,
             Plan::CompoundSelect { right_most, .. } => &right_most.result_columns,
-            Plan::RecursiveCte(plan) => plan.initial_query.select_result_columns(),
+            Plan::RecursiveCte(plan) => &plan.result_columns,
             Plan::Delete(_) | Plan::Update(_) => {
                 panic!("select_result_columns called on a non-SELECT plan")
             }
@@ -491,8 +792,8 @@ impl Plan {
     /// uses. For a compound SELECT, the result spans all of its component
     /// SELECTs. DELETE and UPDATE plans have no outer-query references and
     /// always return an empty vector.
-    pub fn used_outer_query_ref_ids(&self) -> Vec<TableInternalId> {
-        fn collect_from_select(plan: &SelectPlan, out: &mut Vec<TableInternalId>) {
+    pub fn used_outer_query_ref_ids(&self) -> Vec<PlanSourceId> {
+        fn collect_from_select(plan: &SelectPlan, out: &mut Vec<PlanSourceId>) {
             for outer_ref in plan.table_references.outer_query_refs().iter() {
                 if outer_ref.is_used() {
                     out.push(outer_ref.internal_id);
@@ -519,6 +820,16 @@ impl Plan {
         ids
     }
 
+    /// Collect every column and rowid read from `source`, including reads in
+    /// compound arms, recursive terms, and still-unemitted nested queries.
+    /// This is used by post-write RETURNING, where the target cursor no longer
+    /// represents the OLD/NEW row but correlated child plans still need it.
+    pub fn source_row_dependency(&self, source: PlanSourceId) -> Result<PlanRowDependency> {
+        let mut dependency = PlanRowDependency::default();
+        collect_plan_row_dependency(self, source, &mut dependency)?;
+        Ok(dependency)
+    }
+
     /// Returns true if this plan or any of its subplans read from the given table.
     /// (Not for Delete/Update plans)
     fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
@@ -536,6 +847,420 @@ impl Plan {
                     || plan.recursive_query.reads_table(database_id, table_name)
             }
             Plan::Delete(_) | Plan::Update(_) => false,
+        }
+    }
+}
+
+fn collect_expr_row_dependency(
+    expr: &Expr,
+    source: PlanSourceId,
+    dependency: &mut PlanRowDependency,
+) -> Result<()> {
+    walk_plan_expr(expr, &mut |expr| {
+        match expr {
+            Expr::Column(column) if column.source == source => {
+                if !dependency
+                    .columns
+                    .iter()
+                    .any(|existing| existing.column == column.column)
+                {
+                    dependency.columns.push(column.clone());
+                }
+            }
+            Expr::MergedColumn(column) if column.right.source == source => {
+                if !dependency
+                    .columns
+                    .iter()
+                    .any(|existing| existing.column == column.right.column)
+                {
+                    dependency.columns.push(column.right.clone());
+                }
+            }
+            Expr::RowId(expr_source) if *expr_source == source => dependency.rowid = true,
+            _ => {}
+        }
+        Ok(PlanWalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+fn collect_exprs_row_dependency<'a>(
+    exprs: impl IntoIterator<Item = &'a Expr>,
+    source: PlanSourceId,
+    dependency: &mut PlanRowDependency,
+) -> Result<()> {
+    for expr in exprs {
+        collect_expr_row_dependency(expr, source, dependency)?;
+    }
+    Ok(())
+}
+
+fn collect_order_terms_row_dependency(
+    terms: &[PlanOrderTerm],
+    source: PlanSourceId,
+    dependency: &mut PlanRowDependency,
+) -> Result<()> {
+    collect_exprs_row_dependency(terms.iter().map(|term| &term.expr), source, dependency)
+}
+
+fn collect_seek_row_dependency(
+    seek: &SeekDef,
+    source: PlanSourceId,
+    dependency: &mut PlanRowDependency,
+) -> Result<()> {
+    for constraint in &seek.prefix {
+        if let Some((_, expr, _)) = &constraint.eq {
+            collect_expr_row_dependency(expr, source, dependency)?;
+        }
+        if let Some((_, expr, _)) = &constraint.lower_bound {
+            collect_expr_row_dependency(expr, source, dependency)?;
+        }
+        if let Some((_, expr, _)) = &constraint.upper_bound {
+            collect_expr_row_dependency(expr, source, dependency)?;
+        }
+    }
+    for key in [&seek.start, &seek.end] {
+        if let SeekKeyComponent::Expr(expr) = &key.last_component {
+            collect_expr_row_dependency(expr, source, dependency)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_in_seek_row_dependency(
+    input: &InSeekSource,
+    source: PlanSourceId,
+    dependency: &mut PlanRowDependency,
+) -> Result<()> {
+    if let InSeekSource::LiteralList { values, .. } = input {
+        collect_exprs_row_dependency(values, source, dependency)?;
+    }
+    Ok(())
+}
+
+fn collect_operation_row_dependency(
+    operation: &Operation,
+    source: PlanSourceId,
+    dependency: &mut PlanRowDependency,
+) -> Result<()> {
+    match operation {
+        Operation::Scan(Scan::VirtualTable { constraints, .. }) => {
+            collect_exprs_row_dependency(constraints, source, dependency)?;
+        }
+        Operation::Search(Search::RowidEq { cmp_expr }) => {
+            collect_expr_row_dependency(cmp_expr, source, dependency)?;
+        }
+        Operation::Search(Search::Seek { seek_def, .. }) => {
+            collect_seek_row_dependency(seek_def, source, dependency)?;
+        }
+        Operation::Search(Search::InSeek { source: input, .. }) => {
+            collect_in_seek_row_dependency(input, source, dependency)?;
+        }
+        Operation::IndexMethodQuery(query) => {
+            collect_exprs_row_dependency(&query.arguments, source, dependency)?;
+        }
+        Operation::MultiIndexScan(scan) => {
+            for branch in &scan.branches {
+                match &branch.access {
+                    MultiIndexBranchAccess::Seek { seek_def } => {
+                        collect_seek_row_dependency(seek_def, source, dependency)?;
+                    }
+                    MultiIndexBranchAccess::InSeek { source: input } => {
+                        collect_in_seek_row_dependency(input, source, dependency)?;
+                    }
+                }
+                if let Some(residuals) = &branch.union_residuals {
+                    collect_exprs_row_dependency(
+                        residuals
+                            .pre_filter_exprs
+                            .iter()
+                            .chain(&residuals.post_filter_exprs),
+                        source,
+                        dependency,
+                    )?;
+                }
+            }
+        }
+        Operation::Scan(
+            Scan::BTreeTable { .. } | Scan::Subquery { .. } | Scan::RecursiveCteInput,
+        )
+        | Operation::HashJoin(_) => {}
+    }
+    Ok(())
+}
+
+fn collect_table_references_row_dependency(
+    tables: &TableReferences,
+    source: PlanSourceId,
+    dependency: &mut PlanRowDependency,
+) -> Result<()> {
+    for table in tables.joined_tables() {
+        collect_operation_row_dependency(&table.op, source, dependency)?;
+        collect_source_read_programs_row_dependency(&table.read_programs, source, dependency)?;
+        collect_exprs_row_dependency(
+            table
+                .check_constraints
+                .iter()
+                .map(|check| &check.expression),
+            source,
+            dependency,
+        )?;
+        for pattern in &table.index_method_patterns {
+            collect_exprs_row_dependency(
+                pattern.outputs.iter().map(|output| &output.expr),
+                source,
+                dependency,
+            )?;
+            if let Some(predicate) = &pattern.predicate {
+                collect_expr_row_dependency(predicate, source, dependency)?;
+            }
+            collect_order_terms_row_dependency(&pattern.order_by, source, dependency)?;
+            collect_exprs_row_dependency(
+                pattern.limit.iter().chain(pattern.offset.iter()),
+                source,
+                dependency,
+            )?;
+        }
+        for expressions in &table.index_expressions {
+            collect_exprs_row_dependency(
+                expressions.columns.iter().filter_map(Option::as_ref),
+                source,
+                dependency,
+            )?;
+            if let Some(predicate) = &expressions.predicate {
+                collect_expr_row_dependency(predicate, source, dependency)?;
+            }
+        }
+        collect_exprs_row_dependency(
+            table
+                .expression_index_usages
+                .iter()
+                .map(|usage| &usage.expr),
+            source,
+            dependency,
+        )?;
+        if let Table::FromClauseSubquery(subquery) = &table.table {
+            collect_plan_row_dependency(&subquery.plan, source, dependency)?;
+        }
+    }
+    for table in tables.outer_query_refs() {
+        collect_source_read_programs_row_dependency(&table.read_programs, source, dependency)?;
+    }
+    Ok(())
+}
+
+fn collect_source_read_programs_row_dependency(
+    programs: &SourceReadPrograms,
+    source: PlanSourceId,
+    dependency: &mut PlanRowDependency,
+) -> Result<()> {
+    collect_exprs_row_dependency(
+        programs
+            .generated_expressions
+            .iter()
+            .chain(&programs.default_expressions)
+            .filter_map(Option::as_ref),
+        source,
+        dependency,
+    )?;
+    for column_programs in programs.column_type_programs.iter().flatten() {
+        for call in column_programs.encode.iter().chain(&column_programs.decode) {
+            collect_exprs_row_dependency(&call.arguments, source, dependency)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_frame_boundary_row_dependency(
+    boundary: &FrameBoundary,
+    source: PlanSourceId,
+    dependency: &mut PlanRowDependency,
+) -> Result<()> {
+    match boundary {
+        FrameBoundary::Preceding(expr) | FrameBoundary::Following(expr) => {
+            collect_expr_row_dependency(expr, source, dependency)
+        }
+        FrameBoundary::UnboundedPreceding
+        | FrameBoundary::CurrentRow
+        | FrameBoundary::UnboundedFollowing => Ok(()),
+    }
+}
+
+fn collect_select_row_dependency(
+    plan: &SelectPlan,
+    source: PlanSourceId,
+    dependency: &mut PlanRowDependency,
+) -> Result<()> {
+    collect_table_references_row_dependency(&plan.table_references, source, dependency)?;
+    collect_exprs_row_dependency(
+        plan.result_columns.iter().map(|column| &column.expr),
+        source,
+        dependency,
+    )?;
+    collect_exprs_row_dependency(
+        plan.where_clause.iter().map(|term| &term.expr),
+        source,
+        dependency,
+    )?;
+    if let Some(group_by) = &plan.group_by {
+        collect_exprs_row_dependency(&group_by.exprs, source, dependency)?;
+        if let Some(having) = &group_by.having {
+            collect_exprs_row_dependency(having, source, dependency)?;
+        }
+    }
+    collect_order_terms_row_dependency(&plan.order_by, source, dependency)?;
+    for aggregate in &plan.aggregates {
+        collect_exprs_row_dependency(&aggregate.args, source, dependency)?;
+        collect_expr_row_dependency(&aggregate.original_expr, source, dependency)?;
+        if let Some(filter) = &aggregate.filter_expr {
+            collect_expr_row_dependency(filter, source, dependency)?;
+        }
+    }
+    collect_exprs_row_dependency(
+        plan.limit.iter().chain(plan.offset.iter()),
+        source,
+        dependency,
+    )?;
+    for row in &plan.values {
+        collect_exprs_row_dependency(row, source, dependency)?;
+    }
+    if let Some(window) = &plan.window {
+        collect_exprs_row_dependency(&window.partition_by, source, dependency)?;
+        collect_exprs_row_dependency(
+            window.order_by.iter().map(|(expr, _, _)| expr),
+            source,
+            dependency,
+        )?;
+        collect_frame_boundary_row_dependency(&window.frame.start, source, dependency)?;
+        collect_frame_boundary_row_dependency(&window.frame.end, source, dependency)?;
+        for function in &window.functions {
+            collect_expr_row_dependency(&function.original_expr, source, dependency)?;
+            if let Some(rewritten) = &function.rewritten {
+                collect_expr_row_dependency(&rewritten.expr, source, dependency)?;
+                if let Some(filter) = &rewritten.filter_expr {
+                    collect_expr_row_dependency(filter, source, dependency)?;
+                }
+            }
+        }
+    }
+    if let Some(SimpleAggregate::MinMax(definition)) = &plan.simple_aggregate {
+        collect_expr_row_dependency(&definition.argument, source, dependency)?;
+    }
+    for subquery in &plan.non_from_clause_subqueries {
+        if let SubqueryState::Unevaluated {
+            plan: Some(subquery_plan),
+        } = &subquery.state
+        {
+            collect_plan_row_dependency(subquery_plan, source, dependency)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_plan_row_dependency(
+    plan: &Plan,
+    source: PlanSourceId,
+    dependency: &mut PlanRowDependency,
+) -> Result<()> {
+    match plan {
+        Plan::Select(select) => collect_select_row_dependency(select, source, dependency),
+        Plan::CompoundSelect {
+            left,
+            right_most,
+            limit,
+            offset,
+            order_by,
+        } => {
+            for (select, _) in left {
+                collect_select_row_dependency(select, source, dependency)?;
+            }
+            collect_select_row_dependency(right_most, source, dependency)?;
+            collect_exprs_row_dependency(limit.iter().chain(offset.iter()), source, dependency)?;
+            collect_order_terms_row_dependency(order_by, source, dependency)
+        }
+        Plan::RecursiveCte(recursive) => {
+            collect_plan_row_dependency(&recursive.initial_query, source, dependency)?;
+            collect_plan_row_dependency(&recursive.recursive_query, source, dependency)?;
+            collect_exprs_row_dependency(
+                recursive.limit.iter().chain(recursive.offset.iter()),
+                source,
+                dependency,
+            )
+        }
+        Plan::Delete(delete) => {
+            collect_table_references_row_dependency(&delete.table_references, source, dependency)?;
+            collect_exprs_row_dependency(
+                delete.result_columns.iter().map(|column| &column.expr),
+                source,
+                dependency,
+            )?;
+            collect_exprs_row_dependency(
+                delete.where_clause.iter().map(|term| &term.expr),
+                source,
+                dependency,
+            )?;
+            collect_order_terms_row_dependency(&delete.order_by, source, dependency)?;
+            collect_exprs_row_dependency(
+                delete.limit.iter().chain(delete.offset.iter()),
+                source,
+                dependency,
+            )?;
+            if let Some(rowset) = &delete.rowset_plan {
+                collect_select_row_dependency(rowset, source, dependency)?;
+            }
+            for subquery in &delete.non_from_clause_subqueries {
+                if let SubqueryState::Unevaluated {
+                    plan: Some(subquery_plan),
+                } = &subquery.state
+                {
+                    collect_plan_row_dependency(subquery_plan, source, dependency)?;
+                }
+            }
+            Ok(())
+        }
+        Plan::Update(update) => {
+            collect_operation_row_dependency(&update.target_table.op, source, dependency)?;
+            collect_table_references_row_dependency(&update.from_tables, source, dependency)?;
+            for set in &update.set_clauses {
+                collect_expr_row_dependency(&set.expr, source, dependency)?;
+                if let Some(rewritten) = &set.update_from_result {
+                    collect_expr_row_dependency(rewritten, source, dependency)?;
+                }
+            }
+            collect_exprs_row_dependency(
+                update.defaults.iter().map(|(_, expr)| expr),
+                source,
+                dependency,
+            )?;
+            collect_exprs_row_dependency(
+                update.where_clause.iter().map(|term| &term.expr),
+                source,
+                dependency,
+            )?;
+            collect_exprs_row_dependency(
+                update.limit.iter().chain(update.offset.iter()),
+                source,
+                dependency,
+            )?;
+            if let Some(returning) = &update.returning {
+                collect_exprs_row_dependency(
+                    returning.iter().map(|column| &column.expr),
+                    source,
+                    dependency,
+                )?;
+            }
+            if let Some(write_set) = &update.write_set_plan {
+                collect_select_row_dependency(&write_set.select, source, dependency)?;
+            }
+            for subquery in &update.non_from_clause_subqueries {
+                if let SubqueryState::Unevaluated {
+                    plan: Some(subquery_plan),
+                } = &subquery.state
+                {
+                    collect_plan_row_dependency(subquery_plan, source, dependency)?;
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -627,6 +1352,15 @@ pub struct RecursiveCteQueueKey {
     pub nulls_override: Option<ast::NullsOrder>,
 }
 
+#[derive(Debug, Clone)]
+/// One priority expression resolved to a canonical recursive output column.
+pub struct RecursiveCteOrderTerm {
+    pub result_column_index: usize,
+    pub order: SortOrder,
+    pub nulls: Option<ast::NullsOrder>,
+    pub explicit_collation: Option<ResolvedCollation>,
+}
+
 impl QueryDestination {
     pub fn placeholder_for_subquery() -> Self {
         QueryDestination::CoroutineYield {
@@ -639,7 +1373,7 @@ impl QueryDestination {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct JoinOrderMember {
     /// The internal ID of the[TableReference]
-    pub table_id: TableInternalId,
+    pub table_id: PlanSourceId,
     /// The index of the table in the original join order.
     /// This is used to index into e.g. [TableReferences::joined_tables()]
     pub original_idx: usize,
@@ -710,7 +1444,7 @@ impl DistinctCtx {
 #[derive(Debug, Clone)]
 pub struct MinMaxDef {
     pub func: AggFunc,
-    pub argument: ast::Expr,
+    pub argument: Expr,
     pub order: SortOrder,
     /// Explicit COLLATE override, if any. `None` means use the column default.
     pub collation: Option<CollationSeq>,
@@ -739,13 +1473,13 @@ pub struct SelectPlan {
     /// group by clause
     pub group_by: Option<GroupBy>,
     /// order by clause
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
+    pub order_by: Vec<PlanOrderTerm>,
     /// all the aggregates collected from the result columns, order by, and (TODO) having clauses
     pub aggregates: Vec<Aggregate>,
     /// limit clause
-    pub limit: Option<Box<Expr>>,
+    pub limit: Option<Expr>,
     /// offset clause
-    pub offset: Option<Box<Expr>>,
+    pub offset: Option<Expr>,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
     /// the destination of the resulting rows from this plan.
@@ -773,9 +1507,9 @@ pub struct SelectPlan {
     pub simple_aggregate: Option<SimpleAggregate>,
     /// Parameters from EXISTS subquery result columns that were dropped during
     /// semi/anti-join unnesting. These need to be registered in the program's
-    /// parameter list even though no code is emitted for them, so that bind-time
-    /// validation (`has_slot`) succeeds.
-    pub phantom_params: Vec<ast::Variable>,
+    /// parameter list even though no code is emitted for them, so that final
+    /// program validation (`has_slot`) succeeds.
+    pub phantom_params: Vec<PlanParameter>,
 }
 
 impl SelectPlan {
@@ -793,6 +1527,7 @@ impl SelectPlan {
             .outer_query_refs()
             .iter()
             .any(|t| t.is_used())
+            || !self.table_references.outer_outputs().is_empty()
             || self.non_from_clause_subqueries.iter().any(|s| s.correlated)
             || self
                 .table_references
@@ -817,6 +1552,85 @@ impl SelectPlan {
             .non_from_clause_subqueries
             .iter()
             .any(|subquery| subquery.reads_table(database_id, table_name))
+    }
+}
+
+impl SelectPlan {
+    /// Collect every column and rowid this SELECT reads from `source`, including
+    /// reads made by its still-unemitted nested queries.
+    pub fn source_row_dependency(&self, source: PlanSourceId) -> Result<PlanRowDependency> {
+        let mut dependency = PlanRowDependency::default();
+        collect_select_row_dependency(self, source, &mut dependency)?;
+        Ok(dependency)
+    }
+
+    fn output_fact(&self, output: PlanOutputId) -> Option<PlanOutputFact> {
+        self.result_columns
+            .iter()
+            .find(|column| column.id == output)
+            .map(PlanOutputFact::from)
+            .or_else(|| {
+                self.table_references
+                    .outer_output(output)
+                    .map(|reference| reference.fact.clone())
+            })
+    }
+
+    fn subquery_output_fact(
+        &self,
+        query: PlanSubqueryId,
+        output: usize,
+    ) -> Option<&PlanOutputFact> {
+        self.non_from_clause_subqueries
+            .iter()
+            .find(|subquery| subquery.internal_id == query)?
+            .output_facts
+            .get(output)
+    }
+}
+
+impl PlanExprFactSource for SelectPlan {
+    fn output_type_fact(&self, output: PlanOutputId) -> Option<TypeFact> {
+        self.output_fact(output).map(|fact| fact.type_fact)
+    }
+
+    fn subquery_output_type_fact(&self, query: PlanSubqueryId, output: usize) -> Option<TypeFact> {
+        self.subquery_output_fact(query, output)
+            .map(|fact| fact.type_fact.clone())
+    }
+
+    fn subquery_width(&self, query: PlanSubqueryId) -> Option<usize> {
+        self.non_from_clause_subqueries
+            .iter()
+            .find(|subquery| subquery.internal_id == query)
+            .map(|subquery| subquery.output_facts.len())
+    }
+
+    fn output_affinity(&self, output: PlanOutputId) -> Option<PlanExprAffinity> {
+        self.output_fact(output).map(|fact| fact.affinity)
+    }
+
+    fn subquery_output_affinity(
+        &self,
+        query: PlanSubqueryId,
+        output: usize,
+    ) -> Option<PlanExprAffinity> {
+        self.subquery_output_fact(query, output)
+            .map(|fact| fact.affinity)
+    }
+
+    fn output_collation(&self, output: PlanOutputId) -> Option<CollationSeq> {
+        self.output_fact(output)
+            .and_then(|fact| fact.collation.map(|collation| *collation.value()))
+    }
+
+    fn subquery_output_collation(
+        &self,
+        query: PlanSubqueryId,
+        output: usize,
+    ) -> Option<CollationSeq> {
+        self.subquery_output_fact(query, output)
+            .and_then(|fact| fact.collation.as_ref().map(|collation| *collation.value()))
     }
 }
 
@@ -873,15 +1687,15 @@ pub struct DeletePlan {
     /// where clause split into a vec at 'AND' boundaries.
     pub where_clause: Vec<WhereTerm>,
     /// order by clause
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
+    pub order_by: Vec<PlanOrderTerm>,
     /// limit clause
-    pub limit: Option<Box<Expr>>,
+    pub limit: Option<Expr>,
     /// offset clause
-    pub offset: Option<Box<Expr>>,
+    pub offset: Option<Expr>,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
     /// Indexes that must be updated by the delete operation.
-    pub indexes: Vec<Arc<Index>>,
+    pub indexes: Vec<ResolvedIndex>,
     /// When DELETE cannot safely write while scanning, we first collect rowids into a RowSet.
     pub rowset_plan: Option<SelectPlan>,
     /// Register ID for the RowSet (if rowset_plan is Some)
@@ -896,7 +1710,7 @@ pub struct DeletePlan {
 pub struct UpdateSetClause {
     pub column_index: usize,
     /// Original user-visible SET expression.
-    pub expr: Box<ast::Expr>,
+    pub expr: Expr,
     /// In UPDATE FROM, SET clause expressions are rewritten to read from the
     /// scratch table populated before the write loop.
     ///
@@ -905,11 +1719,11 @@ pub struct UpdateSetClause {
     /// `Column` read from the ephemeral scratch table that was populated during
     /// the collection phase. That column in the scratch table contains the evaluated result
     /// of s.x + 1.
-    pub update_from_result: Option<Box<ast::Expr>>,
+    pub update_from_result: Option<Expr>,
 }
 
 impl UpdateSetClause {
-    pub fn new(column_index: usize, expr: Box<ast::Expr>) -> Self {
+    pub fn new(column_index: usize, expr: Expr) -> Self {
         Self {
             column_index,
             expr,
@@ -919,8 +1733,8 @@ impl UpdateSetClause {
 
     /// If UPDATE ... FROM, the this is the materialized result of a SET clause expression derived from the FROM clause;
     /// otherwise, it is the original expression.
-    pub fn emitted_expr(&self) -> &ast::Expr {
-        self.update_from_result.as_deref().unwrap_or(&self.expr)
+    pub fn emitted_expr(&self) -> &Expr {
+        self.update_from_result.as_ref().unwrap_or(&self.expr)
     }
 }
 
@@ -929,7 +1743,7 @@ impl UpdateSetClause {
 #[derive(Debug, Clone)]
 pub struct WriteSetPlan {
     pub select: SelectPlan,
-    pub scratch_table_id: TableInternalId,
+    pub scratch_table_id: PlanSourceId,
 }
 
 #[derive(Debug, Clone)]
@@ -940,20 +1754,23 @@ pub struct UpdatePlan {
     ///
     /// Plain UPDATE statements keep this empty except for any outer-query
     /// references (for example preplanned CTE definitions) that are still needed
-    /// when binding subqueries later in the pipeline.
+    /// when emitting planned subqueries later in the pipeline.
     pub from_tables: TableReferences,
     /// Conflict resolution strategy (e.g., OR IGNORE, OR REPLACE)
     pub or_conflict: Option<ResolveType>,
     /// SET clause assignments
     pub set_clauses: Vec<UpdateSetClause>,
+    /// Target-column defaults instantiated during semantic analysis, used by
+    /// conflict handling without reopening stored schema expressions.
+    pub defaults: Vec<(usize, Expr)>,
     pub where_clause: Vec<WhereTerm>,
-    pub limit: Option<Box<Expr>>,
-    pub offset: Option<Box<Expr>>,
+    pub limit: Option<Expr>,
+    pub offset: Option<Expr>,
     /// Optional RETURNING clause.
     pub returning: Option<Vec<ResultSetColumn>>,
     /// Whether the WHERE clause is always false.
     pub contains_constant_false_condition: bool,
-    pub indexes_to_update: Vec<Arc<Index>>,
+    pub indexes_to_update: Vec<ResolvedIndex>,
     /// Prebuilt write-set SELECT for Halloween protection / UPDATE FROM.
     pub write_set_plan: Option<WriteSetPlan>,
     /// For ALTER TABLE turso-db emits appropriate DDL statement in the "updates"
@@ -967,6 +1784,18 @@ pub struct UpdatePlan {
 }
 
 impl UpdatePlan {
+    /// Build the target-only scope used while choosing an UPDATE access path.
+    /// Runtime rows such as trigger NEW/OLD remain visible even though they do
+    /// not own a FROM cursor.
+    pub fn build_target_scope_tables(&self) -> TableReferences {
+        let mut target_tables = TableReferences::new(
+            vec![self.target_table.clone()],
+            self.from_tables.outer_query_refs().to_vec(),
+        );
+        target_tables.extend_runtime_sources_from(&self.from_tables);
+        target_tables
+    }
+
     /// Combine the UPDATE target (always first) and the `FROM`-clause tables
     /// into one `TableReferences` — the read-side scope used for planning
     /// outer-`WHERE` subqueries, `EXPLAIN QUERY PLAN`, and rendering the plan
@@ -987,106 +1816,6 @@ impl UpdatePlan {
 pub enum IterationDirection {
     Forwards,
     Backwards,
-}
-
-pub fn select_star(
-    tables: &[JoinedTable],
-    out_columns: &mut Vec<ResultSetColumn>,
-    right_join_swapped: bool,
-    long_names: bool,
-) -> crate::Result<()> {
-    // RIGHT JOIN swapped tables; iterate in reverse to restore original column order.
-    let table_iter: Vec<&JoinedTable> = if right_join_swapped {
-        tables.iter().rev().collect()
-    } else {
-        tables.iter().collect()
-    };
-    for table in table_iter {
-        // Semi/anti-join tables are internal (from EXISTS/NOT EXISTS unnesting)
-        // and should not contribute columns to SELECT *.
-        if table
-            .join_info
-            .as_ref()
-            .is_some_and(|ji| ji.is_semi_or_anti())
-        {
-            continue;
-        }
-        // If this table's identifier appears more than once in the FROM clause,
-        // expanding * would produce ambiguous column references (matches SQLite).
-        // However, columns deduplicated by USING/NATURAL are not ambiguous.
-        let has_duplicate_identifier = tables
-            .iter()
-            .filter(|t| t.identifier == table.identifier)
-            .count()
-            > 1;
-        if has_duplicate_identifier {
-            // Collect all USING columns from duplicate tables (both this table's
-            // own join_info and the join_info of other tables with the same identifier).
-            let using_cols: Vec<&str> = tables
-                .iter()
-                .filter(|t| t.identifier == table.identifier)
-                .filter_map(|t| t.join_info.as_ref())
-                .flat_map(|ji| ji.using.iter().map(|u| u.as_str()))
-                .collect();
-            for col in table.columns().iter().filter(|c| !c.hidden()) {
-                if let Some(col_name) = &col.name {
-                    let in_using = using_cols.iter().any(|u| u.eq_ignore_ascii_case(col_name));
-                    if !in_using {
-                        crate::bail_parse_error!(
-                            "ambiguous column name: {}.{}",
-                            table.identifier,
-                            col_name
-                        );
-                    }
-                }
-            }
-        }
-        out_columns.extend(
-            table
-                .columns()
-                .iter()
-                .enumerate()
-                .filter(|(_, col)| !col.hidden())
-                .filter(|(_, col)| {
-                    // If we are joining with USING, we need to deduplicate the columns from the right table
-                    // that are also present in the USING clause.
-                    if let Some(join_info) = &table.join_info {
-                        !join_info.using.iter().any(|using_col| {
-                            col.name
-                                .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(using_col.as_str()))
-                        })
-                    } else {
-                        true
-                    }
-                })
-                .map(|(i, col)| {
-                    // Like SQLite, SELECT * sets column names as aliases (ENAME_NAME),
-                    // bypassing full/short column name logic in get_column_name().
-                    // When long_names (full=ON, short=OFF), use "TABLE.COLUMN".
-                    // Otherwise, use just "COLUMN".
-                    let alias = col.name.as_ref().map(|col_name| {
-                        if long_names {
-                            format!("{}.{}", table.identifier, col_name)
-                        } else {
-                            col_name.clone()
-                        }
-                    });
-                    ResultSetColumn {
-                        alias,
-                        implicit_column_name: None,
-                        expr: ast::Expr::Column {
-                            database: None,
-                            table: table.internal_id,
-                            column: i,
-                            is_rowid_alias: col.is_rowid_alias(),
-                        },
-                        contains_aggregates: false,
-                    }
-                }),
-        );
-    }
-    Ok(())
 }
 
 /// The type of join between two tables.
@@ -1145,6 +1874,26 @@ impl JoinInfo {
     }
 }
 
+/// Source-local programs needed whenever a logical column is read. The same
+/// allocation is shared by a joined table and every correlated outer
+/// reference derived from it.
+#[derive(Debug, Clone)]
+pub struct SourceReadPrograms {
+    pub generated_expressions: Vec<Option<Expr>>,
+    pub default_expressions: Vec<Option<Expr>>,
+    pub column_type_programs: Vec<Option<PlanColumnTypePrograms>>,
+}
+
+impl SourceReadPrograms {
+    pub fn none(column_count: usize) -> Self {
+        Self {
+            generated_expressions: vec![None; column_count],
+            default_expressions: vec![None; column_count],
+            column_type_programs: vec![None; column_count],
+        }
+    }
+}
+
 /// A joined table in the query plan.
 /// For example,
 /// ```sql
@@ -1161,10 +1910,13 @@ pub struct JoinedTable {
     pub op: Operation,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
+    /// Catalog identity retained for real table sources. Synthetic subquery,
+    /// CTE, and scratch tables have no catalog object.
+    pub resolved_table: Option<ResolvedTable>,
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
     pub identifier: String,
-    /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
-    pub internal_id: TableInternalId,
+    /// Plan identity used by [`Expr::Column`] to refer to this source.
+    pub internal_id: PlanSourceId,
     /// The join info for this table reference, if it is the right side of a join (which all except the first table reference have)
     pub join_info: Option<JoinInfo>,
     /// Bitmask of columns that are referenced in the query.
@@ -1179,7 +1931,7 @@ pub struct JoinedTable {
     pub column_use_counts: Vec<usize>,
     /// Expressions referencing this table that may be satisfied by an expression index.
     ///
-    /// Each entry stores the bound query expression and the columns it
+    /// Each entry stores the planned query expression and the columns it
     /// needs. During covering checks we ask: does an index contain this
     /// expression? If yes, all columns that *only* feed this expression can be
     /// removed from the required-column set.
@@ -1187,34 +1939,102 @@ pub struct JoinedTable {
     /// The index of the database. "main" is always zero.
     pub database_id: usize,
     /// INDEXED BY / NOT INDEXED hint from the SQL statement.
-    pub indexed: Option<ast::Indexed>,
-    /// Custom index-method patterns resolved to this table's internal id.
-    /// The optimizer only matches these bound expressions; it never resolves
+    pub index_hint: PlanIndexHint,
+    /// Custom index-method patterns resolved to this source identity.
+    /// The optimizer only matches these planned expressions; it never resolves
     /// names from an index method's raw SQL pattern.
-    pub bound_index_method_patterns: Vec<BoundIndexMethodPattern>,
-    /// Schema index expressions rebound to this table reference during binding.
-    pub bound_index_expressions: Vec<BoundIndexExpressions>,
+    pub index_method_patterns: Vec<PlanIndexMethodPattern>,
+    /// Schema index expressions instantiated for this source during semantic analysis.
+    pub index_expressions: Vec<PlanIndexExpressions>,
+    /// Generated/default/custom-type programs shared with correlated reads of
+    /// this same source identity.
+    pub read_programs: Arc<SourceReadPrograms>,
+    /// CHECK constraints resolved and lowered for this exact DML target.
+    pub check_constraints: Vec<PlanCheckConstraint>,
 }
 
-/// A custom index-method query pattern after name resolution.
-///
-/// The binder removes the pattern's FROM clause after validating it and keeps
-/// only the expressions the optimizer compares with the query plan.
 #[derive(Debug, Clone)]
-pub struct BoundIndexMethodPattern {
-    pub index_name: String,
+pub enum PlanIndexHint {
+    None,
+    NotIndexed,
+    Indexed(ResolvedIndex),
+}
+
+/// An index selected by physical planning. Catalog indexes retain their
+/// semantic identity and snapshot; planner-created ephemeral indexes are
+/// explicitly distinguished instead of masquerading as catalog objects.
+#[derive(Debug, Clone)]
+pub enum PlanIndex {
+    Catalog(ResolvedIndex),
+    Ephemeral(Arc<Index>),
+}
+
+impl PlanIndex {
+    pub fn value(&self) -> &Index {
+        match self {
+            Self::Catalog(index) => index.value(),
+            Self::Ephemeral(index) => index,
+        }
+    }
+
+    pub fn handle(&self) -> Arc<Index> {
+        match self {
+            Self::Catalog(index) => index.handle(),
+            Self::Ephemeral(index) => index.clone(),
+        }
+    }
+
+    pub fn resolved(&self) -> Option<&ResolvedIndex> {
+        match self {
+            Self::Catalog(index) => Some(index),
+            Self::Ephemeral(_) => None,
+        }
+    }
+}
+
+impl std::ops::Deref for PlanIndex {
+    type Target = Index;
+
+    fn deref(&self) -> &Self::Target {
+        self.value()
+    }
+}
+
+impl AsRef<Index> for PlanIndex {
+    fn as_ref(&self) -> &Index {
+        self.value()
+    }
+}
+
+impl Default for PlanIndexHint {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+/// A custom index-method query pattern lowered from Semantic HIR.
+#[derive(Debug, Clone)]
+pub struct PlanIndexMethodPattern {
+    pub index: ResolvedIndex,
     pub pattern_idx: usize,
-    pub columns: Vec<ast::ResultColumn>,
-    pub where_clause: Option<Box<ast::Expr>>,
-    pub order_by: Vec<ast::SortedColumn>,
-    pub limit: Option<ast::Limit>,
+    pub outputs: Vec<ResultSetColumn>,
+    pub predicate: Option<Expr>,
+    pub order_by: Vec<PlanOrderTerm>,
+    pub limit: Option<Expr>,
+    pub offset: Option<Expr>,
 }
 
 #[derive(Debug, Clone)]
-pub struct BoundIndexExpressions {
-    pub index_name: String,
-    pub columns: Vec<Option<Box<ast::Expr>>>,
-    pub where_clause: Option<Box<ast::Expr>>,
+pub struct PlanIndexExpressions {
+    pub index: ResolvedIndex,
+    pub columns: Vec<Option<Expr>>,
+    pub predicate: Option<Expr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanCheckConstraint {
+    pub expression: Expr,
+    pub description: String,
 }
 
 impl JoinedTable {
@@ -1244,10 +2064,12 @@ impl JoinedTable {
 pub struct OuterQueryReference {
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
     pub identifier: String,
-    /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
-    pub internal_id: TableInternalId,
+    /// Plan identity used by [`Expr::Column`] to refer to this source.
+    pub internal_id: PlanSourceId,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
+    /// The exact source read programs owned by the outer source.
+    pub read_programs: Arc<SourceReadPrograms>,
     /// Columns hidden by USING/NATURAL deduplication in the outer scope.
     pub using_dedup_hidden_cols: ColumnMask,
     /// Bitmask of columns that are referenced in the query.
@@ -1276,13 +2098,15 @@ impl OuterQueryReference {
     /// by name, but its columns are not visible for column resolution.
     pub fn cte_definition_only(
         identifier: String,
-        internal_id: TableInternalId,
+        internal_id: PlanSourceId,
         table: Table,
     ) -> Self {
+        let read_programs = Arc::new(SourceReadPrograms::none(table.columns().len()));
         Self {
             identifier,
             internal_id,
             table,
+            read_programs,
             using_dedup_hidden_cols: ColumnMask::default(),
             col_used_mask: ColumnUsedMask::default(),
             cte_definition_only: true,
@@ -1309,6 +2133,17 @@ impl OuterQueryReference {
     }
 }
 
+/// How a resolved plan source participates in one expression scope.
+///
+/// Runtime sources are valid resolved values, but they have no FROM cursor and
+/// therefore contribute no bit to optimizer table masks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanSourceScope {
+    Joined(usize),
+    OuterQuery,
+    Runtime,
+}
+
 #[derive(Debug, Clone)]
 /// A collection of table references in a given SQL statement.
 ///
@@ -1329,6 +2164,13 @@ pub struct TableReferences {
     joined_tables: Vec<JoinedTable>,
     /// Tables from outer scopes that are referenced in this query scope.
     outer_query_refs: Vec<OuterQueryReference>,
+    /// Resolved cursorless sources whose values are supplied by runtime
+    /// bindings, such as trigger NEW/OLD and schema-expression inputs.
+    runtime_sources: Vec<PlanSourceId>,
+    /// Result values supplied by enclosing query blocks. These are registers,
+    /// not table cursors, but their source dependencies still decide when a
+    /// correlated child may run.
+    outer_outputs: Vec<PlanOuterOutputReference>,
     /// Set when a RIGHT JOIN is rewritten as LEFT JOIN by swapping the two tables,
     /// so `select_star` emits columns in the original user-visible order.
     right_join_swapped: bool,
@@ -1353,6 +2195,8 @@ impl TableReferences {
         Self {
             joined_tables,
             outer_query_refs,
+            runtime_sources: Vec::new(),
+            outer_outputs: Vec::new(),
             right_join_swapped: false,
         }
     }
@@ -1361,12 +2205,16 @@ impl TableReferences {
         Self {
             joined_tables: Vec::new(),
             outer_query_refs: Vec::new(),
+            runtime_sources: Vec::new(),
+            outer_outputs: Vec::new(),
             right_join_swapped: false,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.joined_tables.is_empty() && self.outer_query_refs.is_empty()
+        self.joined_tables.is_empty()
+            && self.outer_query_refs.is_empty()
+            && self.runtime_sources.is_empty()
     }
 
     /// Mark that tables were swapped for a RIGHT-to-LEFT JOIN rewrite.
@@ -1387,6 +2235,66 @@ impl TableReferences {
     /// Add a new [OuterQueryReference] to the query plan.
     pub fn add_outer_query_reference(&mut self, outer_query_reference: OuterQueryReference) {
         self.outer_query_refs.push(outer_query_reference);
+    }
+
+    /// Add one source whose values come from runtime bindings instead of a
+    /// table cursor.
+    pub(crate) fn add_runtime_source(&mut self, source: PlanSourceId) {
+        assert!(
+            self.find_table_by_internal_id(source).is_none(),
+            "runtime source {source} also appears as a table source"
+        );
+        if !self.runtime_sources.contains(&source) {
+            self.runtime_sources.push(source);
+        }
+    }
+
+    pub(crate) fn extend_runtime_sources_from(&mut self, other: &Self) {
+        for source in &other.runtime_sources {
+            self.add_runtime_source(*source);
+        }
+    }
+
+    /// Register an enclosing output that is valid in this expression scope.
+    pub(crate) fn add_outer_output(&mut self, reference: PlanOuterOutputReference) {
+        if self
+            .outer_outputs
+            .iter()
+            .any(|candidate| candidate.output == reference.output)
+        {
+            return;
+        }
+        self.outer_outputs.push(reference);
+        self.outer_outputs.sort_by_key(|reference| reference.output);
+    }
+
+    pub(crate) fn outer_outputs(&self) -> &[PlanOuterOutputReference] {
+        &self.outer_outputs
+    }
+
+    pub(crate) fn outer_output(&self, output: PlanOutputId) -> Option<&PlanOuterOutputReference> {
+        self.outer_outputs
+            .iter()
+            .find(|reference| reference.output == output)
+    }
+
+    /// Classify a resolved source in this exact plan scope.
+    pub(crate) fn source_scope(&self, source: PlanSourceId) -> Option<PlanSourceScope> {
+        self.joined_tables
+            .iter()
+            .position(|table| table.internal_id == source)
+            .map(PlanSourceScope::Joined)
+            .or_else(|| {
+                self.outer_query_refs
+                    .iter()
+                    .any(|table| table.internal_id == source)
+                    .then_some(PlanSourceScope::OuterQuery)
+            })
+            .or_else(|| {
+                self.runtime_sources
+                    .contains(&source)
+                    .then_some(PlanSourceScope::Runtime)
+            })
     }
 
     /// Returns an immutable reference to the [JoinedTable]s in the query plan.
@@ -1411,24 +2319,66 @@ impl TableReferences {
     /// SELECT lists `LOWER(name)` and an index exists on `LOWER(name)`, we
     /// can plan a covering scan because the expression value lives inside
     /// the index key.
-    pub fn register_expression_index_usage(&mut self, expr: &ast::Expr) {
-        let Some((table_id, columns_mask)) = single_table_column_usage(expr) else {
-            return;
-        };
-        if !self
-            .joined_tables()
-            .iter()
-            .any(|table| table.internal_id == table_id)
-        {
-            return;
+    pub fn register_plan_expr_usage(&mut self, expr: &Expr) -> Result<()> {
+        let dependencies = plan_expr_dependencies(expr)?;
+        let mut usages = Vec::new();
+        walk_plan_expr_dependencies(expr, &mut |candidate, dependencies| {
+            if !dependencies.outputs.is_empty() || !dependencies.subqueries.is_empty() {
+                return Ok(PlanWalkControl::Continue);
+            }
+
+            let mut source = None;
+            let mut columns = ColumnUsedMask::default();
+            for (candidate_source, use_kind) in &dependencies.source_uses {
+                if source.is_some_and(|source| source != *candidate_source) {
+                    return Ok(PlanWalkControl::Continue);
+                }
+                source = Some(*candidate_source);
+                match use_kind {
+                    PlanColumnUse::Column(column) => columns.set(*column)?,
+                    PlanColumnUse::RowId => return Ok(PlanWalkControl::Continue),
+                }
+            }
+
+            if let Some(source) = source {
+                usages.push((source, candidate.clone(), columns));
+            }
+            Ok(PlanWalkControl::Continue)
+        })?;
+
+        for (source, candidate, columns) in usages {
+            if let Some(table) = self
+                .joined_tables_mut()
+                .iter_mut()
+                .find(|table| table.internal_id == source)
+            {
+                table.register_expression_index_usage(candidate, columns);
+            }
         }
-        if let Some(table_ref_mut) = self
-            .joined_tables_mut()
-            .iter_mut()
-            .find(|t| t.internal_id == table_id)
-        {
-            table_ref_mut.register_expression_index_usage(expr.clone(), columns_mask);
+
+        for (source, usage) in dependencies.source_uses {
+            match self.source_scope(source) {
+                Some(PlanSourceScope::Runtime) => continue,
+                Some(PlanSourceScope::Joined(_) | PlanSourceScope::OuterQuery) => {}
+                None => {
+                    return Err(crate::LimboError::InternalError(format!(
+                        "expression references plan source {source} outside its query scope"
+                    )));
+                }
+            }
+            match usage {
+                PlanColumnUse::Column(column) => self.mark_column_used(source, column),
+                PlanColumnUse::RowId => self.mark_rowid_referenced(source),
+            }
         }
+        for output in dependencies.outputs {
+            if self.outer_output(output).is_none() {
+                return Err(crate::LimboError::InternalError(format!(
+                    "expression references plan output {output} outside its query scope"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Returns an immutable reference to the [OuterQueryReference]s in the query plan.
@@ -1439,7 +2389,7 @@ impl TableReferences {
     /// Returns an immutable reference to the [OuterQueryReference] with the given internal ID.
     pub fn find_outer_query_ref_by_internal_id(
         &self,
-        internal_id: TableInternalId,
+        internal_id: PlanSourceId,
     ) -> Option<&OuterQueryReference> {
         self.outer_query_refs
             .iter()
@@ -1449,7 +2399,7 @@ impl TableReferences {
     /// Returns a mutable reference to the [OuterQueryReference] with the given internal ID.
     pub fn find_outer_query_ref_by_internal_id_mut(
         &mut self,
-        internal_id: TableInternalId,
+        internal_id: PlanSourceId,
     ) -> Option<&mut OuterQueryReference> {
         self.outer_query_refs
             .iter_mut()
@@ -1459,10 +2409,7 @@ impl TableReferences {
     /// Returns an immutable reference to the [Table] with the given internal ID,
     /// plus a boolean indicating whether the table is a joined table from the current query scope (false),
     /// or an outer query reference (true).
-    pub fn find_table_by_internal_id(
-        &self,
-        internal_id: TableInternalId,
-    ) -> Option<(bool, &Table)> {
+    pub fn find_table_by_internal_id(&self, internal_id: PlanSourceId) -> Option<(bool, &Table)> {
         self.joined_tables
             .iter()
             .find(|t| t.internal_id == internal_id)
@@ -1472,6 +2419,24 @@ impl TableReferences {
                     .iter()
                     .find(|t| t.internal_id == internal_id)
                     .map(|t| (true, &t.table))
+            })
+    }
+
+    /// Return the source-local read programs for either a current-scope table
+    /// or a correlated outer reference.
+    pub fn find_source_read_programs_by_internal_id(
+        &self,
+        internal_id: PlanSourceId,
+    ) -> Option<&SourceReadPrograms> {
+        self.joined_tables
+            .iter()
+            .find(|table| table.internal_id == internal_id)
+            .map(|table| table.read_programs.as_ref())
+            .or_else(|| {
+                self.outer_query_refs
+                    .iter()
+                    .find(|table| table.internal_id == internal_id)
+                    .map(|table| table.read_programs.as_ref())
             })
     }
 
@@ -1526,7 +2491,7 @@ impl TableReferences {
     pub fn find_table_and_internal_id_by_identifier(
         &self,
         identifier: &str,
-    ) -> Option<(TableInternalId, &Table)> {
+    ) -> Option<(PlanSourceId, &Table)> {
         self.joined_tables
             .iter()
             .find(|t| t.identifier == identifier)
@@ -1542,7 +2507,7 @@ impl TableReferences {
     /// Returns an immutable reference to the [JoinedTable] with the given internal ID.
     pub fn find_joined_table_by_internal_id(
         &self,
-        internal_id: TableInternalId,
+        internal_id: PlanSourceId,
     ) -> Option<&JoinedTable> {
         self.joined_tables
             .iter()
@@ -1552,7 +2517,7 @@ impl TableReferences {
     /// Returns a mutable reference to the [JoinedTable] with the given internal ID.
     pub fn find_joined_table_by_internal_id_mut(
         &mut self,
-        internal_id: TableInternalId,
+        internal_id: PlanSourceId,
     ) -> Option<&mut JoinedTable> {
         self.joined_tables
             .iter_mut()
@@ -1560,7 +2525,7 @@ impl TableReferences {
     }
 
     /// Marks a column as used; used means that the column is referenced in the query.
-    pub fn mark_column_used(&mut self, internal_id: TableInternalId, column_index: usize) {
+    pub fn mark_column_used(&mut self, internal_id: PlanSourceId, column_index: usize) {
         if let Some(joined_table) = self.find_joined_table_by_internal_id_mut(internal_id) {
             joined_table.mark_column_used(column_index);
         } else if let Some(outer_query_ref) =
@@ -1576,7 +2541,7 @@ impl TableReferences {
 
     /// Marks the rowid of a table as referenced. This is tracked separately
     /// from column usage because rowid is not a real column.
-    pub fn mark_rowid_referenced(&mut self, internal_id: TableInternalId) {
+    pub fn mark_rowid_referenced(&mut self, internal_id: PlanSourceId) {
         if let Some(outer_query_ref) = self.find_outer_query_ref_by_internal_id_mut(internal_id) {
             outer_query_ref.rowid_referenced = true;
         }
@@ -1609,6 +2574,8 @@ impl TableReferences {
         let TableReferences {
             joined_tables,
             outer_query_refs,
+            runtime_sources,
+            outer_outputs,
             right_join_swapped: _,
         } = other;
 
@@ -1618,6 +2585,12 @@ impl TableReferences {
         // and copying every element into a fresh buffer.
         take_or_append(&mut self.joined_tables, joined_tables);
         take_or_append(&mut self.outer_query_refs, outer_query_refs);
+        for source in runtime_sources {
+            self.add_runtime_source(source);
+        }
+        for output in outer_outputs {
+            self.add_outer_output(output);
+        }
     }
 }
 
@@ -2109,9 +3082,9 @@ impl<T> TryFrom<u128> for BitSet<T> {
 
 #[derive(Clone, Debug)]
 pub struct ExpressionIndexUsage {
-    /// Query expression with column references resolved by the binder.
+    /// Query expression with column references fixed by semantic analysis.
     /// Example: `lower(name)` for INDEX ON t(lower(name)).
-    pub bound_expr: Box<ast::Expr>,
+    pub expr: Expr,
     /// Columns required to compute the expression. Helps decide whether using
     /// the expression value from the index fully covers those column reads.
     pub columns_mask: ColumnUsedMask,
@@ -2131,9 +3104,9 @@ pub struct HashJoinKey {
 
 impl HashJoinKey {
     /// Get the build table's expression from the WHERE clause.
-    pub fn get_build_expr<'a>(&self, where_clause: &'a [WhereTerm]) -> &'a ast::Expr {
+    pub fn get_build_expr<'a>(&self, where_clause: &'a [WhereTerm]) -> &'a Expr {
         let where_term = &where_clause[self.where_clause_idx];
-        let Ok(Some((lhs, _, rhs))) = as_binary_components(&where_term.expr) else {
+        let Expr::Binary { lhs, rhs, .. } = &where_term.expr else {
             panic!("HashJoinKey: expected a valid binary expression");
         };
         if self.build_side == BinaryExprSide::Lhs {
@@ -2144,9 +3117,9 @@ impl HashJoinKey {
     }
 
     /// Get the probe table's expression from the WHERE clause.
-    pub fn get_probe_expr<'a>(&self, where_clause: &'a [WhereTerm]) -> &'a ast::Expr {
+    pub fn get_probe_expr<'a>(&self, where_clause: &'a [WhereTerm]) -> &'a Expr {
         let where_term = &where_clause[self.where_clause_idx];
-        let Ok(Some((lhs, _, rhs))) = as_binary_components(&where_term.expr) else {
+        let Expr::Binary { lhs, rhs, .. } = &where_term.expr else {
             panic!("HashJoinKey: expected a valid binary expression");
         };
         if self.build_side == BinaryExprSide::Lhs {
@@ -2229,10 +3202,10 @@ pub struct UnionBranchPrePostFilters {
     /// Outer-table-only residuals evaluated before the branch's index seek.
     /// These reference only tables from earlier (outer) loops, so they can
     /// short-circuit the entire branch without touching the index.
-    pub pre_filter_exprs: Vec<ast::Expr>,
+    pub pre_filter_exprs: Vec<Expr>,
     /// Residual filter expressions that could not be satisfied by the index seek.
     /// Applied within the branch loop after positioning on the table row.
-    pub post_filter_exprs: Vec<ast::Expr>,
+    pub post_filter_exprs: Vec<Expr>,
     /// Whether residual evaluation needs the scanned table cursor positioned.
     pub requires_table_cursor: bool,
 }
@@ -2241,7 +3214,7 @@ pub struct UnionBranchPrePostFilters {
 #[derive(Debug, Clone)]
 pub struct MultiIndexBranch {
     /// The index to use for this branch, or None for rowid access
-    pub index: Option<Arc<Index>>,
+    pub index: Option<PlanIndex>,
     /// How this branch probes the table/index.
     pub access: MultiIndexBranchAccess,
     /// Estimated number of rows from this branch
@@ -2302,7 +3275,7 @@ impl Operation {
         }
     }
 
-    pub fn index(&self) -> Option<&Arc<Index>> {
+    pub fn index(&self) -> Option<&PlanIndex> {
         match self {
             Operation::Scan(Scan::BTreeTable { index, .. }) => index.as_ref(),
             Operation::Search(Search::Seek { index, .. })
@@ -2353,18 +3326,15 @@ fn query_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
 ) -> Result<alloc::Vec<Column>> {
-    let (result_columns, table_references): (&[ResultSetColumn], &TableReferences) = match plan {
-        Plan::Select(select_plan) => (&select_plan.result_columns, &select_plan.table_references),
+    let result_columns: &[ResultSetColumn] = match plan {
+        Plan::Select(select_plan) => &select_plan.result_columns,
         Plan::CompoundSelect {
             left, right_most, ..
         } => left
             .first()
-            .map(|(select, _)| (&select.result_columns[..], &select.table_references))
-            .unwrap_or((&right_most.result_columns, &right_most.table_references)),
-        Plan::RecursiveCte(recursive_cte) => (
-            recursive_cte.initial_query.select_result_columns(),
-            recursive_cte.initial_query.select_table_references(),
-        ),
+            .map(|(select, _)| &select.result_columns[..])
+            .unwrap_or(&right_most.result_columns),
+        Plan::RecursiveCte(recursive_cte) => &recursive_cte.result_columns,
         Plan::Delete(_) | Plan::Update(_) => {
             unreachable!("DELETE/UPDATE plans cannot define query output columns")
         }
@@ -2390,15 +3360,17 @@ fn query_output_columns(
         .map(|(column_index, result_column)| {
             let name = explicit_columns
                 .and_then(|names| names.get(column_index).cloned())
-                .or_else(|| result_column.name(table_references).map(String::from));
+                .unwrap_or_else(|| result_column.name.clone());
             let column_type = compound_arms
                 .as_ref()
-                .map(|arms| compound_column_affinity(arms, column_index).to_type())
-                .unwrap_or_else(|| {
-                    infer_type_from_expr(&result_column.expr, Some(table_references))
-                });
+                .map(|arms| {
+                    compound_column_affinity(arms, column_index)
+                        .affinity
+                        .to_type()
+                })
+                .unwrap_or_else(|| result_column.affinity.affinity.to_type());
             Column::new(
-                name,
+                Some(name),
                 column_type.to_string(),
                 None,
                 None,
@@ -2410,11 +3382,14 @@ fn query_output_columns(
         .try_collect::<alloc::Vec<_>>()?;
 
     for (column_index, column) in columns.iter_mut().enumerate() {
-        let result_expr = &result_columns[column_index].expr;
-        if super::expr::expr_is_array(result_expr, Some(table_references)) {
-            column.set_array_dimensions(1);
-        }
-        column.set_collation(get_collseq_from_expr(result_expr, table_references)?);
+        let result_column = &result_columns[column_index];
+        column.set_array_dimensions(result_column.array_dimensions);
+        column.set_collation(
+            result_column
+                .collation
+                .as_ref()
+                .map(|collation| *collation.value()),
+        );
     }
     Ok(columns)
 }
@@ -2445,16 +3420,16 @@ impl JoinedTable {
         identifier: String,
         plan: SelectPlan,
         join_info: Option<JoinInfo>,
-        internal_id: TableInternalId,
+        internal_id: PlanSourceId,
     ) -> Result<Self> {
         let mut columns = plan
             .result_columns
             .iter()
             .map(|rc| {
-                let col_type = infer_type_from_expr(&rc.expr, Some(&plan.table_references));
+                let col_type = rc.affinity.affinity.to_type();
                 let type_name = col_type.to_string();
                 Column::new(
-                    rc.name(&plan.table_references).map(String::from),
+                    Some(rc.name().to_string()),
                     type_name,
                     None,
                     None,
@@ -2466,16 +3441,14 @@ impl JoinedTable {
             .try_collect::<alloc::Vec<_>>()?;
 
         for (i, column) in columns.iter_mut().enumerate() {
-            if super::expr::expr_is_array(
-                &plan.result_columns[i].expr,
-                Some(&plan.table_references),
-            ) {
-                column.set_array_dimensions(1);
-            }
-            column.set_collation(get_collseq_from_expr(
-                &plan.result_columns[i].expr,
-                &plan.table_references,
-            )?);
+            let result_column = &plan.result_columns[i];
+            column.set_array_dimensions(result_column.array_dimensions);
+            column.set_collation(
+                result_column
+                    .collation
+                    .as_ref()
+                    .map(|collation| *collation.value()),
+            );
         }
 
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
@@ -2486,9 +3459,11 @@ impl JoinedTable {
             materialized_cursor_id: None,
             cte: None,
         }));
+        let read_programs = Arc::new(SourceReadPrograms::none(table.columns().len()));
         Ok(Self {
             op: Operation::default_scan_for(&table),
             table,
+            resolved_table: None,
             identifier,
             internal_id,
             join_info,
@@ -2496,9 +3471,11 @@ impl JoinedTable {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
-            indexed: None,
-            bound_index_method_patterns: Vec::new(),
-            bound_index_expressions: Vec::new(),
+            index_hint: PlanIndexHint::None,
+            index_method_patterns: Vec::new(),
+            index_expressions: Vec::new(),
+            read_programs,
+            check_constraints: Vec::new(),
         })
     }
 
@@ -2511,9 +3488,9 @@ impl JoinedTable {
         identifier: String,
         plan: Plan,
         join_info: Option<JoinInfo>,
-        internal_id: TableInternalId,
+        internal_id: PlanSourceId,
         explicit_columns: Option<&[String]>,
-        cte_id: Option<usize>,
+        cte_id: Option<PlanCteId>,
         materialize_hint: bool,
     ) -> Result<Self> {
         let columns = query_output_columns(&plan, explicit_columns)?;
@@ -2534,9 +3511,11 @@ impl JoinedTable {
             materialized_cursor_id: None,
             cte,
         }));
+        let read_programs = Arc::new(SourceReadPrograms::none(table.columns().len()));
         Ok(Self {
             op: Operation::default_scan_for(&table),
             table,
+            resolved_table: None,
             identifier,
             internal_id,
             join_info,
@@ -2544,19 +3523,47 @@ impl JoinedTable {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
-            indexed: None,
-            bound_index_method_patterns: Vec::new(),
-            bound_index_expressions: Vec::new(),
+            index_hint: PlanIndexHint::None,
+            index_method_patterns: Vec::new(),
+            index_expressions: Vec::new(),
+            read_programs,
+            check_constraints: Vec::new(),
         })
     }
 
     pub fn new_recursive_cte_input(
         identifier: String,
-        query: &Plan,
-        internal_id: TableInternalId,
+        result_columns: &[ResultSetColumn],
+        internal_id: PlanSourceId,
         explicit_columns: Option<&[String]>,
     ) -> Result<Self> {
-        let mut columns = query_output_columns(query, explicit_columns)?;
+        let mut columns = result_columns
+            .iter()
+            .enumerate()
+            .map(|(column_index, result_column)| {
+                let name = explicit_columns
+                    .and_then(|names| names.get(column_index).cloned())
+                    .unwrap_or_else(|| result_column.name.clone());
+                let column_type = result_column.affinity.affinity.to_type();
+                let mut column = Column::new(
+                    Some(name),
+                    column_type.to_string(),
+                    None,
+                    None,
+                    column_type,
+                    None,
+                    ColDef::default(),
+                );
+                column.set_array_dimensions(result_column.array_dimensions);
+                column.set_collation(
+                    result_column
+                        .collation
+                        .as_ref()
+                        .map(|collation| *collation.value()),
+                );
+                column
+            })
+            .try_collect::<alloc::Vec<_>>()?;
         // The recursive self-reference reads SQLite's queue table, whose
         // columns have no declared type: comparisons in the recursive term
         // see the stored value without the anchor query's affinity. Only the
@@ -2568,9 +3575,11 @@ impl JoinedTable {
             name: identifier.clone(),
             columns,
         }));
+        let read_programs = Arc::new(SourceReadPrograms::none(table.columns().len()));
         Ok(Self {
             op: Operation::default_scan_for(&table),
             table,
+            resolved_table: None,
             identifier,
             internal_id,
             join_info: None,
@@ -2578,9 +3587,11 @@ impl JoinedTable {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
-            indexed: None,
-            bound_index_method_patterns: Vec::new(),
-            bound_index_expressions: Vec::new(),
+            index_hint: PlanIndexHint::None,
+            index_method_patterns: Vec::new(),
+            index_expressions: Vec::new(),
+            read_programs,
+            check_constraints: Vec::new(),
         })
     }
 
@@ -2588,27 +3599,27 @@ impl JoinedTable {
         self.table.columns()
     }
 
-    pub fn bound_index_expressions(&self, index: &Index) -> Option<&BoundIndexExpressions> {
-        self.bound_index_expressions
+    pub fn plan_index_expressions(&self, index: &Index) -> Option<&PlanIndexExpressions> {
+        self.index_expressions
             .iter()
-            .find(|bound| bound.index_name == index.name)
+            .find(|planned| std::ptr::eq(planned.index.value(), index))
     }
 
-    pub fn bound_expression_index_pos(&self, index: &Index, expr: &ast::Expr) -> Option<usize> {
-        self.bound_index_expressions(index)?
+    pub fn expression_index_pos(&self, index: &Index, expr: &Expr) -> Option<usize> {
+        self.plan_index_expressions(index)?
             .columns
             .iter()
             .enumerate()
             .position(|(position, candidate)| {
                 index.columns[position].pos_in_table == crate::schema::EXPR_INDEX_SENTINEL
                     && candidate
-                        .as_deref()
-                        .is_some_and(|candidate| exprs_are_equivalent(candidate, expr))
+                        .as_ref()
+                        .is_some_and(|candidate| plan_exprs_are_equivalent(candidate, expr))
             })
     }
 
-    pub fn bound_partial_index_where(&self, index: &Index) -> Option<&ast::Expr> {
-        self.bound_index_expressions(index)?.where_clause.as_deref()
+    pub fn partial_index_predicate(&self, index: &Index) -> Option<&Expr> {
+        self.plan_index_expressions(index)?.predicate.as_ref()
     }
 
     /// Mark a column as used in the query.
@@ -2631,25 +3642,19 @@ impl JoinedTable {
     /// columns a and b are only needed to produce that expression. Later we
     /// can avoid opening the table cursor if all column references are
     /// covered by expression keys.
-    pub fn register_expression_index_usage(
-        &mut self,
-        bound_expr: ast::Expr,
-        columns_mask: ColumnUsedMask,
-    ) {
+    pub fn register_expression_index_usage(&mut self, expr: Expr, columns_mask: ColumnUsedMask) {
         if columns_mask.is_empty() {
             return;
         }
         if self
             .expression_index_usages
             .iter()
-            .any(|usage| exprs_are_equivalent(&usage.bound_expr, &bound_expr))
+            .any(|usage| plan_exprs_are_equivalent(&usage.expr, &expr))
         {
             return;
         }
-        self.expression_index_usages.push(ExpressionIndexUsage {
-            bound_expr: Box::new(bound_expr),
-            columns_mask,
-        });
+        self.expression_index_usages
+            .push(ExpressionIndexUsage { expr, columns_mask });
     }
 
     /// Provided an index that may contain expression keys, remove any
@@ -2669,10 +3674,7 @@ impl JoinedTable {
             //   SELECT lower(name) FROM t;
             // Column `name` is not otherwise needed, so we can rely on the
             // expression value from the index and drop the table cursor.
-            if self
-                .bound_expression_index_pos(index, &usage.bound_expr)
-                .is_some()
-            {
+            if self.expression_index_pos(index, &usage.expr).is_some() {
                 any_covered = true;
                 for col_idx in usage.columns_mask.iter() {
                     if col_idx >= coverage_counts.len() {
@@ -2711,7 +3713,7 @@ impl JoinedTable {
         match &self.table {
             Table::BTree(btree) => {
                 let use_covering_index = self.utilizes_covering_index();
-                let index_is_ephemeral = index.is_some_and(|index| index.ephemeral);
+                let index_is_ephemeral = matches!(index, Some(PlanIndex::Ephemeral(_)));
                 let table_not_required = matches!(mode, OperationMode::SELECT)
                     && use_covering_index
                     && !index_is_ephemeral;
@@ -2750,9 +3752,10 @@ impl JoinedTable {
 
                 let index_cursor_id = index
                     .map(|index| {
+                        let index_handle = index.handle();
                         program.alloc_cursor_index_if_not_exists(
-                            CursorKey::index(self.internal_id, index.clone()),
-                            index,
+                            CursorKey::index(self.internal_id, index_handle.clone()),
+                            &index_handle,
                         )
                     })
                     .transpose()?;
@@ -2769,9 +3772,10 @@ impl JoinedTable {
             Table::FromClauseSubquery(..) => {
                 let index_cursor_id = index
                     .map(|index| {
+                        let index_handle = index.handle();
                         program.alloc_cursor_index_if_not_exists(
-                            CursorKey::index(self.internal_id, index.clone()),
-                            index,
+                            CursorKey::index(self.internal_id, index_handle.clone()),
+                            &index_handle,
                         )
                     })
                     .transpose()?;
@@ -2806,7 +3810,7 @@ impl JoinedTable {
             program.resolve_cursor_id_safe(&CursorKey::table(self.internal_id))
         };
         let index_cursor_id = index.map(|index| {
-            program.resolve_cursor_id(&CursorKey::index(self.internal_id, index.clone()))
+            program.resolve_cursor_id(&CursorKey::index(self.internal_id, index.handle()))
         });
         Ok((table_cursor_id, index_cursor_id))
     }
@@ -2927,8 +3931,8 @@ pub struct SeekDefKeyIterator<'a, T> {
     _t: PhantomData<T>,
 }
 
-impl<'a> Iterator for SeekDefKeyIterator<'a, SeekKeyComponent<&'a ast::Expr>> {
-    type Item = SeekKeyComponent<&'a ast::Expr>;
+impl<'a> Iterator for SeekDefKeyIterator<'a, SeekKeyComponent<&'a Expr>> {
+    type Item = SeekKeyComponent<&'a Expr>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let result = if self.pos < self.seek_def.prefix.len() {
@@ -2985,7 +3989,7 @@ impl SeekDef {
     pub fn iter<'a>(
         &'a self,
         key: &'a SeekKey,
-    ) -> SeekDefKeyIterator<'a, SeekKeyComponent<&'a ast::Expr>> {
+    ) -> SeekDefKeyIterator<'a, SeekKeyComponent<&'a Expr>> {
         SeekDefKeyIterator {
             seek_def: self,
             seek_key: key,
@@ -3030,7 +4034,7 @@ pub fn synthesized_seek_affinity_str(index: &Index, seek_def: &SeekDef) -> Optio
 /// Besides user-provided expressions, planner logic may inject a synthetic NULL sentinel
 /// to encode SQLite-compatible boundary behavior on composite indexes.
 /// This enum accepts generic argument E so we can use both
-/// SeekKeyComponent<ast::Expr> and SeekKeyComponent<&ast::Expr>.
+/// SeekKeyComponent<Expr> and SeekKeyComponent<&Expr>.
 #[derive(Debug, Clone)]
 pub enum SeekKeyComponent<E> {
     Expr(E),
@@ -3042,7 +4046,7 @@ pub enum SeekKeyComponent<E> {
 #[derive(Debug, Clone)]
 pub struct SeekKey {
     /// Complete key must be constructed from common [SeekDef::prefix] and optional last_component
-    pub last_component: SeekKeyComponent<ast::Expr>,
+    pub last_component: SeekKeyComponent<Expr>,
 
     /// The comparison operator to use when seeking.
     pub op: SeekOp,
@@ -3059,7 +4063,7 @@ pub enum Scan {
         /// The iter_dir is used to indicate the direction of the iterator.
         iter_dir: IterationDirection,
         /// The index that we are using to scan the table, if any.
-        index: Option<Arc<Index>>,
+        index: Option<PlanIndex>,
     },
     /// A scan of a virtual table, delegated to the table’s `filter` and related methods.
     VirtualTable {
@@ -3088,16 +4092,16 @@ pub enum Scan {
 #[derive(Clone, Debug)]
 pub enum Search {
     /// A rowid equality point lookup. This is a special case that uses the SeekRowid bytecode instruction and does not loop.
-    RowidEq { cmp_expr: ast::Expr },
+    RowidEq { cmp_expr: Expr },
     /// A search on a table btree (via `rowid`) or a secondary index search. Uses bytecode instructions like SeekGE, SeekGT etc.
     Seek {
-        index: Option<Arc<Index>>,
+        index: Option<PlanIndex>,
         seek_def: SeekDef,
     },
     /// An IN-driven index seek. Iterates an ephemeral B-tree of IN values and
     /// for each value seeks into the real index (or table, if seek by rowid).
     InSeek {
-        index: Option<Arc<Index>>,
+        index: Option<PlanIndex>,
         source: InSeekSource,
     },
 }
@@ -3107,7 +4111,7 @@ pub enum Search {
 pub enum InSeekSource {
     /// Literal values to materialize into a new ephemeral index at open_loop time.
     LiteralList {
-        values: Vec<ast::Expr>,
+        values: Vec<Expr>,
         affinity: Affinity,
     },
     /// Subquery already materialized by emit_non_from_clause_subquery;
@@ -3119,22 +4123,23 @@ pub enum InSeekSource {
 #[derive(Clone, Debug)]
 pub struct IndexMethodQuery {
     /// index method to use
-    pub index: Arc<Index>,
+    pub index: PlanIndex,
     /// idx of the pattern from [crate::index_method::IndexMethodAttachment::definition] which planner chose to use for the access
     pub pattern_idx: usize,
     /// captured arguments for the pattern chosen by the planner
     pub arguments: Vec<Expr>,
-    /// mapping from index of [ast::Expr::Column] to the column index of IndexMethod response
+    /// Mapping from the index of a [`Expr::Column`] argument to the column
+    /// index returned by the index method.
     pub covered_columns: HashMap<usize, usize>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Aggregate {
     pub func: AggFunc,
-    pub args: Vec<ast::Expr>,
-    pub original_expr: ast::Expr,
+    pub args: Vec<Expr>,
+    pub original_expr: Expr,
     pub distinctness: Distinctness,
-    pub filter_expr: Option<ast::Expr>,
+    pub filter_expr: Option<Expr>,
     /// For `percentile_cont`/`percentile_disc`: register holding the fraction
     /// after it has been evaluated and range-checked once per invocation,
     /// before the aggregate row loop. Populated by `InitLoop::emit`.
@@ -3147,7 +4152,7 @@ impl Aggregate {
         args: &[Box<Expr>],
         expr: &Expr,
         distinctness: Distinctness,
-        filter_expr: Option<ast::Expr>,
+        filter_expr: Option<Expr>,
     ) -> Self {
         Aggregate {
             func,
@@ -3199,171 +4204,73 @@ pub struct Window {
 }
 
 impl Window {
-    const DEFAULT_SORT_ORDER: SortOrder = SortOrder::Asc;
-
-    /// Build a `Window` from an inline `OVER (...)` AST node
-    pub fn new_unnamed(ast: &ast::Window, frame: Frame) -> Result<Self> {
-        if !Self::is_default_frame_spec(&ast.frame_clause) {
-            crate::bail_parse_error!("Custom frame specifications are not supported yet");
-        }
-        Ok(Window {
-            name: None,
-            partition_by: ast.partition_by.iter().map(|arg| *arg.clone()).collect(),
-            deduplicated_partition_by_len: None,
-            order_by: ast
-                .order_by
-                .iter()
-                .map(|col| {
-                    (
-                        *col.expr.clone(),
-                        col.order.unwrap_or(Self::DEFAULT_SORT_ORDER),
-                        col.nulls,
-                    )
-                })
-                .collect(),
-            frame,
-            functions: vec![],
-        })
-    }
-
     /// Build an unnamed window from partition/order expressions inherited from
     /// a named base window.
-    pub fn from_unnamed_bound(bound: NamedWindowBound, frame: Frame) -> Self {
+    pub fn from_planned_spec(spec: PlannedWindowSpec, frame: Frame) -> Self {
         Window {
             name: None,
-            partition_by: bound.partition_by,
+            partition_by: spec.partition_by,
             deduplicated_partition_by_len: None,
-            order_by: bound.order_by,
+            order_by: spec.order_by,
             frame,
             functions: vec![],
         }
     }
 
-    /// Build a `Window` from a previously-bound named definition plus a
-    /// resolved frame.
-    pub fn from_named_bound(name: String, bound: NamedWindowBound, frame: Frame) -> Self {
-        Window {
-            name: Some(name),
-            partition_by: bound.partition_by,
-            deduplicated_partition_by_len: None,
-            order_by: bound.order_by,
-            frame,
-            functions: vec![],
-        }
-    }
-
-    /// Whether this window can host a function with the given coerced frame.
-    /// Two windows are equivalent (and can be merged) when the user OVER
-    /// clause matches AND the coerced frames agree — see SQLite's invariant
-    /// at `window.c:1679`.
-    pub fn is_equivalent(&self, ast: &ast::Window, frame: &Frame) -> bool {
-        if &self.frame != frame {
-            return false;
-        }
-        if !Self::is_default_frame_spec(&ast.frame_clause) {
-            return false;
-        }
-
-        if self.partition_by.len() != ast.partition_by.len() {
+    pub fn is_equivalent_to_spec(&self, spec: &PlannedWindowSpec, frame: &Frame) -> bool {
+        if !frames_are_equivalent(&self.frame, frame)
+            || self.partition_by.len() != spec.partition_by.len()
+        {
             return false;
         }
         if !self
             .partition_by
             .iter()
-            .zip(&ast.partition_by)
-            .all(|(a, b)| exprs_are_equivalent(a, b))
+            .zip(&spec.partition_by)
+            .all(|(a, b)| plan_exprs_are_equivalent(a, b))
         {
             return false;
         }
-
-        if self.order_by.len() != ast.order_by.len() {
+        if self.order_by.len() != spec.order_by.len() {
             return false;
         }
-        self.order_by
-            .iter()
-            .zip(&ast.order_by)
-            .all(|((expr_a, order_a, nulls_a), col_b)| {
-                exprs_are_equivalent(expr_a, &col_b.expr)
-                    && *order_a == col_b.order.unwrap_or(Self::DEFAULT_SORT_ORDER)
-                    && *nulls_a == col_b.nulls
-            })
-    }
-
-    pub fn is_equivalent_to_bound(&self, bound: &NamedWindowBound, frame: &Frame) -> bool {
-        if &self.frame != frame || self.partition_by.len() != bound.partition_by.len() {
-            return false;
-        }
-        if !self
-            .partition_by
-            .iter()
-            .zip(&bound.partition_by)
-            .all(|(a, b)| exprs_are_equivalent(a, b))
-        {
-            return false;
-        }
-        if self.order_by.len() != bound.order_by.len() {
-            return false;
-        }
-        self.order_by.iter().zip(&bound.order_by).all(
+        self.order_by.iter().zip(&spec.order_by).all(
             |((expr_a, order_a, nulls_a), (expr_b, order_b, nulls_b))| {
-                exprs_are_equivalent(expr_a, expr_b) && order_a == order_b && nulls_a == nulls_b
+                plan_exprs_are_equivalent(expr_a, expr_b)
+                    && order_a == order_b
+                    && nulls_a == nulls_b
             },
         )
     }
+}
 
-    pub(crate) fn is_default_frame_spec(frame: &Option<FrameClause>) -> bool {
-        if let Some(frame_clause) = frame {
-            let FrameClause {
-                mode,
-                start,
-                end,
-                exclude,
-            } = frame_clause;
-            if *mode != FrameMode::Range {
-                return false;
-            }
-            if *start != FrameBound::UnboundedPreceding {
-                return false;
-            }
-            if *end != Some(FrameBound::CurrentRow) {
-                return false;
-            }
-            if let Some(exclude) = exclude {
-                if *exclude != FrameExclude::NoOthers {
-                    return false;
-                }
-            }
+fn frames_are_equivalent(lhs: &Frame, rhs: &Frame) -> bool {
+    lhs.mode == rhs.mode
+        && frame_boundaries_are_equivalent(&lhs.start, &rhs.start)
+        && frame_boundaries_are_equivalent(&lhs.end, &rhs.end)
+}
+
+fn frame_boundaries_are_equivalent(lhs: &FrameBoundary, rhs: &FrameBoundary) -> bool {
+    match (lhs, rhs) {
+        (FrameBoundary::UnboundedPreceding, FrameBoundary::UnboundedPreceding)
+        | (FrameBoundary::CurrentRow, FrameBoundary::CurrentRow)
+        | (FrameBoundary::UnboundedFollowing, FrameBoundary::UnboundedFollowing) => true,
+        (FrameBoundary::Preceding(lhs), FrameBoundary::Preceding(rhs))
+        | (FrameBoundary::Following(lhs), FrameBoundary::Following(rhs)) => {
+            plan_exprs_are_equivalent(lhs, rhs)
         }
-        true
+        _ => false,
     }
 }
 
-/// A named WINDOW clause definition, captured before any function references
-/// it. The effective frame belongs to the resolved `Window` instance the
-/// planner spawns when a function attaches. Whether the user wrote a frame is
-/// retained because SQLite forbids chaining from a framed base window.
-///
-/// `bound` holds the already-bound `partition_by` / `order_by`. The
-/// first `resolve_window` that needs them *takes* them by moving;
-/// subsequent attachments under a different coerced frame deep-clone
-/// from a sister resolved `Window`. This keeps the common case
-/// (1 function per name, or N functions all sharing one frame) at
-/// zero extra clones vs. the old "mutated stub" model.
 #[derive(Debug, Clone)]
-pub struct NamedWindowDef {
-    pub name: String,
-    pub bound: Option<NamedWindowBound>,
-    pub has_frame_clause: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct NamedWindowBound {
+pub struct PlannedWindowSpec {
     pub partition_by: Vec<Expr>,
     pub order_by: Vec<(Expr, SortOrder, Option<ast::NullsOrder>)>,
 }
 
 /// One bound of a window function's effective frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum FrameBoundary {
     UnboundedPreceding,
     Preceding(Box<Expr>),
@@ -3377,7 +4284,7 @@ pub enum FrameBoundary {
 /// the window's ORDER BY values.
 ///
 /// Example: `<mode: RANGE> <start: UNBOUNDED PRECEDING> TO <end: CURRENT ROW>`
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Frame {
     pub mode: ast::FrameMode,
     pub start: FrameBoundary,
@@ -3459,7 +4366,7 @@ pub enum SubqueryState {
         /// Outer table ids referenced by the subquery when it was planned.
         /// We keep these so later analysis can still understand dependencies
         /// even after the plan is consumed.
-        outer_ref_ids: Vec<TableInternalId>,
+        outer_ref_ids: Vec<PlanSourceId>,
     },
 }
 
@@ -3471,6 +4378,23 @@ pub enum SubqueryPosition {
     Having,
     OrderBy,
     LimitOffset,
+}
+
+/// Runtime shape chosen for a planned non-FROM subquery. Semantic HIR records
+/// only scalar/EXISTS/IN meaning; register and cursor allocation lives here.
+#[derive(Debug, Clone)]
+pub enum PlanSubqueryType {
+    Exists {
+        result_reg: usize,
+    },
+    RowValue {
+        result_reg_start: usize,
+        num_regs: usize,
+    },
+    In {
+        cursor_id: CursorID,
+        affinity_str: Arc<String>,
+    },
 }
 
 impl SubqueryPosition {
@@ -3502,12 +4426,59 @@ impl SubqueryPosition {
 /// This is used for subqueries in the WHERE clause, HAVING clause, ORDER BY clause, LIMIT clause, OFFSET clause, etc.
 /// Currently only subqueries in the WHERE clause are supported.
 pub struct NonFromClauseSubquery {
-    pub internal_id: TableInternalId,
-    pub query_type: SubqueryType,
+    pub internal_id: PlanSubqueryId,
+    pub query_type: PlanSubqueryType,
+    /// Result metadata retained independently of `state.plan`, which is
+    /// consumed when the subquery is emitted.
+    pub output_facts: Vec<PlanOutputFact>,
+    /// Values this child reads from result registers owned by enclosing query
+    /// blocks. The definitions stay with those owners.
+    pub outer_outputs: Vec<PlanOuterOutputReference>,
     pub state: SubqueryState,
     pub correlated: bool,
     pub origin: SubqueryOrigin,
     pub eval_phase: SubqueryEvalPhase,
+}
+
+impl PlanExprFactSource for &[NonFromClauseSubquery] {
+    fn subquery_output_type_fact(&self, query: PlanSubqueryId, output: usize) -> Option<TypeFact> {
+        self.iter()
+            .find(|subquery| subquery.internal_id == query)?
+            .output_facts
+            .get(output)
+            .map(|fact| fact.type_fact.clone())
+    }
+
+    fn subquery_width(&self, query: PlanSubqueryId) -> Option<usize> {
+        self.iter()
+            .find(|subquery| subquery.internal_id == query)
+            .map(|subquery| subquery.output_facts.len())
+    }
+
+    fn subquery_output_affinity(
+        &self,
+        query: PlanSubqueryId,
+        output: usize,
+    ) -> Option<PlanExprAffinity> {
+        self.iter()
+            .find(|subquery| subquery.internal_id == query)?
+            .output_facts
+            .get(output)
+            .map(|fact| fact.affinity)
+    }
+
+    fn subquery_output_collation(
+        &self,
+        query: PlanSubqueryId,
+        output: usize,
+    ) -> Option<CollationSeq> {
+        self.iter()
+            .find(|subquery| subquery.internal_id == query)?
+            .output_facts
+            .get(output)
+            .and_then(|fact| fact.collation.as_ref())
+            .map(|collation| *collation.value())
+    }
 }
 
 impl NonFromClauseSubquery {
@@ -3546,7 +4517,15 @@ impl NonFromClauseSubquery {
                 return Ok(*evaluated_at);
             }
         };
-        eval_at_for_plan(plan, join_order, table_references)
+        let mut eval_at = eval_at_for_plan(plan, join_order, table_references)?;
+        for output in &self.outer_outputs {
+            for source in &output.source_dependencies {
+                if let Some(loop_idx) = source_loop_index(*source, join_order, table_references)? {
+                    eval_at = eval_at.max(EvalAt::Loop(loop_idx));
+                }
+            }
+        }
+        Ok(eval_at)
     }
 
     /// Consumes the plan and returns it, and sets the subquery to the evaluated state.
@@ -3630,7 +4609,7 @@ pub fn plan_is_correlated(plan: &Plan) -> bool {
 
 fn select_plan_has_outer_scope_dependency_with_tables(
     plan: &SelectPlan,
-    accessible_table_ids: &mut Vec<TableInternalId>,
+    accessible_table_ids: &mut Vec<PlanSourceId>,
 ) -> bool {
     let outer_scope_base_len = accessible_table_ids.len();
     accessible_table_ids.extend(
@@ -3647,21 +4626,21 @@ fn select_plan_has_outer_scope_dependency_with_tables(
             .any(|outer_ref| {
                 outer_ref.is_used() && !accessible_table_ids.contains(&outer_ref.internal_id)
             })
-            || plan
-                .non_from_clause_subqueries
-                .iter()
-                .any(|subquery| match &subquery.state {
-                    SubqueryState::Unevaluated {
-                        plan: Some(subquery_plan),
-                    } => plan_has_outer_scope_dependency_with_tables(
-                        subquery_plan,
-                        accessible_table_ids,
-                    ),
-                    SubqueryState::Unevaluated { plan: None } => false,
-                    SubqueryState::Evaluated { outer_ref_ids, .. } => outer_ref_ids
-                        .iter()
-                        .any(|outer_ref_id| !accessible_table_ids.contains(outer_ref_id)),
-                })
+            || plan.non_from_clause_subqueries.iter().any(|subquery| {
+                !subquery.outer_outputs.is_empty()
+                    || match &subquery.state {
+                        SubqueryState::Unevaluated {
+                            plan: Some(subquery_plan),
+                        } => plan_has_outer_scope_dependency_with_tables(
+                            subquery_plan,
+                            accessible_table_ids,
+                        ),
+                        SubqueryState::Unevaluated { plan: None } => false,
+                        SubqueryState::Evaluated { outer_ref_ids, .. } => outer_ref_ids
+                            .iter()
+                            .any(|outer_ref_id| !accessible_table_ids.contains(outer_ref_id)),
+                    }
+            })
             || plan
                 .table_references
                 .joined_tables()
@@ -3682,7 +4661,7 @@ fn select_plan_has_outer_scope_dependency_with_tables(
 
 fn plan_has_outer_scope_dependency_with_tables(
     plan: &Plan,
-    accessible_table_ids: &mut Vec<TableInternalId>,
+    accessible_table_ids: &mut Vec<PlanSourceId>,
 ) -> bool {
     match plan {
         Plan::Select(select_plan) => {
@@ -3770,7 +4749,7 @@ fn eval_at_for_select_plan(
 /// If the table is not present in the join order, we look for a hash join
 /// where that table is the build side and map it to the probe loop.
 fn resolve_outer_ref_loop(
-    table_id: TableInternalId,
+    table_id: PlanSourceId,
     join_order: &[JoinOrderMember],
     table_references: Option<&TableReferences>,
 ) -> Option<usize> {
@@ -4488,11 +5467,11 @@ mod tests {
 
     #[test]
     fn test_bitset_with_table_internal_id() -> TestResult {
-        let a = TableInternalId::from(3);
-        let b = TableInternalId::from(70); // exercises overflow path
-        let c = TableInternalId::from(200);
+        let a = PlanSourceId::new(3);
+        let b = PlanSourceId::new(70); // exercises overflow path
+        let c = PlanSourceId::new(200);
 
-        let mut mask: BitSet<TableInternalId> = BitSet::default();
+        let mut mask: BitSet<PlanSourceId> = BitSet::default();
         mask.set(a)?;
         mask.set(b)?;
         mask.set(c)?;
@@ -4500,21 +5479,21 @@ mod tests {
         assert!(mask.get(a));
         assert!(mask.get(b));
         assert!(mask.get(c));
-        assert!(!mask.get(TableInternalId::from(4)));
+        assert!(!mask.get(PlanSourceId::new(4)));
         assert_eq!(mask.count(), 3);
 
         mask.clear(b);
         assert!(!mask.get(b));
         assert_eq!(mask.count(), 2);
 
-        // Iterator yields TableInternalId, not usize.
-        let collected: Vec<TableInternalId> = (&mask).into_iter().collect();
+        // Iterator yields PlanSourceId, not usize.
+        let collected: Vec<PlanSourceId> = (&mask).into_iter().collect();
         assert_eq!(collected, vec![a, c]);
 
-        // Fallible collection preserves TableInternalId.
-        let rebuilt = BitSet::<TableInternalId>::try_from_iter([a, c])?;
+        // Fallible collection preserves PlanSourceId.
+        let rebuilt = BitSet::<PlanSourceId>::try_from_iter([a, c])?;
         assert_eq!(rebuilt, mask);
-        let mut extended = BitSet::<TableInternalId>::default();
+        let mut extended = BitSet::<PlanSourceId>::default();
         extended.try_extend([a, c])?;
         assert_eq!(extended, mask);
         Ok(())

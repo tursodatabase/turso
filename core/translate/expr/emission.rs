@@ -1,5 +1,8 @@
 use super::*;
 use crate::alloc::TursoIteratorExt;
+use crate::translate::plan::{NonFromClauseSubquery, QueryDestination, SubqueryState};
+use crate::translate::plan_expr::{walk_plan_expr, PlanColumnRef, PlanExpr, PlanWalkControl};
+use crate::turso_assert_eq;
 
 /// Emit literal values - shared between regular and RETURNING expression evaluation
 pub fn emit_literal(
@@ -131,69 +134,6 @@ pub fn emit_function_call(
     Ok(())
 }
 
-/// Process a RETURNING clause, converting ResultColumn expressions into ResultSetColumn structures
-/// with proper column binding and alias handling.
-pub fn process_returning_clause(
-    returning: &mut [ast::ResultColumn],
-    table_references: &mut TableReferences,
-) -> Result<Vec<ResultSetColumn>> {
-    let mut result_columns = Vec::with_capacity(returning.len());
-
-    let alias_to_string = |alias: &ast::As| alias.name().as_str().to_string();
-
-    for rc in returning.iter_mut() {
-        match rc {
-            ast::ResultColumn::Expr(expr, alias) => {
-                // The binder already resolved RETURNING exprs.
-                let vec_size = expr_vector_size(expr)?;
-                if vec_size != 1 {
-                    crate::bail_parse_error!(
-                        "sub-select returns {} columns - expected 1",
-                        vec_size
-                    );
-                }
-
-                result_columns.push(ResultSetColumn {
-                    expr: expr.as_ref().clone(),
-                    alias: alias.as_ref().map(alias_to_string),
-                    implicit_column_name: None,
-                    contains_aggregates: false,
-                });
-            }
-            ast::ResultColumn::Star => {
-                let table = table_references
-                    .joined_tables()
-                    .first()
-                    .expect("RETURNING clause must reference at least one table");
-                let internal_id = table.internal_id;
-
-                // Handle RETURNING * by expanding to all table columns
-                // Use the shared internal_id for all columns
-                for (column_index, column) in table.columns().iter().enumerate() {
-                    let column_expr = Expr::Column {
-                        database: None,
-                        table: internal_id,
-                        column: column_index,
-                        is_rowid_alias: column.is_rowid_alias(),
-                    };
-
-                    result_columns.push(ResultSetColumn {
-                        expr: column_expr,
-                        alias: column.name.clone(),
-                        implicit_column_name: None,
-                        contains_aggregates: false,
-                    });
-                }
-            }
-            ast::ResultColumn::TableStar(_) => {
-                crate::bail_parse_error!("RETURNING may not use \"TABLE.*\" wildcards");
-            }
-        }
-    }
-
-    Ok(result_columns)
-}
-
 /// Context for buffering RETURNING results into an ephemeral table
 /// instead of yielding them immediately via ResultRow.
 /// When used, the DML loop buffers each result row into the ephemeral table,
@@ -201,15 +141,21 @@ pub fn process_returning_clause(
 pub struct ReturningBufferCtx {
     /// Cursor ID of the ephemeral table to buffer results into
     pub cursor_id: usize,
-    /// Number of RETURNING columns (used for scan-back)
-    pub num_columns: usize,
+    /// Frozen semantic metadata used to present buffered values at ResultRow.
+    pub result_columns: Vec<ResultSetColumn>,
 }
 
 /// Emit the scan-back loop that reads all buffered RETURNING rows from the
 /// ephemeral table and yields them via ResultRow. Called after all DML is complete.
-pub(crate) fn emit_returning_scan_back(program: &mut ProgramBuilder, buf: &ReturningBufferCtx) {
+pub(crate) fn emit_returning_scan_back(
+    program: &mut ProgramBuilder,
+    buf: &ReturningBufferCtx,
+    table_references: &TableReferences,
+    resolver: &Resolver<'_>,
+) -> Result<()> {
     let end_label = program.allocate_label();
     let scan_start = program.allocate_label();
+    let num_columns = buf.result_columns.len();
 
     program.emit_insn(Insn::Rewind {
         cursor_id: buf.cursor_id,
@@ -217,8 +163,8 @@ pub(crate) fn emit_returning_scan_back(program: &mut ProgramBuilder, buf: &Retur
     });
     program.preassign_label_to_next_insn(scan_start);
 
-    let result_start_reg = program.alloc_registers(buf.num_columns);
-    for i in 0..buf.num_columns {
+    let result_start_reg = program.alloc_registers(num_columns);
+    for i in 0..num_columns {
         program.emit_insn(Insn::Column {
             cursor_id: buf.cursor_id,
             column: i,
@@ -226,20 +172,25 @@ pub(crate) fn emit_returning_scan_back(program: &mut ProgramBuilder, buf: &Retur
             default: None,
         });
     }
-    program.emit_insn(Insn::ResultRow {
-        start_reg: result_start_reg,
-        count: buf.num_columns,
-    });
+    crate::translate::result_row::emit_result_columns_to_destination(
+        program,
+        &QueryDestination::ResultRows,
+        result_start_reg,
+        &buf.result_columns,
+        table_references,
+        resolver,
+    )?;
     program.emit_insn(Insn::Next {
         cursor_id: buf.cursor_id,
         pc_if_next: scan_start,
     });
     program.preassign_label_to_next_insn(end_label);
+    Ok(())
 }
 
 /// Emit bytecode to evaluate RETURNING expressions and produce result rows.
 /// RETURNING result expressions are otherwise evaluated as normal, but the columns of the target table
-/// are added to [Resolver::expr_to_reg_cache], meaning a reference to e.g tbl.col will effectively
+/// are added to [Resolver::plan_expr_to_reg_cache], meaning a reference to e.g tbl.col will effectively
 /// refer to a register where the OLD/NEW value of tbl.col is stored after an INSERT/UPDATE/DELETE.
 ///
 /// When `returning_buffer` is `Some`, the results are buffered into an ephemeral table
@@ -261,8 +212,9 @@ pub(crate) fn emit_returning_results<'a>(
     }
 
     let cache_state = seed_returning_row_image_in_cache(
-        program,
         table_references,
+        result_columns,
+        &[],
         reg_columns_start,
         rowid_reg,
         resolver,
@@ -274,7 +226,7 @@ pub(crate) fn emit_returning_results<'a>(
 
         for (i, result_column) in result_columns.iter().enumerate() {
             let reg = result_start_reg + i;
-            translate_expr_no_constant_opt(
+            translate_plan_expr_no_constant_opt(
                 program,
                 Some(table_references),
                 &result_column.expr,
@@ -284,18 +236,14 @@ pub(crate) fn emit_returning_results<'a>(
             )?;
         }
 
-        // Decode array columns in RETURNING results (record blob -> JSON text).
-        crate::translate::result_row::emit_array_decode_for_results(
-            program,
-            result_columns,
-            table_references,
-            result_start_reg,
-            resolver,
-        )?;
-
         if let Some(buf) = returning_buffer {
-            // Buffer into ephemeral table instead of yielding directly.
-            // All DML completes before any RETURNING rows are yielded to the caller.
+            turso_assert_eq!(
+                buf.result_columns.len(),
+                result_columns.len(),
+                "RETURNING buffer metadata must match the buffered row"
+            );
+            // Keep canonical expression values in the internal table. Display
+            // conversion runs only while scanning rows back to the caller.
             let record_reg = program.alloc_register();
             let eph_rowid_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
@@ -318,10 +266,14 @@ pub(crate) fn emit_returning_results<'a>(
                 table_name: String::new(),
             });
         } else {
-            program.emit_insn(Insn::ResultRow {
-                start_reg: result_start_reg,
-                count: result_columns.len(),
-            });
+            crate::translate::result_row::emit_result_columns_to_destination(
+                program,
+                &QueryDestination::ResultRows,
+                result_start_reg,
+                result_columns,
+                table_references,
+                resolver,
+            )?;
         }
 
         Ok(())
@@ -332,13 +284,14 @@ pub(crate) fn emit_returning_results<'a>(
 }
 
 pub(crate) struct ReturningRowImageCacheState {
-    cache_len: usize,
+    plan_cache_len: usize,
     cache_enabled: bool,
 }
 
 pub(crate) fn seed_returning_row_image_in_cache<'a>(
-    program: &mut ProgramBuilder,
     table_references: &TableReferences,
+    result_columns: &[ResultSetColumn],
+    post_write_subqueries: &[NonFromClauseSubquery],
     reg_columns_start: usize,
     rowid_reg: usize,
     resolver: &mut Resolver<'a>,
@@ -349,53 +302,93 @@ pub(crate) fn seed_returning_row_image_in_cache<'a>(
         "RETURNING is only used with INSERT, UPDATE, or DELETE statements, which target a single table"
     );
     let table = table_references.joined_tables().first().unwrap();
+    let target_source = table.internal_id;
 
-    let cache_len = resolver.expr_to_reg_cache.len();
+    let plan_cache_len = resolver.plan_expr_to_reg_cache.len();
     let cache_enabled = resolver.expr_to_reg_cache_enabled;
     resolver.enable_expr_to_reg_cache();
-    resolver.cache_expr_reg(
-        std::borrow::Cow::Owned(Expr::RowId {
-            database: None,
-            table: table.internal_id,
-        }),
-        rowid_reg,
-        false,
-        None,
-    );
-    for (i, column) in table.columns().iter().enumerate() {
-        let raw_reg = if column.is_rowid_alias() {
+
+    let mut reads_rowid = false;
+    let mut referenced_columns = Vec::<PlanColumnRef>::new();
+    for result_column in result_columns {
+        walk_plan_expr(&result_column.expr, &mut |expr| {
+            match expr {
+                PlanExpr::Column(column) if column.source == target_source => {
+                    if !referenced_columns.iter().any(|cached| {
+                        cached.source == column.source && cached.column == column.column
+                    }) {
+                        referenced_columns.push(column.clone());
+                    }
+                }
+                PlanExpr::MergedColumn(column) if column.right.source == target_source => {
+                    if !referenced_columns.iter().any(|cached| {
+                        cached.source == column.right.source && cached.column == column.right.column
+                    }) {
+                        referenced_columns.push(column.right.clone());
+                    }
+                }
+                PlanExpr::RowId(source) if *source == target_source => reads_rowid = true,
+                _ => {}
+            }
+            Ok(PlanWalkControl::Continue)
+        })?;
+    }
+
+    // A subquery expression only carries its semantic ID. Its correlated
+    // column reads live in the still-unevaluated child plan, so include those
+    // exact dependencies before that child is emitted against the post-write
+    // target cursor.
+    for subquery in post_write_subqueries
+        .iter()
+        .filter(|subquery| subquery.is_post_write_returning())
+    {
+        let SubqueryState::Unevaluated {
+            plan: Some(subquery_plan),
+        } = &subquery.state
+        else {
+            continue;
+        };
+        let dependency = subquery_plan.source_row_dependency(target_source)?;
+        reads_rowid |= dependency.rowid;
+        for column in dependency.columns {
+            if !referenced_columns
+                .iter()
+                .any(|cached| cached.source == column.source && cached.column == column.column)
+            {
+                referenced_columns.push(column);
+            }
+        }
+    }
+
+    if reads_rowid {
+        resolver.cache_plan_scalar_expr_reg(
+            PlanExpr::RowId(target_source),
+            rowid_reg,
+            false,
+            &(),
+        )?;
+    }
+
+    for column in referenced_columns {
+        let raw_reg = if column.rowid_alias {
             rowid_reg
         } else {
-            reg_columns_start + layout.to_reg_offset(i)
+            reg_columns_start + layout.to_reg_offset(column.column)
         };
-        // The write registers hold stored (encoded) values. Produce the
-        // user-facing value in a fresh register so RETURNING shows decoded
-        // results — this is a no-op for regular columns.
-        let decoded_reg = program.alloc_register();
-        emit_user_facing_column_value(
-            program,
+        let needs_decode =
+            column.type_fact.declared.as_ref().is_some_and(|declared| {
+                declared.array_dimensions == 0 && declared.custom().is_some()
+            });
+        resolver.cache_plan_scalar_expr_reg(
+            PlanExpr::Column(column),
             raw_reg,
-            decoded_reg,
-            column,
-            table.table.is_strict(),
-            resolver,
-        )?;
-        let expr = Expr::Column {
-            database: None,
-            table: table.internal_id,
-            column: i,
-            is_rowid_alias: column.is_rowid_alias(),
-        };
-        resolver.cache_scalar_expr_reg(
-            std::borrow::Cow::Owned(expr),
-            decoded_reg,
-            false,
-            table_references,
+            needs_decode,
+            &(),
         )?;
     }
 
     Ok(ReturningRowImageCacheState {
-        cache_len,
+        plan_cache_len,
         cache_enabled,
     })
 }
@@ -404,6 +397,8 @@ pub(crate) fn restore_returning_row_image_in_cache(
     resolver: &mut Resolver<'_>,
     state: ReturningRowImageCacheState,
 ) {
-    resolver.expr_to_reg_cache.truncate(state.cache_len);
+    resolver
+        .plan_expr_to_reg_cache
+        .truncate(state.plan_cache_len);
     resolver.expr_to_reg_cache_enabled = state.cache_enabled;
 }

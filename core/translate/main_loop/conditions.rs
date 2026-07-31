@@ -1,21 +1,23 @@
 use super::*;
+use crate::translate::expr::translate_plan_condition_expr;
+use crate::translate::plan_expr::{plan_expr_references_subquery_id, PlanExpr, PlanSubqueryId};
 use crate::translate::subquery::emit_non_from_clause_subqueries_for_eval_at;
 
-fn condition_references_subquery(expr: &Expr, subqueries: &[NonFromClauseSubquery]) -> bool {
+fn condition_references_subquery(expr: &PlanExpr, subqueries: &[NonFromClauseSubquery]) -> bool {
     subqueries
         .iter()
-        .any(|s| expr_references_subquery_id(expr, s.internal_id))
+        .any(|s| plan_expr_references_subquery_id(expr, s.internal_id))
 }
 
 fn subquery_referenced_in_predicates(
     predicates: &[WhereTerm],
     from_outer_join: bool,
-    subquery_id: TableInternalId,
+    subquery_id: PlanSubqueryId,
 ) -> bool {
     predicates
         .iter()
         .filter(|cond| cond.from_outer_join.is_some() == from_outer_join)
-        .any(|cond| expr_references_subquery_id(&cond.expr, subquery_id))
+        .any(|cond| plan_expr_references_subquery_id(&cond.expr, subquery_id))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -85,9 +87,9 @@ fn emit_conditions(
             jump_target_when_false: next,
             jump_target_when_null: next,
         };
-        translate_condition_expr(
+        translate_plan_condition_expr(
             program,
-            table_references,
+            Some(table_references),
             &cond.expr,
             condition_metadata,
             &t_ctx.resolver,

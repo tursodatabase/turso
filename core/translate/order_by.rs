@@ -1,17 +1,19 @@
 use crate::{alloc::TursoVecExt, sync::Arc};
 
 use crate::alloc::*;
-use turso_parser::ast::{self, SortOrder};
+use turso_parser::ast::SortOrder;
 
 use crate::{
     emit_explain,
-    schema::{Index, IndexColumn, PseudoCursorType, Schema},
+    schema::{Index, IndexColumn, PseudoCursorType},
     translate::{
-        collate::{get_collseq_from_expr_with_symbols, CollationSeq},
+        collate::CollationSeq,
         group_by::is_orderby_agg_or_const,
-        plan::Aggregate,
+        plan_expr::{
+            plan_expr_array_dimensions, plan_expr_collation, plan_expr_type_fact,
+            plan_exprs_are_equivalent, PlanExpr, PlanExprFactSource, PlanOrderTerm,
+        },
     },
-    util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{to_u32, IdxInsertFlags, Insn},
@@ -21,8 +23,8 @@ use crate::{
 
 use super::{
     emitter::TranslateCtx,
-    expr::translate_expr,
-    plan::{Distinctness, ResultSetColumn, SelectPlan, TableReferences},
+    expr::translate_plan_expr,
+    plan::{Distinctness, ResultSetColumn, SelectPlan},
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
@@ -45,88 +47,49 @@ fn sort_comparator_from_func_name(func_name: &str) -> Option<SortComparatorType>
 /// comparator. Returns None otherwise, which causes the sorter to use encoded
 /// blob ordering instead of silently wrong results.
 pub(crate) fn custom_type_comparator(
-    expr: &ast::Expr,
-    referenced_tables: &TableReferences,
-    schema: &Schema,
+    expr: &PlanExpr,
+    facts: &impl PlanExprFactSource,
 ) -> Option<SortComparatorType> {
-    if let ast::Expr::Column {
-        table: table_ref_id,
-        column,
-        ..
-    } = expr
-    {
-        let (_, table) = referenced_tables.find_table_by_internal_id(*table_ref_id)?;
-        let col = table.get_column_at(*column)?;
-        // Array columns use element-wise comparison
-        if col.is_array() {
-            return Some(SortComparatorType::ArrayLt);
-        }
-        let type_def = schema.get_type_def(&col.ty_str, table.is_strict())?;
-        type_def
-            .operators()
-            .iter()
-            .find(|op| op.op == "<")
-            .and_then(|op| op.func_name.as_ref())
-            .and_then(|func_name| sort_comparator_from_func_name(func_name))
-    } else if super::expr::expr_is_array(expr, Some(referenced_tables)) {
-        Some(SortComparatorType::ArrayLt)
-    } else {
-        None
-    }
+    let type_fact = plan_expr_type_fact(expr, facts);
+    custom_type_comparator_for_type_fact(&type_fact, plan_expr_array_dimensions(expr, facts))
 }
 
-/// For a result column expression that is a column reference to a custom type,
-/// returns the column definition and type definition.
-fn result_column_custom_type_info<'a>(
-    expr: &ast::Expr,
-    referenced_tables: &'a TableReferences,
-    schema: &'a Schema,
-) -> Option<(
-    &'a crate::schema::Column,
-    std::sync::Arc<crate::schema::TypeDef>,
-)> {
-    if let ast::Expr::Column {
-        table: table_ref_id,
-        column,
-        ..
-    } = expr
-    {
-        let (_, table) = referenced_tables.find_table_by_internal_id(*table_ref_id)?;
-        let col = table.get_column_at(*column)?;
-        let type_def = schema.get_type_def(&col.ty_str, table.is_strict())?.clone();
-        Some((col, type_def))
-    } else {
-        None
+pub(crate) fn custom_type_comparator_for_type_fact(
+    type_fact: &crate::translate::semantic::hir::TypeFact,
+    array_dimensions: u32,
+) -> Option<SortComparatorType> {
+    if type_fact.is_array() || array_dimensions > 0 {
+        return Some(SortComparatorType::ArrayLt);
     }
+    let type_def = type_fact.declared.as_ref()?.custom()?.value();
+    type_def
+        .operators()
+        .iter()
+        .find(|op| op.op == "<")
+        .and_then(|op| op.func_name.as_ref())
+        .and_then(|func_name| sort_comparator_from_func_name(func_name))
+}
+
+fn needs_scalar_custom_decode(type_fact: &crate::translate::semantic::hir::TypeFact) -> bool {
+    type_fact.declared.as_ref().is_some_and(|declared| {
+        declared.array_dimensions == 0
+            && declared
+                .custom_chain
+                .iter()
+                .any(|type_def| type_def.value().decode().is_some())
+    })
 }
 
 /// Returns true if the expression is a column reference to a custom type
 /// (with encode/decode) that does NOT have a `<` operator with a known
 /// sort comparator. This includes types with no `<` operator at all, and
 /// types whose `<` function is not recognized by the sorter.
-fn is_custom_type_without_lt(
-    expr: &ast::Expr,
-    referenced_tables: &TableReferences,
-    schema: &Schema,
-) -> bool {
-    if let ast::Expr::Column {
-        table: table_ref_id,
-        column,
-        ..
-    } = expr
-    {
-        if let Some((_, table)) = referenced_tables.find_table_by_internal_id(*table_ref_id) {
-            if let Some(col) = table.get_column_at(*column) {
-                if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict()) {
-                    if type_def.decode().is_some() {
-                        // No `<` operator at all (naked or with function)
-                        return !type_def.operators().iter().any(|op| op.op == "<");
-                    }
-                }
-            }
-        }
-    }
-    false
+fn custom_type_without_lt_name(expr: &PlanExpr, facts: &impl PlanExprFactSource) -> Option<String> {
+    let type_fact = plan_expr_type_fact(expr, facts);
+    let declared = type_fact.declared.as_ref()?;
+    let type_def = declared.custom()?.value();
+    (type_def.decode().is_some() && !type_def.operators().iter().any(|op| op.op == "<"))
+        .then(|| declared.name.clone())
 }
 
 // Metadata for handling ORDER BY operations
@@ -152,45 +115,41 @@ pub struct EmitOrderBy;
 
 impl EmitOrderBy {
     /// Initialize resources needed for ORDER BY processing
-    #[allow(clippy::too_many_arguments)]
     pub fn init(
         program: &mut ProgramBuilder,
         t_ctx: &mut TranslateCtx,
-        result_columns: &[ResultSetColumn],
-        order_by: &[(
-            Box<ast::Expr>,
-            SortOrder,
-            Option<turso_parser::ast::NullsOrder>,
-        )],
-        referenced_tables: &TableReferences,
+        plan: &SelectPlan,
         has_group_by: bool,
         has_distinct: bool,
-        aggregates: &[Aggregate],
     ) -> Result<()> {
+        let result_columns = &plan.result_columns;
+        let order_by = &plan.order_by;
+        let aggregates = &plan.aggregates;
         // Block ORDER BY on custom type columns without OPERATOR '<'
-        for (expr, _, _) in order_by.iter() {
-            if is_custom_type_without_lt(expr, referenced_tables, t_ctx.resolver.schema()) {
-                if let Some((col, type_def)) =
-                    result_column_custom_type_info(expr, referenced_tables, t_ctx.resolver.schema())
+        for term in order_by {
+            if let Some(type_name) = custom_type_without_lt_name(&term.expr, plan) {
+                if let Some(result_column) = result_columns
+                    .iter()
+                    .find(|column| plan_exprs_are_equivalent(&column.expr, &term.expr))
                 {
-                    let col_name = col.name.as_deref().unwrap_or("?");
                     crate::bail_parse_error!(
-                    "cannot ORDER BY column '{}' of type '{}': type does not declare OPERATOR '<'",
-                    col_name,
-                    type_def.name
-                );
+                        "cannot ORDER BY column '{}' of type '{}': type does not declare OPERATOR '<'",
+                        result_column.name,
+                        type_name
+                    );
                 }
                 crate::bail_parse_error!(
-                    "cannot ORDER BY a custom type column that does not declare OPERATOR '<'"
+                    "cannot ORDER BY expression of type '{}': type does not declare OPERATOR '<'",
+                    type_name
                 );
             }
         }
 
         let only_aggs = order_by
             .iter()
-            .all(|(e, _, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));
+            .all(|term| is_orderby_agg_or_const(&term.expr, aggregates));
 
-        let has_explicit_nulls = order_by.iter().any(|(_, _, nulls)| nulls.is_some());
+        let has_explicit_nulls = order_by.iter().any(|term| term.nulls.is_some());
         let use_heap_sort =
             !has_distinct && !has_group_by && t_ctx.limit_ctx.is_some() && !has_explicit_nulls;
 
@@ -203,17 +162,13 @@ impl EmitOrderBy {
             let index_name = format!("heap_sort_{}", program.offset().as_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
             let mut index_columns =
                 Vec::try_with_capacity_ext(order_by.len() + result_columns.len())?;
-            for (column, order, _nulls) in order_by {
-                let collation = get_collseq_from_expr_with_symbols(
-                    column,
-                    referenced_tables,
-                    Some(t_ctx.resolver.symbol_table),
-                )?;
+            for term in order_by {
+                let collation = plan_expr_collation(&term.expr, plan)?;
                 let pos_in_table = index_columns.len();
                 // Have enough space pre-allocatoed to push without realloc
                 index_columns.push(IndexColumn {
                     name: pos_in_table.to_string(),
-                    order: *order,
+                    order: term.order,
                     pos_in_table,
                     collation,
                     default: None,
@@ -277,13 +232,9 @@ impl EmitOrderBy {
                 Option<turso_parser::ast::NullsOrder>,
             )> = order_by
                 .iter()
-                .map(|(expr, dir, nulls)| {
-                    let collation = get_collseq_from_expr_with_symbols(
-                        expr,
-                        referenced_tables,
-                        Some(t_ctx.resolver.symbol_table),
-                    )?;
-                    Ok::<_, crate::LimboError>((*dir, collation, *nulls))
+                .map(|term| {
+                    let collation = plan_expr_collation(&term.expr, plan)?;
+                    Ok::<_, crate::LimboError>((term.order, collation, term.nulls))
                 })
                 .try_collect::<Result<Vec<_>>>()??;
 
@@ -291,9 +242,7 @@ impl EmitOrderBy {
             // For types with a `<` operator, the comparator is used for correct sort ordering.
             let mut comparators: Vec<Option<SortComparatorType>> = order_by
                 .iter()
-                .map(|(expr, _, _)| {
-                    custom_type_comparator(expr, referenced_tables, t_ctx.resolver.schema())
-                })
+                .map(|term| custom_type_comparator(&term.expr, plan))
                 .try_collect()?;
 
             if has_sequence {
@@ -396,44 +345,15 @@ impl EmitOrderBy {
             // Deduplicated columns share a sort key slot, which stores the encoded
             // (on-disk) value (decode was suppressed during sorter insert). Apply
             // DECODE now so the result set contains human-readable values.
-            if remapping.deduplicated {
-                if let Some((col, type_def)) = result_column_custom_type_info(
-                    &rc.expr,
-                    &plan.table_references,
-                    t_ctx.resolver.schema(),
-                ) {
-                    if let Some(decode_expr) = type_def.decode() {
-                        let skip_label = program.allocate_label();
-                        program.emit_insn(Insn::IsNull {
-                            reg,
-                            target_pc: skip_label,
-                        });
-                        super::expr::emit_type_expr(
-                            program,
-                            decode_expr,
-                            reg,
-                            reg,
-                            col,
-                            &type_def,
-                            &t_ctx.resolver,
-                        )?;
-                        program.preassign_label_to_next_insn(skip_label);
-                    }
-                }
-            }
+            debug_assert!(
+                !remapping.deduplicated || !needs_scalar_custom_decode(&rc.type_fact),
+                "decoded custom result columns must keep their own sorter payload slot"
+            );
         }
-
-        // Decode array blobs to JSON text for display, after extracting from sorter
-        super::result_row::emit_array_decode_for_results(
-            program,
-            result_columns,
-            &plan.table_references,
-            start_reg,
-            &t_ctx.resolver,
-        )?;
 
         emit_result_row_and_limit(
             program,
+            &t_ctx.resolver,
             plan,
             start_reg,
             t_ctx.limit_ctx,
@@ -484,14 +404,15 @@ impl EmitOrderBy {
                 - result_columns_to_skip_len;
 
         let start_reg = program.alloc_registers(orderby_sorter_column_count);
-        for (i, (expr, _, _)) in order_by.iter().enumerate() {
+        for (i, term) in order_by.iter().enumerate() {
+            let expr = &term.expr;
             let key_reg = start_reg + i;
 
             // Check if this ORDER BY expression matches a finalized aggregate
             if let Some(agg_idx) = plan
                 .aggregates
                 .iter()
-                .position(|agg| exprs_are_equivalent(&agg.original_expr, expr))
+                .position(|agg| plan_exprs_are_equivalent(&agg.original_expr, expr))
             {
                 // This ORDER BY expression is an aggregate, so copy from register
                 let agg_start_reg = t_ctx
@@ -507,13 +428,11 @@ impl EmitOrderBy {
                 // Sort keys must be encoded (on-disk) values. Suppress decode so the
                 // sorter compares encoded representations, using either the base type's
                 // built-in comparison (naked OPERATOR '<') or a custom comparator function.
-                let is_custom =
-                    result_column_custom_type_info(expr, &plan.table_references, resolver.schema())
-                        .is_some_and(|(_, td)| td.decode().is_some());
+                let is_custom = needs_scalar_custom_decode(&plan_expr_type_fact(expr, plan));
                 if is_custom {
                     program.flags.set_suppress_custom_type_decode(true);
                 }
-                let result = translate_expr(
+                let result = translate_plan_expr(
                     program,
                     Some(&plan.table_references),
                     expr,
@@ -585,7 +504,7 @@ impl EmitOrderBy {
             {
                 continue;
             }
-            translate_expr(
+            translate_plan_expr(
                 program,
                 Some(&plan.table_references),
                 &rc.expr,
@@ -724,11 +643,7 @@ pub struct OrderByRemapping {
 /// If we skip a result column, we need to keep track what index in the ORDER BY sorter the result columns have,
 /// because the result columns should be emitted in the SELECT clause order, not the ORDER BY clause order.
 pub fn order_by_deduplicate_result_columns(
-    order_by: &[(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )],
+    order_by: &[PlanOrderTerm],
     result_columns: &[ResultSetColumn],
     has_sequence: bool,
 ) -> Result<Vec<OrderByRemapping>> {
@@ -741,10 +656,10 @@ pub fn order_by_deduplicate_result_columns(
 
     let mut i = 0;
     for rc in result_columns.iter() {
-        let found = order_by
-            .iter()
-            .enumerate()
-            .find(|(_, (expr, _, _))| exprs_are_equivalent(expr, &rc.expr));
+        let found = order_by.iter().enumerate().find(|(_, term)| {
+            !needs_scalar_custom_decode(&rc.type_fact)
+                && plan_exprs_are_equivalent(&term.expr, &rc.expr)
+        });
         if let Some((j, _)) = found {
             result_column_remapping
                 .push_within_capacity(OrderByRemapping {

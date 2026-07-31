@@ -443,8 +443,6 @@ pub struct AggregateOperator {
     group_by: Vec<usize>,
     // Aggregate functions to compute (including MIN/MAX)
     pub aggregates: Vec<AggregateFunction>,
-    // Column names from input
-    pub input_column_names: Vec<String>,
     // Map from column index to aggregate info for quick lookup
     pub column_min_max: HashMap<usize, AggColumnInfo>,
     // Set of column indices that have distinct aggregates
@@ -1070,7 +1068,6 @@ impl AggregateState {
         values: &[Value],
         weight: isize,
         aggregates: &[AggregateFunction],
-        _column_names: &[String], // No longer needed
         distinct_transitions: &HashMap<usize, DistinctTransition>,
     ) -> Result<()> {
         // Update COUNT
@@ -1350,11 +1347,10 @@ impl AggregateOperator {
         transitions
     }
 
-    pub fn new(
+    pub fn new_typed(
         operator_id: i64,
         group_by: Vec<usize>,
         aggregates: Vec<AggregateFunction>,
-        input_column_names: Vec<String>,
     ) -> Result<Self> {
         // Precompute flags for runtime efficiency
         // Plain DISTINCT is indicated by empty aggregates vector
@@ -1429,7 +1425,6 @@ impl AggregateOperator {
             operator_id,
             group_by,
             aggregates,
-            input_column_names,
             column_min_max,
             distinct_columns,
             tracker: None,
@@ -1567,7 +1562,6 @@ impl AggregateOperator {
                 &row.values,
                 *weight,
                 &self.aggregates,
-                &self.input_column_names,
                 &distinct_transitions,
             )?;
         }

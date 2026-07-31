@@ -659,11 +659,15 @@ pub fn insn_to_row(
                 0,
                 format!("{table_name}.{col_name} ({element_type})"),
             ),
-            Insn::ArrayDecode { reg } => (
+            Insn::ArrayDecode {
+                reg,
+                dimensions,
+                rank_unbounded,
+            } => (
                 "ArrayDecode",
                 *reg as i64,
-                0,
-                0,
+                *dimensions as i64,
+                *rank_unbounded as i64,
                 Value::build_text(""),
                 0,
                 String::new(),
@@ -2337,14 +2341,24 @@ pub fn insn_to_row(
                 0,
                 format!("add_column({table}, {column:?})"),
             ),
-            Insn::AlterColumn { db: _, table, column_index, definition: column, rename } => (
+            Insn::AlterColumn {
+                db: _,
+                table,
+                column_index,
+                table_definition,
+                rename,
+                ..
+            } => (
                 "AlterColumn",
                 0,
                 0,
                 0,
                 Value::build_text(""),
                 0,
-                format!("alter_column({table}, {column_index}, {column:?}, {rename:?})"),
+                format!(
+                    "alter_column({table}, {column_index}, {:?}, {rename:?})",
+                    table_definition.columns()[*column_index]
+                ),
             ),
             Insn::MaxPgcnt { db, dest, new_max } => (
                 "MaxPgcnt",

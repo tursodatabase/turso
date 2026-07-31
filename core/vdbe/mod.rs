@@ -1504,6 +1504,9 @@ pub struct PreparedProgram {
     pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
+    /// Root-independent incremental plans keyed by normalized materialized-view name.
+    pub(crate) incremental_view_templates:
+        HashMap<String, Arc<crate::incremental::view::IncrementalViewTemplate>>,
     pub sql: String,
     /// Whether the statement needs to be wrapped in a statement subtransaction
     /// when run as part of an interactive (non-autocommit) transaction.

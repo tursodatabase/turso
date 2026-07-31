@@ -1,20 +1,21 @@
-use crate::schema::Table;
 use crate::turso_assert_greater_than_or_equal;
 use crate::{
-    schema::{FromClauseSubquery, Index, Schema},
+    schema::{FromClauseSubquery, Index, Table},
     translate::{
-        collate::{get_collseq_from_expr, CollationSeq},
+        collate::CollationSeq,
         optimizer::access_method::AccessMethodParams,
         optimizer::constraints::RangeConstraintRef,
         plan::{
             GroupBy, HashJoinType, IterationDirection, JoinedTable, Operation, Plan, Scan,
             SimpleAggregate, TableReferences,
         },
-        planner::table_mask_from_expr,
+        plan_expr::{
+            plan_expr_collation, plan_expr_dependencies, plan_expr_type_fact,
+            plan_exprs_are_equivalent, PlanExpr, PlanOrderTerm, PlanSourceId,
+        },
     },
-    util::exprs_are_equivalent,
 };
-use turso_parser::ast::{self, SortOrder, TableInternalId};
+use turso_parser::ast::{self, SortOrder};
 
 use super::{
     access_method::AccessMethod,
@@ -23,23 +24,35 @@ use super::{
 };
 
 /// Target component in an ORDER BY/GROUP BY that may be a plain column or an expression.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone)]
 pub enum ColumnTarget {
     Column(usize),
     RowId,
-    /// We know that the ast lives at least as long as the Statement/Program,
-    /// so we store a raw pointer here to avoid cloning yet another ast::Expr
-    Expr(*const ast::Expr),
+    Expr(PlanExpr),
+}
+
+impl PartialEq for ColumnTarget {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Column(lhs), Self::Column(rhs)) => lhs == rhs,
+            (Self::RowId, Self::RowId) => true,
+            (Self::Expr(lhs), Self::Expr(rhs)) => plan_exprs_are_equivalent(lhs, rhs),
+            _ => false,
+        }
+    }
 }
 
 /// A convenience struct for representing a (table_no, column_target, [SortOrder]) tuple.
 #[derive(Debug, PartialEq, Clone)]
 pub struct ColumnOrder {
-    pub table_id: TableInternalId,
+    pub table_id: PlanSourceId,
     pub target: ColumnTarget,
     pub order: SortOrder,
     pub collation: CollationSeq,
     pub nulls_order: Option<ast::NullsOrder>,
+    /// Semantic custom types are encoded as blobs whose byte order is not the
+    /// SQL type's order, so a normal B-tree cannot prove this ordering.
+    pub uses_custom_type_ordering: bool,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -85,7 +98,7 @@ impl OrderTarget {
     /// Build an `OrderTarget` from a list of expressions if they can all be
     /// satisfied by a single-table ordering (needed for index satisfaction).
     fn maybe_from_iterator<'a>(
-        list: impl Iterator<Item = (&'a ast::Expr, SortOrder, Option<ast::NullsOrder>)> + Clone,
+        list: impl Iterator<Item = (&'a PlanExpr, SortOrder, Option<ast::NullsOrder>)> + Clone,
         tables: &crate::translate::plan::TableReferences,
         purpose: OrderTargetPurpose,
     ) -> Option<Self> {
@@ -136,7 +149,7 @@ pub fn simple_aggregate_order_target(
 /// TODO: this does not currently handle the case where we definitely cannot eliminate
 /// the ORDER BY sorter, but we could still eliminate the GROUP BY sorter.
 pub fn compute_order_target(
-    order_by: &mut Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
+    order_by: &mut Vec<PlanOrderTerm>,
     group_by_opt: Option<&mut GroupBy>,
     tables: &TableReferences,
 ) -> Option<OrderTarget> {
@@ -147,7 +160,7 @@ pub fn compute_order_target(
         (false, None) => OrderTarget::maybe_from_iterator(
             order_by
                 .iter()
-                .map(|(expr, order, nulls)| (expr.as_ref(), *order, *nulls)),
+                .map(|term| (&term.expr, term.order, term.nulls)),
             tables,
             OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
         ),
@@ -171,11 +184,11 @@ pub fn compute_order_target(
         // however in this case we must take the ASC/DESC from ORDER BY into account.
         (false, Some(group_by)) => {
             // Does the group by contain all expressions in the order by?
-            let group_by_contains_all = order_by.iter().all(|(expr, _, _)| {
+            let group_by_contains_all = order_by.iter().all(|term| {
                 group_by
                     .exprs
                     .iter()
-                    .any(|group_by_expr| exprs_are_equivalent(expr, group_by_expr))
+                    .any(|group_by_expr| plan_exprs_are_equivalent(&term.expr, group_by_expr))
             });
             // If not, let's try to target an ordering that matches the group by -- we don't care about ASC/DESC
             if !group_by_contains_all {
@@ -193,7 +206,7 @@ pub fn compute_order_target(
             group_by.exprs.sort_by_key(|expr| {
                 order_by
                     .iter()
-                    .position(|(order_by_expr, _, _)| exprs_are_equivalent(expr, order_by_expr))
+                    .position(|term| plan_exprs_are_equivalent(expr, &term.expr))
                     .map_or(usize::MAX, |i| i)
             });
 
@@ -203,9 +216,9 @@ pub fn compute_order_target(
             // First, however, we need to make sure the GROUP BY sorter's column sort directions and NULLS
             // ordering match the ORDER BY requirements.
             turso_assert_greater_than_or_equal!(group_by.exprs.len(), order_by.len());
-            for (i, (_, order_by_dir, order_by_nulls)) in order_by.iter().enumerate() {
-                group_by.sort_order[i] = *order_by_dir;
-                group_by.nulls_order[i] = *order_by_nulls;
+            for (i, term) in order_by.iter().enumerate() {
+                group_by.sort_order[i] = term.order;
+                group_by.nulls_order[i] = term.nulls;
             }
             // The sort_by_key above reordered group_by.exprs but not sort_order,
             // so remaining positions may have stale values. GROUP BY columns not
@@ -238,7 +251,6 @@ pub fn plan_satisfies_order_target(
     access_methods_arena: &[AccessMethod],
     joined_tables: &[JoinedTable],
     order_target: &OrderTarget,
-    schema: &Schema,
 ) -> bool {
     // Outer hash joins emit unmatched rows in hash-bucket order, not scan order.
     for (_, access_method_index) in plan.data.iter() {
@@ -283,7 +295,6 @@ pub fn plan_satisfies_order_target(
                 index_opt.as_deref(),
                 constraint_refs,
                 &order_target.columns[target_col_idx..],
-                schema,
                 EqualityPrefixScope::ConstantEquality,
             ),
             AccessMethodParams::MaterializedSubquery {
@@ -296,7 +307,6 @@ pub fn plan_satisfies_order_target(
                 Some(index.as_ref()),
                 constraint_refs,
                 &order_target.columns[target_col_idx..],
-                schema,
                 EqualityPrefixScope::ConstantEquality,
             ),
             AccessMethodParams::Subquery { iter_dir } => {
@@ -310,7 +320,6 @@ pub fn plan_satisfies_order_target(
                     from_clause_subquery,
                     *iter_dir,
                     &order_target.columns[target_col_idx..],
-                    schema,
                 )
             }
             _ => return false,
@@ -440,11 +449,10 @@ fn index_info_for_access(index: Option<&Index>) -> IndexInfo {
 /// 2. GROUP BY keys (we always use a sorter, never hashing - FOR NOW).
 /// 3. A simple single-source finalized scan whose output order is already known.
 pub fn subquery_intrinsic_order_consumed(
-    table_id: TableInternalId,
+    table_id: PlanSourceId,
     subquery: &FromClauseSubquery,
     iter_dir: IterationDirection,
     target: &[ColumnOrder],
-    schema: &Schema,
 ) -> usize {
     let Plan::Select(select_plan) = subquery.plan.as_ref() else {
         // Don't consider sort elision for compound selects
@@ -458,7 +466,7 @@ pub fn subquery_intrinsic_order_consumed(
             select_plan
                 .order_by
                 .iter()
-                .map(|(expr, order, nulls)| (expr.as_ref(), *order, *nulls)),
+                .map(|term| (&term.expr, term.order, term.nulls)),
         );
         return match_intrinsic_order(&intrinsic, iter_dir, target);
     }
@@ -480,34 +488,27 @@ pub fn subquery_intrinsic_order_consumed(
             return consumed;
         }
     }
-    finalized_scan_subquery_order_consumed(table_id, select_plan, iter_dir, target, schema)
+    finalized_scan_subquery_order_consumed(table_id, select_plan, iter_dir, target)
 }
 
 /// Build a `ColumnOrder` list from expressions and sort directions by mapping
 /// each expression to a result column position.
-fn build_intrinsic_order(
-    table_id: TableInternalId,
+fn build_intrinsic_order<'expr>(
+    table_id: PlanSourceId,
     select_plan: &crate::translate::plan::SelectPlan,
-    exprs: impl Iterator<
-        Item = (
-            impl std::borrow::Borrow<ast::Expr>,
-            SortOrder,
-            Option<ast::NullsOrder>,
-        ),
-    >,
+    exprs: impl Iterator<Item = (&'expr PlanExpr, SortOrder, Option<ast::NullsOrder>)>,
 ) -> Vec<ColumnOrder> {
     let mut intrinsic = Vec::new();
     for (expr, order, nulls) in exprs {
-        let expr = expr.borrow();
         let Some((col_idx, result_col)) = select_plan
             .result_columns
             .iter()
             .enumerate()
-            .find(|(_, result_col)| exprs_are_equivalent(expr, &result_col.expr))
+            .find(|(_, result_col)| plan_exprs_are_equivalent(expr, &result_col.expr))
         else {
             break;
         };
-        let Ok(collation) = get_collseq_from_expr(expr, &select_plan.table_references) else {
+        let Ok(collation) = plan_expr_collation(expr, select_plan) else {
             break;
         };
         intrinsic.push(ColumnOrder {
@@ -515,12 +516,13 @@ fn build_intrinsic_order(
             target: ColumnTarget::Column(col_idx),
             order,
             collation: collation.unwrap_or_else(|| {
-                get_collseq_from_expr(&result_col.expr, &select_plan.table_references)
+                plan_expr_collation(&result_col.expr, select_plan)
                     .ok()
                     .flatten()
                     .unwrap_or_default()
             }),
             nulls_order: nulls,
+            uses_custom_type_ordering: false,
         });
     }
     intrinsic
@@ -576,11 +578,10 @@ fn match_intrinsic_order(
 /// non-window, non-distinct SELECTs only. Those are the cases where insertion
 /// order into the materialized table is just the underlying scan order.
 fn finalized_scan_subquery_order_consumed(
-    table_id: TableInternalId,
+    table_id: PlanSourceId,
     select_plan: &crate::translate::plan::SelectPlan,
     iter_dir: IterationDirection,
     target: &[ColumnOrder],
-    schema: &Schema,
 ) -> usize {
     if select_plan.group_by.is_some()
         || !select_plan.aggregates.is_empty()
@@ -656,7 +657,6 @@ fn finalized_scan_subquery_order_consumed(
             index.as_deref(),
             &[],
             &mapped_target,
-            schema,
             EqualityPrefixScope::ConstantEquality,
         ),
         Operation::Scan(Scan::Subquery { .. }) => {
@@ -668,7 +668,6 @@ fn finalized_scan_subquery_order_consumed(
                 from_clause_subquery,
                 effective_iter_dir,
                 &mapped_target,
-                schema,
             )
         }
         _ => 0,
@@ -676,74 +675,82 @@ fn finalized_scan_subquery_order_consumed(
 }
 
 fn expr_to_column_order(
-    expr: &ast::Expr,
+    expr: &PlanExpr,
     order: SortOrder,
     nulls_order: Option<ast::NullsOrder>,
     tables: &TableReferences,
 ) -> Option<ColumnOrder> {
     match expr {
-        ast::Expr::Column {
-            table: table_id,
-            column,
-            ..
-        } => {
-            let table = tables.find_joined_table_by_internal_id(*table_id)?;
-            let col = table.columns().get(*column)?;
+        PlanExpr::Column(column) => {
+            tables.find_joined_table_by_internal_id(column.source)?;
             return Some(ColumnOrder {
-                table_id: *table_id,
-                target: ColumnTarget::Column(*column),
+                table_id: column.source,
+                target: ColumnTarget::Column(column.column),
                 order,
-                collation: col.collation(),
+                collation: column
+                    .collation
+                    .as_ref()
+                    .map(|collation| *collation.value())
+                    .unwrap_or_default(),
                 nulls_order,
+                uses_custom_type_ordering: column
+                    .type_fact
+                    .declared
+                    .as_ref()
+                    .is_some_and(|declared| declared.custom().is_some()),
             });
         }
-        ast::Expr::Collate(expr, collation) => {
-            if let ast::Expr::Column {
-                table: table_id,
-                column,
-                ..
-            } = expr.as_ref()
-            {
-                let collation = CollationSeq::new(collation.as_str()).unwrap_or_default();
+        PlanExpr::Collate { expr, collation } => {
+            if let PlanExpr::Column(column) = expr.as_ref() {
                 return Some(ColumnOrder {
-                    table_id: *table_id,
-                    target: ColumnTarget::Column(*column),
+                    table_id: column.source,
+                    target: ColumnTarget::Column(column.column),
                     order,
-                    collation,
+                    collation: *collation.value(),
                     nulls_order,
+                    uses_custom_type_ordering: column
+                        .type_fact
+                        .declared
+                        .as_ref()
+                        .is_some_and(|declared| declared.custom().is_some()),
                 });
             };
         }
-        ast::Expr::RowId { table, .. } => {
+        PlanExpr::RowId(source) => {
             return Some(ColumnOrder {
-                table_id: *table,
+                table_id: *source,
                 target: ColumnTarget::RowId,
                 order,
                 collation: CollationSeq::default(),
                 nulls_order,
+                uses_custom_type_ordering: false,
             });
         }
         _ => {}
     }
-    let mask = table_mask_from_expr(expr, tables, &[]).ok()?;
-    if mask.count() != 1 {
+    let dependencies = plan_expr_dependencies(expr).ok()?;
+    if !dependencies.outputs.is_empty() || !dependencies.subqueries.is_empty() {
         return None;
     }
-    let collation = get_collseq_from_expr(expr, tables)
-        .ok()?
-        .unwrap_or_default();
-    let table_no = tables
-        .joined_tables()
-        .iter()
-        .enumerate()
-        .find_map(|(i, _)| mask.get(i).then_some(i))?;
-    let table_id = tables.joined_tables()[table_no].internal_id;
+    let mut sources = dependencies.sources();
+    let table_id = sources.next()?;
+    if sources.any(|source| source != table_id)
+        || tables.find_joined_table_by_internal_id(table_id).is_none()
+    {
+        return None;
+    }
+    let collation = plan_expr_collation(expr, &()).ok()?.unwrap_or_default();
+    let type_fact = plan_expr_type_fact(expr, &());
     Some(ColumnOrder {
         table_id,
-        target: ColumnTarget::Expr(expr as *const ast::Expr),
+        target: ColumnTarget::Expr(expr.clone()),
         order,
         collation,
         nulls_order,
+        uses_custom_type_ordering: type_fact
+            .declared
+            .as_ref()
+            .is_some_and(|declared| declared.custom().is_some()),
     })
 }
 
@@ -762,12 +769,11 @@ fn target_matches_index_column(
         (ColumnTarget::Expr(expr), Some(_))
             if idx_col.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL =>
         {
-            let target_expr = unsafe { &**expr };
             table_ref
-                .bound_index_expressions(index)
+                .plan_index_expressions(index)
                 .and_then(|bound| bound.columns.get(index_column))
-                .and_then(|expr| expr.as_deref())
-                .is_some_and(|index_expr| exprs_are_equivalent(target_expr, index_expr))
+                .and_then(Option::as_ref)
+                .is_some_and(|index_expr| plan_exprs_are_equivalent(expr, index_expr))
         }
         _ => false,
     }
@@ -788,7 +794,6 @@ pub(super) fn btree_access_order_consumed(
     index: Option<&Index>,
     constraint_refs: &[RangeConstraintRef],
     order_target: &[ColumnOrder],
-    schema: &Schema,
     equality_prefix_scope: EqualityPrefixScope,
 ) -> usize {
     let Some(first_target_col) = order_target.first() else {
@@ -867,15 +872,8 @@ pub(super) fn btree_access_order_consumed(
                 // Custom type columns store encoded blobs. The B-tree's bytewise
                 // ordering does not match the custom type's semantic ordering, so
                 // the index cannot satisfy ORDER BY for those columns.
-                if let ColumnTarget::Column(col_no) = &target_col.target {
-                    if let Some(col) = table_ref.table.columns().get(*col_no) {
-                        if schema
-                            .get_type_def(&col.ty_str, table_ref.table.is_strict())
-                            .is_some()
-                        {
-                            break;
-                        }
-                    }
+                if target_col.uses_custom_type_ordering {
+                    break;
                 }
 
                 if target_col.collation != idx_col.collation.unwrap_or_default() {

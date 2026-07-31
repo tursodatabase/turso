@@ -1,9 +1,16 @@
 use super::*;
 use crate::alloc::{TryClone, TursoIteratorExt};
-use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
+use crate::translate::expr::{
+    emit_table_column, translate_plan_condition_expr, translate_plan_expr,
+};
+use crate::translate::optimizer::constraints::table_mask_from_plan_expr;
 use crate::translate::plan::ColumnUsedMask;
-use crate::vdbe::builder::SelfTableContext;
+use crate::translate::plan_expr::{
+    resolve_plan_comparison_affinity, resolve_plan_comparison_collation, walk_plan_expr, PlanExpr,
+    PlanSourceId, PlanWalkControl,
+};
+use crate::LimboError;
 
 #[derive(Debug, Clone)]
 /// Payload layout metadata recorded during hash-build planning or reuse.
@@ -15,13 +22,21 @@ pub(super) struct HashBuildPayloadInfo {
     pub allow_seek: bool,
 }
 
-fn expr_references_outer_query(expr: &Expr, table_references: &TableReferences) -> bool {
+fn expr_references_outer_query(expr: &PlanExpr, table_references: &TableReferences) -> bool {
     let mut has_outer_ref = false;
-    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
-        match e {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
+    let _ = walk_plan_expr(expr, &mut |expr| {
+        match expr {
+            PlanExpr::Column(column) => {
                 if table_references
-                    .find_outer_query_ref_by_internal_id(*table)
+                    .find_outer_query_ref_by_internal_id(column.source)
+                    .is_some()
+                {
+                    has_outer_ref = true;
+                }
+            }
+            PlanExpr::RowId(source) => {
+                if table_references
+                    .find_outer_query_ref_by_internal_id(*source)
                     .is_some()
                 {
                     has_outer_ref = true;
@@ -29,7 +44,7 @@ fn expr_references_outer_query(expr: &Expr, table_references: &TableReferences) 
             }
             _ => {}
         }
-        Ok(WalkControl::Continue)
+        Ok(PlanWalkControl::Continue)
     });
     has_outer_ref
 }
@@ -111,13 +126,13 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
             .get(&self.hash_join_op.build_table_idx);
         let materialized_cursor_id = materialized_input.map(|input| input.cursor_id);
         let num_keys = self.hash_join_op.join_keys.len();
+        let facts = &self.non_from_clause_subqueries;
 
         let mut key_affinities = String::new();
         for join_key in &self.hash_join_op.join_keys {
             let build_expr = join_key.get_build_expr(self.predicates);
             let probe_expr = join_key.get_probe_expr(self.predicates);
-            let affinity =
-                comparison_affinity(build_expr, probe_expr, Some(self.table_references), None);
+            let affinity = resolve_plan_comparison_affinity(build_expr, probe_expr, facts);
             key_affinities.push(affinity.aff_mask());
         }
 
@@ -136,15 +151,9 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                         join_key.get_build_expr(self.predicates),
                     ),
                 };
-                resolve_comparison_collseq_with_symbols(
-                    original_lhs,
-                    original_rhs,
-                    self.table_references,
-                    Some(self.t_ctx.resolver.symbol_table),
-                )
-                .unwrap_or(CollationSeq::Binary)
+                resolve_plan_comparison_collation(original_lhs, original_rhs, facts)
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let use_bloom_filter = self.hash_join_op.use_bloom_filter
             && collations
@@ -175,20 +184,33 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                 _ => {
                     let payload_signature_columns: ColumnUsedMask =
                         build_table.col_used_mask.try_clone()?;
+                    let dependency = self
+                        .t_ctx
+                        .source_row_dependencies
+                        .get(&build_table.internal_id)
+                        .ok_or_else(|| {
+                            crate::LimboError::InternalError(format!(
+                                "hash build source {} has no frozen row dependency",
+                                build_table.internal_id
+                            ))
+                        })?;
                     let payload_columns = payload_signature_columns
                         .iter()
                         .map(|col_idx| {
-                            let column = build_table
-                                .columns()
-                                .get(col_idx)
-                                .expect("build table column missing");
-                            MaterializedColumnRef::Column {
-                                table_id: build_table.internal_id,
-                                column_idx: col_idx,
-                                is_rowid_alias: column.is_rowid_alias(),
-                            }
+                            let column = dependency
+                                .columns
+                                .iter()
+                                .find(|column| column.column == col_idx)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    crate::LimboError::InternalError(format!(
+                                        "hash payload is missing frozen metadata for {}.column{}",
+                                        build_table.internal_id, col_idx
+                                    ))
+                                })?;
+                            Ok(MaterializedColumnRef::Column { column })
                         })
-                        .collect();
+                        .collect::<Result<Vec<_>>>()?;
                     (payload_columns, payload_signature_columns, false, true)
                 }
             };
@@ -357,7 +379,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                     // before null-extension.
                     continue;
                 }
-                let mask = table_mask_from_expr(
+                let mask = table_mask_from_plan_expr(
                     &cond.expr,
                     planner.table_references,
                     planner.non_from_clause_subqueries,
@@ -377,9 +399,9 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                     jump_target_when_false: skip_to_next,
                     jump_target_when_null: skip_to_next,
                 };
-                translate_condition_expr(
+                translate_plan_condition_expr(
                     planner.program,
-                    planner.table_references,
+                    Some(planner.table_references),
                     &cond.expr,
                     condition_metadata,
                     &planner.t_ctx.resolver,
@@ -401,7 +423,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         } else {
             for (idx, join_key) in planner.hash_join_op.join_keys.iter().enumerate() {
                 let build_expr = join_key.get_build_expr(planner.predicates);
-                translate_expr(
+                translate_plan_expr(
                     planner.program,
                     Some(planner.table_references),
                     build_expr,
@@ -423,41 +445,30 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         let (payload_start_reg, mut payload_info) = if num_payload > 0 {
             let payload_reg = planner.program.alloc_registers(num_payload);
             for (i, col_idx) in config.payload_signature_columns.iter().enumerate() {
-                match build_table
-                    .columns()
-                    .get(col_idx)
-                    .map(|c| c.generated_type())
-                {
-                    Some(GeneratedType::Virtual { expr, .. }) if !config.use_materialized_keys => {
-                        planner.t_ctx.resolver.with_self_table_context(
-                            planner.program,
-                            Some(&SelfTableContext::ForSelect {
-                                table_ref_id: build_table.internal_id,
-                                referenced_tables: planner.table_references.clone(),
-                            }),
-                            |program, _| -> Result<()> {
-                                translate_expr(
-                                    program,
-                                    Some(planner.table_references),
-                                    expr,
-                                    payload_reg + i,
-                                    &planner.t_ctx.resolver,
-                                )?;
-                                Ok(())
-                            },
-                        )?;
-
-                        planner.program.emit_column_affinity(
-                            payload_reg + i,
-                            build_table.columns()[col_idx].affinity(),
-                        );
-                    }
-                    _ => planner.program.emit_column_or_rowid(
+                if config.use_materialized_keys {
+                    planner.program.emit_column_or_rowid(
                         payload_source_cursor_id,
                         col_idx,
                         payload_reg + i,
-                    ),
-                };
+                    );
+                } else {
+                    let column = build_table.columns().get(col_idx).ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "hash payload column {col_idx} is outside source {}",
+                            build_table.internal_id
+                        ))
+                    })?;
+                    emit_table_column(
+                        planner.program,
+                        payload_source_cursor_id,
+                        build_table.internal_id,
+                        planner.table_references,
+                        column,
+                        col_idx,
+                        payload_reg + i,
+                        &planner.t_ctx.resolver,
+                    )?;
+                }
             }
             (
                 Some(payload_reg),
@@ -569,7 +580,7 @@ pub(super) struct HashProbeSetupEmitter<'a, 'plan> {
     loop_start: BranchOffset,
     loop_end: BranchOffset,
     next: BranchOffset,
-    live_table_ids: &'a HashSet<TableInternalId>,
+    live_table_ids: &'a HashSet<PlanSourceId>,
 }
 
 impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
@@ -586,7 +597,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         loop_start: BranchOffset,
         loop_end: BranchOffset,
         next: BranchOffset,
-        live_table_ids: &'a HashSet<TableInternalId>,
+        live_table_ids: &'a HashSet<PlanSourceId>,
     ) -> Self {
         Self {
             program,
@@ -687,7 +698,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         let probe_key_start_reg = self.program.alloc_registers(num_keys);
         for (idx, join_key) in self.hash_join_op.join_keys.iter().enumerate() {
             let probe_expr = join_key.get_probe_expr(self.predicates);
-            translate_expr(
+            translate_plan_expr(
                 self.program,
                 Some(self.table_references),
                 probe_expr,
@@ -830,10 +841,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         );
 
         self.t_ctx.resolver.enable_expr_to_reg_cache();
-        let rowid_expr = Expr::RowId {
-            database: None,
-            table: build_table.internal_id,
-        };
+        let rowid_expr = PlanExpr::RowId(build_table.internal_id);
         let payload_has_build_rowid = payload_columns.iter().any(|payload| {
             matches!(
                 payload,
@@ -844,51 +852,33 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         if payload_info.allow_seek && !payload_has_build_rowid && !build_table_is_live {
             self.t_ctx
                 .resolver
-                .cache_expr_reg(Cow::Owned(rowid_expr), match_reg, false, None);
+                .cache_plan_expr_reg(rowid_expr, match_reg, false, None);
         }
         if let Some(payload_reg) = payload_dest_reg {
             for (i, payload) in payload_columns.iter().enumerate() {
-                let (payload_table_id, expr, is_column) = match payload {
-                    MaterializedColumnRef::Column {
-                        table_id,
-                        column_idx,
-                        is_rowid_alias,
-                    } => (
-                        *table_id,
-                        Expr::Column {
-                            database: None,
-                            table: *table_id,
-                            column: *column_idx,
-                            is_rowid_alias: *is_rowid_alias,
-                        },
-                        true,
-                    ),
-                    MaterializedColumnRef::RowId { table_id } => (
-                        *table_id,
-                        Expr::RowId {
-                            database: None,
-                            table: *table_id,
-                        },
-                        false,
-                    ),
-                };
-                if self.live_table_ids.contains(&payload_table_id) {
-                    continue;
-                }
-                if is_column {
-                    self.t_ctx.resolver.cache_scalar_expr_reg(
-                        Cow::Owned(expr),
-                        payload_reg + i,
-                        true,
-                        self.table_references,
-                    )?;
-                } else {
-                    self.t_ctx.resolver.cache_expr_reg(
-                        Cow::Owned(expr),
-                        payload_reg + i,
-                        false,
-                        None,
-                    );
+                match payload {
+                    MaterializedColumnRef::Column { column } => {
+                        if self.live_table_ids.contains(&column.source) {
+                            continue;
+                        }
+                        self.t_ctx.resolver.cache_plan_scalar_expr_reg(
+                            PlanExpr::Column(column.clone()),
+                            payload_reg + i,
+                            true,
+                            &self.subqueries,
+                        )?;
+                    }
+                    MaterializedColumnRef::RowId { table_id } => {
+                        if self.live_table_ids.contains(table_id) {
+                            continue;
+                        }
+                        self.t_ctx.resolver.cache_plan_expr_reg(
+                            PlanExpr::RowId(*table_id),
+                            payload_reg + i,
+                            false,
+                            None,
+                        );
+                    }
                 }
             }
         } else if payload_info.allow_seek && !build_table_is_live {

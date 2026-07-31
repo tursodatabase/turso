@@ -4,21 +4,473 @@ use turso_parser::{
     ast::{
         self,
         fmt::{BlankContext, ToSqlContext, ToTokens, TokenStream},
-        SortOrder, TableInternalId,
+        SortOrder,
     },
     token::TokenType,
 };
 
 use crate::{
     schema::Table,
-    translate::plan::{SeekKeyComponent, TableReferences},
+    translate::{
+        plan::{SeekKeyComponent, TableReferences},
+        plan_expr::{
+            PlanColumnRef, PlanExpr, PlanFrameBound, PlanMergedColumnValue, PlanOrderTerm,
+            PlanSourceId, PlanSubqueryExpr, PlanWindowSpec,
+        },
+        semantic::hir::OutputNameKind,
+    },
     types::SeekOp,
 };
 
 use super::plan::{
-    Aggregate, DeletePlan, JoinedTable, Operation, Plan, ResultSetColumn, Scan, Search, SeekDef,
-    SelectPlan, SetOperation, UpdatePlan,
+    Aggregate, DeletePlan, JoinedTable, Operation, Plan, Scan, Search, SeekDef, SelectPlan,
+    SetOperation, UpdatePlan,
 };
+
+/// SQL rendering for a resolved plan expression.
+///
+/// `PlanExpr` deliberately contains stable source identities instead of parser
+/// table identities. Keeping this small wrapper local to plan display lets us
+/// recover user-facing table and column names without putting presentation
+/// concerns back into the semantic expression type.
+#[derive(Clone, Copy)]
+struct PlanExprSql<'a> {
+    expr: &'a PlanExpr,
+    tables: &'a [&'a TableReferences],
+}
+
+impl<'a> PlanExprSql<'a> {
+    fn new(expr: &'a PlanExpr, tables: &'a [&'a TableReferences]) -> Self {
+        Self { expr, tables }
+    }
+
+    fn nested<'b>(&'b self, expr: &'b PlanExpr) -> PlanExprSql<'b> {
+        PlanExprSql::new(expr, self.tables)
+    }
+
+    fn source(&self, source: PlanSourceId) -> Option<(&'a str, &'a Table)> {
+        self.tables.iter().find_map(|tables| {
+            if let Some(joined) = tables.find_joined_table_by_internal_id(source) {
+                return Some((joined.identifier.as_str(), &joined.table));
+            }
+            tables
+                .find_outer_query_ref_by_internal_id(source)
+                .map(|outer| (outer.identifier.as_str(), &outer.table))
+        })
+    }
+
+    fn column_name(&self, column: &PlanColumnRef) -> (String, String) {
+        let Some((table_name, table)) = self.source(column.source) else {
+            return (
+                column.source.to_string(),
+                format!("column{}", column.column),
+            );
+        };
+        let column_name = if column.rowid_alias {
+            "rowid".to_string()
+        } else {
+            table
+                .columns()
+                .get(column.column)
+                .and_then(|column| column.name.as_deref())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("column{}", column.column))
+        };
+        (table_name.to_string(), column_name)
+    }
+}
+
+impl Display for PlanExprSql<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        self.displayer(&BlankContext).fmt(f)
+    }
+}
+
+impl Display for PlanExpr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        PlanExprSql::new(self, &[]).fmt(f)
+    }
+}
+
+fn append_plan_order_terms<S: TokenStream + ?Sized>(
+    s: &mut S,
+    terms: &[PlanOrderTerm],
+    tables: &[&TableReferences],
+) -> Result<(), S::Error> {
+    for (index, term) in terms.iter().enumerate() {
+        if index != 0 {
+            s.append(TokenType::TK_COMMA, None)?;
+        }
+        PlanExprSql::new(&term.expr, tables).to_tokens(s, &BlankContext)?;
+        term.order.to_tokens(s, &BlankContext)?;
+        if let Some(nulls) = term.nulls {
+            nulls.to_tokens(s, &BlankContext)?;
+        }
+    }
+    Ok(())
+}
+
+fn append_plan_window<S: TokenStream + ?Sized>(
+    s: &mut S,
+    window: &PlanWindowSpec,
+    tables: &[&TableReferences],
+) -> Result<(), S::Error> {
+    s.append(TokenType::TK_LP, None)?;
+    if !window.partition_by.is_empty() {
+        s.append(TokenType::TK_PARTITION, None)?;
+        s.append(TokenType::TK_BY, None)?;
+        for (index, expr) in window.partition_by.iter().enumerate() {
+            if index != 0 {
+                s.append(TokenType::TK_COMMA, None)?;
+            }
+            PlanExprSql::new(expr, tables).to_tokens(s, &BlankContext)?;
+        }
+    }
+    if !window.order_by.is_empty() {
+        s.append(TokenType::TK_ORDER, None)?;
+        s.append(TokenType::TK_BY, None)?;
+        append_plan_order_terms(s, &window.order_by, tables)?;
+    }
+    if let Some(frame) = &window.frame {
+        frame.mode.to_tokens(s, &BlankContext)?;
+        if let Some(end) = &frame.end {
+            s.append(TokenType::TK_BETWEEN, None)?;
+            append_plan_frame_bound(s, &frame.start, tables)?;
+            s.append(TokenType::TK_AND, None)?;
+            append_plan_frame_bound(s, end, tables)?;
+        } else {
+            append_plan_frame_bound(s, &frame.start, tables)?;
+        }
+        if let Some(exclude) = &frame.exclude {
+            s.append(TokenType::TK_EXCLUDE, None)?;
+            exclude.to_tokens(s, &BlankContext)?;
+        }
+    }
+    s.append(TokenType::TK_RP, None)
+}
+
+fn append_plan_frame_bound<S: TokenStream + ?Sized>(
+    s: &mut S,
+    bound: &PlanFrameBound,
+    tables: &[&TableReferences],
+) -> Result<(), S::Error> {
+    match bound {
+        PlanFrameBound::CurrentRow => {
+            s.append(TokenType::TK_CURRENT, None)?;
+            s.append(TokenType::TK_ROW, None)
+        }
+        PlanFrameBound::Following(expr) => {
+            PlanExprSql::new(expr, tables).to_tokens(s, &BlankContext)?;
+            s.append(TokenType::TK_FOLLOWING, None)
+        }
+        PlanFrameBound::Preceding(expr) => {
+            PlanExprSql::new(expr, tables).to_tokens(s, &BlankContext)?;
+            s.append(TokenType::TK_PRECEDING, None)
+        }
+        PlanFrameBound::UnboundedFollowing => {
+            s.append(TokenType::TK_UNBOUNDED, None)?;
+            s.append(TokenType::TK_FOLLOWING, None)
+        }
+        PlanFrameBound::UnboundedPreceding => {
+            s.append(TokenType::TK_UNBOUNDED, None)?;
+            s.append(TokenType::TK_PRECEDING, None)
+        }
+    }
+}
+
+impl ToTokens for PlanExprSql<'_> {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        _context: &C,
+    ) -> Result<(), S::Error> {
+        match self.expr {
+            PlanExpr::Literal(literal) => literal.to_tokens(s, &BlankContext),
+            PlanExpr::Parameter(parameter) => {
+                if let Some(name) = parameter.name.as_deref() {
+                    s.append(TokenType::TK_VARIABLE, Some(name))
+                } else {
+                    let name = format!("?{}", parameter.index);
+                    s.append(TokenType::TK_VARIABLE, Some(&name))
+                }
+            }
+            PlanExpr::Column(column) => {
+                let (table, column) = self.column_name(column);
+                s.append(TokenType::TK_ID, Some(&table))?;
+                s.append(TokenType::TK_DOT, None)?;
+                s.append(TokenType::TK_ID, Some(&column))
+            }
+            PlanExpr::MergedColumn(column) => match column.value {
+                PlanMergedColumnValue::Left => {
+                    self.nested(&column.left).to_tokens(s, &BlankContext)
+                }
+                PlanMergedColumnValue::Right => {
+                    let right = PlanExpr::Column(column.right.clone());
+                    self.nested(&right).to_tokens(s, &BlankContext)
+                }
+                PlanMergedColumnValue::Coalesce => {
+                    s.append(TokenType::TK_ID, Some("coalesce"))?;
+                    s.append(TokenType::TK_LP, None)?;
+                    self.nested(&column.left).to_tokens(s, &BlankContext)?;
+                    s.append(TokenType::TK_COMMA, None)?;
+                    let right = PlanExpr::Column(column.right.clone());
+                    self.nested(&right).to_tokens(s, &BlankContext)?;
+                    s.append(TokenType::TK_RP, None)
+                }
+            },
+            PlanExpr::RowId(source) => {
+                let table = self
+                    .source(*source)
+                    .map(|(name, _)| name.to_string())
+                    .unwrap_or_else(|| source.to_string());
+                s.append(TokenType::TK_ID, Some(&table))?;
+                s.append(TokenType::TK_DOT, None)?;
+                s.append(TokenType::TK_ID, Some("rowid"))
+            }
+            PlanExpr::Output(output) => {
+                let name = format!("${output}");
+                s.append(TokenType::TK_VARIABLE, Some(&name))
+            }
+            PlanExpr::Unary { operator, expr } => {
+                operator.to_tokens(s, &BlankContext)?;
+                self.nested(expr).to_tokens(s, &BlankContext)
+            }
+            PlanExpr::Binary {
+                lhs, operator, rhs, ..
+            } => {
+                self.nested(lhs).to_tokens(s, &BlankContext)?;
+                operator.to_tokens(s, &BlankContext)?;
+                self.nested(rhs).to_tokens(s, &BlankContext)
+            }
+            PlanExpr::Between {
+                expr,
+                negated,
+                start,
+                end,
+            } => {
+                self.nested(expr).to_tokens(s, &BlankContext)?;
+                if *negated {
+                    s.append(TokenType::TK_NOT, None)?;
+                }
+                s.append(TokenType::TK_BETWEEN, None)?;
+                self.nested(start).to_tokens(s, &BlankContext)?;
+                s.append(TokenType::TK_AND, None)?;
+                self.nested(end).to_tokens(s, &BlankContext)
+            }
+            PlanExpr::Case {
+                base,
+                when_then,
+                else_expr,
+            } => {
+                s.append(TokenType::TK_CASE, None)?;
+                if let Some(base) = base {
+                    self.nested(base).to_tokens(s, &BlankContext)?;
+                }
+                for (when, then) in when_then {
+                    s.append(TokenType::TK_WHEN, None)?;
+                    self.nested(when).to_tokens(s, &BlankContext)?;
+                    s.append(TokenType::TK_THEN, None)?;
+                    self.nested(then).to_tokens(s, &BlankContext)?;
+                }
+                if let Some(else_expr) = else_expr {
+                    s.append(TokenType::TK_ELSE, None)?;
+                    self.nested(else_expr).to_tokens(s, &BlankContext)?;
+                }
+                s.append(TokenType::TK_END, None)
+            }
+            PlanExpr::Cast { expr, target } => {
+                s.append(TokenType::TK_CAST, None)?;
+                s.append(TokenType::TK_LP, None)?;
+                self.nested(expr).to_tokens(s, &BlankContext)?;
+                s.append(TokenType::TK_AS, None)?;
+                s.append(TokenType::TK_ID, Some(&target.name))?;
+                if !target.parameters.is_empty() {
+                    s.append(TokenType::TK_LP, None)?;
+                    for (index, parameter) in target.parameters.iter().enumerate() {
+                        if index != 0 {
+                            s.append(TokenType::TK_COMMA, None)?;
+                        }
+                        self.nested(parameter).to_tokens(s, &BlankContext)?;
+                    }
+                    s.append(TokenType::TK_RP, None)?;
+                }
+                for _ in 0..target.array_dimensions {
+                    s.append(TokenType::TK_LBRACKET, None)?;
+                    s.append(TokenType::TK_RBRACKET, None)?;
+                }
+                s.append(TokenType::TK_RP, None)
+            }
+            PlanExpr::Collate { expr, collation } => {
+                self.nested(expr).to_tokens(s, &BlankContext)?;
+                s.append(TokenType::TK_COLLATE, None)?;
+                let name = collation.value().to_string();
+                s.append(TokenType::TK_ID, Some(&name))
+            }
+            PlanExpr::Function(call) => {
+                let name = call.function.value().to_string();
+                s.append(TokenType::TK_ID, Some(&name))?;
+                s.append(TokenType::TK_LP, None)?;
+                if let Some(distinctness) = call.distinctness {
+                    distinctness.to_tokens(s, &BlankContext)?;
+                }
+                if call.star {
+                    s.append(TokenType::TK_STAR, None)?;
+                } else {
+                    for (index, argument) in call.arguments.iter().enumerate() {
+                        if index != 0 {
+                            s.append(TokenType::TK_COMMA, None)?;
+                        }
+                        self.nested(argument).to_tokens(s, &BlankContext)?;
+                    }
+                }
+                if !call.argument_order.is_empty() {
+                    s.append(TokenType::TK_ORDER, None)?;
+                    s.append(TokenType::TK_BY, None)?;
+                    append_plan_order_terms(s, &call.argument_order, self.tables)?;
+                }
+                s.append(TokenType::TK_RP, None)?;
+                if !call.within_group.is_empty() {
+                    s.append(TokenType::TK_WITHIN, None)?;
+                    s.append(TokenType::TK_GROUP, None)?;
+                    s.append(TokenType::TK_LP, None)?;
+                    s.append(TokenType::TK_ORDER, None)?;
+                    s.append(TokenType::TK_BY, None)?;
+                    append_plan_order_terms(s, &call.within_group, self.tables)?;
+                    s.append(TokenType::TK_RP, None)?;
+                }
+                if let Some(filter) = &call.filter {
+                    s.append(TokenType::TK_FILTER, None)?;
+                    s.append(TokenType::TK_LP, None)?;
+                    s.append(TokenType::TK_WHERE, None)?;
+                    self.nested(filter).to_tokens(s, &BlankContext)?;
+                    s.append(TokenType::TK_RP, None)?;
+                }
+                if let Some(window) = &call.window {
+                    s.append(TokenType::TK_OVER, None)?;
+                    append_plan_window(s, window, self.tables)?;
+                }
+                Ok(())
+            }
+            PlanExpr::IsNull(expr) => {
+                self.nested(expr).to_tokens(s, &BlankContext)?;
+                s.append(TokenType::TK_ISNULL, None)
+            }
+            PlanExpr::NotNull(expr) => {
+                self.nested(expr).to_tokens(s, &BlankContext)?;
+                s.append(TokenType::TK_NOTNULL, None)
+            }
+            PlanExpr::InList {
+                lhs,
+                negated,
+                values,
+            } => {
+                self.nested(lhs).to_tokens(s, &BlankContext)?;
+                if *negated {
+                    s.append(TokenType::TK_NOT, None)?;
+                }
+                s.append(TokenType::TK_IN, None)?;
+                s.append(TokenType::TK_LP, None)?;
+                for (index, value) in values.iter().enumerate() {
+                    if index != 0 {
+                        s.append(TokenType::TK_COMMA, None)?;
+                    }
+                    self.nested(value).to_tokens(s, &BlankContext)?;
+                }
+                s.append(TokenType::TK_RP, None)
+            }
+            PlanExpr::Subquery(subquery) => match subquery {
+                PlanSubqueryExpr::Scalar { query, output } => {
+                    let name = format!("${query}_{output}");
+                    s.append(TokenType::TK_VARIABLE, Some(&name))
+                }
+                PlanSubqueryExpr::Exists(query) => {
+                    s.append(TokenType::TK_EXISTS, None)?;
+                    s.append(TokenType::TK_LP, None)?;
+                    let name = format!("${query}");
+                    s.append(TokenType::TK_VARIABLE, Some(&name))?;
+                    s.append(TokenType::TK_RP, None)
+                }
+                PlanSubqueryExpr::In {
+                    lhs,
+                    query,
+                    negated,
+                } => {
+                    self.nested(lhs).to_tokens(s, &BlankContext)?;
+                    if *negated {
+                        s.append(TokenType::TK_NOT, None)?;
+                    }
+                    s.append(TokenType::TK_IN, None)?;
+                    s.append(TokenType::TK_LP, None)?;
+                    let name = format!("${query}");
+                    s.append(TokenType::TK_VARIABLE, Some(&name))?;
+                    s.append(TokenType::TK_RP, None)
+                }
+            },
+            PlanExpr::Like {
+                lhs,
+                negated,
+                operator,
+                rhs,
+                escape,
+                ..
+            } => {
+                self.nested(lhs).to_tokens(s, &BlankContext)?;
+                if *negated {
+                    s.append(TokenType::TK_NOT, None)?;
+                }
+                operator.to_tokens(s, &BlankContext)?;
+                self.nested(rhs).to_tokens(s, &BlankContext)?;
+                if let Some(escape) = escape {
+                    s.append(TokenType::TK_ESCAPE, None)?;
+                    self.nested(escape).to_tokens(s, &BlankContext)?;
+                }
+                Ok(())
+            }
+            PlanExpr::Row(values) => {
+                s.append(TokenType::TK_LP, None)?;
+                for (index, value) in values.iter().enumerate() {
+                    if index != 0 {
+                        s.append(TokenType::TK_COMMA, None)?;
+                    }
+                    self.nested(value).to_tokens(s, &BlankContext)?;
+                }
+                s.append(TokenType::TK_RP, None)
+            }
+            PlanExpr::Array(values) => {
+                s.append(TokenType::TK_ID, Some("ARRAY"))?;
+                s.append(TokenType::TK_LBRACKET, None)?;
+                for (index, value) in values.iter().enumerate() {
+                    if index != 0 {
+                        s.append(TokenType::TK_COMMA, None)?;
+                    }
+                    self.nested(value).to_tokens(s, &BlankContext)?;
+                }
+                s.append(TokenType::TK_RBRACKET, None)
+            }
+            PlanExpr::Subscript { base, index } => {
+                self.nested(base).to_tokens(s, &BlankContext)?;
+                s.append(TokenType::TK_LBRACKET, None)?;
+                self.nested(index).to_tokens(s, &BlankContext)?;
+                s.append(TokenType::TK_RBRACKET, None)
+            }
+            PlanExpr::FieldAccess(access) => {
+                self.nested(&access.base).to_tokens(s, &BlankContext)?;
+                s.append(TokenType::TK_DOT, None)?;
+                s.append(TokenType::TK_ID, Some(&access.field_name))
+            }
+            PlanExpr::Raise { action, message } => {
+                s.append(TokenType::TK_RAISE, None)?;
+                s.append(TokenType::TK_LP, None)?;
+                action.to_tokens(s, &BlankContext)?;
+                if let Some(message) = message {
+                    s.append(TokenType::TK_COMMA, None)?;
+                    self.nested(message).to_tokens(s, &BlankContext)?;
+                }
+                s.append(TokenType::TK_RP, None)
+            }
+        }
+    }
+}
 
 fn fmt_order_by_item(
     f: &mut fmt::Formatter<'_>,
@@ -220,10 +672,10 @@ impl Display for Plan {
                 if let Some(offset) = offset {
                     writeln!(f, "OFFSET: {offset}")?;
                 }
-                if let Some(order_by) = order_by {
+                if !order_by.is_empty() {
                     writeln!(f, "ORDER BY:")?;
-                    for (expr, dir, nulls, _) in order_by {
-                        fmt_order_by_item(f, expr, *dir, *nulls)?;
+                    for term in order_by {
+                        fmt_order_by_item(f, &term.expr, term.order, term.nulls)?;
                     }
                 }
                 Ok(())
@@ -618,33 +1070,7 @@ impl fmt::Display for UpdatePlan {
 
 pub struct PlanContext<'a>(pub &'a [&'a TableReferences]);
 
-// Definitely not perfect yet
-impl ToSqlContext for PlanContext<'_> {
-    fn get_column_name(&self, table_id: TableInternalId, col_idx: usize) -> Option<Option<&str>> {
-        let (_, table) = self
-            .0
-            .iter()
-            .find_map(|table_ref| table_ref.find_table_by_internal_id(table_id))?;
-        let cols = table.columns();
-        cols.get(col_idx)
-            .map(|col| col.name.as_ref().map(|name| name.as_ref()))
-    }
-
-    fn get_table_name(&self, id: TableInternalId) -> Option<&str> {
-        let table_ref = self
-            .0
-            .iter()
-            .find(|table_ref| table_ref.find_table_by_internal_id(id).is_some())?;
-        let joined_table = table_ref.find_joined_table_by_internal_id(id);
-        let outer_query = table_ref.find_outer_query_ref_by_internal_id(id);
-        match (joined_table, outer_query) {
-            (Some(table), None) => Some(&table.identifier),
-            (None, Some(table)) => Some(&table.identifier),
-            (Some(table), Some(_)) => Some(&table.identifier),
-            (None, None) => unreachable!(),
-        }
-    }
-}
+impl ToSqlContext for PlanContext<'_> {}
 
 impl ToTokens for Plan {
     fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
@@ -677,32 +1103,20 @@ impl ToTokens for Plan {
 
                 right_most.to_tokens(s, context)?;
 
-                if let Some(order_by) = order_by {
+                if !order_by.is_empty() {
                     s.append(TokenType::TK_ORDER, None)?;
                     s.append(TokenType::TK_BY, None)?;
-
-                    s.comma(
-                        order_by
-                            .iter()
-                            .map(|(col_idx, order, nulls, _)| ast::SortedColumn {
-                                expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
-                                    (col_idx + 1).to_string(),
-                                ))),
-                                order: Some(*order),
-                                nulls: *nulls,
-                            }),
-                        context,
-                    )?;
+                    append_plan_order_terms(s, order_by, all_refs.as_slice())?;
                 }
 
                 if let Some(limit) = &limit {
                     s.append(TokenType::TK_LIMIT, None)?;
-                    s.append(TokenType::TK_FLOAT, Some(&limit.to_string()))?;
+                    PlanExprSql::new(limit, all_refs.as_slice()).to_tokens(s, &BlankContext)?;
                 }
 
                 if let Some(offset) = &offset {
                     s.append(TokenType::TK_OFFSET, None)?;
-                    s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
+                    PlanExprSql::new(offset, all_refs.as_slice()).to_tokens(s, &BlankContext)?;
                 }
             }
             Self::RecursiveCte(plan) => {
@@ -765,43 +1179,53 @@ impl ToTokens for SelectPlan {
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
+        let expr_tables = [&self.table_references];
         if !self.values.is_empty() {
-            ast::OneSelect::Values(
-                self.values
-                    .iter()
-                    .map(|values| values.iter().map(|v| Box::from(v.clone())).collect())
-                    .collect(),
-            )
-            .to_tokens(s, context)?;
+            s.append(TokenType::TK_VALUES, None)?;
+            for (row_index, row) in self.values.iter().enumerate() {
+                if row_index != 0 {
+                    s.append(TokenType::TK_COMMA, None)?;
+                }
+                s.append(TokenType::TK_LP, None)?;
+                for (column_index, expr) in row.iter().enumerate() {
+                    if column_index != 0 {
+                        s.append(TokenType::TK_COMMA, None)?;
+                    }
+                    PlanExprSql::new(expr, &expr_tables).to_tokens(s, &BlankContext)?;
+                }
+                s.append(TokenType::TK_RP, None)?;
+            }
         } else {
             s.append(TokenType::TK_SELECT, None)?;
             if self.distinctness.is_distinct() {
                 s.append(TokenType::TK_DISTINCT, None)?;
             }
 
-            for (i, ResultSetColumn { expr, alias, .. }) in self.result_columns.iter().enumerate() {
+            for (i, column) in self.result_columns.iter().enumerate() {
                 if i != 0 {
                     s.append(TokenType::TK_COMMA, None)?;
                 }
 
-                expr.to_tokens(s, context)?;
-                if let Some(alias) = alias {
+                PlanExprSql::new(&column.expr, &expr_tables).to_tokens(s, &BlankContext)?;
+                if column.name_kind == OutputNameKind::ExplicitAlias {
                     s.append(TokenType::TK_AS, None)?;
-                    s.append(TokenType::TK_ID, Some(alias))?;
+                    s.append(TokenType::TK_ID, Some(&column.name))?;
                 }
             }
-            s.append(TokenType::TK_FROM, None)?;
 
-            for (i, order) in self.join_order.iter().enumerate() {
-                if i != 0 {
-                    if order.is_outer {
-                        s.append(TokenType::TK_ORDER, None)?;
+            if !self.join_order.is_empty() {
+                s.append(TokenType::TK_FROM, None)?;
+                for (i, order) in self.join_order.iter().enumerate() {
+                    if i != 0 {
+                        if order.is_outer {
+                            s.append(TokenType::TK_ORDER, None)?;
+                        }
+                        s.append(TokenType::TK_JOIN, None)?;
                     }
-                    s.append(TokenType::TK_JOIN, None)?;
-                }
 
-                let table_ref = self.joined_tables().get(order.original_idx).unwrap();
-                table_ref.to_tokens(s, context)?;
+                    let table_ref = self.joined_tables().get(order.original_idx).unwrap();
+                    table_ref.to_tokens(s, context)?;
+                }
             }
 
             if !self.where_clause.is_empty() {
@@ -810,13 +1234,13 @@ impl ToTokens for SelectPlan {
                 for (i, expr) in self
                     .where_clause
                     .iter()
-                    .map(|where_clause| where_clause.expr.clone())
+                    .map(|where_clause| &where_clause.expr)
                     .enumerate()
                 {
                     if i != 0 {
                         s.append(TokenType::TK_AND, None)?;
                     }
-                    expr.to_tokens(s, context)?;
+                    PlanExprSql::new(expr, &expr_tables).to_tokens(s, &BlankContext)?;
                 }
             }
 
@@ -824,8 +1248,12 @@ impl ToTokens for SelectPlan {
                 if !group_by.exprs.is_empty() {
                     s.append(TokenType::TK_GROUP, None)?;
                     s.append(TokenType::TK_BY, None)?;
-
-                    s.comma(group_by.exprs.iter(), context)?;
+                    for (index, expr) in group_by.exprs.iter().enumerate() {
+                        if index != 0 {
+                            s.append(TokenType::TK_COMMA, None)?;
+                        }
+                        PlanExprSql::new(expr, &expr_tables).to_tokens(s, &BlankContext)?;
+                    }
                 }
 
                 // TODO: not sure where I need to place the group_by.sort_order
@@ -836,7 +1264,7 @@ impl ToTokens for SelectPlan {
                         if i != 0 {
                             s.append(TokenType::TK_AND, None)?;
                         }
-                        expr.to_tokens(s, context)?;
+                        PlanExprSql::new(expr, &expr_tables).to_tokens(s, &BlankContext)?;
                     }
                 }
             }
@@ -853,23 +1281,27 @@ impl ToTokens for SelectPlan {
                 if !window.partition_by.is_empty() {
                     s.append(TokenType::TK_PARTITION, None)?;
                     s.append(TokenType::TK_BY, None)?;
-                    s.comma(window.partition_by.iter(), context)?;
+                    for (index, expr) in window.partition_by.iter().enumerate() {
+                        if index != 0 {
+                            s.append(TokenType::TK_COMMA, None)?;
+                        }
+                        PlanExprSql::new(expr, &expr_tables).to_tokens(s, &BlankContext)?;
+                    }
                 }
 
                 if !window.order_by.is_empty() {
                     s.append(TokenType::TK_ORDER, None)?;
                     s.append(TokenType::TK_BY, None)?;
-                    s.comma(
-                        window
-                            .order_by
-                            .iter()
-                            .map(|(expr, order, nulls)| ast::SortedColumn {
-                                expr: Box::new(expr.clone()),
-                                order: Some(*order),
-                                nulls: *nulls,
-                            }),
-                        context,
-                    )?;
+                    for (index, (expr, order, nulls)) in window.order_by.iter().enumerate() {
+                        if index != 0 {
+                            s.append(TokenType::TK_COMMA, None)?;
+                        }
+                        PlanExprSql::new(expr, &expr_tables).to_tokens(s, &BlankContext)?;
+                        order.to_tokens(s, &BlankContext)?;
+                        if let Some(nulls) = nulls {
+                            nulls.to_tokens(s, &BlankContext)?;
+                        }
+                    }
                 }
 
                 s.append(TokenType::TK_RP, None)?;
@@ -879,27 +1311,17 @@ impl ToTokens for SelectPlan {
         if !self.order_by.is_empty() {
             s.append(TokenType::TK_ORDER, None)?;
             s.append(TokenType::TK_BY, None)?;
-
-            s.comma(
-                self.order_by
-                    .iter()
-                    .map(|(expr, order, nulls)| ast::SortedColumn {
-                        expr: expr.clone(),
-                        order: Some(*order),
-                        nulls: *nulls,
-                    }),
-                context,
-            )?;
+            append_plan_order_terms(s, &self.order_by, &expr_tables)?;
         }
 
         if let Some(limit) = &self.limit {
             s.append(TokenType::TK_LIMIT, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&limit.to_string()))?;
+            PlanExprSql::new(limit, &expr_tables).to_tokens(s, &BlankContext)?;
         }
 
         if let Some(offset) = &self.offset {
             s.append(TokenType::TK_OFFSET, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
+            PlanExprSql::new(offset, &expr_tables).to_tokens(s, &BlankContext)?;
         }
 
         Ok(())
@@ -918,7 +1340,6 @@ impl ToTokens for DeletePlan {
             .first()
             .expect("Delete Plan should have only one table reference");
         let context = &[&self.table_references];
-        let context = &PlanContext(context);
 
         s.append(TokenType::TK_DELETE, None)?;
         s.append(TokenType::TK_FROM, None)?;
@@ -930,13 +1351,13 @@ impl ToTokens for DeletePlan {
             for (i, expr) in self
                 .where_clause
                 .iter()
-                .map(|where_clause| where_clause.expr.clone())
+                .map(|where_clause| &where_clause.expr)
                 .enumerate()
             {
                 if i != 0 {
                     s.append(TokenType::TK_AND, None)?;
                 }
-                expr.to_tokens(s, context)?;
+                PlanExprSql::new(expr, context).to_tokens(s, &BlankContext)?;
             }
         }
 
@@ -944,26 +1365,17 @@ impl ToTokens for DeletePlan {
             s.append(TokenType::TK_ORDER, None)?;
             s.append(TokenType::TK_BY, None)?;
 
-            s.comma(
-                self.order_by
-                    .iter()
-                    .map(|(expr, order, nulls)| ast::SortedColumn {
-                        expr: expr.clone(),
-                        order: Some(*order),
-                        nulls: *nulls,
-                    }),
-                context,
-            )?;
+            append_plan_order_terms(s, &self.order_by, context)?;
         }
 
         if let Some(limit) = &self.limit {
             s.append(TokenType::TK_LIMIT, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&limit.to_string()))?;
+            PlanExprSql::new(limit, context).to_tokens(s, &BlankContext)?;
         }
 
         if let Some(offset) = &self.offset {
             s.append(TokenType::TK_OFFSET, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
+            PlanExprSql::new(offset, context).to_tokens(s, &BlankContext)?;
         }
 
         Ok(())
@@ -979,30 +1391,27 @@ impl ToTokens for UpdatePlan {
         let table = &self.target_table;
         let read_scope_tables = self.build_read_scope_tables();
         let context = [&read_scope_tables];
-        let context = &PlanContext(&context);
 
         s.append(TokenType::TK_UPDATE, None)?;
         s.append(TokenType::TK_ID, Some(table.table.get_name()))?;
         s.append(TokenType::TK_SET, None)?;
 
-        s.comma(
-            self.set_clauses.iter().map(|set_clause| {
-                let col_name = table
-                    .table
-                    .get_column_at(set_clause.column_index)
-                    .as_ref()
-                    .unwrap()
-                    .name
-                    .as_ref()
-                    .unwrap();
-
-                ast::Set {
-                    col_names: vec![ast::Name::exact(col_name.clone())],
-                    expr: set_clause.expr.clone(),
-                }
-            }),
-            context,
-        )?;
+        for (index, set_clause) in self.set_clauses.iter().enumerate() {
+            if index != 0 {
+                s.append(TokenType::TK_COMMA, None)?;
+            }
+            let col_name = table
+                .table
+                .get_column_at(set_clause.column_index)
+                .as_ref()
+                .unwrap()
+                .name
+                .as_ref()
+                .unwrap();
+            s.append(TokenType::TK_ID, Some(col_name))?;
+            s.append(TokenType::TK_EQ, None)?;
+            PlanExprSql::new(&set_clause.expr, &context).to_tokens(s, &BlankContext)?;
+        }
 
         if !self.where_clause.is_empty() {
             s.append(TokenType::TK_WHERE, None)?;
@@ -1010,23 +1419,22 @@ impl ToTokens for UpdatePlan {
             let mut iter = self
                 .where_clause
                 .iter()
-                .map(|where_clause| where_clause.expr.clone());
-            iter.next()
-                .expect("should not be empty")
-                .to_tokens(s, context)?;
+                .map(|where_clause| &where_clause.expr);
+            let first = iter.next().expect("should not be empty");
+            PlanExprSql::new(first, &context).to_tokens(s, &BlankContext)?;
             for expr in iter {
                 s.append(TokenType::TK_AND, None)?;
-                expr.to_tokens(s, context)?;
+                PlanExprSql::new(expr, &context).to_tokens(s, &BlankContext)?;
             }
         }
 
         if let Some(limit) = &self.limit {
             s.append(TokenType::TK_LIMIT, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&limit.to_string()))?;
+            PlanExprSql::new(limit, &context).to_tokens(s, &BlankContext)?;
         }
         if let Some(offset) = &self.offset {
             s.append(TokenType::TK_OFFSET, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
+            PlanExprSql::new(offset, &context).to_tokens(s, &BlankContext)?;
         }
 
         Ok(())

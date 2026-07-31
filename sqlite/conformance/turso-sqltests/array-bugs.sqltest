@@ -174,3 +174,110 @@ test array-nested-case-display {
 expect {
     {1,2}
 }
+
+test recursive-cte-arm-introduces-array-output {
+    WITH RECURSIVE array_steps(step, vals) AS (
+        VALUES (0, NULL)
+        UNION ALL
+        SELECT step + 1, array_append(vals, step + 1)
+        FROM array_steps
+        WHERE step < 3
+    )
+    SELECT step, vals FROM array_steps ORDER BY step;
+}
+expect {
+    0|
+    1|{1}
+    2|{1,2}
+    3|{1,2,3}
+}
+
+test recursive-cte-scalar-compound-introduces-array-output {
+    WITH RECURSIVE array_steps(step, vals) AS (
+        VALUES (0, NULL)
+        UNION ALL
+        SELECT step + 1,
+               (SELECT NULL
+                UNION ALL
+                SELECT array_append(vals, step + 1)
+                LIMIT 1 OFFSET 1)
+        FROM array_steps
+        WHERE step < 3
+    )
+    SELECT step, vals FROM array_steps ORDER BY step;
+}
+expect {
+    0|
+    1|{1}
+    2|{1,2}
+    3|{1,2,3}
+}
+
+test recursive-cte-array-fact-crosses-columns {
+    WITH RECURSIVE array_steps(step, previous_vals, vals) AS (
+        VALUES (0, NULL, NULL)
+        UNION ALL
+        SELECT step + 1, vals, array_append(vals, step + 1)
+        FROM array_steps
+        WHERE step < 3
+    )
+    SELECT step, previous_vals, vals FROM array_steps ORDER BY step;
+}
+expect {
+    0||
+    1||{1}
+    2|{1}|{1,2}
+    3|{1,2}|{1,2,3}
+}
+
+test recursive-cte-array-rank-grows {
+    WITH RECURSIVE nested(step, vals) AS (
+        VALUES (0, ARRAY[1])
+        UNION ALL
+        SELECT step + 1, ARRAY[vals]
+        FROM nested
+        WHERE step < 2
+    )
+    SELECT step, vals FROM nested ORDER BY step;
+}
+expect pattern {
+    ^0\|\\{1\\}\n1\|\\{\\{1\\}\\}\n2\|\\{\\{\\{1\\}\\}\\}$
+}
+
+test array-values-stay-canonical-before-output {
+    WITH input(vals) AS (
+        VALUES (ARRAY[2,3]), (ARRAY[1,4])
+    )
+    SELECT array_append(vals, 9) FROM input ORDER BY vals;
+}
+expect {
+    {1,4,9}
+    {2,3,9}
+}
+
+test array-compound-stays-canonical-before-output {
+    SELECT array_append(vals, 9)
+    FROM (
+        SELECT ARRAY[2,3] AS vals
+        UNION ALL
+        SELECT ARRAY[1,4]
+    )
+    ORDER BY vals;
+}
+expect {
+    {1,4,9}
+    {2,3,9}
+}
+
+test array-distinct-and-order-stay-canonical-before-output {
+    WITH input(vals) AS (
+        VALUES (ARRAY[2]), (ARRAY[1]), (ARRAY[2])
+    )
+    SELECT array_append(vals, 9)
+    FROM (SELECT DISTINCT vals FROM input)
+    ORDER BY vals;
+}
+expect {
+    {1,9}
+    {2,9}
+}

@@ -1,4 +1,8 @@
 use super::*;
+use crate::translate::expr::translate_plan_expr_no_constant_opt;
+use crate::translate::optimizer::constraints::plan_expr_needs_no_affinity_change;
+use crate::translate::plan::PlanIndex;
+use crate::LimboError;
 
 fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
     // Apply the constraint's resolved comparison affinity to the seek key,
@@ -7,7 +11,7 @@ fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
         .iter(seek_key)
         .zip(seek_def.iter_affinity(seek_key))
         .map(|(key_component, aff)| match key_component {
-            SeekKeyComponent::Expr(expr) if aff.expr_needs_no_affinity_change(expr) => {
+            SeekKeyComponent::Expr(expr) if plan_expr_needs_no_affinity_change(aff, expr) => {
                 affinity::SQLITE_AFF_NONE
             }
             _ => aff.aff_mask(),
@@ -18,57 +22,65 @@ fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
 fn encode_seek_keys_for_custom_types(
     program: &mut ProgramBuilder,
     tables: &TableReferences,
-    seek_index: &Arc<Index>,
+    seek_cursor_id: CursorID,
+    seek_index: &PlanIndex,
     start_reg: usize,
     num_keys: usize,
     idx_col_offset: usize,
     resolver: &Resolver<'_>,
 ) -> crate::Result<()> {
-    let table = tables
-        .find_table_by_identifier(&seek_index.table_name)
-        .or_else(|| tables.find_table_by_table_name(&seek_index.table_name));
-    let table = match table {
-        Some(t) => t,
-        None => return Ok(()),
-    };
-    let columns = table.columns();
+    let index_handle = seek_index.handle();
+    let source = tables
+        .joined_tables()
+        .iter()
+        .find(|source| {
+            program
+                .resolve_cursor_id_safe(&CursorKey::index(source.internal_id, index_handle.clone()))
+                == Some(seek_cursor_id)
+        })
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "index seek cursor {seek_cursor_id} for '{}' has no planned source",
+                seek_index.name
+            ))
+        })?;
+    let column_count = source.table.columns().len();
+    let column_programs = &source.read_programs.column_type_programs;
+    if column_programs.len() != column_count {
+        return Err(LimboError::InternalError(format!(
+            "index seek source {} has {} column type program slots for {column_count} columns",
+            source.internal_id,
+            column_programs.len()
+        )));
+    }
+
     for i in 0..num_keys {
         let idx_col_pos = idx_col_offset + i;
-        if idx_col_pos >= seek_index.columns.len() {
-            break;
+        let idx_col = seek_index.columns.get(idx_col_pos).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "index '{}' has no seek-key column {idx_col_pos}",
+                seek_index.name
+            ))
+        })?;
+        if idx_col.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL {
+            continue;
         }
-        let idx_col = &seek_index.columns[idx_col_pos];
-        let table_col = match columns.get(idx_col.pos_in_table) {
-            Some(c) => c,
-            None => continue,
+        let programs = column_programs.get(idx_col.pos_in_table).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "index '{}' column {idx_col_pos} refers to missing source column {}",
+                seek_index.name, idx_col.pos_in_table
+            ))
+        })?;
+        let Some(programs) = programs else {
+            continue;
         };
-        let type_def = match resolver
-            .schema()
-            .get_type_def(&table_col.ty_str, table.is_strict())
-        {
-            Some(td) => td,
-            None => continue,
-        };
-        let encode_expr = match type_def.encode() {
-            Some(e) => e,
-            None => continue,
-        };
-        let reg = start_reg + i;
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg,
-            target_pc: skip_label,
-        });
-        crate::translate::expr::emit_type_expr(
+        crate::translate::expr::emit_plan_column_value_encode(
             program,
-            encode_expr,
-            reg,
-            reg,
-            table_col,
-            type_def,
+            Some(tables),
+            programs,
+            start_reg + i,
             resolver,
         )?;
-        program.preassign_label_to_next_insn(skip_label);
     }
     Ok(())
 }
@@ -86,7 +98,7 @@ pub(super) struct SeekEmitter<'a, 'plan> {
     seek_cursor_id: usize,
     start_reg: usize,
     loop_end: BranchOffset,
-    seek_index: Option<&'a Arc<Index>>,
+    seek_index: Option<&'a PlanIndex>,
     is_index: bool,
 }
 
@@ -100,7 +112,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         seek_cursor_id: usize,
         start_reg: usize,
         loop_end: BranchOffset,
-        seek_index: Option<&'a Arc<Index>>,
+        seek_index: Option<&'a PlanIndex>,
     ) -> Self {
         Self {
             program,
@@ -169,7 +181,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             let reg = self.start_reg + i;
             match key {
                 SeekKeyComponent::Expr(expr) => {
-                    translate_expr_no_constant_opt(
+                    translate_plan_expr_no_constant_opt(
                         self.program,
                         Some(self.tables),
                         expr,
@@ -196,6 +208,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             encode_seek_keys_for_custom_types(
                 self.program,
                 self.tables,
+                self.seek_cursor_id,
                 idx,
                 self.start_reg,
                 num_regs,
@@ -303,7 +316,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         let last_reg = self.start_reg + self.seek_def.prefix.len();
         match &self.seek_def.end.last_component {
             SeekKeyComponent::Expr(expr) => {
-                translate_expr_no_constant_opt(
+                translate_plan_expr_no_constant_opt(
                     self.program,
                     Some(self.tables),
                     expr,
@@ -315,6 +328,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     encode_seek_keys_for_custom_types(
                         self.program,
                         self.tables,
+                        self.seek_cursor_id,
                         idx,
                         last_reg,
                         1,

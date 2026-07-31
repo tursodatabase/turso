@@ -1,21 +1,25 @@
 use super::{
-    collate::get_collseq_from_expr,
     emitter::Resolver,
     plan::{
         DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember, JoinType,
-        JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search,
-        SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
-        WhereTerm,
+        JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, PlanIndex,
+        PlanIndexHint, PlanIndexMethodPattern, PlanSubqueryType, Search, SeekDef, SeekKey,
+        SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan, WhereTerm,
     },
 };
 use crate::alloc::TursoIteratorExt;
 use crate::schema::GeneratedType;
-use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
+use crate::translate::plan_expr::{
+    plan_expr_affinity, plan_expr_array_dimensions, plan_expr_collation, plan_expr_dependencies,
+    plan_expr_type_fact, plan_exprs_are_equivalent, walk_plan_expr, walk_plan_expr_mut, PlanExpr,
+    PlanMergedColumnValue, PlanOrderTerm, PlanSourceId, PlanSubqueryExpr, PlanSubqueryId,
+    PlanWalkControl,
+};
 use crate::translate::planner::TableMask;
 use crate::{
     function::{AggFunc, Deterministic},
-    index_method::{IndexMethodCostContext, IndexMethodCostEstimate},
+    index_method::{IndexMethodCostArgument, IndexMethodCostContext, IndexMethodCostEstimate},
     numeric::Numeric,
     schema::{
         BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type,
@@ -33,18 +37,13 @@ use crate::{
             order::{ColumnTarget, OrderTarget},
         },
         plan::{
-            BoundIndexMethodPattern, DmlSafetyReason, EphemeralRowidMode, HashJoinOp,
-            IndexMethodQuery, NonFromClauseSubquery, QueryDestination, ResultSetColumn, Scan,
-            SeekKeyComponent, SubqueryEvalPhase, SubqueryOrigin, SubqueryState, UpdateSetClause,
-            WriteSetPlan,
+            DmlSafetyReason, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
+            NonFromClauseSubquery, QueryDestination, ResultSetColumn, Scan, SeekKeyComponent,
+            SubqueryEvalPhase, SubqueryOrigin, SubqueryState, UpdateSetClause, WriteSetPlan,
         },
         trigger_exec::has_triggers_including_temp,
     },
     types::SeekOp,
-    util::{
-        count_fts_column_args, exprs_are_equivalent, try_capture_parameters,
-        try_capture_parameters_column_agnostic, try_substitute_parameters,
-    },
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, ProgramBuilder},
@@ -68,7 +67,7 @@ use rustc_hash::FxHashMap as HashMap;
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::RefAct;
-use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TableInternalId, TriggerEvent};
+use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
 
 pub(crate) mod access_method;
 pub(crate) mod constraints;
@@ -82,20 +81,38 @@ pub(crate) mod unnest;
 
 #[derive(Debug, Default)]
 pub(crate) struct AvailableIndexes {
-    indexes_by_table_id: HashMap<TableInternalId, VecDeque<Arc<Index>>>,
+    indexes_by_table_id: HashMap<PlanSourceId, VecDeque<PlanIndex>>,
 }
 
 impl AvailableIndexes {
-    fn for_table_references(resolver: &Resolver, table_references: &TableReferences) -> Self {
+    fn for_table_references(table_references: &TableReferences) -> Self {
         let mut available_indexes = Self::default();
         for table_ref in table_references.joined_tables() {
             if !matches!(table_ref.table, Table::BTree(_) | Table::Virtual(_)) {
                 continue;
             }
-            let indexes = resolver.with_schema(table_ref.database_id, |schema| {
-                schema.indexes.get(table_ref.table.get_name()).cloned()
-            });
-            if let Some(indexes) = indexes {
+            let mut indexes = VecDeque::new();
+            for resolved in table_ref
+                .index_expressions
+                .iter()
+                .map(|metadata| &metadata.index)
+                .chain(
+                    table_ref
+                        .index_method_patterns
+                        .iter()
+                        .map(|pattern| &pattern.index),
+                )
+            {
+                if indexes.iter().any(|candidate: &PlanIndex| {
+                    candidate
+                        .resolved()
+                        .is_some_and(|candidate| candidate == resolved)
+                }) {
+                    continue;
+                }
+                indexes.push_back(PlanIndex::Catalog(resolved.clone()));
+            }
+            if !indexes.is_empty() {
                 available_indexes
                     .indexes_by_table_id
                     .insert(table_ref.internal_id, indexes);
@@ -104,16 +121,13 @@ impl AvailableIndexes {
         available_indexes
     }
 
-    pub(crate) fn indexes_for_table(
-        &self,
-        table_id: TableInternalId,
-    ) -> Option<&VecDeque<Arc<Index>>> {
+    pub(crate) fn indexes_for_table(&self, table_id: PlanSourceId) -> Option<&VecDeque<PlanIndex>> {
         self.indexes_by_table_id.get(&table_id)
     }
 
     pub(crate) fn btree_indexes_for_column(
         &self,
-        table_id: TableInternalId,
+        table_id: PlanSourceId,
         column_pos: usize,
     ) -> impl Iterator<Item = &Index> {
         self.indexes_for_table(table_id)
@@ -123,18 +137,21 @@ impl AvailableIndexes {
                 index.index_method.is_none()
                     && index.column_table_pos_to_index_pos(column_pos) == Some(0)
             })
-            .map(Arc::as_ref)
+            .map(PlanIndex::value)
     }
 
-    fn btree_index_by_name(
+    fn btree_index(
         &self,
-        table_id: TableInternalId,
-        index_name: &str,
-    ) -> Option<Arc<Index>> {
+        table_id: PlanSourceId,
+        resolved_index: &crate::translate::semantic::hir::ResolvedIndex,
+    ) -> Option<PlanIndex> {
         self.indexes_for_table(table_id)?
             .iter()
             .find(|index| {
-                index.name.eq_ignore_ascii_case(index_name) && index.index_method.is_none()
+                index
+                    .resolved()
+                    .is_some_and(|candidate| candidate == resolved_index)
+                    && index.index_method.is_none()
             })
             .cloned()
     }
@@ -150,8 +167,10 @@ impl AvailableIndexes {
             .iter()
             .find(|table_ref| table_ref.table.get_name() == table_name)
             .expect("test table should exist");
-        self.indexes_by_table_id
-            .insert(table_ref.internal_id, indexes);
+        self.indexes_by_table_id.insert(
+            table_ref.internal_id,
+            indexes.into_iter().map(PlanIndex::Ephemeral).collect(),
+        );
     }
 
     #[cfg(test)]
@@ -168,7 +187,7 @@ impl AvailableIndexes {
         self.indexes_by_table_id
             .entry(table_ref.internal_id)
             .or_default()
-            .push_front(index);
+            .push_front(PlanIndex::Ephemeral(index));
     }
 }
 
@@ -181,13 +200,16 @@ pub struct IndexMethodCandidate {
     /// Index of the table in the joined_tables list
     pub table_idx: usize,
     /// The index that defines this index method
-    pub index: Arc<Index>,
+    pub index: PlanIndex,
     /// Pattern index from the index method definition that matched
     pub pattern_idx: usize,
     /// Arguments captured from pattern matching
-    pub arguments: Vec<ast::Expr>,
+    pub arguments: Vec<PlanExpr>,
     /// Mapping from synthetic column IDs to pattern column IDs for covered columns
     pub covered_columns: HashMap<usize, usize>,
+    /// Result expressions to replace if this candidate is selected.
+    /// Candidate enumeration must not mutate the plan before the join order is chosen.
+    pub result_column_rewrites: Vec<(usize, PlanExpr)>,
     /// Index in WHERE clause that was covered by this pattern (if any)
     pub where_covered: Option<usize>,
     /// Cost estimate from the index method
@@ -214,7 +236,7 @@ struct IndexMethodPatternMatch {
     /// Pattern index from the index method definition that matched
     pattern_idx: usize,
     /// Parameters captured from pattern matching (positional placeholders)
-    parameters: HashMap<i32, ast::Expr>,
+    parameters: HashMap<std::num::NonZeroU32, PlanExpr>,
     /// Index in WHERE clause that was covered by this pattern (if any)
     where_covered: Option<usize>,
     /// Whether the pattern explicitly handles ORDER BY
@@ -222,117 +244,298 @@ struct IndexMethodPatternMatch {
     /// Whether the pattern explicitly handles LIMIT
     pattern_has_limit: bool,
     /// Pattern result columns (needed for covered columns calculation)
-    pattern_columns: Vec<ast::ResultColumn>,
+    pattern_columns: Vec<ResultSetColumn>,
 }
 
-/// Try to match an index method pattern against a query's clauses.
+fn capture_plan_parameter(
+    parameter: &crate::translate::plan_expr::PlanParameter,
+    query: &PlanExpr,
+    captures: &mut HashMap<std::num::NonZeroU32, PlanExpr>,
+) -> bool {
+    if let Some(previous) = captures.get(&parameter.index) {
+        return plan_exprs_are_equivalent(previous, query);
+    }
+    captures.insert(parameter.index, query.clone());
+    true
+}
+
+fn simple_function_arguments(
+    expr: &PlanExpr,
+) -> Option<(
+    &crate::translate::semantic::hir::ResolvedFunction,
+    Vec<&PlanExpr>,
+)> {
+    match expr {
+        PlanExpr::Function(call)
+            if !call.star
+                && call.distinctness.is_none()
+                && call.argument_order.is_empty()
+                && call.within_group.is_empty()
+                && call.filter.is_none()
+                && call.window.is_none()
+                && call.custom_type_operation.is_none()
+                && call.sequence_operation.is_none() =>
+        {
+            Some((&call.function, call.arguments.iter().collect()))
+        }
+        PlanExpr::Like {
+            lhs,
+            negated: false,
+            operator: ast::LikeOperator::Match,
+            function,
+            rhs,
+            escape: None,
+            ..
+        } => {
+            let mut arguments = match lhs.as_ref() {
+                PlanExpr::Row(columns) => columns.iter().collect(),
+                lhs => vec![lhs],
+            };
+            arguments.push(rhs);
+            Some((function, arguments))
+        }
+        _ => None,
+    }
+}
+
+fn function_columns_are_reorderable(function: &crate::function::Func) -> bool {
+    matches!(function.to_string().as_str(), "fts_match" | "fts_score")
+}
+
+fn match_plan_function_pattern(
+    pattern: &crate::translate::plan_expr::PlanFunctionCall,
+    query: &PlanExpr,
+    captures: &mut HashMap<std::num::NonZeroU32, PlanExpr>,
+) -> bool {
+    if pattern.star
+        || pattern.distinctness.is_some()
+        || !pattern.argument_order.is_empty()
+        || !pattern.within_group.is_empty()
+        || pattern.filter.is_some()
+        || pattern.window.is_some()
+        || pattern.custom_type_operation.is_some()
+        || pattern.sequence_operation.is_some()
+    {
+        return false;
+    }
+    let Some((query_function, query_arguments)) = simple_function_arguments(query) else {
+        return false;
+    };
+    if &pattern.function != query_function || pattern.arguments.len() != query_arguments.len() {
+        return false;
+    }
+
+    if !function_columns_are_reorderable(pattern.function.value()) || pattern.arguments.len() < 2 {
+        return pattern
+            .arguments
+            .iter()
+            .zip(query_arguments)
+            .all(|(pattern, query)| try_match_plan_pattern(pattern, query, captures));
+    }
+
+    let last = pattern.arguments.len() - 1;
+    if !try_match_plan_pattern(&pattern.arguments[last], query_arguments[last], captures) {
+        return false;
+    }
+    let mut used = vec![false; last];
+    for pattern_column in &pattern.arguments[..last] {
+        let mut matched = false;
+        for (query_idx, query_column) in query_arguments[..last].iter().enumerate() {
+            if used[query_idx] {
+                continue;
+            }
+            let mut trial = captures.clone();
+            if try_match_plan_pattern(pattern_column, query_column, &mut trial) {
+                used[query_idx] = true;
+                *captures = trial;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            return false;
+        }
+    }
+    true
+}
+
+fn try_match_plan_pattern(
+    pattern: &PlanExpr,
+    query: &PlanExpr,
+    captures: &mut HashMap<std::num::NonZeroU32, PlanExpr>,
+) -> bool {
+    match (pattern, query) {
+        (PlanExpr::Parameter(parameter), query) => {
+            capture_plan_parameter(parameter, query, captures)
+        }
+        (PlanExpr::Function(pattern), query) => {
+            match_plan_function_pattern(pattern, query, captures)
+        }
+        (
+            PlanExpr::Unary {
+                operator: pattern_operator,
+                expr: pattern_expr,
+            },
+            PlanExpr::Unary {
+                operator: query_operator,
+                expr: query_expr,
+            },
+        ) if pattern_operator == query_operator => {
+            try_match_plan_pattern(pattern_expr, query_expr, captures)
+        }
+        (
+            PlanExpr::Binary {
+                lhs: pattern_lhs,
+                operator: pattern_operator,
+                rhs: pattern_rhs,
+                custom: None,
+            },
+            PlanExpr::Binary {
+                lhs: query_lhs,
+                operator: query_operator,
+                rhs: query_rhs,
+                custom: None,
+            },
+        ) if pattern_operator == query_operator => {
+            try_match_plan_pattern(pattern_lhs, query_lhs, captures)
+                && try_match_plan_pattern(pattern_rhs, query_rhs, captures)
+        }
+        (PlanExpr::IsNull(pattern), PlanExpr::IsNull(query))
+        | (PlanExpr::NotNull(pattern), PlanExpr::NotNull(query)) => {
+            try_match_plan_pattern(pattern, query, captures)
+        }
+        (
+            PlanExpr::Collate {
+                expr: pattern_expr,
+                collation: pattern_collation,
+            },
+            PlanExpr::Collate {
+                expr: query_expr,
+                collation: query_collation,
+            },
+        ) if pattern_collation == query_collation => {
+            try_match_plan_pattern(pattern_expr, query_expr, captures)
+        }
+        (PlanExpr::Row(pattern), PlanExpr::Row(query))
+        | (PlanExpr::Array(pattern), PlanExpr::Array(query))
+            if pattern.len() == query.len() =>
+        {
+            pattern
+                .iter()
+                .zip(query)
+                .all(|(pattern, query)| try_match_plan_pattern(pattern, query, captures))
+        }
+        (
+            PlanExpr::InList {
+                lhs: pattern_lhs,
+                negated: pattern_negated,
+                values: pattern_values,
+            },
+            PlanExpr::InList {
+                lhs: query_lhs,
+                negated: query_negated,
+                values: query_values,
+            },
+        ) if pattern_negated == query_negated && pattern_values.len() == query_values.len() => {
+            try_match_plan_pattern(pattern_lhs, query_lhs, captures)
+                && pattern_values
+                    .iter()
+                    .zip(query_values)
+                    .all(|(pattern, query)| try_match_plan_pattern(pattern, query, captures))
+        }
+        _ => plan_exprs_are_equivalent(pattern, query),
+    }
+}
+
+fn substitute_plan_parameters(
+    expr: &mut PlanExpr,
+    parameters: &HashMap<std::num::NonZeroU32, PlanExpr>,
+) -> bool {
+    let mut complete = true;
+    let result = walk_plan_expr_mut(expr, &mut |expr| {
+        let PlanExpr::Parameter(parameter) = expr else {
+            return Ok(PlanWalkControl::Continue);
+        };
+        let Some(replacement) = parameters.get(&parameter.index) else {
+            complete = false;
+            return Ok(PlanWalkControl::SkipChildren);
+        };
+        *expr = replacement.clone();
+        Ok(PlanWalkControl::SkipChildren)
+    });
+    result.is_ok() && complete
+}
+
+/// Try to match an already-lowered index-method pattern against a query.
 #[allow(clippy::too_many_arguments)]
 fn try_match_index_method_pattern(
-    pattern: &BoundIndexMethodPattern,
+    pattern: &PlanIndexMethodPattern,
     query_where_terms: &[WhereTerm],
-    order_by: &[(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )],
-    limit: &Option<Box<Expr>>,
-    offset: &Option<Box<Expr>>,
+    order_by: &[PlanOrderTerm],
+    limit: &Option<PlanExpr>,
+    offset: &Option<PlanExpr>,
 ) -> Option<IndexMethodPatternMatch> {
-    let columns = &pattern.columns;
-    let pattern_where_clause = pattern.where_clause.as_deref();
+    let columns = &pattern.outputs;
+    let pattern_where_clause = pattern.predicate.as_ref();
     let pattern_has_order_by = !pattern.order_by.is_empty();
     let pattern_has_limit = pattern.limit.is_some();
 
-    // If pattern has ORDER BY, it must match exactly
     if pattern_has_order_by && order_by.len() != pattern.order_by.len() {
         return None;
     }
 
-    let mut where_query_covered: Option<usize> = None;
+    let mut where_query_covered = None;
     let mut parameters = HashMap::default();
 
-    // Match ORDER BY if pattern has it
     if pattern_has_order_by {
-        for (pattern_column, (query_column, query_order, query_nulls)) in
-            pattern.order_by.iter().zip(order_by.iter())
-        {
-            if *query_order != pattern_column.order.unwrap_or(SortOrder::Asc) {
+        for (pattern_column, query_column) in pattern.order_by.iter().zip(order_by) {
+            if query_column.order != pattern_column.order || query_column.nulls.is_some() {
                 return None;
             }
-            // If the query has explicit NULLS ordering, the index pattern cannot
-            // satisfy it (index methods have no NULLS awareness).
-            if query_nulls.is_some() {
+            if !try_match_plan_pattern(&pattern_column.expr, &query_column.expr, &mut parameters) {
                 return None;
             }
-            let num_col_args = count_fts_column_args(&pattern_column.expr);
-            let captured = if num_col_args > 0 {
-                try_capture_parameters_column_agnostic(
-                    &pattern_column.expr,
-                    query_column,
-                    num_col_args,
-                )
-            } else {
-                try_capture_parameters(&pattern_column.expr, query_column)
-            };
-            parameters.extend(captured?);
         }
     }
 
-    // Match LIMIT if pattern has it
-    match (pattern.limit.as_ref().map(|x| &x.expr), limit) {
+    match (pattern.limit.as_ref(), limit.as_ref()) {
         (Some(_), None) => return None,
         (Some(pattern_limit), Some(query_limit)) => {
-            let captured = try_capture_parameters(pattern_limit, query_limit)?;
-            parameters.extend(captured);
+            if !try_match_plan_pattern(pattern_limit, query_limit, &mut parameters) {
+                return None;
+            }
         }
         (None, Some(_)) | (None, None) => {}
     }
 
-    // Match OFFSET if pattern has it
-    match (
-        pattern.limit.as_ref().and_then(|x| x.offset.as_ref()),
-        offset,
-    ) {
+    match (pattern.offset.as_ref(), offset.as_ref()) {
         (Some(_), None) => return None,
-        (Some(pattern_off), Some(query_off)) => {
-            let captured = try_capture_parameters(pattern_off, query_off)?;
-            parameters.extend(captured);
+        (Some(pattern_offset), Some(query_offset)) => {
+            if !try_match_plan_pattern(pattern_offset, query_offset, &mut parameters) {
+                return None;
+            }
         }
         (None, Some(_)) | (None, None) => {}
     }
 
-    // Match WHERE clause
     if let Some(pattern_where) = pattern_where_clause {
-        for (i, query_where) in query_where_terms.iter().enumerate() {
-            let num_col_args = count_fts_column_args(pattern_where);
-            let captured = if num_col_args > 0 {
-                try_capture_parameters_column_agnostic(
-                    pattern_where,
-                    &query_where.expr,
-                    num_col_args,
-                )
-            } else {
-                try_capture_parameters(pattern_where, &query_where.expr)
-            };
-            let Some(captured) = captured else {
+        for (idx, query_where) in query_where_terms.iter().enumerate() {
+            let mut trial = parameters.clone();
+            if !try_match_plan_pattern(pattern_where, &query_where.expr, &mut trial) {
                 continue;
-            };
-            parameters.extend(captured);
-            where_query_covered = Some(i);
+            }
+            parameters = trial;
+            where_query_covered = Some(idx);
             break;
         }
     }
 
-    // Pattern requires WHERE but we didn't match any
     if pattern_where_clause.is_some() && where_query_covered.is_none() {
         return None;
     }
 
     let where_covered_completely = query_where_terms.is_empty()
         || (where_query_covered.is_some() && query_where_terms.len() == 1);
-
-    // When WHERE is not completely covered, skip patterns with ORDER BY/LIMIT
-    // because post-filtering would disrupt the order or apply limits incorrectly
     if !where_covered_completely && (pattern_has_order_by || pattern_has_limit) {
         return None;
     }
@@ -347,121 +550,125 @@ fn try_match_index_method_pattern(
     })
 }
 
-/// Build covered columns mapping from pattern columns.
-/// Returns a HashMap mapping synthetic column IDs to pattern column IDs.
 fn build_covered_columns_mapping(
-    pattern_columns: &[ast::ResultColumn],
-    parameters: &HashMap<i32, ast::Expr>,
-) -> HashMap<usize, usize> {
+    pattern_columns: &[ResultSetColumn],
+    parameters: &HashMap<std::num::NonZeroU32, PlanExpr>,
+    result_columns: &[ResultSetColumn],
+    source: PlanSourceId,
+) -> (HashMap<usize, usize>, Vec<(usize, PlanExpr)>) {
     let mut covered_column_id = 1_000_000;
     let mut covered_columns = HashMap::default();
+    let mut result_column_rewrites = Vec::new();
     for (pattern_column_id, pattern_column) in pattern_columns.iter().enumerate() {
-        let ast::ResultColumn::Expr(pattern_expr, _) = pattern_column else {
+        let mut substituted = pattern_column.expr.clone();
+        if !substitute_plan_parameters(&mut substituted, parameters) {
             continue;
-        };
-        let Some(_substituted) = try_substitute_parameters(pattern_expr, parameters) else {
-            continue;
-        };
-        covered_columns.insert(covered_column_id, pattern_column_id);
-        covered_column_id += 1;
+        }
+        for (result_column_idx, result_column) in result_columns.iter().enumerate() {
+            if result_column_rewrites
+                .iter()
+                .any(|(rewritten_idx, _)| *rewritten_idx == result_column_idx)
+                || !plan_exprs_are_equivalent(&result_column.expr, &substituted)
+            {
+                continue;
+            }
+            let replacement = PlanExpr::Column(crate::translate::plan_expr::PlanColumnRef {
+                source,
+                column: covered_column_id,
+                rowid_alias: false,
+                type_fact: pattern_column.type_fact.clone(),
+                affinity: pattern_column.affinity.affinity,
+                has_affinity: pattern_column.affinity.has_affinity,
+                collation: pattern_column.collation.clone(),
+            });
+            covered_columns.insert(covered_column_id, pattern_column_id);
+            result_column_rewrites.push((result_column_idx, replacement));
+            covered_column_id += 1;
+        }
     }
-    covered_columns
+    (covered_columns, result_column_rewrites)
 }
 
-/// Sort parameters by key and extract just the expressions as a Vec.
-fn sorted_arguments_from_parameters(parameters: &HashMap<i32, ast::Expr>) -> Vec<ast::Expr> {
+fn sorted_arguments_from_parameters(
+    parameters: &HashMap<std::num::NonZeroU32, PlanExpr>,
+) -> Vec<PlanExpr> {
     let mut arguments: Vec<_> = parameters.iter().collect();
-    arguments.sort_by_key(|(&i, _)| i);
-    arguments.iter().map(|(_, e)| (*e).clone()).collect()
+    arguments.sort_by_key(|(&index, _)| index.get());
+    arguments.iter().map(|(_, expr)| (*expr).clone()).collect()
 }
 
-/// Collect index method candidates for all tables that have custom index methods.
-/// This function performs pattern matching but does NOT apply the operations,
-/// allowing the DP join ordering algorithm to consider index methods as candidates.
 #[allow(clippy::too_many_arguments)]
 fn collect_index_method_candidates(
     table_references: &TableReferences,
-    available_indexes: &AvailableIndexes,
+    result_columns: &[ResultSetColumn],
     where_clause: &[WhereTerm],
-    order_by: &[(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )],
+    order_by: &[PlanOrderTerm],
     group_by: &Option<GroupBy>,
-    limit: &Option<Box<Expr>>,
-    offset: &Option<Box<Expr>>,
+    limit: &Option<PlanExpr>,
+    offset: &Option<PlanExpr>,
     base_table_rows: &[RowCountEstimate],
     params: &cost_params::CostModelParams,
 ) -> Result<Vec<IndexMethodCandidate>> {
     let mut candidates = Vec::new();
-
-    // Group by is not supported for index methods
     if group_by.is_some() {
         return Ok(candidates);
     }
 
-    let tables = table_references.joined_tables();
-    for (table_idx, table) in tables.iter().enumerate() {
-        let Some(indexes) = available_indexes.indexes_for_table(table.internal_id) else {
-            continue;
-        };
-
-        for index in indexes {
+    for (table_idx, table) in table_references.joined_tables().iter().enumerate() {
+        let mut matched_indexes = Vec::new();
+        for pattern in &table.index_method_patterns {
+            if matched_indexes.iter().any(
+                |index: &crate::translate::semantic::hir::ResolvedIndex| index == &pattern.index,
+            ) {
+                continue;
+            }
+            let index = PlanIndex::Catalog(pattern.index.clone());
             let Some(module) = &index.index_method else {
                 continue;
             };
             if index.is_backing_btree_index() {
                 continue;
             }
+            let Some(pattern_match) =
+                try_match_index_method_pattern(pattern, where_clause, order_by, limit, offset)
+            else {
+                continue;
+            };
 
-            for pattern in table
-                .bound_index_method_patterns
+            let (covered_columns, result_column_rewrites) = build_covered_columns_mapping(
+                &pattern_match.pattern_columns,
+                &pattern_match.parameters,
+                result_columns,
+                table.internal_id,
+            );
+            let arguments = sorted_arguments_from_parameters(&pattern_match.parameters);
+            let cost_arguments = arguments
                 .iter()
-                .filter(|pattern| pattern.index_name.eq_ignore_ascii_case(&index.name))
-            {
-                let Some(pattern_match) =
-                    try_match_index_method_pattern(pattern, where_clause, order_by, limit, offset)
-                else {
-                    continue;
-                };
-
-                // Build covered columns mapping from pattern match
-                let covered_columns = build_covered_columns_mapping(
-                    &pattern_match.pattern_columns,
-                    &pattern_match.parameters,
-                );
-
-                // Sort and collect arguments before costing so the index
-                // method can inspect captured literals such as LIMIT.
-                let arguments = sorted_arguments_from_parameters(&pattern_match.parameters);
-
-                // Get cost estimate from the index method
-                let cost_estimate = module.init().ok().and_then(|cursor| {
-                    let base_rows = base_table_rows
-                        .get(table_idx)
-                        .map(|r| **r)
-                        .unwrap_or(params.rows_per_table_fallback);
-                    cursor.estimate_cost(&IndexMethodCostContext {
-                        pattern_idx: pattern_match.pattern_idx,
-                        base_table_rows: base_rows,
-                        arguments: &arguments,
-                    })
-                });
-
-                candidates.push(IndexMethodCandidate {
-                    table_idx,
-                    index: index.clone(),
+                .map(IndexMethodCostArgument::from_plan_expr)
+                .collect::<Vec<_>>();
+            let cost_estimate = module.init().ok().and_then(|cursor| {
+                let base_rows = base_table_rows
+                    .get(table_idx)
+                    .map(|rows| **rows)
+                    .unwrap_or(params.rows_per_table_fallback);
+                cursor.estimate_cost(&IndexMethodCostContext {
                     pattern_idx: pattern_match.pattern_idx,
-                    arguments,
-                    covered_columns,
-                    where_covered: pattern_match.where_covered,
-                    cost_estimate,
-                });
+                    base_table_rows: base_rows,
+                    arguments: &cost_arguments,
+                })
+            });
 
-                // Found a match for this table+index, try next index
-                break;
-            }
+            candidates.push(IndexMethodCandidate {
+                table_idx,
+                index,
+                pattern_idx: pattern_match.pattern_idx,
+                arguments,
+                covered_columns,
+                result_column_rewrites,
+                where_covered: pattern_match.where_covered,
+                cost_estimate,
+            });
+            matched_indexes.push(pattern.index.clone());
         }
     }
 
@@ -515,93 +722,53 @@ fn optimize_recursive_cte_query(query: &mut Plan, resolver: &Resolver) -> Result
 }
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-/// Transform MATCH expressions to fts_match() function calls.
-fn transform_match_to_fts_match(
-    where_clause: &mut [WhereTerm],
-    schema: &Schema,
+fn validate_match_index_context(
+    where_clause: &[WhereTerm],
     table_references: &TableReferences,
 ) -> Result<()> {
-    use super::ast::{FunctionTail, LikeOperator, Name, TableInternalId};
-    use super::expr::{walk_expr_mut, WalkControl};
-
-    // Helper to extract table ID from a column expression
-    fn get_table_id_from_expr(expr: &Expr) -> Option<TableInternalId> {
-        match expr {
-            Expr::Column { table, .. } => Some(*table),
-            Expr::Parenthesized(exprs) if !exprs.is_empty() => get_table_id_from_expr(&exprs[0]),
-            _ => None,
-        }
-    }
-
-    // Helper to check if a table has an FTS index by its internal ID
-    let table_has_fts_index = |table_id: TableInternalId| -> bool {
+    let table_has_match_pattern = |source: PlanSourceId| {
         table_references
             .joined_tables()
             .iter()
-            .find(|t| t.internal_id == table_id)
-            .and_then(|t| {
-                if let Table::BTree(btree) = &t.table {
-                    Some(schema.has_fts_index(&btree.name))
-                } else {
-                    None
-                }
+            .find(|table| table.internal_id == source)
+            .is_some_and(|table| {
+                table.index_method_patterns.iter().any(|pattern| {
+                    pattern.predicate.as_ref().is_some_and(|predicate| {
+                        let mut has_match = false;
+                        let _ = walk_plan_expr(predicate, &mut |expr| {
+                            if let PlanExpr::Function(call) = expr {
+                                has_match = call.function.value().to_string() == "fts_match";
+                            }
+                            Ok(if has_match {
+                                PlanWalkControl::SkipChildren
+                            } else {
+                                PlanWalkControl::Continue
+                            })
+                        });
+                        has_match
+                    })
+                })
             })
-            .unwrap_or(false)
     };
 
     let mut match_without_fts = false;
-    for term in where_clause.iter_mut() {
-        let _ = walk_expr_mut(&mut term.expr, &mut |e: &mut Expr| -> Result<WalkControl> {
-            match e {
-                Expr::Like {
-                    lhs,
-                    not,
-                    op: LikeOperator::Match,
-                    rhs,
-                    escape: _,
-                } => {
-                    // Check if the specific table referenced by this MATCH has an FTS index
-                    let has_fts = get_table_id_from_expr(lhs).is_some_and(table_has_fts_index);
-
-                    if !has_fts {
-                        match_without_fts = true;
-                        // Don't transform, we'll error after the walk
-                        return Ok(WalkControl::SkipChildren);
-                    }
-
-                    // Transform MATCH to fts_match():
-                    // - `col MATCH 'query'` -> `fts_match(col, 'query')`
-                    // - `(col1, col2) MATCH 'query'` -> `fts_match(col1, col2, 'query')`
-                    let mut args: Vec<Box<Expr>> = match lhs.as_ref() {
-                        Expr::Parenthesized(cols) => cols.clone(),
-                        _ => vec![lhs.clone()],
-                    };
-                    args.push(rhs.clone());
-
-                    let func_call = Expr::FunctionCall {
-                        name: Name::exact("fts_match".to_string()),
-                        distinctness: None,
-                        args,
-                        order_by: vec![],
-                        within_group: vec![],
-                        filter_over: FunctionTail {
-                            filter_clause: None,
-                            over_clause: None,
-                        },
-                    };
-                    if *not {
-                        // For NOT MATCH, just wrap the whole thing in a unary NOT
-                        *e = Expr::Unary(ast::UnaryOperator::Not, Box::new(func_call));
-                    } else {
-                        *e = func_call;
-                    }
-                    Ok(WalkControl::Continue)
-                }
-                _ => Ok(WalkControl::Continue),
+    for term in where_clause {
+        walk_plan_expr(&term.expr, &mut |expr| {
+            let PlanExpr::Like {
+                lhs,
+                operator: ast::LikeOperator::Match,
+                ..
+            } = expr
+            else {
+                return Ok(PlanWalkControl::Continue);
+            };
+            let dependencies = plan_expr_dependencies(lhs)?;
+            if !dependencies.sources().any(table_has_match_pattern) {
+                match_without_fts = true;
             }
-        });
+            Ok(PlanWalkControl::SkipChildren)
+        })?;
     }
-
     if match_without_fts {
         return Err(LimboError::ParseError(
             "unable to use function MATCH in the requested context".to_string(),
@@ -633,7 +800,7 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
 
     // The result column must be exactly the aggregate expression (not wrapped in
     // something like `length(count(*))`).
-    if !exprs_are_equivalent(result_expr, &agg.original_expr) {
+    if !plan_exprs_are_equivalent(result_expr, &agg.original_expr) {
         return None;
     }
 
@@ -663,9 +830,7 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
             } else {
                 SortOrder::Desc
             };
-            let collation = get_collseq_from_expr(&argument, &plan.table_references)
-                .ok()
-                .flatten();
+            let collation = plan_expr_collation(&argument, plan).ok().flatten();
             Some(SimpleAggregate::MinMax(Box::new(MinMaxDef {
                 func: agg.func.clone(),
                 argument,
@@ -683,6 +848,28 @@ struct OptimizeTableAccessResult {
     min_max_fast_path: bool,
 }
 
+fn parse_plan_signed_number(expr: &PlanExpr) -> Result<crate::types::Value> {
+    match expr {
+        PlanExpr::Literal(ast::Literal::Numeric(number)) => {
+            crate::util::parse_numeric_literal(number)
+        }
+        PlanExpr::Unary { operator, expr } => match (operator, expr.as_ref()) {
+            (ast::UnaryOperator::Negative, PlanExpr::Literal(ast::Literal::Numeric(number))) => {
+                crate::util::parse_numeric_literal(&format!("-{number}"))
+            }
+            (ast::UnaryOperator::Positive, PlanExpr::Literal(ast::Literal::Numeric(number))) => {
+                crate::util::parse_numeric_literal(number)
+            }
+            _ => Err(LimboError::InvalidArgument(
+                "signed-number must be a numeric literal".to_string(),
+            )),
+        },
+        _ => Err(LimboError::InvalidArgument(
+            "signed-number must be a numeric literal".to_string(),
+        )),
+    }
+}
+
 /**
  * Make a few passes over the plan to optimize it.
  * TODO: these could probably be done in less passes,
@@ -690,46 +877,139 @@ struct OptimizeTableAccessResult {
  */
 #[turso_macros::trace_stack]
 pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
-    let schema = resolver.schema();
-    // Transform MATCH expressions to fts_match() for FTS optimizer recognition
+    // One scalar query can expose several outputs, but all of those references
+    // share one physical child plan. Schedule that plan once by query identity.
+    let mut scheduled_expression_subqueries = BitSet::<PlanSubqueryId>::default();
+    let mut pending = vec![SelectOptimizationTask {
+        path: Vec::new(),
+        phase: SelectOptimizationPhase::BeforeChildQueries,
+        resolver: resolver.fork(),
+    }];
+
+    while let Some(task) = pending.pop() {
+        let SelectOptimizationTask {
+            path,
+            phase,
+            resolver,
+        } = task;
+        match phase {
+            SelectOptimizationPhase::BeforeChildQueries => {
+                let child_paths = {
+                    let target = select_plan_at_path_mut(plan, &path)?;
+                    prepare_select_plan_for_child_queries(target, &resolver)?;
+                    let mut child_paths = select_from_subquery_paths(target, &path)?;
+                    child_paths.extend(select_expression_subquery_paths(
+                        target,
+                        &path,
+                        &mut scheduled_expression_subqueries,
+                    )?);
+                    child_paths
+                };
+                let child_tasks = child_paths
+                    .into_iter()
+                    .map(|path| SelectOptimizationTask {
+                        path,
+                        phase: SelectOptimizationPhase::BeforeChildQueries,
+                        resolver: resolver.fork(),
+                    })
+                    .collect::<Vec<_>>();
+
+                // Finish this SELECT only after every child query has completed.
+                pending.push(SelectOptimizationTask {
+                    path,
+                    phase: SelectOptimizationPhase::AfterChildQueries,
+                    resolver,
+                });
+                pending.extend(child_tasks.into_iter().rev());
+            }
+            SelectOptimizationPhase::AfterChildQueries => {
+                let should_reoptimize = {
+                    let target = select_plan_at_path_mut(plan, &path)?;
+                    optimize_select_plan_after_from_subqueries(target, &resolver)?
+                };
+                if should_reoptimize {
+                    pending.push(SelectOptimizationTask {
+                        path,
+                        phase: SelectOptimizationPhase::ReoptimizeCorrelatedSubqueries(0),
+                        resolver,
+                    });
+                }
+            }
+            SelectOptimizationPhase::ReoptimizeCorrelatedSubqueries(start_index) => {
+                let next = {
+                    let target = select_plan_at_path_mut(plan, &path)?;
+                    next_correlated_subquery_reoptimization_path(target, &path, start_index)
+                };
+                if let Some((next_index, child_path)) = next {
+                    let child_resolver = resolver.fork();
+                    // Resume the parent's scan only after this child has been
+                    // fully reoptimized, matching the former recursive loop.
+                    pending.push(SelectOptimizationTask {
+                        path,
+                        phase: SelectOptimizationPhase::ReoptimizeCorrelatedSubqueries(next_index),
+                        resolver,
+                    });
+                    pending.push(SelectOptimizationTask {
+                        path: child_path,
+                        phase: SelectOptimizationPhase::BeforeChildQueries,
+                        resolver: child_resolver,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn prepare_select_plan_for_child_queries(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
+    resolver.bind_plan_subqueries(&plan.non_from_clause_subqueries);
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
+    validate_match_index_context(&plan.where_clause, &plan.table_references)?;
 
     unnest::unnest_exists_subqueries(plan)?;
+    // Unnesting can move subqueries from the EXISTS body into this SELECT.
+    resolver.bind_plan_subqueries(&plan.non_from_clause_subqueries);
     // EXISTS only needs 1 row. Add LIMIT 1 to surviving (non-unnested) EXISTS
     // subqueries. This is done here rather than in the subquery planner so that
     // unnesting sees the plan without an artificial LIMIT.
     for sub in &mut plan.non_from_clause_subqueries {
-        if matches!(sub.query_type, ast::SubqueryType::Exists { .. }) {
+        if matches!(sub.query_type, PlanSubqueryType::Exists { .. }) {
             if let SubqueryState::Unevaluated {
                 plan: Some(inner), ..
             } = &mut sub.state
             {
                 if let Plan::Select(ref mut inner) = inner.as_mut() {
                     if inner.limit.is_none() {
-                        inner.limit = Some(Box::new(Expr::Literal(ast::Literal::Numeric(
-                            "1".to_string(),
-                        ))));
+                        inner.limit =
+                            Some(PlanExpr::Literal(ast::Literal::Numeric("1".to_string())));
                     }
                 }
             }
         }
     }
-    optimize_subqueries(plan, resolver)?;
-    let available_indexes =
-        AvailableIndexes::for_table_references(resolver, &plan.table_references);
+    Ok(())
+}
+
+/// Finish the passes that depend on optimized FROM-subquery row estimates.
+/// Returns false when an impossible predicate makes later reoptimization moot.
+fn optimize_select_plan_after_from_subqueries(
+    plan: &mut SelectPlan,
+    resolver: &Resolver,
+) -> Result<bool> {
+    let schema = resolver.schema();
+    let available_indexes = AvailableIndexes::for_table_references(&plan.table_references);
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
         plan.contains_constant_false_condition = true;
-        return Ok(());
+        return Ok(false);
     }
 
     plan.simple_aggregate = detect_simple_aggregate(plan);
     let best_join_order = optimize_table_access(
         schema,
-        resolver.dialect.as_ref(),
         &mut plan.result_columns,
         &mut plan.table_references,
         &available_indexes,
@@ -762,7 +1042,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
         // Clamp to LIMIT when it's a literal non-negative number.
         // Negative LIMIT means "no limit" in SQLite, so we skip those.
         if let Some(limit_expr) = &plan.limit {
-            if let Ok(val) = crate::util::parse_signed_number(limit_expr) {
+            if let Ok(val) = parse_plan_signed_number(limit_expr) {
                 let limit_f64 = match val {
                     crate::types::Value::Numeric(Numeric::Integer(i)) if i >= 0 => Some(i as f64),
                     crate::types::Value::Numeric(Numeric::Float(f)) => {
@@ -783,17 +1063,17 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
         plan.estimated_output_rows = Some(est);
     }
 
-    reoptimize_correlated_subqueries(plan, resolver)?;
-
-    Ok(())
+    Ok(true)
 }
 
 fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()> {
     let schema = resolver.schema();
-    let available_indexes =
-        AvailableIndexes::for_table_references(resolver, &plan.table_references);
+    let scoped_resolver = resolver.fork();
+    scoped_resolver.bind_plan_subqueries(&plan.non_from_clause_subqueries);
+    let resolver = &scoped_resolver;
+    let available_indexes = AvailableIndexes::for_table_references(&plan.table_references);
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
+    validate_match_index_context(&plan.where_clause, &plan.table_references)?;
 
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
@@ -809,7 +1089,6 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
 
     let _ = optimize_table_access(
         schema,
-        resolver.dialect.as_ref(),
         &mut plan.result_columns,
         &mut plan.table_references,
         &available_indexes,
@@ -832,29 +1111,31 @@ fn optimize_update_plan(
     resolver: &Resolver,
 ) -> Result<()> {
     let schema = resolver.schema();
+    let scoped_resolver = resolver.fork();
+    scoped_resolver.bind_plan_subqueries(&plan.non_from_clause_subqueries);
+    let resolver = &scoped_resolver;
     let is_update_from = !plan.from_tables.joined_tables().is_empty();
     if is_update_from {
         plan.safety.require(DmlSafetyReason::UpdateFrom);
     }
-    let mut target_tables = TableReferences::new(
-        vec![plan.target_table.clone()],
-        plan.from_tables.outer_query_refs().to_vec(),
-    );
+    let mut target_tables = plan.build_target_scope_tables();
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    transform_match_to_fts_match(&mut plan.where_clause, schema, &target_tables)?;
+    validate_match_index_context(&plan.where_clause, &target_tables)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
         plan.contains_constant_false_condition = true;
         if is_update_from {
-            let update_from_set_result_columns = update_from_set_result_columns(&plan.set_clauses);
+            let update_from_set_result_columns =
+                update_from_set_result_columns(program, &plan.set_clauses, resolver);
             build_update_write_set_plan(program, plan, update_from_set_result_columns)?;
         }
         return Ok(());
     }
     if is_update_from {
-        let update_from_set_result_columns = update_from_set_result_columns(&plan.set_clauses);
+        let update_from_set_result_columns =
+            update_from_set_result_columns(program, &plan.set_clauses, resolver);
         build_update_write_set_plan(program, plan, update_from_set_result_columns)?;
         optimize_select_plan(
             &mut plan
@@ -868,10 +1149,9 @@ fn optimize_update_plan(
     }
 
     let mut order_by = vec![];
-    let available_indexes = AvailableIndexes::for_table_references(resolver, &target_tables);
+    let available_indexes = AvailableIndexes::for_table_references(&target_tables);
     let optimize_result = optimize_table_access(
         schema,
-        resolver.dialect.as_ref(),
         &mut [],
         &mut target_tables,
         &available_indexes,
@@ -1019,16 +1299,30 @@ fn update_write_set_reason(
         };
 
         let affected_cols = btree_table.columns_affected_by_update(&updated_cols)?;
-        for c in index.columns.iter() {
-            if let Some(ref expr) = c.expr {
-                let expr_idx_cols_mask = expression_index_column_usage(expr.as_ref())?;
-                if expr_idx_cols_mask
-                    .iter()
-                    .any(|cidx| affected_cols.get(cidx))
-                {
+        let planned_index = table_ref.plan_index_expressions(index.value());
+        for (index_column, column) in index.columns.iter().enumerate() {
+            if column.expr.is_some() {
+                let Some(expr) = planned_index
+                    .and_then(|planned| planned.columns.get(index_column))
+                    .and_then(Option::as_ref)
+                else {
+                    return Err(LimboError::InternalError(format!(
+                        "expression index '{}' has no lowered expression metadata",
+                        index.name
+                    )));
+                };
+                let mut affected = false;
+                walk_plan_expr(expr, &mut |expr| {
+                    if let PlanExpr::Column(column) = expr {
+                        affected |= column.source == table_ref.internal_id
+                            && affected_cols.get(column.column);
+                    }
+                    Ok(PlanWalkControl::Continue)
+                })?;
+                if affected {
                     break 'requires Some(DmlSafetyReason::KeyMutation);
                 }
-            } else if affected_cols.get(c.pos_in_table) {
+            } else if affected_cols.get(column.pos_in_table) {
                 break 'requires Some(DmlSafetyReason::KeyMutation);
             }
         }
@@ -1039,39 +1333,30 @@ fn update_write_set_reason(
 }
 
 fn collect_subquery_ids_from_exprs<'a>(
-    exprs: impl IntoIterator<Item = &'a ast::Expr>,
-) -> Result<BitSet<turso_parser::ast::TableInternalId>> {
-    use crate::translate::expr::walk_expr;
-    use crate::translate::expr::WalkControl;
-
-    let mut ids = BitSet::<turso_parser::ast::TableInternalId>::default();
-    let mut collector = |e: &ast::Expr| -> Result<WalkControl> {
-        if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
-            ids.set(*subquery_id)?;
-        }
-        Ok(WalkControl::Continue)
-    };
+    exprs: impl IntoIterator<Item = &'a PlanExpr>,
+) -> Result<BitSet<PlanSubqueryId>> {
+    let mut ids = BitSet::<PlanSubqueryId>::default();
     for expr in exprs {
-        walk_expr(expr, &mut collector)?;
+        for subquery in plan_expr_dependencies(expr)?.subqueries {
+            ids.set(subquery)?;
+        }
     }
     Ok(ids)
 }
 
-/// Collect SubqueryResult IDs referenced in SET clause and RETURNING expressions.
-/// These subqueries must stay in the main update plan (evaluated during the update phase),
-/// not be moved to the ephemeral plan (which only collects rowids).
-fn collect_update_phase_subquery_ids(
-    plan: &UpdatePlan,
-) -> Result<BitSet<turso_parser::ast::TableInternalId>> {
+/// Collect subquery IDs referenced by expressions evaluated during the write phase.
+/// These must stay in the main update plan rather than the SELECT that collects rowids.
+fn collect_update_phase_subquery_ids(plan: &UpdatePlan) -> Result<BitSet<PlanSubqueryId>> {
     let mut ids = collect_subquery_ids_from_exprs(
-        plan.set_clauses
-            .iter()
-            .map(|set_clause| set_clause.expr.as_ref()),
+        plan.set_clauses.iter().map(|set_clause| &set_clause.expr),
     )?;
     ids.union_with(&collect_subquery_ids_from_exprs(
         plan.returning
             .iter()
             .flat_map(|returning| returning.iter().map(|column| &column.expr)),
+    )?)?;
+    ids.union_with(&collect_subquery_ids_from_exprs(
+        plan.limit.iter().chain(plan.offset.iter()),
     )?)?;
     Ok(ids)
 }
@@ -1109,7 +1394,7 @@ fn build_update_write_set_plan(
     plan: &mut UpdatePlan,
     update_from_set_result_columns: Vec<ResultSetColumn>,
 ) -> Result<()> {
-    let scratch_table_id = program.table_reference_counter.next();
+    let scratch_table_id = program.next_plan_source_id();
     let is_update_from = !plan.from_tables.joined_tables().is_empty();
     let columns = if is_update_from {
         update_from_scratch_columns(plan.set_clauses.len())?
@@ -1144,21 +1429,23 @@ fn build_update_write_set_plan(
         from_tables.add_joined_table(target_table);
         from_tables
     } else {
-        TableReferences::new(
-            vec![plan.target_table.clone()],
-            plan.from_tables.outer_query_refs().to_vec(),
-        )
+        plan.build_target_scope_tables()
     };
     let rowid_internal_id = plan.target_table.internal_id;
 
     let mut result_columns = update_from_set_result_columns;
     result_columns.push(ResultSetColumn {
-        expr: Expr::RowId {
-            database: None,
-            table: rowid_internal_id,
-        },
-        alias: None,
-        implicit_column_name: None,
+        id: program.next_plan_output_id(),
+        name: "rowid".to_string(),
+        name_kind: crate::translate::semantic::hir::OutputNameKind::Inferred,
+        origin: Some(crate::translate::plan::ResultColumnOrigin::RowId {
+            source: rowid_internal_id,
+        }),
+        type_fact: crate::translate::semantic::hir::TypeFact::known(Type::Integer),
+        affinity: crate::translate::plan_expr::PlanExprAffinity::with_affinity(Affinity::Integer),
+        collation: None,
+        array_dimensions: 0,
+        expr: PlanExpr::rowid(rowid_internal_id),
         contains_aggregates: false,
     });
 
@@ -1193,7 +1480,9 @@ fn build_update_write_set_plan(
                 collect_subquery_ids_from_exprs(
                     plan.returning
                         .iter()
-                        .flat_map(|returning| returning.iter().map(|column| &column.expr)),
+                        .flat_map(|returning| returning.iter().map(|column| &column.expr))
+                        .chain(plan.limit.iter())
+                        .chain(plan.offset.iter()),
                 )?
             } else {
                 collect_update_phase_subquery_ids(plan)?
@@ -1226,12 +1515,13 @@ fn build_update_write_set_plan(
         // For UPDATE ... FROM, the SET expression payloads are materialized, so they are direct
         // column references to the scratch table.
         for (idx, set_clause) in plan.set_clauses.iter_mut().enumerate() {
-            set_clause.update_from_result = Some(Box::new(Expr::Column {
-                database: None,
-                table: scratch_table_id,
-                column: idx,
-                is_rowid_alias: false,
-            }));
+            set_clause.update_from_result = Some(PlanExpr::column_with_metadata(
+                scratch_table_id,
+                idx,
+                crate::translate::semantic::hir::TypeFact::known(Type::Blob),
+                Affinity::Blob,
+                None,
+            ));
         }
     }
 
@@ -1254,52 +1544,354 @@ fn default_join_order(table_references: &TableReferences) -> Vec<JoinOrderMember
         .collect()
 }
 
-fn update_from_set_result_columns(set_clauses: &[UpdateSetClause]) -> Vec<ResultSetColumn> {
+fn update_from_set_result_columns(
+    program: &mut ProgramBuilder,
+    set_clauses: &[UpdateSetClause],
+    resolver: &Resolver,
+) -> Vec<ResultSetColumn> {
+    let bindings = resolver.plan_runtime_bindings();
     set_clauses
         .iter()
         .enumerate()
-        .map(|(idx, set_clause)| ResultSetColumn {
-            expr: set_clause.expr.as_ref().clone(),
-            alias: Some(update_from_scratch_col_name(idx)),
-            implicit_column_name: None,
-            contains_aggregates: false,
+        .map(|(idx, set_clause)| {
+            let expr = set_clause.expr.clone();
+            let type_fact = plan_expr_type_fact(&expr, &*bindings);
+            ResultSetColumn {
+                id: program.next_plan_output_id(),
+                name: update_from_scratch_col_name(idx),
+                name_kind: crate::translate::semantic::hir::OutputNameKind::ExplicitAlias,
+                origin: None,
+                affinity: plan_expr_affinity(&expr, &*bindings),
+                array_dimensions: plan_expr_array_dimensions(&expr, &*bindings),
+                type_fact,
+                collation: None,
+                expr,
+                contains_aggregates: false,
+            }
         })
         .collect()
 }
 
-fn optimize_subqueries(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
-    for table in plan.table_references.joined_tables_mut() {
-        if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
-            let from_clause_subquery = Arc::make_mut(from_clause_subquery);
-            // Use match to handle both SelectPlan and CompoundSelect variants
-            match from_clause_subquery.plan.as_mut() {
-                Plan::Select(select_plan) => optimize_select_plan(select_plan, resolver)?,
-                Plan::CompoundSelect {
-                    left, right_most, ..
-                } => {
-                    optimize_select_plan(right_most, resolver)?;
-                    for (select_plan, _) in left {
-                        optimize_select_plan(select_plan, resolver)?;
-                    }
-                }
-                Plan::RecursiveCte(recursive_cte) => {
-                    optimize_recursive_cte_query(&mut recursive_cte.initial_query, resolver)?;
-                    optimize_recursive_cte_query(&mut recursive_cte.recursive_query, resolver)?;
-                }
-                Plan::Delete(_) | Plan::Update(_) => {
-                    turso_soft_unreachable!(
-                        "DELETE/UPDATE plans should not appear in FROM clause subqueries"
-                    );
+#[derive(Clone, Copy)]
+enum SelectOptimizationPathStep {
+    FromTable(usize),
+    NonFromClauseSubquery(usize),
+    Select,
+    CompoundLeft(usize),
+    CompoundRight,
+    RecursiveInitial,
+    RecursiveTerm,
+}
+
+type SelectOptimizationPath = Vec<SelectOptimizationPathStep>;
+
+enum SelectOptimizationPhase {
+    BeforeChildQueries,
+    AfterChildQueries,
+    ReoptimizeCorrelatedSubqueries(usize),
+}
+
+struct SelectOptimizationTask<'a> {
+    path: SelectOptimizationPath,
+    phase: SelectOptimizationPhase,
+    resolver: Resolver<'a>,
+}
+
+enum SelectOptimizationCursor<'a> {
+    Select(&'a mut SelectPlan),
+    Plan(&'a mut Plan),
+}
+
+/// Re-find a SELECT from the trampoline root. Paths keep traversal state on
+/// the heap without retaining mutable references to both a parent and child.
+fn select_plan_at_path_mut<'a>(
+    root: &'a mut SelectPlan,
+    path: &[SelectOptimizationPathStep],
+) -> Result<&'a mut SelectPlan> {
+    let mut cursor = SelectOptimizationCursor::Select(root);
+    for step in path {
+        cursor = match (cursor, *step) {
+            (
+                SelectOptimizationCursor::Select(select),
+                SelectOptimizationPathStep::FromTable(i),
+            ) => {
+                let table = select
+                    .table_references
+                    .joined_tables_mut()
+                    .get_mut(i)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(
+                            "FROM-subquery optimization path has no table".to_string(),
+                        )
+                    })?;
+                let Table::FromClauseSubquery(subquery) = &mut table.table else {
                     return Err(LimboError::InternalError(
-                        "DELETE/UPDATE plans should not appear in FROM clause subqueries"
-                            .to_string(),
+                        "FROM-subquery optimization path reached a leaf table".to_string(),
+                    ));
+                };
+                SelectOptimizationCursor::Plan(Arc::make_mut(subquery).plan.as_mut())
+            }
+            (
+                SelectOptimizationCursor::Select(select),
+                SelectOptimizationPathStep::NonFromClauseSubquery(i),
+            ) => {
+                let subquery = select
+                    .non_from_clause_subqueries
+                    .get_mut(i)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(
+                            "expression-subquery optimization path has no subquery".to_string(),
+                        )
+                    })?;
+                let SubqueryState::Unevaluated {
+                    plan: Some(subquery_plan),
+                } = &mut subquery.state
+                else {
+                    return Err(LimboError::InternalError(
+                        "expression-subquery optimization path has no pending plan".to_string(),
+                    ));
+                };
+                SelectOptimizationCursor::Plan(subquery_plan.as_mut())
+            }
+            (SelectOptimizationCursor::Plan(plan), SelectOptimizationPathStep::Select) => {
+                let Plan::Select(select) = plan else {
+                    return Err(LimboError::InternalError(
+                        "SELECT optimization path reached a non-SELECT plan".to_string(),
+                    ));
+                };
+                SelectOptimizationCursor::Select(select.as_mut())
+            }
+            (SelectOptimizationCursor::Plan(plan), SelectOptimizationPathStep::CompoundLeft(i)) => {
+                let Plan::CompoundSelect { left, .. } = plan else {
+                    return Err(LimboError::InternalError(
+                        "compound optimization path reached a non-compound plan".to_string(),
+                    ));
+                };
+                let select = left.get_mut(i).map(|(select, _)| select).ok_or_else(|| {
+                    LimboError::InternalError(
+                        "compound optimization path has no left arm".to_string(),
+                    )
+                })?;
+                SelectOptimizationCursor::Select(select)
+            }
+            (SelectOptimizationCursor::Plan(plan), SelectOptimizationPathStep::CompoundRight) => {
+                let Plan::CompoundSelect { right_most, .. } = plan else {
+                    return Err(LimboError::InternalError(
+                        "compound optimization path reached a non-compound plan".to_string(),
+                    ));
+                };
+                SelectOptimizationCursor::Select(right_most.as_mut())
+            }
+            (
+                SelectOptimizationCursor::Plan(plan),
+                SelectOptimizationPathStep::RecursiveInitial,
+            ) => {
+                let Plan::RecursiveCte(recursive) = plan else {
+                    return Err(LimboError::InternalError(
+                        "recursive optimization path reached a non-recursive plan".to_string(),
+                    ));
+                };
+                SelectOptimizationCursor::Plan(recursive.initial_query.as_mut())
+            }
+            (SelectOptimizationCursor::Plan(plan), SelectOptimizationPathStep::RecursiveTerm) => {
+                let Plan::RecursiveCte(recursive) = plan else {
+                    return Err(LimboError::InternalError(
+                        "recursive optimization path reached a non-recursive plan".to_string(),
+                    ));
+                };
+                SelectOptimizationCursor::Plan(recursive.recursive_query.as_mut())
+            }
+            _ => {
+                return Err(LimboError::InternalError(
+                    "invalid SELECT optimization path".to_string(),
+                ));
+            }
+        };
+    }
+
+    match cursor {
+        SelectOptimizationCursor::Select(select) => Ok(select),
+        SelectOptimizationCursor::Plan(_) => Err(LimboError::InternalError(
+            "SELECT optimization path ended at a query wrapper".to_string(),
+        )),
+    }
+}
+
+fn path_with_step(
+    path: &[SelectOptimizationPathStep],
+    step: SelectOptimizationPathStep,
+) -> SelectOptimizationPath {
+    let mut child = path.to_vec();
+    child.push(step);
+    child
+}
+
+enum CompoundOptimizationOrder {
+    RightThenLeft,
+    LeftThenRight,
+}
+
+fn append_select_paths_for_query(
+    plan: &Plan,
+    path: &SelectOptimizationPath,
+    compound_order: CompoundOptimizationOrder,
+    out: &mut Vec<SelectOptimizationPath>,
+) -> Result<()> {
+    match plan {
+        Plan::Select(_) => out.push(path_with_step(path, SelectOptimizationPathStep::Select)),
+        Plan::CompoundSelect { left, .. } => match compound_order {
+            CompoundOptimizationOrder::RightThenLeft => {
+                out.push(path_with_step(
+                    path,
+                    SelectOptimizationPathStep::CompoundRight,
+                ));
+                for index in 0..left.len() {
+                    out.push(path_with_step(
+                        path,
+                        SelectOptimizationPathStep::CompoundLeft(index),
                     ));
                 }
             }
+            CompoundOptimizationOrder::LeftThenRight => {
+                for index in 0..left.len() {
+                    out.push(path_with_step(
+                        path,
+                        SelectOptimizationPathStep::CompoundLeft(index),
+                    ));
+                }
+                out.push(path_with_step(
+                    path,
+                    SelectOptimizationPathStep::CompoundRight,
+                ));
+            }
+        },
+        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {
+            return Err(LimboError::InternalError(
+                "recursive CTE query is not a SELECT".to_string(),
+            ));
         }
     }
-
     Ok(())
+}
+
+fn select_from_subquery_paths(
+    plan: &mut SelectPlan,
+    path: &SelectOptimizationPath,
+) -> Result<Vec<SelectOptimizationPath>> {
+    let mut children = Vec::new();
+    for (table_index, table) in plan
+        .table_references
+        .joined_tables_mut()
+        .iter_mut()
+        .enumerate()
+    {
+        let Table::FromClauseSubquery(subquery) = &mut table.table else {
+            continue;
+        };
+        let subquery = Arc::make_mut(subquery);
+        let subquery_path =
+            path_with_step(path, SelectOptimizationPathStep::FromTable(table_index));
+        match subquery.plan.as_ref() {
+            Plan::Select(_) | Plan::CompoundSelect { .. } => append_select_paths_for_query(
+                subquery.plan.as_ref(),
+                &subquery_path,
+                CompoundOptimizationOrder::RightThenLeft,
+                &mut children,
+            )?,
+            Plan::RecursiveCte(recursive) => {
+                let initial_path =
+                    path_with_step(&subquery_path, SelectOptimizationPathStep::RecursiveInitial);
+                append_select_paths_for_query(
+                    recursive.initial_query.as_ref(),
+                    &initial_path,
+                    CompoundOptimizationOrder::LeftThenRight,
+                    &mut children,
+                )?;
+                let recursive_path =
+                    path_with_step(&subquery_path, SelectOptimizationPathStep::RecursiveTerm);
+                append_select_paths_for_query(
+                    recursive.recursive_query.as_ref(),
+                    &recursive_path,
+                    CompoundOptimizationOrder::LeftThenRight,
+                    &mut children,
+                )?;
+            }
+            Plan::Delete(_) | Plan::Update(_) => {
+                turso_soft_unreachable!(
+                    "DELETE/UPDATE plans should not appear in FROM clause subqueries"
+                );
+                return Err(LimboError::InternalError(
+                    "DELETE/UPDATE plans should not appear in FROM clause subqueries".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(children)
+}
+
+/// Find the expression subqueries that still have a physical query plan.
+///
+/// Every such query needs one ordinary optimization pass before its enclosing
+/// SELECT is optimized. The later correlated-subquery pass is only a second
+/// pass for plans whose access choice depends on the enclosing row count.
+fn select_expression_subquery_paths(
+    plan: &mut SelectPlan,
+    path: &SelectOptimizationPath,
+    scheduled: &mut BitSet<PlanSubqueryId>,
+) -> Result<Vec<SelectOptimizationPath>> {
+    let mut children = Vec::new();
+    for (subquery_index, subquery) in plan.non_from_clause_subqueries.iter_mut().enumerate() {
+        if scheduled.get(subquery.internal_id) {
+            continue;
+        }
+        let SubqueryState::Unevaluated {
+            plan: Some(subquery_plan),
+        } = &mut subquery.state
+        else {
+            continue;
+        };
+
+        let subquery_path = path_with_step(
+            path,
+            SelectOptimizationPathStep::NonFromClauseSubquery(subquery_index),
+        );
+        match subquery_plan.as_ref() {
+            Plan::Select(_) | Plan::CompoundSelect { .. } => append_select_paths_for_query(
+                subquery_plan.as_ref(),
+                &subquery_path,
+                CompoundOptimizationOrder::RightThenLeft,
+                &mut children,
+            )?,
+            Plan::RecursiveCte(recursive) => {
+                let initial_path =
+                    path_with_step(&subquery_path, SelectOptimizationPathStep::RecursiveInitial);
+                append_select_paths_for_query(
+                    recursive.initial_query.as_ref(),
+                    &initial_path,
+                    CompoundOptimizationOrder::LeftThenRight,
+                    &mut children,
+                )?;
+                let recursive_path =
+                    path_with_step(&subquery_path, SelectOptimizationPathStep::RecursiveTerm);
+                append_select_paths_for_query(
+                    recursive.recursive_query.as_ref(),
+                    &recursive_path,
+                    CompoundOptimizationOrder::LeftThenRight,
+                    &mut children,
+                )?;
+            }
+            Plan::Delete(_) | Plan::Update(_) => {
+                turso_soft_unreachable!(
+                    "DELETE/UPDATE plans should not appear in expression subqueries"
+                );
+                return Err(LimboError::InternalError(
+                    "DELETE/UPDATE plans should not appear in expression subqueries".to_string(),
+                ));
+            }
+        }
+        scheduled.set(subquery.internal_id)?;
+    }
+    Ok(children)
 }
 
 /// Re-run correlated subqueries once the enclosing plan has learned a better
@@ -1308,19 +1900,28 @@ fn optimize_subqueries(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()>
 /// This converges because `input_cardinality_hint` is monotonic within one
 /// optimization pass: once a plan receives a hint, later re-entry compares
 /// against that stored hint and skips re-optimization unless the new hint is
-/// strictly larger. The recursive call therefore only propagates larger hints
-/// down the subquery tree; it does not oscillate based on newly estimated row
-/// counts.
-fn reoptimize_correlated_subqueries(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
+/// strictly larger. Re-entering through the trampoline therefore only
+/// propagates larger hints down the subquery tree; it does not oscillate based
+/// on newly estimated row counts.
+fn next_correlated_subquery_reoptimization_path(
+    plan: &mut SelectPlan,
+    path: &SelectOptimizationPath,
+    start_index: usize,
+) -> Option<(usize, SelectOptimizationPath)> {
     let Some(invocation_hint) = plan
         .input_cardinality_hint
         .or(plan.estimated_output_rows)
         .filter(|hint| *hint > 1.0)
     else {
-        return Ok(());
+        return None;
     };
 
-    for subquery in &mut plan.non_from_clause_subqueries {
+    for (subquery_index, subquery) in plan
+        .non_from_clause_subqueries
+        .iter_mut()
+        .enumerate()
+        .skip(start_index)
+    {
         if !subquery.correlated {
             continue;
         }
@@ -1345,54 +1946,65 @@ fn reoptimize_correlated_subqueries(plan: &mut SelectPlan, resolver: &Resolver) 
         }
 
         inner_plan.input_cardinality_hint = Some(invocation_hint);
-        optimize_select_plan(inner_plan, resolver)?;
+        let subquery_path = path_with_step(
+            path,
+            SelectOptimizationPathStep::NonFromClauseSubquery(subquery_index),
+        );
+        return Some((
+            subquery_index + 1,
+            path_with_step(&subquery_path, SelectOptimizationPathStep::Select),
+        ));
     }
 
-    Ok(())
+    None
 }
 
 /// Return whether this plan contains any FROM-clause CTE reference whose
 /// access-path choice may change when the enclosing invocation count grows.
 fn select_plan_contains_cte_from_clause_subquery(plan: &SelectPlan) -> bool {
-    plan.table_references
-        .joined_tables()
-        .iter()
-        .any(|table| match &table.table {
-            Table::FromClauseSubquery(subquery) => {
-                subquery.cte_id().is_some()
-                    || match subquery.plan.as_ref() {
-                        Plan::Select(select_plan) => {
-                            select_plan_contains_cte_from_clause_subquery(select_plan)
-                        }
-                        Plan::CompoundSelect {
-                            left, right_most, ..
-                        } => {
-                            left.iter().any(|(select_plan, _)| {
-                                select_plan_contains_cte_from_clause_subquery(select_plan)
-                            }) || select_plan_contains_cte_from_clause_subquery(right_most)
-                        }
-                        Plan::RecursiveCte(_) => false,
-                        Plan::Delete(_) | Plan::Update(_) => false,
+    enum QueryRef<'a> {
+        Select(&'a SelectPlan),
+        Plan(&'a Plan),
+    }
+
+    let mut pending = vec![QueryRef::Select(plan)];
+    while let Some(query) = pending.pop() {
+        match query {
+            QueryRef::Select(select) => {
+                for table in select.table_references.joined_tables() {
+                    let Table::FromClauseSubquery(subquery) = &table.table else {
+                        continue;
+                    };
+                    if subquery.cte_id().is_some() {
+                        return true;
                     }
+                    pending.push(QueryRef::Plan(subquery.plan.as_ref()));
+                }
             }
-            _ => false,
-        })
+            QueryRef::Plan(query) => match query {
+                Plan::Select(select) => pending.push(QueryRef::Select(select.as_ref())),
+                Plan::CompoundSelect {
+                    left, right_most, ..
+                } => {
+                    pending.extend(left.iter().map(|(select, _)| QueryRef::Select(select)));
+                    pending.push(QueryRef::Select(right_most.as_ref()));
+                }
+                Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {}
+            },
+        }
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
 fn optimize_table_access_with_custom_modules(
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
-    available_indexes: &AvailableIndexes,
     where_query: &mut [WhereTerm],
-    order_by: &mut Vec<(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )>,
+    order_by: &mut Vec<PlanOrderTerm>,
     group_by: &mut Option<GroupBy>,
-    limit: &mut Option<Box<Expr>>,
-    offset: &mut Option<Box<Expr>>,
+    limit: &mut Option<PlanExpr>,
+    offset: &mut Option<PlanExpr>,
 ) -> Result<bool> {
     let tables = table_references.joined_tables_mut();
     if tables.is_empty() {
@@ -1407,90 +2019,61 @@ fn optimize_table_access_with_custom_modules(
     // Only optimize the first table with custom index methods.
     // This allows FTS to be used as the driving table in joins.
     let table = &mut tables[0];
-    let Some(indexes) = available_indexes.indexes_for_table(table.internal_id) else {
-        return Ok(false);
-    };
-    for index in indexes {
+    for pattern in &table.index_method_patterns {
+        let index = PlanIndex::Catalog(pattern.index.clone());
         if index.index_method.is_none() {
             continue;
         }
         if index.is_backing_btree_index() {
             continue;
         }
-        for pattern in table
-            .bound_index_method_patterns
-            .iter()
-            .filter(|pattern| pattern.index_name.eq_ignore_ascii_case(&index.name))
-        {
-            let Some(pattern_match) =
-                try_match_index_method_pattern(pattern, where_query, order_by, limit, offset)
-            else {
-                continue;
-            };
+        let Some(pattern_match) =
+            try_match_index_method_pattern(pattern, where_query, order_by, limit, offset)
+        else {
+            continue;
+        };
 
-            // Mark WHERE clause as consumed
-            if let Some(where_covered) = pattern_match.where_covered {
-                where_query[where_covered].consumed = true;
-            }
-
-            // Build covered columns mapping and update result_columns.
-            // This differs from collect_index_method_candidates: we modify result_columns
-            // and increment covered_column_id per matching query column, not per pattern column.
-            let mut covered_column_id = 1_000_000;
-            let mut covered_columns = HashMap::default();
-            for (pattern_column_id, pattern_column) in
-                pattern_match.pattern_columns.iter().enumerate()
-            {
-                let ast::ResultColumn::Expr(pattern_expr, _) = pattern_column else {
-                    continue;
-                };
-                let Some(substituted) =
-                    try_substitute_parameters(pattern_expr, &pattern_match.parameters)
-                else {
-                    continue;
-                };
-                for query_column in result_columns.iter_mut() {
-                    if !exprs_are_equivalent(&query_column.expr, &substituted) {
-                        continue;
-                    }
-                    query_column.expr = ast::Expr::Column {
-                        database: None,
-                        table: table.internal_id,
-                        column: covered_column_id,
-                        is_rowid_alias: false,
-                    };
-                    covered_columns.insert(covered_column_id, pattern_column_id);
-                    covered_column_id += 1;
-                }
-            }
-
-            // Calculate whether WHERE is completely covered for ORDER BY/LIMIT clearing
-            let where_covered_completely = where_query.is_empty()
-                || (pattern_match.where_covered.is_some() && where_query.len() == 1);
-
-            // Only clear ORDER BY/LIMIT/OFFSET if:
-            // 1. The pattern explicitly handles them (has ORDER BY/LIMIT), AND
-            // 2. WHERE is completely covered (no post-filtering needed)
-            // Otherwise, keep them so they're applied after post-filtering
-            if pattern_match.pattern_has_order_by && where_covered_completely {
-                let _ = order_by.drain(..);
-            }
-            if pattern_match.pattern_has_limit && where_covered_completely {
-                let _ = limit.take();
-                let _ = offset.take();
-            }
-
-            // Sort and collect arguments
-            let arguments = sorted_arguments_from_parameters(&pattern_match.parameters);
-
-            table.op = Operation::IndexMethodQuery(IndexMethodQuery {
-                index: index.clone(),
-                pattern_idx: pattern_match.pattern_idx,
-                covered_columns,
-                arguments,
-            });
-            return Ok(true);
+        // Mark WHERE clause as consumed
+        if let Some(where_covered) = pattern_match.where_covered {
+            where_query[where_covered].consumed = true;
         }
+
+        let (covered_columns, result_column_rewrites) = build_covered_columns_mapping(
+            &pattern_match.pattern_columns,
+            &pattern_match.parameters,
+            result_columns,
+            table.internal_id,
+        );
+        for (result_column_idx, replacement) in result_column_rewrites {
+            result_columns[result_column_idx].expr = replacement;
+        }
+
+        // Calculate whether WHERE is completely covered for ORDER BY/LIMIT clearing
+        let where_covered_completely = where_query.is_empty()
+            || (pattern_match.where_covered.is_some() && where_query.len() == 1);
+
+        // Only clear ORDER BY/LIMIT/OFFSET if:
+        // 1. The pattern explicitly handles them (has ORDER BY/LIMIT), AND
+        // 2. WHERE is completely covered (no post-filtering needed)
+        // Otherwise, keep them so they're applied after post-filtering
+        if pattern_match.pattern_has_order_by && where_covered_completely {
+            order_by.clear();
+        }
+        if pattern_match.pattern_has_limit && where_covered_completely {
+            let _ = limit.take();
+            let _ = offset.take();
+        }
+
+        // Sort and collect arguments
+        let arguments = sorted_arguments_from_parameters(&pattern_match.parameters);
+
+        table.op = Operation::IndexMethodQuery(IndexMethodQuery {
+            index,
+            pattern_idx: pattern_match.pattern_idx,
+            covered_columns,
+            arguments,
+        });
+        return Ok(true);
     }
     Ok(false)
 }
@@ -1506,30 +2089,27 @@ fn optimize_table_access_with_custom_modules(
 fn register_expression_index_usages_for_plan(
     table_references: &mut TableReferences,
     result_columns: &[ResultSetColumn],
-    order_by: &[(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )],
+    order_by: &[PlanOrderTerm],
     group_by: Option<&GroupBy>,
-) {
+) -> Result<()> {
     table_references.reset_expression_index_usages();
     for rc in result_columns {
-        table_references.register_expression_index_usage(&rc.expr);
+        table_references.register_plan_expr_usage(&rc.expr)?;
     }
-    for (expr, _, _) in order_by {
-        table_references.register_expression_index_usage(expr);
+    for term in order_by {
+        table_references.register_plan_expr_usage(&term.expr)?;
     }
     if let Some(group_by) = group_by {
         for expr in &group_by.exprs {
-            table_references.register_expression_index_usage(expr);
+            table_references.register_plan_expr_usage(expr)?;
         }
         if let Some(having) = &group_by.having {
             for expr in having {
-                table_references.register_expression_index_usage(expr);
+                table_references.register_plan_expr_usage(expr)?;
             }
         }
     }
+    Ok(())
 }
 
 /// Derive a base row-count estimate for a table, preferring ANALYZE stats.
@@ -1602,10 +2182,9 @@ fn base_row_estimate(
 /// - Expressions that route the table's values through NULL-masking functions
 ///   like `ifnull`/`coalesce`.
 fn where_term_is_null_rejecting_for_table(
-    expr: &ast::Expr,
+    expr: &PlanExpr,
     operator: ConstraintOperator,
-    table_id: ast::TableInternalId,
-    dialect: &dyn crate::dialect::Dialect,
+    table_id: PlanSourceId,
 ) -> bool {
     if matches!(
         operator,
@@ -1614,39 +2193,49 @@ fn where_term_is_null_rejecting_for_table(
         return false;
     }
 
-    !expr_has_null_masking_for_table(expr, table_id, dialect)
+    !expr_has_null_masking_for_table(expr, table_id)
 }
 
 /// Returns true if an expression references a column from `table_id`.
-fn expr_references_table(expr: &ast::Expr, table_id: ast::TableInternalId) -> bool {
-    use crate::translate::expr::{walk_expr, WalkControl};
+fn expr_references_table(expr: &PlanExpr, table_id: PlanSourceId) -> bool {
     let mut found = false;
-    let _ = walk_expr(expr, &mut |inner: &ast::Expr| -> Result<WalkControl> {
+    let _ = walk_plan_expr(expr, &mut |inner| {
         match inner {
-            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. }
-                if *table == table_id =>
-            {
+            PlanExpr::Column(column) if column.source == table_id => {
                 found = true;
-                return Ok(WalkControl::SkipChildren);
+                return Ok(PlanWalkControl::SkipChildren);
+            }
+            PlanExpr::MergedColumn(column) if column.right.source == table_id => {
+                found = true;
+                return Ok(PlanWalkControl::SkipChildren);
+            }
+            PlanExpr::RowId(source) if *source == table_id => {
+                found = true;
+                return Ok(PlanWalkControl::SkipChildren);
             }
             _ => {}
         }
-        Ok(WalkControl::Continue)
+        Ok(PlanWalkControl::Continue)
     });
     found
 }
 
 /// Returns true if an expression is a NULL check on a column from `table_id`.
 /// Matches patterns like `col IS NULL`, `col IS NOT NULL`, `IsNull(col)`, `NotNull(col)`.
-fn is_null_check_on_table(expr: &ast::Expr, table_id: ast::TableInternalId) -> bool {
+fn is_null_check_on_table(expr: &PlanExpr, table_id: PlanSourceId) -> bool {
     match expr {
-        ast::Expr::IsNull(inner) | ast::Expr::NotNull(inner) => {
+        PlanExpr::IsNull(inner) | PlanExpr::NotNull(inner) => {
             expr_references_table(inner, table_id)
         }
-        ast::Expr::Binary(lhs, ast::Operator::Is | ast::Operator::IsNot, rhs) => {
-            (matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::Null))
+        PlanExpr::Binary {
+            lhs,
+            operator: ast::Operator::Is | ast::Operator::IsNot,
+            rhs,
+            ..
+        } => {
+            (matches!(rhs.as_ref(), PlanExpr::Literal(ast::Literal::Null))
                 && expr_references_table(lhs, table_id))
-                || (matches!(lhs.as_ref(), ast::Expr::Literal(ast::Literal::Null))
+                || (matches!(lhs.as_ref(), PlanExpr::Literal(ast::Literal::Null))
                     && expr_references_table(rhs, table_id))
         }
         _ => false,
@@ -1656,58 +2245,50 @@ fn is_null_check_on_table(expr: &ast::Expr, table_id: ast::TableInternalId) -> b
 /// Returns true if an expression uses a NULL-masking construct over columns from `table_id`.
 /// This includes NULL-masking functions (COALESCE, IFNULL) and CASE/IIF expressions
 /// that explicitly handle the NULL case for columns from the target table.
-fn expr_has_null_masking_for_table(
-    expr: &ast::Expr,
-    table_id: ast::TableInternalId,
-    dialect: &dyn crate::dialect::Dialect,
-) -> bool {
-    use crate::translate::expr::{walk_expr, WalkControl};
+fn expr_has_null_masking_for_table(expr: &PlanExpr, table_id: PlanSourceId) -> bool {
     let mut found = false;
-    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+    let _ = walk_plan_expr(expr, &mut |e| {
         match e {
-            ast::Expr::FunctionCall { name, args, .. } => {
-                if let Ok(Some(func)) = dialect.resolve_function(name.as_str(), args.len()) {
-                    // IIF(cond, then, else) is like CASE WHEN cond THEN then ELSE else END.
-                    // If the condition is a null check on the target table, IIF masks nulls.
-                    if matches!(
-                        func,
-                        crate::function::Func::Scalar(crate::function::ScalarFunc::Iif)
-                    ) {
-                        if let Some(cond) = args.first() {
-                            if is_null_check_on_table(cond, table_id) {
-                                found = true;
-                                return Ok(WalkControl::SkipChildren);
-                            }
-                        }
-                        return Ok(WalkControl::Continue);
-                    }
-                    if !func.can_mask_nulls() {
-                        return Ok(WalkControl::Continue);
-                    }
-                    for arg in args {
-                        if expr_references_table(arg, table_id) {
+            PlanExpr::Function(call) => {
+                let function = call.function.value();
+                // IIF(cond, then, else) is like CASE WHEN cond THEN then ELSE else END.
+                // If the condition is a null check on the target table, IIF masks nulls.
+                if matches!(
+                    function,
+                    crate::function::Func::Scalar(crate::function::ScalarFunc::Iif)
+                ) {
+                    if let Some(cond) = call.arguments.first() {
+                        if is_null_check_on_table(cond, table_id) {
                             found = true;
-                            return Ok(WalkControl::SkipChildren);
+                            return Ok(PlanWalkControl::SkipChildren);
                         }
+                    }
+                    return Ok(PlanWalkControl::Continue);
+                }
+                if !function.can_mask_nulls() {
+                    return Ok(PlanWalkControl::Continue);
+                }
+                for arg in &call.arguments {
+                    if expr_references_table(arg, table_id) {
+                        found = true;
+                        return Ok(PlanWalkControl::SkipChildren);
                     }
                 }
             }
             // CASE WHEN <null-check-on-table> THEN ... ELSE ... END
             // If any WHEN condition checks for NULL on a column from the target table,
             // the CASE explicitly handles NULLs and can produce non-NULL results.
-            ast::Expr::Case {
-                when_then_pairs, ..
-            } => {
-                for (when_expr, _) in when_then_pairs {
+            PlanExpr::Case { when_then, .. } => {
+                for (when_expr, _) in when_then {
                     if is_null_check_on_table(when_expr, table_id) {
                         found = true;
-                        return Ok(WalkControl::SkipChildren);
+                        return Ok(PlanWalkControl::SkipChildren);
                     }
                 }
             }
             _ => {}
         }
-        Ok(WalkControl::Continue)
+        Ok(PlanWalkControl::Continue)
     });
     found
 }
@@ -1722,26 +2303,25 @@ fn enforce_indexed_by_hints(
     constraints_per_table: &mut [TableConstraints],
 ) -> Result<()> {
     for (i, table_ref) in table_references.joined_tables().iter().enumerate() {
-        let Some(ref indexed) = table_ref.indexed else {
-            continue;
-        };
         if table_ref.btree().is_none() {
             continue;
         }
         let Some(cs) = constraints_per_table.get_mut(i) else {
             continue;
         };
-        match indexed {
-            ast::Indexed::IndexedBy(name) => {
-                let idx_name = name.as_str();
-                // Verify the index exists and belongs to this table.
+        match &table_ref.index_hint {
+            PlanIndexHint::None => continue,
+            PlanIndexHint::Indexed(resolved_index) => {
                 let forced_index =
-                    available_indexes.btree_index_by_name(table_ref.internal_id, idx_name);
+                    available_indexes.btree_index(table_ref.internal_id, resolved_index);
                 let Some(forced_index) = forced_index else {
-                    crate::bail_parse_error!("no such index: {}", idx_name);
+                    return Err(LimboError::InternalError(format!(
+                        "resolved index '{}' is absent from optimizer metadata",
+                        resolved_index.value().name
+                    )));
                 };
                 let forced_partial_index_unusable = forced_index.where_clause.is_some()
-                    && !can_use_partial_index(forced_index.as_ref(), table_ref, where_clause);
+                    && !can_use_partial_index(forced_index.value(), table_ref, where_clause);
                 if forced_partial_index_unusable
                     && matches!(simple_aggregate, Some(SimpleAggregate::Count))
                 {
@@ -1760,7 +2340,8 @@ fn enforce_indexed_by_hints(
                 cs.candidates.retain(|c| {
                     c.index
                         .as_ref()
-                        .is_some_and(|idx| Arc::ptr_eq(idx, &forced_index))
+                        .and_then(PlanIndex::resolved)
+                        .is_some_and(|idx| idx == resolved_index)
                 });
                 // If no candidate survived (no WHERE constraints matched), add an empty one
                 // so the optimizer can still scan the index.
@@ -1771,7 +2352,7 @@ fn enforce_indexed_by_hints(
                     });
                 }
             }
-            ast::Indexed::NotIndexed => {
+            PlanIndexHint::NotIndexed => {
                 // Remove all secondary index candidates, keep only rowid.
                 cs.candidates.retain(|c| c.index.is_none());
             }
@@ -1794,21 +2375,16 @@ fn enforce_indexed_by_hints(
 #[allow(clippy::too_many_arguments)]
 fn optimize_table_access(
     schema: &Schema,
-    dialect: &dyn crate::dialect::Dialect,
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &AvailableIndexes,
     where_clause: &mut [WhereTerm],
-    order_by: &mut Vec<(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )>,
+    order_by: &mut Vec<PlanOrderTerm>,
     group_by: &mut Option<GroupBy>,
     simple_aggregate: Option<&SimpleAggregate>,
     subqueries: &[NonFromClauseSubquery],
-    limit: &mut Option<Box<Expr>>,
-    offset: &mut Option<Box<Expr>>,
+    limit: &mut Option<PlanExpr>,
+    offset: &mut Option<PlanExpr>,
     initial_input_cardinality: f64,
 ) -> Result<Option<OptimizeTableAccessResult>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
@@ -1840,7 +2416,7 @@ fn optimize_table_access(
             result_columns,
             order_by.as_slice(),
             group_by.as_ref(),
-        );
+        )?;
     }
 
     // For single-table queries, try to optimize with custom index methods directly.
@@ -1850,12 +2426,11 @@ fn optimize_table_access(
     let has_indexed_by_hint = table_references
         .joined_tables()
         .iter()
-        .any(|t| t.indexed.is_some());
+        .any(|table| !matches!(table.index_hint, PlanIndexHint::None));
     if is_single_table && !has_indexed_by_hint {
         let optimized = optimize_table_access_with_custom_modules(
             result_columns,
             table_references,
-            available_indexes,
             where_clause,
             order_by,
             group_by,
@@ -1880,7 +2455,7 @@ fn optimize_table_access(
     let index_method_candidates = if !is_single_table {
         collect_index_method_candidates(
             table_references,
-            available_indexes,
+            result_columns,
             where_clause,
             order_by,
             group_by,
@@ -1950,7 +2525,6 @@ fn optimize_table_access(
                     &where_clause[c.where_clause_pos.0].expr,
                     c.operator,
                     t.internal_id,
-                    dialect,
                 );
                 is_from_where && is_null_rejecting
             }) {
@@ -2045,7 +2619,6 @@ fn optimize_table_access(
             &access_methods_arena,
             table_references.joined_tables_mut(),
             order_target,
-            schema,
         );
         if satisfies_order_target {
             match &order_target.purpose {
@@ -2315,13 +2888,12 @@ fn optimize_table_access(
                     let ephemeral_index = Arc::new(ephemeral_index);
                     table_references.joined_tables_mut()[table_idx].op =
                         Operation::Search(Search::Seek {
-                            index: Some(ephemeral_index),
+                            index: Some(PlanIndex::Ephemeral(ephemeral_index)),
                             seek_def: build_seek_def_from_constraints(
                                 &table_constraints.constraints,
                                 &usable_constraint_refs,
                                 *iter_dir,
                                 where_clause,
-                                Some(table_references),
                             )?,
                         });
                 } else {
@@ -2354,7 +2926,6 @@ fn optimize_table_access(
                                     constraint_refs,
                                     *iter_dir,
                                     where_clause,
-                                    Some(table_references),
                                 )?,
                             });
                         continue;
@@ -2370,7 +2941,7 @@ fn optimize_table_access(
                             Operation::Search(Search::RowidEq {
                                 cmp_expr: constraints_per_table[table_idx].constraints
                                     [eq.constraint_pos]
-                                    .get_constraining_expr(where_clause, Some(table_references))
+                                    .get_constraining_expr(where_clause)
                                     .1,
                             })
                         } else {
@@ -2381,7 +2952,6 @@ fn optimize_table_access(
                                     constraint_refs,
                                     *iter_dir,
                                     where_clause,
-                                    Some(table_references),
                                 )?,
                             })
                         };
@@ -2400,7 +2970,6 @@ fn optimize_table_access(
                     idx_str,
                     constraints,
                     constraint_usages,
-                    Some(table_references),
                 )?;
             }
             AccessMethodParams::Subquery { iter_dir } => {
@@ -2437,12 +3006,11 @@ fn optimize_table_access(
                     constraint_refs,
                     *iter_dir,
                     where_clause,
-                    Some(table_references),
                 )?;
 
                 table_references.joined_tables_mut()[table_idx].op =
                     Operation::Search(Search::Seek {
-                        index: Some(index.clone()),
+                        index: Some(PlanIndex::Ephemeral(index.clone())),
                         seek_def,
                     });
             }
@@ -2473,11 +3041,20 @@ fn optimize_table_access(
             }
             AccessMethodParams::IndexMethod {
                 query,
+                result_column_rewrites,
                 where_covered,
             } => {
                 // Mark WHERE clause term as consumed if the index method covered it
                 if let Some(idx) = where_covered {
                     where_clause[*idx].consumed = true;
+                }
+                for (result_column_idx, replacement) in result_column_rewrites {
+                    let result_column = result_columns.get_mut(*result_column_idx).ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "index-method result rewrite targets missing result column {result_column_idx}"
+                        ))
+                    })?;
+                    result_column.expr = replacement.clone();
                 }
                 // Set up the index method query operation
                 table_references.joined_tables_mut()[table_idx].op =
@@ -2515,7 +3092,6 @@ fn optimize_table_access(
                                 &constraint_refs,
                                 IterationDirection::Forwards, // Multi-index always scans forward
                                 where_clause,
-                                Some(table_references),
                             )?,
                         },
                         MultiIndexBranchAccessParams::InSeek { source } => {
@@ -2543,23 +3119,32 @@ fn optimize_table_access(
                 where_term_idx,
             } => {
                 let source = match &where_clause[*where_term_idx].expr {
-                    Expr::InList { rhs, .. } => {
-                        let in_values: Vec<ast::Expr> = rhs.iter().map(|e| *e.clone()).collect();
-                        InSeekSource::LiteralList {
-                            values: in_values,
-                            affinity: *affinity,
+                    PlanExpr::InList { values, .. } => InSeekSource::LiteralList {
+                        values: values.clone(),
+                        affinity: *affinity,
+                    },
+                    PlanExpr::Subquery(PlanSubqueryExpr::In { query, .. }) => {
+                        let subquery = subqueries
+                            .iter()
+                            .find(|subquery| subquery.internal_id == *query)
+                            .ok_or_else(|| {
+                                LimboError::InternalError(format!(
+                                    "missing planned IN subquery {query:?}"
+                                ))
+                            })?;
+                        let PlanSubqueryType::In { cursor_id, .. } = &subquery.query_type else {
+                            return Err(LimboError::InternalError(format!(
+                                "planned subquery {query:?} used for IN seek has the wrong runtime shape"
+                            )));
+                        };
+                        InSeekSource::Subquery {
+                            cursor_id: *cursor_id,
                         }
                     }
-                    Expr::SubqueryResult {
-                        query_type: SubqueryType::In { cursor_id, .. },
-                        ..
-                    } => InSeekSource::Subquery {
-                        cursor_id: *cursor_id,
-                    },
                     _ => {
-                        return Err(crate::LimboError::InternalError(
-                            "InSeek where term is not an InList or SubqueryResult expression"
-                                .into(),
+                        return Err(LimboError::InternalError(
+                            "IN seek term is not a resolved IN-list or IN-subquery expression"
+                                .to_owned(),
                         ));
                     }
                 };
@@ -2658,7 +3243,6 @@ fn build_vtab_scan_op(
     idx_str: &Option<String>,
     vtab_constraints: &[ConstraintInfo],
     constraint_usages: &[ConstraintUsage],
-    referenced_tables: Option<&TableReferences>,
 ) -> Result<Operation> {
     if constraint_usages.len() != vtab_constraints.len() {
         return Err(LimboError::ExtensionError(format!(
@@ -2696,7 +3280,7 @@ fn build_vtab_scan_op(
         if usage.omit {
             where_clause[constraint.where_clause_pos.0].consumed = true;
         }
-        let (_, expr, _) = constraint.get_constraining_expr(where_clause, referenced_tables);
+        let (_, expr, _) = constraint.get_constraining_expr(where_clause);
         constraints[zero_based_argv_index] = Some(expr);
         arg_count += 1;
     }
@@ -2823,7 +3407,7 @@ fn eliminate_constant_conditions(
 /// Check if the order target collation matches index column collations.
 /// Only remove the index when sort elimination selected this plan.
 fn maybe_remove_index_candidate(
-    index: &mut Option<Arc<Index>>,
+    index: &mut Option<PlanIndex>,
     table_reference: &JoinedTable,
     order_target: Option<&OrderTarget>,
     sort_eliminated: bool,
@@ -2871,7 +3455,8 @@ pub enum AlwaysTrueOrFalse {
 
 /**
   Helper trait for expressions that can be optimized
-  Implemented for ast::Expr
+  Implemented for both parser expressions and resolved plan expressions while
+  legacy expression emission still uses the parser representation.
 */
 pub trait Optimizable {
     // if the expression is a constant expression that, when evaluated as a condition, is always true or false
@@ -2887,6 +3472,260 @@ pub trait Optimizable {
     fn is_nonnull(&self, tables: &TableReferences) -> bool;
 }
 
+impl Optimizable for PlanExpr {
+    fn is_nonnull(&self, tables: &TableReferences) -> bool {
+        let column_is_nonnull = |column: &crate::translate::plan_expr::PlanColumnRef| {
+            if column.rowid_alias {
+                return true;
+            }
+            let Some((_, table_ref)) = tables.find_table_by_internal_id(column.source) else {
+                return false;
+            };
+            table_ref
+                .columns()
+                .get(column.column)
+                .is_some_and(|column| column.is_rowid_alias() || column.notnull())
+        };
+
+        match self {
+            PlanExpr::Literal(literal) => !matches!(literal, ast::Literal::Null),
+            PlanExpr::Parameter(_) | PlanExpr::Output(_) => false,
+            PlanExpr::Column(column) => column_is_nonnull(column),
+            PlanExpr::MergedColumn(column) => match column.value {
+                PlanMergedColumnValue::Left => column.left.is_nonnull(tables),
+                PlanMergedColumnValue::Right => column_is_nonnull(&column.right),
+                PlanMergedColumnValue::Coalesce => {
+                    column.left.is_nonnull(tables) || column_is_nonnull(&column.right)
+                }
+            },
+            PlanExpr::RowId(_) => true,
+            PlanExpr::Unary { expr, .. }
+            | PlanExpr::Cast { expr, .. }
+            | PlanExpr::Collate { expr, .. } => expr.is_nonnull(tables),
+            PlanExpr::Binary {
+                operator: ast::Operator::Modulus | ast::Operator::Divide,
+                ..
+            } => false,
+            PlanExpr::Binary { lhs, rhs, .. } => lhs.is_nonnull(tables) && rhs.is_nonnull(tables),
+            PlanExpr::Between {
+                expr, start, end, ..
+            } => expr.is_nonnull(tables) && start.is_nonnull(tables) && end.is_nonnull(tables),
+            PlanExpr::Case {
+                when_then,
+                else_expr,
+                ..
+            } => {
+                when_then.iter().all(|(_, then)| then.is_nonnull(tables))
+                    && else_expr
+                        .as_ref()
+                        .is_some_and(|else_expr| else_expr.is_nonnull(tables))
+            }
+            PlanExpr::Function(_) | PlanExpr::FieldAccess(_) | PlanExpr::Subscript { .. } => false,
+            PlanExpr::IsNull(_) | PlanExpr::NotNull(_) => true,
+            PlanExpr::InList { lhs, values, .. } => {
+                values.is_empty()
+                    || (lhs.is_nonnull(tables)
+                        && values.iter().all(|value| value.is_nonnull(tables)))
+            }
+            PlanExpr::Subquery(PlanSubqueryExpr::Exists(_)) => true,
+            PlanExpr::Subquery(PlanSubqueryExpr::Scalar { .. } | PlanSubqueryExpr::In { .. }) => {
+                false
+            }
+            PlanExpr::Like {
+                lhs, rhs, escape, ..
+            } => {
+                lhs.is_nonnull(tables)
+                    && rhs.is_nonnull(tables)
+                    && escape
+                        .as_ref()
+                        .is_none_or(|escape| escape.is_nonnull(tables))
+            }
+            PlanExpr::Row(values) => values.iter().all(|value| value.is_nonnull(tables)),
+            PlanExpr::Array(_) => true,
+            PlanExpr::Raise { .. } => false,
+        }
+    }
+
+    fn is_constant(&self, _resolver: &Resolver<'_>) -> bool {
+        match self {
+            PlanExpr::Literal(_) | PlanExpr::Parameter(_) => true,
+            PlanExpr::Column(_)
+            | PlanExpr::MergedColumn(_)
+            | PlanExpr::RowId(_)
+            | PlanExpr::Output(_)
+            | PlanExpr::Subquery(_) => false,
+            PlanExpr::Unary { expr, .. }
+            | PlanExpr::Collate { expr, .. }
+            | PlanExpr::IsNull(expr)
+            | PlanExpr::NotNull(expr) => expr.is_constant(_resolver),
+            PlanExpr::Binary {
+                lhs, rhs, custom, ..
+            } => {
+                custom
+                    .as_ref()
+                    .is_none_or(|custom| custom.function.value().is_deterministic())
+                    && lhs.is_constant(_resolver)
+                    && rhs.is_constant(_resolver)
+            }
+            PlanExpr::Between {
+                expr, start, end, ..
+            } => {
+                expr.is_constant(_resolver)
+                    && start.is_constant(_resolver)
+                    && end.is_constant(_resolver)
+            }
+            PlanExpr::Case {
+                base,
+                when_then,
+                else_expr,
+            } => {
+                base.as_ref().is_none_or(|base| base.is_constant(_resolver))
+                    && when_then.iter().all(|(when, then)| {
+                        when.is_constant(_resolver) && then.is_constant(_resolver)
+                    })
+                    && else_expr
+                        .as_ref()
+                        .is_none_or(|else_expr| else_expr.is_constant(_resolver))
+            }
+            PlanExpr::Cast { expr, target } => {
+                expr.is_constant(_resolver)
+                    && target
+                        .parameters
+                        .iter()
+                        .all(|parameter| parameter.is_constant(_resolver))
+            }
+            PlanExpr::Function(function) => {
+                !function.star
+                    && function.distinctness.is_none()
+                    && function.argument_order.is_empty()
+                    && function.within_group.is_empty()
+                    && function.filter.is_none()
+                    && function.window.is_none()
+                    && function.sequence_operation.is_none()
+                    && function.function.value().is_deterministic()
+                    && function
+                        .arguments
+                        .iter()
+                        .all(|argument| argument.is_constant(_resolver))
+            }
+            PlanExpr::InList { lhs, values, .. } => {
+                lhs.is_constant(_resolver)
+                    && values.iter().all(|value| value.is_constant(_resolver))
+            }
+            PlanExpr::Like {
+                lhs,
+                function,
+                rhs,
+                escape,
+                ..
+            } => {
+                function.value().is_deterministic()
+                    && lhs.is_constant(_resolver)
+                    && rhs.is_constant(_resolver)
+                    && escape
+                        .as_ref()
+                        .is_none_or(|escape| escape.is_constant(_resolver))
+            }
+            PlanExpr::Row(values) | PlanExpr::Array(values) => {
+                values.iter().all(|value| value.is_constant(_resolver))
+            }
+            PlanExpr::Subscript { base, index } => {
+                base.is_constant(_resolver) && index.is_constant(_resolver)
+            }
+            PlanExpr::FieldAccess(access) => access.base.is_constant(_resolver),
+            PlanExpr::Raise { message, .. } => message
+                .as_ref()
+                .is_none_or(|message| message.is_constant(_resolver)),
+        }
+    }
+
+    fn check_always_true_or_false(&self) -> Result<Option<AlwaysTrueOrFalse>> {
+        match self {
+            PlanExpr::Literal(literal) => match literal {
+                ast::Literal::Numeric(value) => {
+                    if let Ok(value) = value.parse::<i64>() {
+                        return Ok(Some(if value == 0 {
+                            AlwaysTrueOrFalse::AlwaysFalse
+                        } else {
+                            AlwaysTrueOrFalse::AlwaysTrue
+                        }));
+                    }
+                    if let Ok(value) = value.parse::<f64>() {
+                        return Ok(Some(if value == 0.0 {
+                            AlwaysTrueOrFalse::AlwaysFalse
+                        } else {
+                            AlwaysTrueOrFalse::AlwaysTrue
+                        }));
+                    }
+                    Ok(None)
+                }
+                ast::Literal::String(value) => {
+                    let numeric = Numeric::from(value.trim_matches('\''));
+                    Ok(Some(if numeric.to_bool() {
+                        AlwaysTrueOrFalse::AlwaysTrue
+                    } else {
+                        AlwaysTrueOrFalse::AlwaysFalse
+                    }))
+                }
+                _ => Ok(None),
+            },
+            PlanExpr::Unary { operator, expr } => match operator {
+                ast::UnaryOperator::Not => {
+                    Ok(expr.check_always_true_or_false()?.map(|value| match value {
+                        AlwaysTrueOrFalse::AlwaysTrue => AlwaysTrueOrFalse::AlwaysFalse,
+                        AlwaysTrueOrFalse::AlwaysFalse => AlwaysTrueOrFalse::AlwaysTrue,
+                    }))
+                }
+                ast::UnaryOperator::Negative | ast::UnaryOperator::Positive => {
+                    expr.check_always_true_or_false()
+                }
+                ast::UnaryOperator::BitwiseNot => Ok(None),
+            },
+            PlanExpr::InList {
+                negated, values, ..
+            } if values.is_empty() => Ok(Some(if *negated {
+                AlwaysTrueOrFalse::AlwaysTrue
+            } else {
+                AlwaysTrueOrFalse::AlwaysFalse
+            })),
+            PlanExpr::Binary {
+                lhs, operator, rhs, ..
+            } => {
+                let lhs = lhs.check_always_true_or_false()?;
+                let rhs = rhs.check_always_true_or_false()?;
+                match operator {
+                    ast::Operator::And
+                        if lhs == Some(AlwaysTrueOrFalse::AlwaysFalse)
+                            || rhs == Some(AlwaysTrueOrFalse::AlwaysFalse) =>
+                    {
+                        Ok(Some(AlwaysTrueOrFalse::AlwaysFalse))
+                    }
+                    ast::Operator::And
+                        if lhs == Some(AlwaysTrueOrFalse::AlwaysTrue)
+                            && rhs == Some(AlwaysTrueOrFalse::AlwaysTrue) =>
+                    {
+                        Ok(Some(AlwaysTrueOrFalse::AlwaysTrue))
+                    }
+                    ast::Operator::Or
+                        if lhs == Some(AlwaysTrueOrFalse::AlwaysTrue)
+                            || rhs == Some(AlwaysTrueOrFalse::AlwaysTrue) =>
+                    {
+                        Ok(Some(AlwaysTrueOrFalse::AlwaysTrue))
+                    }
+                    ast::Operator::Or
+                        if lhs == Some(AlwaysTrueOrFalse::AlwaysFalse)
+                            && rhs == Some(AlwaysTrueOrFalse::AlwaysFalse) =>
+                    {
+                        Ok(Some(AlwaysTrueOrFalse::AlwaysFalse))
+                    }
+                    _ => Ok(None),
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
 impl Optimizable for ast::Expr {
     /// Returns true if the expressions is (verifiably) non-NULL.
     /// It might still be non-NULL even if we return false; we just
@@ -2896,7 +3735,6 @@ impl Optimizable for ast::Expr {
     /// by writing more complex code.
     fn is_nonnull(&self, tables: &TableReferences) -> bool {
         match self {
-            Expr::SubqueryResult { .. } => false,
             Expr::Between {
                 lhs, start, end, ..
             } => lhs.is_nonnull(tables) && start.is_nonnull(tables) && end.is_nonnull(tables),
@@ -2918,34 +3756,11 @@ impl Optimizable for ast::Expr {
             }
             Expr::Cast { expr, .. } => expr.is_nonnull(tables),
             Expr::Collate(expr, _) => expr.is_nonnull(tables),
-            Expr::DoublyQualified(..) => {
-                panic!("Do not call is_nonnull before DoublyQualified has been rewritten as Column")
-            }
+            Expr::DoublyQualified(..) => false,
             Expr::Exists(..) => false,
             Expr::FunctionCall { .. } => false,
-            Expr::BoundCustomTypeFunction { .. } => false,
             Expr::FunctionCallStar { .. } => false,
-            Expr::Id(..) => panic!("Do not call is_nonnull before Id has been rewritten as Column"),
-            Expr::Column {
-                table,
-                column,
-                is_rowid_alias,
-                ..
-            } => {
-                if *is_rowid_alias {
-                    return true;
-                }
-
-                let (_, table_ref) = tables
-                    .find_table_by_internal_id(*table)
-                    .expect("table not found");
-                let columns = table_ref.columns();
-                let column = &columns[*column];
-                // Only INTEGER PRIMARY KEY (rowid alias) is implicitly NOT NULL.
-                // Other PRIMARY KEY types (e.g., TEXT PRIMARY KEY) can contain NULL.
-                column.is_rowid_alias() || column.notnull()
-            }
-            Expr::RowId { .. } => true,
+            Expr::Id(..) => false,
             Expr::InList { lhs, rhs, .. } => {
                 lhs.is_nonnull(tables)
                     && (rhs.is_empty() || rhs.iter().all(|v| v.is_nonnull(tables)))
@@ -2969,15 +3784,12 @@ impl Optimizable for ast::Expr {
             Expr::Name(..) => false,
             Expr::NotNull(..) => true,
             Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_nonnull(tables)),
-            Expr::Qualified(..) => {
-                panic!("Do not call is_nonnull before Qualified has been rewritten as Column")
-            }
+            Expr::Qualified(..) => false,
             Expr::FieldAccess { .. } => false, // struct/union field extraction can return NULL
             Expr::Raise(..) => false,
             Expr::Subquery(..) => false,
             Expr::Unary(_, expr) => expr.is_nonnull(tables),
             Expr::Variable(..) => false,
-            Expr::Register(..) => false, // Register values can be null
             Expr::Default => false,
             Expr::Array { .. } | Expr::Subscript { .. } => {
                 unreachable!("Array and Subscript are desugared into function calls by the parser")
@@ -2987,7 +3799,6 @@ impl Optimizable for ast::Expr {
     /// Returns true if the expression is a constant i.e. does not depend on columns and can be evaluated only once during the execution
     fn is_constant(&self, resolver: &Resolver<'_>) -> bool {
         match self {
-            Expr::SubqueryResult { .. } => false,
             Expr::Between {
                 lhs, start, end, ..
             } => {
@@ -3013,9 +3824,9 @@ impl Optimizable for ast::Expr {
             }
             Expr::Cast { expr, .. } => expr.is_constant(resolver),
             Expr::Collate(expr, _) => expr.is_constant(resolver),
-            // Not constant. Normally rewritten to Expr::Column by the optimizer,
-            // but CHECK constraints bypass the rewrite pass and legitimately
-            // contain DoublyQualified nodes.
+            // Syntax-only column references are not constant. Semantic planning
+            // resolves query columns before the optimizer sees them, while schema
+            // expressions such as CHECK constraints may still use this form.
             Expr::DoublyQualified(_, _, _) => false,
             Expr::Exists(_) => false,
             Expr::FunctionCall {
@@ -3036,11 +3847,8 @@ impl Optimizable for ast::Expr {
                 };
                 func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
             }
-            Expr::BoundCustomTypeFunction { call, .. } => call.is_constant(resolver),
             Expr::FunctionCallStar { .. } => false,
-            Expr::Id(_) => true,
-            Expr::Column { .. } => false,
-            Expr::RowId { .. } => false,
+            Expr::Id(_) => false,
             Expr::InList { lhs, rhs, .. } => {
                 lhs.is_constant(resolver)
                     && (rhs.is_empty() || rhs.iter().all(|v| v.is_constant(resolver)))
@@ -3063,15 +3871,14 @@ impl Optimizable for ast::Expr {
             Expr::Name(_) => false,
             Expr::NotNull(expr) => expr.is_constant(resolver),
             Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_constant(resolver)),
-            // Not constant. Normally rewritten to Expr::Column by the optimizer,
-            // but CHECK constraints bypass the rewrite pass and legitimately
-            // contain Qualified nodes.
+            // Syntax-only column references are not constant. Semantic planning
+            // resolves query columns before the optimizer sees them, while schema
+            // expressions such as CHECK constraints may still use this form.
             Expr::Qualified(_, _) | Expr::FieldAccess { .. } => false,
             Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
             Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => true,
-            Expr::Register(_) => false,
             Expr::Default => true,
             Expr::Array { .. } | Expr::Subscript { .. } => {
                 unreachable!("Array and Subscript are desugared into function calls by the parser")
@@ -3250,7 +4057,6 @@ pub fn build_seek_def_from_constraints(
     constraint_refs: &[RangeConstraintRef],
     iter_dir: IterationDirection,
     where_clause: &[WhereTerm],
-    referenced_tables: Option<&TableReferences>,
 ) -> Result<SeekDef> {
     if constraint_refs.is_empty() {
         // Zero-prefix seeks are used for extremum scans over an already ordered
@@ -3278,7 +4084,7 @@ pub fn build_seek_def_from_constraints(
     // Extract the key values and operators
     let key = constraint_refs
         .iter()
-        .map(|cref| cref.as_seek_range_constraint(constraints, where_clause, referenced_tables))
+        .map(|cref| cref.as_seek_range_constraint(constraints, where_clause))
         .collect();
 
     let seek_def = build_seek_def(iter_dir, key)?;
@@ -3688,14 +4494,20 @@ fn build_seek_def(
 #[cfg(test)]
 mod tests {
     use super::{where_term_is_null_rejecting_for_table, Optimizable};
+    use crate::function::{Func, ScalarFunc};
+    use crate::sync::Arc;
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
+    use crate::translate::plan_expr::{PlanExpr, PlanFunctionCall, PlanSourceId};
+    use crate::translate::semantic::hir::{
+        CatalogObject, CatalogObjectId, CatalogSnapshot, TypeFact,
+    };
     use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
-    use turso_parser::ast::{self, Expr, FunctionTail, Name, TableInternalId};
+    use turso_parser::ast::{self, Expr, FunctionTail, Name};
 
     fn empty_resolver<'a>(
         schema: &'a Schema,
-        database_schemas: &'a RwLock<HashMap<usize, crate::sync::Arc<Schema>>>,
+        database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
         temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
         syms: &'a SymbolTable,
@@ -3708,7 +4520,7 @@ mod tests {
             syms,
             true,
             DoubleQuotedDml::Enabled,
-            crate::sync::Arc::new(crate::dialect::SqliteDialect),
+            Arc::new(crate::dialect::SqliteDialect),
         )
     }
 
@@ -3719,7 +4531,7 @@ mod tests {
         }
     }
 
-    fn fn_call(name: &str, args: Vec<Expr>) -> Expr {
+    fn syntax_function(name: &str, args: Vec<Expr>) -> Expr {
         Expr::FunctionCall {
             name: Name::exact(name.to_string()),
             distinctness: None,
@@ -3728,6 +4540,31 @@ mod tests {
             within_group: vec![],
             filter_over: no_tail(),
         }
+    }
+
+    fn plan_function(function: ScalarFunc, arguments: Vec<PlanExpr>) -> PlanExpr {
+        PlanExpr::Function(PlanFunctionCall {
+            function: CatalogObject::new(
+                CatalogObjectId::new(1),
+                CatalogSnapshot::from_id(1),
+                None,
+                Arc::new(Func::Scalar(function)),
+            ),
+            arguments,
+            star: false,
+            distinctness: None,
+            argument_order: vec![],
+            within_group: vec![],
+            filter: None,
+            window: None,
+            custom_type_operation: None,
+            sequence_operation: None,
+            result_type: TypeFact::dynamic(),
+        })
+    }
+
+    fn number(value: &str) -> PlanExpr {
+        PlanExpr::literal(ast::Literal::Numeric(value.into()))
     }
 
     #[test]
@@ -3745,15 +4582,15 @@ mod tests {
             &syms,
         );
 
-        let expr = fn_call(
+        let expr = syntax_function(
             "coalesce",
             vec![
-                fn_call(
+                syntax_function(
                     "length",
                     vec![Expr::Literal(ast::Literal::String("a".into()))],
                 ),
                 Expr::InList {
-                    lhs: Box::new(fn_call(
+                    lhs: Box::new(syntax_function(
                         "hex",
                         vec![Expr::Literal(ast::Literal::Blob("X'01'".into()))],
                     )),
@@ -3767,324 +4604,184 @@ mod tests {
     }
 
     #[test]
-    fn constant_classifier_for_quote_of_column() {
-        let schema = Schema::new();
-        let syms = SymbolTable::new();
-        let database_schemas = RwLock::new(HashMap::default());
-        let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let temp_database = RwLock::new(None);
-        let resolver = empty_resolver(
-            &schema,
-            &database_schemas,
-            &temp_database,
-            &attached_databases,
-            &syms,
-        );
-
-        let expr = fn_call(
-            "quote",
-            vec![Expr::Column {
-                database: None,
-                table: TableInternalId::default(),
-                column: 0,
-                is_rowid_alias: false,
-            }],
-        );
-
-        assert!(!expr.is_constant(&resolver));
-    }
-
-    #[test]
-    fn null_rejection_detection_uses_function_resolution() {
-        let table = TableInternalId::from(42);
-        let expr = Expr::Binary(
-            Box::new(fn_call(
-                "IFNULL",
-                vec![
-                    Expr::Column {
-                        database: None,
-                        table,
-                        column: 0,
-                        is_rowid_alias: false,
-                    },
-                    Expr::Literal(ast::Literal::Numeric("2147483647".into())),
-                ],
-            )),
+    fn null_rejection_detection_uses_resolved_function_identity() {
+        let table = PlanSourceId::new(42);
+        let expr = PlanExpr::binary(
+            plan_function(
+                ScalarFunc::IfNull,
+                vec![PlanExpr::column(table, 0), number("2147483647")],
+            ),
             ast::Operator::GreaterEquals,
-            Box::new(Expr::Literal(ast::Literal::Numeric("127".into()))),
+            number("127"),
         );
 
         assert!(!where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::GreaterEquals.into(),
             table,
-            &crate::dialect::SqliteDialect,
         ));
     }
 
     #[test]
     fn null_rejection_detection_requires_target_table_reference() {
-        let target_table = TableInternalId::from(7);
-        let other_table = TableInternalId::from(8);
-        let expr = Expr::Binary(
-            Box::new(fn_call(
-                "coalesce",
-                vec![
-                    Expr::Column {
-                        database: None,
-                        table: other_table,
-                        column: 0,
-                        is_rowid_alias: false,
-                    },
-                    Expr::Literal(ast::Literal::Numeric("0".into())),
-                ],
-            )),
+        let target_table = PlanSourceId::new(7);
+        let other_table = PlanSourceId::new(8);
+        let expr = PlanExpr::binary(
+            plan_function(
+                ScalarFunc::Coalesce,
+                vec![PlanExpr::column(other_table, 0), number("0")],
+            ),
             ast::Operator::Greater,
-            Box::new(Expr::Literal(ast::Literal::Numeric("1".into()))),
+            number("1"),
         );
 
         assert!(where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::Greater.into(),
             target_table,
-            &crate::dialect::SqliteDialect,
         ));
     }
 
     #[test]
     fn null_rejection_detection_handles_nested_null_masking_functions() {
-        let table = TableInternalId::from(9);
-        let expr = Expr::Binary(
-            Box::new(fn_call(
-                "coalesce",
+        let table = PlanSourceId::new(9);
+        let expr = PlanExpr::binary(
+            plan_function(
+                ScalarFunc::Coalesce,
                 vec![
-                    fn_call(
-                        "ifnull",
-                        vec![
-                            Expr::Column {
-                                database: None,
-                                table,
-                                column: 1,
-                                is_rowid_alias: false,
-                            },
-                            Expr::Literal(ast::Literal::Numeric("0".into())),
-                        ],
+                    plan_function(
+                        ScalarFunc::IfNull,
+                        vec![PlanExpr::column(table, 1), number("0")],
                     ),
-                    Expr::Literal(ast::Literal::Numeric("2".into())),
+                    number("2"),
                 ],
-            )),
+            ),
             ast::Operator::Equals,
-            Box::new(Expr::Literal(ast::Literal::Numeric("2".into()))),
+            number("2"),
         );
 
         assert!(!where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::Equals.into(),
             table,
-            &crate::dialect::SqliteDialect,
         ));
     }
 
     #[test]
-    fn null_rejection_detection_treats_is_operator_as_non_rejecting() {
-        let table = TableInternalId::from(11);
-        let expr = Expr::Binary(
-            Box::new(Expr::Column {
-                database: None,
-                table,
-                column: 0,
-                is_rowid_alias: false,
-            }),
+    fn null_rejection_detection_treats_is_as_non_rejecting() {
+        let table = PlanSourceId::new(11);
+        let expr = PlanExpr::binary(
+            PlanExpr::column(table, 0),
             ast::Operator::Is,
-            Box::new(Expr::Literal(ast::Literal::Null)),
+            PlanExpr::literal(ast::Literal::Null),
         );
 
         assert!(!where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::Is.into(),
             table,
-            &crate::dialect::SqliteDialect,
         ));
     }
 
     #[test]
     fn null_rejection_detection_treats_is_between_columns_as_non_rejecting() {
-        let table = TableInternalId::from(12);
-        let expr = Expr::Binary(
-            Box::new(Expr::Column {
-                database: None,
-                table,
-                column: 0,
-                is_rowid_alias: false,
-            }),
+        let table = PlanSourceId::new(12);
+        let expr = PlanExpr::binary(
+            PlanExpr::column(table, 0),
             ast::Operator::Is,
-            Box::new(Expr::Column {
-                database: None,
-                table,
-                column: 1,
-                is_rowid_alias: false,
-            }),
+            PlanExpr::column(table, 1),
         );
 
         assert!(!where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::Is.into(),
             table,
-            &crate::dialect::SqliteDialect,
         ));
     }
 
     #[test]
-    fn null_rejection_detection_treats_is_with_non_null_literal_as_non_rejecting() {
-        let table = TableInternalId::from(13);
-        let expr = Expr::Binary(
-            Box::new(Expr::Column {
-                database: None,
-                table,
-                column: 0,
-                is_rowid_alias: false,
-            }),
-            ast::Operator::Is,
-            Box::new(Expr::Literal(ast::Literal::Numeric("5".into()))),
-        );
-
-        assert!(!where_term_is_null_rejecting_for_table(
-            &expr,
-            ast::Operator::Is.into(),
-            table,
-            &crate::dialect::SqliteDialect,
-        ));
-    }
-
-    #[test]
-    fn null_rejection_detection_treats_is_not_with_non_null_literal_as_non_rejecting() {
-        let table = TableInternalId::from(14);
-        let expr = Expr::Binary(
-            Box::new(Expr::Column {
-                database: None,
-                table,
-                column: 0,
-                is_rowid_alias: false,
-            }),
+    fn null_rejection_detection_treats_is_not_as_non_rejecting() {
+        let table = PlanSourceId::new(14);
+        let expr = PlanExpr::binary(
+            PlanExpr::column(table, 0),
             ast::Operator::IsNot,
-            Box::new(Expr::Literal(ast::Literal::Numeric("5".into()))),
+            number("5"),
         );
 
         assert!(!where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::IsNot.into(),
             table,
-            &crate::dialect::SqliteDialect,
         ));
     }
 
     #[test]
     fn null_rejection_detection_case_with_is_null_check_not_rejecting() {
-        let table = TableInternalId::from(15);
-        // CASE WHEN t.col IS NULL THEN 1 ELSE t.col END > 0
-        let expr = Expr::Binary(
-            Box::new(Expr::Case {
+        let table = PlanSourceId::new(15);
+        let expr = PlanExpr::binary(
+            PlanExpr::Case {
                 base: None,
-                when_then_pairs: vec![(
-                    Box::new(Expr::IsNull(Box::new(Expr::Column {
-                        database: None,
-                        table,
-                        column: 0,
-                        is_rowid_alias: false,
-                    }))),
-                    Box::new(Expr::Literal(ast::Literal::Numeric("1".into()))),
-                )],
-                else_expr: Some(Box::new(Expr::Column {
-                    database: None,
-                    table,
-                    column: 0,
-                    is_rowid_alias: false,
-                })),
-            }),
+                when_then: vec![(PlanExpr::is_null(PlanExpr::column(table, 0)), number("1"))],
+                else_expr: Some(Box::new(PlanExpr::column(table, 0))),
+            },
             ast::Operator::Greater,
-            Box::new(Expr::Literal(ast::Literal::Numeric("0".into()))),
+            number("0"),
         );
 
         assert!(!where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::Greater.into(),
             table,
-            &crate::dialect::SqliteDialect,
         ));
     }
 
     #[test]
     fn null_rejection_detection_case_without_null_check_is_rejecting() {
-        let table = TableInternalId::from(16);
-        // CASE WHEN t.col > 5 THEN t.col ELSE 0 END > 0
-        let expr = Expr::Binary(
-            Box::new(Expr::Case {
+        let table = PlanSourceId::new(16);
+        let expr = PlanExpr::binary(
+            PlanExpr::Case {
                 base: None,
-                when_then_pairs: vec![(
-                    Box::new(Expr::Binary(
-                        Box::new(Expr::Column {
-                            database: None,
-                            table,
-                            column: 0,
-                            is_rowid_alias: false,
-                        }),
+                when_then: vec![(
+                    PlanExpr::binary(
+                        PlanExpr::column(table, 0),
                         ast::Operator::Greater,
-                        Box::new(Expr::Literal(ast::Literal::Numeric("5".into()))),
-                    )),
-                    Box::new(Expr::Column {
-                        database: None,
-                        table,
-                        column: 0,
-                        is_rowid_alias: false,
-                    }),
+                        number("5"),
+                    ),
+                    PlanExpr::column(table, 0),
                 )],
-                else_expr: Some(Box::new(Expr::Literal(ast::Literal::Numeric("0".into())))),
-            }),
+                else_expr: Some(Box::new(number("0"))),
+            },
             ast::Operator::Greater,
-            Box::new(Expr::Literal(ast::Literal::Numeric("0".into()))),
+            number("0"),
         );
 
-        // CASE without IS NULL check doesn't mask nulls, so it IS null-rejecting
         assert!(where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::Greater.into(),
             table,
-            &crate::dialect::SqliteDialect,
         ));
     }
 
     #[test]
     fn null_rejection_detection_iif_with_is_null_check_not_rejecting() {
-        let table = TableInternalId::from(17);
-        // IIF(t.col IS NULL, 1, t.col) > 0
-        let expr = Expr::Binary(
-            Box::new(fn_call(
-                "iif",
+        let table = PlanSourceId::new(17);
+        let expr = PlanExpr::binary(
+            plan_function(
+                ScalarFunc::Iif,
                 vec![
-                    Expr::IsNull(Box::new(Expr::Column {
-                        database: None,
-                        table,
-                        column: 0,
-                        is_rowid_alias: false,
-                    })),
-                    Expr::Literal(ast::Literal::Numeric("1".into())),
-                    Expr::Column {
-                        database: None,
-                        table,
-                        column: 0,
-                        is_rowid_alias: false,
-                    },
+                    PlanExpr::is_null(PlanExpr::column(table, 0)),
+                    number("1"),
+                    PlanExpr::column(table, 0),
                 ],
-            )),
+            ),
             ast::Operator::Greater,
-            Box::new(Expr::Literal(ast::Literal::Numeric("0".into()))),
+            number("0"),
         );
 
         assert!(!where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::Greater.into(),
             table,
-            &crate::dialect::SqliteDialect,
         ));
     }
 }

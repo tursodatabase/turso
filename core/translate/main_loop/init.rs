@@ -1,23 +1,18 @@
 use super::*;
 use crate::alloc::TursoIteratorExt;
 use crate::function::AggFunc;
+use crate::translate::expr::{translate_plan_condition_expr, translate_plan_expr};
+use crate::translate::plan_expr::{plan_expr_collation, walk_plan_expr, PlanExpr, PlanWalkControl};
 
 pub fn init_distinct(
     program: &mut ProgramBuilder,
     plan: &SelectPlan,
-    resolver: &Resolver,
+    _resolver: &Resolver,
 ) -> Result<DistinctCtx> {
     let collations = plan
         .result_columns
         .iter()
-        .map(|col| {
-            get_collseq_from_expr_with_symbols(
-                &col.expr,
-                &plan.table_references,
-                Some(resolver.symbol_table),
-            )
-            .map(|c| c.unwrap_or(CollationSeq::Binary))
-        })
+        .map(|col| plan_expr_collation(&col.expr, plan).map(|c| c.unwrap_or(CollationSeq::Binary)))
         .collect::<Result<Vec<_>>>()?;
     let hash_table_id = program.alloc_hash_table_id();
     let ctx = DistinctCtx {
@@ -86,12 +81,10 @@ impl InitLoop {
                 1,
                 "DISTINCT aggregate functions must have exactly one argument"
             );
-            let collations = vec![get_collseq_from_expr_with_symbols(
-                &agg.original_expr,
-                tables,
-                Some(t_ctx.resolver.symbol_table),
-            )?
-            .unwrap_or(CollationSeq::Binary)];
+            let subquery_facts: &[NonFromClauseSubquery] = subqueries;
+            let collations =
+                vec![plan_expr_collation(&agg.args[0], &subquery_facts)?
+                    .unwrap_or(CollationSeq::Binary)];
             let hash_table_id = program.alloc_hash_table_id();
             agg.distinctness = Distinctness::Distinct {
                 ctx: Some(DistinctCtx {
@@ -489,9 +482,10 @@ impl InitLoop {
                             // Open cursors for each index branch
                             for branch in &multi_idx_op.branches {
                                 if let Some(index) = &branch.index {
+                                    let index = index.handle();
                                     let branch_cursor_id = program.alloc_cursor_index(
                                         Some(CursorKey::index(table.internal_id, index.clone())),
-                                        index,
+                                        &index,
                                     )?;
                                     program.emit_insn(Insn::OpenRead {
                                         cursor_id: branch_cursor_id,
@@ -524,7 +518,13 @@ impl InitLoop {
                     "main_loop_end label should be set before emitting condition expressions",
                 ),
             };
-            translate_condition_expr(program, tables, &cond.expr, meta, &t_ctx.resolver)?;
+            translate_plan_condition_expr(
+                program,
+                Some(tables),
+                &cond.expr,
+                meta,
+                &t_ctx.resolver,
+            )?;
             program.preassign_label_to_next_insn(jump_target);
         }
 
@@ -542,19 +542,24 @@ fn emit_percentile_fraction_check(
     resolver: &Resolver,
     agg: &mut crate::translate::plan::Aggregate,
 ) -> Result<()> {
-    use turso_parser::ast::Expr;
     // The fraction must be constant w.r.t. the aggregated rows. Outer
     // (correlated) columns are constant for the inner aggregate and allowed;
     // a subquery may hide an input-column reference, so reject conservatively.
     // This must run before we emit the expression — at this point the cursors
     // for this query's tables aren't open yet, so a local Column read would
     // panic in translate_expr.
-    walk_expr(&agg.args[1], &mut |e: &Expr| -> Result<WalkControl> {
-        let invalid = match e {
-            Expr::Column { table, .. } => {
-                matches!(tables.find_table_by_internal_id(*table), Some((false, _)))
+    walk_plan_expr(&agg.args[1], &mut |expr| {
+        let invalid = match expr {
+            PlanExpr::Column(column) => {
+                matches!(
+                    tables.find_table_by_internal_id(column.source),
+                    Some((false, _))
+                )
             }
-            Expr::Subquery(_) | Expr::Exists(_) | Expr::SubqueryResult { .. } => true,
+            PlanExpr::RowId(source) => {
+                matches!(tables.find_table_by_internal_id(*source), Some((false, _)))
+            }
+            PlanExpr::Subquery(_) => true,
             _ => false,
         };
         if invalid {
@@ -564,11 +569,11 @@ fn emit_percentile_fraction_check(
                 agg.func
             );
         }
-        Ok(WalkControl::Continue)
+        Ok(PlanWalkControl::Continue)
     })?;
 
     let fraction_reg = program.alloc_register();
-    translate_expr(program, Some(tables), &agg.args[1], fraction_reg, resolver)?;
+    translate_plan_expr(program, Some(tables), &agg.args[1], fraction_reg, resolver)?;
 
     // NULL skips the range check and propagates to a NULL result in finalize.
     // Use one scratch register for both bounds: success falls through to `done`

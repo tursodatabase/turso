@@ -1301,7 +1301,7 @@ fn query_pragma(
                     &name,
                 )?;
                 let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
-                resolver.with_schema(table_database_id, |db_schema| {
+                resolver.with_schema(table_database_id, |db_schema| -> crate::Result<()> {
                     if let Some(table) = db_schema.get_table(&lookup_name) {
                         let primary_key_columns = match table.as_ref() {
                             Table::BTree(bt) => Some(bt.primary_key_columns.as_slice()),
@@ -1313,7 +1313,7 @@ fn query_pragma(
                             primary_key_columns,
                             base_reg,
                             false,
-                        );
+                        )?;
                     } else if let Some(view_mutex) = db_schema.get_materialized_view(&lookup_name) {
                         let view = view_mutex.lock();
                         let flat_columns = view.column_schema.flat_columns();
@@ -1325,7 +1325,7 @@ fn query_pragma(
                             None,
                             base_reg,
                             false,
-                        );
+                        )?;
                     } else if let Some(view) = db_schema.get_view(&lookup_name) {
                         emit_columns_for_table_info(
                             program,
@@ -1334,9 +1334,10 @@ fn query_pragma(
                             None,
                             base_reg,
                             false,
-                        );
+                        )?;
                     }
-                });
+                    Ok(())
+                })?;
             }
             let col_names = ["cid", "name", "type", "notnull", "dflt_value", "pk"];
             for name in col_names {
@@ -1361,7 +1362,7 @@ fn query_pragma(
                     &name,
                 )?;
                 let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
-                resolver.with_schema(table_database_id, |db_schema| {
+                resolver.with_schema(table_database_id, |db_schema| -> crate::Result<()> {
                     if let Some(table) = db_schema.get_table(&lookup_name) {
                         let primary_key_columns = match table.as_ref() {
                             Table::BTree(bt) => Some(bt.primary_key_columns.as_slice()),
@@ -1373,7 +1374,7 @@ fn query_pragma(
                             primary_key_columns,
                             base_reg,
                             true,
-                        );
+                        )?;
                     } else if let Some(view_mutex) = db_schema.get_materialized_view(&lookup_name) {
                         let view = view_mutex.lock();
                         let flat_columns = view.column_schema.flat_columns();
@@ -1385,7 +1386,7 @@ fn query_pragma(
                             None,
                             base_reg,
                             true,
-                        );
+                        )?;
                     } else if let Some(view) = db_schema.get_view(&lookup_name) {
                         emit_columns_for_table_info(
                             program,
@@ -1394,9 +1395,10 @@ fn query_pragma(
                             None,
                             base_reg,
                             true,
-                        );
+                        )?;
                     }
-                });
+                    Ok(())
+                })?;
             }
             let col_names = [
                 "cid",
@@ -1712,17 +1714,17 @@ fn query_pragma(
                     program.emit_string8(display_name, base_reg);
                     program.emit_string8(type_def.base().to_string(), base_reg + 1);
                     if let Some(expr) = type_def.encode() {
-                        program.emit_string8(expr.to_string(), base_reg + 2);
+                        program.emit_string8(expr.render(&[] as &[&str])?, base_reg + 2);
                     } else {
                         program.emit_null(base_reg + 2, None);
                     }
                     if let Some(expr) = type_def.decode() {
-                        program.emit_string8(expr.to_string(), base_reg + 3);
+                        program.emit_string8(expr.render(&[] as &[&str])?, base_reg + 3);
                     } else {
                         program.emit_null(base_reg + 3, None);
                     }
                     if let Some(expr) = type_def.default_expr() {
-                        program.emit_string8(expr.to_string(), base_reg + 4);
+                        program.emit_string8(expr.render(&[] as &[&str])?, base_reg + 4);
                     } else {
                         program.emit_null(base_reg + 4, None);
                     }
@@ -1771,7 +1773,7 @@ fn emit_columns_for_table_info(
     primary_key_columns: Option<&[(String, turso_parser::ast::SortOrder)]>,
     base_reg: usize,
     extended: bool,
-) {
+) -> crate::Result<()> {
     // According to the SQLite documentation: "The 'cid' column should not be taken to
     // mean more than 'rank within the current result set'."
     // Therefore, we enumerate only after filtering out hidden columns (if extended set to false).
@@ -1819,7 +1821,7 @@ fn emit_columns_for_table_info(
                 program.emit_null(base_reg + 4, None);
             }
             Some(expr) => {
-                program.emit_string8(expr.to_string(), base_reg + 4);
+                program.emit_string8(expr.render(&[] as &[&str])?, base_reg + 4);
             }
         }
 
@@ -1844,6 +1846,7 @@ fn emit_columns_for_table_info(
 
         program.emit_result_row(base_reg, 6 + if extended { 1 } else { 0 });
     }
+    Ok(())
 }
 
 fn update_cache_size(

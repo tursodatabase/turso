@@ -7,7 +7,16 @@ use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::translate::emitter::{DoubleQuotedDml, Resolver};
-use crate::translate::expr::translate_expr;
+use crate::translate::expr::translate_plan_expr;
+use crate::translate::logical::{LogicalExpr, LogicalSchema};
+use crate::translate::plan::{
+    PlanOutputFact, PlanRuntimeBindings, RuntimeOutputBinding, RuntimeOutputDefinition,
+    RuntimeValueBinding,
+};
+use crate::translate::plan_expr::{
+    PlanCastPrograms, PlanExpr, PlanExprAffinity, PlanFunctionCall, PlanOutputId, PlanTypeName,
+};
+#[cfg(test)]
 use crate::types::Text;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::Insn;
@@ -15,76 +24,7 @@ use crate::vdbe::{Program, ProgramState, Register};
 use crate::{Connection, QueryMode, Result, Value};
 use crate::{DatabaseCatalog, RwLock, SymbolTable};
 use rustc_hash::FxHashMap as HashMap;
-use turso_parser::ast::{Expr, Literal, Operator};
-
-// Transform an expression to replace column references with Register expressions Why do we want to
-// do this?
-//
-// Imagine you have a view like:
-//
-// create materialized view hex(count(*) + 2). translate_expr will usually try to find match names
-// to either literals or columns. But "count(*)" is not a column in any sqlite table.
-//
-// We *could* theoretically have a table-representation of every DBSP-step, but it is a lot simpler
-// to just pass registers as parameters to the VDBE expression, and teach translate_expr to
-// recognize those.
-//
-// But because the expression compiler will not generate those register inputs, we have to
-// transform the expression.
-fn transform_expr_for_dbsp(expr: &Expr, input_column_names: &[String]) -> Expr {
-    match expr {
-        // Transform column references (represented as Id) to Register expressions
-        Expr::Id(name) => {
-            // Check if this is a column name from our input
-            if let Some(idx) = input_column_names
-                .iter()
-                .position(|col| col == name.as_str())
-            {
-                // Replace with a Register expression
-                Expr::Register(idx)
-            } else {
-                // Not a column reference, keep as is
-                expr.clone()
-            }
-        }
-        // Recursively transform nested expressions
-        Expr::Binary(lhs, op, rhs) => Expr::Binary(
-            Box::new(transform_expr_for_dbsp(lhs, input_column_names)),
-            *op,
-            Box::new(transform_expr_for_dbsp(rhs, input_column_names)),
-        ),
-        Expr::Unary(op, operand) => Expr::Unary(
-            *op,
-            Box::new(transform_expr_for_dbsp(operand, input_column_names)),
-        ),
-        Expr::FunctionCall {
-            name,
-            distinctness,
-            args,
-            order_by,
-            within_group,
-            filter_over,
-        } => Expr::FunctionCall {
-            name: name.clone(),
-            distinctness: *distinctness,
-            args: args
-                .iter()
-                .map(|arg| Box::new(transform_expr_for_dbsp(arg, input_column_names)))
-                .collect(),
-            order_by: order_by.clone(),
-            within_group: within_group.clone(),
-            filter_over: filter_over.clone(),
-        },
-        Expr::Parenthesized(exprs) => Expr::Parenthesized(
-            exprs
-                .iter()
-                .map(|e| Box::new(transform_expr_for_dbsp(e, input_column_names)))
-                .collect(),
-        ),
-        // For other expression types, keep as is
-        _ => expr.clone(),
-    }
-}
+use turso_parser::ast::{Literal, Operator};
 
 /// Enum to represent either a trivial or compiled expression
 #[derive(Clone)]
@@ -196,47 +136,23 @@ impl CompiledExpression {
     // Validates if an expression is trivial (columns, immediates, and simple arithmetic)
     // Only considers expressions trivial if they don't require type coercion
     fn try_get_trivial_expr(
-        expr: &Expr,
-        input_column_names: &[String],
+        expr: &LogicalExpr,
+        input_schema: &LogicalSchema,
     ) -> Option<TrivialExpression> {
         match expr {
-            // Column reference or register
-            Expr::Id(name) => input_column_names
-                .iter()
-                .position(|col| col == name.as_str())
-                .map(TrivialExpression::Column),
-            Expr::Register(idx) => Some(TrivialExpression::Column(*idx)),
-
-            // Immediate values
-            Expr::Literal(lit) => {
-                let value = match lit {
-                    Literal::Numeric(n) => {
-                        if let Ok(i) = n.parse::<i64>() {
-                            Value::from_i64(i)
-                        } else if let Ok(f) = n.parse::<f64>() {
-                            Value::from_f64(f)
-                        } else {
-                            return None;
-                        }
-                    }
-                    Literal::String(s) => {
-                        let cleaned = s.trim_matches('\'').trim_matches('"').to_string();
-                        Value::Text(Text::new(cleaned))
-                    }
-                    Literal::Null => Value::Null,
-                    _ => return None,
-                };
-                Some(TrivialExpression::Immediate(value))
-            }
+            LogicalExpr::Column(column) => input_schema
+                .find_column_id(column.id)
+                .map(|(index, _)| TrivialExpression::Column(index)),
+            LogicalExpr::Literal(value) => Some(TrivialExpression::Immediate(value.clone())),
 
             // Binary operations with simple operators
-            Expr::Binary(left, op, right) => {
+            LogicalExpr::BinaryExpr { left, op, right } => {
                 // Only support simple arithmetic operators
                 match op {
                     Operator::Add | Operator::Subtract | Operator::Multiply | Operator::Divide => {
                         // Both operands must be trivial
-                        let left_trivial = Self::try_get_trivial_expr(left, input_column_names)?;
-                        let right_trivial = Self::try_get_trivial_expr(right, input_column_names)?;
+                        let left_trivial = Self::try_get_trivial_expr(left, input_schema)?;
+                        let right_trivial = Self::try_get_trivial_expr(right, input_schema)?;
 
                         // Check if we can determine types statically
                         // For arithmetic operations, we allow mixing integers and floats
@@ -271,10 +187,7 @@ impl CompiledExpression {
                 }
             }
 
-            // Parenthesized expressions with single element
-            Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-                Self::try_get_trivial_expr(&exprs[0], input_column_names)
-            }
+            LogicalExpr::Alias { expr, .. } => Self::try_get_trivial_expr(expr, input_schema),
 
             _ => None,
         }
@@ -285,16 +198,16 @@ impl CompiledExpression {
     /// For trivial expressions (columns, immediates, simple same-type arithmetic), uses inline evaluation.
     /// For complex expressions or those requiring type coercion, compiles to VDBE bytecode.
     pub fn compile(
-        expr: &Expr,
-        input_column_names: &[String],
+        expr: &LogicalExpr,
+        input_schema: &LogicalSchema,
         schema: &Schema,
         syms: &SymbolTable,
         connection: Arc<Connection>,
     ) -> Result<Self> {
-        let input_count = input_column_names.len();
+        let input_count = input_schema.column_count();
 
         // First, check if this is a trivial expression
-        if let Some(trivial) = Self::try_get_trivial_expr(expr, input_column_names) {
+        if let Some(trivial) = Self::try_get_trivial_expr(expr, input_schema) {
             return Ok(CompiledExpression {
                 executor: ExpressionExecutor::Trivial(trivial),
                 input_count,
@@ -307,8 +220,6 @@ impl CompiledExpression {
             ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 5, 0));
 
         // Allocate registers for input values
-        let input_count = input_column_names.len();
-
         // Allocate input registers
         for _ in 0..input_count {
             builder.alloc_register();
@@ -317,8 +228,29 @@ impl CompiledExpression {
         // Allocate a temp register for computation
         let temp_result_register = builder.alloc_register();
 
-        // Transform the expression to replace column references with Register expressions
-        let transformed_expr = transform_expr_for_dbsp(expr, input_column_names);
+        let plan_expr = Self::logical_to_plan_expr(expr, input_schema)?;
+        let mut bindings = PlanRuntimeBindings::default();
+        for (index, column) in input_schema.columns.iter().enumerate() {
+            bindings.bind_output(
+                PlanOutputId::new(index),
+                RuntimeOutputBinding {
+                    value: RuntimeValueBinding::Register {
+                        register: index,
+                        needs_decode: false,
+                    },
+                    fact: PlanOutputFact {
+                        type_fact: crate::translate::semantic::hir::TypeFact::known(column.ty),
+                        affinity: PlanExprAffinity {
+                            affinity: column.affinity,
+                            has_affinity: column.has_affinity,
+                        },
+                        collation: column.collation.clone(),
+                        array_dimensions: 0,
+                    },
+                    definition: RuntimeOutputDefinition::ExternalInput,
+                },
+            );
+        }
 
         // Create a resolver for translate_expr
         let database_schemas = RwLock::new(HashMap::default());
@@ -335,14 +267,15 @@ impl CompiledExpression {
             std::sync::Arc::new(crate::dialect::SqliteDialect),
         );
 
-        // Translate the transformed expression to bytecode
-        translate_expr(
-            &mut builder,
-            None, // No table references needed for pure expressions
-            &transformed_expr,
-            temp_result_register,
-            &resolver,
-        )?;
+        resolver.with_plan_runtime_bindings(bindings, |resolver| {
+            translate_plan_expr(
+                &mut builder,
+                None,
+                &plan_expr,
+                temp_result_register,
+                resolver,
+            )
+        })?;
 
         // Copy the result to register 0 for return
         builder.emit_insn(Insn::Copy {
@@ -366,6 +299,174 @@ impl CompiledExpression {
             executor: ExpressionExecutor::Compiled(program),
             input_count,
         })
+    }
+
+    fn logical_to_plan_expr(expr: &LogicalExpr, schema: &LogicalSchema) -> Result<PlanExpr> {
+        match expr {
+            LogicalExpr::Column(column) => {
+                let (index, _) = schema.find_column_id(column.id).ok_or_else(|| {
+                    crate::LimboError::InternalError(format!(
+                        "logical column {:?} is absent from the expression input",
+                        column.id
+                    ))
+                })?;
+                Ok(PlanExpr::Output(PlanOutputId::new(index)))
+            }
+            LogicalExpr::Literal(value) => Ok(PlanExpr::Literal(Self::value_literal(value))),
+            LogicalExpr::BinaryExpr { left, op, right } => Ok(PlanExpr::Binary {
+                lhs: Box::new(Self::logical_to_plan_expr(left, schema)?),
+                operator: *op,
+                rhs: Box::new(Self::logical_to_plan_expr(right, schema)?),
+                custom: None,
+            }),
+            LogicalExpr::UnaryExpr { op, expr } => Ok(PlanExpr::Unary {
+                operator: *op,
+                expr: Box::new(Self::logical_to_plan_expr(expr, schema)?),
+            }),
+            LogicalExpr::ScalarFunction {
+                function,
+                args,
+                result_type,
+            } => Ok(PlanExpr::Function(PlanFunctionCall {
+                function: function.clone(),
+                arguments: args
+                    .iter()
+                    .map(|arg| Self::logical_to_plan_expr(arg, schema))
+                    .collect::<Result<Vec<_>>>()?,
+                star: false,
+                distinctness: None,
+                argument_order: Vec::new(),
+                within_group: Vec::new(),
+                filter: None,
+                window: None,
+                custom_type_operation: None,
+                sequence_operation: None,
+                result_type: crate::translate::semantic::hir::TypeFact::known(*result_type),
+            })),
+            LogicalExpr::Case {
+                expr,
+                when_then,
+                else_expr,
+            } => Ok(PlanExpr::Case {
+                base: expr
+                    .as_ref()
+                    .map(|expr| Self::logical_to_plan_expr(expr, schema).map(Box::new))
+                    .transpose()?,
+                when_then: when_then
+                    .iter()
+                    .map(|(when, then)| {
+                        Ok((
+                            Self::logical_to_plan_expr(when, schema)?,
+                            Self::logical_to_plan_expr(then, schema)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                else_expr: else_expr
+                    .as_ref()
+                    .map(|expr| Self::logical_to_plan_expr(expr, schema).map(Box::new))
+                    .transpose()?,
+            }),
+            LogicalExpr::InList {
+                expr,
+                list,
+                negated,
+            } => Ok(PlanExpr::InList {
+                lhs: Box::new(Self::logical_to_plan_expr(expr, schema)?),
+                negated: *negated,
+                values: list
+                    .iter()
+                    .map(|value| Self::logical_to_plan_expr(value, schema))
+                    .collect::<Result<Vec<_>>>()?,
+            }),
+            LogicalExpr::Alias { expr, .. } => Self::logical_to_plan_expr(expr, schema),
+            LogicalExpr::IsNull { expr, negated } => {
+                let expr = Box::new(Self::logical_to_plan_expr(expr, schema)?);
+                if *negated {
+                    Ok(PlanExpr::NotNull(expr))
+                } else {
+                    Ok(PlanExpr::IsNull(expr))
+                }
+            }
+            LogicalExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => Ok(PlanExpr::Between {
+                expr: Box::new(Self::logical_to_plan_expr(expr, schema)?),
+                negated: *negated,
+                start: Box::new(Self::logical_to_plan_expr(low, schema)?),
+                end: Box::new(Self::logical_to_plan_expr(high, schema)?),
+            }),
+            LogicalExpr::Like {
+                expr,
+                pattern,
+                escape,
+                negated,
+                operator,
+                function,
+                argument_count,
+            } => Ok(PlanExpr::Like {
+                lhs: Box::new(Self::logical_to_plan_expr(expr, schema)?),
+                negated: *negated,
+                operator: *operator,
+                function: function.clone(),
+                argument_count: *argument_count,
+                rhs: Box::new(Self::logical_to_plan_expr(pattern, schema)?),
+                escape: escape
+                    .as_ref()
+                    .map(|escape| Self::logical_to_plan_expr(escape, schema).map(Box::new))
+                    .transpose()?,
+            }),
+            LogicalExpr::Cast {
+                expr,
+                name,
+                parameters,
+                ty,
+            } => Ok(PlanExpr::Cast {
+                expr: Box::new(Self::logical_to_plan_expr(expr, schema)?),
+                target: PlanTypeName {
+                    name: name.clone(),
+                    parameters: parameters
+                        .iter()
+                        .map(|parameter| Self::logical_to_plan_expr(parameter, schema))
+                        .collect::<Result<Vec<_>>>()?,
+                    array_dimensions: 0,
+                    type_fact: crate::translate::semantic::hir::TypeFact::known(*ty),
+                    programs: PlanCastPrograms {
+                        encode: Vec::new(),
+                        domain: None,
+                        apply_builtin_affinity: true,
+                    },
+                },
+            }),
+            LogicalExpr::Collate { expr, collation } => Ok(PlanExpr::Collate {
+                expr: Box::new(Self::logical_to_plan_expr(expr, schema)?),
+                collation: collation.clone(),
+            }),
+            LogicalExpr::AggregateFunction { .. } => Err(crate::LimboError::InternalError(
+                "aggregate expression reached scalar expression compilation".to_string(),
+            )),
+            LogicalExpr::InSubquery { .. }
+            | LogicalExpr::Exists { .. }
+            | LogicalExpr::ScalarSubquery { .. } => Err(crate::LimboError::ParseError(
+                "subqueries are not supported in incremental expressions".to_string(),
+            )),
+        }
+    }
+
+    fn value_literal(value: &Value) -> Literal {
+        match value {
+            Value::Numeric(Numeric::Integer(value)) => Literal::Numeric(value.to_string()),
+            Value::Numeric(Numeric::Float(value)) => {
+                Literal::Numeric(f64::from(*value).to_string())
+            }
+            Value::Text(value) => {
+                Literal::String(format!("'{}'", value.as_str().replace('\'', "''")))
+            }
+            Value::Blob(value) => Literal::Blob(format!("X'{}'", hex::encode(value))),
+            Value::Null => Literal::Null,
+        }
     }
 
     /// Execute the compiled expression with the given input values

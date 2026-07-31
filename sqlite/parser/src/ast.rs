@@ -1,7 +1,7 @@
 pub mod check;
 pub mod fmt;
 
-use std::{num::NonZeroU32, sync::Arc};
+use std::num::NonZeroU32;
 
 use crate::lexer::is_quotable_keyword;
 use strum_macros::{EnumIter, EnumString};
@@ -359,88 +359,7 @@ pub enum Stmt {
     },
 }
 
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-/// Internal ID of a table reference.
-///
-/// Used by [Expr::Column] and [Expr::RowId] to refer to a table.
-/// E.g. in 'SELECT * FROM t UNION ALL SELECT * FROM t', there are two table references,
-/// so there are two TableInternalIds.
-///
-/// FIXME: rename this to TableReferenceId.
-pub struct TableInternalId(usize);
-
-impl TableInternalId {
-    /// used in generated columns to signify "the table that the column belongs to"
-    pub const SELF_TABLE: Self = Self(0);
-
-    pub const fn is_self_table(&self) -> bool {
-        self.0 == 0
-    }
-}
-
-impl Default for TableInternalId {
-    fn default() -> Self {
-        Self(1)
-    }
-}
-
-impl From<usize> for TableInternalId {
-    fn from(value: usize) -> Self {
-        Self(value)
-    }
-}
-
-impl std::ops::AddAssign<usize> for TableInternalId {
-    fn add_assign(&mut self, rhs: usize) {
-        self.0 += rhs;
-    }
-}
-
-impl From<TableInternalId> for usize {
-    fn from(value: TableInternalId) -> Self {
-        value.0
-    }
-}
-
-impl std::fmt::Display for TableInternalId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "t{}", self.0)
-    }
-}
-
 /// SQL expression
-/// Pre-resolved field/variant index for FieldAccess expressions.
-/// Populated during binding so that translation can emit instructions directly.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum FieldAccessResolution {
-    StructField { field_index: usize },
-    UnionVariant { tag_index: u8 },
-}
-
-/// Schema identities needed to emit a custom-type function call.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum CustomTypeFunctionResolution {
-    UnionValue {
-        tag_index: u8,
-        result_type: String,
-    },
-    UnionTag {
-        tag_names: Arc<[String]>,
-    },
-    UnionExtract {
-        tag_index: u8,
-        result_type: String,
-    },
-    StructExtract {
-        field_index: usize,
-        result_type: String,
-    },
-}
-
 // https://sqlite.org/syntax/expr.html
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -458,9 +377,6 @@ pub enum Expr {
     },
     /// binary expression
     Binary(Box<Expr>, Operator, Box<Expr>),
-    /// Register reference for DBSP expression compilation
-    /// This is not part of SQL syntax but used internally for incremental computation
-    Register(usize),
     /// `CASE` expression
     Case {
         /// operand
@@ -483,19 +399,12 @@ pub enum Expr {
     DoublyQualified(Name, Name, Name),
     /// `EXISTS` subquery
     Exists(Select),
-    /// Struct/union field access (produced by translator, not parser directly)
+    /// Struct/union field access
     FieldAccess {
         /// base expression (e.g., column reference)
         base: Box<Expr>,
         /// field or variant name
         field: Name,
-        /// pre-resolved field/variant index (populated during binding)
-        resolved: Option<FieldAccessResolution>,
-    },
-    /// Custom-type function call with schema identities recorded by binding.
-    BoundCustomTypeFunction {
-        call: Box<Expr>,
-        resolution: CustomTypeFunctionResolution,
     },
     /// call to a built-in function
     FunctionCall {
@@ -521,24 +430,6 @@ pub enum Expr {
     },
     /// Identifier
     Id(Name),
-    /// Column
-    Column {
-        /// the x in `x.y.z`. index of the db in catalog.
-        database: Option<usize>,
-        /// the y in `x.y.z`. index of the table in catalog.
-        table: TableInternalId,
-        /// the z in `x.y.z`. index of the column in the table.
-        column: usize,
-        /// is the column a rowid alias
-        is_rowid_alias: bool,
-    },
-    /// `ROWID`
-    RowId {
-        /// the x in `x.y.z`. index of the db in catalog.
-        database: Option<usize>,
-        /// the y in `x.y.z`. index of the table in catalog.
-        table: TableInternalId,
-    },
     /// `IN`
     InList {
         /// expression
@@ -601,24 +492,6 @@ pub enum Expr {
     Unary(UnaryOperator, Box<Expr>),
     /// Parameters
     Variable(Variable),
-    /// Subqueries from e.g. the WHERE clause are planned separately
-    /// and their results will be placed in registers or in an ephemeral index
-    /// pointed to by this type.
-    SubqueryResult {
-        /// Internal "opaque" identifier for the subquery. When the translator encounters
-        /// a [Expr::SubqueryResult], it needs to know which subquery in the corresponding
-        /// query plan it references.
-        subquery_id: TableInternalId,
-        /// Left-hand side expression for IN subqueries.
-        /// This property plus 'not_in' are only relevant for IN subqueries,
-        /// and the reason they are not included in the [SubqueryType] enum is so that
-        /// we don't have to clone this Box.
-        lhs: Option<Box<Expr>>,
-        /// Whether the IN subquery is a NOT IN subquery.
-        not_in: bool,
-        /// The type of subquery.
-        query_type: SubqueryType,
-    },
     /// `DEFAULT` keyword in INSERT VALUES
     Default,
     /// `ARRAY[expr, ...]` array literal
@@ -646,59 +519,19 @@ impl Default for Expr {
 pub struct Variable {
     pub index: NonZeroU32,
     pub name: Option<Box<str>>,
-    /// Type of the source column, if known (e.g. from trigger NEW/OLD rewrite).
-    pub col_type: Option<Box<str>>,
 }
 
 impl Variable {
     pub fn indexed(index: NonZeroU32) -> Self {
-        Self {
-            index,
-            name: None,
-            col_type: None,
-        }
-    }
-
-    pub fn indexed_typed(index: NonZeroU32, col_type: &str) -> Self {
-        Self {
-            index,
-            name: None,
-            col_type: if col_type.is_empty() {
-                None
-            } else {
-                Some(col_type.into())
-            },
-        }
+        Self { index, name: None }
     }
 
     pub fn named(name: impl Into<Box<str>>, index: NonZeroU32) -> Self {
         Self {
             index,
             name: Some(name.into()),
-            col_type: None,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum SubqueryType {
-    /// EXISTS subquery; result is stored in a single register.
-    Exists { result_reg: usize },
-    /// Row value subquery; result is stored in a range of registers.
-    /// Example: x = (SELECT ...) or (x, y) = (SELECT ...)
-    RowValue {
-        result_reg_start: usize,
-        num_regs: usize,
-    },
-    /// IN subquery; result is stored in an ephemeral index.
-    /// Example: x <NOT> IN (SELECT ...)
-    In {
-        cursor_id: usize,
-        /// Affinity string used by the IN operator probe and ephemeral materialization.
-        /// Mirrors SQLite's exprINAffinity behavior.
-        affinity_str: Arc<String>,
-    },
 }
 
 impl Expr {

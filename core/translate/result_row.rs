@@ -13,10 +13,11 @@ use turso_parser::ast;
 use super::{
     emitter::{LimitCtx, Resolver},
     expr::{
-        emit_array_decode, expr_is_array, translate_expr, translate_expr_no_constant_opt,
-        walk_expr, NoConstantOptReason, WalkControl,
+        emit_plan_result_array_decode, translate_plan_expr, translate_plan_expr_no_constant_opt,
+        NoConstantOptReason,
     },
     plan::{Distinctness, QueryDestination, ResultSetColumn, SelectPlan, TableReferences},
+    plan_expr::{walk_plan_expr, PlanExpr, PlanWalkControl},
 };
 
 /// Emits the bytecode for:
@@ -59,17 +60,17 @@ pub fn emit_select_result(
     // result column registers. If constants are moved to the init section, they can be
     // overwritten by subsequent subselects before being used.
     //
-    // We conservatively disable constant optimization for EphemeralIndex, CoroutineYield,
-    // and EphemeralTable destinations because these are used in compound select contexts
-    // and CTE materialization. This is slightly over-broad (e.g., simple INSERT INTO ...
-    // SELECT with no UNION doesn't need this), but we lack context here to distinguish
-    // compound vs non-compound cases.
+    // We conservatively disable constant optimization for destinations used by compound
+    // selects and CTE materialization. This is slightly over-broad (e.g., a simple scalar
+    // subquery does not share its output range), but we lack context here to distinguish
+    // compound from non-compound emission.
     let disable_constant_opt = matches!(
         plan.query_destination,
         QueryDestination::EphemeralIndex { .. }
             | QueryDestination::CoroutineYield { .. }
             | QueryDestination::EphemeralTable { .. }
             | QueryDestination::RecursiveCteQueue { .. }
+            | QueryDestination::RowValueSubqueryResult { .. }
     );
 
     if !skip_column_eval {
@@ -85,7 +86,7 @@ pub fn emit_select_result(
         }) {
             let reg = start_reg + i;
             if disable_constant_opt {
-                translate_expr_no_constant_opt(
+                translate_plan_expr_no_constant_opt(
                     program,
                     Some(&plan.table_references),
                     &rc.expr,
@@ -94,7 +95,7 @@ pub fn emit_select_result(
                     NoConstantOptReason::RegisterReuse,
                 )?;
             } else {
-                translate_expr(
+                translate_plan_expr(
                     program,
                     Some(&plan.table_references),
                     &rc.expr,
@@ -107,26 +108,13 @@ pub fn emit_select_result(
         // EXISTS optimization skips column evaluation, but parameters in those
         // expressions must still be registered for bind validation to succeed.
         for rc in plan.result_columns.iter() {
-            let _ = walk_expr(&rc.expr, &mut |e| {
-                if let ast::Expr::Variable(variable) = e {
-                    program.register_variable(variable);
+            walk_plan_expr(&rc.expr, &mut |expr| {
+                if let PlanExpr::Parameter(parameter) = expr {
+                    program.register_plan_parameter(parameter);
                 }
-                Ok(WalkControl::Continue)
-            });
+                Ok(PlanWalkControl::Continue)
+            })?;
         }
-    }
-
-    // Emit ArrayDecode for result columns that produce array blobs.
-    // Array values are stored as record-format blobs internally; decode
-    // them to JSON text for user-facing display.
-    if !skip_column_eval {
-        emit_array_decode_for_results(
-            program,
-            &plan.result_columns,
-            &plan.table_references,
-            start_reg,
-            resolver,
-        )?;
     }
 
     // Handle SELECT DISTINCT deduplication
@@ -142,7 +130,14 @@ pub fn emit_select_result(
         }
     }
 
-    emit_result_row_and_limit(program, plan, start_reg, limit_ctx, label_on_limit_reached)?;
+    emit_result_row_and_limit(
+        program,
+        resolver,
+        plan,
+        start_reg,
+        limit_ctx,
+        label_on_limit_reached,
+    )?;
     Ok(())
 }
 
@@ -463,21 +458,66 @@ pub fn emit_columns_to_destination(
     Ok(())
 }
 
+/// Send resolved result columns to their destination. Internal destinations
+/// keep array record blobs intact; only the API-facing ResultRow boundary
+/// converts them to their display representation.
+pub(crate) fn emit_result_columns_to_destination(
+    program: &mut ProgramBuilder,
+    destination: &QueryDestination,
+    start_reg: usize,
+    result_columns: &[ResultSetColumn],
+    table_references: &TableReferences,
+    resolver: &Resolver,
+) -> Result<()> {
+    if matches!(destination, QueryDestination::ResultRows)
+        && result_columns
+            .iter()
+            .any(|column| column.type_fact.is_array())
+    {
+        // Display conversion must not mutate the canonical row registers.
+        // Constant result expressions and DISTINCT reuse them on later loop
+        // iterations, where they must still contain record-format arrays.
+        let display_start_reg = program.alloc_registers(result_columns.len());
+        program.emit_insn(Insn::Copy {
+            src_reg: start_reg,
+            dst_reg: display_start_reg,
+            extra_amount: result_columns.len() - 1,
+        });
+        emit_array_decode_for_results(
+            program,
+            result_columns,
+            table_references,
+            display_start_reg,
+            resolver,
+        )?;
+        return emit_columns_to_destination(
+            program,
+            destination,
+            display_start_reg,
+            result_columns.len(),
+        );
+    }
+    emit_columns_to_destination(program, destination, start_reg, result_columns.len())
+}
+
 /// Emits the bytecode for:
 /// - result row (or if a subquery, yields to the parent query)
 /// - limit
 pub fn emit_result_row_and_limit(
     program: &mut ProgramBuilder,
+    resolver: &Resolver,
     plan: &SelectPlan,
     result_columns_start_reg: usize,
     limit_ctx: Option<LimitCtx>,
     label_on_limit_reached: Option<BranchOffset>,
 ) -> Result<()> {
-    emit_columns_to_destination(
+    emit_result_columns_to_destination(
         program,
         &plan.query_destination,
         result_columns_start_reg,
-        plan.result_columns.len(),
+        &plan.result_columns,
+        &plan.table_references,
+        resolver,
     )?;
 
     if plan.limit.is_some() {
@@ -507,7 +547,8 @@ pub fn emit_offset(program: &mut ProgramBuilder, jump_to: BranchOffset, reg_offs
 
 /// Emit ArrayDecode for result columns that produce array record blobs.
 /// Array values are stored as record-format blobs internally; this converts
-/// them to JSON text for user-facing display, just before ResultRow.
+/// them to PostgreSQL-style array text for user-facing display, just before
+/// ResultRow.
 pub(crate) fn emit_array_decode_for_results(
     program: &mut ProgramBuilder,
     result_columns: &[ResultSetColumn],
@@ -516,34 +557,21 @@ pub(crate) fn emit_array_decode_for_results(
     resolver: &Resolver,
 ) -> Result<()> {
     for (i, rc) in result_columns.iter().enumerate() {
-        // Check if this is a column reference to an array column
-        let array_col = if let ast::Expr::Column { table, column, .. } = &rc.expr {
-            table_references
-                .find_table_by_internal_id(*table)
-                .map(|(_, t)| t)
-                .and_then(|t| t.get_column_at(*column))
-                .filter(|col| col.is_array())
-        } else {
-            None
-        };
-
-        // Check if this expression produces an array (function call, || operator, etc.)
-        let is_array_expr = array_col.is_none() && expr_is_array(&rc.expr, Some(table_references));
-
-        if array_col.is_some() || is_array_expr {
+        if rc.type_fact.is_array() {
             let reg = start_reg + i;
             let skip = program.allocate_label();
             program.emit_insn(Insn::IsNull {
                 reg,
                 target_pc: skip,
             });
-
-            if let Some(col) = array_col {
-                emit_array_decode(program, reg, col, resolver)?;
-            } else {
-                program.emit_insn(Insn::ArrayDecode { reg });
-            }
-
+            emit_plan_result_array_decode(
+                program,
+                table_references,
+                &rc.expr,
+                &rc.type_fact,
+                reg,
+                resolver,
+            )?;
             program.preassign_label_to_next_insn(skip);
         }
     }

@@ -3,13 +3,11 @@ use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
-use turso_parser::ast::{self, SortOrder, TableInternalId};
+use turso_parser::ast::{self, SortOrder};
 
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
-use crate::translate::collate::CollationSeq;
-use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, ordered_materialized_key_columns, partial_index,
     partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
@@ -18,8 +16,11 @@ use crate::translate::optimizer::constraints::{
 use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
-    plan_has_outer_scope_dependency, HashJoinKey, HashJoinType, NonFromClauseSubquery,
-    SetOperation, SubqueryState, TableReferences, WhereTerm,
+    plan_has_outer_scope_dependency, HashJoinKey, HashJoinType, NonFromClauseSubquery, PlanIndex,
+    PlanIndexHint, SetOperation, SubqueryState, TableReferences, WhereTerm,
+};
+use crate::translate::plan_expr::{
+    plan_expr_vector_size, walk_plan_expr, PlanExpr, PlanSourceId, PlanWalkControl,
 };
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
@@ -87,7 +88,7 @@ pub enum AccessMethodParams {
         /// Typically this is backwards only if it helps satisfy an [OrderTarget].
         iter_dir: IterationDirection,
         /// The index that is being used, if any. For rowid based searches (and full table scans), this is None.
-        index: Option<Arc<Index>>,
+        index: Option<PlanIndex>,
         /// The constraint references that are being used, if any.
         /// An empty list of constraint refs means a scan (full table or index);
         /// a non-empty list means a search.
@@ -145,6 +146,9 @@ pub enum AccessMethodParams {
     IndexMethod {
         /// The fully constructed IndexMethodQuery operation to apply to this table.
         query: IndexMethodQuery,
+        /// Result expressions that become reads from the index-method cursor if
+        /// this candidate wins join enumeration.
+        result_column_rewrites: Vec<(usize, PlanExpr)>,
         /// Index in WHERE clause that was covered by this index method (if any).
         where_covered: Option<usize>,
     },
@@ -161,7 +165,7 @@ pub enum AccessMethodParams {
     },
     /// IN-list driven index seek.
     InSeek {
-        index: Option<Arc<Index>>,
+        index: Option<PlanIndex>,
         affinity: Affinity,
         where_term_idx: usize,
     },
@@ -171,7 +175,7 @@ pub enum AccessMethodParams {
 /// [`AccessMethod`].
 pub(super) struct ChosenBtreeCandidate {
     pub(super) iter_dir: IterationDirection,
-    pub(super) index: Option<Arc<Index>>,
+    pub(super) index: Option<PlanIndex>,
     pub(super) constraint_refs: Vec<RangeConstraintRef>,
     pub(super) base_row_count: RowCountEstimate,
     pub(super) cost: Cost,
@@ -179,7 +183,7 @@ pub(super) struct ChosenBtreeCandidate {
 
 #[derive(Debug, Clone)]
 pub(super) struct ChosenInSeekCandidate {
-    pub(super) index: Option<Arc<Index>>,
+    pub(super) index: Option<PlanIndex>,
     pub(super) affinity: Affinity,
     pub(super) constraint_idx: usize,
     pub(super) cost: Cost,
@@ -291,7 +295,6 @@ pub(super) fn choose_best_btree_candidate(
                     candidate.index.as_deref(),
                     &usable_constraint_refs,
                     &order_target.columns,
-                    schema,
                     EqualityPrefixScope::AnyEquality,
                 ) == order_target.columns.len();
                 let all_opposite_direction = btree_access_order_consumed(
@@ -300,7 +303,6 @@ pub(super) fn choose_best_btree_candidate(
                     candidate.index.as_deref(),
                     &usable_constraint_refs,
                     &order_target.columns,
-                    schema,
                     EqualityPrefixScope::AnyEquality,
                 ) == order_target.columns.len();
 
@@ -327,7 +329,7 @@ pub(super) fn choose_best_btree_candidate(
 
         let analyze_ctx = AnalyzeCtx {
             rhs_table,
-            index: candidate.index.as_ref(),
+            index: candidate.index.as_deref(),
             stats: analyze_stats,
         };
         // For partial indexes, the index physically contains only the rows whose
@@ -693,7 +695,7 @@ fn residual_literal_in_list_eval_cost(
         .filter(|constraint| {
             where_clause
                 .get(constraint.where_clause_pos.0)
-                .is_some_and(|term| matches!(term.expr, ast::Expr::InList { .. }))
+                .is_some_and(|term| matches!(term.expr, PlanExpr::InList { .. }))
         })
         .filter_map(|constraint| match constraint.operator {
             ConstraintOperator::In {
@@ -754,7 +756,6 @@ pub fn find_best_access_method_for_join_order(
             rhs_constraints,
             join_order,
             planning_context,
-            schema,
             input_cardinality,
             base_row_count,
             params,
@@ -839,7 +840,7 @@ fn find_best_access_method_for_btree(
         };
         let analyze_ctx = AnalyzeCtx {
             rhs_table,
-            index: best.index.as_ref(),
+            index: best.index.as_deref(),
             stats: analyze_stats,
         };
         estimate_rows_per_seek(
@@ -876,7 +877,9 @@ fn find_best_access_method_for_btree(
 
     // Skip alternative access methods (in-seek, multi-index) when INDEXED BY or NOT INDEXED
     // is specified — the user explicitly requested a specific index or no index.
-    if rhs_table.indexed.is_none() && rhs_table.btree().is_some_and(|b| b.has_rowid) {
+    if matches!(rhs_table.index_hint, PlanIndexHint::None)
+        && rhs_table.btree().is_some_and(|b| b.has_rowid)
+    {
         let in_seek_threshold = best_access_method.cost
             + residual_literal_in_list_eval_cost(
                 &rhs_constraints.constraints,
@@ -992,18 +995,28 @@ fn find_best_access_method_for_vtab(
 }
 
 /// Collect all table IDs referenced in an expression.
-fn collect_table_refs(expr: &ast::Expr) -> Option<Vec<TableInternalId>> {
+fn collect_table_refs(expr: &PlanExpr) -> Option<Vec<PlanSourceId>> {
     let mut tables = Vec::new();
-    let result = walk_expr(expr, &mut |e| {
+    let result = walk_plan_expr(expr, &mut |e| {
         match e {
-            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
-                if !tables.contains(table) {
-                    tables.push(*table);
+            PlanExpr::Column(column) => {
+                if !tables.contains(&column.source) {
+                    tables.push(column.source);
+                }
+            }
+            PlanExpr::MergedColumn(column) => {
+                if !tables.contains(&column.right.source) {
+                    tables.push(column.right.source);
+                }
+            }
+            PlanExpr::RowId(source) => {
+                if !tables.contains(source) {
+                    tables.push(*source);
                 }
             }
             _ => {}
         }
-        Ok(WalkControl::Continue)
+        Ok(PlanWalkControl::Continue)
     });
     result.ok().map(|_| tables)
 }
@@ -1023,9 +1036,10 @@ fn collect_table_refs(expr: &ast::Expr) -> Option<Vec<TableInternalId>> {
 /// This function does *not* mark any terms as consumed; the caller is responsible
 /// for doing so if a hash join is selected.
 pub fn find_equijoin_conditions(
-    build_table_id: TableInternalId,
-    probe_table_id: TableInternalId,
+    build_table_id: PlanSourceId,
+    probe_table_id: PlanSourceId,
     where_clause: &[WhereTerm],
+    subqueries: &[NonFromClauseSubquery],
 ) -> Vec<HashJoinKey> {
     let mut join_keys = Vec::new();
 
@@ -1034,10 +1048,22 @@ pub fn find_equijoin_conditions(
             continue;
         }
 
-        let Ok(Some((lhs, op, rhs))) = as_binary_components(&where_term.expr) else {
+        let PlanExpr::Binary {
+            lhs, operator, rhs, ..
+        } = &where_term.expr
+        else {
             continue;
         };
-        if !matches!(op.as_ast_operator(), Some(ast::Operator::Equals)) {
+        if *operator != ast::Operator::Equals {
+            continue;
+        }
+
+        // A HashJoinKey owns one build register and one probe register. Keep
+        // row comparisons as residual predicates until hash joins can model
+        // each row field as a separate key.
+        if plan_expr_vector_size(lhs, &subqueries).ok() != Some(1)
+            || plan_expr_vector_size(rhs, &subqueries).ok() != Some(1)
+        {
             continue;
         }
 
@@ -1077,16 +1103,16 @@ pub fn find_equijoin_conditions(
     join_keys
 }
 
-fn expr_uses_custom_collation(expr: &ast::Expr) -> bool {
+fn expr_uses_custom_collation(expr: &PlanExpr) -> bool {
     let mut uses_custom = false;
-    let _ = walk_expr(expr, &mut |expr| -> Result<WalkControl> {
-        if let ast::Expr::Collate(_, collation_name) = expr {
-            uses_custom = CollationSeq::known_custom(collation_name.as_str()).is_some();
+    let _ = walk_plan_expr(expr, &mut |expr| -> Result<PlanWalkControl> {
+        if let PlanExpr::Collate { collation, .. } = expr {
+            uses_custom = collation.value().is_custom();
             if uses_custom {
-                return Ok(WalkControl::SkipChildren);
+                return Ok(PlanWalkControl::SkipChildren);
             }
         }
-        Ok(WalkControl::Continue)
+        Ok(PlanWalkControl::Continue)
     });
     uses_custom
 }
@@ -1172,7 +1198,9 @@ pub fn try_hash_join_access_method(
     // Explicit INDEXED BY / NOT INDEXED directives must be honored. A hash join
     // bypasses the normal access-path selection for the build/probe pair, so it
     // would ignore the user's requested scan shape.
-    if build_table.indexed.is_some() || probe_table.indexed.is_some() {
+    if !matches!(build_table.index_hint, PlanIndexHint::None)
+        || !matches!(probe_table.index_hint, PlanIndexHint::None)
+    {
         return None;
     }
     // No hash join for semi/anti-joins (nested loop with index seek is preferred).
@@ -1251,6 +1279,7 @@ pub fn try_hash_join_access_method(
         build_table.internal_id,
         probe_table.internal_id,
         where_clause,
+        subqueries,
     )
     .into_iter()
     .filter(|join_key| {
@@ -1381,11 +1410,11 @@ pub fn try_hash_join_access_method(
 
 /// Returns true when the expression is a simple column/rowid reference to the table.
 /// Used to decide if an index seek could replace a hash join.
-fn expr_is_simple_column_from_table(expr: &ast::Expr, table_id: TableInternalId) -> bool {
+fn expr_is_simple_column_from_table(expr: &PlanExpr, table_id: PlanSourceId) -> bool {
     matches!(
         expr,
-        ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } if *table == table_id
-    )
+        PlanExpr::Column(column) if column.source == table_id
+    ) || matches!(expr, PlanExpr::RowId(source) if *source == table_id)
 }
 
 /// Check whether a subquery's intrinsic row order (from its ORDER BY or
@@ -1400,7 +1429,6 @@ fn intrinsic_subquery_scan_direction(
     subquery: &FromClauseSubquery,
     maybe_order_target: Option<&OrderTarget>,
     table_materialization_required: bool,
-    schema: &Schema,
 ) -> Option<IterationDirection> {
     let order_target = maybe_order_target?;
     let cols = &order_target.columns;
@@ -1410,7 +1438,6 @@ fn intrinsic_subquery_scan_direction(
         subquery,
         IterationDirection::Forwards,
         cols,
-        schema,
     ) == cols.len();
     if matches_forwards {
         return Some(IterationDirection::Forwards);
@@ -1422,7 +1449,6 @@ fn intrinsic_subquery_scan_direction(
             subquery,
             IterationDirection::Backwards,
             cols,
-            schema,
         ) == cols.len();
     matches_backwards.then_some(IterationDirection::Backwards)
 }
@@ -1440,7 +1466,6 @@ fn find_best_access_method_for_subquery(
     rhs_constraints: &TableConstraints,
     join_order: &[JoinOrderMember],
     planning_context: JoinPlanningContext<'_>,
-    schema: &Schema,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
@@ -1541,7 +1566,6 @@ fn find_best_access_method_for_subquery(
             subquery,
             maybe_order_target,
             table_materialization_required,
-            schema,
         ) {
             return Ok(Some(AccessMethod {
                 cost: scan_cost,
@@ -1636,7 +1660,6 @@ fn find_best_access_method_for_subquery(
             &ephemeral_index,
             &usable_constraint_refs,
             maybe_order_target,
-            schema,
             base_row_count,
             params,
         );
@@ -1778,7 +1801,6 @@ fn materialized_subquery_order_properties(
     index: &Arc<Index>,
     constraint_refs: &[RangeConstraintRef],
     maybe_order_target: Option<&OrderTarget>,
-    schema: &Schema,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
 ) -> (IterationDirection, bool, Cost) {
@@ -1794,7 +1816,6 @@ fn materialized_subquery_order_properties(
         Some(index.as_ref()),
         constraint_refs,
         &order_target.columns,
-        schema,
         EqualityPrefixScope::AnyEquality,
     ) == order_target.columns.len();
     let all_opposite_direction = btree_access_order_consumed(
@@ -1803,7 +1824,6 @@ fn materialized_subquery_order_properties(
         Some(index.as_ref()),
         constraint_refs,
         &order_target.columns,
-        schema,
         EqualityPrefixScope::AnyEquality,
     ) == order_target.columns.len();
 

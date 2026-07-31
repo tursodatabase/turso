@@ -449,18 +449,12 @@ pub(super) fn explicit_collation(
 pub(super) fn comparison_collation(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
-    referenced_tables: Option<&TableReferences>,
+    _referenced_tables: Option<&TableReferences>,
     resolver: Option<&Resolver>,
 ) -> Result<Option<CollationSeq>> {
-    if let Some(tables) = referenced_tables {
-        let symbol_table = resolver.map(|resolver| resolver.symbol_table);
-        let lhs_collation = get_collseq_from_expr_with_symbols(lhs_expr, tables, symbol_table)?;
-        if lhs_collation.is_some() {
-            return Ok(lhs_collation);
-        }
-        return get_collseq_from_expr_with_symbols(rhs_expr, tables, symbol_table);
-    }
-
+    // This is the legacy syntax emitter. Resolved column and subquery
+    // collations belong to PlanExpr; the parser tree only owns explicit
+    // COLLATE clauses.
     let lhs_collation = explicit_collation(lhs_expr, resolver)?;
     if lhs_collation.is_some() {
         return Ok(lhs_collation);
@@ -787,17 +781,6 @@ pub(super) fn emit_binary_insn(
 /// Check if an expression is known to produce an array value.
 pub(crate) fn expr_is_array(expr: &Expr, referenced_tables: Option<&TableReferences>) -> bool {
     match expr {
-        Expr::Column { table, column, .. } => {
-            if let Some(tables) = referenced_tables {
-                tables
-                    .find_table_by_internal_id(*table)
-                    .map(|(_, t)| t)
-                    .and_then(|t| t.get_column_at(*column))
-                    .is_some_and(|col| col.is_array())
-            } else {
-                false
-            }
-        }
         Expr::FunctionCall { name, args, .. } => {
             if let Ok(Some(f)) = Func::resolve_function(name.as_str(), args.len()) {
                 match &f {
@@ -859,12 +842,6 @@ pub(crate) fn expr_is_array(expr: &Expr, referenced_tables: Option<&TableReferen
 /// Return the number of array dimensions for an expression, or 0 for non-array.
 pub(super) fn expr_array_dimensions(expr: &Expr, tables: &TableReferences) -> u32 {
     match expr {
-        Expr::Column { table, column, .. } => tables
-            .find_table_by_internal_id(*table)
-            .map(|(_, t)| t)
-            .and_then(|t| t.get_column_at(*column))
-            .map(|col| col.array_dimensions())
-            .unwrap_or(0),
         Expr::FunctionCall { name, args, .. }
             if name.as_str().eq_ignore_ascii_case("array_element") =>
         {

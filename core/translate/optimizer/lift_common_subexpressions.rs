@@ -1,9 +1,11 @@
 use crate::{turso_assert, turso_assert_greater_than};
-use turso_parser::ast::{Expr, Operator};
+use turso_parser::ast::Operator;
 
 use crate::{
-    translate::{expr::unwrap_parens_owned, plan::WhereTerm},
-    util::exprs_are_equivalent,
+    translate::{
+        plan::WhereTerm,
+        plan_expr::{plan_exprs_are_equivalent, PlanExpr as Expr},
+    },
     Result,
 };
 /// Lifts shared conjuncts (ANDs) from sibling OR terms.
@@ -34,7 +36,13 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
 ) -> Result<()> {
     let mut i = 0;
     while i < where_clause.len() {
-        if !matches!(where_clause[i].expr, Expr::Binary(_, Operator::Or, _)) {
+        if !matches!(
+            where_clause[i].expr,
+            Expr::Binary {
+                operator: Operator::Or,
+                ..
+            }
+        ) {
             // Not an OR term, skip.
             i += 1;
             continue;
@@ -50,29 +58,25 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
         // Each OR operand is potentially an AND chain, e.g.
         // (a AND b) OR (c AND d).
         // Flatten them.
-        // It's safe to remove parentheses with `unwrap_parens_owned` because
-        // we will add them back once we reconstruct the OR term's child expressions.
-        // e.g. (a AND b) OR (c AND d) becomes effectively AND [[a,b], [c,d]].
-        let all_or_operands_conjunct_lists: Vec<(Vec<Expr>, usize)> = or_operands
+        // Parentheses do not survive semantic lowering, so each operand can be
+        // flattened directly.
+        let all_or_operands_conjunct_lists: Vec<Vec<Expr>> = or_operands
             .into_iter()
-            .map(|expr| {
-                let (expr, paren_count) = unwrap_parens_owned(expr)?;
-                Ok((flatten_and_expr_owned(expr)?, paren_count))
-            })
+            .map(flatten_and_expr_owned)
             .collect::<Result<Vec<_>>>()?;
 
         // Find common conjuncts across all OR branches.
         // Initialize with conjuncts from the first OR branch.
         // We clone because `common_conjuncts_accumulator` will be modified.
-        let mut common_conjuncts_accumulator = all_or_operands_conjunct_lists[0].0.clone();
+        let mut common_conjuncts_accumulator = all_or_operands_conjunct_lists[0].clone();
 
-        for (other_conjunct_list, _) in all_or_operands_conjunct_lists.iter().skip(1) {
+        for other_conjunct_list in all_or_operands_conjunct_lists.iter().skip(1) {
             // Retain only those expressions in `common_conjuncts_accumulator`
             // that are also present in `other_conjunct_list`.
             common_conjuncts_accumulator.retain(|common_expr| {
                 other_conjunct_list
                     .iter()
-                    .any(|expr| exprs_are_equivalent(common_expr, expr))
+                    .any(|expr| plan_exprs_are_equivalent(common_expr, expr))
             });
         }
 
@@ -86,12 +90,13 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
         // E.g. (a AND b) OR (a AND c) -> (b OR c) AND a.
         let mut new_or_operands_for_original_term = Vec::new();
         let mut found_non_empty_or_branches = false;
-        for (mut conjunct_list_for_or_branch, mut num_unwrapped_parens) in
-            all_or_operands_conjunct_lists.into_iter()
-        {
+        for mut conjunct_list_for_or_branch in all_or_operands_conjunct_lists {
             // Remove the common conjuncts from this specific OR branch's list of conjuncts.
-            conjunct_list_for_or_branch
-                .retain(|expr_in_list| !common_conjuncts_accumulator.contains(expr_in_list));
+            conjunct_list_for_or_branch.retain(|expr_in_list| {
+                !common_conjuncts_accumulator
+                    .iter()
+                    .any(|common| plan_exprs_are_equivalent(common, expr_in_list))
+            });
 
             if conjunct_list_for_or_branch.is_empty() {
                 // If any of the OR branches are empty, we can remove the entire OR term.
@@ -101,13 +106,8 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
             }
 
             // Rebuild this OR branch from its remaining (non-common) conjuncts.
-            // If we unwrapped parentheses before, let's add them back.
-            let mut top_level_expr = rebuild_and_expr_from_list(conjunct_list_for_or_branch);
-            while num_unwrapped_parens > 0 {
-                top_level_expr = Expr::Parenthesized(vec![top_level_expr.into()]);
-                num_unwrapped_parens -= 1;
-            }
-            new_or_operands_for_original_term.push(top_level_expr);
+            new_or_operands_for_original_term
+                .push(rebuild_and_expr_from_list(conjunct_list_for_or_branch));
         }
 
         if found_non_empty_or_branches {
@@ -135,9 +135,15 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
     Ok(())
 }
 
-/// Flatten an ast::Expr::Binary(lhs, OR, rhs) into a list of disjuncts.
+/// Flatten a binary OR into a list of disjuncts.
 fn flatten_or_expr_owned(expr: Expr) -> Result<Vec<Expr>> {
-    let Expr::Binary(lhs, Operator::Or, rhs) = expr else {
+    let Expr::Binary {
+        lhs,
+        operator: Operator::Or,
+        rhs,
+        ..
+    } = expr
+    else {
         return Ok(vec![expr]);
     };
     let mut flattened = flatten_or_expr_owned(*lhs)?;
@@ -145,9 +151,15 @@ fn flatten_or_expr_owned(expr: Expr) -> Result<Vec<Expr>> {
     Ok(flattened)
 }
 
-/// Flatten an ast::Expr::Binary(lhs, AND, rhs) into a list of conjuncts.
+/// Flatten a binary AND into a list of conjuncts.
 fn flatten_and_expr_owned(expr: Expr) -> Result<Vec<Expr>> {
-    let Expr::Binary(lhs, Operator::And, rhs) = expr else {
+    let Expr::Binary {
+        lhs,
+        operator: Operator::And,
+        rhs,
+        ..
+    } = expr
+    else {
         return Ok(vec![expr]);
     };
     let mut flattened = flatten_and_expr_owned(*lhs)?;
@@ -155,7 +167,7 @@ fn flatten_and_expr_owned(expr: Expr) -> Result<Vec<Expr>> {
     Ok(flattened)
 }
 
-/// Rebuild an ast::Expr::Binary(lhs, AND, rhs) for a list of conjuncts.
+/// Rebuild a binary AND for a list of conjuncts.
 fn rebuild_and_expr_from_list(mut conjuncts: Vec<Expr>) -> Expr {
     turso_assert!(!conjuncts.is_empty());
 
@@ -165,12 +177,12 @@ fn rebuild_and_expr_from_list(mut conjuncts: Vec<Expr>) -> Expr {
 
     let mut current_expr = conjuncts.remove(0);
     for next_expr in conjuncts {
-        current_expr = Expr::Binary(Box::new(current_expr), Operator::And, Box::new(next_expr));
+        current_expr = Expr::binary(current_expr, Operator::And, next_expr);
     }
     current_expr
 }
 
-/// Rebuild an ast::Expr::Binary(lhs, OR, rhs) for a list of operands.
+/// Rebuild a binary OR for a list of operands.
 fn rebuild_or_expr_from_list(mut operands: Vec<Expr>) -> Expr {
     turso_assert!(!operands.is_empty());
 
@@ -180,7 +192,7 @@ fn rebuild_or_expr_from_list(mut operands: Vec<Expr>) -> Expr {
 
     let mut current_expr = operands.remove(0);
     for next_expr in operands {
-        current_expr = Expr::Binary(Box::new(current_expr), Operator::Or, Box::new(next_expr));
+        current_expr = Expr::binary(current_expr, Operator::Or, next_expr);
     }
     current_expr
 }
@@ -188,427 +200,170 @@ fn rebuild_or_expr_from_list(mut operands: Vec<Expr>) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translate::plan::WhereTerm;
-    use turso_parser::ast::{self, Expr, Literal, Operator, TableInternalId};
+    use crate::translate::{
+        plan::WhereTerm,
+        plan_expr::{PlanExpr, PlanSourceId},
+    };
+    use turso_parser::ast::{Literal, Operator};
+
+    fn equals(column: usize) -> PlanExpr {
+        PlanExpr::binary(
+            PlanExpr::column(PlanSourceId::new(0), column),
+            Operator::Equals,
+            PlanExpr::literal(Literal::Numeric("1".to_string())),
+        )
+    }
+
+    fn and(expressions: Vec<PlanExpr>) -> PlanExpr {
+        rebuild_and_expr_from_list(expressions)
+    }
+
+    fn or(expressions: Vec<PlanExpr>) -> PlanExpr {
+        rebuild_or_expr_from_list(expressions)
+    }
+
+    fn assert_expr_eq(actual: &PlanExpr, expected: &PlanExpr) {
+        assert!(plan_exprs_are_equivalent(actual, expected));
+    }
 
     #[test]
-    fn test_lift_common_subexpressions() -> Result<()> {
-        // SELECT * FROM t WHERE (a = 1 and x = 1 and b = 1) OR (a = 1 and y = 1 and b = 1)
-        // should be rewritten to:
-        // SELECT * FROM t WHERE (x = 1 OR y = 1) and a = 1 and b = 1
-
-        // assume the table has 4 columns: a, b, x, y
-        let a_expr = Expr::Binary(
-            Box::new(Expr::Column {
-                database: None,
-                table: TableInternalId::default(),
-                column: 0,
-                is_rowid_alias: false,
-            }),
-            Operator::Equals,
-            Box::new(Expr::Literal(Literal::Numeric("1".to_string()))),
-        );
-
-        let b_expr = Expr::Binary(
-            Box::new(Expr::Column {
-                database: None,
-                table: TableInternalId::default(),
-                column: 1,
-                is_rowid_alias: false,
-            }),
-            Operator::Equals,
-            Box::new(Expr::Literal(Literal::Numeric("1".to_string()))),
-        );
-
-        let x_expr = Expr::Binary(
-            Box::new(Expr::Column {
-                database: None,
-                table: TableInternalId::default(),
-                column: 2,
-                is_rowid_alias: false,
-            }),
-            Operator::Equals,
-            Box::new(Expr::Literal(Literal::Numeric("1".to_string()))),
-        );
-
-        let y_expr = Expr::Binary(
-            Box::new(Expr::Column {
-                database: None,
-                table: TableInternalId::default(),
-                column: 3,
-                is_rowid_alias: false,
-            }),
-            Operator::Equals,
-            Box::new(Expr::Literal(Literal::Numeric("1".to_string()))),
-        );
-
-        // Create (a = 1 AND x = 1 AND b = 1) OR (a = 1 AND y = 1 AND b = 1)
-        let or_expr = Expr::Binary(
-            Box::new(ast::Expr::Parenthesized(vec![rebuild_and_expr_from_list(
-                vec![a_expr.clone(), x_expr.clone(), b_expr.clone()],
-            )
-            .into()])),
-            Operator::Or,
-            Box::new(ast::Expr::Parenthesized(vec![rebuild_and_expr_from_list(
-                vec![a_expr.clone(), y_expr.clone(), b_expr.clone()],
-            )
-            .into()])),
-        );
-
+    fn lifts_two_common_conjuncts() -> Result<()> {
+        let a = equals(0);
+        let b = equals(1);
+        let x = equals(2);
+        let y = equals(3);
         let mut where_clause = vec![WhereTerm {
-            expr: or_expr,
+            expr: or(vec![
+                and(vec![a.clone(), x.clone(), b.clone()]),
+                and(vec![a.clone(), y.clone(), b.clone()]),
+            ]),
             from_outer_join: None,
             consumed: false,
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
 
-        // Should now have 3 terms:
-        // 1. (x = 1) OR (y = 1)
-        // 2. a = 1
-        // 3. b = 1
-        let nonconsumed_terms = where_clause
+        let terms = where_clause
             .iter()
             .filter(|term| !term.consumed)
             .collect::<Vec<_>>();
-        assert_eq!(nonconsumed_terms.len(), 3);
-        assert_eq!(
-            nonconsumed_terms[0].expr,
-            Expr::Binary(
-                Box::new(ast::Expr::Parenthesized(vec![x_expr.into()])),
-                Operator::Or,
-                Box::new(ast::Expr::Parenthesized(vec![y_expr.into()]))
-            )
-        );
-        assert_eq!(nonconsumed_terms[1].expr, a_expr);
-        assert_eq!(nonconsumed_terms[2].expr, b_expr);
-
+        assert_eq!(terms.len(), 3);
+        assert_expr_eq(&terms[0].expr, &or(vec![x, y]));
+        assert_expr_eq(&terms[1].expr, &a);
+        assert_expr_eq(&terms[2].expr, &b);
         Ok(())
     }
 
     #[test]
-    fn test_lift_common_subexpressions_three_branches() -> Result<()> {
-        // Test case with three OR branches and one common term:
-        // (a = 1 AND x = 1) OR (a = 1 AND y = 1) OR (a = 1 AND z = 1)
-        // Should become:
-        // (x = 1 OR y = 1 OR z = 1) AND a = 1
-
-        let a_expr = Expr::Binary(
-            Box::new(Expr::Column {
-                database: None,
-                table: TableInternalId::default(),
-                column: 0,
-                is_rowid_alias: false,
-            }),
-            Operator::Equals,
-            Box::new(Expr::Literal(Literal::Numeric("1".to_string()))),
-        );
-
-        let x_expr = Expr::Binary(
-            Box::new(Expr::Column {
-                database: None,
-                table: TableInternalId::default(),
-                column: 1,
-                is_rowid_alias: false,
-            }),
-            Operator::Equals,
-            Box::new(Expr::Literal(Literal::Numeric("1".to_string()))),
-        );
-
-        let y_expr = Expr::Binary(
-            Box::new(Expr::Column {
-                database: None,
-                table: TableInternalId::default(),
-                column: 2,
-                is_rowid_alias: false,
-            }),
-            Operator::Equals,
-            Box::new(Expr::Literal(Literal::Numeric("1".to_string()))),
-        );
-
-        let z_expr = Expr::Binary(
-            Box::new(Expr::Column {
-                database: None,
-                table: TableInternalId::default(),
-                column: 3,
-                is_rowid_alias: false,
-            }),
-            Operator::Equals,
-            Box::new(Expr::Literal(Literal::Numeric("1".to_string()))),
-        );
-
-        // Create (a = 1 AND x = 1) OR (a = 1 AND y = 1) OR (a = 1 AND z = 1)
-        let or_expr = Expr::Binary(
-            Box::new(Expr::Binary(
-                Box::new(ast::Expr::Parenthesized(vec![rebuild_and_expr_from_list(
-                    vec![a_expr.clone(), x_expr.clone()],
-                )
-                .into()])),
-                Operator::Or,
-                Box::new(ast::Expr::Parenthesized(vec![rebuild_and_expr_from_list(
-                    vec![a_expr.clone(), y_expr.clone()],
-                )
-                .into()])),
-            )),
-            Operator::Or,
-            Box::new(ast::Expr::Parenthesized(vec![rebuild_and_expr_from_list(
-                vec![a_expr.clone(), z_expr.clone()],
-            )
-            .into()])),
-        );
-
+    fn lifts_common_conjunct_across_three_branches() -> Result<()> {
+        let a = equals(0);
+        let x = equals(1);
+        let y = equals(2);
+        let z = equals(3);
         let mut where_clause = vec![WhereTerm {
-            expr: or_expr,
+            expr: or(vec![
+                and(vec![a.clone(), x.clone()]),
+                and(vec![a.clone(), y.clone()]),
+                and(vec![a.clone(), z.clone()]),
+            ]),
             from_outer_join: None,
             consumed: false,
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
 
-        // Should now have 2 terms:
-        // 1. (x = 1) OR (y = 1) OR (z = 1)
-        // 2. a = 1
-        let nonconsumed_terms = where_clause
+        let terms = where_clause
             .iter()
             .filter(|term| !term.consumed)
             .collect::<Vec<_>>();
-        assert_eq!(nonconsumed_terms.len(), 2);
-        assert_eq!(
-            nonconsumed_terms[0].expr,
-            Expr::Binary(
-                Box::new(Expr::Binary(
-                    Box::new(ast::Expr::Parenthesized(vec![x_expr.into()])),
-                    Operator::Or,
-                    Box::new(ast::Expr::Parenthesized(vec![y_expr.into()])),
-                )),
-                Operator::Or,
-                Box::new(ast::Expr::Parenthesized(vec![z_expr.into()])),
-            )
-        );
-        assert_eq!(nonconsumed_terms[1].expr, a_expr);
-
+        assert_eq!(terms.len(), 2);
+        assert_expr_eq(&terms[0].expr, &or(vec![x, y, z]));
+        assert_expr_eq(&terms[1].expr, &a);
         Ok(())
     }
 
     #[test]
-    fn test_lift_common_subexpressions_no_common_terms() -> Result<()> {
-        // Test case where there are no common terms between OR branches:
-        // SELECT * FROM t WHERE (x = 1) OR (y = 1)
-        // should remain unchanged.
-
-        let x_expr = Expr::Binary(
-            Box::new(Expr::Column {
-                database: None,
-                table: TableInternalId::default(),
-                column: 0,
-                is_rowid_alias: false,
-            }),
-            Operator::Equals,
-            Box::new(Expr::Literal(Literal::Numeric("1".to_string()))),
-        );
-
-        let y_expr = Expr::Binary(
-            Box::new(Expr::Column {
-                database: None,
-                table: TableInternalId::default(),
-                column: 1,
-                is_rowid_alias: false,
-            }),
-            Operator::Equals,
-            Box::new(Expr::Literal(Literal::Numeric("1".to_string()))),
-        );
-
-        let or_expr = Expr::Binary(
-            Box::new(ast::Expr::Parenthesized(vec![x_expr.into()])),
-            Operator::Or,
-            Box::new(ast::Expr::Parenthesized(vec![y_expr.into()])),
-        );
-
+    fn leaves_disjoint_branches_unchanged() -> Result<()> {
+        let original = or(vec![equals(0), equals(1)]);
         let mut where_clause = vec![WhereTerm {
-            expr: or_expr.clone(),
+            expr: original.clone(),
             from_outer_join: None,
             consumed: false,
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
 
-        // Should remain unchanged since no common terms
-        let nonconsumed_terms = where_clause
-            .iter()
-            .filter(|term| !term.consumed)
-            .collect::<Vec<_>>();
-        assert_eq!(nonconsumed_terms.len(), 1);
-        assert_eq!(nonconsumed_terms[0].expr, or_expr);
-
+        assert_eq!(where_clause.len(), 1);
+        assert!(!where_clause[0].consumed);
+        assert_expr_eq(&where_clause[0].expr, &original);
         Ok(())
     }
 
     #[test]
-    fn test_lift_common_subexpressions_from_outer_join() -> Result<()> {
-        // Test case with from_outer_join flag set;
-        // it should be retained in the new WhereTerms, for outer join correctness.
-
-        let a_expr = Expr::Binary(
-            Box::new(Expr::Column {
-                database: None,
-                table: TableInternalId::default(),
-                column: 0,
-                is_rowid_alias: false,
-            }),
-            Operator::Equals,
-            Box::new(Expr::Literal(Literal::Numeric("1".to_string()))),
-        );
-
-        let x_expr = Expr::Binary(
-            Box::new(Expr::Column {
-                database: None,
-                table: TableInternalId::default(),
-                column: 1,
-                is_rowid_alias: false,
-            }),
-            Operator::Equals,
-            Box::new(Expr::Literal(Literal::Numeric("1".to_string()))),
-        );
-
-        let y_expr = Expr::Binary(
-            Box::new(Expr::Column {
-                database: None,
-                table: TableInternalId::default(),
-                column: 2,
-                is_rowid_alias: false,
-            }),
-            Operator::Equals,
-            Box::new(Expr::Literal(Literal::Numeric("1".to_string()))),
-        );
-
-        let or_expr = Expr::Binary(
-            Box::new(ast::Expr::Parenthesized(vec![rebuild_and_expr_from_list(
-                vec![a_expr.clone(), x_expr.clone()],
-            )
-            .into()])),
-            Operator::Or,
-            Box::new(ast::Expr::Parenthesized(vec![rebuild_and_expr_from_list(
-                vec![a_expr.clone(), y_expr.clone()],
-            )
-            .into()])),
-        );
-
+    fn preserves_outer_join_origin_on_lifted_terms() -> Result<()> {
+        let source = PlanSourceId::new(9);
+        let a = equals(0);
+        let x = equals(1);
+        let y = equals(2);
         let mut where_clause = vec![WhereTerm {
-            expr: or_expr,
-            from_outer_join: Some(TableInternalId::default()), // Set from_outer_join
+            expr: or(vec![
+                and(vec![a.clone(), x.clone()]),
+                and(vec![a.clone(), y.clone()]),
+            ]),
+            from_outer_join: Some(source),
             consumed: false,
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
 
-        // Should have 2 terms, both with from_outer_join set
-        let nonconsumed_terms = where_clause
+        let terms = where_clause
             .iter()
             .filter(|term| !term.consumed)
             .collect::<Vec<_>>();
-        assert_eq!(nonconsumed_terms.len(), 2);
-        assert_eq!(
-            nonconsumed_terms[0].expr,
-            Expr::Binary(
-                Box::new(ast::Expr::Parenthesized(vec![x_expr.into()])),
-                Operator::Or,
-                Box::new(ast::Expr::Parenthesized(vec![y_expr.into()]))
-            )
-        );
-        assert_eq!(
-            nonconsumed_terms[0].from_outer_join,
-            Some(TableInternalId::default())
-        );
-        assert_eq!(nonconsumed_terms[1].expr, a_expr);
-        assert_eq!(
-            nonconsumed_terms[1].from_outer_join,
-            Some(TableInternalId::default())
-        );
-
+        assert_eq!(terms.len(), 2);
+        assert!(terms
+            .iter()
+            .all(|term| term.from_outer_join == Some(source)));
+        assert_expr_eq(&terms[0].expr, &or(vec![x, y]));
+        assert_expr_eq(&terms[1].expr, &a);
         Ok(())
     }
 
     #[test]
-    fn test_lift_common_subexpressions_single_term() -> Result<()> {
-        // Test case with a single non-OR term:
-        // SELECT * FROM t WHERE a = 1
-        // should remain unchanged.
-
-        let single_expr = Expr::Binary(
-            Box::new(Expr::Column {
-                database: None,
-                table: TableInternalId::default(),
-                column: 0,
-                is_rowid_alias: false,
-            }),
-            Operator::Equals,
-            Box::new(Expr::Literal(Literal::Numeric("1".to_string()))),
-        );
-
+    fn leaves_non_or_term_unchanged() -> Result<()> {
+        let expression = equals(0);
         let mut where_clause = vec![WhereTerm {
-            expr: single_expr.clone(),
+            expr: expression.clone(),
             from_outer_join: None,
             consumed: false,
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
 
-        // Should remain unchanged
-        let nonconsumed_terms = where_clause
-            .iter()
-            .filter(|term| !term.consumed)
-            .collect::<Vec<_>>();
-        assert_eq!(nonconsumed_terms.len(), 1);
-        assert_eq!(nonconsumed_terms[0].expr, single_expr);
-
+        assert_eq!(where_clause.len(), 1);
+        assert!(!where_clause[0].consumed);
+        assert_expr_eq(&where_clause[0].expr, &expression);
         Ok(())
     }
 
     #[test]
-    fn test_lift_common_subexpressions_empty_or_branch() -> Result<()> {
-        // Test case where OR becomes redundant:
-        // (a = 1 AND b = 1) OR (a = 1) becomes -> a = 1.
-        let exprs = (0..=1)
-            .map(|i| {
-                Expr::Binary(
-                    Box::new(Expr::Column {
-                        database: None,
-                        table: TableInternalId::default(),
-                        column: i,
-                        is_rowid_alias: false,
-                    }),
-                    Operator::Equals,
-                    Box::new(Expr::Literal(Literal::Numeric("1".to_string()))),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let a_expr = exprs[0].clone();
-        let b_expr = exprs[1].clone();
-
-        let a_and_b_expr = Expr::Binary(Box::new(a_expr.clone()), Operator::And, Box::new(b_expr));
-
-        let or_expr = Expr::Binary(
-            Box::new(a_and_b_expr),
-            Operator::Or,
-            Box::new(a_expr.clone()),
-        );
-
+    fn removes_or_when_one_branch_is_only_the_common_term() -> Result<()> {
+        let a = equals(0);
+        let b = equals(1);
         let mut where_clause = vec![WhereTerm {
-            expr: or_expr,
+            expr: or(vec![and(vec![a.clone(), b]), a.clone()]),
             from_outer_join: None,
             consumed: false,
         }];
 
         lift_common_subexpressions_from_binary_or_terms(&mut where_clause)?;
 
-        let nonconsumed_terms = where_clause
+        let terms = where_clause
             .iter()
             .filter(|term| !term.consumed)
             .collect::<Vec<_>>();
-        assert_eq!(nonconsumed_terms.len(), 1);
-        assert_eq!(nonconsumed_terms[0].expr, a_expr);
-
+        assert_eq!(terms.len(), 1);
+        assert_expr_eq(&terms[0].expr, &a);
         Ok(())
     }
 }

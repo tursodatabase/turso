@@ -3,7 +3,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
 
-use turso_parser::ast::{Expr, Operator, TableInternalId};
+use turso_parser::ast::Operator;
 
 use super::{
     access_method::{find_best_access_method_for_join_order, AccessMethod},
@@ -17,7 +17,6 @@ use crate::{
     schema::Schema,
     stats::AnalyzeStats,
     translate::{
-        expr::{walk_expr, WalkControl},
         optimizer::{
             access_method::{
                 estimate_hash_join_cost, try_hash_join_access_method, AccessMethodParams,
@@ -33,6 +32,7 @@ use crate::{
             HashJoinKey, HashJoinType, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
             TableReferences, WhereTerm,
         },
+        plan_expr::{walk_plan_expr, PlanExpr as Expr, PlanSourceId, PlanWalkControl},
         planner::TableMask,
     },
     LimboError, Result,
@@ -160,7 +160,7 @@ pub fn join_lhs_and_rhs<'a>(
     cost_upper_bound: Cost,
     joined_tables: &[JoinedTable],
     where_clause: &mut [WhereTerm],
-    where_term_table_ids: &[HashSet<TableInternalId>],
+    where_term_table_ids: &[HashSet<PlanSourceId>],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
@@ -246,7 +246,7 @@ pub fn join_lhs_and_rhs<'a>(
     };
 
     let rhs_internal_id = rhs_table_reference.internal_id;
-    let lhs_internal_ids: HashSet<TableInternalId> = lhs
+    let lhs_internal_ids: HashSet<PlanSourceId> = lhs
         .map(|l| {
             l.table_numbers()
                 .map(|table_no| joined_tables[table_no].internal_id)
@@ -701,6 +701,7 @@ pub fn join_lhs_and_rhs<'a>(
                     consumed_where_terms: candidate.where_covered.into_iter().collect(),
                     params: AccessMethodParams::IndexMethod {
                         query: candidate.to_query(),
+                        result_column_rewrites: candidate.result_column_rewrites.clone(),
                         where_covered: candidate.where_covered,
                     },
                 };
@@ -1000,13 +1001,9 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     let mut best_ordered_plan: Option<JoinN> = None;
     let mut best_plan_is_also_ordered =
         match (naive_plan.as_ref(), planning_context.maybe_order_target) {
-            (Some(plan), Some(order_target)) => plan_satisfies_order_target(
-                plan,
-                access_methods_arena,
-                joined_tables,
-                order_target,
-                schema,
-            ),
+            (Some(plan), Some(order_target)) => {
+                plan_satisfies_order_target(plan, access_methods_arena, joined_tables, order_target)
+            }
             _ => false,
         };
 
@@ -1027,7 +1024,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // Reuse a single mutable join order to avoid allocating join orders per permutation.
     let mut join_order = Vec::with_capacity(num_tables);
     join_order.push(JoinOrderMember {
-        table_id: TableInternalId::default(),
+        table_id: joined_tables[0].internal_id,
         original_idx: 0,
         is_outer: false,
     });
@@ -1261,7 +1258,6 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                                 access_methods_arena,
                                 joined_tables,
                                 order_target,
-                                schema,
                             )
                         } else {
                             false
@@ -1305,7 +1301,6 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                                 access_methods_arena,
                                 joined_tables,
                                 order_target,
-                                schema,
                             )
                         } else {
                             false
@@ -1399,7 +1394,7 @@ pub fn compute_greedy_join_order<'a>(
     base_table_rows: &[RowCountEstimate],
     access_methods_arena: &'a mut Vec<AccessMethod>,
     where_clause: &mut [WhereTerm],
-    where_term_table_ids: &[HashSet<TableInternalId>],
+    where_term_table_ids: &[HashSet<PlanSourceId>],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
@@ -1830,7 +1825,7 @@ fn get_best_seek_score(
         };
         let analyze_ctx = AnalyzeCtx {
             rhs_table,
-            index: candidate.index.as_ref(),
+            index: candidate.index.as_deref(),
             stats: analyze_stats,
         };
         let estimated_rows = estimate_rows_per_seek(
@@ -1862,7 +1857,7 @@ pub fn compute_naive_left_deep_plan<'a>(
     access_methods_arena: &'a mut Vec<AccessMethod>,
     constraints: &'a [TableConstraints],
     where_clause: &mut [WhereTerm],
-    where_term_table_ids: &[HashSet<TableInternalId>],
+    where_term_table_ids: &[HashSet<PlanSourceId>],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
@@ -1947,9 +1942,8 @@ pub fn compute_naive_left_deep_plan<'a>(
 fn build_where_term_table_ids(
     where_clause: &[WhereTerm],
     joined_tables: &[JoinedTable],
-) -> Vec<HashSet<TableInternalId>> {
-    let joined_ids: HashSet<TableInternalId> =
-        joined_tables.iter().map(|t| t.internal_id).collect();
+) -> Vec<HashSet<PlanSourceId>> {
+    let joined_ids: HashSet<PlanSourceId> = joined_tables.iter().map(|t| t.internal_id).collect();
     where_clause
         .iter()
         .map(|term| expr_table_ids_filtered(&term.expr, &joined_ids))
@@ -1959,19 +1953,29 @@ fn build_where_term_table_ids(
 /// Collect table IDs from an expression that belong to the joined tables set.
 fn expr_table_ids_filtered(
     expr: &Expr,
-    joined_ids: &HashSet<TableInternalId>,
-) -> HashSet<TableInternalId> {
+    joined_ids: &HashSet<PlanSourceId>,
+) -> HashSet<PlanSourceId> {
     let mut tables = HashSet::default();
-    let _ = walk_expr(expr, &mut |node| {
+    let _ = walk_plan_expr(expr, &mut |node| {
         match node {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                if joined_ids.contains(table) {
-                    tables.insert(*table);
+            Expr::Column(column) => {
+                if joined_ids.contains(&column.source) {
+                    tables.insert(column.source);
+                }
+            }
+            Expr::MergedColumn(column) => {
+                if joined_ids.contains(&column.right.source) {
+                    tables.insert(column.right.source);
+                }
+            }
+            Expr::RowId(source) => {
+                if joined_ids.contains(source) {
+                    tables.insert(*source);
                 }
             }
             _ => {}
         }
-        Ok(WalkControl::Continue)
+        Ok(PlanWalkControl::Continue)
     });
     tables
 }
@@ -2030,7 +2034,7 @@ fn generate_join_bitmasks(table_number_max_exclusive: usize, how_many: usize) ->
 mod tests {
     use std::{collections::VecDeque, sync::Arc};
 
-    use turso_parser::ast::{self, Expr, Operator, TableInternalId};
+    use turso_parser::ast::{self, Operator};
 
     use super::*;
     use crate::alloc::TursoSliceExt;
@@ -2047,11 +2051,11 @@ mod tests {
                 cost_params::DEFAULT_PARAMS,
             },
             plan::{
-                ColumnUsedMask, IterationDirection, JoinInfo, JoinType, Operation, TableReferences,
-                WhereTerm,
+                ColumnUsedMask, IterationDirection, JoinInfo, JoinType, Operation, PlanIndex,
+                PlanIndexHint, SourceReadPrograms, TableReferences, WhereTerm,
             },
+            plan_expr::{PlanExpr as Expr, PlanIdentityAllocator, PlanSourceId},
         },
-        vdbe::builder::TableRefIdCounter,
         MAIN_DB_ID,
     };
 
@@ -2061,6 +2065,10 @@ mod tests {
 
     fn empty_schema() -> Schema {
         Schema::default()
+    }
+
+    fn binary(lhs: Box<Expr>, operator: Operator, rhs: Box<Expr>) -> Expr {
+        Expr::binary(*lhs, operator, *rhs)
     }
 
     #[test]
@@ -2077,14 +2085,14 @@ mod tests {
 
     #[test]
     fn test_seek_score_accounts_for_composite_index_prefix() {
-        let mut table_id_counter = TableRefIdCounter::new();
+        let mut table_id_counter = PlanIdentityAllocator::new();
         let t1 = _create_btree_table("table1", _create_column_list(&["x"], Type::Integer));
         let t2 = _create_btree_table(
             "table2",
             _create_column_list(&["x", "y", "z"], Type::Integer),
         );
         let joined_tables = vec![
-            _create_table_reference(t1, None, table_id_counter.next()),
+            _create_table_reference(t1, None, table_id_counter.next_source()),
             _create_table_reference(
                 t2,
                 Some(JoinInfo {
@@ -2092,7 +2100,7 @@ mod tests {
                     using: vec![],
                     no_reorder: false,
                 }),
-                table_id_counter.next(),
+                table_id_counter.next_source(),
             ),
         ];
 
@@ -2183,8 +2191,12 @@ mod tests {
     /// Test that [compute_best_join_order] returns a table scan access method when the where clause is empty.
     fn test_compute_best_join_order_single_table_no_indexes() {
         let t1 = _create_btree_table("test_table", _create_column_list(&["id"], Type::Integer));
-        let mut table_id_counter = TableRefIdCounter::new();
-        let joined_tables = vec![_create_table_reference(t1, None, table_id_counter.next())];
+        let mut table_id_counter = PlanIdentityAllocator::new();
+        let joined_tables = vec![_create_table_reference(
+            t1,
+            None,
+            table_id_counter.next_source(),
+        )];
         let table_references = TableReferences::new(joined_tables, vec![]);
         let available_indexes = AvailableIndexes::default();
         let mut where_clause = vec![];
@@ -2233,8 +2245,12 @@ mod tests {
     /// Test that [compute_best_join_order] returns a RowidEq access method when the where clause has an EQ constraint on the rowid alias.
     fn test_compute_best_join_order_single_table_rowid_eq() {
         let t1 = _create_btree_table("test_table", vec![_create_column_rowid_alias("id")]);
-        let mut table_id_counter = TableRefIdCounter::new();
-        let joined_tables = vec![_create_table_reference(t1, None, table_id_counter.next())];
+        let mut table_id_counter = PlanIdentityAllocator::new();
+        let joined_tables = vec![_create_table_reference(
+            t1,
+            None,
+            table_id_counter.next_source(),
+        )];
 
         let mut where_clause = vec![_create_binary_expr(
             _create_column_expr(joined_tables[0].internal_id, 0, true), // table 0, column 0 (rowid)
@@ -2299,8 +2315,12 @@ mod tests {
             "test_table",
             vec![_create_column_of_type("id", Type::Integer)],
         );
-        let mut table_id_counter = TableRefIdCounter::new();
-        let joined_tables = vec![_create_table_reference(t1, None, table_id_counter.next())];
+        let mut table_id_counter = PlanIdentityAllocator::new();
+        let joined_tables = vec![_create_table_reference(
+            t1,
+            None,
+            table_id_counter.next_source(),
+        )];
 
         let mut where_clause = vec![_create_binary_expr(
             _create_column_expr(joined_tables[0].internal_id, 0, false), // table 0, column 0 (id)
@@ -2382,9 +2402,9 @@ mod tests {
         let t1 = _create_btree_table("table1", _create_column_list(&["id"], Type::Integer));
         let t2 = _create_btree_table("table2", _create_column_list(&["id"], Type::Integer));
 
-        let mut table_id_counter = TableRefIdCounter::new();
+        let mut table_id_counter = PlanIdentityAllocator::new();
         let joined_tables = vec![
-            _create_table_reference(t1, None, table_id_counter.next()),
+            _create_table_reference(t1, None, table_id_counter.next_source()),
             _create_table_reference(
                 t2,
                 Some(JoinInfo {
@@ -2392,7 +2412,7 @@ mod tests {
                     using: vec![],
                     no_reorder: false,
                 }),
-                table_id_counter.next(),
+                table_id_counter.next_source(),
             ),
         ];
 
@@ -2503,9 +2523,9 @@ mod tests {
             ],
         );
 
-        let mut table_id_counter = TableRefIdCounter::new();
+        let mut table_id_counter = PlanIdentityAllocator::new();
         let joined_tables = vec![
-            _create_table_reference(table_orders, None, table_id_counter.next()),
+            _create_table_reference(table_orders, None, table_id_counter.next_source()),
             _create_table_reference(
                 table_customers,
                 Some(JoinInfo {
@@ -2513,7 +2533,7 @@ mod tests {
                     using: vec![],
                     no_reorder: false,
                 }),
-                table_id_counter.next(),
+                table_id_counter.next_source(),
             ),
             _create_table_reference(
                 table_order_items,
@@ -2522,7 +2542,7 @@ mod tests {
                     using: vec![],
                     no_reorder: false,
                 }),
-                table_id_counter.next(),
+                table_id_counter.next_source(),
             ),
         ];
 
@@ -2698,9 +2718,9 @@ mod tests {
         let t2 = _create_btree_table("t2", _create_column_list(&["id", "foo"], Type::Integer));
         let t3 = _create_btree_table("t3", _create_column_list(&["id", "foo"], Type::Integer));
 
-        let mut table_id_counter = TableRefIdCounter::new();
+        let mut table_id_counter = PlanIdentityAllocator::new();
         let joined_tables = vec![
-            _create_table_reference(t1, None, table_id_counter.next()),
+            _create_table_reference(t1, None, table_id_counter.next_source()),
             _create_table_reference(
                 t2,
                 Some(JoinInfo {
@@ -2708,7 +2728,7 @@ mod tests {
                     using: vec![],
                     no_reorder: false,
                 }),
-                table_id_counter.next(),
+                table_id_counter.next_source(),
             ),
             _create_table_reference(
                 t3,
@@ -2717,7 +2737,7 @@ mod tests {
                     using: vec![],
                     no_reorder: false,
                 }),
-                table_id_counter.next(),
+                table_id_counter.next_source(),
             ),
         ];
 
@@ -2819,12 +2839,12 @@ mod tests {
             })
             .collect();
 
-        let mut table_id_counter = TableRefIdCounter::new();
+        let mut table_id_counter = PlanIdentityAllocator::new();
         let joined_tables = {
             let mut refs = vec![_create_table_reference(
                 dim_tables[0].clone(),
                 None,
-                table_id_counter.next(),
+                table_id_counter.next_source(),
             )];
             refs.extend(dim_tables.iter().skip(1).map(|t| {
                 _create_table_reference(
@@ -2834,7 +2854,7 @@ mod tests {
                         using: vec![],
                         no_reorder: false,
                     }),
-                    table_id_counter.next(),
+                    table_id_counter.next_source(),
                 )
             }));
             refs.push(_create_table_reference(
@@ -2844,7 +2864,7 @@ mod tests {
                     using: vec![],
                     no_reorder: false,
                 }),
-                table_id_counter.next(),
+                table_id_counter.next_source(),
             ));
             refs
         };
@@ -2946,11 +2966,11 @@ mod tests {
 
         let available_indexes = AvailableIndexes::default();
 
-        let mut table_id_counter = TableRefIdCounter::new();
+        let mut table_id_counter = PlanIdentityAllocator::new();
         // Create table references
         let joined_tables: Vec<_> = tables
             .iter()
-            .map(|t| _create_table_reference(t.clone(), None, table_id_counter.next()))
+            .map(|t| _create_table_reference(t.clone(), None, table_id_counter.next_source()))
             .collect();
 
         // Create where clause linking each table to the next
@@ -3043,7 +3063,7 @@ mod tests {
     fn test_index_second_column_only() {
         let mut joined_tables = Vec::new();
 
-        let mut table_id_counter = TableRefIdCounter::new();
+        let mut table_id_counter = PlanIdentityAllocator::new();
 
         // Create a table with two columns
         let table = _create_btree_table("t1", _create_column_list(&["x", "y"], Type::Integer));
@@ -3064,32 +3084,31 @@ mod tests {
 
         let mut available_indexes = AvailableIndexes::default();
 
+        let column_count = table.columns().len();
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
             table,
-            internal_id: table_id_counter.next(),
+            resolved_table: None,
+            internal_id: table_id_counter.next_source(),
             identifier: "t1".to_string(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
-            indexed: None,
-            bound_index_method_patterns: Vec::new(),
-            bound_index_expressions: Vec::new(),
+            index_hint: PlanIndexHint::None,
+            index_method_patterns: Vec::new(),
+            index_expressions: Vec::new(),
+            read_programs: Arc::new(SourceReadPrograms::none(column_count)),
+            check_constraints: Vec::new(),
         });
         available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
 
         // Create where clause that only references second column
         let mut where_clause = vec![WhereTerm {
-            expr: Expr::Binary(
-                Box::new(Expr::Column {
-                    database: None,
-                    table: joined_tables[0].internal_id,
-                    column: 1,
-                    is_rowid_alias: false,
-                }),
+            expr: binary(
+                Box::new(_create_column_expr(joined_tables[0].internal_id, 1, false)),
                 ast::Operator::Equals,
                 Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
             ),
@@ -3140,7 +3159,7 @@ mod tests {
     /// Test that an index with a gap in referenced columns (e.g. index on (a,b,c), where clause on a and c)
     /// only uses the prefix before the gap.
     fn test_index_skips_middle_column() {
-        let mut table_id_counter = TableRefIdCounter::new();
+        let mut table_id_counter = PlanIdentityAllocator::new();
         let mut joined_tables = Vec::new();
         let mut available_indexes = AvailableIndexes::default();
 
@@ -3162,33 +3181,32 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
+        let column_count = table.columns().len();
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
             table,
-            internal_id: table_id_counter.next(),
+            resolved_table: None,
+            internal_id: table_id_counter.next_source(),
             identifier: "t1".to_string(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
-            indexed: None,
-            bound_index_method_patterns: Vec::new(),
-            bound_index_expressions: Vec::new(),
+            index_hint: PlanIndexHint::None,
+            index_method_patterns: Vec::new(),
+            index_expressions: Vec::new(),
+            read_programs: Arc::new(SourceReadPrograms::none(column_count)),
+            check_constraints: Vec::new(),
         });
         available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
 
         // Create where clause that references first and third columns
         let mut where_clause = vec![
             WhereTerm {
-                expr: Expr::Binary(
-                    Box::new(Expr::Column {
-                        database: None,
-                        table: joined_tables[0].internal_id,
-                        column: 0, // c1
-                        is_rowid_alias: false,
-                    }),
+                expr: binary(
+                    Box::new(_create_column_expr(joined_tables[0].internal_id, 0, false)),
                     ast::Operator::Equals,
                     Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
                 ),
@@ -3196,13 +3214,8 @@ mod tests {
                 consumed: false,
             },
             WhereTerm {
-                expr: Expr::Binary(
-                    Box::new(Expr::Column {
-                        database: None,
-                        table: joined_tables[0].internal_id,
-                        column: 2, // c3
-                        is_rowid_alias: false,
-                    }),
+                expr: binary(
+                    Box::new(_create_column_expr(joined_tables[0].internal_id, 2, false)),
                     ast::Operator::Equals,
                     Box::new(Expr::Literal(ast::Literal::Numeric(7.to_string()))),
                 ),
@@ -3259,7 +3272,7 @@ mod tests {
     /// Test that an index seek stops after a range operator.
     /// e.g. index on (a,b,c), where clause a=1, b>2, c=3. Only a and b should be used for seek.
     fn test_index_stops_at_range_operator() {
-        let mut table_id_counter = TableRefIdCounter::new();
+        let mut table_id_counter = PlanIdentityAllocator::new();
         let mut joined_tables = Vec::new();
         let mut available_indexes = AvailableIndexes::default();
 
@@ -3277,33 +3290,32 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
+        let column_count = table.columns().len();
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
             table,
-            internal_id: table_id_counter.next(),
+            resolved_table: None,
+            internal_id: table_id_counter.next_source(),
             identifier: "t1".to_string(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
-            indexed: None,
-            bound_index_method_patterns: Vec::new(),
-            bound_index_expressions: Vec::new(),
+            index_hint: PlanIndexHint::None,
+            index_method_patterns: Vec::new(),
+            index_expressions: Vec::new(),
+            read_programs: Arc::new(SourceReadPrograms::none(column_count)),
+            check_constraints: Vec::new(),
         });
         available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
 
         // Create where clause: c1 = 5 AND c2 > 10 AND c3 = 7
         let mut where_clause = vec![
             WhereTerm {
-                expr: Expr::Binary(
-                    Box::new(Expr::Column {
-                        database: None,
-                        table: joined_tables[0].internal_id,
-                        column: 0, // c1
-                        is_rowid_alias: false,
-                    }),
+                expr: binary(
+                    Box::new(_create_column_expr(joined_tables[0].internal_id, 0, false)),
                     ast::Operator::Equals,
                     Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
                 ),
@@ -3311,13 +3323,8 @@ mod tests {
                 consumed: false,
             },
             WhereTerm {
-                expr: Expr::Binary(
-                    Box::new(Expr::Column {
-                        database: None,
-                        table: joined_tables[0].internal_id,
-                        column: 1, // c2
-                        is_rowid_alias: false,
-                    }),
+                expr: binary(
+                    Box::new(_create_column_expr(joined_tables[0].internal_id, 1, false)),
                     ast::Operator::Greater,
                     Box::new(Expr::Literal(ast::Literal::Numeric(10.to_string()))),
                 ),
@@ -3325,13 +3332,8 @@ mod tests {
                 consumed: false,
             },
             WhereTerm {
-                expr: Expr::Binary(
-                    Box::new(Expr::Column {
-                        database: None,
-                        table: joined_tables[0].internal_id,
-                        column: 2, // c3
-                        is_rowid_alias: false,
-                    }),
+                expr: binary(
+                    Box::new(_create_column_expr(joined_tables[0].internal_id, 2, false)),
                     ast::Operator::Equals,
                     Box::new(Expr::Literal(ast::Literal::Numeric(7.to_string()))),
                 ),
@@ -3469,13 +3471,15 @@ mod tests {
     fn _create_table_reference(
         table: Arc<BTreeTable>,
         join_info: Option<JoinInfo>,
-        internal_id: TableInternalId,
+        internal_id: PlanSourceId,
     ) -> JoinedTable {
         let name = table.name.clone();
+        let column_count = table.columns().len();
         let table = Table::BTree(table);
         JoinedTable {
             op: Operation::default_scan_for(&table),
             table,
+            resolved_table: None,
             identifier: name,
             internal_id,
             join_info,
@@ -3483,26 +3487,27 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
-            indexed: None,
-            bound_index_method_patterns: Vec::new(),
-            bound_index_expressions: Vec::new(),
+            index_hint: PlanIndexHint::None,
+            index_method_patterns: Vec::new(),
+            index_expressions: Vec::new(),
+            read_programs: Arc::new(SourceReadPrograms::none(column_count)),
+            check_constraints: Vec::new(),
         }
     }
 
     /// Creates a column expression
-    fn _create_column_expr(table: TableInternalId, column: usize, is_rowid_alias: bool) -> Expr {
-        Expr::Column {
-            database: None,
-            table,
-            column,
-            is_rowid_alias,
+    fn _create_column_expr(table: PlanSourceId, column: usize, is_rowid_alias: bool) -> Expr {
+        let mut expression = Expr::column(table, column);
+        if let Expr::Column(column) = &mut expression {
+            column.rowid_alias = is_rowid_alias;
         }
+        expression
     }
 
     /// Creates a binary expression for a WHERE clause
     fn _create_binary_expr(lhs: Expr, op: Operator, rhs: Expr) -> WhereTerm {
         WhereTerm {
-            expr: Expr::Binary(Box::new(lhs), op, Box::new(rhs)),
+            expr: Expr::binary(lhs, op, rhs),
             from_outer_join: None,
             consumed: false,
         }
@@ -3510,7 +3515,7 @@ mod tests {
 
     /// Creates a numeric literal expression
     fn _create_numeric_literal(value: &str) -> Expr {
-        Expr::Literal(ast::Literal::Numeric(value.to_string()))
+        Expr::literal(ast::Literal::Numeric(value.to_string()))
     }
 
     fn seek_score_for_indexes(
@@ -3548,7 +3553,7 @@ mod tests {
         access_method: &AccessMethod,
     ) -> (
         IterationDirection,
-        Option<Arc<Index>>,
+        Option<PlanIndex>,
         &'_ [RangeConstraintRef],
     ) {
         match &access_method.params {
@@ -3575,9 +3580,9 @@ mod tests {
         let t1 = _create_btree_table("t1", _create_column_list(&["a", "b", "c"], Type::Integer));
         let t2 = _create_btree_table("t2", _create_column_list(&["a", "b", "c"], Type::Integer));
 
-        let mut table_id_counter = TableRefIdCounter::new();
+        let mut table_id_counter = PlanIdentityAllocator::new();
         let joined_tables = vec![
-            _create_table_reference(t1, None, table_id_counter.next()),
+            _create_table_reference(t1, None, table_id_counter.next_source()),
             _create_table_reference(
                 t2,
                 Some(JoinInfo {
@@ -3585,7 +3590,7 @@ mod tests {
                     using: vec![],
                     no_reorder: false,
                 }),
-                table_id_counter.next(),
+                table_id_counter.next_source(),
             ),
         ];
 

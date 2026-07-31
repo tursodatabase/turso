@@ -573,10 +573,11 @@ impl Connection {
     }
 
     pub(crate) fn empty_temp_schema(&self) -> Arc<Schema> {
-        // with_options only fails if built-in type SQL is malformed (programmer bug).
-        let mut schema = Schema::with_options(
+        // Building an empty schema only fails if built-in type SQL is malformed.
+        let mut schema = Schema::with_options_and_symbols(
             self.db.experimental_custom_types_enabled(),
             self.db.dialect().as_ref(),
+            &self.syms.read(),
         )
         .expect("built-in type definitions are malformed");
         schema.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
@@ -1322,9 +1323,10 @@ impl Connection {
         let guard = self.schema_reparse_guard();
         self.pager.load().set_schema_cookie(Some(cookie));
         // create fresh schema as some objects can be deleted
-        let mut fresh = Schema::with_options(
+        let mut fresh = Schema::with_options_and_symbols(
             self.experimental_custom_types_enabled(),
             self.db.dialect().as_ref(),
+            &self.syms.read(),
         )?;
         fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
@@ -1402,7 +1404,8 @@ impl Connection {
                         &mut inner.fresh,
                         &self.syms.read(),
                         &attached_resolver,
-                        self.db.dialect().as_ref(),
+                        self.experimental_custom_types_enabled(),
+                        self.dialect(),
                     ));
 
                     // Rehydrate built-in table-valued functions captured at init.
@@ -2800,6 +2803,10 @@ impl Connection {
                 materialized_view_info,
                 dbsp_state_roots,
                 dbsp_state_index_roots,
+                &syms,
+                self.experimental_custom_types_enabled(),
+                self.dialect(),
+                None,
             ) {
                 Ok(()) => {}
                 Err(LimboError::ExtensionError(msg)) => eprintln!("Warning: {msg}"),

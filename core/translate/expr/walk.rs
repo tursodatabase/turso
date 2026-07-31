@@ -42,11 +42,6 @@ where
                     continue;
                 }
                 match expr {
-                    ast::Expr::SubqueryResult { lhs, .. } => {
-                        if let Some(lhs) = lhs {
-                            stack.push(WalkItem::Expr(lhs));
-                        }
-                    }
                     ast::Expr::Between {
                         lhs, start, end, ..
                     } => {
@@ -87,33 +82,6 @@ where
                         filter_over,
                         ..
                     } => {
-                        if let Some(over_clause) = &filter_over.over_clause {
-                            push_over_clause_walk_items(&mut stack, over_clause);
-                        }
-                        if let Some(filter_clause) = &filter_over.filter_clause {
-                            stack.push(WalkItem::Expr(filter_clause));
-                        }
-                        for sort_col in within_group.iter().rev() {
-                            stack.push(WalkItem::Expr(&sort_col.expr));
-                        }
-                        for sort_col in order_by.iter().rev() {
-                            stack.push(WalkItem::Expr(&sort_col.expr));
-                        }
-                        for arg in args.iter().rev() {
-                            stack.push(WalkItem::Expr(arg));
-                        }
-                    }
-                    ast::Expr::BoundCustomTypeFunction { call, .. } => {
-                        let ast::Expr::FunctionCall {
-                            args,
-                            order_by,
-                            within_group,
-                            filter_over,
-                            ..
-                        } = call.as_ref()
-                        else {
-                            unreachable!("bound custom-type function must wrap a function call")
-                        };
                         if let Some(over_clause) = &filter_over.over_clause {
                             push_over_clause_walk_items(&mut stack, over_clause);
                         }
@@ -185,14 +153,11 @@ where
                         )
                     }
                     ast::Expr::Id(_)
-                    | ast::Expr::Column { .. }
-                    | ast::Expr::RowId { .. }
                     | ast::Expr::Literal(_)
                     | ast::Expr::DoublyQualified(..)
                     | ast::Expr::Name(_)
                     | ast::Expr::Qualified(..)
                     | ast::Expr::Variable(_)
-                    | ast::Expr::Register(_)
                     | ast::Expr::Default => {}
                     ast::Expr::FieldAccess { base, .. } => {
                         stack.push(WalkItem::Expr(base));
@@ -210,35 +175,6 @@ where
         }
     }
     Ok(WalkControl::Continue)
-}
-
-pub fn expr_references_subquery_id(expr: &ast::Expr, subquery_id: TableInternalId) -> bool {
-    let mut found = false;
-    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-        if let ast::Expr::SubqueryResult {
-            subquery_id: sid, ..
-        } = e
-        {
-            if *sid == subquery_id {
-                found = true;
-                return Ok(WalkControl::SkipChildren);
-            }
-        }
-        Ok(WalkControl::Continue)
-    });
-    found
-}
-
-pub fn expr_references_any_subquery(expr: &ast::Expr) -> bool {
-    let mut found = false;
-    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-        if matches!(e, ast::Expr::SubqueryResult { .. }) {
-            found = true;
-            return Ok(WalkControl::SkipChildren);
-        }
-        Ok(WalkControl::Continue)
-    });
-    found
 }
 
 /// Returns true if this expression calls a scalar function whose result can
@@ -345,11 +281,6 @@ where
                     continue;
                 }
                 match expr {
-                    ast::Expr::SubqueryResult { lhs, .. } => {
-                        if let Some(lhs) = lhs {
-                            stack.push(WalkItem::Expr(lhs));
-                        }
-                    }
                     ast::Expr::Between {
                         lhs, start, end, ..
                     } => {
@@ -390,33 +321,6 @@ where
                         filter_over,
                         ..
                     } => {
-                        if let Some(over_clause) = &mut filter_over.over_clause {
-                            push_over_clause_walk_items(&mut stack, over_clause);
-                        }
-                        if let Some(filter_clause) = &mut filter_over.filter_clause {
-                            stack.push(WalkItem::Expr(filter_clause));
-                        }
-                        for sort_col in within_group.iter_mut().rev() {
-                            stack.push(WalkItem::Expr(&mut sort_col.expr));
-                        }
-                        for sort_col in order_by.iter_mut().rev() {
-                            stack.push(WalkItem::Expr(&mut sort_col.expr));
-                        }
-                        for arg in args.iter_mut().rev() {
-                            stack.push(WalkItem::Expr(arg));
-                        }
-                    }
-                    ast::Expr::BoundCustomTypeFunction { call, .. } => {
-                        let ast::Expr::FunctionCall {
-                            args,
-                            order_by,
-                            within_group,
-                            filter_over,
-                            ..
-                        } = call.as_mut()
-                        else {
-                            unreachable!("bound custom-type function must wrap a function call")
-                        };
                         if let Some(over_clause) = &mut filter_over.over_clause {
                             push_over_clause_walk_items(&mut stack, over_clause);
                         }
@@ -488,14 +392,11 @@ where
                         )
                     }
                     ast::Expr::Id(_)
-                    | ast::Expr::Column { .. }
-                    | ast::Expr::RowId { .. }
                     | ast::Expr::Literal(_)
                     | ast::Expr::DoublyQualified(..)
                     | ast::Expr::Name(_)
                     | ast::Expr::Qualified(..)
                     | ast::Expr::Variable(_)
-                    | ast::Expr::Register(_)
                     | ast::Expr::Default => {}
                     ast::Expr::FieldAccess { base, .. } => {
                         stack.push(WalkItem::Expr(base));

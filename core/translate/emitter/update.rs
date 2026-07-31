@@ -1,33 +1,28 @@
-use super::gencol::compute_virtual_columns;
+use super::gencol::compute_planned_virtual_columns;
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
-use crate::vdbe::builder::SelfTableContext;
 use crate::{
-    ast, emit_explain,
+    emit_explain,
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
-    schema::{
-        collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Index,
-        EXPR_INDEX_SENTINEL, ROWID_SENTINEL,
-    },
+    schema::{BTreeTable, Index, EXPR_INDEX_SENTINEL, ROWID_SENTINEL},
     sync::Arc,
     translate::{
         display::format_eqp_detail,
         emitter::{
-            check_expr_references_updated_columns, delete::emit_fk_child_decrement_on_delete,
-            emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
-            emit_cdc_patch_record, emit_check_constraints, emit_index_column_value_new_image,
-            emit_index_column_value_old_image, emit_make_record, emit_program_for_select,
-            init_limit, OperationMode, Resolver, UpdateRowSource,
+            delete::emit_fk_child_decrement_on_delete, emit_cdc_autocommit_commit,
+            emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, emit_check_constraints,
+            emit_index_column_value_new_image, emit_index_column_value_old_image, emit_make_record,
+            emit_program_for_select, init_limit, OperationMode, Resolver, UpdateRowSource,
         },
         expr::{
-            emit_dml_expr_index_value, emit_returning_results, emit_returning_scan_back,
+            emit_plan_source_encode_columns, emit_returning_results, emit_returning_scan_back,
             emit_table_column, restore_returning_row_image_in_cache,
-            seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            NoConstantOptReason, ReturningBufferCtx,
+            seed_returning_row_image_in_cache, translate_plan_expr,
+            translate_plan_expr_no_constant_opt, NoConstantOptReason, ReturningBufferCtx,
         },
         fkeys::{
             emit_fk_child_update_counters, emit_fk_parent_deferred_new_key_probes,
@@ -37,24 +32,24 @@ use crate::{
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
             EvalAt, IterationDirection, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
-            Operation, OuterQueryReference, QueryDestination, ResultSetColumn, Scan, Search,
+            Operation, OuterQueryReference, PlanRuntimeBindings, QueryDestination, ResultSetColumn,
+            RuntimeRowBinding, RuntimeValueBinding, Scan, Search, SourceReadPrograms,
             SubqueryEvalPhase, TableReferences, UpdatePlan, UpdateSetClause,
         },
-        planner::ROWID_STRS,
+        plan_expr::{plan_expr_dependencies, PlanColumnUse, PlanExpr},
         subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
         trigger_exec::{
             fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
         },
         ProgramBuilder,
     },
-    util::normalize_ident,
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext},
         insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset,
     },
-    CaptureDataChangesExt, Connection, HashSet, Result, MAIN_DB_ID,
+    CaptureDataChangesExt, Connection, Result, MAIN_DB_ID,
 };
 use std::num::NonZeroUsize;
 use tracing::{instrument, Level};
@@ -120,17 +115,14 @@ pub fn emit_program_for_update(
         });
         Some(ReturningBufferCtx {
             cursor_id: ret_cursor_id,
-            num_columns: plan.returning.as_ref().unwrap().len(),
+            result_columns: plan.returning.as_ref().unwrap().clone(),
         })
     } else {
         None
     };
 
     let target_table = Arc::new(plan.target_table.clone());
-    let target_tables = TableReferences::new(
-        vec![plan.target_table.clone()],
-        plan.from_tables.outer_query_refs().to_vec(),
-    );
+    let target_tables = plan.build_target_scope_tables();
     let write_set_plan = plan.write_set_plan.take();
     let temp_cursor_id = match write_set_plan.as_ref() {
         Some(plan) => {
@@ -157,6 +149,8 @@ pub fn emit_program_for_update(
         };
         let scratch_table = scratch_table.clone();
         let scratch_table_internal_id = write_set_plan.scratch_table_id;
+        let scratch_read_programs =
+            Arc::new(SourceReadPrograms::none(scratch_table.columns().len()));
         program.emit_insn(Insn::OpenEphemeral {
             cursor_id: temp_cursor_id.unwrap(),
             is_table: true,
@@ -166,6 +160,7 @@ pub fn emit_program_for_update(
         let mut write_phase_tables = TableReferences::new(
             vec![JoinedTable {
                 table: Table::BTree(scratch_table),
+                resolved_table: None,
                 identifier: "ephemeral_scratch".to_string(),
                 internal_id: scratch_table_internal_id,
                 op: Operation::Scan(Scan::BTreeTable {
@@ -177,16 +172,20 @@ pub fn emit_program_for_update(
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
                 database_id: MAIN_DB_ID,
-                indexed: None,
-                bound_index_method_patterns: Vec::new(),
-                bound_index_expressions: Vec::new(),
+                index_hint: Default::default(),
+                index_method_patterns: Vec::new(),
+                index_expressions: Vec::new(),
+                read_programs: scratch_read_programs,
+                check_constraints: Vec::new(),
             }],
             vec![],
         );
+        write_phase_tables.extend_runtime_sources_from(&plan.from_tables);
         write_phase_tables.add_outer_query_reference(OuterQueryReference {
             identifier: target_table.identifier.clone(),
             internal_id: target_table.internal_id,
             table: target_table.table.clone(),
+            read_programs: Arc::clone(&target_table.read_programs),
             using_dedup_hidden_cols: ColumnMask::default(),
             col_used_mask: target_table.col_used_mask.try_clone()?,
             cte_definition_only: false,
@@ -208,6 +207,9 @@ pub fn emit_program_for_update(
         write_phase_tables.joined_tables().len(),
         connection.db.opts.unsafe_testing,
     );
+    t_ctx
+        .resolver
+        .bind_plan_subqueries(&plan.non_from_clause_subqueries);
 
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
@@ -297,8 +299,13 @@ pub fn emit_program_for_update(
 
     // Prepare index cursors
     let target_database_id = target_table.database_id;
-    let mut index_cursors = Vec::with_capacity(plan.indexes_to_update.len());
-    for index in &plan.indexes_to_update {
+    let indexes_to_update = plan
+        .indexes_to_update
+        .iter()
+        .map(|index| index.handle())
+        .collect::<Vec<_>>();
+    let mut index_cursors = Vec::with_capacity(indexes_to_update.len());
+    for index in &indexes_to_update {
         let index_cursor = if let Some(cursor) = program.resolve_cursor_id_safe(&CursorKey::index(
             write_phase_tables
                 .joined_tables()
@@ -365,13 +372,14 @@ pub fn emit_program_for_update(
         program.flags.has_statement_conflict(),
         program.resolve_type,
         rowid_alias_conflict,
-        plan.indexes_to_update.iter().map(|idx| idx.on_conflict),
+        indexes_to_update.iter().map(|idx| idx.on_conflict),
     );
     let all_index_cursors = if any_replace {
-        let table_name = target_table.table.get_name();
-        let all_indexes: Vec<_> = resolver.with_schema(target_database_id, |s| {
-            s.get_indices(table_name).cloned().collect()
-        });
+        let all_indexes = target_table
+            .index_expressions
+            .iter()
+            .map(|planned| planned.index.handle())
+            .collect::<Vec<_>>();
         let source_table = write_phase_tables
             .joined_tables()
             .first()
@@ -392,8 +400,7 @@ pub fn emit_program_for_update(
             .into_iter()
             .map(|index| {
                 // Check if this index already has a cursor opened (from indexes_to_update)
-                let existing_cursor = plan
-                    .indexes_to_update
+                let existing_cursor = indexes_to_update
                     .iter()
                     .zip(&index_cursors)
                     .find(|(idx, _)| idx.name == index.name)
@@ -428,7 +435,7 @@ pub fn emit_program_for_update(
     turso_assert!(
         plan.set_clauses.iter().all(|set_clause| {
             set_clause.update_from_result.as_ref().is_none_or(|result| {
-                matches!(result.as_ref(), ast::Expr::Column { .. })
+                matches!(result, crate::translate::plan_expr::PlanExpr::Column(_))
             })
         }),
         "materialized UPDATE set clauses must stay attached to their original clause and read from scratch-table columns"
@@ -437,8 +444,9 @@ pub fn emit_program_for_update(
         connection,
         &mut write_phase_tables,
         &plan.set_clauses,
+        &plan.defaults,
         plan.cdc_update_alter_statement.as_deref(),
-        &plan.indexes_to_update,
+        &indexes_to_update,
         plan.returning.as_ref(),
         temp_cursor_id,
         &mut t_ctx,
@@ -471,7 +479,7 @@ pub fn emit_program_for_update(
     // RETURNING rows from being emitted (matching SQLite behavior).
     if let Some(ref buf) = returning_buffer {
         program.emit_insn(Insn::FkCheck { deferred: false });
-        emit_returning_scan_back(program, buf);
+        emit_returning_scan_back(program, buf, &write_phase_tables, resolver)?;
     }
     after(program);
 
@@ -514,13 +522,50 @@ impl UpdateColumnCtx<'_> {
     }
 }
 
+fn update_new_image_bindings(
+    target_table: &JoinedTable,
+    columns_start_reg: usize,
+    rowid_reg: usize,
+    layout: &ColumnLayout,
+) -> PlanRuntimeBindings {
+    let columns = target_table.table.columns();
+    let column_bindings = columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let register = if column.is_rowid_alias() {
+                rowid_reg
+            } else {
+                layout.to_register(columns_start_reg, index)
+            };
+            RuntimeValueBinding::Register {
+                register,
+                needs_decode: true,
+            }
+        })
+        .collect();
+    let mut bindings = PlanRuntimeBindings::default();
+    bindings.bind_row(
+        target_table.internal_id,
+        RuntimeRowBinding {
+            columns: column_bindings,
+            rowid: Some(RuntimeValueBinding::Register {
+                register: rowid_reg,
+                needs_decode: false,
+            }),
+            read_programs: Some(Arc::clone(&target_table.read_programs)),
+        },
+    );
+    bindings
+}
+
 /// Emit the VDBE instructions that enforce a `NOT NULL` constraint on the
 /// value currently in `target_reg`, honoring the UPDATE's OR conflict clause:
 ///
 /// - `OR IGNORE`: branch to `skip_row_label` when the value is NULL, leaving
 ///   the existing row untouched.
-/// - `OR REPLACE`: if the column has a DEFAULT, evaluate it into `target_reg`;
-///   otherwise halt with `SQLITE_CONSTRAINT_NOTNULL`.
+/// - `OR REPLACE`: evaluate the analyzed DEFAULT into `target_reg`, then halt
+///   if the replacement is NULL. A missing DEFAULT is analyzed as NULL.
 /// - everything else (ABORT/ROLLBACK/FAIL, or the default): halt with
 ///   `SQLITE_CONSTRAINT_NOTNULL`.
 #[allow(clippy::too_many_arguments)]
@@ -528,6 +573,7 @@ fn emit_notnull_constraint_check(
     program: &mut ProgramBuilder,
     table_references: &TableReferences,
     target_reg: usize,
+    default_expr: Option<&PlanExpr>,
     table_column: &Column,
     table_name: &str,
     or_conflict: ResolveType,
@@ -552,13 +598,13 @@ fn emit_notnull_constraint_check(
             });
         }
         ResolveType::Replace => {
-            if let Some(default_expr) = table_column.default.as_ref() {
+            if let Some(default_expr) = default_expr {
                 let continue_label = program.allocate_label();
                 program.emit_insn(Insn::NotNull {
                     reg: target_reg,
                     target_pc: continue_label,
                 });
-                translate_expr_no_constant_opt(
+                translate_plan_expr_no_constant_opt(
                     program,
                     Some(table_references),
                     default_expr,
@@ -566,6 +612,14 @@ fn emit_notnull_constraint_check(
                     resolver,
                     NoConstantOptReason::RegisterReuse,
                 )?;
+                // DML lowering represents a missing column default as NULL.
+                // REPLACE may use a real default, but it must still fail when
+                // that substitution is NULL.
+                program.emit_insn(Insn::HaltIfNull {
+                    target_reg,
+                    err_code: SQLITE_CONSTRAINT_NOTNULL,
+                    description: description(),
+                });
                 program.preassign_label_to_next_insn(continue_label);
             } else {
                 program.emit_insn(Insn::HaltIfNull {
@@ -586,6 +640,14 @@ fn emit_notnull_constraint_check(
     Ok(())
 }
 
+fn effective_notnull_conflict(program: &ProgramBuilder, column: &Column) -> ResolveType {
+    if program.flags.has_statement_conflict() {
+        program.resolve_type
+    } else {
+        column.notnull_conflict_clause.unwrap_or(ResolveType::Abort)
+    }
+}
+
 /// Build the `TriggerContext` used to fire BEFORE/AFTER row triggers for this
 /// UPDATE. Carries the NEW and OLD register snapshots the trigger body will
 /// read, and propagates a conflict-resolution override when one is in effect:
@@ -597,6 +659,7 @@ fn emit_notnull_constraint_check(
 fn update_trigger_context(
     program: &ProgramBuilder,
     btree_table: &Arc<BTreeTable>,
+    read_programs: &Arc<SourceReadPrograms>,
     new_registers: Option<Vec<usize>>,
     old_registers: Option<Vec<usize>>,
     or_conflict: ResolveType,
@@ -610,20 +673,30 @@ fn update_trigger_context(
     match (after, override_conflict) {
         (true, Some(override_conflict)) => TriggerContext::new_after_with_override_conflict(
             btree_table.clone(),
+            Arc::clone(read_programs),
             new_registers,
             old_registers,
             override_conflict,
         ),
-        (true, None) => {
-            TriggerContext::new_after(btree_table.clone(), new_registers, old_registers)
-        }
+        (true, None) => TriggerContext::new_after(
+            btree_table.clone(),
+            Arc::clone(read_programs),
+            new_registers,
+            old_registers,
+        ),
         (false, Some(override_conflict)) => TriggerContext::new_with_override_conflict(
             btree_table.clone(),
+            Arc::clone(read_programs),
             new_registers,
             old_registers,
             override_conflict,
         ),
-        (false, None) => TriggerContext::new(btree_table.clone(), new_registers, old_registers),
+        (false, None) => TriggerContext::new(
+            btree_table.clone(),
+            Arc::clone(read_programs),
+            new_registers,
+            old_registers,
+        ),
     }
 }
 
@@ -653,7 +726,6 @@ fn emit_replace_delete<'a>(
     t_ctx: &mut TranslateCtx<'a>,
 ) -> crate::Result<()> {
     let table_name = target_table.table.get_name();
-    let internal_id = target_table.internal_id;
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
         let prepared = if t_ctx.resolver.with_schema(update_database_id, |s| {
             s.any_resolved_fks_referencing(table_name)
@@ -661,11 +733,10 @@ fn emit_replace_delete<'a>(
             ForeignKeyActions::prepare_fk_delete_actions(
                 program,
                 &mut t_ctx.resolver,
-                table_name,
+                target_table.as_ref(),
                 target_table_cursor_id,
                 conflicting_rowid_reg,
                 new_row_registers,
-                update_database_id,
             )?
         } else {
             ForeignKeyActions::default()
@@ -693,17 +764,21 @@ fn emit_replace_delete<'a>(
     };
 
     for (other_index, other_idx_cursor_id) in all_index_cursors {
+        let planned_index = target_table
+            .plan_index_expressions(other_index)
+            .expect("semantic HIR provided index expressions for every catalog index");
         let other_num_regs = other_index.columns.len() + 1;
         let other_start_reg = program.alloc_registers(other_num_regs);
 
-        for (reg_offset, column_index) in other_index.columns.iter().enumerate() {
+        for reg_offset in 0..other_index.columns.len() {
             emit_index_column_value_old_image(
                 program,
                 &t_ctx.resolver,
                 table_references,
+                target_table,
+                &planned_index.index,
+                reg_offset,
                 target_table_cursor_id,
-                internal_id,
-                column_index,
                 other_start_reg + reg_offset,
             )?;
         }
@@ -747,13 +822,13 @@ fn emit_update_column_values<'a>(
     program: &mut ProgramBuilder,
     table_references: &mut TableReferences,
     set_clauses: &[UpdateSetClause],
+    defaults: &[(usize, PlanExpr)],
     column_ctx: &UpdateColumnCtx<'_>,
     t_ctx: &mut TranslateCtx<'a>,
     skip_set_clauses: bool,
     skip_row_label: BranchOffset,
     skip_notnull_checks: bool,
 ) -> crate::Result<()> {
-    let or_conflict = program.resolve_type;
     if let Some(expr) = set_clauses
         .iter()
         .find(|set_clause| set_clause.column_index == ROWID_SENTINEL)
@@ -761,7 +836,7 @@ fn emit_update_column_values<'a>(
     {
         if !skip_set_clauses {
             let rowid_set_clause_reg = column_ctx.rowid_set_clause_reg.unwrap();
-            translate_expr(
+            translate_plan_expr(
                 program,
                 Some(table_references),
                 expr,
@@ -775,25 +850,28 @@ fn emit_update_column_values<'a>(
         }
     }
     let target_table_columns = column_ctx.target_table.table.columns();
+    let column_type_programs = &column_ctx.target_table.read_programs.column_type_programs;
+    if column_type_programs.len() != target_table_columns.len() {
+        return Err(crate::LimboError::InternalError(format!(
+            "UPDATE target {} has {} column type program slots for {} columns",
+            column_ctx.target_table.internal_id,
+            column_type_programs.len(),
+            target_table_columns.len()
+        )));
+    }
 
     for (idx, table_column) in target_table_columns.iter().enumerate() {
         let target_reg = column_ctx.layout.to_register(column_ctx.start, idx);
 
-        // If the column needs to be updated, retrieve its column index, or its expression.
-        // Such a column can be directly updated, in which case `expr` is the right-side of the SET
-        // clause, or it can be an indirectly updated generated columns, in which case `expr` is the
-        // column's expression.
+        // SET expressions are loaded here. Affected virtual columns are
+        // materialized together later, after all base values and affinities
+        // are final, so dependency order and the NEW row image are correct.
         let update_expr = set_clauses
             .iter()
             .find(|set_clause| set_clause.column_index == idx)
-            .map(UpdateSetClause::emitted_expr)
-            .or_else(|| {
-                if column_ctx.affected_columns.get(idx) {
-                    table_column.generated_expr()
-                } else {
-                    None
-                }
-            });
+            .map(UpdateSetClause::emitted_expr);
+        let affected_virtual =
+            column_ctx.affected_columns.get(idx) && table_column.is_virtual_generated();
 
         if let Some(expr) = update_expr {
             if !skip_set_clauses {
@@ -806,7 +884,7 @@ fn emit_update_column_values<'a>(
                     && !column_ctx.is_virtual_table
                 {
                     let rowid_set_clause_reg = column_ctx.rowid_set_clause_reg.unwrap();
-                    translate_expr(
+                    translate_plan_expr(
                         program,
                         Some(table_references),
                         expr,
@@ -821,76 +899,51 @@ fn emit_update_column_values<'a>(
 
                     program.emit_null(target_reg, None);
                 } else {
-                    let self_table_context = match table_column.generated_type() {
-                        GeneratedType::Virtual { .. } => Some(SelfTableContext::ForDML {
-                            dml_ctx: DmlColumnContext::layout(
-                                column_ctx.target_table.table.columns(),
-                                column_ctx.start,
-                                column_ctx.rowid_reg,
-                                column_ctx.layout.clone(),
-                            ),
-                            table: column_ctx.target_table.table.require_btree()?,
-                        }),
-                        GeneratedType::NotGenerated => None,
+                    // Columns with custom type encode must not have their SET
+                    // expressions hoisted as constants. See the doc comment on
+                    // NoConstantOptReason::CustomTypeEncode.
+                    let has_custom_encode =
+                        column_type_programs[idx].as_ref().is_some_and(|programs| {
+                            programs.array.is_some() || !programs.encode.is_empty()
+                        });
+                    let translate_result = if has_custom_encode {
+                        translate_plan_expr_no_constant_opt(
+                            program,
+                            Some(table_references),
+                            expr,
+                            target_reg,
+                            &t_ctx.resolver,
+                            NoConstantOptReason::CustomTypeEncode,
+                        )
+                    } else {
+                        translate_plan_expr(
+                            program,
+                            Some(table_references),
+                            expr,
+                            target_reg,
+                            &t_ctx.resolver,
+                        )
                     };
-
-                    t_ctx.resolver.with_self_table_context(
-                        program,
-                        self_table_context.as_ref(),
-                        |program, _| {
-                            // Columns with custom type encode must not have their
-                            // SET expressions hoisted as constants. See the doc
-                            // comment on NoConstantOptReason::CustomTypeEncode.
-                            let has_custom_encode = {
-                                let ty = &table_column.ty_str;
-                                !ty.is_empty()
-                                    && t_ctx
-                                        .resolver
-                                        .schema
-                                        .get_type_def_unchecked(ty)
-                                        .is_some_and(|td| td.encode().is_some())
-                            };
-                            let translate_result = if has_custom_encode {
-                                translate_expr_no_constant_opt(
-                                    program,
-                                    Some(table_references),
-                                    expr,
-                                    target_reg,
-                                    &t_ctx.resolver,
-                                    NoConstantOptReason::CustomTypeEncode,
-                                )
-                            } else {
-                                translate_expr(
-                                    program,
-                                    Some(table_references),
-                                    expr,
-                                    target_reg,
-                                    &t_ctx.resolver,
-                                )
-                            };
-                            translate_result?;
-                            if table_column.notnull() && !skip_notnull_checks {
-                                let notnull_conflict = if program.flags.has_statement_conflict() {
-                                    or_conflict
-                                } else {
-                                    table_column
-                                        .notnull_conflict_clause
-                                        .unwrap_or(ResolveType::Abort)
-                                };
-                                emit_notnull_constraint_check(
-                                    program,
-                                    table_references,
-                                    target_reg,
-                                    table_column,
-                                    column_ctx.table_name(),
-                                    notnull_conflict,
-                                    skip_row_label,
-                                    &t_ctx.resolver,
-                                )?;
-                            }
-                            Ok(())
-                        },
-                    )?;
+                    translate_result?;
+                    if table_column.notnull()
+                        && !table_column.is_virtual_generated()
+                        && !skip_notnull_checks
+                    {
+                        let notnull_conflict = effective_notnull_conflict(program, table_column);
+                        emit_notnull_constraint_check(
+                            program,
+                            table_references,
+                            target_reg,
+                            defaults
+                                .iter()
+                                .find_map(|(column, expr)| (*column == idx).then_some(expr)),
+                            table_column,
+                            column_ctx.table_name(),
+                            notnull_conflict,
+                            skip_row_label,
+                            &t_ctx.resolver,
+                        )?;
+                    }
                 }
 
                 if let Some(cdc_updates_register) = column_ctx.cdc_updates_register {
@@ -912,6 +965,14 @@ fn emit_update_column_values<'a>(
                             extra_amount: 0,
                         });
                     }
+                }
+            }
+        } else if affected_virtual {
+            if !skip_set_clauses {
+                if let Some(cdc_updates_register) = column_ctx.cdc_updates_register {
+                    let change_bit_reg = cdc_updates_register + idx;
+                    program.emit_bool(true, change_bit_reg);
+                    program.mark_last_insn_constant();
                 }
             }
         } else {
@@ -969,21 +1030,21 @@ fn emit_update_column_values<'a>(
     Ok(())
 }
 
-/// Emit NOT NULL constraint checks for SET clause columns after BEFORE triggers have fired.
-/// This is deferred from the first `emit_update_column_values` call so that triggers
-/// run before constraint checks, matching SQLite's behavior.
+/// Emit NOT NULL checks skipped by the first SET-value pass when this UPDATE
+/// has triggers. The deferred position lets BEFORE triggers stop the row first;
+/// statements with only AFTER triggers still check before writing the row.
 fn emit_deferred_notnull_checks<'a>(
     program: &mut ProgramBuilder,
     table_references: &mut TableReferences,
     target_table: &Arc<JoinedTable>,
     updated_column_indices: &ColumnMask,
+    defaults: &[(usize, PlanExpr)],
     column_ctx: &UpdateColumnCtx<'_>,
     skip_row_label: BranchOffset,
     t_ctx: &mut TranslateCtx<'a>,
 ) -> crate::Result<()> {
-    let or_conflict = program.resolve_type;
     for (idx, table_column) in target_table.table.columns().iter().enumerate() {
-        if !table_column.notnull() {
+        if !table_column.notnull() || table_column.is_virtual_generated() {
             continue;
         }
         // Only check columns that are in SET clauses
@@ -991,18 +1052,75 @@ fn emit_deferred_notnull_checks<'a>(
             continue;
         }
         let target_reg = column_ctx.layout.to_register(column_ctx.start, idx);
+        let notnull_conflict = effective_notnull_conflict(program, table_column);
         emit_notnull_constraint_check(
             program,
             table_references,
             target_reg,
+            defaults
+                .iter()
+                .find_map(|(column, expr)| (*column == idx).then_some(expr)),
             table_column,
             column_ctx.table_name(),
-            or_conflict,
+            notnull_conflict,
             skip_row_label,
             &t_ctx.resolver,
         )?;
     }
     Ok(())
+}
+
+/// Enforce NOT NULL after affected virtual columns have been recomputed from
+/// the final NEW row image. Evaluating these constraints while SET expressions
+/// are loaded would read the old cursor image and miss transitive generated
+/// dependencies.
+fn emit_affected_virtual_notnull_checks<'a>(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    target_table: &JoinedTable,
+    affected_columns: &ColumnMask,
+    column_ctx: &UpdateColumnCtx<'_>,
+    skip_row_label: BranchOffset,
+    t_ctx: &TranslateCtx<'a>,
+) -> crate::Result<()> {
+    for (idx, column) in target_table.table.columns().iter().enumerate() {
+        if !affected_columns.get(idx) || !column.is_virtual_generated() || !column.notnull() {
+            continue;
+        }
+        let target_reg = column_ctx.layout.to_register(column_ctx.start, idx);
+        let notnull_conflict = effective_notnull_conflict(program, column);
+        emit_notnull_constraint_check(
+            program,
+            table_references,
+            target_reg,
+            None,
+            column,
+            column_ctx.table_name(),
+            notnull_conflict,
+            skip_row_label,
+            &t_ctx.resolver,
+        )?;
+    }
+    Ok(())
+}
+
+fn emit_affected_virtual_cdc_values(
+    program: &mut ProgramBuilder,
+    column_ctx: &UpdateColumnCtx<'_>,
+) {
+    let Some(cdc_updates_register) = column_ctx.cdc_updates_register else {
+        return;
+    };
+    for (idx, column) in column_ctx.target_table.table.columns().iter().enumerate() {
+        if !column_ctx.affected_columns.get(idx) || !column.is_virtual_generated() {
+            continue;
+        }
+        program.emit_insn(Insn::Copy {
+            src_reg: column_ctx.layout.to_register(column_ctx.start, idx),
+            dst_reg: cdc_updates_register + column_ctx.col_len() + idx,
+            extra_amount: 0,
+        });
+    }
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -1021,6 +1139,7 @@ fn emit_update_insns<'a>(
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
     set_clauses: &[UpdateSetClause],
+    defaults: &[(usize, PlanExpr)],
     cdc_update_alter_statement: Option<&str>,
     indexes_to_update: &[Arc<Index>],
     returning: Option<&'a Vec<ResultSetColumn>>,
@@ -1053,8 +1172,8 @@ fn emit_update_insns<'a>(
         Operation::Scan(Scan::BTreeTable { index, .. }) => (
             index.as_ref().map(|index| {
                 (
-                    index.clone(),
-                    program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
+                    index.handle(),
+                    program.resolve_cursor_id(&CursorKey::index(internal_id, index.handle())),
                 )
             }),
             false,
@@ -1071,8 +1190,8 @@ fn emit_update_insns<'a>(
                 index: Some(index), ..
             } => (
                 Some((
-                    index.clone(),
-                    program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
+                    index.handle(),
+                    program.resolve_cursor_id(&CursorKey::index(internal_id, index.handle())),
                 )),
                 false,
             ),
@@ -1251,6 +1370,7 @@ fn emit_update_insns<'a>(
         program,
         table_references,
         set_clauses,
+        defaults,
         &column_ctx,
         t_ctx,
         skip_set_clauses,
@@ -1345,20 +1465,27 @@ fn emit_update_insns<'a>(
 
                 // Compute virtual columns for NEW values
                 //TODO only emit required virtual columns
-                if let Table::BTree(ref btree) = target_table.table {
+                if let Table::BTree(_) = &target_table.table {
                     let new_ctx =
                         DmlColumnContext::layout(columns, start, new_rowid_reg, layout.clone());
-                    compute_virtual_columns(
+                    compute_planned_virtual_columns(
                         program,
-                        &btree.columns_topo_sort()?,
+                        target_table.as_ref(),
                         &new_ctx,
                         &t_ctx.resolver,
-                        btree,
                     )?;
                 }
 
-                let new_registers = (0..col_len)
-                    .map(|i| layout.to_register(start, i))
+                let new_registers = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, column)| {
+                        if column.is_rowid_alias() {
+                            new_rowid_reg
+                        } else {
+                            layout.to_register(start, i)
+                        }
+                    })
                     .chain(std::iter::once(new_rowid_reg))
                     .collect();
 
@@ -1369,6 +1496,7 @@ fn emit_update_insns<'a>(
                 let trigger_ctx = update_trigger_context(
                     program,
                     &btree_table,
+                    &target_table.read_programs,
                     Some(new_registers),
                     Some(old_registers.clone()),
                     or_conflict,
@@ -1443,21 +1571,26 @@ fn emit_update_insns<'a>(
             program,
             table_references,
             set_clauses,
+            defaults,
             &column_ctx,
             t_ctx,
             skip_set_clauses,
             skip_row_label,
             false,
         )?;
+    }
 
-        // Now emit NOT NULL checks for SET clause columns that were deferred
-        // from the first emit_update_column_values call. In SQLite, NOT NULL
-        // constraint checks happen after BEFORE triggers fire.
+    if has_any_update_triggers {
+        // NOT NULL checks for SET columns were deferred so a BEFORE trigger can
+        // stop the row before its pending NEW image is rejected. This also
+        // covers statements that only have AFTER triggers: their checks were
+        // skipped by the shared first pass and must still run before the write.
         emit_deferred_notnull_checks(
             program,
             table_references,
             &target_table,
             &updated_column_indices,
+            defaults,
             &column_ctx,
             skip_row_label,
             t_ctx,
@@ -1482,49 +1615,51 @@ fn emit_update_insns<'a>(
         }
     }
 
-    // Populate register-to-affinity map for expression index evaluation.
-    // When column references are rewritten to Expr::Register during UPDATE, comparison
-    // operators need the original column affinity. This is set once here and cleared at
-    // the end of the function.
-    {
-        let columns = target_table.table.columns();
-        for (idx, col) in columns.iter().enumerate() {
-            t_ctx
-                .resolver
-                .register_affinities
-                .insert(layout.to_register(start, idx), col.affinity());
-        }
-        t_ctx
-            .resolver
-            .register_affinities
-            .insert(effective_rowid_reg, Affinity::Integer);
-    }
-
-    let update_affects_virtual_columns = affected_columns.count() > updated_column_indices.count();
+    let update_affects_virtual_columns = target_table
+        .table
+        .columns()
+        .iter()
+        .enumerate()
+        .any(|(idx, column)| affected_columns.get(idx) && column.is_virtual_generated());
     let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
     if let Table::BTree(ref btree) = target_table.table {
-        let has_check_constraints = !btree.check_constraints.is_empty();
+        let has_check_constraints = !target_table.check_constraints.is_empty();
         let cols = btree.columns();
-        let virtual_col_names: HashSet<String> = cols
-            .iter()
-            .filter(|c| c.is_virtual_generated())
-            .filter_map(|c| c.name.as_ref().map(|n| normalize_ident(n)))
-            .collect();
-        let expr_references_virtual = |expr: &ast::Expr| {
-            !virtual_col_names.is_empty()
-                && !collect_column_dependencies_of_expr(expr, cols).is_disjoint(&virtual_col_names)
+        let expr_references_virtual = |expr: &crate::translate::plan_expr::PlanExpr| {
+            crate::translate::plan_expr::plan_expr_dependencies(expr).is_ok_and(|dependencies| {
+                dependencies.source_uses.iter().any(|(source, column)| {
+                    *source == target_table.internal_id
+                        && match column {
+                            crate::translate::plan_expr::PlanColumnUse::Column(column) => cols
+                                .get(*column)
+                                .is_some_and(|column| column.is_virtual_generated()),
+                            crate::translate::plan_expr::PlanColumnUse::RowId => false,
+                        }
+                })
+            })
         };
         let index_references_virtual_column = indexes_to_update.iter().any(|idx| {
             idx.columns.iter().any(|col| {
                 if col.pos_in_table != EXPR_INDEX_SENTINEL {
                     cols[col.pos_in_table].is_virtual_generated()
                 } else {
-                    col.expr.as_deref().is_some_and(expr_references_virtual)
+                    target_table
+                        .plan_index_expressions(idx)
+                        .and_then(|planned| {
+                            planned
+                                .columns
+                                .get(
+                                    idx.columns
+                                        .iter()
+                                        .position(|candidate| std::ptr::eq(candidate, col))?,
+                                )?
+                                .as_ref()
+                        })
+                        .is_some_and(&expr_references_virtual)
                 }
-            }) || idx
-                .where_clause
-                .as_deref()
-                .is_some_and(expr_references_virtual)
+            }) || target_table
+                .partial_index_predicate(idx)
+                .is_some_and(&expr_references_virtual)
         });
 
         if update_affects_virtual_columns
@@ -1539,14 +1674,26 @@ fn emit_update_insns<'a>(
             //TODO don't emit all virtual columns
             let dml_ctx =
                 DmlColumnContext::layout(columns, start, effective_rowid_reg, layout.clone());
-            compute_virtual_columns(
+            compute_planned_virtual_columns(
                 program,
-                &btree.columns_topo_sort()?,
+                target_table.as_ref(),
                 &dml_ctx,
                 &t_ctx.resolver,
-                btree,
             )?;
         }
+    }
+
+    if update_affects_virtual_columns {
+        emit_affected_virtual_cdc_values(program, &column_ctx);
+        emit_affected_virtual_notnull_checks(
+            program,
+            table_references,
+            target_table.as_ref(),
+            &affected_columns,
+            &column_ctx,
+            skip_row_label,
+            t_ctx,
+        )?;
     }
 
     let target_is_strict = target_table
@@ -1658,14 +1805,14 @@ fn emit_update_insns<'a>(
 
             // Encode only SET clause columns. Non-SET columns were read from disk
             // and are already encoded; re-encoding them would corrupt data.
-            crate::translate::expr::emit_custom_type_encode_columns(
+            emit_plan_source_encode_columns(
                 program,
-                &t_ctx.resolver,
-                btree_table.columns(),
+                Some(table_references),
+                target_table.as_ref(),
                 start,
                 Some(&set_col_indices),
-                table_name,
                 &layout,
+                &t_ctx.resolver,
             )?;
 
             // Post-encode TypeCheck: validate encoded values match storage type.
@@ -1680,66 +1827,48 @@ fn emit_update_insns<'a>(
             });
         }
 
-        if !btree_table.check_constraints.is_empty() {
-            // SQLite only evaluates CHECK constraints that reference at least one
-            // column in the SET clause. Build a set of updated column names to filter.
-            let mut updated_col_names: HashSet<String> = btree_table
-                .columns()
-                .iter()
-                .enumerate()
-                .filter(|(idx, _)| affected_columns.get(*idx))
-                .filter_map(|(_, col)| col.name.as_deref())
-                .map(normalize_ident)
-                .collect();
-
-            // If the rowid is being updated (either directly via ROWID_SENTINEL or
-            // through a rowid alias column), also include the rowid pseudo-column
-            // names so that CHECK(rowid > 0) etc. are properly triggered.
-            if updates_rowid {
-                for name in ROWID_STRS {
-                    updated_col_names.insert(name.to_string());
+        if !target_table.check_constraints.is_empty() {
+            // SQLite only evaluates CHECK constraints that depend on the row
+            // fields changed by this UPDATE.
+            let mut relevant_checks = Vec::new();
+            for check in &target_table.check_constraints {
+                let dependencies = plan_expr_dependencies(&check.expression)?;
+                let references_updated_field =
+                    dependencies.source_uses.iter().any(|(source, column)| {
+                        *source == target_table.internal_id
+                            && match column {
+                                PlanColumnUse::Column(column) => {
+                                    affected_columns.get(*column)
+                                        || (updates_rowid
+                                            && btree_table
+                                                .columns()
+                                                .get(*column)
+                                                .is_some_and(|column| column.is_rowid_alias()))
+                                }
+                                PlanColumnUse::RowId => updates_rowid,
+                            }
+                    });
+                if references_updated_field {
+                    relevant_checks.push(check);
                 }
             }
 
-            let relevant_checks: Vec<CheckConstraint> = btree_table
-                .check_constraints
-                .iter()
-                .filter(|cc| {
-                    check_expr_references_updated_columns(
-                        &cc.expr,
-                        |idx| affected_columns.get(idx),
-                        &updated_col_names,
-                        updates_rowid,
-                    )
-                })
-                .cloned()
-                .collect();
-
-            let check_constraint_tables =
-                TableReferences::new(vec![target_table.as_ref().clone()], vec![]);
+            let dml_ctx = DmlColumnContext::layout(
+                btree_table.columns(),
+                start,
+                effective_rowid_reg,
+                layout.clone(),
+            );
             emit_check_constraints(
                 program,
-                &relevant_checks,
-                &mut t_ctx.resolver,
-                &btree_table.name,
+                target_table.as_ref(),
+                relevant_checks,
+                &dml_ctx,
                 effective_rowid_reg,
-                btree_table
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, col)| {
-                        col.name.as_deref().map(|n| {
-                            if col.is_rowid_alias() {
-                                (n, effective_rowid_reg)
-                            } else {
-                                (n, layout.to_register(start, idx))
-                            }
-                        })
-                    }),
+                &t_ctx.resolver,
                 connection,
                 or_conflict,
                 skip_row_label,
-                Some(&check_constraint_tables),
             )?;
         }
     }
@@ -1766,17 +1895,22 @@ fn emit_update_insns<'a>(
     }
 
     let mut idx_phase_ctxs: Vec<IndexUpdatePhaseCtx> = Vec::with_capacity(indexes_to_update.len());
+    let new_image_bindings =
+        update_new_image_bindings(&target_table, start, effective_rowid_reg, &layout);
 
     // ---- Phase 1: Constraint checks + new key build ----
     let mut seen_replace = false;
     for (index, (idx_cursor_id, record_reg)) in indexes_to_update.iter().zip(index_cursors) {
+        let planned_index = target_table
+            .plan_index_expressions(index)
+            .expect("semantic HIR provided index expressions for every updated index");
         let (old_satisfies_where, new_satisfies_where) = if index.where_clause.is_some() {
             let where_clause = target_table
-                .bound_partial_index_where(index)
-                .expect("binder provided the partial-index predicate")
+                .partial_index_predicate(index)
+                .expect("semantic HIR provided the partial-index predicate")
                 .clone();
             let old_satisfied_reg = program.alloc_register();
-            translate_expr_no_constant_opt(
+            translate_plan_expr_no_constant_opt(
                 program,
                 Some(table_references),
                 &where_clause,
@@ -1785,37 +1919,23 @@ fn emit_update_insns<'a>(
                 NoConstantOptReason::RegisterReuse,
             )?;
 
-            // Evaluate the partial index predicate against the NEW row image using the
-            // DML self-table register mapping.
-            let new_where_expr = index
-                .where_clause
-                .as_ref()
-                .expect("checked where clause to exist")
-                .as_ref()
-                .clone();
-            let columns = target_table.table.columns();
-            let mut column_regs: Vec<usize> = columns
-                .iter()
-                .enumerate()
-                .map(|(i, col)| {
-                    if col.is_rowid_alias() {
-                        effective_rowid_reg
-                    } else {
-                        layout.to_register(start, i)
-                    }
-                })
-                .collect();
+            // Evaluate the same resolved predicate against the NEW row image.
+            // Runtime bindings redirect this source from its table cursor to
+            // the registers holding the pending row without changing the plan expression.
             let new_satisfied_reg = program.alloc_register();
-            let bt = target_table.table.require_btree()?;
-            emit_dml_expr_index_value(
-                program,
-                &t_ctx.resolver,
-                new_where_expr,
-                columns,
-                &mut column_regs,
-                &bt,
-                new_satisfied_reg,
-            )?;
+            t_ctx
+                .resolver
+                .with_plan_runtime_bindings(new_image_bindings.clone(), |resolver| {
+                    translate_plan_expr_no_constant_opt(
+                        program,
+                        Some(table_references),
+                        &where_clause,
+                        new_satisfied_reg,
+                        resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
+                    Ok(())
+                })?;
 
             // now we have two registers that tell us whether or not the old and new values satisfy
             // the partial index predicate, and we can use those to decide whether or not to
@@ -1830,22 +1950,21 @@ fn emit_update_insns<'a>(
         let idx_start_reg = program.alloc_registers(num_cols + 1);
         let rowid_reg = effective_rowid_reg;
 
-        for (i, col) in index.columns.iter().enumerate() {
-            emit_index_column_value_new_image(
-                program,
-                &t_ctx.resolver,
-                target_table.table.columns(),
-                start,
-                rowid_reg,
-                col,
-                idx_start_reg + i,
-                &layout,
-                &target_table
-                    .table
-                    .btree()
-                    .expect("expected btree table: no indexes on virtual tables"),
-            )?;
-        }
+        t_ctx
+            .resolver
+            .with_plan_runtime_bindings(new_image_bindings.clone(), |resolver| {
+                for i in 0..index.columns.len() {
+                    emit_index_column_value_new_image(
+                        program,
+                        resolver,
+                        &target_table,
+                        &planned_index.index,
+                        i,
+                        idx_start_reg + i,
+                    )?;
+                }
+                Ok(())
+            })?;
         // last register is the rowid
         program.emit_insn(Insn::Copy {
             src_reg: rowid_reg,
@@ -2119,7 +2238,7 @@ fn emit_update_insns<'a>(
                 };
                 deferred_new_key_plans = emit_fk_update_parent_actions(
                     program,
-                    &table_btree,
+                    target_table.as_ref(),
                     indexes_to_update.iter(),
                     target_table_cursor_id,
                     beg,
@@ -2128,7 +2247,6 @@ fn emit_update_insns<'a>(
                     rowid_set_clause_reg,
                     &updated_column_indices,
                     new_key_probe_mode,
-                    update_database_id,
                     &t_ctx.resolver,
                 )?;
             }
@@ -2140,17 +2258,15 @@ fn emit_update_insns<'a>(
     // before the physical rewrite, for the same counter and rollback reasons as
     // the parent-side checks above.
     if connection.foreign_keys_enabled() {
-        if let Some(table_btree) = target_table.table.btree() {
+        if target_table.table.btree().is_some() {
             if t_ctx.resolver.schema().has_child_fks(table_name) {
                 emit_fk_child_update_counters(
                     program,
-                    &table_btree,
-                    table_name,
+                    target_table.as_ref(),
                     target_table_cursor_id,
                     start,
                     effective_rowid_reg,
                     &affected_columns,
-                    update_database_id,
                     &t_ctx.resolver,
                     &layout,
                 )?;
@@ -2161,6 +2277,9 @@ fn emit_update_insns<'a>(
     // ---- Phase 2: Delete old index entries ----
     // All constraint checks passed. Now safe to mutate indexes.
     for (index, ctx) in indexes_to_update.iter().zip(idx_phase_ctxs.iter()) {
+        let planned_index = target_table
+            .plan_index_expressions(index)
+            .expect("semantic HIR provided index expressions for every updated index");
         let mut skip_delete_label = None;
 
         if let Some(old_satisfied) = ctx.old_satisfies_where {
@@ -2174,14 +2293,15 @@ fn emit_update_insns<'a>(
 
         let num_regs = index.columns.len() + 1;
         let delete_start_reg = program.alloc_registers(num_regs);
-        for (reg_offset, column_index) in index.columns.iter().enumerate() {
+        for reg_offset in 0..index.columns.len() {
             emit_index_column_value_old_image(
                 program,
                 &t_ctx.resolver,
                 table_references,
+                &target_table,
+                &planned_index.index,
+                reg_offset,
                 target_table_cursor_id,
-                internal_id,
-                column_index,
                 delete_start_reg + reg_offset,
             )?;
         }
@@ -2375,17 +2495,17 @@ fn emit_update_insns<'a>(
                 fire_fk_update_actions(
                     program,
                     &mut t_ctx.resolver,
-                    table_name,
+                    target_table.as_ref(),
                     beg, // old_rowid_reg
                     old_values_start,
                     start, // new_values_start
                     effective_rowid_reg,
                     connection,
-                    update_database_id,
                 )?;
             }
 
             // Fire AFTER UPDATE triggers
+            let mut fired_after_update_trigger = false;
             if let Some(btree_table) = target_table.table.btree() {
                 let relevant_triggers = get_triggers_including_temp(
                     &t_ctx.resolver,
@@ -2400,18 +2520,17 @@ fn emit_update_insns<'a>(
 
                     // Compute VIRTUAL columns for NEW values
                     //TODO only emit required virtual columns
-                    let bt = target_table.table.btree().ok_or_else(|| {
-                        crate::LimboError::InternalError(
-                            "UPDATE on virtual table has no btree".into(),
-                        )
-                    })?;
-                    let new_ctx = DmlColumnContext::layout(columns, start, beg, layout.clone());
-                    compute_virtual_columns(
+                    let new_ctx = DmlColumnContext::layout(
+                        columns,
+                        start,
+                        effective_rowid_reg,
+                        layout.clone(),
+                    );
+                    compute_planned_virtual_columns(
                         program,
-                        &btree_table.columns_topo_sort()?,
+                        target_table.as_ref(),
                         &new_ctx,
                         &t_ctx.resolver,
-                        &bt,
                     )?;
 
                     // Compute VIRTUAL columns for OLD values if we have preserved OLD registers
@@ -2419,19 +2538,26 @@ fn emit_update_insns<'a>(
                         let pairs = columns.iter().zip(old_regs.iter().copied());
                         //TODO only emit required virtual columns
                         let old_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
-                        compute_virtual_columns(
+                        compute_planned_virtual_columns(
                             program,
-                            &btree_table.columns_topo_sort()?,
+                            target_table.as_ref(),
                             &old_ctx,
                             &t_ctx.resolver,
-                            &bt,
                         )?;
                     }
 
                     // Build raw NEW registers. Values are encoded at this point;
                     // fire_trigger will decode them via decode_trigger_registers.
-                    let new_registers_after: Vec<usize> = (0..col_len)
-                        .map(|i| layout.to_register(start, i))
+                    let new_registers_after: Vec<usize> = columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, column)| {
+                            if column.is_rowid_alias() {
+                                effective_rowid_reg
+                            } else {
+                                layout.to_register(start, i)
+                            }
+                        })
                         .chain(std::iter::once(effective_rowid_reg))
                         .collect();
 
@@ -2442,6 +2568,7 @@ fn emit_update_insns<'a>(
                     let trigger_ctx_after = update_trigger_context(
                         program,
                         &btree_table,
+                        &target_table.read_programs,
                         Some(new_registers_after),
                         old_registers_after,
                         or_conflict,
@@ -2463,16 +2590,70 @@ fn emit_update_insns<'a>(
                         )?;
                     }
                     program.preassign_label_to_next_insn(after_trigger_done);
+                    fired_after_update_trigger = true;
                 }
+            }
+
+            // Turso exposes same-row writes made by AFTER UPDATE triggers through
+            // UPDATE RETURNING. Refresh the register row before RETURNING is
+            // evaluated. If the trigger deleted or moved the row, keep the outer
+            // UPDATE image rather than reading from an unrelated cursor position.
+            if fired_after_update_trigger
+                && returning
+                    .as_ref()
+                    .is_some_and(|returning_columns| !returning_columns.is_empty())
+            {
+                let row_missing = program.allocate_label();
+                program.emit_insn(Insn::NotExists {
+                    cursor: target_table_cursor_id,
+                    rowid_reg: effective_rowid_reg,
+                    target_pc: row_missing,
+                });
+                let columns = target_table.table.columns();
+                for (i, column) in columns.iter().enumerate() {
+                    if column.is_virtual_generated() {
+                        continue;
+                    }
+                    program.emit_column_or_rowid(
+                        target_table_cursor_id,
+                        i,
+                        layout.to_register(start, i),
+                    );
+                }
+                if target_table
+                    .table
+                    .btree()
+                    .is_some_and(|table| table.has_virtual_columns())
+                {
+                    let refreshed_ctx = DmlColumnContext::layout(
+                        columns,
+                        start,
+                        effective_rowid_reg,
+                        layout.clone(),
+                    );
+                    compute_planned_virtual_columns(
+                        program,
+                        target_table.as_ref(),
+                        &refreshed_ctx,
+                        &t_ctx.resolver,
+                    )?;
+                }
+                program.preassign_label_to_next_insn(row_missing);
             }
 
             let has_post_write_returning_subqueries = non_from_clause_subqueries
                 .iter()
                 .any(|s| !s.has_been_evaluated() && s.is_post_write_returning());
             if has_post_write_returning_subqueries {
+                let returning_columns = returning.ok_or_else(|| {
+                    crate::LimboError::InternalError(
+                        "UPDATE has RETURNING subqueries without RETURNING columns".to_string(),
+                    )
+                })?;
                 let cache_state = seed_returning_row_image_in_cache(
-                    program,
                     table_references,
+                    returning_columns,
+                    non_from_clause_subqueries,
                     start,
                     effective_rowid_reg,
                     &mut t_ctx.resolver,
@@ -2619,7 +2800,5 @@ fn emit_update_insns<'a>(
     }
     program.preassign_label_to_next_insn(trigger_ignore_jump_label);
 
-    t_ctx.resolver.register_affinities.clear();
-    t_ctx.resolver.register_collations.clear();
     Ok(())
 }

@@ -444,7 +444,7 @@ pub(super) struct AutoIndexResult {
 }
 
 pub(super) struct AutoIndexBuild<'a> {
-    pub(super) index: &'a Arc<Index>,
+    pub(super) index: &'a Index,
     pub(super) table_cursor_id: CursorID,
     pub(super) index_cursor_id: CursorID,
     pub(super) table_has_rowid: bool,
@@ -453,7 +453,7 @@ pub(super) struct AutoIndexBuild<'a> {
     pub(super) affinity_str: Option<&'a Arc<String>>,
     /// Table columns needed for transparent virtual column computation.
     pub(super) table_columns: Option<&'a [crate::schema::Column]>,
-    pub(super) table_ref_id: turso_parser::ast::TableInternalId,
+    pub(super) table_ref_id: crate::translate::plan_expr::PlanSourceId,
     pub(super) table_references: &'a TableReferences,
     pub(super) resolver: &'a Resolver<'a>,
 }

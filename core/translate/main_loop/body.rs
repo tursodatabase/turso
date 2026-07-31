@@ -1,4 +1,10 @@
+use crate::translate::expr::{
+    translate_plan_condition_expr, translate_plan_expr, translate_plan_expr_no_constant_opt,
+};
 use crate::translate::plan::SimpleAggregate;
+use crate::translate::plan_expr::{
+    plan_expr_dependencies, plan_exprs_are_equivalent, walk_plan_expr, PlanExpr, PlanWalkControl,
+};
 use crate::translate::{
     aggregation::agg_arg_collation,
     order_by::{custom_type_comparator, EmitOrderBy},
@@ -155,7 +161,7 @@ fn emit_loop_source<'a>(
             for (expr, _) in t_ctx.non_aggregate_expressions.iter() {
                 let key_reg = cur_reg;
                 cur_reg += 1;
-                translate_expr(
+                translate_plan_expr(
                     program,
                     Some(&plan.table_references),
                     expr,
@@ -176,7 +182,7 @@ fn emit_loop_source<'a>(
                     for leaf_expr in t_ctx.agg_leaf_columns.iter() {
                         let reg = cur_reg;
                         cur_reg += 1;
-                        translate_expr(
+                        translate_plan_expr(
                             program,
                             Some(&plan.table_references),
                             leaf_expr,
@@ -197,7 +203,7 @@ fn emit_loop_source<'a>(
                         for expr in agg.args.iter() {
                             let agg_reg = cur_reg;
                             cur_reg += 1;
-                            translate_expr(
+                            translate_plan_expr(
                                 program,
                                 Some(&plan.table_references),
                                 expr,
@@ -228,7 +234,7 @@ fn emit_loop_source<'a>(
                 .expect("aggregate registers must be initialized");
             if let Some(SimpleAggregate::MinMax(min_max)) = &plan.simple_aggregate {
                 let expr_reg = program.alloc_register();
-                translate_expr(
+                translate_plan_expr(
                     program,
                     Some(&plan.table_references),
                     &min_max.argument,
@@ -251,13 +257,8 @@ fn emit_loop_source<'a>(
                     None
                 };
 
-                let arg_collation =
-                    agg_arg_collation(&plan.table_references, &min_max.argument, &t_ctx.resolver);
-                let comparator = custom_type_comparator(
-                    &min_max.argument,
-                    &plan.table_references,
-                    t_ctx.resolver.schema(),
-                );
+                let arg_collation = agg_arg_collation(&min_max.argument, plan)?;
+                let comparator = custom_type_comparator(&min_max.argument, plan);
                 program.emit_insn(Insn::AggStep {
                     acc_reg: start_reg,
                     col: expr_reg,
@@ -287,7 +288,7 @@ fn emit_loop_source<'a>(
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
                     let label = program.allocate_label();
                     let filter_reg = program.alloc_register();
-                    translate_expr(
+                    translate_plan_expr(
                         program,
                         Some(&plan.table_references),
                         filter_expr,
@@ -310,6 +311,7 @@ fn emit_loop_source<'a>(
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness),
                     reg,
                     &t_ctx.resolver,
+                    plan,
                     agg.fraction_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
@@ -351,7 +353,7 @@ fn emit_loop_source<'a>(
                 // Must use no_constant_opt to prevent constant hoisting: in compound
                 // selects (UNION ALL), all branches share the same result registers,
                 // so hoisted constants from the last branch overwrite earlier branches.
-                translate_expr_no_constant_opt(
+                translate_plan_expr_no_constant_opt(
                     program,
                     Some(&plan.table_references),
                     &rc.expr,
@@ -364,41 +366,48 @@ fn emit_loop_source<'a>(
             // For result columns that contain aggregates but also reference
             // non-aggregate columns (e.g. CASE WHEN SUM(1) THEN a ELSE b END),
             // pre-read those column references while the cursor is still valid.
-            // They are cached in expr_to_reg_cache so that when the full
-            // expression is evaluated after AggFinal, translate_expr finds
+            // They are cached in the plan-expression register cache so that when the full
+            // expression is evaluated after AggFinal, expression translation finds
             // the cached values instead of reading from the exhausted cursor.
             for rc in plan
                 .result_columns
                 .iter()
                 .filter(|rc| rc.contains_aggregates)
             {
-                walk_expr(&rc.expr, &mut |expr: &Expr| -> Result<WalkControl> {
-                    match expr {
-                        Expr::Column { .. } | Expr::RowId { .. } => {
-                            let reg = program.alloc_register();
-                            translate_expr(
-                                program,
-                                Some(&plan.table_references),
-                                expr,
-                                reg,
-                                &t_ctx.resolver,
-                            )?;
-                            t_ctx.resolver.cache_scalar_expr_reg(
-                                Cow::Owned(expr.clone()),
-                                reg,
-                                false,
-                                &plan.table_references,
-                            )?;
-                            Ok(WalkControl::SkipChildren)
-                        }
-                        _ => {
-                            if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
-                                return Ok(WalkControl::SkipChildren);
+                walk_plan_expr(
+                    &rc.expr,
+                    &mut |expr: &PlanExpr| -> Result<PlanWalkControl> {
+                        match expr {
+                            PlanExpr::Column(_)
+                            | PlanExpr::MergedColumn(_)
+                            | PlanExpr::RowId(_) => {
+                                let reg = program.alloc_register();
+                                translate_plan_expr(
+                                    program,
+                                    Some(&plan.table_references),
+                                    expr,
+                                    reg,
+                                    &t_ctx.resolver,
+                                )?;
+                                t_ctx.resolver.cache_plan_scalar_expr_reg(
+                                    expr.clone(),
+                                    reg,
+                                    false,
+                                    plan,
+                                )?;
+                                Ok(PlanWalkControl::SkipChildren)
                             }
-                            Ok(WalkControl::Continue)
+                            _ => {
+                                if plan.aggregates.iter().any(|aggregate| {
+                                    plan_exprs_are_equivalent(&aggregate.original_expr, expr)
+                                }) {
+                                    return Ok(PlanWalkControl::SkipChildren);
+                                }
+                                Ok(PlanWalkControl::Continue)
+                            }
                         }
-                    }
-                })?;
+                    },
+                )?;
             }
 
             if let Some(label) = label_emit_nonagg_only_once {
@@ -488,7 +497,8 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
         .iter()
         .filter(|c| !c.consumed && c.from_outer_join.is_none())
         .filter(|c| {
-            !has_gosub || expr_tables_subset_of(&c.expr, &plan.table_references, &allowed_tables)
+            !has_gosub
+                || plan_expr_tables_subset_of(&c.expr, &plan.table_references, &allowed_tables)
         })
     {
         let jump_target_when_true = program.allocate_label();
@@ -498,9 +508,9 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
             jump_target_when_false: skip_label,
             jump_target_when_null: skip_label,
         };
-        translate_condition_expr(
+        translate_plan_condition_expr(
             program,
-            &plan.table_references,
+            Some(&plan.table_references),
             &cond.expr,
             condition_metadata,
             &t_ctx.resolver,
@@ -517,4 +527,22 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
         emit_loop(program, t_ctx, plan)?;
     }
     Ok(())
+}
+
+fn plan_expr_tables_subset_of(
+    expr: &PlanExpr,
+    table_references: &TableReferences,
+    allowed: &TableMask,
+) -> bool {
+    let Ok(dependencies) = plan_expr_dependencies(expr) else {
+        return false;
+    };
+    let all_sources_are_allowed = dependencies.sources().all(|source| {
+        table_references
+            .joined_tables()
+            .iter()
+            .position(|table| table.internal_id == source)
+            .is_none_or(|index| allowed.get(index))
+    });
+    all_sources_are_allowed
 }

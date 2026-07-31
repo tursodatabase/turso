@@ -15,11 +15,16 @@ use crate::{
         order_by::EmitOrderBy,
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
-            Operation, QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan,
-            SimpleAggregate,
+            Operation, QueryDestination, ResultColumnOrigin, Scan, Search, SeekKeyComponent,
+            SelectPlan, SimpleAggregate,
+        },
+        plan_expr::{
+            plan_expr_affinity, plan_expr_array_dimensions, plan_expr_explicit_collation,
+            plan_expr_type_fact, PlanExpr, PlanSourceId, PlanSubqueryExpr,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
+        semantic::hir::{OutputNameKind, ResolvedCollation},
         subquery::{emit_from_clause_subqueries, emit_non_from_clause_subqueries_for_eval_at},
         values::emit_values,
         window::{emit_window_flush, EmitWindow},
@@ -30,7 +35,6 @@ use crate::{
 };
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
-use turso_parser::ast::Expr;
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_select(
@@ -74,20 +78,67 @@ fn emit_program_for_select_with_inputs(
     Ok(())
 }
 
+fn ensure_plan_outputs_bound(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    outputs: &[ResultSetColumn],
+) -> usize {
+    if let Some(start_register) = resolver.bound_plan_outputs_start(outputs) {
+        return start_register;
+    }
+    let start_register = program.alloc_registers(outputs.len());
+    resolver.bind_plan_outputs(outputs, start_register);
+    start_register
+}
+
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_query<'a>(
     program: &mut ProgramBuilder,
     plan: &'a mut SelectPlan,
     t_ctx: &mut TranslateCtx<'a>,
 ) -> Result<usize> {
+    t_ctx
+        .resolver
+        .bind_plan_subqueries(&plan.non_from_clause_subqueries);
+
+    // Nested WHERE/ORDER BY/HAVING queries may read a SELECT alias before the
+    // owning row is finally emitted. Give every output a stable register now;
+    // the phase emitter materializes the current row or group value on demand.
+    // Hash-build materialization may have installed the range earlier so its
+    // cloned subqueries can read the same owner aliases.
+    let result_cols_start = match (
+        t_ctx.reg_result_cols_start,
+        t_ctx
+            .resolver
+            .bound_plan_outputs_start(&plan.result_columns),
+    ) {
+        (Some(context_start), Some(bound_start)) => {
+            assert_eq!(
+                context_start, bound_start,
+                "SELECT context and output bindings use different register ranges"
+            );
+            context_start
+        }
+        (Some(context_start), None) => {
+            t_ctx
+                .resolver
+                .bind_plan_outputs(&plan.result_columns, context_start);
+            context_start
+        }
+        (None, Some(bound_start)) => bound_start,
+        (None, None) => ensure_plan_outputs_bound(program, &t_ctx.resolver, &plan.result_columns),
+    };
+    t_ctx.reg_result_cols_start = Some(result_cols_start);
+    program.reg_result_cols_start = Some(result_cols_start);
+
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
     // Register parameters from EXISTS subquery result columns that were dropped
     // during semi/anti-join unnesting. No code is emitted for these, but the
-    // parameter slots must exist for bind-time validation to succeed.
-    for variable in &plan.phantom_params {
-        program.register_variable(variable);
+    // parameter slots must exist for final program validation to succeed.
+    for parameter in &plan.phantom_params {
+        program.register_plan_parameter(parameter);
     }
 
     // Evaluate uncorrelated subqueries as early as possible, because even LIMIT can reference a subquery.
@@ -112,23 +163,22 @@ pub fn emit_query<'a>(
     // Emit FROM clause subqueries first so the results can be read in the main query loop.
     emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references, &plan.join_order)?;
 
+    let has_group_by_exprs = plan
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| !gb.exprs.is_empty());
+
     // For non-grouped aggregation queries that also have non-aggregate columns,
     // we need to ensure non-aggregate columns are only emitted once.
     // This flag helps track whether we've already emitted these columns.
     let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
-        && plan.group_by.is_none()
+        && !has_group_by_exprs
         && plan.result_columns.iter().any(|c| !c.contains_aggregates);
 
     if has_ungrouped_nonagg_cols {
         let flag = program.alloc_register();
         program.emit_int(0, flag); // Initialize flag to 0 (not yet emitted)
         t_ctx.reg_nonagg_emit_once_flag = Some(flag);
-    }
-
-    // Allocate registers for result columns
-    if t_ctx.reg_result_cols_start.is_none() {
-        t_ctx.reg_result_cols_start = Some(program.alloc_registers(plan.result_columns.len()));
-        program.reg_result_cols_start = t_ctx.reg_result_cols_start
     }
 
     // For ungrouped aggregates with non-aggregate columns, initialize EXISTS subquery
@@ -144,22 +194,14 @@ pub fn emit_query<'a>(
         }
     }
 
-    let has_group_by_exprs = plan
-        .group_by
-        .as_ref()
-        .is_some_and(|gb| !gb.exprs.is_empty());
-
     // Initialize cursors and other resources needed for query execution
     if !plan.order_by.is_empty() {
         EmitOrderBy::init(
             program,
             t_ctx,
-            &plan.result_columns,
-            &plan.order_by,
-            &plan.table_references,
+            plan,
             has_group_by_exprs,
             plan.distinctness != Distinctness::NonDistinct,
-            &plan.aggregates,
         )?;
     }
 
@@ -217,6 +259,7 @@ pub fn emit_query<'a>(
             target_pc: after_main_loop_label,
         });
     }
+    t_ctx.capture_source_row_dependencies(plan)?;
     InitLoop::emit(
         program,
         t_ctx,
@@ -268,7 +311,7 @@ pub fn emit_query<'a>(
 
     let has_order_by = !plan.order_by.is_empty();
     let order_by_necessary = has_order_by && !plan.contains_constant_false_condition;
-    let mut grouped_output_subqueries = plan.non_from_clause_subqueries.clone();
+    let mut output_subqueries = plan.non_from_clause_subqueries.clone();
 
     // Handle GROUP BY and aggregation processing
     if has_group_by_exprs {
@@ -280,10 +323,10 @@ pub fn emit_query<'a>(
         if matches!(row_source, GroupByRowSource::Sorter { .. }) {
             group_by_agg_phase(program, t_ctx, plan)?;
         }
-        group_by_emit_row_phase(program, t_ctx, plan, &mut grouped_output_subqueries)?;
+        group_by_emit_row_phase(program, t_ctx, plan, &mut output_subqueries)?;
     } else if !plan.aggregates.is_empty() {
         // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
-        emit_ungrouped_aggregation(program, t_ctx, plan)?;
+        emit_ungrouped_aggregation(program, t_ctx, plan, &mut output_subqueries)?;
     } else if plan.window.is_some() {
         emit_window_flush(program, t_ctx, plan)?;
     }
@@ -303,7 +346,7 @@ struct MaterializationSpec {
     probe_table_idx: usize,
     mode: MaterializedBuildInputMode,
     prefix_tables: TableMask,
-    key_exprs: Vec<Expr>,
+    key_exprs: Vec<PlanExpr>,
     payload_columns: Vec<MaterializedColumnRef>,
 }
 
@@ -406,7 +449,7 @@ pub(crate) fn emit_materialized_build_inputs(
                 // Prior probe -> build chaining OR any multi-table prefix requires keys+payload
                 // so we do not lose multiplicity or correlation.
                 let payload_columns = collect_materialized_payload_columns(plan, &included_tables)?;
-                let key_exprs: Vec<Expr> = hash_join_op
+                let key_exprs: Vec<PlanExpr> = hash_join_op
                     .join_keys
                     .iter()
                     .map(|key| key.get_build_expr(&plan.where_clause).clone())
@@ -439,6 +482,13 @@ pub(crate) fn emit_materialized_build_inputs(
     }
 
     // Now we emit each of the materialization subplans into an ephemeral table.
+    if !materializations.is_empty() {
+        // Materialization subplans clone owner subqueries. Install the owner's
+        // runtime identities first so an alias correlation in a cloned query
+        // uses the same stable output range that emit_query will later reuse.
+        resolver.bind_plan_subqueries(&plan.non_from_clause_subqueries);
+        ensure_plan_outputs_bound(program, resolver, &plan.result_columns);
+    }
     for spec in materializations.iter() {
         let build_table = &plan.table_references.joined_tables()[spec.build_table_idx];
         let build_table_name = if build_table.table.get_name() == build_table.identifier {
@@ -450,7 +500,7 @@ pub(crate) fn emit_materialized_build_inputs(
                 build_table.identifier
             )
         };
-        let internal_id = program.table_reference_counter.next();
+        let internal_id = program.next_plan_source_id();
         let columns = match &spec.mode {
             MaterializedBuildInputMode::RowidOnly => {
                 std::iter::once(build_rowid_column()).try_collect()?
@@ -476,6 +526,7 @@ pub(crate) fn emit_materialized_build_inputs(
         // Build a plan that emits only rowids for the build table using the join prefix
         // that makes the hash join legal (including any earlier hash joins).
         let materialize_plan = build_materialized_build_input_plan(
+            program,
             plan,
             spec.build_table_idx,
             spec.probe_table_idx,
@@ -703,28 +754,32 @@ fn collect_materialized_payload_columns(
     included_tables: &TableMask,
 ) -> Result<Vec<MaterializedColumnRef>> {
     let mut payload_columns: Vec<MaterializedColumnRef> = Vec::new();
-    let mut seen: HashSet<MaterializedColumnRef> = HashSet::default();
+    let mut seen: HashSet<(PlanSourceId, Option<usize>)> = HashSet::default();
     for table_idx in included_tables.iter() {
         let table = &plan.table_references.joined_tables()[table_idx];
+        let dependency = plan.source_row_dependency(table.internal_id)?;
         for col_idx in table.col_used_mask.iter() {
-            let is_rowid_alias = table
-                .columns()
-                .get(col_idx)
-                .is_some_and(|col| col.is_rowid_alias());
-            let col_ref = MaterializedColumnRef::Column {
-                table_id: table.internal_id,
-                column_idx: col_idx,
-                is_rowid_alias,
-            };
-            if seen.insert(col_ref.clone()) {
-                payload_columns.push(col_ref);
+            let column = dependency
+                .columns
+                .iter()
+                .find(|column| column.column == col_idx)
+                .cloned()
+                .ok_or_else(|| {
+                    crate::LimboError::InternalError(format!(
+                        "materialized input is missing frozen metadata for {0}.column{col_idx}",
+                        table.internal_id
+                    ))
+                })?;
+            let key = (column.source, Some(column.column));
+            if seen.insert(key) {
+                payload_columns.push(MaterializedColumnRef::Column { column });
             }
         }
         if table.btree().is_some_and(|btree| btree.has_rowid) {
             let rowid_ref = MaterializedColumnRef::RowId {
                 table_id: table.internal_id,
             };
-            if seen.insert(rowid_ref.clone()) {
+            if seen.insert((table.internal_id, None)) {
                 payload_columns.push(rowid_ref);
             }
         }
@@ -756,6 +811,65 @@ fn build_materialized_input_columns(
         .try_collect()?)
 }
 
+fn resolved_plan_expr_collation(
+    expr: &PlanExpr,
+    plan: &SelectPlan,
+) -> Result<Option<ResolvedCollation>> {
+    fn inherited(expr: &PlanExpr, plan: &SelectPlan) -> Option<ResolvedCollation> {
+        match expr {
+            PlanExpr::Column(column) => column.collation.clone(),
+            PlanExpr::MergedColumn(column) => column.collation.clone(),
+            PlanExpr::Output(output) => plan
+                .result_columns
+                .iter()
+                .find(|column| column.id == *output)
+                .and_then(|column| column.collation.clone()),
+            PlanExpr::Subquery(PlanSubqueryExpr::Scalar { query, output }) => plan
+                .non_from_clause_subqueries
+                .iter()
+                .find(|subquery| subquery.internal_id == *query)
+                .and_then(|subquery| subquery.output_facts.get(*output))
+                .and_then(|fact| fact.collation.clone()),
+            PlanExpr::Unary {
+                operator: turso_parser::ast::UnaryOperator::Positive,
+                expr,
+            }
+            | PlanExpr::Cast { expr, .. } => inherited(expr, plan),
+            _ => None,
+        }
+    }
+
+    Ok(plan_expr_explicit_collation(expr)?.or_else(|| inherited(expr, plan)))
+}
+
+fn synthetic_result_column(
+    program: &mut ProgramBuilder,
+    plan: &SelectPlan,
+    name: String,
+    expr: PlanExpr,
+) -> Result<ResultSetColumn> {
+    let origin = match &expr {
+        PlanExpr::Column(column) => Some(ResultColumnOrigin::Column {
+            source: column.source,
+            column: column.column,
+        }),
+        PlanExpr::RowId(source) => Some(ResultColumnOrigin::RowId { source: *source }),
+        _ => None,
+    };
+    Ok(ResultSetColumn {
+        id: program.next_plan_output_id(),
+        name,
+        name_kind: OutputNameKind::Inferred,
+        origin,
+        type_fact: plan_expr_type_fact(&expr, plan),
+        affinity: plan_expr_affinity(&expr, plan),
+        collation: resolved_plan_expr_collation(&expr, plan)?,
+        array_dimensions: plan_expr_array_dimensions(&expr, plan),
+        expr,
+        contains_aggregates: false,
+    })
+}
+
 /// Construct a SELECT plan that materializes build-side inputs into an ephemeral table.
 /// This plan is separate from the main query plan and is exclusively used for the materialization.
 /// process.
@@ -765,13 +879,14 @@ fn build_materialized_input_columns(
 /// and then prunes any tables already captured by earlier key+payload materializations.
 #[allow(clippy::too_many_arguments)]
 fn build_materialized_build_input_plan(
+    program: &mut ProgramBuilder,
     plan: &SelectPlan,
     build_table_idx: usize,
     probe_table_idx: usize,
     cursor_id: CursorID,
     table: Arc<BTreeTable>,
     mode: &MaterializedBuildInputMode,
-    key_exprs: &[Expr],
+    key_exprs: &[PlanExpr],
     payload_columns: &[MaterializedColumnRef],
     materialized_build_inputs: &HashMap<usize, MaterializedBuildInput>,
 ) -> Result<SelectPlan> {
@@ -826,7 +941,7 @@ fn build_materialized_build_input_plan(
     // Helper to decide whether an expression depends on tables outside
     // the prefix. If it does, any access method that relies on that
     // expression must be invalidated for the materialization subplan.
-    let expr_depends_outside_prefix = |expr: &Expr| -> Result<bool> {
+    let expr_depends_outside_prefix = |expr: &PlanExpr| -> Result<bool> {
         let mask = table_mask_from_expr(
             expr,
             &plan.table_references,
@@ -850,7 +965,7 @@ fn build_materialized_build_input_plan(
                 reset_op = expr_depends_outside_prefix(cmp_expr)?;
             }
             Operation::Search(Search::Seek { seek_def, .. }) => {
-                // Seek keys can include expressions bound by other tables. If so,
+                // Seek keys can depend on other planned tables. If so,
                 // the seek is not valid in the prefix-only subplan.
                 for component in seek_def.iter(&seek_def.start) {
                     if let SeekKeyComponent::Expr(expr) = component {
@@ -913,52 +1028,37 @@ fn build_materialized_build_input_plan(
 
     let build_internal_id = plan.table_references.joined_tables()[build_table_idx].internal_id;
     let result_columns = match mode {
-        MaterializedBuildInputMode::RowidOnly => vec![ResultSetColumn {
-            expr: Expr::RowId {
-                database: None,
-                table: build_internal_id,
-            },
-            alias: None,
-            implicit_column_name: None,
-            contains_aggregates: false,
-        }],
+        MaterializedBuildInputMode::RowidOnly => vec![synthetic_result_column(
+            program,
+            plan,
+            "rowid".to_string(),
+            PlanExpr::rowid(build_internal_id),
+        )?],
         MaterializedBuildInputMode::KeyPayload { num_keys, .. } => {
             turso_assert!(
                 *num_keys == key_exprs.len(),
                 "materialized hash build input key count mismatch"
             );
             let mut result_columns: Vec<ResultSetColumn> = Vec::new();
-            for expr in key_exprs.iter() {
-                result_columns.push(ResultSetColumn {
-                    expr: expr.clone(),
-                    alias: None,
-                    implicit_column_name: None,
-                    contains_aggregates: false,
-                });
+            for (index, expr) in key_exprs.iter().enumerate() {
+                result_columns.push(synthetic_result_column(
+                    program,
+                    plan,
+                    format!("key_{index}"),
+                    expr.clone(),
+                )?);
             }
-            for payload in payload_columns.iter() {
+            for (index, payload) in payload_columns.iter().enumerate() {
                 let expr = match payload {
-                    MaterializedColumnRef::Column {
-                        table_id,
-                        column_idx,
-                        is_rowid_alias,
-                    } => Expr::Column {
-                        database: None,
-                        table: *table_id,
-                        column: *column_idx,
-                        is_rowid_alias: *is_rowid_alias,
-                    },
-                    MaterializedColumnRef::RowId { table_id } => Expr::RowId {
-                        database: None,
-                        table: *table_id,
-                    },
+                    MaterializedColumnRef::Column { column } => PlanExpr::Column(column.clone()),
+                    MaterializedColumnRef::RowId { table_id } => PlanExpr::rowid(*table_id),
                 };
-                result_columns.push(ResultSetColumn {
+                result_columns.push(synthetic_result_column(
+                    program,
+                    plan,
+                    format!("payload_{index}"),
                     expr,
-                    alias: None,
-                    implicit_column_name: None,
-                    contains_aggregates: false,
-                });
+                )?);
             }
             result_columns
         }
