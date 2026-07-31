@@ -204,10 +204,11 @@ impl EmitOrderBy {
             let mut index_columns =
                 Vec::try_with_capacity_ext(order_by.len() + result_columns.len())?;
             for (column, order, nulls) in order_by {
-                assert!(
-                    nulls.is_none(),
-                    "nulls should be None when emitting a heap sort"
-                );
+                if nulls.is_some() {
+                    return Err(crate::LimboError::InternalError(
+                        "heap sort cannot express an explicit NULLS ordering".to_string(),
+                    ));
+                }
                 let collation = get_collseq_from_expr_with_symbols(
                     column,
                     referenced_tables,
