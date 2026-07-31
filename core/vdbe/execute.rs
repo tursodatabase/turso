@@ -3478,6 +3478,19 @@ pub fn halt(
             }
         }
 
+        // A FAIL resolution that cannot commit here because an outer statement
+        // is still running (this is a trigger subprogram fired mid-statement)
+        // must still tell the enclosing statement to keep the changes made
+        // before the error. Re-tag the constraint as a FAIL raise so the outer
+        // program's abort() preserves and commits them instead of rolling the
+        // statement back. FK errors do not respect ON CONFLICT, so leave them
+        // as-is.
+        if program.resolve_type == ResolveType::Fail {
+            if let LimboError::Constraint(msg) = error {
+                return Err(LimboError::Raise(ResolveType::Fail, msg));
+            }
+        }
+
         // For non-FAIL modes (or non-autocommit), just return the error.
         // abort() will handle rollback based on resolve_type.
         return Err(error);
