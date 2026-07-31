@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File as StdFile, OpenOptions};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::debug;
+use tracing::{debug, warn};
 use turso_core::{
     Clock, Completion, File, IO, MonotonicInstant, OpenFlags, Result, WallClockInstant,
 };
@@ -236,6 +236,40 @@ type PendingQueue = Arc<Mutex<Vec<PendingCompletion>>>;
 const MAX_FILE_SIZE: usize = 1 << 33; // 8 GiB
 pub(crate) const FILE_SIZE_SOFT_LIMIT: u64 = 6 * (1 << 30); // 6 GiB (75% of MAX_FILE_SIZE)
 
+#[cfg(windows)]
+fn mark_sparse(file: &StdFile) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::FALSE;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+
+    let mut bytes_returned = 0;
+    // SAFETY: `file` owns a live handle, the optional input/output buffers are
+    // null with zero lengths, and `bytes_returned` is writable for the call.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == FALSE {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn mark_sparse(_file: &StdFile) -> std::io::Result<()> {
+    Ok(())
+}
+
 struct SimulatorFile {
     mmap: Mutex<MmapMut>,
     size: Mutex<usize>,
@@ -259,6 +293,9 @@ impl SimulatorFile {
             .open(file_path)
             .unwrap_or_else(|e| panic!("Failed to create file {file_path}: {e}"));
 
+        if let Err(error) = mark_sparse(&file) {
+            warn!(%error, %file_path, "failed to mark simulator file as sparse");
+        }
         file.set_len(MAX_FILE_SIZE as u64)
             .unwrap_or_else(|e| panic!("Failed to truncate file {file_path}: {e}"));
 

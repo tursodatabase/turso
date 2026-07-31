@@ -7718,6 +7718,7 @@ dependencies = [
  "turso_core",
  "turso_parser",
  "twox-hash",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
