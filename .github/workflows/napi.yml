@@ -172,6 +172,9 @@ jobs:
         run: |
           shopt -s nullglob
           files=(packages/native/turso.*.node sync/packages/native/sync.*.node)
+          # Docker builds run as root, leaving the outputs unwritable for the
+          # runner user, and strip rewrites the file in place.
+          sudo chown "$(id -u):$(id -g)" "${files[@]}"
           strip "${files[@]}"
           ls -la "${files[@]}"
       - name: Upload artifact
