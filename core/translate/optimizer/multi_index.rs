@@ -1275,6 +1275,7 @@ mod tests {
             database_id: MAIN_DB_ID,
             indexed: None,
             bound_index_method_patterns: Vec::new(),
+            bound_index_expressions: Vec::new(),
         }
     }
 
