@@ -64,7 +64,7 @@ pub fn bind_prepare_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
-    let bound = bind_select_stmt(&mut select, resolver, program)?;
+    let bound = super::bind::bind_select_stmt(&mut select, resolver, program)?;
     prepare_bound_select_plan(
         select,
         bound,
@@ -73,18 +73,6 @@ pub fn bind_prepare_select_plan(
         query_destination,
         connection,
     )
-}
-
-/// Bind a SELECT statement up front (the first half of
-/// [bind_prepare_select_plan]). The statement path binds once via
-/// `bind_stmt` and hands the result to [prepare_bound_select_plan].
-pub fn bind_select_stmt(
-    select: &mut ast::Select,
-    resolver: &Resolver,
-    program: &mut ProgramBuilder,
-) -> Result<super::bind::BoundSelect> {
-    let mut binder = super::bind::BindContext::new(resolver, program);
-    binder.bind_select(select)
 }
 
 /// Plan an already-bound SELECT (the second half of

@@ -2103,6 +2103,16 @@ impl BoundDelete {
 
 // ── Statement-level binding ──────────────────────────────────────────────
 
+/// Bind a SELECT statement before planning or emission.
+pub fn bind_select_stmt(
+    select: &mut ast::Select,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<BoundSelect> {
+    let mut binder = BindContext::new(resolver, program);
+    binder.bind_select(select)
+}
+
 /// Bind a DELETE statement up front: validate the target table and resolve
 /// all names in WHERE and RETURNING. Planning consumes the result without
 /// re-resolving anything.

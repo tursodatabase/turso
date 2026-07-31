@@ -412,7 +412,7 @@ pub fn translate_inner(
         } => translate_rollback(program, tx_name, savepoint_name)?,
         ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
         ast::Stmt::Select(mut select) => {
-            let bound = select::bind_select_stmt(&mut select, resolver, program)?;
+            let bound = bind::bind_select_stmt(&mut select, resolver, program)?;
             translate_select(
                 select,
                 bound,
