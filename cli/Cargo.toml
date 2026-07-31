@@ -64,6 +64,14 @@ roaring = "0.11.2"
 bytes = "1.11.1"
 itertools.workspace = true
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+] }
+
 [features]
 default = ["io_uring", "mimalloc", "experimental_win_iocp"]
 io_uring = ["turso_core/io_uring"]
