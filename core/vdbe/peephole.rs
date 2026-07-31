@@ -221,7 +221,15 @@ struct Scratch {
     worklist: Vec<u32>,
 }
 
-thread_local! {
+// Reusing the buffers through a thread-local is a measured win on the
+// per-prepare fast path, but it MUST NOT be used on wasm: the browser's
+// wasi-threads runtime runs worker "threads" whose thread-local storage
+// aliases, so two concurrent prepares can both pass `try_borrow_mut` on the
+// same `RefCell` and scribble over each other's rewrite state. That showed up
+// as corrupted rows in the browser sync tests. Fresh buffers per program are
+// the safe (and still cheap) choice there.
+#[cfg(not(target_family = "wasm"))]
+crate::thread::thread_local! {
     static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
 }
 
@@ -234,12 +242,15 @@ pub(crate) fn optimize_program(
         return;
     }
     maybe_register_stats_dump();
+    #[cfg(not(target_family = "wasm"))]
     SCRATCH.with(|cell| match cell.try_borrow_mut() {
         Ok(mut scratch) => run_pass(insns, comments, &mut scratch),
         // Defensive: if a prepare ever nests inside another prepare on this
         // thread, fall back to fresh buffers instead of sharing.
         Err(_) => run_pass(insns, comments, &mut Scratch::default()),
     });
+    #[cfg(target_family = "wasm")]
+    run_pass(insns, comments, &mut Scratch::default());
 }
 
 fn run_pass(
