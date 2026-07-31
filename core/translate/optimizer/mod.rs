@@ -3427,17 +3427,6 @@ fn build_seek_def(
         // Sometimes we must add an extra NULL to the key on purpose.
         // We do this so scans over composite indexes match SQLite exactly.
         //
-        // Example:
-        //   INDEX(c1, c2 ASC)
-        //   WHERE c1='a' AND c2<=999
-        //
-        // If we start from key [c1='a'], we hit rows where c2 is NULL first.
-        // For this case we want to start right after that NULL boundary.
-        // So we:
-        // - use start key [c1='a', NULL]
-        // - change start op from GE to GT
-        // - for backward scans in the symmetric shape, change LE to LT
-        //
         // A range with only one bound leaves the other side of the scan
         // without a key: the scan just runs until the prefix stops matching.
         // That is a problem when the NULLs of the range column live on that
@@ -3450,6 +3439,18 @@ fn build_seek_def(
         if !has_prefix {
             return;
         }
+        // 1) Choose a better starting point.
+        //
+        // Example:
+        //   INDEX(c1, c2 ASC)
+        //   WHERE c1='a' AND c2<=999
+        //
+        // If we start from key [c1='a'], we hit rows where c2 is NULL first.
+        // For this case we want to start right after that NULL boundary.
+        // So we:
+        // - use start key [c1='a', NULL]
+        // - change start op from GE to GT
+        // - for backward scans in the symmetric shape, change LE to LT
         if matches!(start.last_component, SeekKeyComponent::None) {
             match (iter_dir, stored_nulls) {
                 (IterationDirection::Forwards, ast::NullsOrder::First) => {
@@ -3463,6 +3464,17 @@ fn build_seek_def(
                 _ => {}
             }
         }
+        // 2) Choose a better stopping point.
+        //
+        // Example:
+        //   INDEX(c1, c2 DESC)
+        //   WHERE c1='a' AND c2<=999
+        //
+        // The stop check must also respect the NULL boundary for c2.
+        // So we:
+        // - use stop key [c1='a', NULL]
+        // - change end op from GT to GE
+        // - for backward scans, change LT to LE
         if matches!(end.last_component, SeekKeyComponent::None) {
             match (iter_dir, stored_nulls) {
                 (IterationDirection::Forwards, ast::NullsOrder::Last) => {
