@@ -29,6 +29,12 @@ use crate::schema::SchemaIntrospector;
 pub use sql_gen::TreeMode;
 use sql_gen_prop::SqlValue;
 
+const MAX_GENERATED_SQL_BYTES: usize = 64 * 1024;
+
+fn generated_sql_is_too_large(sql: &str) -> bool {
+    sql.len() > MAX_GENERATED_SQL_BYTES
+}
+
 /// Configuration for the simulator.
 #[derive(Debug, Clone)]
 pub struct SimConfig {
@@ -372,6 +378,23 @@ impl Fuzzer {
 
         for i in 0..self.config.num_statements {
             let stmt = generator.generate(&schema)?;
+
+            // A generated expression can branch into several subqueries at
+            // each level. This occasionally produces hundreds of kilobytes of
+            // SQL. Preparing such a statement uses enough recursive calls to
+            // exhaust the process stack before either engine can return an
+            // error. These statements add little useful coverage, so skip
+            // them before passing them to either engine.
+            if generated_sql_is_too_large(&stmt.sql) {
+                stats.statements_skipped += 1;
+                let reason = format!(
+                    "Statement skipped because it is {} bytes; the limit is {MAX_GENERATED_SQL_BYTES} bytes",
+                    stmt.sql.len()
+                );
+                push_warning_comments(executed_sql, i, &reason);
+                tracing::debug!("Skipped generated statement {i}: {reason}");
+                continue;
+            }
 
             if self.config.verbose {
                 let stmt_type = if stmt.is_ddl { "DDL" } else { "DML" };
@@ -718,5 +741,15 @@ mod tests {
         push_warning_comments(&mut out, 465, "first\nsecond");
         assert_eq!(out[0], "-- WARNING stmt=465 line=0: first");
         assert_eq!(out[1], "-- WARNING stmt=465 line=1: second");
+    }
+
+    #[test]
+    fn statements_over_64_kib_are_too_large() {
+        assert!(!generated_sql_is_too_large(
+            &"x".repeat(MAX_GENERATED_SQL_BYTES)
+        ));
+        assert!(generated_sql_is_too_large(
+            &"x".repeat(MAX_GENERATED_SQL_BYTES + 1)
+        ));
     }
 }
