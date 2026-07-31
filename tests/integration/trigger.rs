@@ -1460,6 +1460,30 @@ fn test_alter_table_rename_column_qualified_reference_to_trigger_table(db: TempD
 }
 
 #[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_rejects_join_using_target_column(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("CREATE TABLE other (id INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("CREATE TABLE dst (id INTEGER)").unwrap();
+    conn.execute("CREATE TABLE log (value INTEGER)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+         INSERT INTO log SELECT b FROM src JOIN other USING (b);
+         END",
+    )
+    .unwrap();
+
+    let result = conn.execute("ALTER TABLE src RENAME COLUMN b TO c");
+    assert!(
+        result.is_err(),
+        "RENAME COLUMN must not guess which JOIN USING reference belongs to src"
+    );
+}
+
+#[turso_macros::test(mvcc)]
 fn test_alter_table_rename_column_same_connection_cross_table_update_new_ref(db: TempDatabase) {
     let conn = db.connect_limbo();
 

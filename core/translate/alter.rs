@@ -3296,6 +3296,11 @@ fn apply_one_select_for_column_rename(
             window_clause,
             ..
         } => {
+            crate::translate::bind::validate_column_rename_using_clause(
+                from,
+                target_table_name,
+                old_col_norm,
+            )?;
             let visible_target_qualifiers = merge_target_qualifiers(
                 outer_target_qualifiers,
                 &from_clause_target_qualifiers(from, target_table_name),

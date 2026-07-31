@@ -207,6 +207,52 @@ pub fn bind_check_column_default(
     bound
 }
 
+/// Reject a column rename when a direct reference to the renamed table
+/// participates in a JOIN USING the old column name.
+///
+/// A USING name identifies columns on both sides of the join. Rewriting the
+/// unresolved name would guess which side owns it, while leaving it unchanged
+/// would make the renamed table fail the join. Rejecting the rename keeps us
+/// from persisting a schema whose column identity was guessed.
+pub fn validate_column_rename_using_clause(
+    from: &Option<ast::FromClause>,
+    target_table: &str,
+    old_column: &str,
+) -> Result<()> {
+    let Some(from) = from else {
+        return Ok(());
+    };
+
+    let is_target = |table: &ast::SelectTable| {
+        matches!(
+            table,
+            ast::SelectTable::Table(name, _, _)
+                if name.name.as_str().eq_ignore_ascii_case(target_table)
+        )
+    };
+
+    let mut target_is_on_left = is_target(&from.select);
+    for join in &from.joins {
+        let target_is_on_right = is_target(&join.table);
+        let uses_old_column = matches!(
+            &join.constraint,
+            Some(ast::JoinConstraint::Using(columns))
+                if columns
+                    .iter()
+                    .any(|column| column.as_str().eq_ignore_ascii_case(old_column))
+        );
+        if uses_old_column && (target_is_on_left || target_is_on_right) {
+            crate::bail_parse_error!(
+                "cannot join using column {} - column not present in both tables",
+                old_column
+            );
+        }
+        target_is_on_left |= target_is_on_right;
+    }
+
+    Ok(())
+}
+
 /// Point SELF_TABLE references in a stored schema expression at a concrete
 /// table reference. This does not reject unresolved identifiers because ALTER
 /// validation may deliberately bind them through an expression register cache.
