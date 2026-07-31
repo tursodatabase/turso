@@ -5126,7 +5126,11 @@ impl Pager {
         mode: CheckpointMode,
         sync_mode: crate::SyncMode,
     ) -> Result<CheckpointResult> {
-        self.io.block(|| self.checkpoint(mode, sync_mode, true))
+        let result = self.io.block(|| self.checkpoint(mode, sync_mode, true));
+        if result.is_err() {
+            self.cleanup_after_checkpoint_failure();
+        }
+        result
     }
 
     pub fn freepage_list(&self) -> u32 {
@@ -6220,6 +6224,8 @@ mod tests {
         );
     }
 
+    /// Verifies that cacheflush returns a codec error when rereading an evicted page fails,
+    /// and resets its state so a later flush can retry.
     #[test]
     fn cacheflush_propagates_failed_page_codec_reread() {
         let pager = pager_with_cache_capacity(5, 2);
