@@ -728,6 +728,44 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
     })
 }
 
+pub fn round_half_away_from_zero_tie(f: f64, precision: usize) -> Option<f64> {
+    use num_traits::Float;
+
+    let (m, k, sign): (u64, i16, i8) = f.integer_decode();
+    let k = k as i32;
+
+    let precision_i32 = precision as i32;
+    let q = -(k + precision_i32);
+
+    const MAX_TIE_PRODUCT_BITS: i32 = 127;
+    if !(1..=MAX_TIE_PRODUCT_BITS).contains(&q) {
+        return None;
+    }
+
+    let precision_u32 = precision as u32;
+    let five_pow = 5u128.pow(precision_u32);
+    let scaled = (m as u128) * five_pow;
+
+    let low_q_bits = scaled & ((1u128 << q) - 1);
+    let is_tie = low_q_bits == (1u128 << (q - 1));
+    if !is_tie {
+        return None;
+    }
+
+    let rounded_int = (scaled >> q) + 1;
+
+    let ten_pow = 10u128.pow(precision_u32);
+    let int_part = rounded_int / ten_pow;
+    let frac_part = rounded_int % ten_pow;
+    let sign_str = if sign.is_negative() { "-" } else { "" };
+    let s = format!("{sign_str}{int_part}.{frac_part:0precision$}");
+
+    let result: f64 = str_to_f64(s)
+        .expect("constructed digit string should always parse")
+        .into();
+    Some(result)
+}
+
 enum FloatParts {
     Special(String),
     Normal {
@@ -897,4 +935,15 @@ fn test_decode_float() {
     assert_eq!(format_float(0.0), "0.0");
     assert_eq!(format_float(4.94e-322), "4.94065645841247e-322");
     assert_eq!(format_float(-20228007.0), "-20228007.0");
+}
+
+#[test]
+fn test_round_half_away_from_zero_tie() {
+    assert_eq!(round_half_away_from_zero_tie(2.25, 1), Some(2.3));
+    assert_eq!(round_half_away_from_zero_tie(0.125, 2), Some(0.13));
+    assert_eq!(round_half_away_from_zero_tie(1.125, 2), Some(1.13));
+    assert_eq!(round_half_away_from_zero_tie(-2.25, 1), Some(-2.3));
+    assert_eq!(round_half_away_from_zero_tie(2.35, 1), None);
+    assert_eq!(round_half_away_from_zero_tie(1.005, 2), None);
+    assert_eq!(round_half_away_from_zero_tie(5e-320, 10), None);
 }
