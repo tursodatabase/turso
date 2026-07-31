@@ -1831,6 +1831,59 @@ impl PostgreSQLTranslator {
             .as_ref()
             .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
 
+        // PostgreSQL exposes scalar functions in FROM position as one-row,
+        // one-column tables (clients issue `SELECT * FROM current_schema()`),
+        // but core's TableCall path resolves only table-valued functions, so
+        // desugar these zero-argument session functions into a subselect.
+        // The TEXT cast keeps the wire column text-typed; a bare subselect
+        // column comes back as bytea.
+        if args.is_empty() && matches!(func_name, "current_schema" | "current_database" | "version")
+        {
+            let column_name = match &alias {
+                Some(ast::As::As(name) | ast::As::Elided(name)) => name.clone(),
+                _ => ast::Name::from_string(func_name),
+            };
+            let call = ast::Expr::FunctionCall {
+                name: ast::Name::from_string(func_name),
+                distinctness: None,
+                args: vec![],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            };
+            let cast = ast::Expr::Cast {
+                expr: Box::new(call),
+                type_name: Some(ast::Type {
+                    name: "TEXT".to_string(),
+                    size: None,
+                    array_dimensions: 0,
+                }),
+            };
+            let select = ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns: vec![ast::ResultColumn::Expr(
+                            Box::new(cast),
+                            Some(ast::As::Elided(column_name)),
+                        )],
+                        from: None,
+                        where_clause: None,
+                        group_by: None,
+                        window_clause: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            };
+            return Ok(ast::SelectTable::Select(select, alias));
+        }
+
         Ok(ast::SelectTable::TableCall(
             ast::QualifiedName::single(ast::Name::from_string(func_name)),
             args,
@@ -2005,7 +2058,8 @@ impl PostgreSQLTranslator {
                         } else {
                             let expr = self.translate_expr(val)?;
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
-                                None
+                                derived_column_name(val)
+                                    .map(|name| ast::As::Elided(ast::Name::from_string(name)))
                             } else {
                                 Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
                             };
@@ -2240,9 +2294,30 @@ impl PostgreSQLTranslator {
                         // Return empty string stub for user functions
                         Ok(ast::Expr::Literal(ast::Literal::String("''".into())))
                     }
-                    Ok(SqlValueFunctionOp::SvfopCurrentCatalog) => {
-                        Ok(ast::Expr::Literal(ast::Literal::String("'main'".into())))
-                    }
+                    // The bare keywords route through the frontend scalars so both
+                    // syntaxes share one implementation and agree with pg_catalog.
+                    Ok(SqlValueFunctionOp::SvfopCurrentSchema) => Ok(ast::Expr::FunctionCall {
+                        name: ast::Name::from_string("current_schema"),
+                        distinctness: None,
+                        args: vec![],
+                        order_by: vec![],
+                        within_group: vec![],
+                        filter_over: ast::FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    }),
+                    Ok(SqlValueFunctionOp::SvfopCurrentCatalog) => Ok(ast::Expr::FunctionCall {
+                        name: ast::Name::from_string("current_database"),
+                        distinctness: None,
+                        args: vec![],
+                        order_by: vec![],
+                        within_group: vec![],
+                        filter_over: ast::FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    }),
                     _ => Err(ParseError::ParseError(format!(
                         "Unsupported SqlValueFunction op: {}",
                         svf.op
@@ -3889,6 +3964,43 @@ impl PostgreSQLTranslator {
             not_null,
             constraints,
         })
+    }
+}
+
+/// PostgreSQL derives a name for result columns without an explicit alias
+/// (FigureColname in the server): function calls are named after the function
+/// and SQL value functions after their keyword. Clients read columns by these
+/// names, e.g. knex reads rows[0].version from `select version()`.
+fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+    match &node.node {
+        Some(Node::FuncCall(func_call)) => func_call
+            .funcname
+            .iter()
+            .filter_map(|n| match &n.node {
+                Some(Node::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .next_back(),
+        Some(Node::SqlvalueFunction(svf)) => {
+            use pg_query::protobuf::SqlValueFunctionOp as Op;
+            let name = match Op::try_from(svf.op) {
+                Ok(Op::SvfopCurrentDate) => "current_date",
+                Ok(Op::SvfopCurrentTime | Op::SvfopCurrentTimeN) => "current_time",
+                Ok(Op::SvfopCurrentTimestamp | Op::SvfopCurrentTimestampN) => "current_timestamp",
+                Ok(Op::SvfopLocaltime | Op::SvfopLocaltimeN) => "localtime",
+                Ok(Op::SvfopLocaltimestamp | Op::SvfopLocaltimestampN) => "localtimestamp",
+                Ok(Op::SvfopCurrentRole) => "current_role",
+                Ok(Op::SvfopCurrentUser) => "current_user",
+                Ok(Op::SvfopUser) => "user",
+                Ok(Op::SvfopSessionUser) => "session_user",
+                Ok(Op::SvfopCurrentCatalog) => "current_catalog",
+                Ok(Op::SvfopCurrentSchema) => "current_schema",
+                _ => return None,
+            };
+            Some(name.to_string())
+        }
+        _ => None,
     }
 }
 

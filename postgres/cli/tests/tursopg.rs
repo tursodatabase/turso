@@ -986,6 +986,9 @@ fn start_tursopg_server() -> (Child, u16) {
 /// Sends startup + simple query and reads responses.
 struct PgTestClient {
     stream: TcpStream,
+    /// Raw startup response bytes, which carry the ParameterStatus messages
+    /// advertising session defaults like server_version.
+    startup_response: Vec<u8>,
 }
 
 impl PgTestClient {
@@ -994,10 +997,18 @@ impl PgTestClient {
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
-        let mut client = Self { stream };
+        let mut client = Self {
+            stream,
+            startup_response: Vec::new(),
+        };
         client.send_startup();
-        client.read_until_ready();
+        client.startup_response = client.read_until_ready();
         client
+    }
+
+    /// Value of a ParameterStatus ('S') message sent during startup.
+    fn startup_parameter(&self, name: &str) -> Option<String> {
+        extract_parameter_status(&self.startup_response, name)
     }
 
     /// Send StartupMessage (protocol v3.0)
@@ -1072,6 +1083,84 @@ impl PgTestClient {
         let response = self.read_until_ready();
         extract_row_description_oids(&response)
     }
+
+    /// Send query and return the first column of the first DataRow ('D') as text.
+    fn query_single_text(&mut self, sql: &str) -> String {
+        self.send_query(sql);
+        let response = self.read_until_ready();
+        extract_first_data_row_text(&response).expect("query returned no rows")
+    }
+}
+
+/// Walk raw PG wire bytes and return the value of the first ParameterStatus
+/// (`'S'`) message with the given parameter name. Body layout per the PG
+/// protocol docs: cstring name, cstring value.
+fn extract_parameter_status(data: &[u8], name: &str) -> Option<String> {
+    let mut pos = 0;
+    while pos < data.len() {
+        let tag = data[pos];
+        pos += 1;
+        if pos + 4 > data.len() {
+            break;
+        }
+        let len =
+            i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+        let body_end = pos + (len - 4);
+        if body_end > data.len() {
+            break;
+        }
+        if tag == b'S' {
+            let body = &data[pos..body_end];
+            let name_end = body
+                .iter()
+                .position(|&b| b == 0)
+                .expect("ParameterStatus name missing nul terminator");
+            if &body[..name_end] == name.as_bytes() {
+                let value = &body[name_end + 1..];
+                let value_end = value
+                    .iter()
+                    .position(|&b| b == 0)
+                    .expect("ParameterStatus value missing nul terminator");
+                return Some(String::from_utf8(value[..value_end].to_vec()).unwrap());
+            }
+        }
+        pos = body_end;
+    }
+    None
+}
+
+/// Walk raw PG wire bytes, find the first DataRow (`'D'`), and return its
+/// first column as text. Body layout per the PG protocol docs: `int16`
+/// column count, then per column an `int32` value length (-1 for NULL) and
+/// that many bytes.
+fn extract_first_data_row_text(data: &[u8]) -> Option<String> {
+    let mut pos = 0;
+    while pos < data.len() {
+        let tag = data[pos];
+        pos += 1;
+        if pos + 4 > data.len() {
+            break;
+        }
+        let len =
+            i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+        let body_end = pos + (len - 4);
+        if body_end > data.len() {
+            break;
+        }
+        if tag == b'D' {
+            let body = &data[pos..body_end];
+            let value_len = i32::from_be_bytes([body[2], body[3], body[4], body[5]]);
+            if value_len < 0 {
+                return None;
+            }
+            let value = &body[6..6 + value_len as usize];
+            return Some(String::from_utf8(value.to_vec()).unwrap());
+        }
+        pos = body_end;
+    }
+    None
 }
 
 /// Walk raw PG wire bytes, find the first `RowDescription` (`'T'`), and
@@ -1230,6 +1319,48 @@ fn with_pg_client<F: FnOnce(&mut PgTestClient)>(f: F) {
 fn wire_integer_literal_reports_int4() {
     with_pg_client(|c| {
         assert_eq!(c.query_column_oids("SELECT 42"), vec![OID_INT4]);
+    });
+}
+
+/// Clients decode values off the OID, so FROM-position scalars must
+/// report their result type rather than bytea.
+#[test]
+fn wire_from_position_scalar_reports_text() {
+    with_pg_client(|c| {
+        assert_eq!(
+            c.query_column_oids("SELECT * FROM current_schema()"),
+            vec![OID_TEXT]
+        );
+    });
+}
+
+/// Leading numeric version of a string like "16.6-pgwire-0.36.3" or "16.6 (...)".
+fn numeric_prefix(s: &str) -> &str {
+    let end = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(s.len());
+    &s[..end]
+}
+
+/// The `server_version` startup parameter and version() are from two distinct
+/// sources, and clients see both. Until they share a single source of truth,
+/// this pins their numeric prefixes together so drift is noticed.
+#[test]
+fn wire_server_version_parameter_matches_version_function() {
+    with_pg_client(|c| {
+        let advertised = c
+            .startup_parameter("server_version")
+            .expect("startup must advertise server_version");
+        let version = c.query_single_text("SELECT version()");
+        let reported = version
+            .strip_prefix("PostgreSQL ")
+            .expect("version() must start with 'PostgreSQL '");
+        assert!(!numeric_prefix(&advertised).is_empty(), "{advertised:?}");
+        assert_eq!(
+            numeric_prefix(&advertised),
+            numeric_prefix(reported),
+            "server_version parameter {advertised:?} vs version() {version:?}"
+        );
     });
 }
 
