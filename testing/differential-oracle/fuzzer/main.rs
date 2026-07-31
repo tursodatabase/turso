@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use differential_fuzzer::{Fuzzer, GeneratorKind, SimConfig, TreeMode};
+use differential_fuzzer::{Fuzzer, GeneratorKind, SimConfig, TreeMode, WeightProfile};
 use rand::RngCore;
 use serde::Serialize;
 
@@ -68,6 +68,12 @@ struct Args {
     /// Focus sql-gen-prop on bounded recursive CTE SELECT workloads.
     #[arg(long, requires = "generator")]
     recursive_cte_focus: bool,
+
+    /// Named statement-weight mix to generate with. Each profile stresses a
+    /// different part of the engine. A failing seed reproduces under the same
+    /// profile.
+    #[arg(long, default_value = "balanced", value_enum)]
+    profile: WeightProfile,
 }
 
 #[derive(Subcommand, Debug)]
@@ -105,6 +111,7 @@ struct ConfigRecord {
     generator: String,
     mvcc: bool,
     recursive_cte_focus: bool,
+    profile: String,
 }
 
 /// Summary written to the JSON report file.
@@ -124,6 +131,7 @@ impl ConfigRecord {
             generator: format!("{:?}", args.generator),
             mvcc: args.mvcc,
             recursive_cte_focus: args.recursive_cte_focus,
+            profile: format!("{:?}", args.profile),
         }
     }
 }
@@ -257,6 +265,7 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
         mvcc: args.mvcc,
         window_function_probability: args.window_function_probability.clamp(0.0, 1.0),
         recursive_cte_focus: args.recursive_cte_focus,
+        weight_profile: args.profile,
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);

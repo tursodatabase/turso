@@ -34,6 +34,65 @@ pub enum GeneratorKind {
     SqlGenProp,
 }
 
+/// A named mix of top-level statement weights. Each profile stresses a
+/// different part of the engine so CI can cover several statement mixes
+/// instead of the single default distribution. Profiles are static, so a
+/// failing run reproduces from its seed once the same profile is selected.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum WeightProfile {
+    /// The general-purpose mix: mostly reads and writes, a little DDL.
+    #[default]
+    Balanced,
+    /// Heavy schema churn: create/drop/alter tables and indexes.
+    Ddl,
+    /// Heavy trigger creation plus writes, so triggers fire often.
+    Triggers,
+    /// Heavy insert/update/delete to stress constraint and conflict paths.
+    Writes,
+}
+
+impl WeightProfile {
+    /// The top-level statement weights for this profile. Transaction and
+    /// not-yet-implemented statements stay at 0, matching the fuzzer's scope.
+    fn stmt_weights(self) -> sql_gen::StmtWeights {
+        let base = |select,
+                    insert,
+                    update,
+                    delete,
+                    create_table,
+                    drop_table,
+                    alter_table,
+                    create_index,
+                    drop_index,
+                    pragma_foreign_key_list,
+                    create_trigger,
+                    drop_trigger| {
+            sql_gen::StmtWeights {
+                select,
+                insert,
+                update,
+                delete,
+                create_table,
+                drop_table,
+                alter_table,
+                create_index,
+                drop_index,
+                pragma_foreign_key_list,
+                create_trigger,
+                drop_trigger,
+                ..sql_gen::StmtWeights::default()
+            }
+        };
+        match self {
+            //                sel ins upd del  ct dt at  ci di pfk cg dg
+            WeightProfile::Balanced => base(40, 20, 30, 10, 2, 1, 1, 2, 1, 1, 1, 1),
+            WeightProfile::Ddl => base(15, 20, 10, 10, 20, 12, 20, 15, 10, 5, 5, 3),
+            WeightProfile::Triggers => base(10, 25, 25, 20, 8, 3, 3, 5, 2, 2, 30, 10),
+            WeightProfile::Writes => base(10, 35, 30, 20, 5, 2, 3, 5, 2, 1, 5, 3),
+        }
+    }
+}
+
 /// Trait abstracting SQL generation backends.
 pub trait SqlGenerator {
     /// Generate the next SQL statement given the current schema.
@@ -78,19 +137,22 @@ fn schema_has_a_shadowed_table_name(schema: &sql_gen::Schema) -> bool {
 
 impl SqlGenBackend {
     pub fn new(seed: u64) -> Self {
-        Self::new_with_window_weight(seed, 0.0)
+        Self::new_with_window_weight(seed, 0.0, WeightProfile::default())
     }
 
     /// Construct with a non-zero probability that each expression-list
-    /// result column is a window function. Used by the window-function-
-    /// focused fuzzing path.
-    pub fn new_with_window_weight(seed: u64, window_function_probability: f64) -> Self {
+    /// result column is a window function (used by the window-function-
+    /// focused fuzzing path) and a chosen statement-weight profile.
+    pub fn new_with_window_weight(
+        seed: u64,
+        window_function_probability: f64,
+        profile: WeightProfile,
+    ) -> Self {
         let ctx = sql_gen::Context::new_with_seed(seed);
+        let stmt_weights = profile.stmt_weights();
+        tracing::info!("Statement weight profile {profile:?}: {stmt_weights:?}");
         let mut policy = Policy::default()
-            .with_stmt_weights(sql_gen::StmtWeights {
-                update: 30,
-                ..sql_gen::StmtWeights::default()
-            })
+            .with_stmt_weights(stmt_weights)
             .with_function_config(
                 sql_gen::FunctionConfig::deterministic().disable(&["LIKELY", "UNLIKELY"]),
             );
@@ -390,5 +452,37 @@ mod tests {
             ..Default::default()
         };
         assert!(!schema_has_a_shadowed_table_name(&schema));
+    }
+
+    #[test]
+    fn every_profile_can_read_and_write() {
+        // A profile that never selects, inserts, updates, or deletes would
+        // generate an empty or read-only workload and quietly cover nothing.
+        for profile in [
+            WeightProfile::Balanced,
+            WeightProfile::Ddl,
+            WeightProfile::Triggers,
+            WeightProfile::Writes,
+        ] {
+            let w = profile.stmt_weights();
+            assert!(w.select > 0, "{profile:?} never selects");
+            assert!(w.insert > 0, "{profile:?} never inserts");
+            assert!(w.update > 0, "{profile:?} never updates");
+            assert!(w.delete > 0, "{profile:?} never deletes");
+        }
+    }
+
+    #[test]
+    fn profiles_emphasize_their_theme() {
+        let ddl = WeightProfile::Ddl.stmt_weights();
+        assert!(
+            ddl.create_table > WeightProfile::Balanced.stmt_weights().create_table,
+            "ddl profile should create tables more often than balanced"
+        );
+        let triggers = WeightProfile::Triggers.stmt_weights();
+        assert!(
+            triggers.create_trigger > WeightProfile::Balanced.stmt_weights().create_trigger,
+            "triggers profile should create triggers more often than balanced"
+        );
     }
 }

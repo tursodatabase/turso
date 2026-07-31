@@ -22,7 +22,7 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::Database;
 
-use crate::generate::{GeneratorKind, PropTestBackend, SqlGenBackend, SqlGenerator};
+use crate::generate::{GeneratorKind, PropTestBackend, SqlGenBackend, SqlGenerator, WeightProfile};
 use crate::memory::{MemorySimIO, SimIO};
 use crate::oracle::{DifferentialOracle, OracleResult, QueryResult, check_differential};
 use crate::schema::SchemaIntrospector;
@@ -65,6 +65,8 @@ pub struct SimConfig {
     pub window_function_probability: f64,
     /// Generate SELECT-only workloads whose CTE definitions are all recursive.
     pub recursive_cte_focus: bool,
+    /// Named statement-weight mix to generate with.
+    pub weight_profile: WeightProfile,
 }
 
 impl Default for SimConfig {
@@ -82,6 +84,7 @@ impl Default for SimConfig {
             mvcc: false,
             window_function_probability: 0.0,
             recursive_cte_focus: false,
+            weight_profile: WeightProfile::default(),
         }
     }
 }
@@ -359,6 +362,7 @@ impl Fuzzer {
                 Box::new(SqlGenBackend::new_with_window_weight(
                     seed,
                     self.config.window_function_probability,
+                    self.config.weight_profile,
                 ))
             }
             GeneratorKind::SqlGenProp => {
@@ -730,6 +734,7 @@ mod tests {
             mvcc: false,
             window_function_probability: 0.0,
             recursive_cte_focus: false,
+            weight_profile: WeightProfile::default(),
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());
