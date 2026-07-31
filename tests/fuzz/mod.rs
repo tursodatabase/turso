@@ -5625,11 +5625,101 @@ mod fuzz_tests {
         );
     }
 
+    #[cfg(feature = "test_helper")]
+    const PENDING_BYTE_CHILD_ENV: &str = "TURSO_PENDING_BYTE_TEST_CHILD";
+
+    /// SQLite's pending-byte test control is process-global, so tests that
+    /// move it re-run themselves in a child test process; other tests in this
+    /// binary never observe the moved value.
+    #[cfg(feature = "test_helper")]
+    fn run_pending_byte_test_in_child(test_name: &str) -> anyhow::Result<()> {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .arg(test_name)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(PENDING_BYTE_CHILD_ENV, "1")
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::ensure!(
+            output.status.success(),
+            "isolated pending-byte test failed:\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            stderr
+        );
+        anyhow::ensure!(
+            stdout.contains("test result: ok. 1 passed;"),
+            "isolated pending-byte test did not run exactly once:\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            stderr
+        );
+        Ok(())
+    }
+
+    /// Restores the previous pending byte when dropped, so a failing test
+    /// body cannot leave the process-global control moved.
+    #[cfg(feature = "test_helper")]
+    struct PendingByteGuard(u32);
+
+    #[cfg(feature = "test_helper")]
+    impl PendingByteGuard {
+        fn set(offset: u32) -> Self {
+            let previous = TempDatabase::get_pending_byte();
+            TempDatabase::set_pending_byte(offset);
+            Self(previous)
+        }
+    }
+
+    #[cfg(feature = "test_helper")]
+    impl Drop for PendingByteGuard {
+        fn drop(&mut self) {
+            TempDatabase::set_pending_byte(self.0);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "test_helper")]
+    fn pending_byte_guard_restores_on_failure() -> anyhow::Result<()> {
+        if std::env::var_os(PENDING_BYTE_CHILD_ENV).is_none() {
+            return run_pending_byte_test_in_child(
+                "fuzz_tests::pending_byte_guard_restores_on_failure",
+            );
+        }
+
+        const MOVED_PENDING_BYTE: u32 = 1 << 20;
+
+        let original = TempDatabase::get_pending_byte();
+        anyhow::ensure!(
+            original != MOVED_PENDING_BYTE,
+            "the test must move the pending byte to observe restoration"
+        );
+
+        let unwind = std::panic::catch_unwind(|| {
+            let _guard = PendingByteGuard::set(MOVED_PENDING_BYTE);
+            assert_eq!(TempDatabase::get_pending_byte(), MOVED_PENDING_BYTE);
+            panic!("fail with the pending byte moved");
+        });
+
+        anyhow::ensure!(unwind.is_err(), "the guarded body must fail");
+        anyhow::ensure!(
+            TempDatabase::get_pending_byte() == original,
+            "a failing body must restore the previous pending byte"
+        );
+        Ok(())
+    }
+
     #[turso_macros::test(mvcc)]
     #[cfg(feature = "test_helper")]
-    #[serial_test::file_serial]
     pub fn fuzz_pending_byte_database(db: TempDatabase) -> anyhow::Result<()> {
         use core_tester::common::rusqlite_integrity_check;
+
+        if std::env::var_os(PENDING_BYTE_CHILD_ENV).is_none() {
+            return run_pending_byte_test_in_child(if db.enable_mvcc {
+                "fuzz_tests::fuzz_pending_byte_database_mvcc"
+            } else {
+                "fuzz_tests::fuzz_pending_byte_database"
+            });
+        }
 
         let (mut rng, _seed) = helpers::init_fuzz_test_tracing("fuzz_pending_byte_database");
 
@@ -5653,13 +5743,10 @@ mod fuzz_tests {
 
             let db_path = tempfile::NamedTempFile::new()?;
 
-            {
+            let pending_byte_guard = {
                 let db = builder.clone().with_db_path(db_path.path()).build();
 
-                let prev_pending_byte = TempDatabase::get_pending_byte();
-                tracing::debug!(prev_pending_byte);
-
-                TempDatabase::set_pending_byte(pending_byte);
+                let pending_byte_guard = PendingByteGuard::set(pending_byte);
 
                 let new_pending_byte = TempDatabase::get_pending_byte();
                 tracing::debug!(new_pending_byte);
@@ -5677,11 +5764,12 @@ mod fuzz_tests {
                 conn.execute(&query)?;
 
                 conn.close()?;
-            }
+
+                pending_byte_guard
+            };
 
             rusqlite_integrity_check(db_path.path())?;
-
-            TempDatabase::reset_pending_byte();
+            drop(pending_byte_guard);
         }
 
         Ok(())

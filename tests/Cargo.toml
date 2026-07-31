@@ -43,7 +43,7 @@ turso-dbhash.workspace = true
 
 [dev-dependencies]
 similar-asserts.workspace = true
-serial_test = { version = "3", features = ["file_locks"] }
+serial_test = "3"
 test-log = { version = "0.2.17", features = ["trace"] }
 turso_macros.workspace = true
 

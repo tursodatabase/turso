@@ -325,14 +325,6 @@ impl TempDatabase {
         };
         Database::set_pending_byte(offset);
     }
-
-    #[allow(dead_code)]
-    #[cfg(feature = "test_helper")]
-    pub fn reset_pending_byte() {
-        // 1 Gib
-        const PENDING_BYTE: u32 = 2u32.pow(30);
-        Self::set_pending_byte(PENDING_BYTE);
-    }
 }
 
 pub fn do_flush(conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
