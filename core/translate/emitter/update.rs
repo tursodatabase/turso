@@ -1262,6 +1262,26 @@ fn emit_update_insns<'a>(
     };
     let skip_set_clauses = false;
 
+    // A BEFORE UPDATE trigger can change the row before constraint checks run,
+    // so NOT NULL checks on SET-clause columns are deferred until after those
+    // triggers fire (see emit_deferred_notnull_checks below). AFTER triggers
+    // run once the row is already written and do not affect this ordering, so
+    // they must not defer the checks. Skipping the inline check for any update
+    // trigger, but only re-emitting it when a BEFORE trigger exists, would drop
+    // the NOT NULL check entirely for a table that has only AFTER triggers.
+    let relevant_before_update_triggers = match target_table.table.btree() {
+        Some(btree_table) => get_triggers_including_temp(
+            &t_ctx.resolver,
+            update_database_id,
+            TriggerEvent::Update,
+            TriggerTime::Before,
+            Some(updated_column_indices.clone()),
+            &btree_table,
+        ),
+        None => Vec::new(),
+    };
+    let has_before_triggers = !relevant_before_update_triggers.is_empty();
+
     emit_update_column_values(
         program,
         table_references,
@@ -1270,7 +1290,7 @@ fn emit_update_insns<'a>(
         t_ctx,
         skip_set_clauses,
         skip_row_label,
-        has_any_update_triggers,
+        has_before_triggers,
     )?;
 
     // For non-STRICT tables, apply column affinity to the NEW values early.
@@ -1298,18 +1318,9 @@ fn emit_update_insns<'a>(
     }
 
     // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
-    let mut has_before_triggers = false;
     let mut has_after_triggers = false;
     let preserved_old_registers: Option<Vec<usize>> =
         if let Some(btree_table) = target_table.table.btree() {
-            let relevant_before_update_triggers = get_triggers_including_temp(
-                &t_ctx.resolver,
-                update_database_id,
-                TriggerEvent::Update,
-                TriggerTime::Before,
-                Some(updated_column_indices.clone()),
-                &btree_table,
-            );
             has_after_triggers = has_triggers_including_temp(
                 &t_ctx.resolver,
                 update_database_id,
@@ -1323,7 +1334,6 @@ fn emit_update_insns<'a>(
                     s.any_resolved_fks_referencing(table_name)
                 });
 
-            has_before_triggers = !relevant_before_update_triggers.is_empty();
             let needs_old_registers = has_before_triggers || has_after_triggers || has_fk_cascade;
 
             // Only read OLD row values when triggers or FK cascades need them
