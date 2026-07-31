@@ -3438,11 +3438,15 @@ fn build_seek_def(
         // - change start op from GE to GT
         // - for backward scans in the symmetric shape, change LE to LT
         //
-        // A one-sided range leaves one side of the scan bounded only by the
-        // prefix, and that side needs the NULL boundary key exactly when the
-        // range column stores its NULL block at that end of the prefix group:
-        // the scan's low end for NULLS FIRST layouts, its high end for NULLS
-        // LAST layouts.
+        // A range with only one bound leaves the other side of the scan
+        // without a key: the scan just runs until the prefix stops matching.
+        // That is a problem when the NULLs of the range column live on that
+        // side, because the scan would walk into them, and a comparison like
+        // c2<=999 must not return NULL rows. So we add the NULL key on that
+        // side: as a start key it makes the scan begin right after the NULLs,
+        // as an end key it makes the scan stop right before them. Which side
+        // the NULLs live on depends on the column: before all values with
+        // NULLS FIRST, after all values with NULLS LAST.
         if !has_prefix {
             return;
         }
