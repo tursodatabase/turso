@@ -285,10 +285,10 @@ pub fn plan_satisfies_order_target(
                 *iter_dir,
                 index_opt.as_deref(),
                 constraint_refs,
-                &order_target.columns[target_col_idx..],
+                order_target,
+                target_col_idx,
                 schema,
                 EqualityPrefixScope::ConstantEquality,
-                order_target.is_extremum(),
             ),
             AccessMethodParams::MaterializedSubquery {
                 index,
@@ -299,10 +299,10 @@ pub fn plan_satisfies_order_target(
                 *iter_dir,
                 Some(index.as_ref()),
                 constraint_refs,
-                &order_target.columns[target_col_idx..],
+                order_target,
+                target_col_idx,
                 schema,
                 EqualityPrefixScope::ConstantEquality,
-                order_target.is_extremum(),
             ),
             AccessMethodParams::Subquery { iter_dir } => {
                 let Table::FromClauseSubquery(from_clause_subquery) = &table_ref.table else {
@@ -652,10 +652,13 @@ fn finalized_scan_subquery_order_consumed(
             effective_iter_dir,
             index.as_deref(),
             &[],
-            &mapped_target,
+            &OrderTarget {
+                columns: mapped_target,
+                purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
+            },
+            0,
             schema,
             EqualityPrefixScope::ConstantEquality,
-            false,
         ),
         Operation::Scan(Scan::Subquery { .. }) => {
             let Table::FromClauseSubquery(from_clause_subquery) = &joined_table.table else {
@@ -787,12 +790,13 @@ pub(super) fn btree_access_order_consumed(
     iter_dir: IterationDirection,
     index: Option<&Index>,
     constraint_refs: &[RangeConstraintRef],
-    order_target: &[ColumnOrder],
+    order_target: &OrderTarget,
+    start_col: usize,
     schema: &Schema,
     equality_prefix_scope: EqualityPrefixScope,
-    target_is_extremum: bool,
 ) -> usize {
-    let Some(first_target_col) = order_target.first() else {
+    let target_columns = &order_target.columns[start_col..];
+    let Some(first_target_col) = target_columns.first() else {
         return 0;
     };
 
@@ -830,8 +834,8 @@ pub(super) fn btree_access_order_consumed(
         Some(index) => {
             let mut col_idx = 0;
             let mut idx_pos = 0;
-            while col_idx < order_target.len() && idx_pos < index.columns.len() {
-                let target_col = &order_target[col_idx];
+            while col_idx < target_columns.len() && idx_pos < index.columns.len() {
+                let target_col = &target_columns[col_idx];
                 if target_col.table_id != table_ref.internal_id {
                     break;
                 }
@@ -892,7 +896,7 @@ pub(super) fn btree_access_order_consumed(
                     break;
                 }
 
-                if !target_is_extremum {
+                if !order_target.is_extremum() {
                     let requested_nulls = target_col.effective_nulls_order();
                     let effective_nulls = idx_col.effective_nulls_order_when_iterated(iter_dir);
                     if requested_nulls != effective_nulls {
@@ -906,8 +910,8 @@ pub(super) fn btree_access_order_consumed(
 
             // SQLite-style rowid tables keep equal secondary-index keys ordered
             // by rowid. That implicit suffix can satisfy one extra ORDER BY term.
-            if col_idx < order_target.len() && idx_pos == index.columns.len() && index.has_rowid {
-                let target_col = &order_target[col_idx];
+            if col_idx < target_columns.len() && idx_pos == index.columns.len() && index.has_rowid {
+                let target_col = &target_columns[col_idx];
                 let rowid_matches = match target_col.target {
                     ColumnTarget::RowId => true,
                     ColumnTarget::Column(col_no) => {
