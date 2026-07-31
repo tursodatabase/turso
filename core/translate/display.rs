@@ -208,6 +208,9 @@ pub(crate) fn render_postgres_explain(
             offset.as_deref(),
             order_by.as_deref(),
         ),
+        Plan::RecursiveCte(_) => {
+            unreachable!("recursive CTE plans are nested in a top-level SELECT plan")
+        }
         Plan::Delete(delete) => render_postgres_delete(delete, explain),
         Plan::Update(update) => render_postgres_update(update, explain),
     }

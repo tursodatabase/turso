@@ -1383,7 +1383,7 @@ fn wire_server_version_parameter_matches_version_function() {
     });
 }
 
- /// EXPLAIN travels through the same simple-query protocol used by psql and
+/// EXPLAIN travels through the same simple-query protocol used by psql and
 /// returns PostgreSQL's one-column text result shape.
 #[test]
 fn wire_explain_reports_text_column_oid() {
