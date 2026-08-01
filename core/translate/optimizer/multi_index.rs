@@ -6,7 +6,7 @@
 //! union/intersection-specific decomposition, costing, and residual handling on
 //! top.
 
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Index, Schema};
 use crate::stats::AnalyzeStats;
 use crate::translate::expr::expr_references_any_subquery;
@@ -955,7 +955,7 @@ pub fn consider_multi_index_union(
             continue;
         }
 
-        let mut allowed_mask = lhs_mask.clone();
+        let mut allowed_mask = lhs_mask.try_clone()?;
         let Some(rhs_idx) = table_references
             .joined_tables()
             .iter()
@@ -1247,7 +1247,7 @@ mod tests {
             1,
             name.to_string(),
             crate::alloc::vec![],
-            columns.try_to_vec().expect("TODO: fallible allocations"),
+            columns.try_to_vec().expect(crate::alloc::ALLOC_ERR_MSG),
             BTreeCharacteristics::HAS_ROWID,
             crate::alloc::vec![],
             crate::alloc::vec![],
@@ -1362,14 +1362,7 @@ mod tests {
                 name: "idx_item_id".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
-                columns: crate::alloc::vec![IndexColumn {
-                    name: "id".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 0,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                }],
+                columns: IndexColumn::new_many(vec!["id"]),
                 unique: false,
                 ephemeral: false,
                 root_page: 2,
@@ -1513,14 +1506,7 @@ mod tests {
                 name: "idx_item_a".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
-                columns: crate::alloc::vec![IndexColumn {
-                    name: "a".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 1,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                }],
+                columns: crate::alloc::vec![IndexColumn::new("a", 1)],
                 unique: false,
                 ephemeral: false,
                 root_page: 2,
@@ -1826,14 +1812,7 @@ mod tests {
                 name: "idx_item_id".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
-                columns: crate::alloc::vec![IndexColumn {
-                    name: "id".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 0,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                }],
+                columns: IndexColumn::new_many(vec!["id"]),
                 unique: false,
                 ephemeral: false,
                 root_page: 2,

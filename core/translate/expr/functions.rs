@@ -1,7 +1,7 @@
 use super::*;
 use crate::translate::sequence::emit_sequence_descriptor_literals;
 use crate::vdbe::builder::CursorType;
-use crate::vdbe::insn::{to_u16, InsertFlags, RegisterOrLiteral};
+use crate::vdbe::insn::{to_u32, InsertFlags, RegisterOrLiteral};
 
 /// The base logic for translating LIKE and GLOB expressions.
 /// The logic for handling "NOT LIKE" is different depending on whether the expression
@@ -314,7 +314,8 @@ pub(super) fn translate_sequence_function(
         program.emit_insn(Insn::Delete {
             cursor_id,
             table_name: normalized_name.clone(),
-            is_part_of_update: false,
+            // Sequence storage is internal bookkeeping, not a SQL row change.
+            is_part_of_update: true,
         });
         program.emit_insn(Insn::Next {
             cursor_id,
@@ -344,9 +345,9 @@ pub(super) fn translate_sequence_function(
 
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(col_base),
+            start_reg: to_u32(col_base),
             count: 7,
-            dest_reg: to_u16(record_reg),
+            dest_reg: to_u32(record_reg),
             index_name: None,
             affinity_str: None,
         });
@@ -354,7 +355,7 @@ pub(super) fn translate_sequence_function(
             cursor: cursor_id,
             key_reg: start_reg + 1,
             record_reg,
-            flag: InsertFlags::new().require_seek(),
+            flag: InsertFlags::new().require_seek().skip_all_change_counts(),
             table_name: normalized_name.clone(),
         });
         program.emit_insn(Insn::SetSequenceCurrval {

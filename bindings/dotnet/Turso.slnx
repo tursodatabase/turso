@@ -19,5 +19,7 @@
   <Project Path="src\Turso.Data.Sqlite\Turso.Data.Sqlite.csproj" />
   <Project Path="src\Turso.EntityFrameworkCore.Sqlite\Turso.EntityFrameworkCore.Sqlite.csproj" />
   <Project Path="src\Turso.Data\Turso.Data.csproj" />
+  <Project Path="src\Turso.Platform.Client\Turso.Platform.Client.csproj" />
+  <Project Path="src\Turso.Serverless.Client\Turso.Serverless.Client.csproj" />
   <Project Path="src\Turso.Raw\Turso.Raw.csproj" Type="Classic C#" />
 </Solution>

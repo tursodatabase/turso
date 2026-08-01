@@ -180,8 +180,16 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
         let d1 = vector_distance_jaccard(&v1, &v2).unwrap();
         println!("v1: {:?}, v2: {:?}", v1.as_f32_slice(), v2.as_f32_slice());
 
@@ -204,8 +212,8 @@ mod tests {
     //     v1: ArbitraryVector<100>,
     //     v2: ArbitraryVector<100>,
     // ) -> bool {
-    //     let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
-    //     let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+    //     let v1 = vector_convert(v1.try_into().expect("generated vector must be valid"), VectorType::Float32Dense).unwrap();
+    //     let v2 = vector_convert(v2.try_into().expect("generated vector must be valid"), VectorType::Float32Dense).unwrap();
     //     let v1_f8 = vector_convert(v1, VectorType::Float8).unwrap();
     //     let v2_f8 = vector_convert(v2, VectorType::Float8).unwrap();
     //     let d_f8 = vector_distance_jaccard(&v1_f8, &v2_f8).unwrap();
@@ -221,8 +229,16 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        let v1 = vector_convert(v1.into(), VectorType::Float1Bit).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float1Bit).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float1Bit,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float1Bit,
+        )
+        .unwrap();
         let d = vector_distance_jaccard(&v1, &v2).unwrap();
         // Manual: binary Jaccard = 1 - |intersection| / |union| over set bits
         let d1 = v1.as_1bit_data();

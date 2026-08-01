@@ -785,6 +785,14 @@ pub enum Literal {
     CurrentTimestamp,
 }
 
+pub fn blob_literal_hex(blob: &str) -> &str {
+    debug_assert!(blob.len() >= 3);
+    debug_assert!(matches!(blob.as_bytes()[0], b'x' | b'X'));
+    debug_assert_eq!(blob.as_bytes()[1], b'\'');
+    debug_assert_eq!(blob.as_bytes()[blob.len() - 1], b'\'');
+    &blob[2..blob.len() - 1]
+}
+
 /// Textual comparison operator in an expression
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

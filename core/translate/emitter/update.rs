@@ -1,6 +1,6 @@
 use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
@@ -51,7 +51,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext},
-        insn::{to_u16, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
+        insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset,
     },
     CaptureDataChangesExt, Connection, HashSet, Result, MAIN_DB_ID,
@@ -186,7 +186,7 @@ pub fn emit_program_for_update(
             internal_id: target_table.internal_id,
             table: target_table.table.clone(),
             using_dedup_hidden_cols: ColumnMask::default(),
-            col_used_mask: target_table.col_used_mask.clone(),
+            col_used_mask: target_table.col_used_mask.try_clone()?,
             cte_select: None,
             cte_explicit_columns: vec![],
             cte_id: None,
@@ -1241,7 +1241,7 @@ fn emit_update_insns<'a>(
     };
     let table_name = target_table.table.get_name();
     let start = if is_virtual_table { beg + 2 } else { beg + 1 };
-    let layout = ColumnLayout::from_table(&target_table.as_ref().table);
+    let layout = ColumnLayout::from_table(&target_table.as_ref().table)?;
     let affected_columns = match target_table.table.btree() {
         Some(btree) => btree.columns_affected_by_update(&updated_column_indices)?,
         None => updated_column_indices.clone(),
@@ -1887,9 +1887,9 @@ fn emit_update_insns<'a>(
         });
 
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(idx_start_reg),
-            count: to_u16(num_cols + 1),
-            dest_reg: to_u16(*record_reg),
+            start_reg: to_u32(idx_start_reg),
+            count: to_u32(num_cols + 1),
+            dest_reg: to_u32(*record_reg),
             index_name: Some(index.name.clone()),
             affinity_str: None,
         });
@@ -2229,7 +2229,7 @@ fn emit_update_insns<'a>(
             cursor_id: ctx.idx_cursor_id,
             record_reg: ctx.record_reg,
             unpacked_start: Some(ctx.idx_start_reg),
-            unpacked_count: Some((ctx.num_cols + 1) as u16),
+            unpacked_count: Some((ctx.num_cols + 1) as u32),
             flags: IdxInsertFlags::new().nchange(true),
         });
 
@@ -2547,9 +2547,9 @@ fn emit_update_insns<'a>(
             let cdc_updates_record = if let Some(cdc_updates_register) = cdc_updates_register {
                 let record_reg = program.alloc_register();
                 program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u16(cdc_updates_register),
-                    count: to_u16(2 * col_len),
-                    dest_reg: to_u16(record_reg),
+                    start_reg: to_u32(cdc_updates_register),
+                    count: to_u32(2 * col_len),
+                    dest_reg: to_u32(record_reg),
                     index_name: None,
                     affinity_str: None,
                 });
@@ -2631,5 +2631,6 @@ fn emit_update_insns<'a>(
     program.preassign_label_to_next_insn(trigger_ignore_jump_label);
 
     t_ctx.resolver.register_affinities.clear();
+    t_ctx.resolver.register_collations.clear();
     Ok(())
 }

@@ -1,0 +1,78 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <PackageId>Turso.Data.Sqlite.NativeAot.$(NativeAotRid)</PackageId>
+    <Title>Turso NativeAOT static library ($(NativeAotRid))</Title>
+    <Description>RID-specific static native library assets for NativeAOT publishing with Turso.Data.Sqlite.</Description>
+    <Authors>Turso authors</Authors>
+    <PackageTags>turso;sqlite;database;nativeaot;static;$(NativeAotRid)</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/tursodatabase/turso</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/tursodatabase/turso</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+    <RequireNativeAssetsForPack>true</RequireNativeAssetsForPack>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <NativeAotTarget Condition="'$(NativeAotRid)' == 'win-x64'">x86_64-pc-windows-msvc</NativeAotTarget>
+    <NativeAotTarget Condition="'$(NativeAotRid)' == 'win-arm64'">aarch64-pc-windows-msvc</NativeAotTarget>
+    <NativeAotTarget Condition="'$(NativeAotRid)' == 'linux-x64'">x86_64-unknown-linux-gnu</NativeAotTarget>
+    <NativeAotTarget Condition="'$(NativeAotRid)' == 'linux-arm64'">aarch64-unknown-linux-gnu</NativeAotTarget>
+    <NativeAotTarget Condition="'$(NativeAotRid)' == 'osx-x64'">x86_64-apple-darwin</NativeAotTarget>
+    <NativeAotTarget Condition="'$(NativeAotRid)' == 'osx-arm64'">aarch64-apple-darwin</NativeAotTarget>
+
+    <NativeAotLibraryFile Condition="'$(NativeAotRid)' == 'win-x64' or '$(NativeAotRid)' == 'win-arm64'">turso_sdk_kit.lib</NativeAotLibraryFile>
+    <NativeAotLibraryFile Condition="'$(NativeAotRid)' == 'linux-x64' or '$(NativeAotRid)' == 'linux-arm64' or '$(NativeAotRid)' == 'osx-x64' or '$(NativeAotRid)' == 'osx-arm64'">libturso_sdk_kit.a</NativeAotLibraryFile>
+
+    <_NativeAotProfileDirectory Condition="'$(NativeAotTarget)' != '' and '$(NativeAotLibraryFile)' != '' and Exists('..\..\rs_compiled\$(NativeAotTarget)\release-official\$(NativeAotLibraryFile)')">release-official</_NativeAotProfileDirectory>
+    <_NativeAotProfileDirectory Condition="'$(_NativeAotProfileDirectory)' == '' and '$(NativeAotTarget)' != '' and '$(NativeAotLibraryFile)' != '' and Exists('..\..\rs_compiled\$(NativeAotTarget)\release\$(NativeAotLibraryFile)')">release</_NativeAotProfileDirectory>
+    <_NativeAotLibraryPath Condition="'$(NativeAotTarget)' != '' and '$(_NativeAotProfileDirectory)' != ''">..\..\rs_compiled\$(NativeAotTarget)\$(_NativeAotProfileDirectory)\$(NativeAotLibraryFile)</_NativeAotLibraryPath>
+    <_NativeAotWindowsDependencyDirectory Condition="'$(NativeAotRid)' == 'win-x64' or '$(NativeAotRid)' == 'win-arm64'">..\..\rs_compiled\$(NativeAotTarget)\$(_NativeAotProfileDirectory)\native-static-libs</_NativeAotWindowsDependencyDirectory>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\Readme.md" Pack="true" PackagePath="README.md" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="buildTransitive\Turso.Data.Sqlite.NativeAot.targets"
+          Pack="true"
+          PackagePath="buildTransitive\$(PackageId).targets" />
+    <None Include="$(_NativeAotLibraryPath)"
+          Visible="false"
+          Condition="'$(_NativeAotLibraryPath)' != '' and Exists('$(_NativeAotLibraryPath)')">
+      <Pack>true</Pack>
+      <PackagePath>buildTransitive\native\$(NativeAotRid)\$(NativeAotLibraryFile)</PackagePath>
+    </None>
+    <None Include="$(_NativeAotWindowsDependencyDirectory)\windows*.lib"
+          Visible="false"
+          Condition="'$(_NativeAotWindowsDependencyDirectory)' != '' and Exists('$(_NativeAotWindowsDependencyDirectory)')">
+      <Pack>true</Pack>
+      <PackagePath>buildTransitive\native\$(NativeAotRid)\</PackagePath>
+    </None>
+  </ItemGroup>
+
+  <Target Name="ValidateNativeAotStaticPackage" BeforeTargets="Pack"
+          Condition="'$(RequireNativeAssetsForPack)' == 'true'">
+    <ItemGroup>
+      <_NativeAotWindowsDependencies Include="$(_NativeAotWindowsDependencyDirectory)\windows*.lib"
+                                     Condition="'$(_NativeAotWindowsDependencyDirectory)' != '' and Exists('$(_NativeAotWindowsDependencyDirectory)')" />
+    </ItemGroup>
+
+    <Error Condition="'$(NativeAotRid)' == ''"
+           Text="NativeAotRid is required when packing Turso.Data.Sqlite.NativeAot." />
+    <Error Condition="'$(NativeAotTarget)' == ''"
+           Text="Unsupported NativeAotRid '$(NativeAotRid)'." />
+    <Error Condition="'$(_NativeAotLibraryPath)' == '' or !Exists('$(_NativeAotLibraryPath)')"
+           Text="Missing $(NativeAotRid) static native asset. Build $(NativeAotLibraryFile) before packing $(PackageId)." />
+    <Error Condition="('$(NativeAotRid)' == 'win-x64' or '$(NativeAotRid)' == 'win-arm64') and '@(_NativeAotWindowsDependencies)' == ''"
+           Text="Missing $(NativeAotRid) static native dependency assets. Collect windows*.lib before packing $(PackageId)." />
+  </Target>
+</Project>

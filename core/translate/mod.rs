@@ -30,6 +30,7 @@ pub(crate) mod order_by;
 pub(crate) mod plan;
 pub(crate) mod planner;
 pub(crate) mod pragma;
+pub(crate) mod recursive_cte;
 pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;
@@ -70,6 +71,7 @@ use update::translate_update;
 #[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
 #[turso_macros::trace_stack]
+#[allow(clippy::too_many_arguments)]
 pub fn translate(
     schema: &Schema,
     stmt: ast::Stmt,
@@ -78,6 +80,7 @@ pub fn translate(
     syms: &SymbolTable,
     query_mode: QueryMode,
     input: &str,
+    origin: crate::statement::StatementOrigin,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
@@ -88,13 +91,19 @@ pub fn translate(
             | ast::Stmt::Update { .. }
     );
 
+    let capture_data_changes_info = if connection.is_mvcc_bootstrap_connection() {
+        None
+    } else {
+        connection.get_capture_data_changes_info().clone()
+    };
     // Boxed so the ~800 B builder sits on the heap instead of the prepare frame.
     let mut program = Box::new(ProgramBuilder::new(
         query_mode,
-        connection.get_capture_data_changes_info().clone(),
+        capture_data_changes_info,
         // These options will be extended whithin each translate program
         ProgramBuilderOpts::new(1, 32, 2),
     ));
+    program.set_mvcc_enabled(connection.mvcc_enabled());
 
     program.prologue();
     let mut resolver = Resolver::new(
@@ -105,6 +114,14 @@ pub fn translate(
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
+        // Engine-generated helper statements are always SQLite text and
+        // must resolve functions with SQLite semantics regardless of the
+        // database's dialect — the same invariant as unmarked schema rows.
+        if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
+            Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
+        } else {
+            connection.dialect()
+        },
     );
 
     match stmt {
@@ -173,6 +190,10 @@ pub fn translate_inner(
     }
 
     let is_select = matches!(stmt, ast::Stmt::Select { .. });
+    let is_dml = matches!(
+        stmt,
+        ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }
+    );
 
     match stmt {
         ast::Stmt::AlterTable(alter) => {
@@ -202,6 +223,7 @@ pub fn translate_inner(
             body,
             program,
             connection,
+            input,
         )?,
         ast::Stmt::CreateTrigger {
             temporary,
@@ -447,9 +469,16 @@ pub fn translate_inner(
         }
     };
 
-    // Indicate write operations so that in the epilogue we can emit the correct type of transaction
     if is_write {
-        program.begin_write_operation()?;
+        if is_dml {
+            // DML translators register their actual write database. Keep a
+            // main read transaction to coordinate connection-level autocommit,
+            // without upgrading an unrelated main snapshot for attached-only
+            // writes.
+            program.begin_read_operation()?;
+        } else {
+            program.begin_write_operation()?;
+        }
     }
 
     // Indicate read operations so that in the epilogue we can emit the correct type of transaction
@@ -501,15 +530,18 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::TryClone;
     use crate::io::MemoryIO;
     use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
+    use crate::vdbe::insn::Insn;
     use crate::Database;
+    use crate::SqliteDialect;
 
     /// Verify that REGEXP produces the correct error when no regexp function is registered.
     #[test]
     fn test_regexp_no_function_registered() {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:").unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
         let schema = db.schema.lock().clone();
         let pager = conn.pager.load().clone();
@@ -531,6 +563,7 @@ mod tests {
             &empty_syms,
             QueryMode::Normal,
             "",
+            crate::statement::StatementOrigin::Root,
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -540,14 +573,49 @@ mod tests {
     }
 
     #[test]
+    fn nth_value_reads_from_saved_rows_without_an_accumulator() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE items(value)").unwrap();
+
+        let statement = conn
+            .prepare("SELECT nth_value(value, 2) OVER (ORDER BY value) FROM items")
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+
+        let missing_row_target = instructions
+            .iter()
+            .find_map(|(instruction, _)| match instruction {
+                Insn::SeekRowid { target_pc, .. } => Some(target_pc.as_offset_int() as usize),
+                _ => None,
+            })
+            .expect("nth_value must read its answer from the saved window rows");
+        assert!(
+            matches!(
+                &instructions[missing_row_target].0,
+                Insn::Halt { on_error: None, .. }
+            ),
+            "a missing saved row must stop execution instead of returning NULL"
+        );
+        assert!(
+            instructions.iter().all(|(instruction, _)| !matches!(
+                instruction,
+                Insn::AggStep { .. } | Insn::AggValue { .. }
+            )),
+            "nth_value must not keep another copy of saved values in an accumulator"
+        );
+    }
+
+    #[test]
     fn test_insert_autoincrement_with_malformed_sqlite_sequence_is_corrupt() {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:").unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
             .unwrap();
 
-        let mut schema = db.schema.lock().as_ref().clone();
+        let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
         let seq_root_page = schema
             .get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
             .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
@@ -570,8 +638,17 @@ mod tests {
             _ => panic!("expected statement"),
         };
 
-        let err = translate(&schema, stmt, pager, conn, &syms, QueryMode::Normal, "")
-            .expect_err("translation should fail with malformed sqlite_sequence");
+        let err = translate(
+            &schema,
+            stmt,
+            pager,
+            conn,
+            &syms,
+            QueryMode::Normal,
+            "",
+            crate::statement::StatementOrigin::Root,
+        )
+        .expect_err("translation should fail with malformed sqlite_sequence");
         match err {
             crate::LimboError::Corrupt(msg) => {
                 assert!(
@@ -586,12 +663,12 @@ mod tests {
     #[test]
     fn test_insert_autoincrement_with_missing_sqlite_sequence_is_corrupt() {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:").unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
             .unwrap();
 
-        let mut schema = db.schema.lock().as_ref().clone();
+        let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
         schema.tables.remove(SQLITE_SEQUENCE_TABLE_NAME);
 
         let pager = conn.pager.load().clone();
@@ -604,8 +681,17 @@ mod tests {
             _ => panic!("expected statement"),
         };
 
-        let err = translate(&schema, stmt, pager, conn, &syms, QueryMode::Normal, "")
-            .expect_err("translation should fail with missing sqlite_sequence");
+        let err = translate(
+            &schema,
+            stmt,
+            pager,
+            conn,
+            &syms,
+            QueryMode::Normal,
+            "",
+            crate::statement::StatementOrigin::Root,
+        )
+        .expect_err("translation should fail with missing sqlite_sequence");
         match err {
             crate::LimboError::Corrupt(msg) => {
                 assert!(
@@ -620,7 +706,7 @@ mod tests {
     #[test]
     fn test_trigger_compile_error_does_not_poison_future_insert_compilation() {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:").unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
 
         conn.execute("CREATE TABLE ref(x);").unwrap();

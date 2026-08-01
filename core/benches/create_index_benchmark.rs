@@ -27,6 +27,7 @@ use criterion::{
 };
 #[cfg(not(feature = "codspeed"))]
 use pprof::criterion::{Output, PProfProfiler};
+use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{
@@ -90,7 +91,7 @@ fn open_turso(temp_dir: &TempDir) -> (Arc<Database>, Arc<turso_core::Connection>
     let db_path = temp_dir.path().join("create_index_bench.db");
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+    let db = Database::open_file(io, db_path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect().unwrap();
     exec_turso(&conn, &db, "PRAGMA journal_mode = 'mvcc'");
     exec_turso(&conn, &db, "PRAGMA mvcc_checkpoint_threshold = -1");

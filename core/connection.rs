@@ -1,3 +1,4 @@
+use crate::alloc::TryClone;
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
@@ -26,8 +27,8 @@ use crate::{
     BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
     Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
     EncryptionKey, EncryptionOpts, IOResult, IndexMethod, LimboError, MvStore, OpenFlags, PageSize,
-    Pager, Parser, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode,
-    TransactionMode, Trigger, Value, VirtualTable, WalAutoActions,
+    Pager, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
+    Trigger, Value, VirtualTable, WalAutoActions,
 };
 use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
@@ -351,6 +352,10 @@ pub struct Connection {
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
     pub(super) transaction_state: AtomicTransactionState,
+    /// True when an unfinished write statement inside an explicit transaction
+    /// was reset or dropped and there was no statement savepoint to undo only
+    /// that statement. COMMIT must roll back the whole transaction.
+    pub(crate) poisoned_tx: AtomicBool,
     pub(super) last_insert_rowid: AtomicI64,
     pub(crate) changes: AtomicI64,
     pub(crate) total_changes: AtomicI64,
@@ -460,7 +465,10 @@ pub struct Connection {
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
     pub(crate) fk_deferred_violations: AtomicIsize,
-    /// Number of active write statements on this connection.
+    /// Number of active top-level write statements on this connection.
+    ///
+    /// This is currently only 0 or 1. We return Busy instead of allowing a
+    /// second same-connection writer to start.
     pub(crate) n_active_writes: AtomicI32,
     /// Number of active root statements currently executing on this connection.
     /// This is Turso's equivalent of SQLite's top-level active-VDBE count
@@ -566,8 +574,11 @@ impl Connection {
 
     pub(crate) fn empty_temp_schema(&self) -> Arc<Schema> {
         // with_options only fails if built-in type SQL is malformed (programmer bug).
-        let mut schema = Schema::with_options(self.db.experimental_custom_types_enabled())
-            .expect("built-in type definitions are malformed");
+        let mut schema = Schema::with_options(
+            self.db.experimental_custom_types_enabled(),
+            self.db.dialect().as_ref(),
+        )
+        .expect("built-in type definitions are malformed");
         schema.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         Arc::new(schema)
     }
@@ -609,6 +620,7 @@ impl Connection {
                 OpenFlags::Create,
                 db_opts,
                 None,
+                self.db.dialect(),
             )?;
             let pager = Arc::new(db._init(None)?);
             pager.set_initial_page_size(page_size)?;
@@ -639,6 +651,7 @@ impl Connection {
                 OpenFlags::Create,
                 db_opts,
                 None,
+                self.db.dialect(),
             )?;
             let pager = Arc::new(db._init(None)?);
             pager.set_initial_page_size(page_size)?;
@@ -658,6 +671,7 @@ impl Connection {
                 OpenFlags::Create,
                 db_opts,
                 None,
+                self.db.dialect(),
             )?;
             let pager = Arc::new(db._init(None)?);
             pager.set_initial_page_size(page_size)?;
@@ -674,6 +688,7 @@ impl Connection {
             OpenFlags::Create,
             self.make_temp_database_opts(),
             None,
+            self.db.dialect(),
         )?;
         let pager = Arc::new(db._init(None)?);
         pager.set_initial_page_size(self.get_page_size())?;
@@ -879,6 +894,7 @@ impl Connection {
         self: &Arc<Connection>,
         cmd: Cmd,
         input: &str,
+        origin: StatementOrigin,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
         self.maybe_update_schema();
 
@@ -895,6 +911,7 @@ impl Connection {
             &syms,
             mode,
             input,
+            origin,
         ) {
             Ok(program) => Ok((program, pager, mode)),
             Err(err) if self.should_retry_cross_process_schema_lookup(&err)? => {
@@ -904,8 +921,8 @@ impl Connection {
                 drop(syms);
                 let cmd = {
                     crate::stack::trace_stack!("schema_retry_parse");
-                    let mut parser = Parser::new(input.as_bytes());
-                    let Some(cmd) = parser.next_cmd()? else {
+                    let (cmd, _) = self.parse_sql(input)?;
+                    let Some(cmd) = cmd else {
                         return Err(err);
                     };
                     cmd
@@ -924,6 +941,7 @@ impl Connection {
                     &syms,
                     mode,
                     input,
+                    origin,
                 )
                 .map(|program| (program, pager, mode))
             }
@@ -935,10 +953,12 @@ impl Connection {
         self._prepare(sql)
     }
 
-    pub(crate) fn prepare_internal(
-        self: &Arc<Connection>,
-        sql: impl AsRef<str>,
-    ) -> Result<Statement> {
+    pub fn prepare_sqlite(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
+        self.prepare_with_origin(sql, StatementOrigin::Root)
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_internal(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self.prepare_with_origin(sql, StatementOrigin::InternalHelper)
     }
 
@@ -948,7 +968,7 @@ impl Connection {
     }
 
     #[turso_macros::trace_stack]
-    fn prepare_with_origin(
+    pub(crate) fn prepare_with_origin(
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
         origin: StatementOrigin,
@@ -969,23 +989,23 @@ impl Connection {
         let result = (|| {
             let sql = sql.as_ref();
             tracing::debug!("Preparing: {}", sql);
+
             let (cmd, byte_offset_end) = {
                 crate::stack::trace_stack!("parse");
-                let mut parser = Parser::new(sql.as_bytes());
-                let cmd = match parser.next_cmd()? {
-                    Some(cmd) => cmd,
-                    None => {
-                        return Err(LimboError::InvalidArgument(
-                            "The supplied SQL string contains no statements".to_string(),
-                        ));
-                    }
-                };
-                (cmd, parser.offset())
+                self.parse_sql(sql)?
+            };
+            let cmd = match cmd {
+                Some(cmd) => cmd,
+                None => {
+                    return Err(LimboError::InvalidArgument(
+                        "The supplied SQL string contains no statements".to_string(),
+                    ));
+                }
             };
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
 
             Ok(Statement::new_with_origin(
                 program,
@@ -1002,16 +1022,26 @@ impl Connection {
         result
     }
 
-    /// Prepare a statement from an AST node directly, skipping SQL parsing.
-    /// This is more efficient when AST is already available or constructed programmatically.
-    pub fn prepare_stmt(self: &Arc<Connection>, stmt: ast::Stmt) -> Result<Statement> {
-        self.prepare_stmt_with_origin(stmt, StatementOrigin::Root)
+    /// Prepare an already-translated statement while keeping the original
+    /// SQL text.
+    ///
+    /// A frontend that already has an engine AST can call this instead of
+    /// parsing through [`Dialect::parse`](crate::Dialect::parse), while the
+    /// original text remains available for schema storage, diagnostics, and
+    /// later re-preparation through the dialect.
+    pub fn prepare_translated_stmt(
+        self: &Arc<Connection>,
+        stmt: ast::Stmt,
+        input: &str,
+    ) -> Result<Statement> {
+        self.prepare_stmt_with_input_and_origin(stmt, input, StatementOrigin::Root)
     }
 
     #[turso_macros::trace_stack]
-    fn prepare_stmt_with_origin(
+    fn prepare_stmt_with_input_and_origin(
         self: &Arc<Connection>,
         stmt: ast::Stmt,
+        input: &str,
         origin: StatementOrigin,
     ) -> Result<Statement> {
         if self.is_closed() {
@@ -1022,20 +1052,7 @@ impl Connection {
             self.start_nested();
         }
         let result = (|| {
-            self.maybe_update_schema();
-            let syms = self.syms.read();
-            let pager = self.pager.load().clone();
-            let mode = QueryMode::Normal;
-            let schema = self.schema.read().clone();
-            let program = translate::translate(
-                &schema,
-                stmt,
-                pager.clone(),
-                self.clone(),
-                &syms,
-                mode,
-                "<ast>", // No SQL input string available
-            )?;
+            let (program, pager, mode) = self.compile_cmd(Cmd::Stmt(stmt), input, origin)?;
             Ok(Statement::new_with_origin(
                 program,
                 pager,
@@ -1083,6 +1100,7 @@ impl Connection {
         if self.get_tx_state() != TransactionState::None {
             return Ok(());
         }
+        let had_main_mv_tx = self.get_mv_tx().is_some();
 
         if self.db.shared_wal_coordination()?.is_some() {
             // Cross-process schema changes can leave page 1 and sqlite_schema
@@ -1151,12 +1169,85 @@ impl Connection {
         if previous == TransactionState::Read {
             pager.end_read_tx();
         }
+        if !had_main_mv_tx {
+            self.clear_internal_main_mvcc_tx(&pager);
+        }
 
         reparse_result?;
 
         let schema = self.schema.read().clone();
         self.db.update_schema_if_newer(schema);
         Ok(())
+    }
+
+    /// Parse schema from scratch even if the schema cookie did not change.
+    ///
+    /// Sync replace-base can install a page snapshot outside ordinary SQL DDL.
+    /// The replacement may reuse the same schema cookie while changing root
+    /// pages, so cookie-based refresh would keep stale btree metadata.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn force_reparse_schema(self: &Arc<Connection>) -> Result<()> {
+        self.force_reparse_schema_inner(true)
+    }
+
+    /// Like [`Self::force_reparse_schema`], but refreshes only this connection's
+    /// own schema snapshot without publishing it to the shared database cache.
+    ///
+    /// Use this when the caller must further mutate the schema before it becomes
+    /// visible to other connections.
+    pub fn force_reparse_schema_without_publish(self: &Arc<Connection>) -> Result<()> {
+        self.force_reparse_schema_inner(false)
+    }
+
+    fn force_reparse_schema_inner(self: &Arc<Connection>, publish: bool) -> Result<()> {
+        if self.get_tx_state() != TransactionState::None {
+            return Err(LimboError::Busy);
+        }
+        if self.get_mv_tx().is_some() || self.next_attached_mv_tx().is_some() {
+            return Err(LimboError::Busy);
+        }
+
+        let pager = self.pager.load().clone();
+        pager.clear_page_cache(false);
+        pager.set_schema_cookie(None);
+        pager.begin_read_tx()?;
+        self.set_tx_state(TransactionState::Read);
+
+        let reparse_result = self.reparse_schema();
+
+        let previous = self.transaction_state.swap(TransactionState::None);
+        turso_assert!(
+            matches!(previous, TransactionState::None | TransactionState::Read),
+            "unexpected end transaction state"
+        );
+        if previous == TransactionState::Read {
+            pager.end_read_tx();
+        }
+        self.clear_internal_main_mvcc_tx(&pager);
+
+        reparse_result?;
+
+        if publish {
+            let schema = self.schema.read().clone();
+            self.db.update_schema_if_newer(schema);
+        }
+        Ok(())
+    }
+
+    fn clear_internal_main_mvcc_tx(&self, pager: &Arc<Pager>) {
+        let Some(tx_id) = self.get_mv_tx_id() else {
+            return;
+        };
+        if let Some(mv_store) = self.mv_store().as_ref() {
+            if mv_store.is_tx_rollbackable(tx_id) {
+                mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+            } else {
+                self.set_mv_tx(None);
+            }
+        } else {
+            self.set_mv_tx(None);
+        }
+        pager.cleanup_read_tx();
     }
 
     /// Blocking shim: drives [`Self::reparse_schema_nonblock`] to completion.
@@ -1231,7 +1322,10 @@ impl Connection {
         let guard = self.schema_reparse_guard();
         self.pager.load().set_schema_cookie(Some(cookie));
         // create fresh schema as some objects can be deleted
-        let mut fresh = Schema::with_options(self.experimental_custom_types_enabled())?;
+        let mut fresh = Schema::with_options(
+            self.experimental_custom_types_enabled(),
+            self.db.dialect().as_ref(),
+        )?;
         fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
 
@@ -1259,8 +1353,9 @@ impl Connection {
         // But in this occasion it will always reprepare, and we get an error. So we trick the statement by swapping our schema
         // with a new clean schema that has the same header cookie.
         self.with_schema_mut(|schema| {
-            *schema = fresh.clone();
-        });
+            *schema = fresh.try_clone()?;
+            Ok::<_, crate::alloc::TryReserveError>(())
+        })??;
 
         let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
 
@@ -1307,6 +1402,7 @@ impl Connection {
                         &mut inner.fresh,
                         &self.syms.read(),
                         &attached_resolver,
+                        self.db.dialect().as_ref(),
                     ));
 
                     // Rehydrate built-in table-valued functions captured at init.
@@ -1349,8 +1445,9 @@ impl Connection {
                             let work = inner.fresh.sequence_backing_table_names();
                             if !work.is_empty() {
                                 self.with_schema_mut(|schema| {
-                                    *schema = inner.fresh.clone();
-                                });
+                                    *schema = inner.fresh.try_clone()?;
+                                    Ok::<_, crate::alloc::TryReserveError>(())
+                                })??;
                             }
                             *pending = Some(work);
                         }
@@ -1428,8 +1525,9 @@ impl Connection {
                     {
                         // Temporarily install the schema so we can query against it.
                         self.with_schema_mut(|schema| {
-                            *schema = inner.fresh.clone();
-                        });
+                            *schema = inner.fresh.try_clone()?;
+                            Ok::<_, crate::alloc::TryReserveError>(())
+                        })??;
                         let stmt = self.prepare_internal(format!(
                             "SELECT name, sql FROM {}",
                             crate::schema::TURSO_TYPES_TABLE_NAME
@@ -1489,7 +1587,7 @@ impl Connection {
                     );
                     self.with_schema_mut(|schema| {
                         *schema = fresh;
-                    });
+                    })?;
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -1540,14 +1638,15 @@ impl Connection {
         }
         let sql = sql.as_ref();
         tracing::trace!("Preparing and executing batch: {}", sql);
-        let mut parser = Parser::new(sql.as_bytes());
-        while let Some(cmd) = parser.next_cmd()? {
-            let byte_offset_end = parser.offset();
-            let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+
+        let mut remaining = sql;
+        while let (Some(cmd), byte_offset_end) = self.parse_sql(remaining)? {
+            let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
-            Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
+            Statement::new(program, pager, mode, 0).run_ignore_rows()?;
+            remaining = &remaining[byte_offset_end..];
         }
         Ok(())
     }
@@ -1559,9 +1658,8 @@ impl Connection {
         }
         let sql = sql.as_ref();
         tracing::trace!("Querying: {}", sql);
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
-        let byte_offset_end = parser.offset();
+
+        let (cmd, byte_offset_end) = self.parse_sql(sql)?;
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
@@ -1580,7 +1678,7 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        let (program, pager, mode) = self.compile_cmd(cmd, input)?;
+        let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some(stmt))
     }
@@ -1598,17 +1696,17 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
-        let mut parser = Parser::new(sql.as_bytes());
-        while let Some(cmd) = parser.next_cmd()? {
-            let byte_offset_end = parser.offset();
-            let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+        let mut remaining = sql;
+        while let (Some(cmd), byte_offset_end) = self.parse_sql(remaining)? {
+            let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
             {
                 crate::stack::trace_stack!("run");
                 Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
             }
+            remaining = &remaining[byte_offset_end..];
         }
         Ok(())
     }
@@ -1618,27 +1716,41 @@ impl Connection {
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
     ) -> Result<Option<(Statement, usize)>> {
-        let mut parser = Parser::new(sql.as_ref().as_bytes());
-        let Some(cmd) = parser.next_cmd()? else {
+        let (cmd, byte_offset_end) = self.parse_sql(sql.as_ref())?;
+        let Some(cmd) = cmd else {
             return Ok(None);
         };
-        let byte_offset_end = parser.offset();
         let input = str::from_utf8(&sql.as_ref().as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
-        let (program, pager, mode) = self.compile_cmd(cmd, input)?;
+        let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
         let stmt = Statement::new(program, pager, mode, 0);
-        Ok(Some((stmt, parser.offset())))
+        Ok(Some((stmt, byte_offset_end)))
+    }
+
+    pub(crate) fn parse_sql(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        self.db.dialect().parse(sql)
     }
 
     #[cfg(feature = "fs")]
-    pub fn from_uri(uri: &str, db_opts: DatabaseOpts) -> Result<(Arc<dyn IO>, Arc<Connection>)> {
+    pub fn from_uri(
+        uri: &str,
+        db_opts: DatabaseOpts,
+        dialect: Arc<dyn crate::Dialect>,
+    ) -> Result<(Arc<dyn IO>, Arc<Connection>)> {
         use crate::util::MEMORY_PATH;
         let opts = OpenOptions::parse(uri)?;
         let flags = opts.get_flags()?;
         if opts.path == MEMORY_PATH || matches!(opts.mode, OpenMode::Memory) {
             let io = Arc::new(MemoryIO::new());
-            let db = Database::open_file_with_flags(io.clone(), MEMORY_PATH, flags, db_opts, None)?;
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                MEMORY_PATH,
+                flags,
+                db_opts,
+                None,
+                dialect,
+            )?;
             let conn = db.connect()?;
             return Ok((io, conn));
         }
@@ -1662,6 +1774,7 @@ impl Connection {
             flags,
             db_opts,
             encryption_opts,
+            dialect,
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
@@ -1684,6 +1797,7 @@ impl Connection {
         mut db_opts: DatabaseOpts,
         main_db_flags: OpenFlags,
         io: Arc<dyn IO>,
+        dialect: Arc<dyn crate::Dialect>,
     ) -> Result<(Arc<Database>, Option<EncryptionOpts>)> {
         let opts = OpenOptions::parse(uri)?;
         let mut flags = opts.get_flags()?;
@@ -1714,6 +1828,7 @@ impl Connection {
             flags,
             db_opts,
             encryption_opts.clone(),
+            dialect,
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
@@ -1792,7 +1907,16 @@ impl Connection {
                 || self
                     .has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema))
         {
-            *self.schema.write() = schema.clone();
+            let mut adopted = schema.clone();
+            // Resolve placeholder (negative) roots to the real pages a checkpoint has
+            // materialized, so consumers that skip negative roots (integrity_check) see them.
+            let mv_store_guard = self.db.get_mv_store();
+            if let Some(mv_store) = mv_store_guard.as_ref() {
+                if let Ok(schema) = Schema::try_make_mut(&mut adopted) {
+                    mv_store.resolve_schema_negative_roots(schema);
+                }
+            }
+            *self.schema.write() = adopted;
             self.bump_prepare_context_generation();
         }
     }
@@ -1820,6 +1944,35 @@ impl Connection {
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock();
         self.has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema)
+    }
+
+    /// Begin-tx schema gate for MVCC. Returns the `MvStore::schema_generation` this connection's
+    /// prepared schema is valid as of, or `SchemaUpdated` if it is already stale (a passive
+    /// checkpoint republished physical roots without a cookie change). The returned generation is
+    /// re-checked inside `begin_tx`'s clock callback: a publish bumps `schema_generation` under the
+    /// same clock, so if one lands between here and the begin clock the generations differ and the
+    /// statement is forced to reprepare against the published roots.
+    pub(crate) fn mvcc_begin_schema_generation(&self) -> Result<Option<u64>> {
+        let mv_guard = self.db.get_mv_store();
+        let Some(mv) = mv_guard.as_ref() else {
+            return Ok(None);
+        };
+        // Mid-transaction (e.g. a multi-statement BEGIN): the snapshot and schema are fixed at the
+        // first begin, so a later checkpoint republication must not gate or reprepare here. Mirror
+        // the guard of `mvcc_schema_requires_reprepare_before_tx`.
+        if !self.has_no_open_transaction_state() {
+            return Ok(None);
+        }
+        // Read the generation before the snapshot comparison: any publish that mutates the shared
+        // schema after this read is caught by the comparison below (it changes the Arc), and any
+        // publish that lands during begin is caught by the clock re-check (it bumps the generation).
+        let generation = mv.schema_generation();
+        let current_schema = self.schema.read().clone();
+        let schema = self.db.schema.lock();
+        if self.has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema) {
+            return Err(LimboError::SchemaUpdated);
+        }
+        Ok(Some(generation))
     }
 
     pub(crate) fn refresh_schema_from_shared_for_reprepare(&self) {
@@ -1863,13 +2016,15 @@ impl Connection {
                     header.schema_cookie.get() < version,
                     "cookie can't go back in time"
                 );
-                self.set_tx_state(TransactionState::Write {
-                    schema_did_change: true,
-                });
-                self.with_schema_mut(|schema| schema.schema_version = version);
-                header.schema_cookie = version.into();
+                self.with_schema_mut(|schema| schema.schema_version = version)
+                    .map(|()| {
+                        self.set_tx_state(TransactionState::Write {
+                            schema_did_change: true,
+                        });
+                        header.schema_cookie = version.into();
+                    })
             })
-        })?;
+        })??;
         self.reparse_schema()?;
         Ok(())
     }
@@ -2036,12 +2191,12 @@ impl Connection {
                 pager
                     .io
                     .block(|| {
-                        return_if_io!(pager.commit_dirty_pages(
+                        return_if_io!(pager.commit_wal(
                             WalAutoActions::empty(),
                             self.get_sync_mode(),
                             self.get_data_sync_retry(),
                         ));
-                        pager.commit_dirty_pages_end();
+                        pager.commit_wal_end();
                         Ok(IOResult::Done(()))
                     })
                     .err()
@@ -2089,6 +2244,20 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         if let Some(mv_store) = self.mv_store().as_ref() {
+            let mode = if self.experimental_mvcc_passive_checkpoint_enabled() {
+                assert!(
+                    matches!(
+                        mode,
+                        CheckpointMode::Passive { .. } | CheckpointMode::Truncate { .. }
+                    ),
+                    "MVCC checkpoint supports only Truncate or Passive when experimental_mvcc_passive_checkpoint is enabled"
+                );
+                mode
+            } else {
+                CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                }
+            };
             let pager = self.pager.load().clone();
             let io = pager.io.clone();
             let mut ckpt_sm = CheckpointStateMachine::new(
@@ -2098,6 +2267,7 @@ impl Connection {
                 true,
                 self.get_sync_mode(),
                 MAIN_DB_ID,
+                mode,
             );
             loop {
                 match ckpt_sm.step(&()) {
@@ -2185,6 +2355,92 @@ impl Connection {
             return WalAutoActions::empty();
         }
         WalAutoActions::from_bits_truncate(self.wal_auto_actions.load(Ordering::SeqCst))
+    }
+
+    /// Publish the connection's current schema snapshot to the shared database
+    /// cache after a successful commit so other live connections can refresh.
+    pub fn publish_schema_if_newer(&self) {
+        let schema = self.schema.read().clone();
+        self.db.update_schema_if_newer(schema);
+    }
+
+    /// Publish the connection's current schema snapshot after pages were
+    /// replaced outside normal SQL commit ordering.
+    ///
+    /// External restore paths can move the schema cookie backwards. In that
+    /// case the shared schema cache must be replaced rather than updated
+    /// monotonically, otherwise new connections can re-adopt stale metadata.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn publish_schema_after_external_restore(&self) -> Result<()> {
+        if self.get_tx_state() != TransactionState::None {
+            return Err(LimboError::Busy);
+        }
+        if self.get_mv_tx().is_some() || self.next_attached_mv_tx().is_some() {
+            return Err(LimboError::Busy);
+        }
+
+        let schema = self.schema.read().clone();
+        self.db.with_schema_mut(|current| {
+            *current = schema.as_ref().try_clone()?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Roll back the main-database MVCC transaction while keeping the
+    /// surrounding raw WAL-insert session open.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn reset_main_mvcc_tx_for_wal_session(&self) {
+        let mv_store = self.mv_store();
+        let Some(mv_store) = mv_store.as_ref() else {
+            return;
+        };
+        let Some(tx_id) = self.get_mv_tx_id() else {
+            return;
+        };
+        let pager = self.pager.load();
+        mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+    }
+
+    /// Discard the main-db MVCC transaction left by a sync raw-WAL session
+    /// before reparsing state after external file replacement.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn discard_main_mvcc_tx_after_external_restore(&self) {
+        let pager = self.pager.load();
+        self.clear_internal_main_mvcc_tx(&pager);
+    }
+
+    /// Returns whether the main database currently has a live MVCC transaction.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn has_main_mvcc_tx_for_wal_session(&self) -> bool {
+        self.get_mv_tx_id().is_some()
+    }
+
+    /// Commit the main-database MVCC transaction while keeping the surrounding
+    /// raw WAL-insert session open.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn commit_main_mvcc_tx_for_wal_session(self: &Arc<Self>) -> Result<()> {
+        let mv_store_handle = self.mv_store();
+        let Some(mv_store) = mv_store_handle.as_ref() else {
+            return Ok(());
+        };
+        let Some(tx_id) = self.get_mv_tx_id() else {
+            return Ok(());
+        };
+
+        let mut state_machine = mv_store.commit_tx(tx_id, self, MAIN_DB_ID)?;
+        while let IOResult::IO(io) = state_machine.step(mv_store)? {
+            io.wait(self.db.io.as_ref())?;
+        }
+        assert!(state_machine.is_finalized());
+        self.set_mv_tx(None);
+        self.publish_schema_if_newer();
+        Ok(())
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn reload_wal_after_external_restore(&self) -> Result<()> {
+        self.db.reload_wal_after_external_restore()
     }
 
     /// Enable or disable writing portable logical-change metadata into MVCC
@@ -2406,8 +2662,13 @@ impl Connection {
     }
 
     #[cfg(feature = "fs")]
-    pub fn open_new(&self, path: &str, vfs: &str) -> Result<(Arc<dyn IO>, Arc<Database>)> {
-        Database::open_with_vfs(&self.db, path, vfs)
+    pub fn open_new(
+        &self,
+        path: &str,
+        vfs: &str,
+        dialect: Arc<dyn crate::Dialect>,
+    ) -> Result<(Arc<dyn IO>, Arc<Database>)> {
+        Database::open_with_vfs(&self.db, path, vfs, dialect)
     }
 
     pub fn list_vfs(&self) -> Vec<String> {
@@ -2434,6 +2695,24 @@ impl Connection {
 
     pub fn get_auto_commit(&self) -> bool {
         self.auto_commit.load(Ordering::SeqCst)
+    }
+
+    /// Mark the active explicit transaction poisoned so COMMIT rolls it back.
+    ///
+    /// This is used when a write statement under BEGIN is abandoned before it
+    /// reaches Halt/Done and that statement did not open a statement savepoint.
+    pub(crate) fn mark_tx_poisoned(&self) {
+        self.poisoned_tx.store(true, Ordering::SeqCst);
+    }
+
+    /// Return whether the active explicit transaction must roll back at COMMIT.
+    pub(crate) fn tx_is_poisoned(&self) -> bool {
+        self.poisoned_tx.load(Ordering::SeqCst)
+    }
+
+    /// Clear the poison marker after BEGIN, COMMIT, or ROLLBACK.
+    pub(crate) fn clear_tx_poison(&self) {
+        self.poisoned_tx.store(false, Ordering::SeqCst);
     }
 
     pub fn set_load_extension_enabled(&self, enabled: bool) {
@@ -2500,6 +2779,7 @@ impl Connection {
                     &mut dbsp_state_index_roots,
                     &mut materialized_view_info,
                     &attached_resolver,
+                    self.db.dialect().as_ref(),
                 ) {
                     Ok(()) => {}
                     Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
@@ -2526,7 +2806,7 @@ impl Connection {
                 Err(e) => return Err(e),
             }
             Ok(())
-        })
+        })?
     }
 
     // Clearly there is something to improve here, Vec<Vec<Value>> isn't a couple of tea
@@ -2557,6 +2837,41 @@ impl Connection {
         stmt.run_collect_rows()
     }
 
+    /// The SQL dialect of the database this connection belongs to.
+    pub fn dialect(&self) -> Arc<dyn crate::Dialect> {
+        self.db.dialect()
+    }
+
+    pub fn register_internal_vtab<T>(&self, table: T) -> Result<String>
+    where
+        T: crate::vtab::InternalVirtualTable + 'static,
+    {
+        let name = self.db.register_internal_vtab(table)?;
+        *self.schema.write() = self.db.clone_schema();
+        self.bump_prepare_context_generation();
+        Ok(name)
+    }
+
+    pub fn register_virtual_table(&self, table: Arc<crate::VirtualTable>) -> Result<String> {
+        let name = self.db.register_virtual_table(table)?;
+        *self.schema.write() = self.db.clone_schema();
+        self.bump_prepare_context_generation();
+        Ok(name)
+    }
+
+    pub fn current_schema(&self) -> Arc<Schema> {
+        self.schema.read().clone()
+    }
+
+    pub fn attached_database_names(&self) -> Vec<String> {
+        self.attached_databases
+            .read()
+            .name_to_index
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     pub fn experimental_views_enabled(&self) -> bool {
         self.db.experimental_views_enabled()
     }
@@ -2575,6 +2890,10 @@ impl Connection {
 
     pub fn experimental_vacuum_enabled(&self) -> bool {
         self.db.experimental_vacuum_enabled()
+    }
+
+    pub fn experimental_mvcc_passive_checkpoint_enabled(&self) -> bool {
+        self.db.experimental_mvcc_passive_checkpoint_enabled()
     }
 
     pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
@@ -2705,10 +3024,10 @@ impl Connection {
     }
 
     #[inline]
-    pub fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> T) -> T {
+    pub fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> T) -> Result<T> {
         let mut schema_ref = self.schema.write();
-        let schema = Arc::make_mut(&mut *schema_ref);
-        f(schema)
+        let schema = Schema::try_make_mut(&mut schema_ref)?;
+        Ok(f(schema))
     }
 
     /// Mutate the schema for a specific database (main or attached).
@@ -2716,7 +3035,7 @@ impl Connection {
         &self,
         database_id: usize,
         f: impl FnOnce(&mut Schema) -> T,
-    ) -> T {
+    ) -> Result<T> {
         match database_id {
             crate::MAIN_DB_ID => self.with_schema_mut(f),
             crate::TEMP_DB_ID => {
@@ -2728,10 +3047,10 @@ impl Connection {
                     .as_ref()
                     .expect("temp database should be initialized before schema mutation");
                 let mut schema_guard = temp_db.db.schema.lock();
-                let schema = Arc::make_mut(&mut schema_guard);
+                let schema = Schema::try_make_mut(&mut schema_guard)?;
                 let result = f(schema);
                 self.bump_prepare_context_generation();
-                result
+                Ok(result)
             }
             _ => {
                 // For attached databases, update a connection-local copy of the schema.
@@ -2748,10 +3067,10 @@ impl Connection {
                     let schema = db.schema.lock().clone();
                     schema
                 });
-                let schema = Arc::make_mut(schema_arc);
+                let schema = Schema::try_make_mut(schema_arc)?;
                 let result = f(schema);
                 self.bump_prepare_context_generation();
-                result
+                Ok(result)
             }
         }
     }
@@ -2824,7 +3143,7 @@ impl Connection {
         }
     }
 
-    fn is_attached(&self, alias: &str) -> bool {
+    pub(crate) fn is_attached(&self, alias: &str) -> bool {
         self.attached_databases
             .read()
             .name_to_index
@@ -3056,8 +3375,13 @@ impl Connection {
                         self.db.io.clone()
                     };
                     let main_db_flags = self.db.open_flags;
-                    let (db, encryption_opts) =
-                        Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
+                    let (db, encryption_opts) = Self::from_uri_attached(
+                        path,
+                        db_opts,
+                        main_db_flags,
+                        io,
+                        self.db.dialect(),
+                    )?;
                     let attached_is_fresh = !db.initialized();
                     if !is_memory_db {
                         Self::validate_attach_target(&db, attached_is_fresh, alias)?;
@@ -3115,6 +3439,7 @@ impl Connection {
                             init.db.durable_storage.clone(),
                             enc_ctx,
                             init.db.mv_store_allocator.clone(),
+                            init.db.experimental_mvcc_passive_checkpoint_enabled(),
                         )?;
                         init.db.mv_store.store(Some(mv_store));
                         *state = AttachDatabaseState::Bootstrap(Box::new(
@@ -3666,7 +3991,7 @@ impl Connection {
                         schema
                             .sequences
                             .insert(normalized.clone(), Arc::new(sequence));
-                    });
+                    })?;
                     *idx += 1;
                     *stmt = None;
                     *meta = None;
@@ -3976,6 +4301,11 @@ impl Connection {
                 }
             }
         }
+    }
+
+    #[doc(hidden)]
+    pub fn db_file_path(&self) -> &str {
+        &self.db.path
     }
 
     /// Create a `TempDir` honoring `TURSO_TMPDIR` and `SQLITE_TMPDIR`,
@@ -4514,6 +4844,7 @@ impl Connection {
         }
         self.rollback_attached_wal_txns();
         self.set_tx_state(TransactionState::None);
+        self.clear_tx_poison();
     }
 
     /// Roll back transaction state for helpers that start a manual `BEGIN`
@@ -4544,6 +4875,7 @@ impl Connection {
         }
 
         self.rollback_temp_schema();
+        self.clear_tx_poison();
         self.set_cdc_transaction_id(-1);
         self.clear_named_savepoints();
         self.clear_deferred_foreign_key_violations();
@@ -4619,6 +4951,13 @@ impl Connection {
         match self.db.get_mv_store().as_ref() {
             Some(mv_store) => Ok(mv_store.gc_threshold()),
             None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
+    pub(crate) fn mvcc_tx_should_abort(&self) -> bool {
+        match (self.db.get_mv_store().clone(), self.get_mv_tx_id()) {
+            (Some(mv_store), Some(tx_id)) => mv_store.tx_should_abort(tx_id),
+            _ => false,
         }
     }
 }
@@ -4722,6 +5061,7 @@ impl SymbolTable {
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
+    use crate::SqliteDialect;
     use tempfile::TempDir;
 
     fn open_connection_with_opts(path: &std::path::Path, opts: DatabaseOpts) -> Arc<Connection> {
@@ -4732,6 +5072,7 @@ mod tests {
             OpenFlags::default(),
             opts,
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         db.connect().unwrap()
@@ -4791,8 +5132,10 @@ mod tests {
     #[test]
     fn test_named_memory_databases_on_same_io_are_distinct() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let draft_db = Database::open_file(io.clone(), ":memory:sync-draft").unwrap();
-        let synced_db = Database::open_file(io, ":memory:sync-synced").unwrap();
+        let draft_db =
+            Database::open_file(io.clone(), ":memory:sync-draft", Arc::new(SqliteDialect)).unwrap();
+        let synced_db =
+            Database::open_file(io, ":memory:sync-synced", Arc::new(SqliteDialect)).unwrap();
         assert!(!Arc::ptr_eq(&draft_db, &synced_db));
 
         let draft = draft_db.connect().unwrap();
@@ -4821,13 +5164,14 @@ mod tests {
     fn test_named_memory_database_reopened_on_same_io_sees_same_rows() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
 
-        let first_db = Database::open_file(io.clone(), ":memory:reopen").unwrap();
+        let first_db =
+            Database::open_file(io.clone(), ":memory:reopen", Arc::new(SqliteDialect)).unwrap();
         let first = first_db.connect().unwrap();
         first
             .execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(99)")
             .unwrap();
 
-        let second_db = Database::open_file(io, ":memory:reopen").unwrap();
+        let second_db = Database::open_file(io, ":memory:reopen", Arc::new(SqliteDialect)).unwrap();
         let second = second_db.connect().unwrap();
         assert_eq!(query_single_i64(&second, "SELECT x FROM t"), 99);
     }
@@ -4862,6 +5206,7 @@ mod tests {
             OpenFlags::default(),
             DatabaseOpts::new().with_attach(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();

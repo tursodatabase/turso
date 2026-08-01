@@ -141,6 +141,7 @@ impl CloseLoop {
                                 });
                             }
                         }
+                        Scan::RecursiveCteInput => {}
                     }
                     program.preassign_label_to_next_insn(loop_labels.loop_end);
                 }
@@ -526,9 +527,9 @@ pub(super) fn emit_autoindex(
     }
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(ephemeral_cols_start_reg),
-        count: to_u16(num_regs_to_reserve),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(ephemeral_cols_start_reg),
+        count: to_u32(num_regs_to_reserve),
+        dest_reg: to_u32(record_reg),
         index_name: Some(index.name.clone()),
         affinity_str: affinity_str.map(|s| (**s).clone()),
     });
@@ -548,7 +549,7 @@ pub(super) fn emit_autoindex(
         cursor_id: index_cursor_id,
         record_reg,
         unpacked_start: Some(ephemeral_cols_start_reg),
-        unpacked_count: Some(num_regs_to_reserve as u16),
+        unpacked_count: Some(num_regs_to_reserve as u32),
         flags: IdxInsertFlags::new().use_seek(false),
     });
     program.emit_insn(Insn::Next {

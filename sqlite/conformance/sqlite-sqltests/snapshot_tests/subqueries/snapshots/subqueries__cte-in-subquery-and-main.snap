@@ -1,0 +1,154 @@
+---
+source: subqueries.sqltest
+expression: |-
+  WITH category_avg AS (
+          SELECT category_id, avg(price) AS avg_price
+          FROM products
+          GROUP BY category_id
+      )
+      SELECT p.name, p.price, ca.avg_price
+      FROM products p
+      JOIN category_avg ca ON ca.category_id = p.category_id
+      WHERE p.price > (
+          SELECT max(avg_price) FROM category_avg
+      ) * 0.8;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - ca.category_id
+  - category_avg
+  - products
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCALAR SUBQUERY 1
+|  `--SCAN category_avg
+|     `--SCAN products USING INDEX idx_products_category
+|--SCAN products USING INDEX idx_products_category
+|--SCAN category_avg AS ca
+`--SEARCH p USING INDEX idx_products_category (category_id=?)
+
+BYTECODE
+addr  opcode                            p1   p2   p3  p4              p5  comment
+   0                    Init             0  117    0                   0  Start at 117
+   1                    Once            54    0    0                   0  goto 54
+   2                    BeginSubrtn      2    0    0                   0  r[2]=NULL
+   3                    Null             0    1    0                   0  r[1]=NULL
+   4                    InitCoroutine    3   42    5                   0
+   5                    Null             0   11    0                   0  r[11]=NULL
+   6                    Integer          0    8    0                   0  r[8]=0; clear group by abort flag
+   7                    Null             0    9    0                   0  r[9]=NULL; initialize group by comparison registers to NULL
+   8                    Gosub           15   38    0                   0  ; go to clear accumulator subroutine
+   9                    OpenRead         0    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  10                    OpenRead         1    8    0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
+  11                    Rewind           1   27    0                   0  Rewind index idx_products_category
+  12                      DeferredSeek   1    0    0                   0
+  13                      Column         1    0   13                   0  r[13]=idx_products_category.category_id
+  14                      Column         0    3   14                   0  r[14]=products.price
+  15                      RealAffinity  14    0    0                   0
+  16                      Compare        9   13    1  k(1, Binary)     0  r[9..9]==r[13..13]
+  17                      Jump          18   22   18                   0  ; start new group if comparison is not equal
+  18                      Gosub          6   31    0                   0  ; check if ended group had data, and output if so
+  19                      Move          13    9    1                   0  r[9..9]=r[13..13]
+  20                      IfPos          8   41    0                   0  r[8]>0 -> r[8]-=0, goto 41; check abort flag
+  21                      Gosub         15   38    0                   0  ; goto clear accumulator subroutine
+  22                      AggStep        0   14   11  avg              0  accum=r[11] step(r[14])
+  23                      If             7   25    0                   0  if r[7] goto 25; don't emit group columns if continuing existing group
+  24                      Column         1    0   10                   0  r[10]=idx_products_category.category_id
+  25                      Integer        1    7    0                   0  r[7]=1; indicate data in accumulator
+  26                    Next             1   12    0                   0
+  27                    Gosub            6   31    0                   0  ; emit row for final group
+  28                    Goto             0   41    0                   0  ; group by finished
+  29                    Integer          1    8    0                   0  r[8]=1
+  30                  Return             6    0    0                   0
+  31                  IfPos              7   33    0                   0  r[7]>0 -> r[7]-=0, goto 33; output group by row subroutine start
+  32                Return               6    0    0                   0
+  33                AggFinal             0   11    0  avg              0  accum=r[11]
+  34                Copy                10    4    0                   0  r[4]=r[10]
+  35                Copy                11    5    0                   0  r[5]=r[11]
+  36                Yield                3    0    0                   0
+  37              Return                 6    0    0                   0
+  38              Null                   0   10   11                   0  r[10..11]=NULL; clear accumulator subroutine start
+  39              Integer                0    7    0                   0  r[7]=0
+  40            Return                  15    0    0                   0
+  41            EndCoroutine             3    0    0                   0
+  42            Null                     0   17    0                   0  r[17]=NULL
+  43            Integer                  1   18    0                   0  r[18]=1; LIMIT counter
+  44            IfNot                   18   50    0                   0  if !r[18] goto 50
+  45            InitCoroutine            3    0    5                   0
+  46              Yield                  3   50    0                   0
+  47              Copy                   5   19    0                   0  r[19]=r[5]
+  48              AggStep                0   19   17  max(Binary)      0  accum=r[17] step(r[19])
+  49            Goto                     0   46    0                   0
+  50            AggFinal                 0   17    0  max              0  accum=r[17]
+  51            Copy                    17   16    0                   0  r[16]=r[17]
+  52            Copy                    16    1    0                   0  r[1]=r[16]
+  53          Return                     2    0    1                   0
+  54          OpenEphemeral              2    1    0                   0  cursor=2 is_table=true
+  55          Null                       0   29    0                   0  r[29]=NULL
+  56          Integer                    0   26    0                   0  r[26]=0; clear group by abort flag
+  57          Null                       0   27    0                   0  r[27]=NULL; initialize group by comparison registers to NULL
+  58          Gosub                     33   90    0                   0  ; go to clear accumulator subroutine
+  59          OpenRead                   3    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  60          OpenRead                   4    8    0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
+  61          Rewind                     4   77    0                   0  Rewind index idx_products_category
+  62            DeferredSeek             4    3    0                   0
+  63            Column                   4    0   31                   0  r[31]=idx_products_category.category_id
+  64            Column                   3    3   32                   0  r[32]=products.price
+  65            RealAffinity            32    0    0                   0
+  66            Compare                 27   31    1  k(1, Binary)     0  r[27..27]==r[31..31]
+  67            Jump                    68   72   68                   0  ; start new group if comparison is not equal
+  68            Gosub                   24   81    0                   0  ; check if ended group had data, and output if so
+  69            Move                    31   27    1                   0  r[27..27]=r[31..31]
+  70            IfPos                   26   93    0                   0  r[26]>0 -> r[26]-=0, goto 93; check abort flag
+  71            Gosub                   33   90    0                   0  ; goto clear accumulator subroutine
+  72            AggStep                  0   32   29  avg              0  accum=r[29] step(r[32])
+  73            If                      25   75    0                   0  if r[25] goto 75; don't emit group columns if continuing existing group
+  74            Column                   4    0   28                   0  r[28]=idx_products_category.category_id
+  75            Integer                  1   25    0                   0  r[25]=1; indicate data in accumulator
+  76          Next                       4   62    0                   0
+  77          Gosub                     24   81    0                   0  ; emit row for final group
+  78          Goto                       0   93    0                   0  ; group by finished
+  79          Integer                    1   26    0                   0  r[26]=1
+  80        Return                      24    0    0                   0
+  81        IfPos                       25   83    0                   0  r[25]>0 -> r[25]-=0, goto 83; output group by row subroutine start
+  82      Return                        24    0    0                   0
+  83      AggFinal                       0   29    0  avg              0  accum=r[29]
+  84      Copy                          28   22    0                   0  r[22]=r[28]
+  85      Copy                          29   23    0                   0  r[23]=r[29]
+  86      MakeRecord                    22    2   34                   0  r[34]=mkrec(r[22..23]); for
+  87      NewRowid                       2   35    0                   0  r[35]=rowid
+  88      Insert                         2   34   35                   4  intkey=r[35] data=r[34]
+  89    Return                          24    0    0                   0
+  90    Null                             0   28   29                   0  r[28..29]=NULL; clear accumulator subroutine start
+  91    Integer                          0   25    0                   0  r[25]=0
+  92  Return                            33    0    0                   0
+  93  OpenRead                           5    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  94  OpenRead                           6    8    0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
+  95  Rewind                             2  116    0                   0  Rewind  ephemeral()
+  96    Column                           2    0   20                   0  r[20]=ephemeral().category_id
+  97    Column                           2    1   21                   0  r[21]=ephemeral().avg_price
+  98    Copy                            20   39    0                   0  r[39]=r[20]
+  99    IsNull                          39  115    0                   0  if (r[39]==NULL) goto 115
+ 100    Affinity                        39    1    0                   0  r[39..40] = C
+ 101    SeekGE                           6  115   39                   0  key=[39..39]
+ 102      IdxGT                          6  115   39                   0  key=[39..39]
+ 103      DeferredSeek                   6    5    0                   0
+ 104      Column                         5    3   41                   0  r[41]=products.price
+ 105      RealAffinity                  41    0    0                   0
+ 106      Copy                           1   43    0                   0  r[43]=r[1]
+ 107      Multiply                      43   44   42                   0  r[42]=r[43]*r[44]
+ 108      Le                            41   42  114  Binary           0  if r[41]<=r[42] goto 114
+ 109      Column                         5    1   36                   0  r[36]=products.name
+ 110      Column                         5    3   37                   0  r[37]=products.price
+ 111      RealAffinity                  37    0    0                   0
+ 112      Copy                          21   38    0                   0  r[38]=r[21]
+ 113      ResultRow                     36    3    0                   0  output=r[36..38]
+ 114    Next                             6  102    0                   0
+ 115  Next                               2   96    0                   0
+ 116  Halt                               0    0    0                   0
+ 117  Transaction                        0    1   11                   0  iDb=0 tx_mode=Read
+ 118  Real                               0   44    0  0.8              0  r[44]=0.8
+ 119  Goto                               0    1    0                   0

@@ -4,5 +4,5 @@ This package is the Turso Sync common JS library which is shared between final b
 
 Do not use this package directly - instead you must use `@tursodatabase/sync` or `@tursodatabase/sync-wasm`.
 
-> **⚠️ Warning:** This software is in BETA. It may still contain bugs and unexpected behavior. Use caution with production data and ensure you have backups.
+Turso Database runs in production today at multiple organizations. It has not yet reached 1.0, so as with any database we recommend keeping backups — see the [FAQ](https://github.com/tursodatabase/turso#faq) for where the project stands.
 

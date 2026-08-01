@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
 use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq, turso_assert_ne};
 use turso_parser::{
@@ -12,7 +13,7 @@ use super::{
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
-    schema::{CheckConstraint, Column, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
+    schema::{CheckConstraint, Column, ColumnLayout, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
@@ -27,10 +28,10 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorType, DmlColumnContext, ProgramBuilder},
-        insn::{to_u16, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
+        insn::{to_u32, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
-    LimboError, Numeric, Result, Value,
+    LimboError, Numeric, Result, Value, ValueRef,
 };
 use either::Either;
 use rustc_hash::FxHashSet as HashSet;
@@ -242,9 +243,9 @@ fn emit_rename_autoincrement_backing_table_entry(
 
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(rec_start),
-            count: to_u16(5),
-            dest_reg: to_u16(record_reg),
+            start_reg: to_u32(rec_start),
+            count: to_u32(5),
+            dest_reg: to_u32(record_reg),
             index_name: None,
             affinity_str: None,
         });
@@ -335,9 +336,9 @@ fn emit_rename_sqlite_sequence_entry(
             extra_amount: 0,
         });
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(record_start_reg),
-            count: to_u16(2),
-            dest_reg: to_u16(record_reg),
+            start_reg: to_u32(record_start_reg),
+            count: to_u32(2),
+            dest_reg: to_u32(record_reg),
             index_name: None,
             affinity_str: Some(affinity_str.clone()),
         });
@@ -414,13 +415,14 @@ pub(crate) fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
         ast::Literal::Numeric(val) => parse_numeric_literal(val),
         ast::Literal::String(s) => Ok(Value::from_text(crate::translate::expr::sanitize_string(s))),
         ast::Literal::Blob(s) => Ok(Value::Blob(
-            s.as_bytes()
+            ast::blob_literal_hex(s)
+                .as_bytes()
                 .chunks_exact(2)
                 .map(|pair| {
                     let hex_byte = std::str::from_utf8(pair).expect("parser validated hex string");
                     u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
                 })
-                .collect(),
+                .try_collect()?,
         )),
         ast::Literal::Null => Ok(Value::Null),
         ast::Literal::True => Ok(Value::from_i64(1)),
@@ -470,7 +472,10 @@ pub(crate) fn eval_constant_default_value(expr: &ast::Expr) -> Result<Value> {
 fn apply_affinity_to_value(value: &mut Value, affinity: Affinity) {
     if let Some(converted) = affinity.convert(value) {
         *value = match converted {
-            Either::Left(val_ref) => val_ref.to_owned(),
+            Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
+            Either::Left(_) => {
+                unreachable!("affinity conversion returned an unexpected borrowed value")
+            }
             Either::Right(val) => val,
         };
     }
@@ -622,7 +627,7 @@ fn emit_add_virtual_column_validation(
         dest: rowid_reg,
     });
 
-    let layout = resolved_table.column_layout();
+    let layout = resolved_table.column_layout()?;
     let base_dest_reg = program.alloc_registers(layout.column_count());
     for (idx, table_column) in resolved_table.columns().iter().enumerate() {
         if table_column.is_virtual_generated() || table_column.is_rowid_alias() {
@@ -1159,6 +1164,26 @@ pub fn translate_alter_table(
                 ));
             };
 
+            let rewrite_rows = if !original_btree.columns()[dropped_index].is_virtual_generated() {
+                let source_column_by_schema_idx: Vec<Option<usize>> = btree
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(new_idx, column)| {
+                        if column.is_virtual_generated() {
+                            None
+                        } else if new_idx < dropped_index {
+                            Some(new_idx)
+                        } else {
+                            Some(new_idx + 1)
+                        }
+                    })
+                    .collect();
+                Some((source_column_by_schema_idx, btree.column_layout()?))
+            } else {
+                None
+            };
+
             translate_update_for_schema_change(
                 update,
                 resolver,
@@ -1166,27 +1191,13 @@ pub fn translate_alter_table(
                 connection,
                 input,
                 |program| {
-                    if !original_btree.columns()[dropped_index].is_virtual_generated() {
-                        let source_column_by_schema_idx = btree
-                            .columns()
-                            .iter()
-                            .enumerate()
-                            .map(|(new_idx, column)| {
-                                if column.is_virtual_generated() {
-                                    None
-                                } else if new_idx < dropped_index {
-                                    Some(new_idx)
-                                } else {
-                                    Some(new_idx + 1)
-                                }
-                            })
-                            .collect();
-
+                    if let Some((source_column_by_schema_idx, layout)) = &rewrite_rows {
                         emit_rewrite_table_rows(
                             program,
                             original_btree.clone(),
                             &btree,
                             source_column_by_schema_idx,
+                            layout,
                             connection,
                             database_id,
                         );
@@ -1636,9 +1647,9 @@ pub fn translate_alter_table(
                 let record = program.alloc_register();
 
                 program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u16(out),
-                    count: to_u16(sqlite_schema_column_len),
-                    dest_reg: to_u16(record),
+                    start_reg: to_u32(out),
+                    count: to_u32(sqlite_schema_column_len),
+                    dest_reg: to_u32(record),
                     index_name: None,
                     affinity_str: None,
                 });
@@ -2082,9 +2093,9 @@ pub fn translate_alter_table(
                 let record = program.alloc_register();
 
                 program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u16(out),
-                    count: to_u16(sqlite_schema_column_len),
-                    dest_reg: to_u16(record),
+                    start_reg: to_u32(out),
+                    count: to_u32(sqlite_schema_column_len),
+                    dest_reg: to_u32(record),
                     index_name: None,
                     affinity_str: None,
                 });
@@ -2199,7 +2210,7 @@ pub fn translate_alter_table(
                 )?;
 
                 let original_columns = original_btree.columns();
-                let source_column_by_schema_idx = rewritten_table
+                let source_column_by_schema_idx: Vec<Option<usize>> = rewritten_table
                     .columns()
                     .iter()
                     .enumerate()
@@ -2225,11 +2236,13 @@ pub fn translate_alter_table(
                         }
                     })
                     .collect();
+                let layout = rewritten_table.column_layout()?;
                 emit_rewrite_table_rows(
                     program,
                     original_btree.clone(),
                     &rewritten_table,
-                    source_column_by_schema_idx,
+                    &source_column_by_schema_idx,
+                    &layout,
                     connection,
                     database_id,
                 );
@@ -2268,7 +2281,8 @@ fn emit_rewrite_table_rows(
     program: &mut ProgramBuilder,
     original_btree: Arc<BTreeTable>,
     rewritten_table: &BTreeTable,
-    source_column_by_schema_idx: Vec<Option<usize>>,
+    source_column_by_schema_idx: &[Option<usize>],
+    layout: &ColumnLayout,
     connection: &Arc<crate::Connection>,
     database_id: usize,
 ) {
@@ -2277,7 +2291,6 @@ fn emit_rewrite_table_rows(
         rewritten_table.columns().len()
     );
 
-    let layout = rewritten_table.column_layout();
     let non_virtual_column_count = layout.num_non_virtual_cols();
     let root_page = rewritten_table.root_page;
     let table_name = rewritten_table.name.clone();
@@ -2309,9 +2322,9 @@ fn emit_rewrite_table_rows(
 
         let record = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(base_dest_reg),
-            count: to_u16(non_virtual_column_count),
-            dest_reg: to_u16(record),
+            start_reg: to_u32(base_dest_reg),
+            count: to_u32(non_virtual_column_count),
+            dest_reg: to_u32(record),
             index_name: None,
             affinity_str: Some(affinity_str.clone()),
         });
@@ -2408,9 +2421,9 @@ fn translate_rename_virtual_table(
 
         let rec = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(out),
-            count: to_u16(ncols),
-            dest_reg: to_u16(rec),
+            start_reg: to_u32(out),
+            count: to_u32(ncols),
+            dest_reg: to_u32(rec),
             index_name: None,
             affinity_str: None,
         });
@@ -2793,8 +2806,8 @@ enum ColumnRenameExprTraversal {
     RewriteResultExpr,
 }
 
-fn no_such_column_error(old_col_norm: &str) -> LimboError {
-    LimboError::ParseError(format!("no such column: {old_col_norm}"))
+fn no_such_column_error(column_ref: &str) -> LimboError {
+    LimboError::ParseError(format!("no such column: {column_ref}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2809,13 +2822,26 @@ fn apply_expr_column_ref_with_context(
     from_target_qualifiers: &[String],
 ) -> Result<()> {
     match e {
-        ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
+        ast::Expr::Qualified(..) | ast::Expr::DoublyQualified(..) => {
+            let (db, ns, col) = match e {
+                ast::Expr::Qualified(ns, col) => (None, &*ns, col),
+                ast::Expr::DoublyQualified(db, ns, col) => (Some(&*db), &*ns, col),
+                _ => unreachable!("outer match arm only admits (Doubly)Qualified"),
+            };
             let ns_norm = normalize_ident(ns.as_str());
             let col_norm = normalize_ident(col.as_str());
 
             if col_norm != *old_col_norm {
                 return Ok(());
             }
+
+            // SQLite reports unresolvable references as written in the
+            // original expression (e.g. "no such column: t.b"), so keep
+            // the qualifier(s) when building validation error messages.
+            let error_column_ref = match db {
+                Some(db) => format!("{}.{}.{}", db.as_str(), ns.as_str(), col.as_str()),
+                None => format!("{}.{}", ns.as_str(), col.as_str()),
+            };
 
             // These branches are mutually exclusive — a qualifier can
             // match at most one of: NEW/OLD (the trigger table), the
@@ -2831,7 +2857,7 @@ fn apply_expr_column_ref_with_context(
                     if let Some(new_col_norm) = mode.rewritten_name() {
                         *col = ast::Name::from_string(new_col_norm);
                     } else {
-                        return Err(no_such_column_error(old_col_norm));
+                        return Err(no_such_column_error(&error_column_ref));
                     }
                 }
                 return Ok(());
@@ -2846,7 +2872,7 @@ fn apply_expr_column_ref_with_context(
                 if let Some(new_col_norm) = mode.rewritten_name() {
                     *col = ast::Name::from_string(new_col_norm);
                 } else {
-                    return Err(no_such_column_error(old_col_norm));
+                    return Err(no_such_column_error(&error_column_ref));
                 }
             } else if is_renaming_trigger_table
                 && ns_norm.eq_ignore_ascii_case(trigger_table_name)
@@ -2858,19 +2884,17 @@ fn apply_expr_column_ref_with_context(
                         .as_ref()
                         .is_some_and(|(_, ctx_name, _)| *ctx_name != trigger_table_name_norm);
                     if ctx_is_different_table {
-                        return Err(LimboError::ParseError(format!(
-                            "no such column: {trigger_table_name}.{col_norm}"
-                        )));
+                        return Err(no_such_column_error(&error_column_ref));
                     }
                     *col = ast::Name::from_string(new_col_norm);
                 } else {
-                    return Err(no_such_column_error(old_col_norm));
+                    return Err(no_such_column_error(&error_column_ref));
                 }
             } else if from_target_qualifiers.contains(&ns_norm) {
                 if let Some(new_col_norm) = mode.rewritten_name() {
                     *col = ast::Name::from_string(new_col_norm);
                 } else {
-                    return Err(no_such_column_error(old_col_norm));
+                    return Err(no_such_column_error(&error_column_ref));
                 }
             }
         }

@@ -8,10 +8,7 @@ use std::{
 };
 
 use tracing::{instrument, Level};
-use turso_parser::{
-    ast::{fmt::ToTokens, Cmd},
-    parser::Parser,
-};
+use turso_parser::ast::{fmt::ToTokens, Cmd};
 
 use crate::alloc::TursoIteratorExt;
 use crate::{
@@ -20,6 +17,7 @@ use crate::{
     schema::Trigger,
     stats::refresh_analyze_stats,
     translate::{self, display::PlanContext, emitter::TransactionMode, plan::BitSet},
+    turso_assert,
     vdbe::{
         self,
         explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE},
@@ -220,7 +218,7 @@ fn infer_expression_primitive(
             | Operator::BitwiseNot
             | Operator::LeftShift
             | Operator::RightShift => Some("INTEGER"),
-            // Comparison and logical: SQLite returns 0/1 INTEGER; pgmicro
+            // Comparison and logical: SQLite returns 0/1 INTEGER; tursopg
             // maps INTEGER to BOOL at the wire layer for boolean columns,
             // but the type the wire layer reports is still INTEGER here.
             Operator::Equals
@@ -397,6 +395,12 @@ impl Statement {
         self.state
             .n_change
             .load(crate::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn set_n_change(&self, n: i64) {
+        self.state
+            .n_change
+            .store(n, crate::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn n_total_change(&self) -> i64 {
@@ -587,6 +591,10 @@ impl Statement {
             // After ANALYZE completes, refresh in-memory stats so planners can use them.
             let sql = self.program.sql.trim_start().as_bytes();
             if sql.len() >= 7 && sql[..7].eq_ignore_ascii_case(b"ANALYZE") {
+                // The stats refresh runs a SELECT on this same connection. At
+                // this point ANALYZE is already Done, so it must not count as a
+                // sibling root statement for that internal SELECT.
+                self.release_active_root_if_counted();
                 refresh_analyze_stats(&self.program.connection);
             }
         } else {
@@ -731,7 +739,7 @@ impl Statement {
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::IO | vdbe::StepResult::Yield => {
                     let io = self.take_io_completions().unwrap_or_else(|| {
-                        crate::types::IOCompletions::Single(crate::io::Completion::new_yield())
+                        crate::types::IOCompletions(crate::io::Completion::new_yield())
                     });
                     return Ok(crate::IOResult::IO(io));
                 }
@@ -764,7 +772,7 @@ impl Statement {
                 }
                 vdbe::StepResult::IO | vdbe::StepResult::Yield => {
                     let io = self.take_io_completions().unwrap_or_else(|| {
-                        crate::types::IOCompletions::Single(crate::io::Completion::new_yield())
+                        crate::types::IOCompletions(crate::io::Completion::new_yield())
                     });
                     return Ok(crate::IOResult::IO(io));
                 }
@@ -861,8 +869,7 @@ impl Statement {
         // same-version reprepare still refreshes it.
         conn.refresh_schema_from_shared_for_reprepare();
         let new_program = {
-            let mut parser = Parser::new(self.program.sql.as_bytes());
-            let cmd = parser.next_cmd()?;
+            let (cmd, _) = conn.parse_sql(&self.program.sql)?;
             let cmd = cmd.expect("Same SQL string should be able to be parsed");
 
             let syms = conn.syms.read();
@@ -879,6 +886,7 @@ impl Statement {
                 &syms,
                 mode,
                 &self.program.sql,
+                self.origin,
             )?
         };
 
@@ -1215,6 +1223,29 @@ impl Statement {
         }
     }
 
+    /// Returns the inferred type affinity name for a result column by examining
+    /// the column expression. Unlike `get_column_decltype` which only works for
+    /// table columns, this works for arbitrary expressions (CAST, function calls,
+    /// literals, etc.) by inferring the type from the expression structure.
+    pub fn get_column_inferred_type(&self, idx: usize) -> Option<String> {
+        if self.query_mode != QueryMode::Normal {
+            return None;
+        }
+        let column = &self.program.result_columns.get(idx)?;
+        let affinity = translate::expr::get_expr_affinity(
+            &column.expr,
+            Some(&self.program.table_references),
+            None,
+        );
+        match affinity {
+            crate::vdbe::affinity::Affinity::Integer => Some("INTEGER".to_string()),
+            crate::vdbe::affinity::Affinity::Real => Some("REAL".to_string()),
+            crate::vdbe::affinity::Affinity::Text => Some("TEXT".to_string()),
+            crate::vdbe::affinity::Affinity::Numeric => Some("NUMERIC".to_string()),
+            crate::vdbe::affinity::Affinity::Blob => None, // Blob means "no affinity"
+        }
+    }
+
     pub fn parameters(&self) -> &parameters::Parameters {
         &self.program.parameters
     }
@@ -1424,10 +1455,15 @@ impl Statement {
         // mid-execution), ensure n_active_writes is decremented before reset
         // clears the flag.
         if self.state.is_active_write {
-            self.program
+            let previous = self
+                .program
                 .connection
                 .n_active_writes
                 .fetch_sub(1, Ordering::SeqCst);
+            turso_assert!(
+                previous == 1,
+                "resetting a writer with {previous} active writer(s)"
+            );
             self.state.is_active_write = false;
         }
         if self.counted_as_active_root && !preserve_active_root_count {
@@ -1485,6 +1521,7 @@ impl Drop for Statement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SqliteDialect;
     use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
 
     fn open_test_connection() -> crate::Result<Arc<crate::Connection>> {
@@ -1495,6 +1532,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )?;
         db.connect()
     }

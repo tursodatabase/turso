@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PublishAot>true</PublishAot>
+    <SelfContained>true</SelfContained>
+    <TursoUseStaticNativeLibrary>true</TursoUseStaticNativeLibrary>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Turso.Data.Sqlite" Version="$(Version)" />
+    <PackageReference Include="Turso.Data.Sqlite.NativeAot.$(RuntimeIdentifier)"
+                      Version="$(Version)"
+                      PrivateAssets="all"
+                      Condition="'$(PublishAot)' == 'true' and '$(TursoUseStaticNativeLibrary)' == 'true' and '$(RuntimeIdentifier)' != ''" />
+  </ItemGroup>
+</Project>

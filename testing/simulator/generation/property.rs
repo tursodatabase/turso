@@ -1013,8 +1013,17 @@ impl Property {
                                     return Ok(Ok(()));
                                 }
 
-                                // On error we rollback the transaction if there is any active here
-                                env.rollback_conn(connection_index);
+                                // A statement that fails due to an injected I/O fault is
+                                // rolled back at the statement level (its effects are not
+                                // shadowed, above). It does NOT necessarily abort the
+                                // enclosing transaction: the engine keeps the transaction
+                                // open and its prior statements intact. Only mirror a full
+                                // transaction rollback in the model when the engine actually
+                                // rolled back (returned to autocommit); otherwise the model
+                                // would drop rows that are still live in the open transaction.
+                                if !env.conn_db_in_transaction(connection_index) {
+                                    env.rollback_conn(connection_index);
+                                }
                                 Ok(Ok(()))
                             }
                         }

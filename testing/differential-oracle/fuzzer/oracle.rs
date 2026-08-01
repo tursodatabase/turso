@@ -393,6 +393,7 @@ pub fn check_differential(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use turso_core::SqliteDialect;
 
     use core::f64;
 
@@ -466,6 +467,7 @@ mod tests {
             turso_core::OpenFlags::default(),
             turso_core::DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let turso_conn = turso_db.connect().unwrap();

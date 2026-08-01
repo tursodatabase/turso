@@ -7,12 +7,12 @@ use turso_parser::ast::{Expr, Operator, TableInternalId};
 
 use super::{
     access_method::{find_best_access_method_for_join_order, AccessMethod},
-    constraints::TableConstraints,
+    constraints::{usable_constraints_for_lhs_mask, TableConstraints},
     cost_params::CostModelParams,
     order::OrderTarget,
     AvailableIndexes, IndexMethodCandidate,
 };
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::{
     schema::Schema,
     stats::AnalyzeStats,
@@ -23,7 +23,10 @@ use crate::{
                 estimate_hash_join_cost, try_hash_join_access_method, AccessMethodParams,
                 ResidualConstraintMode,
             },
-            cost::{Cost, RowCountEstimate},
+            cost::{
+                estimate_rows_per_seek, rows_per_leaf_page_for_index, AnalyzeCtx, Cost, IndexInfo,
+                RowCountEstimate,
+            },
             order::plan_satisfies_order_target,
         },
         plan::{
@@ -345,7 +348,7 @@ pub fn join_lhs_and_rhs<'a>(
             let probe_cardinality = *rhs_base_rows;
 
             let prior_mask = {
-                let mut mask = lhs_mask.clone();
+                let mut mask = lhs_mask.try_clone()?;
                 mask.clear(build_table_idx);
                 mask
             };
@@ -1174,7 +1177,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
 
                 // If there are no other tables except RHS, skip.
                 let lhs_mask = {
-                    let mut copy = mask.clone();
+                    let mut copy = mask.try_clone()?;
                     copy.clear(rhs_idx);
                     copy
                 };
@@ -1351,9 +1354,17 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                             && other.join_info.as_ref().is_some_and(|ji| ji.is_outer())
                     })
                 });
+                // A recursive CTE input cannot be the build side of the hash
+                // join that FULL OUTER requires, so no plan exists for
+                // `recursive_table FULL JOIN other`.
+                let has_recursive_input = joined_tables
+                    .iter()
+                    .any(|t| matches!(t.table, crate::schema::Table::RecursiveCteInput(_)));
                 let has_correlated_subquery = subqueries.iter().any(|sq| sq.correlated);
                 let msg = if build_is_outer {
                     "FULL OUTER JOIN chaining is not yet supported"
+                } else if has_recursive_input {
+                    "FULL OUTER JOIN with a recursive reference is not yet supported"
                 } else if has_correlated_subquery {
                     "FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables"
                 } else {
@@ -1375,7 +1386,7 @@ pub const GREEDY_JOIN_THRESHOLD: usize = 12;
 /// Greedy Operator Ordering (GOO) for join optimization. O(n²) time, O(n) space.
 ///
 /// Builds a left-deep join tree by:
-/// 1. Starting with the table that has best hub score (enables most index lookups)
+/// 1. Starting with the table that best balances local filtering and indexed-seek benefits
 /// 2. Greedily adding the remaining table with lowest marginal cost
 ///
 /// Respects outer join ordering constraints.
@@ -1423,9 +1434,16 @@ pub fn compute_greedy_join_order<'a>(
     let mut remaining: TableMask = (0..num_tables).try_collect()?;
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
 
-    // Pick starting table: prefer tables with high "hub score" (referenced by many constraints).
-    let first_idx =
-        find_best_starting_table(num_tables, constraints, base_table_rows, &left_join_deps)?;
+    // Pick the starting table using local filters and directed indexed-seek benefits.
+    let first_idx = find_best_starting_table(
+        num_tables,
+        joined_tables,
+        constraints,
+        base_table_rows,
+        &left_join_deps,
+        analyze_stats,
+        params,
+    )?;
     let first_table = &joined_tables[first_idx];
     join_order.push(JoinOrderMember {
         table_id: first_table.internal_id,
@@ -1574,33 +1592,33 @@ pub fn compute_greedy_join_order<'a>(
     }))
 }
 
-/// Select starting table for greedy join ordering.
+/// Select the best starting table for greedy join ordering by evaluating indexed-seek benefits.
 ///
-/// Prefers tables with high "hub score": tables referenced by many other tables' usable
-/// constraints. Starting with such tables enables index lookups on subsequent joins.
-/// E.g., in a star schema, the fact table is referenced by all dimension FKs, so
-/// starting there allows all dimensions to use their PK indexes.
+/// Score = base_rows * filter_selectivity * table's indexed-seek multiplier
 ///
-/// Score = (base_rows * filter_selectivity) / (1 + hub_score)
-/// Lower score wins. Outer join RHS tables are excluded (have ordering dependencies).
+/// The multiplier is lower (better) for tables that enable indexed seeks on others
+/// (e.g., a fact table in a star schema) and higher for tables that are themselves
+/// better reached via an index only after a predecessor has been joined.
+///
+/// Lower score wins. Outer join RHS tables are excluded.
 fn find_best_starting_table(
     num_tables: usize,
+    joined_tables: &[JoinedTable],
     constraints: &[TableConstraints],
     base_table_rows: &[RowCountEstimate],
     left_join_deps: &HashMap<usize, TableMask>,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
 ) -> Result<usize> {
-    // hub_score[t] = count of usable constraints on OTHER tables that reference t.
-    // If we join t first, each such constraint becomes usable for an index lookup.
-    let mut hub_score = vec![0usize; num_tables];
-    for (t, tc) in constraints.iter().enumerate() {
-        for c in &tc.constraints {
-            if c.usable && c.table_col_pos.is_some() {
-                for other in (0..num_tables).filter(|&x| x != t && c.lhs_mask.get(x)) {
-                    hub_score[other] += 1;
-                }
-            }
-        }
-    }
+    let multipliers = compute_indexed_seek_benefits(
+        num_tables,
+        joined_tables,
+        constraints,
+        base_table_rows,
+        left_join_deps,
+        analyze_stats,
+        params,
+    )?;
 
     let mut best: Option<(usize, f64)> = None;
     for t in 0..num_tables {
@@ -1625,7 +1643,7 @@ fn find_best_starting_table(
             .map(|c| c.selectivity)
             .product();
 
-        let score = base_rows * selectivity / (1.0 + hub_score[t] as f64);
+        let score = base_rows * selectivity * multipliers[t];
 
         if best.is_none_or(|(_, s)| score < s) {
             best = Some((t, score));
@@ -1634,6 +1652,202 @@ fn find_best_starting_table(
 
     // Table 0 can never be outer join RHS, so best is always Some.
     Ok(best.expect("no valid starting table").0)
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct IndexedSeekBenefit {
+    /// measures how much choosing this table first enables indexed seeks on other tables.
+    /// Higher is better for a starting table.
+    reward: f64,
+    /// measures how much this table prefers some other table to be joined first
+    /// so it can be reached through an indexed seek.
+    /// Higher indicates that it is a poor starting choice.
+    penalty: f64,
+}
+
+impl IndexedSeekBenefit {
+    fn multiplier(&self) -> f64 {
+        (1.0 + self.penalty) / (1.0 + self.reward)
+    }
+}
+
+/// Compute directed indexed-seek benefits for single-table starting choices.
+///
+/// A table enables a seek on another when its presence in the join prefix allows
+/// the second table to use an indexed seek instead of a scan. The returned
+/// multiplier is lower for better starting choices.
+fn compute_indexed_seek_benefits(
+    num_tables: usize,
+    joined_tables: &[JoinedTable],
+    constraints: &[TableConstraints],
+    base_table_rows: &[RowCountEstimate],
+    left_join_deps: &HashMap<usize, TableMask>,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+) -> Result<Vec<f64>> {
+    let mut benefits = vec![IndexedSeekBenefit::default(); num_tables];
+
+    let mut total_constant_score = 0.0;
+    let mut constant_scores = vec![0.0; num_tables];
+    let empty_lhs_mask = TableMask::default();
+
+    for rhs in 0..num_tables {
+        let rhs_constraints = &constraints[rhs];
+        let rhs_table = &joined_tables[rhs];
+        let rhs_base_rows = base_table_rows[rhs];
+
+        if let Some(deps) = left_join_deps.get(&rhs) {
+            if deps.count() > 1 {
+                continue;
+            }
+            if let Some(dep_t) = deps.iter().next() {
+                let mut lhs_mask = TableMask::default();
+                lhs_mask.set(dep_t)?;
+                let score = get_best_seek_score(
+                    rhs_constraints,
+                    &lhs_mask,
+                    rhs,
+                    rhs_table,
+                    rhs_base_rows,
+                    analyze_stats,
+                    params,
+                );
+                if score > 0.0 {
+                    benefits[dep_t].reward += score;
+                    benefits[rhs].penalty += score;
+                }
+                continue;
+            }
+        }
+
+        let mut potential_predecessors = TableMask::default();
+        for candidate in &rhs_constraints.candidates {
+            for cref in &candidate.refs {
+                // Only the first index column can be enabled for an index
+                // seek by joining a single table first.
+                if cref.index_col_pos > 0 {
+                    break;
+                }
+                let c = &rhs_constraints.constraints[cref.constraint_vec_pos];
+                if c.lhs_mask.count() != 1 {
+                    continue;
+                }
+                let Some(t) = c.lhs_mask.iter().next() else {
+                    continue;
+                };
+                potential_predecessors.set(t)?;
+            }
+        }
+
+        let constant_score = get_best_seek_score(
+            rhs_constraints,
+            &empty_lhs_mask,
+            rhs,
+            rhs_table,
+            rhs_base_rows,
+            analyze_stats,
+            params,
+        );
+        if constant_score > 0.0 {
+            total_constant_score += constant_score;
+            constant_scores[rhs] = constant_score;
+            benefits[rhs].penalty += constant_score * (num_tables.saturating_sub(1)) as f64;
+        }
+
+        for t in potential_predecessors.iter() {
+            if t == rhs {
+                continue;
+            }
+            let mut lhs_mask = TableMask::default();
+            lhs_mask.set(t)?;
+            let specific_score = get_best_seek_score(
+                rhs_constraints,
+                &lhs_mask,
+                rhs,
+                rhs_table,
+                rhs_base_rows,
+                analyze_stats,
+                params,
+            );
+            let delta = specific_score - constant_score;
+            if delta != 0.0 {
+                benefits[t].reward += delta;
+                benefits[rhs].penalty += delta;
+            }
+        }
+    }
+
+    for start in 0..num_tables {
+        benefits[start].reward += total_constant_score - constant_scores[start];
+    }
+
+    Ok(benefits.into_iter().map(|b| b.multiplier()).collect())
+}
+
+/// Estimate how much `lhs_mask` improves indexed access to `rhs`.
+///
+/// Higher is better, based on estimated row reduction:
+///
+/// `ln(base_rows / estimated_rows_per_seek)`
+fn get_best_seek_score(
+    rhs_constraints: &TableConstraints,
+    lhs_mask: &TableMask,
+    rhs: usize,
+    rhs_table: &JoinedTable,
+    base_row_count: RowCountEstimate,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+) -> f64 {
+    let mut best_score = 0.0;
+    for candidate in &rhs_constraints.candidates {
+        let usable_constraint_refs = usable_constraints_for_lhs_mask(
+            &rhs_constraints.constraints,
+            &candidate.refs,
+            lhs_mask,
+            rhs,
+        );
+        if usable_constraint_refs.is_empty() {
+            continue;
+        }
+
+        let index_info = match candidate.index.as_ref() {
+            Some(index) => IndexInfo {
+                unique: index.unique,
+                covering: rhs_table.index_is_covering(index),
+                column_count: index.columns.len(),
+                rows_per_leaf_page: rows_per_leaf_page_for_index(
+                    index.columns.len(),
+                    rhs_table,
+                    params.rows_per_table_page,
+                ),
+            },
+            None => IndexInfo {
+                unique: true,
+                covering: true,
+                column_count: 1,
+                rows_per_leaf_page: params.rows_per_table_page,
+            },
+        };
+        let analyze_ctx = AnalyzeCtx {
+            rhs_table,
+            index: candidate.index.as_ref(),
+            stats: analyze_stats,
+        };
+        let estimated_rows = estimate_rows_per_seek(
+            index_info,
+            &rhs_constraints.constraints,
+            &usable_constraint_refs,
+            base_row_count,
+            Some(&analyze_ctx),
+        )
+        .max(1.0);
+        let base_rows = (*base_row_count).max(1.0);
+        let score = (base_rows / estimated_rows).ln().max(0.0);
+        if score > best_score {
+            best_score = score;
+        }
+    }
+    best_score
 }
 
 /// Specialized version of [compute_best_join_order] that just joins tables in the order they are given
@@ -1816,7 +2030,7 @@ fn generate_join_bitmasks(table_number_max_exclusive: usize, how_many: usize) ->
 mod tests {
     use std::{collections::VecDeque, sync::Arc};
 
-    use turso_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
+    use turso_parser::ast::{self, Expr, Operator, TableInternalId};
 
     use super::*;
     use crate::alloc::TursoSliceExt;
@@ -1859,6 +2073,70 @@ mod tests {
         assert!(bitmasks.contains(&TableMask::try_from(0b1010u128)?)); // {1,3}
         assert!(bitmasks.contains(&TableMask::try_from(0b1100u128)?)); // {2,3}
         Ok(())
+    }
+
+    #[test]
+    fn test_seek_score_accounts_for_composite_index_prefix() {
+        let mut table_id_counter = TableRefIdCounter::new();
+        let t1 = _create_btree_table("table1", _create_column_list(&["x"], Type::Integer));
+        let t2 = _create_btree_table(
+            "table2",
+            _create_column_list(&["x", "y", "z"], Type::Integer),
+        );
+        let joined_tables = vec![
+            _create_table_reference(t1, None, table_id_counter.next()),
+            _create_table_reference(
+                t2,
+                Some(JoinInfo {
+                    join_type: JoinType::Inner,
+                    using: vec![],
+                    no_reorder: false,
+                }),
+                table_id_counter.next(),
+            ),
+        ];
+
+        const TABLE1: usize = 0;
+        const TABLE2: usize = 1;
+
+        let where_clause = vec![
+            _create_binary_expr(
+                _create_column_expr(joined_tables[TABLE2].internal_id, 0, false),
+                ast::Operator::Equals,
+                _create_column_expr(joined_tables[TABLE1].internal_id, 0, false),
+            ),
+            _create_binary_expr(
+                _create_column_expr(joined_tables[TABLE2].internal_id, 1, false),
+                ast::Operator::Equals,
+                _create_numeric_literal("1"),
+            ),
+            _create_binary_expr(
+                _create_column_expr(joined_tables[TABLE2].internal_id, 2, false),
+                ast::Operator::Equals,
+                _create_numeric_literal("2"),
+            ),
+        ];
+
+        let single_col_index = _create_index("idx_table2_x", "table2", &[("x", 0)], false);
+        let composite_index = _create_index(
+            "idx_table2_xyz",
+            "table2",
+            &[("x", 0), ("y", 1), ("z", 2)],
+            false,
+        );
+
+        let single_col_score = seek_score_for_indexes(
+            &joined_tables,
+            &where_clause,
+            VecDeque::from([single_col_index]),
+        );
+        let composite_score = seek_score_for_indexes(
+            &joined_tables,
+            &where_clause,
+            VecDeque::from([composite_index]),
+        );
+
+        assert!(composite_score > single_col_score);
     }
 
     #[test]
@@ -2037,14 +2315,7 @@ mod tests {
             name: "sqlite_autoindex_test_table_1".to_string(),
             table_name: "test_table".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn {
-                name: "id".to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: 0,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: crate::alloc::vec![IndexColumn::new("id", 0)],
             unique: true,
             ephemeral: false,
             root_page: 1,
@@ -2134,14 +2405,7 @@ mod tests {
             name: "index1".to_string(),
             table_name: "table1".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn {
-                name: "id".to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: 0,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: crate::alloc::vec![IndexColumn::new("id", 0)],
             unique: true,
             ephemeral: false,
             root_page: 1,
@@ -2276,14 +2540,7 @@ mod tests {
                     name: index_name,
                     where_clause: None,
                     table_name: table_name.to_string(),
-                    columns: crate::alloc::vec![IndexColumn {
-                        name: "id".to_string(),
-                        order: SortOrder::Asc,
-                        pos_in_table: 0,
-                        collation: None,
-                        default: None,
-                        expr: None,
-                    }],
+                    columns: crate::alloc::vec![IndexColumn::new("id", 0)],
                     unique: true,
                     ephemeral: false,
                     root_page: 1,
@@ -2301,14 +2558,7 @@ mod tests {
             name: "orders_customer_id_idx".to_string(),
             table_name: "orders".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn {
-                name: "customer_id".to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: 1,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: crate::alloc::vec![IndexColumn::new("customer_id", 1)],
             unique: false,
             ephemeral: false,
             root_page: 1,
@@ -2320,14 +2570,7 @@ mod tests {
             name: "order_items_order_id_idx".to_string(),
             table_name: "order_items".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn {
-                name: "order_id".to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: 1,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: crate::alloc::vec![IndexColumn::new("order_id", 1)],
             unique: false,
             ephemeral: false,
             root_page: 1,
@@ -2810,24 +3053,7 @@ mod tests {
             name: "idx_xy".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![
-                IndexColumn {
-                    name: "x".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 0,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: "y".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 1,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-            ],
+            columns: crate::alloc::vec![IndexColumn::new("x", 0), IndexColumn::new("y", 1),],
             unique: false,
             root_page: 2,
             ephemeral: false,
@@ -2923,30 +3149,9 @@ mod tests {
             table_name: "t1".to_string(),
             where_clause: None,
             columns: crate::alloc::vec![
-                IndexColumn {
-                    name: "c1".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 0,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: "c2".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 1,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: "c3".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 2,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
+                IndexColumn::new("c1", 0),
+                IndexColumn::new("c2", 1),
+                IndexColumn::new("c3", 2),
             ],
             unique: false,
             root_page: 2,
@@ -3060,32 +3265,7 @@ mod tests {
             name: "idx1".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![
-                IndexColumn {
-                    name: "c1".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 0,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: "c2".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 1,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: "c3".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 2,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-            ],
+            columns: IndexColumn::new_many(vec!["c1", "c2", "c3"]),
             root_page: 2,
             ephemeral: false,
             has_rowid: true,
@@ -3246,13 +3426,37 @@ mod tests {
             1, // root_page, doesn't matter for tests
             name.to_string(),
             crate::alloc::vec![],
-            columns.try_to_vec().expect("TODO: fallible allocations"),
+            columns.try_to_vec().expect(crate::alloc::ALLOC_ERR_MSG),
             BTreeCharacteristics::HAS_ROWID,
             crate::alloc::vec![],
             crate::alloc::vec![],
             crate::alloc::vec![],
             None,
         ))
+    }
+
+    fn _create_index(
+        name: &str,
+        table_name: &str,
+        columns: &[(&str, usize)],
+        unique: bool,
+    ) -> Arc<Index> {
+        Arc::new(Index {
+            name: name.to_string(),
+            table_name: table_name.to_string(),
+            where_clause: None,
+            columns: columns
+                .iter()
+                .map(|(name, pos_in_table)| IndexColumn::new((*name).to_string(), *pos_in_table))
+                .try_collect()
+                .unwrap(),
+            unique,
+            ephemeral: false,
+            root_page: 1,
+            has_rowid: true,
+            index_method: None,
+            on_conflict: None,
+        })
     }
 
     /// Creates a TableReference for a BTreeTable
@@ -3299,6 +3503,37 @@ mod tests {
     /// Creates a numeric literal expression
     fn _create_numeric_literal(value: &str) -> Expr {
         Expr::Literal(ast::Literal::Numeric(value.to_string()))
+    }
+
+    fn seek_score_for_indexes(
+        joined_tables: &[JoinedTable],
+        where_clause: &[WhereTerm],
+        indexes: VecDeque<Arc<Index>>,
+    ) -> f64 {
+        let mut available_indexes = AvailableIndexes::default();
+        available_indexes.insert_for_table_name(joined_tables, "table2", indexes);
+        let table_references = TableReferences::new(joined_tables.to_vec(), vec![]);
+        let constraints = constraints_from_where_clause(
+            where_clause,
+            &table_references,
+            &available_indexes,
+            &[],
+            &empty_schema(),
+            &DEFAULT_PARAMS,
+        )
+        .unwrap();
+
+        let mut lhs_mask = TableMask::default();
+        lhs_mask.set(0).unwrap();
+        get_best_seek_score(
+            &constraints[1],
+            &lhs_mask,
+            1,
+            &joined_tables[1],
+            RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS),
+            &AnalyzeStats::default(),
+            &DEFAULT_PARAMS,
+        )
     }
 
     fn _as_btree(
@@ -3355,14 +3590,7 @@ mod tests {
             name: "idx_t2_a".to_string(),
             table_name: "t2".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn {
-                name: "a".to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: 0,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: crate::alloc::vec![IndexColumn::new("a", 0)],
             unique: false, // Non-unique index
             ephemeral: false,
             root_page: 2,

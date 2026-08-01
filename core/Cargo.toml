@@ -20,6 +20,11 @@ path = "lib.rs"
 default = ["fs", "uuid", "time", "json", "series", "encryption", "percentile"]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
+# Harness-side observability: turns on aristo's instrument surface so the
+# logical-log conformance DTs can read private LogicalLog state (header
+# version, pending running CRC) and construct LogRecords. Off by default;
+# production builds carry zero instrumentation.
+aristo-instr = ["aristo/aristo_instrument"]
 fs = ["turso_ext/vfs"]
 json = []
 uuid = ["dep:uuid"]
@@ -72,6 +77,12 @@ libloading = "0.8.6"
 tantivy = { version = "0.26.0", optional = true }
 
 [dependencies]
+# aristo SDK from crates.io (0.4.x — latest; also carries the aristo::instrument
+# surface behind the `aristo_instrument` feature, for future state-exposure
+# accessors). Was a local sibling path (../../aristo) pre-OSS; the conformance
+# harness resolves aristo + aristo-macros from crates.io, so no vendored mount
+# / path-rewrite is needed.
+aristo = "0.4"
 turso_ext = { workspace = true, features = ["core_only"] }
 cfg_block = "0.1.1"
 fallible-iterator = { workspace = true }
@@ -116,6 +127,7 @@ rustc-hash = "2.0"
 either = { workspace = true }
 tracing-subscriber.workspace = true
 rapidhash = "4.1.1"
+simdutf8 = "0.1.5"
 branches = { version = "0.4.3", default-features = false }
 bumpalo = { version = "3", features = ["collections"] }
 smallvec = "1.15.1"
@@ -155,6 +167,7 @@ pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }
 
 [dev-dependencies]
 memory-stats = "1.2.0"
+serde_json = { workspace = true }
 criterion = { workspace = true, features = [
     "html_reports",
     "async",
@@ -182,12 +195,21 @@ name = "benchmark"
 harness = false
 
 [[bench]]
+name = "count_benchmark"
+harness = false
+
+[[bench]]
 name = "mvcc_benchmark"
 harness = false
 
 [[bench]]
 name = "mvcc_recovery_benchmark"
 harness = false
+
+[[bench]]
+name = "logical_log_serialization"
+harness = false
+required-features = ["bench"]
 
 [[bench]]
 name = "json_benchmark"
@@ -225,6 +247,11 @@ harness = false
 required-features = ["fts"]
 
 [[bench]]
+name = "fts_comparison_benchmark"
+harness = false
+required-features = ["fts"]
+
+[[bench]]
 name = "graph_queries_benchmark"
 harness = false
 
@@ -242,4 +269,12 @@ harness = false
 
 [[bench]]
 name = "prepare_params_benchmark"
+harness = false
+
+[[bench]]
+name = "prepare_benchmark"
+harness = false
+
+[[bench]]
+name = "record_recycling"
 harness = false

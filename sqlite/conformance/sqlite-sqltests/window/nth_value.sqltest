@@ -1,0 +1,508 @@
+@database :memory:
+
+setup nth_base {
+    CREATE TABLE nth_items(id INTEGER PRIMARY KEY, g TEXT, v INTEGER);
+    INSERT INTO nth_items VALUES
+        (1, 'a', 10),
+        (2, 'a', 20),
+        (3, 'a', 30),
+        (4, 'b', 100),
+        (5, 'b', 200);
+}
+
+# Position 1 means the first value ordered by v among rows with the same g
+# value. This should match first_value for this query.
+@setup nth_base
+test nth-value-first-row {
+    SELECT id, v, nth_value(v, 1) OVER (PARTITION BY g ORDER BY v) FROM nth_items ORDER BY id;
+}
+expect {
+    1|10|10
+    2|20|10
+    3|30|10
+    4|100|100
+    5|200|100
+}
+
+# Position 2 is not available until the second row in the window order has
+# been reached, so the first row gets NULL.
+@setup nth_base
+test nth-value-second-row {
+    SELECT id, v, nth_value(v, 2) OVER (PARTITION BY g ORDER BY v) FROM nth_items ORDER BY id;
+}
+expect {
+    1|10|
+    2|20|20
+    3|30|20
+    4|100|
+    5|200|200
+}
+
+# No partition has ten rows, so position 10 always gives NULL.
+@setup nth_base
+test nth-value-out-of-bounds {
+    SELECT id, v, nth_value(v, 10) OVER (PARTITION BY g ORDER BY v) FROM nth_items ORDER BY id;
+}
+expect {
+    1|10|
+    2|20|
+    3|30|
+    4|100|
+    5|200|
+}
+
+setup nth_nulls {
+    CREATE TABLE nth_n(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO nth_n VALUES (1, 10), (2, NULL), (3, 30);
+}
+
+# When the chosen value is NULL, later rows must keep returning NULL instead
+# of choosing a later non-NULL value.
+@setup nth_nulls
+test nth-value-captures-null {
+    SELECT id, v, nth_value(v, 2) OVER (ORDER BY id) FROM nth_n ORDER BY id;
+}
+expect {
+    1|10|
+    2||
+    3|30|
+}
+
+setup nth_peers {
+    CREATE TABLE nth_p(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO nth_p VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 3);
+}
+
+# The position counts individual rows, including rows with equal sort values.
+# Position 3 is therefore the first row whose value is 2.
+@setup nth_peers
+test nth-value-counts-rows-not-peers {
+    SELECT id, v, nth_value(v, 3) OVER (ORDER BY v) FROM nth_p ORDER BY id;
+}
+expect {
+    1|1|
+    2|1|
+    3|2|2
+    4|2|2
+    5|3|2
+}
+
+setup nth_empty {
+    CREATE TABLE nth_e(v INTEGER);
+}
+
+@setup nth_empty
+test nth-value-empty-input {
+    SELECT nth_value(v, 1) OVER (ORDER BY v) FROM nth_e;
+}
+expect {
+}
+
+@setup nth_base
+test nth-value-expression-argument {
+    SELECT id, nth_value(v * 10, 2) OVER (ORDER BY v) FROM nth_items ORDER BY id;
+}
+expect {
+    1|
+    2|200
+    3|200
+    4|200
+    5|200
+}
+
+@setup nth_base
+test nth-value-with-first-and-last-value {
+    SELECT id, v,
+           first_value(v) OVER (ORDER BY v),
+           nth_value(v, 2) OVER (ORDER BY v),
+           nth_value(v, 3) OVER (ORDER BY v),
+           last_value(v) OVER (ORDER BY v)
+    FROM nth_items ORDER BY id;
+}
+expect {
+    1|10|10|||10
+    2|20|10|20||20
+    3|30|10|20|30|30
+    4|100|10|20|30|100
+    5|200|10|20|30|200
+}
+
+setup nth_text {
+    CREATE TABLE nth_t(v TEXT);
+    INSERT INTO nth_t VALUES ('apple'), ('banana'), ('cherry');
+}
+
+@setup nth_text
+test nth-value-text-argument {
+    SELECT v, nth_value(v, 2) OVER (ORDER BY v) FROM nth_t ORDER BY v;
+}
+expect {
+    apple|
+    banana|banana
+    cherry|banana
+}
+
+@setup nth_base
+test nth-value-float-n-converts-losslessly {
+    SELECT id, nth_value(v, 2.0) OVER (ORDER BY v) FROM nth_items ORDER BY id;
+}
+expect {
+    1|
+    2|20
+    3|20
+    4|20
+    5|20
+}
+
+# SQLite treats the text '2' as position 2, so Turso must do the same.
+@setup nth_base
+test nth-value-text-n-coerces {
+    SELECT id, nth_value(v, '2') OVER (ORDER BY v) FROM nth_items ORDER BY id;
+}
+expect {
+    1|
+    2|20
+    3|20
+    4|20
+    5|20
+}
+
+# The position must be a positive whole number. These invalid forms must all
+# return the same error as SQLite.
+@setup nth_base
+test nth-value-n-zero-errors {
+    SELECT nth_value(v, 0) OVER (ORDER BY v) FROM nth_items;
+}
+expect error {
+}
+
+@setup nth_base
+test nth-value-n-negative-errors {
+    SELECT nth_value(v, -1) OVER (ORDER BY v) FROM nth_items;
+}
+expect error {
+}
+
+@setup nth_base
+test nth-value-n-lossy-float-errors {
+    SELECT nth_value(v, 1.5) OVER (ORDER BY v) FROM nth_items;
+}
+expect error {
+}
+
+@setup nth_base
+test nth-value-n-non-numeric-text-errors {
+    SELECT nth_value(v, 'abc') OVER (ORDER BY v) FROM nth_items;
+}
+expect error {
+    second argument to nth_value must be a positive integer
+}
+
+# SQLite rejects text with anything after the number, so Turso must reject it.
+@setup nth_base
+test nth-value-n-text-prefix-errors {
+    SELECT nth_value(v, '2abc') OVER (ORDER BY v) FROM nth_items;
+}
+expect error {
+    second argument to nth_value must be a positive integer
+}
+
+@setup nth_base
+test nth-value-n-null-errors {
+    SELECT nth_value(v, NULL) OVER (ORDER BY v) FROM nth_items;
+}
+expect error {
+    second argument to nth_value must be a positive integer
+}
+
+setup nth_adversarial {
+    CREATE TABLE nth_a(id INTEGER PRIMARY KEY, g TEXT, ord INTEGER, v, n INTEGER);
+    INSERT INTO nth_a VALUES
+        (1, 'a', 1, 'raven', 1),
+        (2, 'a', 1, 'nevermore', 2),
+        (3, 'a', 2, NULL, 3),
+        (4, 'a', 2, 'telltale', 4),
+        (5, 'a', 3, 'pendulum', 99),
+        (6, 'b', NULL, x'00ff', 1),
+        (7, 'b', NULL, 3.5, 2),
+        (8, 'b', 1, -7, 3);
+}
+
+# Each result row uses its own position argument. This also checks that the
+# chosen value keeps its type and that a missing position gives NULL.
+@setup nth_adversarial
+test nth-value-varying-n-replaces-earlier-match {
+    SELECT id,
+           typeof(nth_value(v, n) OVER (PARTITION BY g ORDER BY id)),
+           quote(nth_value(v, n) OVER (PARTITION BY g ORDER BY id))
+    FROM nth_a ORDER BY id;
+}
+expect {
+    1|text|'raven'
+    2|text|'nevermore'
+    3|null|NULL
+    4|text|'telltale'
+    5|null|NULL
+    6|blob|X'00FF'
+    7|real|3.5
+    8|integer|-7
+}
+
+# Rows with equal sort values consider the same rows, but each row uses its own
+# position argument. The counts avoid relying on the order of tied rows.
+@setup nth_adversarial
+test nth-value-varying-n-across-peer-groups {
+    WITH results AS (
+        SELECT g, ord, nth_value(v, n) OVER (PARTITION BY g ORDER BY ord) AS x
+        FROM nth_a
+    )
+    SELECT g, quote(ord), count(*), count(x), count(DISTINCT x)
+    FROM results
+    GROUP BY g, ord
+    ORDER BY g, ord;
+}
+expect {
+    a|1|2|2|2
+    a|2|2|1|1
+    a|3|1|0|0
+    b|NULL|2|2|2
+    b|1|1|1|1
+}
+
+# Without ORDER BY, every row considers its whole partition. Position 2 must
+# therefore give the same answer throughout each partition.
+@setup nth_adversarial
+test nth-value-without-order-by-sees-whole-partition {
+    SELECT id, quote(nth_value(v, 2) OVER (PARTITION BY g))
+    FROM nth_a ORDER BY id;
+}
+expect {
+    1|'nevermore'
+    2|'nevermore'
+    3|'nevermore'
+    4|'nevermore'
+    5|'nevermore'
+    6|3.5
+    7|3.5
+    8|3.5
+}
+
+# The extra id ordering decides which tied row comes first. A row still gets
+# NULL until position 2 has been reached.
+@setup nth_adversarial
+test nth-value-descending-null-order-and-tiebreaker {
+    SELECT id,
+           quote(nth_value(v, 2) OVER (
+               PARTITION BY g ORDER BY ord DESC NULLS LAST, id DESC
+           ))
+    FROM nth_a ORDER BY id;
+}
+expect {
+    1|'telltale'
+    2|'telltale'
+    3|'telltale'
+    4|'telltale'
+    5|NULL
+    6|3.5
+    7|3.5
+    8|NULL
+}
+
+# Naming a window only reuses its definition, so it must not change the result.
+@setup nth_adversarial
+test nth-value-varying-n-with-named-window {
+    SELECT id, quote(nth_value(v, n) OVER gothic)
+    FROM nth_a
+    WINDOW gothic AS (PARTITION BY g ORDER BY ord, id)
+    ORDER BY id;
+}
+expect {
+    1|'raven'
+    2|'nevermore'
+    3|NULL
+    4|'telltale'
+    5|NULL
+    6|X'00FF'
+    7|3.5
+    8|-7
+}
+
+# These calls order the same rows differently. Reusing one call's lookup for
+# another would return the wrong value.
+@setup nth_adversarial
+test nth-value-multiple-window-definitions {
+    SELECT id,
+           quote(nth_value(v, n) OVER (PARTITION BY g ORDER BY ord, id)),
+           quote(nth_value(v, 2) OVER (PARTITION BY g ORDER BY ord DESC, id DESC)),
+           quote(nth_value(v, 3) OVER (PARTITION BY g ORDER BY id))
+    FROM nth_a ORDER BY id;
+}
+expect {
+    1|'raven'|'telltale'|NULL
+    2|'nevermore'|'telltale'|NULL
+    3|NULL|'telltale'|NULL
+    4|'telltale'|'telltale'|NULL
+    5|NULL|NULL|NULL
+    6|X'00FF'|3.5|NULL
+    7|3.5|3.5|NULL
+    8|-7|NULL|-7
+}
+
+# The position argument may change from one result row to the next, so every
+# returned row must check its own value.
+setup nth_late_invalid {
+    CREATE TABLE nth_li(id INTEGER PRIMARY KEY, v TEXT, n);
+    INSERT INTO nth_li VALUES (1, 'first', 1), (2, 'second', 2), (3, 'doom', 0);
+}
+
+@setup nth_late_invalid
+test nth-value-varying-n-late-invalid-errors {
+    SELECT nth_value(v, n) OVER (ORDER BY id) FROM nth_li;
+}
+expect error {
+    second argument to nth_value must be a positive integer
+}
+
+# LIMIT 2 prevents the third result from being returned, so its invalid
+# position must not cause an error.
+@setup nth_late_invalid
+test nth-value-limit-stops-before-late-invalid-n {
+    SELECT id, nth_value(v, n) OVER (ORDER BY id)
+    FROM nth_li ORDER BY id LIMIT 2;
+}
+expect {
+    1|first
+    2|second
+}
+
+# OFFSET hides the first result only after its window value is calculated, so
+# its invalid position must still cause an error.
+setup nth_offset_invalid {
+    CREATE TABLE nth_oi(id INTEGER PRIMARY KEY, v TEXT, n);
+    INSERT INTO nth_oi VALUES (1, 'doom', 0), (2, 'second', 2);
+}
+
+@setup nth_offset_invalid
+test nth-value-offset-does-not-hide-invalid-n {
+    SELECT id, nth_value(v, n) OVER (ORDER BY id)
+    FROM nth_oi ORDER BY id LIMIT 1 OFFSET 1;
+}
+expect error {
+    second argument to nth_value must be a positive integer
+}
+
+# With no input rows, there is no position argument to check.
+@setup nth_empty
+test nth-value-invalid-n-on-empty-input-does-not-error {
+    SELECT nth_value(v, 0) OVER () FROM nth_e;
+}
+expect {
+}
+
+# SQLite accepts this exactly represented whole decimal. It is beyond this
+# small partition, so the result must be NULL rather than an error.
+@setup nth_base
+test nth-value-largest-near-boundary-exact-real {
+    SELECT quote(nth_value(v, 9223372036854774784.0) OVER (ORDER BY v))
+    FROM nth_items ORDER BY v;
+}
+expect {
+    NULL
+    NULL
+    NULL
+    NULL
+    NULL
+}
+
+# The first decimal rounds to the second value shown below. Both are larger
+# than the greatest supported integer, so SQLite rejects them.
+@setup nth_base
+test nth-value-rounded-i64-max-real-errors {
+    SELECT nth_value(v, 9223372036854775807.0) OVER () FROM nth_items;
+}
+expect error {
+    second argument to nth_value must be a positive integer
+}
+
+@setup nth_base
+test nth-value-two-to-63-real-errors {
+    SELECT nth_value(v, 9223372036854775808.0) OVER () FROM nth_items;
+}
+expect error {
+    second argument to nth_value must be a positive integer
+}
+
+# SQLite accepts spaces and an exponent when the text still represents a
+# positive whole number, so Turso must do the same.
+@setup nth_base
+test nth-value-text-exponent-n-coerces {
+    SELECT id, nth_value(v, ' 2e0 ') OVER (ORDER BY v)
+    FROM nth_items ORDER BY id;
+}
+expect {
+    1|
+    2|20
+    3|20
+    4|20
+    5|20
+}
+
+# SQLite only treats ASCII whitespace around a number as numeric input.
+@setup nth_base
+test nth-value-unicode-whitespace-n-errors {
+    SELECT nth_value(v, char(160) || '1' || char(160)) OVER () FROM nth_items;
+}
+expect error {
+    second argument to nth_value must be a positive integer
+}
+
+# A blob is not a position number, even when its byte spells '2'.
+@setup nth_base
+test nth-value-blob-n-errors {
+    SELECT nth_value(v, x'32') OVER () FROM nth_items;
+}
+expect error {
+    second argument to nth_value must be a positive integer
+}
+
+# Force 512 tied rows onto disk and read a value near the end. This exercises
+# position lookup after the saved table has grown across many pages.
+setup nth_large_peer {
+    PRAGMA temp_store=FILE;
+}
+
+@setup nth_large_peer
+test nth-value-large-peer-group-uses-temp-storage {
+    WITH digit(i) AS (
+        VALUES(0), (1), (2), (3), (4), (5), (6), (7)
+    )
+    SELECT count(*), sum(length(value))
+    FROM (
+        SELECT nth_value(zeroblob(32768), 512) OVER (ORDER BY 0) AS value
+        FROM digit AS a CROSS JOIN digit AS b CROSS JOIN digit AS c
+    );
+}
+expect {
+    512|16777216
+}
+
+# Every new sort value makes the preceding row ready while all earlier rows
+# remain saved. The large values force the saved table to grow across many
+# pages. Its return cursor must stay on the next row while that table grows.
+@setup nth_large_peer
+test nth-value-return-cursor-survives-growing-buffer {
+    WITH digit(i) AS (
+        VALUES(0), (1), (2), (3), (4), (5), (6), (7)
+    )
+    SELECT count(*), sum(length(chosen))
+    FROM (
+        SELECT nth_value(zeroblob(4096), i) OVER (ORDER BY i) AS chosen
+        FROM (
+            SELECT a.i * 64 + b.i * 8 + c.i + 1 AS i
+            FROM digit AS a CROSS JOIN digit AS b CROSS JOIN digit AS c
+        )
+    );
+}
+expect {
+    512|2097152
+}

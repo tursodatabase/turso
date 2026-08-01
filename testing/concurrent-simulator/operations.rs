@@ -56,8 +56,16 @@ pub enum Operation {
     Commit,
     /// Rollback current transaction
     Rollback,
+    /// Create a savepoint within the current transaction
+    Savepoint { name: String },
+    /// Roll back to a savepoint without leaving the outer transaction
+    RollbackToSavepoint { name: String },
+    /// Release a savepoint without leaving the outer transaction
+    ReleaseSavepoint { name: String },
     /// Run PRAGMA integrity_check
     IntegrityCheck,
+    /// Execute a statement that does not need workload-specific state tracking.
+    Execute { sql: String },
     /// Run WAL checkpoint with specified mode
     WalCheckpoint { mode: String },
     /// Create a simple key-value table
@@ -163,7 +171,11 @@ impl Operation {
             Operation::Begin { mode } => mode.as_sql().to_string(),
             Operation::Commit => "COMMIT".to_string(),
             Operation::Rollback => "ROLLBACK".to_string(),
+            Operation::Savepoint { name } => format!("SAVEPOINT {name}"),
+            Operation::RollbackToSavepoint { name } => format!("ROLLBACK TO SAVEPOINT {name}"),
+            Operation::ReleaseSavepoint { name } => format!("RELEASE SAVEPOINT {name}"),
             Operation::IntegrityCheck => "PRAGMA integrity_check".to_string(),
+            Operation::Execute { sql } => sql.clone(),
             Operation::WalCheckpoint { mode } => format!("PRAGMA wal_checkpoint({mode})"),
             Operation::CreateSimpleTable { table_name } => {
                 format!(

@@ -1,4 +1,4 @@
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
@@ -19,7 +19,7 @@ use crate::translate::{
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
 };
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
-use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
+use crate::vdbe::insn::{to_u32, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEMP_DB_ID};
 use crate::{
     schema::{
@@ -199,7 +199,7 @@ pub fn translate_create_index(
             index_method = Some(index_module.attach(&IndexMethodConfiguration {
                 table_name: tbl.name.clone(),
                 index_name: idx_name.clone(),
-                columns: columns.clone(),
+                columns: columns.try_clone()?,
                 parameters,
             })?);
         }
@@ -257,7 +257,7 @@ pub fn translate_create_index(
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
         db: database_id,
     });
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
     emit_schema_entry(
         program,
         resolver,
@@ -416,9 +416,9 @@ fn emit_refill_index(
         });
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(start_reg),
-            count: to_u16(columns.len() + 1),
-            dest_reg: to_u16(record_reg),
+            start_reg: to_u32(start_reg),
+            count: to_u32(columns.len() + 1),
+            dest_reg: to_u32(record_reg),
             index_name: Some(idx.name.clone()),
             affinity_str: None,
         });
@@ -427,7 +427,7 @@ fn emit_refill_index(
             cursor_id: index_cursor_id,
             record_reg,
             unpacked_start: Some(start_reg),
-            unpacked_count: Some((columns.len() + 1) as u16),
+            unpacked_count: Some((columns.len() + 1) as u32),
             flags: IdxInsertFlags::new().use_seek(false),
         });
 
@@ -444,14 +444,15 @@ fn emit_refill_index(
             .columns
             .iter()
             .map(|c| (c.order, c.collation, None))
-            .try_collect()
-            .expect("TODO: fallible allocations");
+            .try_collect()?;
         program.emit_insn(Insn::SorterOpen {
             cursor_id: sorter_cursor_id,
             columns: columns.len(),
             order_collations_nulls,
             comparators: crate::alloc::vec![],
         });
+        // SorterData moves each sorted record into the pseudo cursor's
+        // content register; the two must name the same register.
         let content_reg = program.alloc_register();
         program.emit_insn(Insn::OpenPseudo {
             cursor_id: pseudo_cursor_id,
@@ -512,9 +513,9 @@ fn emit_refill_index(
         });
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(start_reg),
-            count: to_u16(columns.len() + 1),
-            dest_reg: to_u16(record_reg),
+            start_reg: to_u32(start_reg),
+            count: to_u32(columns.len() + 1),
+            dest_reg: to_u32(record_reg),
             index_name: Some(idx.name.clone()),
             affinity_str: None,
         });
@@ -552,8 +553,6 @@ fn emit_refill_index(
             pc_if_empty: sorted_loop_end,
         });
 
-        let sorted_record_reg = program.alloc_register();
-
         if idx.unique {
             let goto_label = program.allocate_label();
             let label_after_sorter_compare = program.allocate_label();
@@ -564,7 +563,7 @@ fn emit_refill_index(
             program.preassign_label_to_next_insn(sorted_loop_start);
             program.emit_insn(Insn::SorterCompare {
                 cursor_id: sorter_cursor_id,
-                sorted_record_reg,
+                sorted_record_reg: content_reg,
                 num_regs: columns.len(),
                 pc_when_nonequal: goto_label,
             });
@@ -582,7 +581,7 @@ fn emit_refill_index(
         program.emit_insn(Insn::SorterData {
             pseudo_cursor: pseudo_cursor_id,
             cursor_id: sorter_cursor_id,
-            dest_reg: sorted_record_reg,
+            dest_reg: content_reg,
         });
 
         program.emit_insn(Insn::SeekEnd {
@@ -590,7 +589,7 @@ fn emit_refill_index(
         });
         program.emit_insn(Insn::IdxInsert {
             cursor_id: index_cursor_id,
-            record_reg: sorted_record_reg,
+            record_reg: content_reg,
             unpacked_start: None,
             unpacked_count: None,
             flags: IdxInsertFlags::new().use_seek(false),
@@ -883,16 +882,30 @@ pub fn resolve_sorted_columns(
     resolve_sorted_columns_with_resolver(table, cols, None)
 }
 
+/// SQLite rejects explicit `NULLS FIRST`/`NULLS LAST` wherever an index key
+/// is defined or matched: CREATE INDEX, table PRIMARY KEY/UNIQUE constraints,
+/// and UPSERT conflict targets (see `sqlite3HasExplicitNulls`). Accepting the
+/// clause in schema definitions would store SQL in `sqlite_schema` that
+/// SQLite refuses to load ("malformed database schema").
+pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
+    for sc in cols {
+        if let Some(nulls) = sc.nulls {
+            crate::bail_parse_error!("unsupported use of {}", nulls);
+        }
+    }
+    Ok(())
+}
+
 fn resolve_sorted_columns_with_resolver(
     table: &BTreeTable,
     cols: &[SortedColumn],
     resolver: Option<&Resolver>,
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
+    reject_explicit_nulls(cols)?;
     let mut resolved =
         <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
             cols.len(),
-        )
-        .expect("TODO: fallible allocations");
+        )?;
     for sc in cols {
         let order = sc.order.unwrap_or(SortOrder::Asc);
         let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref(), resolver)?;
@@ -904,27 +917,31 @@ fn resolve_sorted_columns_with_resolver(
                 GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
                 GeneratedType::NotGenerated => None,
             };
-            resolved.push(IndexColumn {
-                name: column_name,
-                order,
-                pos_in_table: pos,
-                collation,
-                default: column.default.clone(),
-                expr,
-            });
+            resolved
+                .push_within_capacity(IndexColumn {
+                    name: column_name,
+                    order,
+                    pos_in_table: pos,
+                    collation,
+                    default: column.default.clone(),
+                    expr,
+                })
+                .expect("resolved index columns vector was preallocated to cols.len()");
             continue;
         }
         if !validate_index_expression(unwrapped_expr, table) {
             crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
         }
-        resolved.push(IndexColumn {
-            name: sc.expr.to_string(),
-            order,
-            pos_in_table: EXPR_INDEX_SENTINEL,
-            collation: explicit_collation,
-            default: None,
-            expr: Some(sc.expr.clone()),
-        });
+        resolved
+            .push_within_capacity(IndexColumn {
+                name: sc.expr.to_string(),
+                order,
+                pos_in_table: EXPR_INDEX_SENTINEL,
+                collation: explicit_collation,
+                default: None,
+                expr: Some(sc.expr.clone()),
+            })
+            .expect("resolved index columns vector was preallocated to cols.len()");
     }
     Ok(resolved)
 }
@@ -1150,7 +1167,8 @@ pub fn resolve_index_method_parameters(
                 ast::Literal::Null => crate::Value::Null,
                 ast::Literal::String(s) => crate::Value::Text(s.into()),
                 ast::Literal::Blob(b) => crate::Value::Blob(
-                    b.as_bytes()
+                    ast::blob_literal_hex(&b)
+                        .as_bytes()
                         .chunks_exact(2)
                         .map(|pair| {
                             // We assume that sqlite3-parser has already validated that
@@ -1158,7 +1176,7 @@ pub fn resolve_index_method_parameters(
                             let hex_byte = std::str::from_utf8(pair).unwrap();
                             u8::from_str_radix(hex_byte, 16).unwrap()
                         })
-                        .collect(),
+                        .try_collect()?,
                 ),
                 _ => bail_parse_error!("parameters must be constant literals"),
             },
@@ -1223,7 +1241,7 @@ pub fn translate_drop_index(
         }
     }
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
 
     // According to sqlite should emit Null instruction
     // but why?

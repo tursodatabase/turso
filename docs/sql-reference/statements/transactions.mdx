@@ -16,7 +16,10 @@ BEGIN [DEFERRED | IMMEDIATE | EXCLUSIVE] [TRANSACTION];
 COMMIT [TRANSACTION];
 END [TRANSACTION];
 
-ROLLBACK [TRANSACTION];
+ROLLBACK [TRANSACTION] [TO [SAVEPOINT] savepoint-name];
+
+SAVEPOINT savepoint-name;
+RELEASE [SAVEPOINT] savepoint-name;
 ```
 
 ## BEGIN
@@ -104,8 +107,35 @@ COMMIT;
 ROLLBACK;
 ```
 
+Each connection can have at most one active top-level transaction at a time. For finer-grained rollback within a transaction, use savepoints.
+
+## Savepoints
+
+Savepoints are named markers within a transaction that let you roll back part of the work without aborting the whole transaction. They can be nested.
+
+| Statement | Description |
+|-----------|-------------|
+| `SAVEPOINT name` | Establishes a new savepoint with the given name |
+| `RELEASE [SAVEPOINT] name` | Removes the savepoint (and any savepoints created after it), keeping its changes as part of the enclosing transaction |
+| `ROLLBACK [TRANSACTION] TO [SAVEPOINT] name` | Undoes all changes made since the savepoint, but keeps the savepoint and the transaction open |
+
+```sql
+BEGIN;
+INSERT INTO accounts (name, balance) VALUES ('Alice', 1000);
+
+SAVEPOINT before_bonus;
+UPDATE accounts SET balance = balance + 500 WHERE name = 'Alice';
+
+-- Undo just the bonus, keep the insert
+ROLLBACK TO before_bonus;
+
+-- Discard the savepoint and keep the rest
+RELEASE before_bonus;
+COMMIT;
+```
+
 <Info>
-Turso does not support SAVEPOINT or nested transactions. Each connection can have at most one active transaction at a time.
+While a write statement on the same connection is still in progress, `SAVEPOINT`, `RELEASE`, and `ROLLBACK TO` may return `SQLITE_BUSY`.
 </Info>
 
 ## BEGIN CONCURRENT

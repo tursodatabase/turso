@@ -1,5 +1,5 @@
 import { registerFileAtWorker, unregisterFileAtWorker, ioNotifier } from "@tursodatabase/database-wasm-common"
-import { DatabasePromise, TransactionFunction } from "@tursodatabase/database-common"
+import { DatabasePromise, Transaction, TransactionFunction, AsyncTransactionFunction } from "@tursodatabase/database-common"
 import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards, Runner, runner, RemoteWriter, RemoteWriteStatement } from "@tursodatabase/sync-common";
 import { SyncEngine, SyncEngineProtocolVersion, initThreadPool, MainWorker, Database as NativeDatabase } from "./index-turbopack-hack.js";
 
@@ -101,6 +101,7 @@ class Database extends DatabasePromise {
             partialSyncOpts: partialSyncOpts,
             pushOperationsThreshold: opts.pushOperationsThreshold,
             pullBytesThreshold: opts.pullBytesThreshold,
+            logicalMvccPull: opts.logicalMvccPull,
         });
 
         let headers: { [K: string]: string } | (() => Promise<{ [K: string]: string }>);
@@ -179,7 +180,7 @@ class Database extends DatabasePromise {
                     registerFileAtWorker(this.#worker, `${this.name}-changes`),
                 ]);
             }
-            await run(this.#runner, this.#engine.connect());
+            await run(this.#runner, this.#engine.connect(), this.execLock);
         }
         this.connected = true;
     }
@@ -192,11 +193,11 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        const changes = await this.#guards.wait(async () => await run(this.#runner, this.#engine.wait()));
+        const changes = await this.#guards.wait(async () => await run(this.#runner, this.#engine.wait(), this.execLock));
         if (changes.empty()) {
             return false;
         }
-        await this.#guards.apply(async () => await run(this.#runner, this.#engine.apply(changes)));
+        await this.#guards.apply(async () => await run(this.#runner, this.#engine.apply(changes), this.execLock));
         return true;
     }
     /**
@@ -207,7 +208,7 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        await this.#guards.push(async () => await run(this.#runner, this.#engine.push()));
+        await this.#guards.push(async () => await run(this.#runner, this.#engine.push(), this.execLock));
     }
     /**
      * checkpoint WAL for local database
@@ -216,7 +217,7 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        await this.#guards.checkpoint(async () => await run(this.#runner, this.#engine.checkpoint()));
+        await this.#guards.checkpoint(async () => await run(this.#runner, this.#engine.checkpoint(), this.execLock));
     }
     /**
      * @returns statistic of current local database
@@ -225,7 +226,7 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        return (await run(this.#runner, this.#engine.stats()));
+        return (await run(this.#runner, this.#engine.stats(), this.execLock));
     }
 
     /**
@@ -317,6 +318,26 @@ class Database extends DatabasePromise {
     }
 
     /**
+     * Returns a function that executes the given function in a transaction
+     * on a connection owned for the whole BEGIN..COMMIT window; the callback
+     * receives a {@link Transaction} handle as its first argument.
+     *
+     * Not supported together with {@link DatabaseOpts.remoteWritesExperimental}
+     * yet: remote-writes transactions run on the remote server and have no
+     * local connection to hand out.
+     */
+    override transactionAsync<F extends (txn: Transaction, ...args: any[]) => Promise<any>>(
+        fn: F,
+    ): AsyncTransactionFunction<F> {
+        if (this.#remoteWriter) {
+            throw new Error(
+                "transactionAsync is not supported with remoteWritesExperimental yet; use the deprecated transaction() for now",
+            );
+        }
+        return super.transactionAsync(fn);
+    }
+
+    /**
      * close the database and relevant files
      */
     async close() {
@@ -351,7 +372,7 @@ async function connect(opts: DatabaseOpts): Promise<Database> {
     return db;
 }
 
-export { connect, Database }
+export { connect, Database, Transaction }
 export { retryFetch } from "@tursodatabase/sync-common"
 export type { DatabaseOpts, EncryptionOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult }
 export type { RetryFetchOpts } from "@tursodatabase/sync-common"

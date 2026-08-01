@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import TracebackType
@@ -204,6 +205,14 @@ def _step_once_with_io(stmt: PyTursoStatement, extra_io: Optional[Callable[[], N
                 extra_io()
             continue
         return status
+
+
+def _reject_stdlib_row_factory(rf: Any) -> None:
+    stdlib_sqlite3 = sys.modules.get("sqlite3")
+    if stdlib_sqlite3 is None:
+        return
+    if isinstance(rf, type) and issubclass(rf, stdlib_sqlite3.Row):
+        raise TypeError("sqlite3.Row is not supported as a row_factory on turso connections; use turso.Row instead")
 
 
 @dataclass
@@ -415,6 +424,43 @@ class Connection:
             if self._autocommit_mode is False:
                 # Re-open a transaction to maintain PEP 249 behavior
                 self._ensure_transaction_open()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def interrupt(self) -> None:
+        """
+        Abort any query currently executing on this connection.
+
+        Mirrors ``sqlite3.Connection.interrupt``: call it from another thread to
+        cancel a long-running ``execute``/``fetch*`` in flight; that call raises
+        ``OperationalError`` ("interrupted"). The underlying execution methods
+        release the GIL, so a watchdog thread can actually run while a query is
+        busy. If no statement is running the call is a no-op.
+        """
+        try:
+            self._conn.interrupt()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def set_query_timeout(self, milliseconds: int) -> None:
+        """
+        Set the maximum time (in milliseconds) a single statement may run before
+        it is interrupted (raising ``OperationalError``). ``0`` disables the
+        timeout. Unlike ``interrupt()`` this needs no watchdog thread: the
+        deadline is enforced inside the engine. Turso extension (not in stdlib
+        ``sqlite3``).
+        """
+        if milliseconds < 0:
+            raise ProgrammingError("query timeout must be non-negative")
+        try:
+            self._conn.set_query_timeout(milliseconds)
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def get_query_timeout(self) -> int:
+        """Return the current per-statement query timeout in milliseconds (``0`` = disabled)."""
+        try:
+            return self._conn.get_query_timeout()
         except Exception as exc:  # noqa: BLE001
             raise _map_turso_exception(exc)
 
@@ -810,7 +856,11 @@ class Cursor:
         if isinstance(rf, type) and issubclass(rf, Row):
             return rf(self, Row(self, row_values))  # type: ignore[call-arg]
         if callable(rf):
-            return rf(self, Row(self, row_values))  # type: ignore[misc]
+            try:
+                return rf(self, Row(self, row_values))  # type: ignore[misc]
+            except TypeError:
+                _reject_stdlib_row_factory(rf)
+                raise
         # Fallback: return tuple
         return row_values
 

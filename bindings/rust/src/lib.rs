@@ -47,6 +47,7 @@ pub mod sync;
 
 pub use connection::Connection;
 use turso_sdk_kit::rsapi::TursoError;
+pub use turso_sdk_kit::IoBackend;
 pub use value::Value;
 
 pub use params::params_from_iter;
@@ -148,7 +149,8 @@ pub struct Builder {
     enable_generated_columns: bool,
     enable_multiprocess_wal: bool,
     enable_without_rowid: bool,
-    vfs: Option<String>,
+    enable_mvcc_passive_checkpoint: bool,
+    vfs: IoBackend,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
     io: Option<Arc<dyn turso_core::IO>>,
 }
@@ -167,7 +169,8 @@ impl Builder {
             enable_generated_columns: false,
             enable_multiprocess_wal: false,
             enable_without_rowid: false,
-            vfs: None,
+            enable_mvcc_passive_checkpoint: false,
+            vfs: IoBackend::Default,
             encryption_opts: None,
             io: None,
         }
@@ -233,8 +236,13 @@ impl Builder {
         self
     }
 
-    pub fn with_io(mut self, vfs: String) -> Self {
-        self.vfs = Some(vfs);
+    pub fn experimental_mvcc_passive_checkpoint(mut self, enabled: bool) -> Self {
+        self.enable_mvcc_passive_checkpoint = enabled;
+        self
+    }
+
+    pub fn with_io(mut self, vfs: impl Into<IoBackend>) -> Self {
+        self.vfs = vfs.into();
         self
     }
 
@@ -272,6 +280,9 @@ impl Builder {
         }
         if self.enable_without_rowid {
             features.push("without_rowid");
+        }
+        if self.enable_mvcc_passive_checkpoint {
+            features.push("mvcc_passive_checkpoint");
         }
         if features.is_empty() {
             return None;

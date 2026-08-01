@@ -4,7 +4,7 @@ use rusqlite::types::Value;
 use turso_core::types::ImmutableRecord;
 use turso_core::CDC_VERSION_CURRENT;
 
-use crate::common::{limbo_exec_rows, TempDatabase};
+use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
 
 fn replace_column_with_null(rows: Vec<Vec<Value>>, column: usize) -> Vec<Vec<Value>> {
     rows.into_iter()
@@ -1555,6 +1555,14 @@ fn test_cdc_drop_table_cleans_up_version(db: TempDatabase) {
     // Version entry should be cleaned up
     let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM turso_cdc_version");
     assert_eq!(rows, vec![vec![Value::Integer(0)]]);
+
+    // The cleanup must remove the primary-key index entry as well as the table row.
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT COUNT(*) FROM turso_cdc_version \
+         INDEXED BY sqlite_autoindex_turso_cdc_version_1",
+    );
+    assert_eq!(rows, vec![vec![Value::Integer(0)]]);
 }
 
 // ============================================================================
@@ -1665,6 +1673,49 @@ fn test_cdc_v2_txn_id_reset_after_commit(db: TempDatabase) {
     // Two INSERT records with different txn_ids (reset happened between statements)
     assert_eq!(rows.len(), 2);
     assert_ne!(rows[0][0], rows[1][0]);
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/7677.
+///
+/// With CDC v2 enabled, an explicit COMMIT emits a CDC commit record. For a transaction that
+/// captured no changes (empty or read-only) that record used to be written without
+/// establishing a write transaction, leaving a dirty CDC page that the commit path never
+/// flushed or cleared. The leaked page then tripped the "dirty pages should be empty for read
+/// txn" assertion when the *next* transaction was rolled back.
+///
+/// A committed no-change transaction followed by a rolled-back one must not panic, and
+/// no-change transactions must not emit CDC commit records (they stay read-only).
+#[turso_macros::test]
+fn test_cdc_v2_no_change_commit_then_rollback(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA capture_data_changes_conn('full,turso_cdc')")
+        .unwrap();
+
+    // An explicit transaction that captures no changes, committed.
+    conn.execute("BEGIN").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    // A subsequent read-only transaction that is rolled back used to panic here.
+    conn.execute("BEGIN").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    // The connection is still usable...
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT x FROM t");
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+    // ...and the no-change BEGIN/COMMIT and BEGIN/ROLLBACK contributed no commit records:
+    // the only ones come from the autocommit CREATE TABLE and INSERT above.
+    let commits = limbo_exec_rows(
+        &conn,
+        "SELECT change_txn_id FROM turso_cdc WHERE change_type = 2",
+    );
+    assert_eq!(commits.len(), 2);
+    assert!(commits
+        .iter()
+        .all(|row| !matches!(row[0], Value::Integer(-1))));
 }
 
 #[turso_macros::test]
@@ -1789,4 +1840,95 @@ fn test_cdc_drop_turso_cdc_version(db: TempDatabase) {
         "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'turso_cdc_version'",
     );
     assert_eq!(rows, vec![vec![Value::Integer(0)]]);
+}
+
+/// Count rows in the CDC table.
+fn cdc_row_count(conn: &std::sync::Arc<turso_core::Connection>) -> i64 {
+    let rows = limbo_exec_rows(conn, "SELECT COUNT(*) FROM turso_cdc");
+    match rows[0][0] {
+        Value::Integer(n) => n,
+        ref other => panic!("expected integer count, got {other:?}"),
+    }
+}
+
+/// Changing journal_mode while CDC capture is active must fail loudly.
+///
+/// Regression guard: 0.6-era commit 34a110181 ("block CDC in MVCC mode")
+/// rejected `PRAGMA journal_mode = 'mvcc'` under active capture with
+/// "cannot enable MVCC while CDC is active". That check was dropped in
+/// c04b2c209 (logical log v3 redesign); the engine then accepted the
+/// switch and silently stopped capturing while the capture pragma still
+/// reported active.
+#[turso_macros::test]
+fn test_cdc_journal_mode_change_rejected_while_capture_active(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let captured_before = cdc_row_count(&conn);
+    assert!(
+        captured_before > 0,
+        "capture must be live before the switch attempt"
+    );
+
+    // Re-running the CURRENT mode is a no-op and must stay allowed under CDC.
+    let rows = limbo_exec_rows(&conn, "PRAGMA journal_mode = 'wal'");
+    assert_eq!(rows, vec![vec![Value::Text("wal".to_string())]]);
+
+    // An actual mode CHANGE must be rejected loudly.
+    let err = limbo_exec_rows_fallible(&db, &conn, "PRAGMA journal_mode = 'mvcc'")
+        .expect_err("journal_mode change must be rejected while CDC capture is active");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("CDC") && msg.contains("capture_data_changes"),
+        "error must name CDC capture: {msg}"
+    );
+
+    // The mode did not change and capture still works after the rejection.
+    let rows = limbo_exec_rows(&conn, "PRAGMA journal_mode");
+    assert_eq!(rows, vec![vec![Value::Text("wal".to_string())]]);
+    conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    let captured_after = cdc_row_count(&conn);
+    assert!(
+        captured_after > captured_before,
+        "capture must still record changes after the rejected switch \
+         ({captured_before} -> {captured_after})"
+    );
+}
+
+/// The qualified spelling must hit the same guard.
+#[turso_macros::test]
+fn test_cdc_qualified_journal_mode_change_rejected(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let captured_before = cdc_row_count(&conn);
+
+    let err = limbo_exec_rows_fallible(&db, &conn, "PRAGMA main.journal_mode = 'mvcc'")
+        .expect_err("qualified journal_mode change must be rejected while CDC capture is active");
+    assert!(
+        err.to_string().contains("CDC"),
+        "error must name CDC capture: {err}"
+    );
+
+    conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    assert!(cdc_row_count(&conn) > captured_before);
+}
+
+/// Without CDC capture the mvcc switch must keep working.
+#[turso_macros::test]
+fn test_journal_mode_mvcc_switch_allowed_without_cdc(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    let rows = limbo_exec_rows(&conn, "PRAGMA journal_mode = 'mvcc'");
+    assert_eq!(rows, vec![vec![Value::Text("mvcc".to_string())]]);
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM t");
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
 }

@@ -1,4 +1,4 @@
-use crate::{alloc, turso_assert, turso_assert_eq, turso_debug_assert, Result};
+use crate::{alloc, turso_assert, turso_assert_eq, turso_debug_assert, Result, Value, ValueRef};
 
 use rustc_hash::FxHashMap as HashMap;
 use tracing::{instrument, Level};
@@ -225,6 +225,8 @@ pub struct ProgramBuilder {
     /// Curr collation sequence. Bool indicates whether it was set by a COLLATE expr
     collation: Option<(CollationSeq, bool)>,
     capture_data_changes_info: Option<CaptureDataChangesInfo>,
+    /// Whether the main database uses MVCC journal mode, set once at translation time from the connection.
+    mvcc_enabled: bool,
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
     /// Set of database IDs that need write transactions (for attached databases).
@@ -252,6 +254,8 @@ pub struct ProgramBuilder {
     /// The mode in which the query is being executed.
     query_mode: QueryMode,
     pub flags: ProgramBuilderFlags,
+    /// True once any `Insn::Function` has been emitted. See [`Self::may_abort`].
+    emitted_function_call: bool,
     next_free_register: usize,
     next_free_cursor_id: usize,
     next_hash_table_id: usize,
@@ -668,6 +672,7 @@ impl ProgramBuilder {
             init_label: BranchOffset::Placeholder,
             start_offset: BranchOffset::Placeholder,
             capture_data_changes_info,
+            mvcc_enabled: false,
             txn_mode: TransactionMode::None,
             write_databases: BitSet::default(),
             read_databases: BitSet::default(),
@@ -677,6 +682,7 @@ impl ProgramBuilder {
             current_parent_explain_idx: None,
             reg_result_cols_start: None,
             flags: ProgramBuilderFlags::new(is_subprogram),
+            emitted_function_call: false,
             trigger,
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
@@ -742,6 +748,30 @@ impl ProgramBuilder {
     /// Check whether a name refers to a CTE currently being planned.
     pub fn is_cte_being_defined(&self, name: &str) -> bool {
         self.ctes_being_defined.iter().any(|n| n == name)
+    }
+
+    /// Hide CTEs being defined whose names an inner WITH clause redefines:
+    /// the inner definitions shadow the outer names for that lexical scope,
+    /// so references to them are not circular. Returns the hidden names for
+    /// [Self::unmask_shadowed_ctes_being_defined].
+    pub fn mask_shadowed_ctes_being_defined(&mut self, shadowing_names: &[String]) -> Vec<String> {
+        let mut masked = Vec::new();
+        self.ctes_being_defined.retain(|name| {
+            if shadowing_names.contains(name) {
+                masked.push(name.clone());
+                false
+            } else {
+                true
+            }
+        });
+        masked
+    }
+
+    /// Restore names hidden by [Self::mask_shadowed_ctes_being_defined] when
+    /// their shadowing scope ends. Membership is all that matters for the
+    /// circular-reference check, so restore order is irrelevant.
+    pub fn unmask_shadowed_ctes_being_defined(&mut self, masked: Vec<String>) {
+        self.ctes_being_defined.extend(masked);
     }
 
     /// Temporarily take the CTE-being-defined stack (e.g. during view
@@ -833,8 +863,27 @@ impl ProgramBuilder {
         self.flags.set_may_abort(may_abort);
     }
 
+    /// True if this statement may throw an ABORT exception. Combines the
+    /// translate paths' constraint analysis with emission taint: any emitted
+    /// function call can raise at runtime, like SQLite's
+    /// sqlite3VdbeAddFunctionCall() → sqlite3MayAbort(). The taint is a
+    /// separate monotonic bit (not folded into the flag) because the analysis
+    /// assigns the flag mid-translation and would clobber it.
+    pub const fn may_abort(&self) -> bool {
+        self.flags.may_abort() || self.emitted_function_call
+    }
+
     pub const fn capture_data_changes_info(&self) -> &Option<CaptureDataChangesInfo> {
         &self.capture_data_changes_info
+    }
+
+    /// Whether the main database uses MVCC journal mode. See [`Self::mvcc_enabled`].
+    pub const fn is_mvcc_enabled(&self) -> bool {
+        self.mvcc_enabled
+    }
+
+    pub fn set_mvcc_enabled(&mut self, enabled: bool) {
+        self.mvcc_enabled = enabled;
     }
 
     pub fn extend(&mut self, opts: &ProgramBuilderOpts) {
@@ -1005,6 +1054,10 @@ impl ProgramBuilder {
         tracing::trace!("");
         self.flags
             .set_readonly(self.flags.readonly() & insn.is_readonly());
+        // Any function can raise at runtime; see Self::may_abort.
+        if matches!(insn, Insn::Function { .. }) {
+            self.emitted_function_call = true;
+        }
         self.insns.push((insn, self.insns.len()));
     }
 
@@ -1758,9 +1811,12 @@ impl ProgramBuilder {
         self.table_references.contains_table(table)
     }
 
-    /// Returns true if the cursor is a BTreeTable cursor.
+    /// Returns true if the cursor is backed by a table or index B-tree.
     pub fn cursor_is_btree(&self, cursor_id: CursorID) -> bool {
-        matches!(self.cursor_ref[cursor_id].1, CursorType::BTreeTable(_))
+        matches!(
+            self.cursor_ref[cursor_id].1,
+            CursorType::BTreeTable(_) | CursorType::BTreeIndex(_)
+        )
     }
 
     /// Returns the BTreeTable for the given cursor, if it is a BTreeTable cursor.
@@ -1911,7 +1967,10 @@ impl ProgramBuilder {
             };
             if let Some(converted) = affinity.convert(&value) {
                 value = match converted {
-                    either::Either::Left(val_ref) => val_ref.to_owned(),
+                    either::Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
+                    either::Either::Left(_) => {
+                        unreachable!("affinity conversion returned an unexpected borrowed value")
+                    }
                     either::Either::Right(val) => val,
                 };
             }
@@ -1951,12 +2010,7 @@ impl ProgramBuilder {
         // (e.g., single-row INSERT) set is_multi_write=false to opt out.
         let needs_stmt_subtransactions = matches!(self.txn_mode, TransactionMode::Write)
             && self.flags.is_multi_write()
-            && self.flags.may_abort();
-
-        let contains_trigger_subprograms = self
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::Program { .. }));
+            && self.may_abort();
 
         let prepared = PreparedProgram {
             max_registers: self.next_free_register,
@@ -1974,7 +2028,6 @@ impl ProgramBuilder {
             )),
             trigger: self.trigger.take(),
             is_subprogram: self.flags.is_subprogram(),
-            contains_trigger_subprograms,
             resolve_type: self.resolve_type,
             prepare_context,
             write_databases: self.write_databases,

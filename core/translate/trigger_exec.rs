@@ -879,6 +879,7 @@ pub fn fire_trigger(
     let ctx = &decode_trigger_registers(program, resolver, ctx)?;
 
     let saved_register_affinities = std::mem::take(&mut resolver.register_affinities);
+    let saved_register_collations = std::mem::take(&mut resolver.register_collations);
     populate_trigger_register_affinities(resolver, ctx);
     let result = (|| -> Result<()> {
         // Evaluate WHEN clause if present
@@ -950,6 +951,7 @@ pub fn fire_trigger(
         Ok(())
     })();
     resolver.register_affinities = saved_register_affinities;
+    resolver.register_collations = saved_register_collations;
     result
 }
 

@@ -373,6 +373,7 @@ fn access_method_emits_unique_order_prefix(
             consumed_order_terms,
         ),
         AccessMethodParams::Subquery { .. }
+        | AccessMethodParams::RecursiveCteInput
         | AccessMethodParams::HashJoin { .. }
         | AccessMethodParams::VirtualTable { .. }
         | AccessMethodParams::IndexMethod { .. }

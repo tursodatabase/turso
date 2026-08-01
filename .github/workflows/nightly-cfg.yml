@@ -42,7 +42,6 @@ jobs:
           # otherwise evict/thrash the stable cache entries.
           prefix-key: "v1-rust-nightly-cfg"
           cache-on-failure: true
-      - uses: "./.github/shared/setup-sccache"
       - name: Check core with the nightly allocator cfg
         env:
           RUSTFLAGS: "--cfg nightly"

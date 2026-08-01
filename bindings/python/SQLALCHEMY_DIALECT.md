@@ -4,15 +4,15 @@ This document describes the SQLAlchemy dialect implementation for pyturso.
 
 ## Status: Implemented
 
-The SQLAlchemy dialect is fully implemented with three dialects:
+The SQLAlchemy dialect is implemented with three dialects:
 - `sqlite+turso://` - Basic local database connections
 - `sqlite+aioturso://` - Basic local database connections for SQLAlchemy async engines
 - `sqlite+turso_sync://` - Sync-enabled connections with remote database support
 
 ## Installation
-
+Requires SQLAlchemy ≥ 2.0.45
 ```bash
-pip install pyturso[sqlalchemy]
+pip install pyturso[sqlalchemy] # ensures compatible version of SQLAlchemy is installed
 ```
 
 ## Quick Start
@@ -61,8 +61,7 @@ engine = create_engine(
 )
 
 with engine.connect() as conn:
-    # Access sync operations
-    sync = get_sync_connection(conn)
+    sync = get_sync_connection(conn) # get_sync_connection() exposes the underlying sync engine
     sync.pull()  # Pull changes from remote
 
     result = conn.execute(text("SELECT * FROM users"))
@@ -125,7 +124,7 @@ sqlite+turso:///db.db?isolation_level=IMMEDIATE
 ```
 
 Query parameters:
-- `isolation_level` - Transaction isolation level (DEFERRED, IMMEDIATE, EXCLUSIVE, AUTOCOMMIT)
+- `isolation_level` - Transaction isolation level: DEFERRED (default), IMMEDIATE, EXCLUSIVE, or AUTOCOMMIT (disables implicit transactions)
 - `experimental_features` - Comma-separated feature flags
 
 ### Async Local Dialect (`sqlite+aioturso://`)
@@ -137,7 +136,7 @@ sqlite+aioturso:///db.db?isolation_level=IMMEDIATE
 ```
 
 Query parameters:
-- `isolation_level` - Transaction isolation level (DEFERRED, IMMEDIATE, EXCLUSIVE, AUTOCOMMIT)
+- `isolation_level` - Transaction isolation level: DEFERRED (default), IMMEDIATE, EXCLUSIVE, or AUTOCOMMIT (disables implicit transactions)
 - `experimental_features` - Comma-separated feature flags
 
 ### Sync Dialect (`sqlite+turso_sync://`)
@@ -152,7 +151,7 @@ Query parameters:
 - `client_name` - Client identifier (default: turso-sqlalchemy)
 - `long_poll_timeout_ms` - Long poll timeout in milliseconds
 - `bootstrap_if_empty` - Bootstrap from remote if local empty (default: true)
-- `isolation_level` - Transaction isolation level
+- `isolation_level` - Transaction isolation level: DEFERRED (default), IMMEDIATE, EXCLUSIVE, or AUTOCOMMIT (disables implicit transactions)
 - `experimental_features` - Comma-separated feature flags
 
 URL validation:
@@ -160,30 +159,14 @@ URL validation:
 - Host/port in URL raises `ValueError` (use `remote_url` query param instead)
 - Unrecognized query parameters emit a `UserWarning`
 
-## Sync Operations
+## Sync Operations 
 
-The `get_sync_connection()` helper provides access to sync-specific methods:
+The `get_sync_connection()` helper (shown in Quick Start above) exposes the underlying `turso.sync.ConnectionSync` with these sync-specific methods:
 
-```python
-from turso.sqlalchemy import get_sync_connection
-
-with engine.connect() as conn:
-    sync = get_sync_connection(conn)
-
-    # Pull changes from remote (returns True if updates were pulled)
-    if sync.pull():
-        print("Pulled new changes!")
-
-    # Push local changes to remote
-    sync.push()
-
-    # Checkpoint the WAL
-    sync.checkpoint()
-
-    # Get sync statistics
-    stats = sync.stats()
-    print(f"Network received: {stats.network_received_bytes} bytes")
-```
+- `pull()` - Pull changes from remote; returns `True` if updates were pulled
+- `push()` - Push local changes to remote
+- `checkpoint()` - Checkpoint the WAL
+- `stats()` - Sync statistics (e.g. `stats().network_received_bytes`)
 
 `get_sync_connection()` raises `TypeError` if called on a non-sync connection (e.g. a plain `sqlite+turso://` or standard `sqlite://` engine).
 
@@ -251,38 +234,19 @@ All dialects share these overrides via `_TursoDialectMixin` and direct method im
 
 ### Reflection Overrides (via `_TursoDialectMixin`)
 
-Single-table methods (return empty list):
-- `get_foreign_keys()` - `PRAGMA foreign_key_list` not supported
-- `get_indexes()` - `PRAGMA index_list` not supported
-- `get_unique_constraints()` - Relies on `PRAGMA index_list`
-- `get_check_constraints()` - `sqlite_master` parsing not fully supported
+Index, unique-constraint, check-constraint, and foreign-key reflection
+(`get_indexes`, `get_unique_constraints`, `get_check_constraints`,
+`get_foreign_keys`, and their `get_multi_*` counterparts) are inherited from
+SQLAlchemy's parent SQLite dialect — Turso supports `PRAGMA index_list` /
+`index_info` / `index_xinfo` / `foreign_key_list` and returns the original DDL
+via `sqlite_master.sql`.
 
-Multi-table methods (return empty dict):
-- `get_multi_indexes()`
-- `get_multi_unique_constraints()`
-- `get_multi_foreign_keys()`
-- `get_multi_check_constraints()`
+The following are overridden and return empty stubs:
+
+- `get_temp_table_names()` / `get_temp_view_names()` - no temp database
+  (`sqlite_temp_master` not supported)
 
 ## Limitations
-
-### Table Reflection
-
-Turso doesn't support some SQLite PRAGMAs used for table reflection:
-- `PRAGMA foreign_key_list` - Foreign key introspection
-- `PRAGMA index_list` - Index introspection
-
-This means:
-- `inspector.get_foreign_keys()` returns empty list
-- `inspector.get_indexes()` returns empty list
-- `inspector.get_unique_constraints()` returns empty list
-- `inspector.get_check_constraints()` returns empty list
-- Foreign keys, indexes, and constraints still **work** at runtime, just can't be introspected
-- `inspector.get_table_names()` and `inspector.get_columns()` work normally
-
-This doesn't affect normal usage including:
-- Pandas `df.to_sql()` with `if_exists='replace'`
-- SQLAlchemy ORM operations
-- Alembic migrations (when using `--autogenerate`, manually verify FK/index changes)
 
 ### Native Datetime
 

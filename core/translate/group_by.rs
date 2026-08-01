@@ -177,8 +177,7 @@ impl EmitGroupBy {
                     )?;
                     Ok::<_, crate::LimboError>((*ord, collation, *nulls))
                 })
-                .try_collect::<Result<crate::alloc::Vec<_>>>()
-                .expect("TODO: fallible allocations")?;
+                .try_collect::<Result<crate::alloc::Vec<_>>>()??;
 
             // Resolve custom type comparators for GROUP BY columns (e.g. array_lt).
             let comparators = group_by
@@ -187,8 +186,7 @@ impl EmitGroupBy {
                 .map(|expr| {
                     custom_type_comparator(expr, &plan.table_references, t_ctx.resolver.schema())
                 })
-                .try_collect()
-                .expect("TODO: fallible allocations");
+                .try_collect()?;
 
             program.emit_insn(Insn::SorterOpen {
                 cursor_id: sort_cursor,
@@ -372,10 +370,18 @@ fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Resu
                     .iter()
                     .find(|s| s.internal_id == *subquery_id)
                     .is_some_and(|s| s.correlated);
-                if is_correlated && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr)) {
-                    leaf_columns.push(expr.clone());
+                if is_correlated {
+                    if !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr)) {
+                        leaf_columns.push(expr.clone());
+                    }
+                    Ok(WalkControl::SkipChildren)
+                } else {
+                    // A non-correlated subquery is materialized once and probed
+                    // per row (e.g. the LHS of `x IN (SELECT ...)`), so the
+                    // probe's column references must be carried through the
+                    // sorter like any other aggregate input.
+                    Ok(WalkControl::Continue)
                 }
-                Ok(WalkControl::SkipChildren)
             }
             _ => Ok(WalkControl::Continue),
         }

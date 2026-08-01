@@ -646,6 +646,31 @@ mod tests {
     }
 
     #[test]
+    fn test_ctas_column_count_is_zero() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"CREATE TABLE dst AS SELECT 1 AS a, 'x' AS b".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_column_count(stmt), 0);
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
     #[cfg(not(target_os = "windows"))]
     fn column_text_is_nul_terminated_and_bytes_match() {
         unsafe {

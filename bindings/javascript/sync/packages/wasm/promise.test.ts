@@ -1,6 +1,6 @@
 import { expect, test, afterAll } from 'vitest'
 import { Database, connect, DatabaseRowMutation, DatabaseRowTransformResult } from './promise-default.js'
-import { MainWorker } from './index-default.js'
+import { MainWorker, SyncEngine, GeneratorHolder, Database as NativeDatabase } from './index-default.js'
 
 afterAll(() => {
     MainWorker?.terminate();
@@ -8,6 +8,82 @@ afterAll(() => {
 
 const localeCompare = (a: { x: string }, b: { x: string }) => a.x.localeCompare(b.x);
 const intCompare = (a: { x: number }, b: { x: number }) => a.x - b.x;
+
+test('no-native-call-overlap-with-worker-tasks', async () => {
+    // Regression test for the parking_lot "Parking not supported on this
+    // platform" panic on browser wasm. The sync engine executes core work on
+    // the napi async worker (resumeAsync / ioLoopAsync); if a main-thread
+    // native call runs while such a task is in flight, both threads can
+    // contend on a core lock. The browser main thread cannot park, so
+    // contention panics, and the aborted call leaks every lock it held,
+    // poisoning the whole instance.
+    //
+    // Instrument the native entry points to count main-thread executor steps
+    // that overlap an in-flight worker task. Each in-flight window is
+    // artificially extended by a few milliseconds, so an implementation that
+    // does not serialize the two overlaps on every run; the serialized
+    // implementation structurally cannot overlap.
+    {
+        const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL, longPollTimeoutMs: 10 });
+        await db.exec("CREATE TABLE IF NOT EXISTS overlap_probe(x TEXT PRIMARY KEY, y)");
+        await db.exec("DELETE FROM overlap_probe");
+        await db.push();
+        await db.close();
+    }
+    const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL, longPollTimeoutMs: 10 });
+
+    let inFlight = 0;
+    let overlaps = 0;
+    const extend = () => new Promise(resolve => setTimeout(resolve, 2));
+    const trackInFlight = (original: any) => async function (this: any, ...args: any[]) {
+        inFlight += 1;
+        try {
+            const result = await original.apply(this, args);
+            await extend();
+            return result;
+        } finally {
+            inFlight -= 1;
+        }
+    };
+    const origResume = (GeneratorHolder as any).prototype.resumeAsync;
+    const origIoLoop = (SyncEngine as any).prototype.ioLoopAsync;
+    const origExecutor = (NativeDatabase as any).prototype.executor;
+    (GeneratorHolder as any).prototype.resumeAsync = trackInFlight(origResume);
+    (SyncEngine as any).prototype.ioLoopAsync = trackInFlight(origIoLoop);
+    (NativeDatabase as any).prototype.executor = function (this: any, ...args: any[]) {
+        const executor = origExecutor.apply(this, args);
+        const origStep = executor.stepSync.bind(executor);
+        executor.stepSync = () => {
+            if (inFlight > 0) {
+                overlaps += 1;
+            }
+            return origStep();
+        };
+        return executor;
+    };
+    try {
+        const pulls = (async () => {
+            for (let i = 0; i < 10; i++) {
+                await db.pull();
+            }
+        })();
+        for (let i = 0; i < 50; i++) {
+            try {
+                await db.exec(`INSERT INTO overlap_probe VALUES ('${i % 4}', 0) ON CONFLICT DO UPDATE SET y = y + 1`);
+            } catch (e) {
+                // Busy conflicts with the concurrent pulls are irrelevant here;
+                // only the overlap counter matters.
+            }
+        }
+        await pulls;
+    } finally {
+        (GeneratorHolder as any).prototype.resumeAsync = origResume;
+        (SyncEngine as any).prototype.ioLoopAsync = origIoLoop;
+        (NativeDatabase as any).prototype.executor = origExecutor;
+        await db.close();
+    }
+    expect(overlaps).toBe(0);
+})
 
 test('open non-sync db', async () => {
     const db = await connect({ path: 'local.db' });

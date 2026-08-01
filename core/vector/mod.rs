@@ -43,7 +43,7 @@ pub fn vector32(args: &[Register]) -> Result<Value> {
     let value = args[0].get_value();
     let vector = parse_vector(value, Some(VectorType::Float32Dense))?;
     let vector = operations::convert::vector_convert(vector, VectorType::Float32Dense)?;
-    Ok(operations::serialize::vector_serialize(vector))
+    Ok(operations::serialize::vector_serialize(vector)?)
 }
 
 pub fn vector32_sparse(args: &[Register]) -> Result<Value> {
@@ -55,7 +55,7 @@ pub fn vector32_sparse(args: &[Register]) -> Result<Value> {
     let value = args[0].get_value();
     let vector = parse_vector(value, Some(VectorType::Float32Sparse))?;
     let vector = operations::convert::vector_convert(vector, VectorType::Float32Sparse)?;
-    Ok(operations::serialize::vector_serialize(vector))
+    Ok(operations::serialize::vector_serialize(vector)?)
 }
 
 pub fn vector64(args: &[Register]) -> Result<Value> {
@@ -67,7 +67,7 @@ pub fn vector64(args: &[Register]) -> Result<Value> {
     let value = args[0].get_value();
     let vector = parse_vector(value, Some(VectorType::Float64Dense))?;
     let vector = operations::convert::vector_convert(vector, VectorType::Float64Dense)?;
-    Ok(operations::serialize::vector_serialize(vector))
+    Ok(operations::serialize::vector_serialize(vector)?)
 }
 
 pub fn vector8(args: &[Register]) -> Result<Value> {
@@ -79,7 +79,7 @@ pub fn vector8(args: &[Register]) -> Result<Value> {
     let value = args[0].get_value();
     let vector = parse_vector(value, Some(VectorType::Float8))?;
     let vector = operations::convert::vector_convert(vector, VectorType::Float8)?;
-    Ok(operations::serialize::vector_serialize(vector))
+    Ok(operations::serialize::vector_serialize(vector)?)
 }
 
 pub fn vector1bit(args: &[Register]) -> Result<Value> {
@@ -91,7 +91,7 @@ pub fn vector1bit(args: &[Register]) -> Result<Value> {
     let value = args[0].get_value();
     let vector = parse_vector(value, Some(VectorType::Float1Bit))?;
     let vector = operations::convert::vector_convert(vector, VectorType::Float1Bit)?;
-    Ok(operations::serialize::vector_serialize(vector))
+    Ok(operations::serialize::vector_serialize(vector)?)
 }
 
 pub fn vector_extract(args: &[Register]) -> Result<Value> {
@@ -191,7 +191,7 @@ pub fn vector_concat(args: &[Register]) -> Result<Value> {
     let x = parse_vector(value_0, None)?;
     let y = parse_vector(value_1, None)?;
     let vector = operations::concat::vector_concat(&x, &y)?;
-    Ok(operations::serialize::vector_serialize(vector))
+    Ok(operations::serialize::vector_serialize(vector)?)
 }
 
 pub fn vector_slice(args: &[Register]) -> Result<Value> {
@@ -223,5 +223,5 @@ pub fn vector_slice(args: &[Register]) -> Result<Value> {
     let result =
         operations::slice::vector_slice(&vector, start_index as usize, end_index as usize)?;
 
-    Ok(operations::serialize::vector_serialize(result))
+    Ok(operations::serialize::vector_serialize(result)?)
 }

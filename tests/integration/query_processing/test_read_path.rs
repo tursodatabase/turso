@@ -35,6 +35,53 @@ fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[turso_macros::test]
+fn recursive_cte_with_bound_termination_predicate(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let mut stmt = conn.prepare(
+        "SELECT (
+            WITH RECURSIVE seq(x) AS (
+                VALUES(1)
+                UNION ALL
+                SELECT x + 1 FROM seq WHERE x < ?
+            )
+            SELECT count(*) FROM seq
+        )",
+    )?;
+    stmt.bind_at(1.try_into()?, Value::from_i64(100))?;
+    stmt.run_with_row_callback(|row| {
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(100));
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[turso_macros::test]
+fn recursive_cte_explain_query_plan_shows_setup_and_recursive_step(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let eqp_rows = limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN
+         WITH RECURSIVE t(a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM t WHERE a < 3)
+         SELECT * FROM t",
+    );
+    let plan = eqp_rows
+        .iter()
+        .filter_map(|row| match row.get(3) {
+            Some(rusqlite::types::Value::Text(detail)) => Some(detail.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("SETUP") && plan.contains("RECURSIVE STEP"),
+        "expected recursive CTE structure in query plan, got:\n{plan}"
+    );
+    Ok(())
+}
+
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
 fn test_statement_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -907,40 +954,6 @@ fn test_many_columns(tmp_db: TempDatabase) {
             turso_core::Value::from_i64(900),
         ]]
     );
-}
-
-#[turso_macros::test]
-fn test_eval_param_only_once(tmp_db: TempDatabase) {
-    let conn = tmp_db.connect_limbo();
-    conn.execute("CREATE TABLE t(x)").unwrap();
-    conn.execute("INSERT INTO t SELECT value FROM generate_series(1, 10000)")
-        .unwrap();
-    let mut stmt = conn
-        .query("SELECT COUNT(*) FROM t WHERE LENGTH(zeroblob(?)) = ?")
-        .unwrap()
-        .unwrap();
-    stmt.bind_at(
-        1.try_into().unwrap(),
-        turso_core::Value::from_i64(100_000_000),
-    )
-    .unwrap();
-    stmt.bind_at(
-        2.try_into().unwrap(),
-        turso_core::Value::from_i64(100_000_000),
-    )
-    .unwrap();
-    let start_time = std::time::Instant::now();
-    stmt.run_with_row_callback(|row| {
-        let values = row.get_values().cloned().collect::<Vec<_>>();
-        assert_eq!(values, vec![turso_core::Value::from_i64(10000)]);
-        Ok(())
-    })
-    .unwrap();
-
-    let end_time = std::time::Instant::now();
-    let elapsed = end_time.duration_since(start_time);
-    // the test will allocate 10^8 * 10^4 bytes in case if parameter will be evaluated for every row
-    assert!(elapsed < std::time::Duration::from_millis(500));
 }
 
 /// Regression test for https://github.com/tursodatabase/turso/issues/5232

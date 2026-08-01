@@ -99,9 +99,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
 
       - name: Install dependencies
         run: npm install
@@ -134,9 +134,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
 
       - name: Setup Ruby
         uses: ruby/setup-ruby@v1
@@ -211,9 +211,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
 
       - name: Update npm
         run: npm install -g npm@11

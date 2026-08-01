@@ -157,6 +157,102 @@ impl Workload for SelectWorkload {
     }
 }
 
+const JSON_WORKLOAD_VARIANT_COUNT: usize = 6;
+
+/// Exercise JSON text, JSONB, aggregate, and virtual-table functions.
+pub struct JsonWorkload;
+
+impl Workload for JsonWorkload {
+    fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        let id = rng.random_range(0..1_000_000_i64);
+        let first = rng.random_range(-1_000_000..=1_000_000_i64);
+        let second = rng.random_range(-1_000_000..=1_000_000_i64);
+        let third = rng.random_range(-1_000_000..=1_000_000_i64);
+        let active = rng.random_bool(0.5);
+        let payload = "x".repeat(rng.random_range(8..=512));
+        let document = format!(
+            r#"{{"id":{id},"meta":{{"active":{active},"label":"item_{id}","payload":"{payload}"}},"items":[{first},{second},{{"value":{third}}}],"nullable":null}}"#
+        );
+        let replacement = rng.random_range(-1_000_000..=1_000_000_i64);
+        let patch = format!(r#"{{"patched":true,"revision":{replacement}}}"#);
+        let variant = rng.random_range(0..JSON_WORKLOAD_VARIANT_COUNT);
+
+        Some(Operation::Select {
+            sql: json_workload_sql(variant, &document, &patch, replacement),
+        })
+    }
+}
+
+fn json_workload_sql(variant: usize, document: &str, patch: &str, replacement: i64) -> String {
+    match variant {
+        0 => format!(
+            "WITH input(doc) AS (VALUES ('{document}')) \
+             SELECT json(doc), \
+                    json_extract(doc, '$.id'), \
+                    json_extract(doc, '$.items[2].value'), \
+                    json_type(doc, '$.meta.active'), \
+                    json_array_length(doc, '$.items'), \
+                    json_valid(doc), \
+                    json_error_position(doc) \
+             FROM input"
+        ),
+        1 => format!(
+            "WITH input(doc) AS (VALUES ('{document}')) \
+             SELECT json_set(doc, '$.meta.active', {}, '$.items[#]', {replacement}), \
+                    json_insert(doc, '$.created', json_object('step', {replacement})), \
+                    json_replace(doc, '$.meta.label', json_quote('label_{replacement}')), \
+                    json_remove(doc, '$.nullable'), \
+                    json_patch(doc, '{patch}'), \
+                    json_pretty(doc) \
+             FROM input",
+            replacement & 1
+        ),
+        2 => format!(
+            "WITH input(doc) AS (VALUES ('{document}')) \
+             SELECT hex(jsonb(doc)), \
+                    json(jsonb_extract(doc, '$.items')), \
+                    json(jsonb_set(doc, '$.id', {replacement})), \
+                    json(jsonb_insert(doc, '$.created', jsonb_object('step', {replacement}))), \
+                    json(jsonb_replace(doc, '$.meta.label', jsonb_array('label', {replacement}))), \
+                    json(jsonb_remove(doc, '$.nullable')), \
+                    json(jsonb_patch(doc, '{patch}')) \
+             FROM input"
+        ),
+        3 => format!(
+            "SELECT json_array({replacement}, 'item_{replacement}', NULL), \
+                    json_object('id', {replacement}, 'nested', json_array(1, 2, 3)), \
+                    json(jsonb_array({replacement}, json(jsonb_object('active', true)))), \
+                    json(jsonb_object('id', {replacement}, 'values', json(jsonb_array(1, 2, 3)))), \
+                    json_quote('payload_{replacement}')"
+        ),
+        4 => format!(
+            "WITH input(doc) AS (VALUES ('{document}')) \
+             SELECT jt.fullkey, jt.type, jt.atom \
+             FROM input, json_tree(input.doc) AS jt \
+             WHERE jt.atom IS NOT NULL \
+             UNION ALL \
+             SELECT '$.items[' || je.key || ']', je.type, je.atom \
+             FROM input, json_each(input.doc, '$.items') AS je \
+             WHERE je.atom IS NOT NULL"
+        ),
+        5 => format!(
+            "WITH input_rows(id, label) AS ( \
+                 VALUES ({replacement}, 'a_{replacement}'), \
+                        ({}, 'b_{replacement}'), \
+                        ({}, 'c_{replacement}') \
+             ) \
+             SELECT json_group_array(json_object('id', id, 'label', label)), \
+                    json_group_object(label, json_array(id, id + 1)), \
+                    json(jsonb_group_array(jsonb_object('id', id, 'label', label))), \
+                    json(jsonb_group_object(label, jsonb_array(id, id + 1))) \
+             FROM input_rows",
+            replacement + 1,
+            replacement + 2
+        ),
+        _ => unreachable!("JSON workload variant is selected from a bounded range"),
+    }
+}
+
 /// Execute an INSERT statement (works in both Idle and InTx states).
 pub struct InsertWorkload;
 
@@ -235,7 +331,9 @@ impl Workload for DropIndexWorkload {
 }
 
 /// Run WAL checkpoint with a randomly selected mode.
-pub struct WalCheckpointWorkload;
+pub struct WalCheckpointWorkload {
+    pub allow_passive: bool,
+}
 
 impl Workload for WalCheckpointWorkload {
     fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
@@ -243,13 +341,128 @@ impl Workload for WalCheckpointWorkload {
         if *ctx.fiber_state != FiberState::Idle {
             return None;
         }
-        let mode = ["PASSIVE", "FULL", "RESTART", "TRUNCATE"]
-            .choose(rng)
-            .expect("array is not empty");
+        let modes: &[&str] = if self.allow_passive {
+            &["PASSIVE"]
+        } else {
+            &["FULL", "RESTART", "TRUNCATE"]
+        };
+        let mode = modes.choose(rng).expect("array is not empty");
         Some(Operation::WalCheckpoint {
             mode: mode.to_string(),
         })
     }
+}
+
+/// Run the checkpoint mode that is valid for both WAL and MVCC.
+pub struct TruncateCheckpointWorkload;
+
+impl Workload for TruncateCheckpointWorkload {
+    fn generate(&self, ctx: &WorkloadContext, _rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if *ctx.fiber_state != FiberState::Idle {
+            return None;
+        }
+        Some(Operation::WalCheckpoint {
+            mode: "TRUNCATE".to_string(),
+        })
+    }
+}
+
+/// Churn schema objects to force schema copy-on-write under allocation faults.
+pub struct SchemaChurnWorkload;
+
+impl Workload for SchemaChurnWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if *ctx.fiber_state == FiberState::InConcurrentTx {
+            return None;
+        }
+
+        let table_id = rng.random_range(0..64);
+        let index_id = rng.random_range(0..256);
+        let sql = match rng.random_range(0..12) {
+            0..=2 => schema_churn_create_table_sql(table_id),
+            3..=4 => schema_churn_create_index_sql(table_id, index_id),
+            5 => schema_churn_create_view_sql(table_id),
+            6 => schema_churn_create_trigger_sql(table_id),
+            7 => schema_churn_drop_index_sql(table_id, index_id),
+            8 => schema_churn_drop_view_sql(table_id),
+            9 => schema_churn_schema_read_sql(table_id),
+            10 => existing_table_index_sql(&ctx.tables_vec, index_id, rng)
+                .unwrap_or_else(|| schema_churn_create_table_sql(table_id)),
+            _ => "SELECT name, sql FROM sqlite_schema WHERE name LIKE 'schema_clone_%' ORDER BY name LIMIT 8".to_string(),
+        };
+        Some(Operation::Execute { sql })
+    }
+}
+
+fn schema_churn_table_name(table_id: u32) -> String {
+    format!("schema_clone_t_{table_id}")
+}
+
+fn schema_churn_create_table_sql(table_id: u32) -> String {
+    let table_name = schema_churn_table_name(table_id);
+    format!(
+        "CREATE TABLE IF NOT EXISTS {table_name} (\
+         id INTEGER PRIMARY KEY, \
+         k TEXT NOT NULL DEFAULT 'k', \
+         v INTEGER NOT NULL DEFAULT 0, \
+         payload BLOB, \
+         CHECK (v >= 0), \
+         UNIQUE (k, v))"
+    )
+}
+
+fn schema_churn_create_index_sql(table_id: u32, index_id: u32) -> String {
+    let table_name = schema_churn_table_name(table_id);
+    format!(
+        "CREATE INDEX IF NOT EXISTS schema_clone_idx_{table_id}_{index_id} \
+         ON {table_name}(k, v) WHERE v >= 0"
+    )
+}
+
+fn schema_churn_create_view_sql(table_id: u32) -> String {
+    let table_name = schema_churn_table_name(table_id);
+    format!(
+        "CREATE VIEW IF NOT EXISTS schema_clone_v_{table_id} AS \
+         SELECT id, k, v FROM {table_name} WHERE v >= 0"
+    )
+}
+
+fn schema_churn_create_trigger_sql(table_id: u32) -> String {
+    let table_name = schema_churn_table_name(table_id);
+    format!(
+        "CREATE TRIGGER IF NOT EXISTS schema_clone_tr_{table_id} \
+         AFTER INSERT ON {table_name} \
+         WHEN new.v > 100 \
+         BEGIN \
+             UPDATE {table_name} SET v = new.v WHERE id = new.id; \
+         END"
+    )
+}
+
+fn schema_churn_drop_index_sql(table_id: u32, index_id: u32) -> String {
+    format!("DROP INDEX IF EXISTS schema_clone_idx_{table_id}_{index_id}")
+}
+
+fn schema_churn_drop_view_sql(table_id: u32) -> String {
+    format!("DROP VIEW IF EXISTS schema_clone_v_{table_id}")
+}
+
+fn schema_churn_schema_read_sql(table_id: u32) -> String {
+    let table_name = schema_churn_table_name(table_id);
+    format!("PRAGMA table_info('{table_name}')")
+}
+
+fn existing_table_index_sql(
+    tables: &[Table],
+    index_id: u32,
+    rng: &mut ChaCha8Rng,
+) -> Option<String> {
+    let table = tables.choose(rng)?;
+    let column = table.columns.choose(rng)?;
+    Some(format!(
+        "CREATE INDEX IF NOT EXISTS schema_clone_existing_idx_{}_{} ON {}({})",
+        table.name, index_id, table.name, column.name
+    ))
 }
 
 /// Commit the current transaction.
@@ -619,5 +832,136 @@ impl Workload for AutoincDeleteWorkload {
     fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
         let id = rng.random_range(1..10_000i64);
         Some(Operation::AutoincDelete { id })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rand::SeedableRng;
+    use sql_generation::{
+        generation::Opts,
+        model::table::{Column, ColumnType, Table},
+    };
+    use turso_core::{Database, MemoryIO, SqliteDialect};
+
+    use super::*;
+
+    #[test]
+    fn schema_churn_create_table_uses_schema_features() {
+        let sql = schema_churn_create_table_sql(7);
+
+        assert!(sql.contains("schema_clone_t_7"));
+        assert!(sql.contains("UNIQUE"));
+        assert!(sql.contains("CHECK"));
+    }
+
+    #[test]
+    fn schema_churn_skips_concurrent_transactions() {
+        let table = Table {
+            name: "table_0".to_string(),
+            columns: vec![Column {
+                name: "id".to_string(),
+                column_type: ColumnType::Integer,
+                constraints: vec![],
+            }],
+            rows: vec![],
+            indexes: vec![],
+        };
+        let state = SimulatorState::new(vec![table.clone()], vec![]);
+        let opts = Opts::default();
+        let tables_vec = vec![table];
+        let ctx = WorkloadContext {
+            fiber_state: &FiberState::InConcurrentTx,
+            sim_state: &state,
+            opts: &opts,
+            enable_mvcc: true,
+            tables_vec,
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+
+        assert!(SchemaChurnWorkload.generate(&ctx, &mut rng).is_none());
+    }
+
+    #[test]
+    fn existing_table_index_targets_generated_schema() {
+        let table = Table {
+            name: "table_0".to_string(),
+            columns: vec![Column {
+                name: "col_0".to_string(),
+                column_type: ColumnType::Integer,
+                constraints: vec![],
+            }],
+            rows: vec![],
+            indexes: vec![],
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+
+        let sql = existing_table_index_sql(&[table], 9, &mut rng).unwrap();
+
+        assert_eq!(
+            sql,
+            "CREATE INDEX IF NOT EXISTS schema_clone_existing_idx_table_0_9 ON table_0(col_0)"
+        );
+    }
+
+    #[test]
+    fn json_workload_variants_cover_json_function_families() {
+        let document =
+            r#"{"id":1,"meta":{"active":true},"items":[1,2,{"value":3}],"nullable":null}"#;
+        let patch = r#"{"patched":true}"#;
+        let sql = (0..JSON_WORKLOAD_VARIANT_COUNT)
+            .map(|variant| json_workload_sql(variant, document, patch, 7))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for function in [
+            "json_extract(",
+            "json_set(",
+            "jsonb(",
+            "jsonb_set(",
+            "json_tree(",
+            "json_each(",
+            "json_group_array(",
+            "jsonb_group_object(",
+        ] {
+            assert!(sql.contains(function), "missing {function}");
+        }
+    }
+
+    #[test]
+    fn json_workload_variants_execute() {
+        let io = Arc::new(MemoryIO::new());
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = database.connect().unwrap();
+        let document =
+            r#"{"id":1,"meta":{"active":true},"items":[1,2,{"value":3}],"nullable":null}"#;
+        let patch = r#"{"patched":true}"#;
+
+        for variant in 0..JSON_WORKLOAD_VARIANT_COUNT {
+            let sql = json_workload_sql(variant, document, patch, 7);
+            connection
+                .execute(&sql)
+                .unwrap_or_else(|error| panic!("JSON workload variant {variant} failed: {error}"));
+        }
+    }
+
+    #[test]
+    fn json_workload_generates_select_operations() {
+        let state = SimulatorState::new(vec![], vec![]);
+        let opts = Opts::default();
+        let ctx = WorkloadContext {
+            fiber_state: &FiberState::Idle,
+            sim_state: &state,
+            opts: &opts,
+            enable_mvcc: false,
+            tables_vec: vec![],
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+
+        let operation = JsonWorkload.generate(&ctx, &mut rng).unwrap();
+
+        assert!(matches!(operation, Operation::Select { ref sql } if sql.contains("json")));
     }
 }

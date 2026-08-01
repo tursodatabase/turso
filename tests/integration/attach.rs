@@ -1,4 +1,5 @@
 use crate::common::{do_flush, limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
+use anyhow::Context;
 use rusqlite::params;
 use rusqlite::Connection as RusqliteConnection;
 use std::fs::File;
@@ -6,6 +7,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
+use turso_core::SqliteDialect;
 use turso_core::{Database, DatabaseOpts, OpenFlags};
 
 const PAGE_SIZE_OFFSET: u64 = 16;
@@ -79,6 +81,43 @@ fn test_attached_schema_refreshes_after_other_connection_create(
     );
     assert_eq!(rows[0], vec![rusqlite::types::Value::Integer(1)]);
 
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_attached_write_does_not_upgrade_stale_main_snapshot(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let aux_path = tmp_db.path.with_extension("attach_busy_snapshot.db");
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1.execute("CREATE TABLE main_t(x INTEGER)")?;
+    conn1.execute("INSERT INTO main_t VALUES (1)")?;
+    conn1.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn2.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn1.execute("CREATE TABLE aux.t(x INTEGER)")?;
+    conn1.execute("INSERT INTO aux.t VALUES (1)")?;
+
+    conn1.execute("BEGIN")?;
+    let main_rows = limbo_exec_rows(&conn1, "SELECT x FROM main_t");
+    assert_eq!(main_rows, vec![vec![rusqlite::types::Value::Integer(1)]]);
+
+    conn2
+        .execute("UPDATE main_t SET x = 2")
+        .context("update main")?;
+    conn2
+        .execute("UPDATE aux.t SET x = 2")
+        .context("update aux")?;
+
+    conn1
+        .execute("DELETE FROM aux.t")
+        .context("delete from aux")?;
+    let rows = limbo_exec_rows(&conn1, "SELECT x FROM aux.t");
+    assert!(rows.is_empty());
+    let main_rows = limbo_exec_rows(&conn1, "SELECT x FROM main_t");
+    assert_eq!(main_rows, vec![vec![rusqlite::types::Value::Integer(1)]]);
+    conn1.execute("ROLLBACK")?;
     Ok(())
 }
 
@@ -163,6 +202,7 @@ fn test_fresh_attach_inherits_mvcc_before_first_write(_tmp_db: TempDatabase) -> 
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
+        Arc::new(SqliteDialect),
     )?;
     let aux_conn = aux_db.connect()?;
     assert!(aux_conn.mvcc_enabled());
@@ -184,6 +224,7 @@ fn test_attach_rejects_initialized_page_size_mismatch(_tmp_db: TempDatabase) -> 
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
+        Arc::new(SqliteDialect),
     )?;
     let aux_conn = aux_db.connect()?;
     aux_conn.execute("CREATE TABLE t(x INTEGER)")?;
@@ -282,13 +323,14 @@ fn test_fresh_mvcc_attach_rejects_custom_durable_storage_without_attached_backen
         None,
     ));
 
-    let db = Database::open_file_with_flags_and_durable_storage(
+    let db = Database::open(
         tmp_db.io.clone(),
         db_path.to_str().unwrap(),
-        OpenFlags::default(),
-        DatabaseOpts::new().with_attach(true),
-        None,
-        Some(durable_storage),
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(DatabaseOpts::new().with_attach(true))
+            .durable_storage(
+                durable_storage as Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage>,
+            ),
     )?;
     let conn = db.connect()?;
     conn.pragma_update("journal_mode", "'mvcc'")?;

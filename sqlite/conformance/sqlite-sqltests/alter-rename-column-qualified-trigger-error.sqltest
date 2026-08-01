@@ -1,0 +1,39 @@
+@database :memory:
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/7737
+#
+# When ALTER TABLE RENAME COLUMN is rejected because a trigger still references
+# the renamed column, SQLite reports the reference as written in the expression
+# ("no such column: t.b"), not the normalized bare column name ("no such
+# column: b"). This includes doubly-qualified (db.table.column) references and
+# quoted identifiers, which report the dequoted, case-preserved spelling.
+
+@cross-check-integrity
+test rename-column-trigger-when-qualified-ref-error-message {
+    CREATE TABLE t (a, b);
+    CREATE TRIGGER tr BEFORE UPDATE ON t WHEN t.b > 0 BEGIN SELECT 1; END;
+    ALTER TABLE t RENAME COLUMN b TO c;
+}
+expect error {
+    no such column: t\.b
+}
+
+@cross-check-integrity
+test rename-column-trigger-when-doubly-qualified-ref-error-message {
+    CREATE TABLE t (a, b);
+    CREATE TRIGGER tr BEFORE UPDATE ON t WHEN main.t.b > 0 BEGIN SELECT 1; END;
+    ALTER TABLE t RENAME COLUMN b TO c;
+}
+expect error {
+    no such column: main\.t\.b
+}
+
+@cross-check-integrity
+test rename-column-trigger-when-quoted-qualified-ref-error-message {
+    CREATE TABLE t (a, b);
+    CREATE TRIGGER tr BEFORE UPDATE ON t WHEN "T"."B" > 0 BEGIN SELECT 1; END;
+    ALTER TABLE t RENAME COLUMN b TO c;
+}
+expect error {
+    no such column: T\.B
+}

@@ -35,7 +35,8 @@ use std::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
-    io_error, Connection, Database, LimboError, Numeric, OpenFlags, QueryMode, Statement, Value,
+    io_error, Connection, Database, LimboError, Numeric, OpenFlags, QueryMode, SqliteDialect,
+    Statement, Value,
 };
 
 #[derive(Parser, Debug)]
@@ -102,6 +103,11 @@ pub struct Opts {
         help = "Enable experimental multiprocess WAL coordination (on Windows, use --vfs experimental_win_iocp)"
     )]
     pub experimental_multiprocess_wal: bool,
+    #[clap(
+        long,
+        help = "Enable experimental passive MVCC checkpointing (requires journal_mode=mvcc)"
+    )]
+    pub experimental_mvcc_passive_checkpoint: bool,
     #[cfg(feature = "mvcc_repl")]
     #[clap(long, help = "Start MVCC concurrent transaction harness")]
     pub mvcc: bool,
@@ -245,12 +251,13 @@ impl Limbo {
             .with_generated_columns(opts.experimental_generated_columns)
             .with_without_rowid(opts.experimental_without_rowid)
             .with_multiprocess_wal(opts.experimental_multiprocess_wal)
+            .with_experimental_mvcc_passive_checkpoint(opts.experimental_mvcc_passive_checkpoint)
             .with_unsafe_testing(opts.unsafe_testing);
 
         let db_file = normalize_db_path(db_file);
 
         let (io, conn) = if db_file.starts_with("file:") {
-            Connection::from_uri(&db_file, db_opts)?
+            Connection::from_uri(&db_file, db_opts, Arc::new(SqliteDialect))?
         } else {
             let flags = if opts.readonly {
                 OpenFlags::default().union(OpenFlags::ReadOnly)
@@ -263,6 +270,7 @@ impl Limbo {
                 flags,
                 db_opts.turso_cli(),
                 None,
+                Arc::new(SqliteDialect),
             )?;
             let conn = db.connect()?;
             (io, conn)
@@ -343,9 +351,6 @@ impl Limbo {
                 self.writeln(&hint).map_err(|e| io_error(e, "write"))?;
             }
 
-            self.writeln(
-                "This software is in BETA, use caution with production data and ensure you have backups."
-            ).map_err(|e| io_error(e, "write"))?;
             self.display_in_memory().map_err(|e| io_error(e, "write"))?;
         }
         Ok(())
@@ -465,7 +470,8 @@ impl Limbo {
     fn open_db(&mut self, path: &str, vfs_name: Option<&str>) -> anyhow::Result<()> {
         self.conn.close()?;
         let (io, db) = if let Some(vfs_name) = vfs_name {
-            self.conn.open_new(path, vfs_name)?
+            self.conn
+                .open_new(path, vfs_name, Arc::new(SqliteDialect))?
         } else {
             let io = {
                 match path {
@@ -481,6 +487,7 @@ impl Limbo {
                     OpenFlags::default(),
                     self.db_opts,
                     None,
+                    Arc::new(SqliteDialect),
                 )?,
             )
         };
@@ -2025,7 +2032,7 @@ impl Limbo {
             anyhow::bail!("Refusing to overwrite existing file: {output_file}");
         }
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
-        let db = Database::open_file(io.clone(), output_file)?;
+        let db = Database::open_file(io.clone(), output_file, Arc::new(SqliteDialect))?;
         let target = db.connect()?;
 
         let mut applier = ApplyWriter::new(&target);

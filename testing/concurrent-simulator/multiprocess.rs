@@ -12,9 +12,11 @@ use std::fs::{File, create_dir_all};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use turso_core::SqliteDialect;
 
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -271,6 +273,7 @@ impl MultiprocessWhopper {
                 OpenFlags::default(),
                 DatabaseOpts::new().with_multiprocess_wal(true),
                 None,
+                Arc::new(SqliteDialect),
             )?;
             let conn = db.connect()?;
 

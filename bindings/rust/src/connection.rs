@@ -68,7 +68,7 @@ impl Clone for Connection {
 }
 
 impl Connection {
-    pub fn create(
+    pub(crate) fn create(
         conn: Arc<turso_sdk_kit::rsapi::TursoConnection>,
         extra_io: Option<Arc<dyn Fn(Waker) -> Result<()> + Send + Sync>>,
     ) -> Self {

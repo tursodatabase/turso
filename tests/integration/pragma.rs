@@ -1,7 +1,5 @@
 use crate::common::{limbo_exec_rows, TempDatabase};
 use rusqlite::types::Value as RValue;
-#[cfg(not(target_vendor = "apple"))]
-use turso_core::LimboError;
 use turso_core::{Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
@@ -296,15 +294,8 @@ fn test_pragma_fullfsync(db: TempDatabase) {
     conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
         .unwrap();
 
-    // On non-Apple platforms, fullfsync pragma should not exist
-    let result = conn.execute("PRAGMA fullfsync=1");
-    assert!(
-        matches!(
-            result,
-            Err(LimboError::ParseError(e)) if e.contains("Not a valid pragma name")
-        ),
-        "fullfsync pragma should not be available on non-Apple platforms"
-    );
+    // On non-Apple platforms, fullfsync is unknown and silently ignored (SQLite behavior).
+    conn.execute("PRAGMA fullfsync=1").unwrap();
 }
 
 #[turso_macros::test(mvcc)]
@@ -412,6 +403,36 @@ fn test_pragma_cache_size_min_value(db: TempDatabase) {
     assert_eq!(*value, 200);
 }
 
+#[turso_macros::test(mvcc)]
+fn test_pragma_cache_size_i32_min_order_by(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Regression test for issue #7150: setting cache_size to i32::MIN and then
+    // running an ORDER BY query used to panic in op_sorter_open due to i32::abs()
+    // overflowing on i32::MIN.
+    let min_val = i32::MIN;
+    conn.execute(format!("PRAGMA cache_size = {min_val}"))
+        .unwrap();
+
+    // Sanity check: the connection must actually hold i32::MIN, otherwise the
+    // ORDER BY below no longer exercises the overflow path in op_sorter_open.
+    let rows = limbo_exec_rows(&conn, "PRAGMA cache_size");
+    assert_eq!(rows, vec![vec![RValue::Integer(min_val as i64)]]);
+
+    conn.execute("CREATE TABLE items (id TEXT)").unwrap();
+    conn.execute("INSERT INTO items VALUES ('b'), ('a')")
+        .unwrap();
+
+    let rows = limbo_exec_rows(&conn, "SELECT id FROM items ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![
+            vec![RValue::Text("a".to_string())],
+            vec![RValue::Text("b".to_string())],
+        ]
+    );
+}
+
 #[turso_macros::test]
 fn test_pragma_wal_checkpoint_targets_attached_database(db: TempDatabase) {
     let conn = db.connect_limbo();
@@ -452,5 +473,124 @@ fn test_pragma_wal_checkpoint_targets_attached_database(db: TempDatabase) {
     assert!(
         *checkpointed > 0,
         "aux pager should have checkpointed frames (got {checkpointed})"
+    );
+}
+
+// Regression tests for https://github.com/tursodatabase/turso/issues/7466:
+// querying a pragma virtual table (pragma_table_info, pragma_function_list, ...)
+// left the connection's implicit read transaction open, so every subsequent
+// write on that connection reported success but was never committed.
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_vtab_query_does_not_break_subsequent_writes(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER, b TEXT)").unwrap();
+
+    // Full scan of a pragma virtual table.
+    let mut stmt = conn
+        .query("SELECT * FROM pragma_table_info('t')")
+        .unwrap()
+        .unwrap();
+    while let StepResult::Row = stmt.step().unwrap() {}
+    drop(stmt);
+
+    assert!(
+        conn.get_auto_commit(),
+        "autocommit must survive a pragma vtab query"
+    );
+
+    // This write must auto-commit at Halt like any other statement.
+    conn.execute("INSERT INTO t VALUES (1, 'one')").unwrap();
+
+    // A second connection only sees committed data.
+    let conn2 = db.connect_limbo();
+    let rows = limbo_exec_rows(&conn2, "SELECT a, b FROM t");
+    assert_eq!(
+        rows,
+        vec![vec![RValue::Integer(1), RValue::Text("one".to_string())]],
+        "insert after pragma vtab query must be committed"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_function_list_then_create_and_insert(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    let mut stmt = conn
+        .query("SELECT name FROM pragma_function_list()")
+        .unwrap()
+        .unwrap();
+    let mut n = 0;
+    while let StepResult::Row = stmt.step().unwrap() {
+        n += 1;
+    }
+    assert!(n > 0, "pragma_function_list should return rows");
+    drop(stmt);
+
+    conn.execute("CREATE TABLE t (x)").unwrap();
+    conn.execute("INSERT INTO t VALUES (42)").unwrap();
+
+    let conn2 = db.connect_limbo();
+    let rows = limbo_exec_rows(&conn2, "SELECT x FROM t");
+    assert_eq!(
+        rows,
+        vec![vec![RValue::Integer(42)]],
+        "writes after pragma_function_list query must be committed"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_vtab_partial_scan_does_not_break_subsequent_writes(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER, b TEXT, c REAL)")
+        .unwrap();
+
+    // Partial scan: step once, then abandon the statement mid-scan so cleanup
+    // goes through the abort path instead of Halt.
+    let mut stmt = conn
+        .query("SELECT * FROM pragma_table_info('t')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected at least one row from pragma_table_info");
+    };
+    drop(stmt);
+
+    conn.execute("INSERT INTO t VALUES (1, 'one', 1.5)")
+        .unwrap();
+
+    let conn2 = db.connect_limbo();
+    let rows = limbo_exec_rows(&conn2, "SELECT a FROM t");
+    assert_eq!(
+        rows,
+        vec![vec![RValue::Integer(1)]],
+        "insert after abandoned pragma vtab scan must be committed"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_vtab_query_with_limit_then_write(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER, b TEXT, c REAL)")
+        .unwrap();
+
+    // LIMIT terminates the scan before the virtual table cursor is exhausted,
+    // so the program halts while the cursor still holds its helper statement.
+    let mut stmt = conn
+        .query("SELECT * FROM pragma_table_info('t') LIMIT 1")
+        .unwrap()
+        .unwrap();
+    while let StepResult::Row = stmt.step().unwrap() {}
+    drop(stmt);
+
+    conn.execute("INSERT INTO t VALUES (2, 'two', 2.5)")
+        .unwrap();
+
+    let conn2 = db.connect_limbo();
+    let rows = limbo_exec_rows(&conn2, "SELECT a FROM t");
+    assert_eq!(
+        rows,
+        vec![vec![RValue::Integer(2)]],
+        "insert after LIMITed pragma vtab query must be committed"
     );
 }

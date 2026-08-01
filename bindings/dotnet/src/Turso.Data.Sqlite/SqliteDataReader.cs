@@ -2,6 +2,7 @@ using System.Collections;
 using System.ComponentModel;
 using System.Data;
 using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -221,6 +222,7 @@ public class SqliteDataReader : DbDataReader
 
     public override IEnumerator GetEnumerator() => new DbEnumerator(this, closeReader: false);
 
+    [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
     public override Type GetFieldType(int ordinal)
     {
         EnsureOpen();
@@ -954,6 +956,7 @@ public class SqliteDataReader : DbDataReader
         };
     }
 
+    [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
     private static Type GetClrTypeFromSqliteType(string typeName, TursoValueType fallback)
     {
         if (IsGuidType(typeName))
@@ -974,6 +977,7 @@ public class SqliteDataReader : DbDataReader
         return typeof(string);
     }
 
+    [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
     private static Type GetClrTypeFromValueType(TursoValueType valueType)
         => valueType switch
         {

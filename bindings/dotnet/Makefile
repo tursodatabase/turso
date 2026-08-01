@@ -109,6 +109,12 @@ build-dotnet:
 	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.Data/Turso.Data.csproj
 	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
 	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj
+	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.Platform.Client/Turso.Platform.Client.csproj
+	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.Serverless.Client/Turso.Serverless.Client.csproj
+
+# Generate the Turso Platform API client from the pinned OpenAPI spec.
+generate-platform-client:
+	dotnet build ./src/Turso.Platform.Client/Turso.Platform.Client.csproj
 
 build: build-rust build-dotnet
 
@@ -121,6 +127,17 @@ test: build
 benchmark: build-production
 	dotnet run -c Release --project ./src/Benchmarks/Benchmarks.csproj
 
+pack-nativeaot-static:
+	dotnet pack -c Release ./src/Turso.Data.Sqlite.NativeAot/Turso.Data.Sqlite.NativeAot.csproj -p:NativeAotRid=win-x64
+	dotnet pack -c Release ./src/Turso.Data.Sqlite.NativeAot/Turso.Data.Sqlite.NativeAot.csproj -p:NativeAotRid=win-arm64
+	dotnet pack -c Release ./src/Turso.Data.Sqlite.NativeAot/Turso.Data.Sqlite.NativeAot.csproj -p:NativeAotRid=linux-x64
+	dotnet pack -c Release ./src/Turso.Data.Sqlite.NativeAot/Turso.Data.Sqlite.NativeAot.csproj -p:NativeAotRid=linux-arm64
+	dotnet pack -c Release ./src/Turso.Data.Sqlite.NativeAot/Turso.Data.Sqlite.NativeAot.csproj -p:NativeAotRid=osx-x64
+	dotnet pack -c Release ./src/Turso.Data.Sqlite.NativeAot/Turso.Data.Sqlite.NativeAot.csproj -p:NativeAotRid=osx-arm64
+
 pack:
 	dotnet pack -c Release ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
 	dotnet pack -c Release ./src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj
+	$(MAKE) pack-nativeaot-static
+	dotnet pack -c Release ./src/Turso.Platform.Client/Turso.Platform.Client.csproj
+	dotnet pack -c Release ./src/Turso.Serverless.Client/Turso.Serverless.Client.csproj

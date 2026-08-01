@@ -1,9 +1,12 @@
+mod abandoned_create_index;
+mod abandoned_statement_pager;
 mod assert_details;
 mod attach;
 mod common;
 mod conflict_resolution;
 mod custom_types;
 mod database;
+mod expr_depth_stack_overflow;
 mod external_apis;
 mod functions;
 mod fuzz_transaction;

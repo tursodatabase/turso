@@ -1,0 +1,27 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFrameworks>$(TursoTargetFrameworks)</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Turso.Serverless.Client</RootNamespace>
+
+    <PackageId>Turso.Serverless.Client</PackageId>
+    <Title>Turso Serverless Driver for .NET</Title>
+    <Description>Serverless database driver for Turso Cloud using only HttpClient — SQL over HTTP with streaming cursor support and no native component. The .NET counterpart of @tursodatabase/serverless.</Description>
+    <Authors>Turso authors</Authors>
+    <PackageTags>turso;sqlite;database;serverless;http;hrana</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/tursodatabase/turso</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/tursodatabase/turso</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="README.md" />
+  </ItemGroup>
+</Project>

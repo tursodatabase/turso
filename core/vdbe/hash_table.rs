@@ -453,8 +453,9 @@ impl HashEntry {
         let mut key_values = Vec::try_with_capacity_ext(num_keys as usize)?;
         for _ in 0..num_keys {
             let (value, consumed) = Self::deserialize_value(&buf[offset..])?;
-            // Preallocated enough already
-            key_values.push(value);
+            key_values
+                .push_within_capacity(value)
+                .expect("key values vector was preallocated");
             offset += consumed;
         }
 
@@ -465,8 +466,9 @@ impl HashEntry {
         let mut payload_values = Vec::try_with_capacity_ext(num_payload as usize)?;
         for _ in 0..num_payload {
             let (value, consumed) = Self::deserialize_value(&buf[offset..])?;
-            // Preallocated enough already
-            payload_values.push(value);
+            payload_values
+                .push_within_capacity(value)
+                .expect("payload values vector was preallocated");
             offset += consumed;
         }
 
@@ -540,7 +542,8 @@ impl HashEntry {
                         "HashEntry: buffer too small for blob".to_string(),
                     ));
                 }
-                let b = buf[offset..offset + blob_len as usize].to_vec();
+                let b =
+                    crate::types::value_blob_from_slice(&buf[offset..offset + blob_len as usize])?;
                 offset += blob_len as usize;
                 Value::Blob(b)
             }
@@ -1208,7 +1211,7 @@ impl HashTable {
                 // I/O pending, caller will re-enter after completion and retry the insert.
                 if !c.finished() {
                     return Ok(HashInsertResult::IO {
-                        io: IOCompletions::Single(c),
+                        io: IOCompletions(c),
                         pending,
                     });
                 }
@@ -1316,7 +1319,7 @@ impl HashTable {
             let entry_size = HashEntry::size_from_values(key_values, &[]);
             if let Some(c) = self.spill_partitions_for_entry(entry_size, metrics.as_deref_mut())? {
                 if !c.succeeded() {
-                    return Ok(IOResult::IO(IOCompletions::Single(c)));
+                    return Ok(IOResult::IO(IOCompletions(c)));
                 }
             }
 
@@ -1466,8 +1469,9 @@ impl HashTable {
         let mut total_size = 0usize;
         for entry in &partition.entries {
             let entry_size = entry.serialized_size();
-            // Preallocated enough already
-            entry_sizes.push(entry_size);
+            entry_sizes
+                .push_within_capacity(entry_size)
+                .expect("entry sizes vector was preallocated");
             total_size += varint_len(entry_size as u64) + entry_size;
         }
 
@@ -1589,8 +1593,9 @@ impl HashTable {
             let mut partition_size = 0usize;
             for entry in &partition.entries {
                 let entry_size = entry.serialized_size();
-                // Preallocated enough
-                entry_sizes.push(entry_size);
+                entry_sizes
+                    .push_within_capacity(entry_size)
+                    .expect("entry sizes vector was preallocated");
                 partition_size += varint_len(entry_size as u64) + entry_size;
             }
 
@@ -1618,8 +1623,9 @@ impl HashTable {
         let mut partition_offsets = Vec::try_with_capacity_ext(metas.len())?;
 
         for meta in &metas {
-            // Preallocated enough already
-            partition_offsets.push(offset);
+            partition_offsets
+                .push_within_capacity(offset)
+                .expect("partition offsets vector was preallocated");
             let partition = &spill_state.partition_buffers[meta.idx];
 
             for (entry, &entry_size) in partition.entries.iter().zip(meta.entry_sizes.iter()) {
@@ -2443,7 +2449,6 @@ impl HashTable {
             } else {
                 let mut combined =
                     Vec::try_with_capacity_ext(partition.partial_entry.len() + data.len())?;
-                // Preallocated enough already
                 combined.extend_from_slice(&partition.partial_entry);
                 combined.extend_from_slice(data);
                 combined
@@ -2729,7 +2734,7 @@ impl HashTable {
         if probe_state.mem_used > probe_state.mem_budget {
             if let Some(c) = self.spill_largest_probe_partition(None)? {
                 if !c.finished() {
-                    return Ok(IOResult::IO(IOCompletions::Single(c)));
+                    return Ok(IOResult::IO(IOCompletions(c)));
                 }
             }
         }
@@ -3543,7 +3548,10 @@ mod hashtests {
                 Value::from_f64(std::f64::consts::PI),
             ],
             100,
-            vec![Value::Blob(std::vec![1, 2, 3, 4, 5]), Value::from_i64(-999)],
+            vec![
+                Value::from_slice(&[1, 2, 3, 4, 5]).expect(crate::alloc::ALLOC_ERR_MSG),
+                Value::from_i64(-999),
+            ],
         );
 
         // Serialize using the Vec-based method
@@ -4251,7 +4259,10 @@ mod hashtests {
         // Insert entry with blob payload
         let key = vec![Value::from_i64(1)];
         let blob_data = std::vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let payload = vec![Value::Blob(blob_data.clone()), Value::from_i64(42)];
+        let payload = vec![
+            Value::from_slice(&blob_data).expect(crate::alloc::ALLOC_ERR_MSG),
+            Value::from_i64(42),
+        ];
         let _ = ht.insert(key.clone(), 100, payload, None).unwrap();
 
         let _ = ht.finalize_build(None);
@@ -4260,7 +4271,10 @@ mod hashtests {
         assert!(result.is_some());
         let entry = result.unwrap();
         assert_eq!(entry.payload_values.len(), 2);
-        assert_eq!(entry.payload_values[0], Value::Blob(blob_data));
+        assert_eq!(
+            entry.payload_values[0],
+            Value::from_slice(&blob_data).expect(crate::alloc::ALLOC_ERR_MSG)
+        );
         assert_eq!(entry.payload_values[1], Value::from_i64(42));
     }
 
@@ -4342,7 +4356,7 @@ mod hashtests {
                 Value::from_i64(999),
                 Value::from_f64(std::f64::consts::PI),
                 Value::Null,
-                Value::Blob(std::vec![1, 2, 3, 4]),
+                Value::from_slice(&[1, 2, 3, 4]).expect(crate::alloc::ALLOC_ERR_MSG),
             ],
         );
 
@@ -4373,7 +4387,7 @@ mod hashtests {
         assert_eq!(deserialized.payload_values[3], Value::Null);
         assert_eq!(
             deserialized.payload_values[4],
-            Value::Blob(std::vec![1, 2, 3, 4])
+            Value::from_slice(&[1, 2, 3, 4]).expect(crate::alloc::ALLOC_ERR_MSG)
         );
     }
 

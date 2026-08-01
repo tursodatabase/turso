@@ -1,0 +1,151 @@
+@database :memory:
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/7934
+#
+# When a row-value expression appears where a scalar is required, or the
+# operands of a binary operator, BETWEEN, or IN have mismatched arities,
+# SQLite reports "row value misused" (or, for IN with a row-value LHS,
+# "IN(...) element has N term(s) - expected M"). Turso used to leak the
+# internal arity counts into the error message instead, e.g.:
+#   all arguments to binary operator > must return the same number of values.
+#   Got: (1) > (2)
+
+test binary-op-row-value-arity-mismatch-error-message {
+    SELECT count(*) > ('abc', 'def');
+}
+expect error {
+    row value misused
+}
+
+test binary-op-row-value-arity-mismatch-eq-error-message {
+    SELECT 1 = (1, 2);
+}
+expect error {
+    row value misused
+}
+
+test binary-op-row-value-arity-mismatch-lhs-error-message {
+    SELECT ('a', 'b') < 3;
+}
+expect error {
+    row value misused
+}
+
+test between-row-value-arity-mismatch-error-message {
+    SELECT (1, 2) BETWEEN 1 AND 2;
+}
+expect error {
+    row value misused
+}
+
+test case-row-value-error-message {
+    SELECT CASE (1, 2) WHEN 1 THEN 1 END;
+}
+expect error {
+    row value misused
+}
+
+test cast-row-value-error-message {
+    SELECT CAST((1, 2) AS INT);
+}
+expect error {
+    row value misused
+}
+
+test collate-row-value-error-message {
+    SELECT (1, 2) COLLATE nocase;
+}
+expect error {
+    row value misused
+}
+
+test function-arg-row-value-error-message {
+    SELECT abs((1, 2));
+}
+expect error {
+    row value misused
+}
+
+test in-list-scalar-lhs-row-value-error-message {
+    SELECT 1 IN ((1, 2));
+}
+expect error {
+    row value misused
+}
+
+test in-list-vector-lhs-arity-mismatch-error-message {
+    SELECT (1, 2) IN (1, 2);
+}
+expect error {
+    IN\(\.\.\.\) element has 1 term - expected 2
+}
+
+test in-list-vector-lhs-arity-mismatch-plural-error-message {
+    SELECT (1, 2) IN ((1, 2, 3));
+}
+expect error {
+    IN\(\.\.\.\) element has 3 terms - expected 2
+}
+
+test is-null-row-value-error-message {
+    SELECT (1, 2) IS NULL;
+}
+expect error {
+    row value misused
+}
+
+test like-row-value-error-message {
+    SELECT (1, 2) LIKE 'a';
+}
+expect error {
+    row value misused
+}
+
+test unary-op-row-value-error-message {
+    SELECT -(1, 2);
+}
+expect error {
+    row value misused
+}
+
+test result-column-row-value-error-message {
+    SELECT (1, 2);
+}
+expect error {
+    row value misused
+}
+
+test where-clause-row-value-error-message {
+    SELECT 1 WHERE (1, 2);
+}
+expect error {
+    row value misused
+}
+
+test group-by-row-value-error-message {
+    SELECT 1 GROUP BY (1, 2);
+}
+expect error {
+    row value misused
+}
+
+test limit-row-value-error-message {
+    SELECT 1 LIMIT (1, 2);
+}
+expect error {
+    row value misused
+}
+
+test values-row-value-error-message {
+    VALUES((1, 2));
+}
+expect error {
+    row value misused
+}
+
+test aggregate-arg-row-value-error-message {
+    SELECT max((1, 2));
+}
+expect error {
+    row value misused
+}

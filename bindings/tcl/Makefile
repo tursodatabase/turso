@@ -2,7 +2,7 @@
 #
 # The shared library wraps libturso_sqlite3 and exposes an in-process sqlite3
 # Tcl command compatible with the upstream SQLite Tcl binding, enabling the
-# testing/conformance/sqlite3 harness to run without a subprocess per statement.
+# sqlite/conformance/upstream harness to run without a subprocess per statement.
 #
 # Primary targets (Linux / Docker — no host toolchain required):
 #   docker-build   Build libturso_tcl.so inside a Debian container.
@@ -19,7 +19,7 @@
 #   make clean
 
 ROOT_DIR  := $(shell cd ../.. && pwd)
-TURSO_LIB := $(ROOT_DIR)/target/debug
+TURSO_LIB := $(shell $(ROOT_DIR)/scripts/cargo-target-dir)/debug
 SRC       := $(ROOT_DIR)/bindings/tcl/turso_tcl.c
 INCLUDE   := $(ROOT_DIR)/bindings/c/include
 

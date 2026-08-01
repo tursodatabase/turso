@@ -79,7 +79,9 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
                 let table = Arc::new(Table::Virtual(vtab));
                 let mutex = &*(ext_ctx.schema as *mut Mutex<Arc<Schema>>);
                 let mut guard = mutex.lock();
-                let schema = Arc::make_mut(&mut *guard);
+                let Ok(schema) = Schema::try_make_mut(&mut guard) else {
+                    return ResultCode::Error;
+                };
                 schema.tables.insert(name_str, table);
             } else {
                 return ResultCode::Error;
@@ -214,6 +216,7 @@ impl Database {
         &self,
         path: &str,
         vfs: &str,
+        dialect: Arc<dyn crate::Dialect>,
     ) -> crate::Result<(Arc<dyn IO>, Arc<Database>)> {
         use crate::{MemoryIO, SyscallIO};
         use dynamic::get_vfs_modules;
@@ -234,7 +237,7 @@ impl Database {
                 }
             },
         };
-        let db = Self::open_file(io.clone(), path)?;
+        let db = Self::open_file(io.clone(), path, dialect)?;
         Ok((io, db))
     }
 
@@ -301,6 +304,19 @@ impl Database {
 }
 
 impl Connection {
+    /// Register statically linked functions or virtual tables against this
+    /// connection using the generic extension API.
+    pub fn register_static_extension<F>(&self, register: F)
+    where
+        F: FnOnce(&mut ExtensionApi),
+    {
+        unsafe {
+            let mut ext_api = self._build_turso_ext();
+            register(&mut ext_api);
+            self._free_extension_ctx(ext_api);
+        }
+    }
+
     /// Build the connection's extension api context for manually registering an extension.
     /// you probably want to use `Connection::load_extension(path)`.
     ///

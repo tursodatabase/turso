@@ -14,6 +14,8 @@
 !bindings/dotnet/src/Turso.Data.Sqlite/
 !bindings/dotnet/src/Turso.Data.Sqlite/**
 # Python
+*.egg-info/
+.hypothesis/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
@@ -49,6 +51,8 @@ perf/mobibench/plot/uv.lock
 examples/dotnet/obj/
 
 # testing
+testing/stress/git.diff
+testing/stress/targeted_coverage.json
 testing/limbo_output.txt
 **/limbo_output.txt
 testing/*.log
@@ -70,8 +74,8 @@ settings.local.json
 .build-hash
 
 # Track empty wals for read only databases
-!testing/sqltests/database/*
-testing/sqltests/database/integrity_*.db
+!sqlite/conformance/database/*
+sqlite/conformance/database/integrity_*.db
 
 
 # For simulator redo
@@ -85,3 +89,22 @@ CLAUDE.md
 bindings/python/dev.py
 bindings/python/implementation-test/
 dhat-heap.json
+
+# Aristo runtime, cache, and per-user state: never commit these.
+# Durable state (.aristo/proofs/*.proof, .aristo/specs/, .aristo/feedback/,
+# .aristo/expectations.toml, .aristo/canon-matches.toml, aristo.toml) is
+# committed and intentionally not listed here.
+.aristo/index.toml
+# Per-annotation docs: normally committed, but excluded from this PR to keep the
+# diff small. Regenerate with `aristo doc` (see CONTRIBUTING.md -> Aristo).
+.aristo/doc/
+.aristo/sessions/
+.aristo/nudge-state.toml
+.aristo/verify-queue/
+.aristo/critique-queue/
+.aristo/critiques/
+.aristo/proofs/*.proof.bak
+.aristo/archive/
+
+# pgregress actual output and diffs
+postgres/regress/results/

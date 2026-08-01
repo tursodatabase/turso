@@ -4,12 +4,13 @@ use std::{
     fmt::Display,
     ops::Deref,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, Once, RwLock, Weak,
     },
     task::Waker,
     time::Duration,
 };
+use turso_core::SqliteDialect;
 
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
@@ -20,18 +21,50 @@ use tracing_subscriber::{
 };
 use turso_core::{
     storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, QueryMode,
-    Statement, StepResult, IO,
+    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, OpenOptions,
+    QueryMode, Statement, StepResult, IO,
 };
 
 use crate::{
     assert_send, assert_sync,
     capi::{self, c},
-    ConcurrentGuard,
+    ConcurrentGuard, IoBackend,
 };
 
 assert_send!(TursoDatabase, TursoConnection, TursoStatement);
 assert_sync!(TursoDatabase);
+
+#[derive(Default)]
+pub struct SyncBusyGate {
+    active: AtomicBool,
+}
+
+impl SyncBusyGate {
+    pub fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Release);
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+pub struct SyncBusyGuard {
+    gate: Arc<SyncBusyGate>,
+}
+
+impl SyncBusyGuard {
+    pub fn new(gate: Arc<SyncBusyGate>) -> Self {
+        gate.set_active(true);
+        Self { gate }
+    }
+}
+
+impl Drop for SyncBusyGuard {
+    fn drop(&mut self) {
+        self.gate.set_active(false);
+    }
+}
 
 pub use turso_core::types::FromValue;
 pub use turso_ext::{
@@ -55,7 +88,7 @@ pub struct TursoLog<'a> {
     pub level: &'a str,
 }
 
-type Logger = dyn Fn(TursoLog) + Send + Sync + 'static;
+type Logger = dyn Fn(TursoLog<'_>) + Send + Sync + 'static;
 pub struct TursoSetupConfig {
     pub logger: Option<Box<Logger>>,
     pub log_level: Option<String>,
@@ -139,7 +172,7 @@ pub struct TursoDatabaseConfig {
     /// - "memory": in-memory backend
     /// - "syscall": generic syscall backend
     /// - "io_uring": IO uring (supported only on Linux)
-    pub vfs: Option<String>,
+    pub vfs: IoBackend,
 
     /// optional custom IO provided by the caller
     pub io: Option<Arc<dyn IO>>,
@@ -173,6 +206,7 @@ impl TursoDatabaseConfig {
                 "generated_columns" => opts.with_generated_columns(true),
                 "multiprocess_wal" => opts.with_multiprocess_wal(true),
                 "without_rowid" => opts.with_without_rowid(true),
+                "mvcc_passive_checkpoint" => opts.with_experimental_mvcc_passive_checkpoint(true),
                 // "strict" is always enabled, kept for backwards compatibility
                 _ => opts,
             };
@@ -314,9 +348,9 @@ impl TursoDatabaseConfig {
                 hexkey: encryption_hexkey.unwrap(),
             }),
             vfs: if !config.vfs.is_null() {
-                Some(str_from_c_str(config.vfs)?.to_string())
+                str_from_c_str(config.vfs)?.into()
             } else {
-                None
+                IoBackend::Default
             },
             io: None,
             db_file: None,
@@ -346,6 +380,7 @@ pub struct TursoDatabaseOpenState {
     io: Option<Arc<dyn IO>>,
     db_file: Option<Arc<dyn DatabaseStorage>>,
     opts: Option<DatabaseOpts>,
+    open_flags: OpenFlags,
     open_db_state: OpenDbAsyncState,
 }
 
@@ -362,6 +397,7 @@ impl TursoDatabaseOpenState {
             io: None,
             db_file: None,
             opts: None,
+            open_flags: OpenFlags::default(),
             open_db_state: OpenDbAsyncState::new(),
         }
     }
@@ -478,6 +514,9 @@ impl From<LimboError> for TursoError {
             LimboError::DatabaseFull(e) => TursoError::DatabaseFull(e),
             LimboError::ReadOnly => TursoError::Readonly("database is readonly".to_string()),
             LimboError::Busy => TursoError::Busy("database is locked".to_string()),
+            // Same-connection rejections carry SQLITE_BUSY semantics, but the
+            // caller must finish/reset its own statement rather than wait.
+            err @ LimboError::StatementsInProgress(_) => TursoError::Busy(err.to_string()),
             LimboError::BusySnapshot => TursoError::BusySnapshot(
                 "database snapshot is stale, rollback and retry the transaction".to_string(),
             ),
@@ -489,12 +528,38 @@ impl From<LimboError> for TursoError {
     }
 }
 
+fn sync_busy_error() -> TursoError {
+    TursoError::Busy("database is locked".to_string())
+}
+
+fn sync_operation_active(sync_busy: Option<&Arc<SyncBusyGate>>) -> bool {
+    sync_busy.is_some_and(|gate| gate.is_active())
+}
+
+fn map_sync_transient_error(
+    sync_busy: Option<&Arc<SyncBusyGate>>,
+    error: TursoError,
+) -> TursoError {
+    if sync_busy.is_none() {
+        return error;
+    }
+    match error {
+        TursoError::Error(message)
+            if message == "Database schema changed"
+                || message.starts_with("I/O error: short read on page") =>
+        {
+            sync_busy_error()
+        }
+        other => other,
+    }
+}
+
 static LOGGER: RwLock<Option<Box<Logger>>> = RwLock::new(None);
 static SETUP: Once = Once::new();
 
 struct CallbackLayer<F>
 where
-    F: Fn(TursoLog) + Send + Sync + 'static,
+    F: Fn(TursoLog<'_>) + Send + Sync + 'static,
 {
     callback: F,
 }
@@ -502,7 +567,7 @@ where
 impl<S, F> tracing_subscriber::Layer<S> for CallbackLayer<F>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-    F: Fn(TursoLog) + Send + Sync + 'static,
+    F: Fn(TursoLog<'_>) + Send + Sync + 'static,
 {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         let mut buffer = String::new();
@@ -609,9 +674,9 @@ impl TursoDatabase {
         let io: Arc<dyn turso_core::IO + 'static> = if let Some(io) = &self.config.io {
             io.clone()
         } else {
-            match self.config.vfs.as_deref() {
-                Some("memory") => Arc::new(turso_core::MemoryIO::new()),
-                Some("syscall") => {
+            match self.config.vfs {
+                IoBackend::Memory => Arc::new(turso_core::MemoryIO::new()),
+                IoBackend::Syscall => {
                     #[cfg(all(target_family = "unix", not(miri)))]
                     {
                         Arc::new(turso_core::UnixIO::new().map_err(|e| {
@@ -630,31 +695,29 @@ impl TursoDatabase {
                     }
                 }
                 #[cfg(all(target_os = "linux", not(miri)))]
-                Some("io_uring") => Arc::new(turso_core::UringIO::new().map_err(|e| {
+                IoBackend::IoUring => Arc::new(turso_core::UringIO::new().map_err(|e| {
                     TursoError::Error(format!("unable to create io_uring backend: {e}"))
                 })?),
                 #[cfg(all(target_os = "windows", not(miri)))]
-                Some("experimental_win_iocp") => {
-                    Arc::new(turso_core::WindowsIOCP::new().map_err(|e| {
-                        TursoError::Error(format!("unable to create win_iocp backend: {e}"))
-                    })?)
-                }
+                IoBackend::IOCP => Arc::new(turso_core::WindowsIOCP::new().map_err(|e| {
+                    TursoError::Error(format!("unable to create win_iocp backend: {e}"))
+                })?),
                 #[cfg(any(not(target_os = "linux"), miri))]
-                Some("io_uring") => {
+                IoBackend::IoUring => {
                     return Err(TursoError::Error(
                         "io_uring is only available on Linux targets".to_string(),
                     ));
                 }
                 #[cfg(any(not(target_os = "windows"), miri))]
-                Some("experimental_win_iocp") => {
+                IoBackend::IOCP => {
                     return Err(TursoError::Error(
                         "win_iocp is only available on Windows targets".to_string(),
                     ));
                 }
-                Some(vfs) => {
+                IoBackend::Other(ref vfs) => {
                     Database::io_for_vfs(vfs).map_err(|e| TursoError::Error(format!("{e}")))?
                 }
-                None => match self.config.path.as_str() {
+                IoBackend::Default => match self.config.path.as_str() {
                     ":memory:" => Arc::new(turso_core::MemoryIO::new()),
                     _ => Arc::new(turso_core::PlatformIO::new()?),
                 },
@@ -710,6 +773,7 @@ impl TursoDatabase {
                     state.io = Some(io);
                     state.db_file = Some(db_file);
                     state.opts = Some(opts);
+                    state.open_flags = open_flags;
                     state.phase = TursoDatabaseOpenPhase::Opening;
                 }
 
@@ -725,16 +789,18 @@ impl TursoDatabase {
                         .expect("db_file must be initialized in Init phase")
                         .clone();
                     let opts = state.opts.expect("opts must be initialized in Init phase");
+                    let open_flags = state.open_flags;
 
-                    match Database::open_with_flags_async(
+                    let options = OpenOptions::new(Arc::new(SqliteDialect))
+                        .storage(db_file)
+                        .flags(open_flags)
+                        .db_opts(opts)
+                        .encryption(self.config.encryption.clone());
+                    match Database::open_async(
                         &mut state.open_db_state,
                         io.clone(),
                         &self.config.path,
-                        db_file,
-                        OpenFlags::default(),
-                        opts,
-                        self.config.encryption.clone(),
-                        None,
+                        &options,
                     )? {
                         IOResult::Done(db) => {
                             let mut inner_db = self.db.lock().unwrap();
@@ -825,6 +891,7 @@ pub struct TursoConnection {
     async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
     connection: Arc<Connection>,
+    sync_busy: Option<Arc<SyncBusyGate>>,
     cached_statements: Arc<Mutex<HashMap<String, Arc<CachedStatement>>>>,
     /// Weak refs to every statement handle created by this connection, keyed
     /// by a monotonic ID. Statements remove themselves on drop, so this map
@@ -836,18 +903,51 @@ pub struct TursoConnection {
 
 impl TursoConnection {
     pub fn new(config: &TursoDatabaseConfig, connection: Arc<Connection>) -> Arc<Self> {
+        Self::new_with_sync_busy(config, connection, None)
+    }
+
+    pub fn new_with_sync_busy(
+        config: &TursoDatabaseConfig,
+        connection: Arc<Connection>,
+        sync_busy: Option<Arc<SyncBusyGate>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             async_io: config.async_io,
             connection,
+            sync_busy,
             concurrent_guard: Arc::new(ConcurrentGuard::new()),
             cached_statements: Arc::new(Mutex::new(HashMap::new())),
             stmts: Arc::new(Mutex::new(HashMap::new())),
             next_stmt_id: Arc::new(AtomicUsize::new(0)),
         })
     }
+
+    fn sync_operation_active(&self) -> bool {
+        sync_operation_active(self.sync_busy.as_ref())
+    }
+
+    fn map_sync_transient_error(&self, error: TursoError) -> TursoError {
+        map_sync_transient_error(self.sync_busy.as_ref(), error)
+    }
     /// Set busy timeout for the connection
     pub fn set_busy_timeout(&self, duration: Duration) {
         self.connection.set_busy_timeout(duration);
+    }
+    /// Request interruption of the statement currently running on this connection.
+    /// Mirrors `sqlite3_interrupt`: the in-flight `step`/`execute` aborts with an
+    /// `Interrupt` error. Safe to call from another thread. If no statement is
+    /// active the request is ignored.
+    pub fn interrupt(&self) {
+        self.connection.interrupt();
+    }
+    /// Set the maximum wall-clock duration a single statement is allowed to run
+    /// before it is interrupted. `Duration::ZERO` disables the timeout.
+    pub fn set_query_timeout(&self, duration: Duration) {
+        self.connection.set_query_timeout(duration);
+    }
+    /// Get the current per-statement query timeout (`Duration::ZERO` when disabled).
+    pub fn get_query_timeout(&self) -> Duration {
+        self.connection.get_query_timeout()
     }
     pub fn get_auto_commit(&self) -> bool {
         self.connection.get_auto_commit()
@@ -965,12 +1065,20 @@ impl TursoConnection {
 
     /// prepares single SQL statement
     pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
-        let statement = self.connection.prepare(sql)?;
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
+        let statement = self
+            .connection
+            .prepare(sql)
+            .map_err(TursoError::from)
+            .map_err(|error| self.map_sync_transient_error(error))?;
         let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
         let stmt_id = self.track_stmt(&handle);
         Ok(Box::new(TursoStatement {
             concurrent_guard: self.concurrent_guard.clone(),
             async_io: self.async_io,
+            sync_busy: self.sync_busy.clone(),
             handle,
             stmt_id,
             stmts: self.stmts.clone(),
@@ -979,6 +1087,9 @@ impl TursoConnection {
 
     /// Prepare a statement from the provided SQL string and cache it for future use.
     pub fn prepare_cached(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
         let sql_str = sql.as_ref();
 
         // Check if we have a cached version
@@ -995,6 +1106,7 @@ impl TursoConnection {
                 return Ok(Box::new(TursoStatement {
                     concurrent_guard: self.concurrent_guard.clone(),
                     async_io: self.async_io,
+                    sync_busy: self.sync_busy.clone(),
                     handle,
                     stmt_id,
                     stmts: self.stmts.clone(),
@@ -1003,7 +1115,11 @@ impl TursoConnection {
         }
 
         // Not cached, prepare it fresh
-        let statement = self.connection.prepare(sql_str)?;
+        let statement = self
+            .connection
+            .prepare(sql_str)
+            .map_err(TursoError::from)
+            .map_err(|error| self.map_sync_transient_error(error))?;
 
         // Cache it for future use
         let cached = Arc::new(CachedStatement {
@@ -1020,6 +1136,7 @@ impl TursoConnection {
         Ok(Box::new(TursoStatement {
             concurrent_guard: self.concurrent_guard.clone(),
             async_io: self.async_io,
+            sync_busy: self.sync_busy.clone(),
             handle,
             stmt_id,
             stmts: self.stmts.clone(),
@@ -1032,7 +1149,15 @@ impl TursoConnection {
         &self,
         sql: impl AsRef<str>,
     ) -> Result<Option<(Box<TursoStatement>, usize)>, TursoError> {
-        match self.connection.consume_stmt(sql)? {
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
+        match self
+            .connection
+            .consume_stmt(sql)
+            .map_err(TursoError::from)
+            .map_err(|error| self.map_sync_transient_error(error))?
+        {
             Some((statement, position)) => {
                 let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
                 let stmt_id = self.track_stmt(&handle);
@@ -1040,6 +1165,7 @@ impl TursoConnection {
                     Box::new(TursoStatement {
                         async_io: self.async_io,
                         concurrent_guard: Arc::new(ConcurrentGuard::new()),
+                        sync_busy: self.sync_busy.clone(),
                         handle,
                         stmt_id,
                         stmts: self.stmts.clone(),
@@ -1164,6 +1290,7 @@ fn step_inner(
 pub struct TursoStatement {
     async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
+    sync_busy: Option<Arc<SyncBusyGate>>,
     pub(crate) handle: StatementHandle,
     stmt_id: usize,
     stmts: StmtRegistry,
@@ -1265,6 +1392,9 @@ impl TursoStatement {
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
     #[inline]
     pub fn step(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
+        if sync_operation_active(self.sync_busy.as_ref()) {
+            return Err(sync_busy_error());
+        }
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
         let mut handle = self.handle.lock().unwrap();
@@ -1272,12 +1402,16 @@ impl TursoStatement {
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
         step_inner(stmt, self.async_io, waker)
+            .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))
     }
 
     /// execute statement to completion
     /// method returns [TursoStatusCode::Done] if execution completed
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
     pub fn execute(&mut self, waker: Option<&Waker>) -> Result<TursoExecutionResult, TursoError> {
+        if sync_operation_active(self.sync_busy.as_ref()) {
+            return Err(sync_busy_error());
+        }
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
         let mut handle = self.handle.lock().unwrap();
@@ -1286,7 +1420,8 @@ impl TursoStatement {
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
 
         loop {
-            let status = step_inner(stmt, self.async_io, waker)?;
+            let status = step_inner(stmt, self.async_io, waker)
+                .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))?;
             if status == TursoStatusCode::Row {
                 continue;
             } else if status == TursoStatusCode::Io {
@@ -1317,6 +1452,9 @@ impl TursoStatement {
     /// get row value as an owned Value
     #[inline]
     pub fn row_value(&self, index: usize) -> Result<turso_core::Value, TursoError> {
+        if sync_operation_active(self.sync_busy.as_ref()) {
+            return Err(sync_busy_error());
+        }
         let handle = self.handle.lock().unwrap();
         let stmt = handle
             .as_ref()
@@ -1329,7 +1467,11 @@ impl TursoStatement {
                 "attempt to access row value out of bounds".to_string(),
             ));
         }
-        Ok(row.get_value(index).as_value_ref().to_owned())
+        Ok(row
+            .get_value(index)
+            .as_value_ref()
+            .to_owned()
+            .map_err(LimboError::from)?)
     }
     /// returns column count
     pub fn column_count(&self) -> usize {
@@ -1439,8 +1581,9 @@ impl TursoStatement {
 
 #[cfg(test)]
 mod tests {
-    use crate::rsapi::{
-        TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode, FINALIZED_ERR,
+    use crate::{
+        rsapi::{TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode, FINALIZED_ERR},
+        IoBackend,
     };
     use turso_core::Value;
 
@@ -1450,7 +1593,7 @@ mod tests {
             experimental_features: features.map(str::to_string),
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         }
@@ -1500,7 +1643,7 @@ mod tests {
                 experimental_features: None,
                 async_io: false,
                 encryption: None,
-                vfs: None,
+                vfs: IoBackend::Default,
                 io: None,
                 db_file: None,
             });
@@ -1561,7 +1704,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1581,7 +1724,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1611,7 +1754,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1634,7 +1777,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1684,7 +1827,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1743,7 +1886,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1775,7 +1918,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1804,7 +1947,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1829,7 +1972,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1855,7 +1998,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1905,7 +2048,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1993,7 +2136,7 @@ mod tests {
                     experimental_features: Some("encryption".to_string()),
                     async_io: false,
                     encryption: Some(create_encryption_opts()),
-                    vfs: None,
+                    vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
                 });
@@ -2033,7 +2176,7 @@ mod tests {
                     experimental_features: Some("encryption".to_string()),
                     async_io: false,
                     encryption: Some(create_encryption_opts()),
-                    vfs: None,
+                    vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
                 });
@@ -2059,7 +2202,7 @@ mod tests {
                         cipher: TEST_CIPHER.to_string(),
                         hexkey: WRONG_HEXKEY.to_string(),
                     }),
-                    vfs: None,
+                    vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
                 });
@@ -2073,7 +2216,7 @@ mod tests {
                     experimental_features: Some("encryption".to_string()),
                     async_io: false,
                     encryption: None,
-                    vfs: None,
+                    vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
                 });
@@ -2108,7 +2251,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -2145,7 +2288,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -2179,7 +2322,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -2213,7 +2356,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });

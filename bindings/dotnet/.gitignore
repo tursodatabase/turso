@@ -485,3 +485,7 @@ $RECYCLE.BIN/
 
 src/Turso.Native/*
 rs_compiled/*
+
+# Derived from Turso.Platform.Client/openapi.json during MSBuild compilation.
+src/Turso.Platform.Client/TursoPlatformClient.generated.cs
+src/Turso.Platform.Client/openapi.transformed.json

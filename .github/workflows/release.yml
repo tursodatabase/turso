@@ -228,13 +228,15 @@ jobs:
             mkdir -p "$extract_dir"
             unzip -o "$zip_path" tursodb.exe -d "$extract_dir"
 
-            exe_path="$(pwd)/$extract_dir/tursodb.exe"
+            exe_path="$extract_dir/tursodb.exe"
             if [[ ! -f "$exe_path" ]]; then
               echo "Expected tursodb.exe in $zip_path" >&2
               exit 1
             fi
 
-            printf '%s\n' "$exe_path" >> sign-tmp/files-to-sign.txt
+            # signtool.exe parses MSYS-style /d/... paths as options, so hand
+            # the signing action a native Windows path.
+            cygpath -w "$(pwd)/$exe_path" >> sign-tmp/files-to-sign.txt
             printf '%s\t%s\n' "$zip_path" "$extract_dir" >> sign-tmp/archives.txt
           done
 

@@ -1,5 +1,6 @@
 use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use std::sync::{atomic::Ordering, Arc};
+use turso_core::SqliteDialect;
 use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, StepResult};
 
 /// Opens a database on `QueuedIo` so tests can control when pending writes complete.
@@ -10,6 +11,7 @@ fn open_queued_db(io: Arc<QueuedIo>, path: &str) -> anyhow::Result<Arc<Database>
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
+        Arc::new(SqliteDialect),
     )?)
 }
 

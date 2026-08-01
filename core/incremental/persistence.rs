@@ -39,7 +39,7 @@ impl ReadRecord {
                             ))
                         })?;
                         // The blob is in column 3: operator_id, zset_id, element_id, value, weight
-                        let blob = r.get_value(3)?.to_owned();
+                        let blob = r.get_value(3)?.to_owned()?;
 
                         let (state, _group_key) = match blob {
                             Value::Blob(blob) => AggregateState::from_blob(&blob),
@@ -116,7 +116,7 @@ impl WriteRow {
                         ImmutableRecord::from_values(&index_values, index_values.len())?;
 
                     let res = return_if_io!(cursors.index_cursor.seek(
-                        SeekKey::IndexKey(&index_record),
+                        SeekKey::IndexKey(index_record.as_record_ref()),
                         SeekOp::GE { eq_only: true }
                     ));
 
@@ -155,7 +155,7 @@ impl WriteRow {
 
                         // Weight is always the last value (column 4 in our 5-column structure)
                         let existing_weight = match weight_opt {
-                            Some(val) => match val.to_owned() {
+                            Some(val) => match val.to_owned()? {
                                 Value::Numeric(Numeric::Integer(w)) => w as isize,
                                 _ => {
                                     return Err(LimboError::InternalError(
@@ -257,7 +257,7 @@ impl WriteRow {
                     // Create the index record with the rowid appended
                     let index_record =
                         ImmutableRecord::from_values(&index_values, index_values.len())?;
-                    let index_btree_key = BTreeKey::new_index_key(&index_record);
+                    let index_btree_key = BTreeKey::new_index_key(index_record.as_record_ref());
 
                     // Mark as Done before index insert to avoid retry on I/O
                     *self = WriteRow::Done;

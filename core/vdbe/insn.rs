@@ -1,10 +1,12 @@
 use std::num::{NonZero, NonZeroUsize};
 
-/// Convert a usize to u16 for instruction fields (registers, counts).
-/// Panics if the value exceeds u16::MAX.
+/// Convert a usize to u32 for instruction fields (registers, counts).
+/// Panics if the value exceeds u32::MAX, which would require an impossible
+/// four-billion-register program; u16 was too small for real queries (e.g. a
+/// handful of CTEs at the 2000-column limit already exceed 65535 registers).
 #[inline]
-pub fn to_u16(v: usize) -> u16 {
-    v.try_into().expect("value exceeds u16::MAX")
+pub fn to_u32(v: usize) -> u32 {
+    v.try_into().expect("value exceeds u32::MAX")
 }
 
 use super::{execute, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
@@ -181,6 +183,7 @@ impl InsertFlags {
     pub const EPHEMERAL_TABLE_INSERT: u8 = 0x04; // Flag indicating that this is an insert into an ephemeral table
     pub const SKIP_LAST_ROWID: u8 = 0x08; // Flag indicating that last_insert_rowid() must not be updated
     pub const SKIP_STATEMENT_CHANGE_COUNT: u8 = 0x10; // Flag indicating that changes() must not count this insert
+    pub const SKIP_ALL_CHANGE_COUNTS: u8 = 0x20; // Flag indicating that neither changes() nor total_changes() must count this insert
 
     pub fn new() -> Self {
         InsertFlags(0)
@@ -212,6 +215,11 @@ impl InsertFlags {
 
     pub fn skip_statement_change_count(mut self) -> Self {
         self.0 |= InsertFlags::SKIP_STATEMENT_CHANGE_COUNT;
+        self
+    }
+
+    pub fn skip_all_change_counts(mut self) -> Self {
+        self.0 |= InsertFlags::SKIP_ALL_CHANGE_COUNTS;
         self
     }
 }
@@ -650,8 +658,8 @@ pub enum Insn {
         col_name: Arc<str>,
     },
 
-    /// Convert a native record-format BLOB back to JSON text for display.
-    /// Input: reg = record-format BLOB. Output: reg = JSON text '[1,2,3]'.
+    /// Convert a native record-format BLOB back to PostgreSQL-style array text for display.
+    /// Input: reg = record-format BLOB. Output: reg = PG array text like '{1,2,3}'.
     ArrayDecode {
         reg: usize,
     },
@@ -729,7 +737,42 @@ pub enum Insn {
         base: usize,
         offset_reg: usize,
     },
-
+    /// Read `registers[amount]` bytes at `registers[offset]` within column `column`
+    /// of the cursor's current table row into `dest` (as a blob), following overflow
+    /// pages. The VDBE backing for sqlite3_blob_read: byte-level payload access
+    /// without materializing the whole value. Stores NULL into `dest` when the
+    /// handle expired (the row was written after the cursor pinned it): expiry is a
+    /// per-operation failure in SQLite (SQLITE_ABORT), not a program abort, so the
+    /// paused blob program and its transaction must stay alive.
+    BlobRead {
+        cursor: CursorID,
+        column: usize,
+        offset: usize,
+        amount: usize,
+        dest: usize,
+    },
+    /// Write the blob in `src` at `registers[offset]` within column `column` of the
+    /// cursor's current table row, in place across the local page and overflow chain.
+    /// The VDBE backing for sqlite3_blob_write; cannot change the value's size.
+    /// Stores 1 into `dest` on success, or NULL when the handle expired (see
+    /// BlobRead) — expiry must not abort the program, because writes made before it
+    /// belong to the paused program's transaction and must survive to commit.
+    BlobWrite {
+        cursor: CursorID,
+        column: usize,
+        offset: usize,
+        src: usize,
+        dest: usize,
+    },
+    /// Store the byte length of column `column` of the cursor's current table row
+    /// into `dest`, erroring unless the value is byte-addressable (TEXT or BLOB).
+    /// The VDBE backing for sqlite3_blob_open's length and type validation, run by
+    /// the same program that holds the row's cursor so the answer cannot go stale.
+    BlobLen {
+        cursor: CursorID,
+        column: usize,
+        dest: usize,
+    },
     /// Concatenate/append/prepend arrays. PostgreSQL-compatible semantics:
     /// - blob || blob → array_cat
     /// - blob || scalar → array_append
@@ -762,9 +805,9 @@ pub enum Insn {
 
     // Make a record and write it to destination register.
     MakeRecord {
-        start_reg: u16, // P1
-        count: u16,     // P2
-        dest_reg: u16,  // P3
+        start_reg: u32, // P1
+        count: u32,     // P2
+        dest_reg: u32,  // P3
         index_name: Option<String>,
         affinity_str: Option<String>,
     },
@@ -890,7 +933,7 @@ pub enum Insn {
 
     /// Write a blob value into a register.
     Blob {
-        value: Vec<u8>,
+        value: crate::ValueBlob,
         dest: usize,
     },
 
@@ -959,7 +1002,7 @@ pub enum Insn {
         cursor_id: CursorID,
         record_reg: usize, // P2 the register containing the record to insert
         unpacked_start: Option<usize>, // P3 the index of the first register for the unpacked key
-        unpacked_count: Option<u16>, // P4 # of unpacked values in the key in P2
+        unpacked_count: Option<u32>, // P4 # of unpacked values in the key in P2
         flags: IdxInsertFlags, // TODO: optimization
     },
 
@@ -1036,6 +1079,21 @@ pub enum Insn {
         delimiter: usize,
         func: AccumulatorFunc,
         /// Optional custom type comparator for MIN/MAX aggregates.
+        comparator: Option<SortComparatorType>,
+        /// Collation for comparison-based aggregates (MIN/MAX), resolved at
+        /// translation time from the argument expression.
+        collation: Option<CollationSeq>,
+    },
+
+    /// Mirror-image of AggStep: fires when a row crosses the frame-start
+    /// cursor on its way out of the frame. The runtime arm undoes the
+    /// matching xStep — sum subtracts, count decrements, position
+    /// counters advance.
+    AggInverse {
+        acc_reg: usize,
+        col: usize,
+        delimiter: usize,
+        func: AccumulatorFunc,
         comparator: Option<SortComparatorType>,
     },
 
@@ -1499,21 +1557,6 @@ pub enum Insn {
         target_pc: BranchOffset,
     },
 
-    /// Set the collation sequence for the next function call.
-    /// P4 is a pointer to a CollationSeq. If the next call to a user function
-    /// or aggregate calls sqlite3GetFuncCollSeq(), this collation sequence will
-    /// be returned. This is used by the built-in min(), max() and nullif()
-    /// functions.
-    ///
-    /// If P1 is not zero, then it is a register that a subsequent min() or
-    /// max() aggregate will set to 1 if the current row is not the minimum or
-    /// maximum.  The P1 register is initialized to 0 by this instruction.
-    CollSeq {
-        /// Optional register to initialize to 0 (P1).
-        reg: Option<usize>,
-        /// The collation sequence to set (P4).
-        collation: CollationSeq,
-    },
     ParseSchema {
         db: usize,
         where_clause: Option<String>,
@@ -1690,10 +1733,14 @@ pub enum Insn {
     /// otherwise writes a textual error summary.
     /// Higher-level semantic checks (row/index consistency, constraints, etc.)
     /// are emitted as normal VDBE bytecode in translation.
+    ///
+    /// In passive MVCC mode, `dropped_roots` lists checkpointed objects dropped before the next
+    /// checkpoint; execute walks them after live roots and skips pages already accounted for.
     IntegrityCk {
         db: usize,
         max_errors: usize,
         roots: Vec<i64>,
+        dropped_roots: Vec<i64>,
         message_register: usize,
     },
     RenameTable {
@@ -1808,21 +1855,21 @@ pub enum Insn {
     /// payload_dest_reg..payload_dest_reg+num_payload-1.
     /// If no matches, jump to target_pc.
     HashProbe {
-        hash_table_id: u16,
-        key_start_reg: u16,
-        num_keys: u16,
-        dest_reg: u16,
+        hash_table_id: u32,
+        key_start_reg: u32,
+        num_keys: u32,
+        dest_reg: u32,
         target_pc: BranchOffset,
         /// Starting register to write payload columns from hash entry.
-        payload_dest_reg: Option<u16>,
+        payload_dest_reg: Option<u32>,
         /// Number of payload columns expected
-        num_payload: u16,
+        num_payload: u32,
         /// Register containing probe-side rowid for grace hash join buffering.
         /// When Some and target partition is on disk, buffer the probe row
         /// instead of loading the partition on demand.
         /// When None, this instruction is running inside grace processing and
         /// the build partition must already be loaded.
-        probe_rowid_reg: Option<u16>,
+        probe_rowid_reg: Option<u32>,
     },
 
     /// Advance to next matching row in hash table bucket.
@@ -1888,14 +1935,14 @@ pub enum Insn {
     /// Finalizes probe-side spills and calls grace_begin.
     /// Jumps to target_pc if no spilling occurred or no partitions to process.
     HashGraceInit {
-        hash_table_id: u16,
+        hash_table_id: u32,
         target_pc: BranchOffset,
     },
 
     /// Load the current grace partition's build side from disk.
     /// Also loads the first probe chunk. Jumps to target_pc when all partitions done.
     HashGraceLoadPartition {
-        hash_table_id: u16,
+        hash_table_id: u32,
         target_pc: BranchOffset,
     },
 
@@ -1903,17 +1950,17 @@ pub enum Insn {
     /// Writes probe keys to key_start_reg..key_start_reg+num_keys-1 and probe rowid to probe_rowid_dest.
     /// Jumps to target_pc when probe entries exhausted.
     HashGraceNextProbe {
-        hash_table_id: u16,
-        key_start_reg: u16,
-        num_keys: u16,
-        probe_rowid_dest: u16,
+        hash_table_id: u32,
+        key_start_reg: u32,
+        num_keys: u32,
+        probe_rowid_dest: u32,
         target_pc: BranchOffset,
     },
 
     /// Evict current grace partition and advance to the next one.
     /// Jumps to target_pc when all partitions are processed.
     HashGraceAdvancePartition {
-        hash_table_id: u16,
+        hash_table_id: u32,
         target_pc: BranchOffset,
     },
 
@@ -2031,6 +2078,9 @@ impl InsnVariants {
             InsnVariants::UnionTag => execute::op_union_tag,
             InsnVariants::UnionExtract => execute::op_union_extract,
             InsnVariants::RegCopyOffset => execute::op_reg_copy_offset,
+            InsnVariants::BlobRead => execute::op_blob_read,
+            InsnVariants::BlobWrite => execute::op_blob_write,
+            InsnVariants::BlobLen => execute::op_blob_len,
             InsnVariants::ArrayConcat => execute::op_array_concat,
             InsnVariants::ArraySetElement => execute::op_array_set_element,
             InsnVariants::ArraySlice => execute::op_array_slice,
@@ -2069,6 +2119,7 @@ impl InsnVariants {
             InsnVariants::IdxLT => execute::op_idx_lt,
             InsnVariants::DecrJumpZero => execute::op_decr_jump_zero,
             InsnVariants::AggStep => execute::op_agg_step,
+            InsnVariants::AggInverse => execute::op_agg_inverse,
             InsnVariants::AggFinal | InsnVariants::AggValue => execute::op_agg_final,
             InsnVariants::SorterOpen => execute::op_sorter_open,
             InsnVariants::SorterInsert => execute::op_sorter_insert,
@@ -2119,7 +2170,6 @@ impl InsnVariants {
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
-            InsnVariants::CollSeq => execute::op_coll_seq,
             InsnVariants::ParseSchema => execute::op_parse_schema,
             InsnVariants::PopulateMaterializedViews => execute::op_populate_materialized_views,
             InsnVariants::ShiftRight => execute::op_shift_right,
@@ -2188,7 +2238,7 @@ impl Insn {
     // SAFETY: If the enumeration specifies a primitive representation,
     // then the discriminant may be reliably accessed via unsafe pointer casting
     #[inline(always)]
-    const fn discriminant(&self) -> u8 {
+    pub(crate) const fn discriminant(&self) -> u8 {
         unsafe { *(self as *const Self as *const u8) }
     }
 
@@ -2294,5 +2344,17 @@ mod tests {
                 variant, *variant as usize
             );
         }
+    }
+
+    #[test]
+    fn test_insn_size_does_not_grow() {
+        // Interpreter dispatch is sensitive to instruction size. Widening a
+        // variant past the current largest one silently degrades every query;
+        // grow this bound only deliberately.
+        assert!(
+            std::mem::size_of::<super::Insn>() <= 96,
+            "Insn grew to {} bytes",
+            std::mem::size_of::<super::Insn>()
+        );
     }
 }

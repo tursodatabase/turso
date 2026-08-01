@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+use std::sync::Arc;
 
 use core_tester::common::rng_from_time_or_env;
 use rand::{RngCore, SeedableRng};
@@ -15,7 +17,6 @@ use turso_core::{
     vector::{self, vector_types::VectorType},
     Numeric, Register, Result, Value, MAIN_DB_ID,
 };
-use turso_parser::ast::SortOrder;
 
 use crate::common::{limbo_exec_rows, TempDatabase};
 
@@ -32,9 +33,53 @@ fn run<T>(db: &TempDatabase, mut f: impl FnMut() -> Result<IOResult<T>>) -> Resu
     }
 }
 
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+fn fts_test_stats(
+    db: &TempDatabase,
+    conn: &Arc<turso_core::Connection>,
+    table_name: &str,
+    index_name: &str,
+    columns: &[(&str, usize)],
+) -> turso_core::index_method::IndexMethodTestStats {
+    let attachment = FtsIndexMethod
+        .attach(&IndexMethodConfiguration {
+            table_name: table_name.to_string(),
+            index_name: index_name.to_string(),
+            columns: columns
+                .iter()
+                .map(|&(name, index)| IndexColumn::new(name, index))
+                .collect(),
+            parameters: HashMap::default(),
+        })
+        .unwrap();
+    let mut cursor = attachment.init().unwrap();
+    run(db, || cursor.open_read(conn, MAIN_DB_ID)).unwrap();
+    cursor.test_stats().unwrap().unwrap()
+}
+
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+fn fts_attachment_test_stats(
+    db: &TempDatabase,
+    conn: &Arc<turso_core::Connection>,
+    table_name: &str,
+    index_name: &str,
+) -> turso_core::index_method::IndexMethodTestStats {
+    let attachment = conn
+        .with_schema_mut(|schema| {
+            schema
+                .get_index(table_name, index_name)
+                .and_then(|index| index.index_method.clone())
+        })
+        .unwrap()
+        .expect("FTS attachment must exist in the connection schema");
+    let mut cursor = attachment.init().unwrap();
+    run(db, || cursor.open_read(conn, MAIN_DB_ID)).unwrap();
+    cursor.test_stats().unwrap().unwrap()
+}
+
 fn sparse_vector(v: &str) -> Value {
     let vector = vector::operations::text::vector_from_text(VectorType::Float32Sparse, v).unwrap();
-    vector::operations::serialize::vector_serialize(vector)
+    vector::operations::serialize::vector_serialize(vector).expect(turso_core::alloc::ALLOC_ERR_MSG)
 }
 
 // TODO: cannot use MVCC as we use indexes here
@@ -60,14 +105,7 @@ fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "t".to_string(),
             index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn {
-                name: "embedding".to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: 1,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: vec![IndexColumn::new("embedding", 1)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -103,14 +141,7 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "t".to_string(),
             index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn {
-                name: "embedding".to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: 1,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: vec![IndexColumn::new("embedding", 1)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -193,14 +224,7 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "t".to_string(),
             index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn {
-                name: "embedding".to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: 1,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: vec![IndexColumn::new("embedding", 1)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -342,7 +366,9 @@ fn test_vector_sparse_ivf_fuzz(tmp_db: TempDatabase) {
             } else {
                 let v = vector(&mut rng);
                 let k = rng.next_u32() % 20 + 1;
-                let sql = format!("SELECT key, vector_distance_jaccard(embedding, vector32_sparse('{v}')) as d FROM t ORDER BY d LIMIT {k}");
+                let sql = format!(
+                    "SELECT key, vector_distance_jaccard(embedding, vector32_sparse('{v}')) as d FROM t ORDER BY d LIMIT {k}"
+                );
                 tracing::info!("({}) {}", operation, sql);
                 let simple_rows = limbo_exec_rows(&simple_conn, &sql);
                 let index_rows = limbo_exec_rows(&index_conn, &sql);
@@ -411,24 +437,7 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "fts_docs".to_string(),
-            columns: vec![
-                IndexColumn {
-                    name: "title".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 1,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: "body".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 2,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-            ],
+            columns: vec![IndexColumn::new("title", 1), IndexColumn::new("body", 2)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -470,24 +479,7 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "fts_docs".to_string(),
-            columns: vec![
-                IndexColumn {
-                    name: "title".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 1,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: "body".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 2,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-            ],
+            columns: vec![IndexColumn::new("title", 1), IndexColumn::new("body", 2)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -1758,8 +1750,43 @@ fn test_fts_optimize_index(tmp_db: TempDatabase) {
     );
     assert_eq!(rows.len(), 10, "Should find all 10 documents");
 
+    // Open an independent cursor so the catalog is reconstructed from the
+    // physical backing B-tree rather than inherited from an attachment cache.
+    #[cfg(feature = "test_helper")]
+    let stats_before_optimize = fts_test_stats(
+        &tmp_db,
+        &conn,
+        "docs",
+        "fts_docs",
+        &[("title", 1), ("body", 2)],
+    );
+    #[cfg(feature = "test_helper")]
+    assert_eq!(
+        stats_before_optimize.segment_count,
+        Some(3),
+        "base-8 maintenance should compact 10 single-row commits to 3 segments"
+    );
+
     // Run OPTIMIZE INDEX on specific index
     conn.execute("OPTIMIZE INDEX fts_docs").unwrap();
+    #[cfg(feature = "test_helper")]
+    let stats_after_optimize = fts_test_stats(
+        &tmp_db,
+        &conn,
+        "docs",
+        "fts_docs",
+        &[("title", 1), ("body", 2)],
+    );
+    #[cfg(feature = "test_helper")]
+    assert_eq!(stats_after_optimize.segment_count, Some(1));
+    #[cfg(feature = "test_helper")]
+    assert!(
+        stats_after_optimize.storage_file_count < stats_before_optimize.storage_file_count,
+        "optimize must physically remove obsolete segment files: \
+         before={}, after={}",
+        stats_before_optimize.storage_file_count,
+        stats_after_optimize.storage_file_count
+    );
 
     // Verify documents are still searchable after optimize
     let rows = limbo_exec_rows(
@@ -2310,4 +2337,349 @@ fn test_fts_multi_table_join(tmp_db: TempDatabase) {
         .collect();
     assert!(titles.contains(&"Database Systems".to_string()));
     assert!(titles.contains(&"SQL Performance".to_string()));
+}
+
+/// Regression test for issue 7522: a rolled-back transaction containing FTS
+/// writes and OPTIMIZE INDEX must not leave the shared directory cache
+/// pointing at segment files whose BTree rows were rolled back. Before the
+/// fix, the next write against the index failed with
+/// `FileDoesNotExist("<uuid>.term")`.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[test]
+fn fts_rolled_back_optimize_does_not_leak_segment_state() {
+    let _ = env_logger::try_init();
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT, f TEXT, b BLOB)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx ON t USING fts(f)").unwrap();
+    conn.execute(
+        "INSERT INTO t(id,x,f,b) VALUES (270323, 'x', 'optimize', X'01'), (-596572, NULL, 'foo', X'02')",
+    )
+    .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("UPDATE t SET b=X'D9', f='rust token full search text search rollback'")
+        .unwrap();
+    conn.execute("OPTIMIZE INDEX idx").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    // Writes after the rollback must see the pre-transaction index state.
+    conn.execute("INSERT INTO t(id) VALUES (32378), (NULL), (524997)")
+        .unwrap();
+    conn.execute("DELETE FROM t WHERE x").unwrap();
+
+    // The rolled-back UPDATE must not be searchable; the surviving row is.
+    let hits = limbo_exec_rows(&conn, "SELECT id FROM t WHERE f MATCH 'foo'");
+    assert_eq!(
+        hits.len(),
+        1,
+        "pre-transaction document must remain searchable"
+    );
+    let rolled_back = limbo_exec_rows(&conn, "SELECT id FROM t WHERE f MATCH 'rollback'");
+    assert!(
+        rolled_back.is_empty(),
+        "rolled-back document must not be searchable"
+    );
+}
+
+/// Automatic segment maintenance runs inside the caller's transaction. A
+/// rollback must restore both the pre-merge metadata and every old segment
+/// file, and the next write must be able to merge those restored segments.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_rolled_back_automatic_merge_restores_segments() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    for id in 0..7 {
+        conn.execute(format!(
+            "INSERT INTO docs VALUES ({id}, 'committed common document {id}')"
+        ))
+        .unwrap();
+    }
+    assert_eq!(
+        fts_test_stats(&tmp_db, &conn, "docs", "docs_fts", &[("body", 1)]).segment_count,
+        Some(7)
+    );
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO docs VALUES (7, 'ephemeralrollbacktoken common document')")
+        .unwrap();
+    assert_eq!(
+        fts_test_stats(&tmp_db, &conn, "docs", "docs_fts", &[("body", 1)]).segment_count,
+        Some(1),
+        "the eighth segment should trigger maintenance inside the transaction"
+    );
+    conn.execute("ROLLBACK").unwrap();
+
+    assert_eq!(
+        fts_test_stats(&tmp_db, &conn, "docs", "docs_fts", &[("body", 1)]).segment_count,
+        Some(7),
+        "rollback must restore the seven pre-merge segments"
+    );
+    assert!(limbo_exec_rows(
+        &conn,
+        "SELECT id FROM docs WHERE fts_match(body, 'ephemeralrollbacktoken')"
+    )
+    .is_empty());
+
+    conn.execute("INSERT INTO docs VALUES (8, 'surviving common document')")
+        .unwrap();
+    assert_eq!(
+        fts_test_stats(&tmp_db, &conn, "docs", "docs_fts", &[("body", 1)]).segment_count,
+        Some(1),
+        "the next committed write should merge the restored segments"
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT id FROM docs WHERE fts_match(body, 'common')").len(),
+        8
+    );
+}
+
+/// Sequential INSERT statements should retain the committed Tantivy writer
+/// while the backing B-tree metadata remains unchanged.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_reuses_committed_writer_across_insert_statements() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+
+    conn.execute("INSERT INTO docs VALUES (1, 'first retained writer document')")
+        .unwrap();
+    assert_eq!(
+        fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts").cached_writer,
+        Some(true)
+    );
+
+    conn.execute("INSERT INTO docs VALUES (2, 'second retained writer document')")
+        .unwrap();
+    assert_eq!(
+        fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts").cached_writer,
+        Some(true)
+    );
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'retained')"
+        )
+        .len(),
+        2
+    );
+
+    // Destroying an index must release the retained Tantivy writer and its
+    // directory lock so an index with the same name can be created immediately.
+    conn.execute("DROP INDEX docs_fts").unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(body, 'retained')"
+        )
+        .len(),
+        2
+    );
+}
+
+/// FTS read state belongs to the connection snapshot that populated it.
+/// Sharing that state with another connection must not expose uncommitted index
+/// maintenance from an active writer transaction.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[test]
+fn fts_uncommitted_changes_are_connection_isolated() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .build();
+    let writer = tmp_db.connect_limbo();
+    let observer = tmp_db.connect_limbo();
+
+    writer
+        .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, content TEXT)")
+        .unwrap();
+    writer
+        .execute("CREATE INDEX docs_fts ON docs USING fts(content)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO docs VALUES (10, 'charlie'), (13, 'charlie'), (20, 'unrelated')")
+        .unwrap();
+
+    let query = "SELECT id FROM docs WHERE fts_match(content, 'charlie') ORDER BY id";
+    assert_eq!(
+        limbo_exec_rows(&observer, query),
+        vec![
+            vec![rusqlite::types::Value::Integer(10)],
+            vec![rusqlite::types::Value::Integer(13)],
+        ]
+    );
+    assert_eq!(
+        limbo_exec_rows(&writer, query),
+        vec![
+            vec![rusqlite::types::Value::Integer(10)],
+            vec![rusqlite::types::Value::Integer(13)],
+        ],
+        "writer should warm its own cached read state before starting the transaction"
+    );
+
+    writer.execute("BEGIN").unwrap();
+    writer
+        .execute("UPDATE docs SET content = NULL WHERE id = 10")
+        .unwrap();
+    writer
+        .execute("INSERT INTO docs VALUES (14, 'charlie')")
+        .unwrap();
+
+    assert_eq!(
+        limbo_exec_rows(&writer, query),
+        vec![
+            vec![rusqlite::types::Value::Integer(13)],
+            vec![rusqlite::types::Value::Integer(14)],
+        ]
+    );
+    assert_eq!(
+        limbo_exec_rows(&observer, query),
+        vec![
+            vec![rusqlite::types::Value::Integer(10)],
+            vec![rusqlite::types::Value::Integer(13)],
+        ],
+        "observer must retain its committed FTS snapshot"
+    );
+
+    writer.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        limbo_exec_rows(&writer, query),
+        vec![
+            vec![rusqlite::types::Value::Integer(10)],
+            vec![rusqlite::types::Value::Integer(13)],
+        ]
+    );
+
+    writer
+        .execute("INSERT INTO docs VALUES (14, 'charlie')")
+        .unwrap();
+    assert_eq!(
+        limbo_exec_rows(&observer, query),
+        vec![
+            vec![rusqlite::types::Value::Integer(10)],
+            vec![rusqlite::types::Value::Integer(13)],
+            vec![rusqlite::types::Value::Integer(14)],
+        ],
+        "observer must discard its cached FTS state when the WAL snapshot advances"
+    );
+}
+
+/// Alternating readers must retain independent snapshot caches instead of
+/// repeatedly replacing one global cache entry. The cache is bounded so a
+/// large connection pool cannot retain unbounded Tantivy state.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_read_cache_is_connection_local_and_bounded() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .build();
+    let setup = tmp_db.connect_limbo();
+    setup
+        .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, content TEXT)")
+        .unwrap();
+    setup
+        .execute("CREATE INDEX docs_fts ON docs USING fts(content)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO docs VALUES (1, 'database document')")
+        .unwrap();
+
+    let attachment = FtsIndexMethod
+        .attach(&IndexMethodConfiguration {
+            table_name: "docs".to_string(),
+            index_name: "docs_fts".to_string(),
+            columns: vec![IndexColumn::new("content", 1)],
+            parameters: HashMap::default(),
+        })
+        .unwrap();
+    let readers = (0..5).map(|_| tmp_db.connect_limbo()).collect::<Vec<_>>();
+
+    for (reader_index, expected_cached) in [(0, 1), (1, 2), (0, 2), (1, 2), (2, 3), (3, 4), (4, 4)]
+    {
+        let mut cursor = attachment.init().unwrap();
+        run(&tmp_db, || {
+            cursor.open_read(&readers[reader_index], MAIN_DB_ID)
+        })
+        .unwrap();
+        let stats = cursor.test_stats().unwrap().unwrap();
+        assert_eq!(
+            stats.cached_connection_count,
+            Some(expected_cached),
+            "unexpected cache size after reader {reader_index}"
+        );
+        assert!(
+            stats.cached_bytes.unwrap() <= 192 * 1024 * 1024,
+            "retained connection caches exceeded the aggregate file-cache budget"
+        );
+    }
+}
+
+/// Unordered MATCH cursors stream from Tantivy. UPDATE and DELETE must first
+/// collect their rowids so index maintenance cannot perturb the active scorer.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[test]
+fn fts_streaming_dml_collects_stable_rowids() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .build();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, content TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(content)")
+        .unwrap();
+
+    let values = (0..32)
+        .map(|id| format!("({id}, 'common document {id}')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    conn.execute(format!("INSERT INTO docs VALUES {values}"))
+        .unwrap();
+
+    conn.execute(
+        "UPDATE docs SET content = 'updated document' \
+         WHERE fts_match(content, 'common')",
+    )
+    .unwrap();
+    assert!(limbo_exec_rows(
+        &conn,
+        "SELECT id FROM docs WHERE fts_match(content, 'common')"
+    )
+    .is_empty());
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT id FROM docs WHERE fts_match(content, 'updated')"
+        )
+        .len(),
+        32
+    );
+
+    conn.execute("DELETE FROM docs WHERE fts_match(content, 'updated')")
+        .unwrap();
+    assert!(limbo_exec_rows(&conn, "SELECT id FROM docs").is_empty());
+    assert!(limbo_exec_rows(
+        &conn,
+        "SELECT id FROM docs WHERE fts_match(content, 'updated')"
+    )
+    .is_empty());
 }

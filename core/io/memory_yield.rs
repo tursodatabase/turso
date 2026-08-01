@@ -211,6 +211,7 @@ impl File for MemoryYieldFile {
 mod tests {
     use super::*;
     use crate::vdbe::StepResult;
+    use crate::SqliteDialect;
     use crate::{Database, IOResult, OpenFlags};
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -356,7 +357,8 @@ mod tests {
     fn engine_yields_and_round_trips() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryYieldIO::new());
-        let db = Database::open_file(io.clone(), "memory_yield_test.db").unwrap();
+        let db = Database::open_file(io.clone(), "memory_yield_test.db", Arc::new(SqliteDialect))
+            .unwrap();
         let conn = db.connect().unwrap();
 
         // Step statements manually so we can observe the cooperative-yield path.
@@ -403,7 +405,12 @@ mod tests {
     fn journal_mode_mvcc_bootstrap_yields_without_internal_step() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(StepGuardedIO::new());
-        let db = Database::open_file(io.clone(), "journal_mode_mvcc_yield.db").unwrap();
+        let db = Database::open_file(
+            io.clone(),
+            "journal_mode_mvcc_yield.db",
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
         let mut stmt = conn.prepare("PRAGMA journal_mode = 'mvcc'").unwrap();
 
@@ -446,6 +453,7 @@ mod tests {
             OpenFlags::Create,
             crate::DatabaseOpts::new().with_attach(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -488,7 +496,8 @@ mod tests {
     fn pager_allocate_and_free_yield_for_header_reads_without_internal_step() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(StepGuardedIO::new());
-        let db = Database::open_file(io.clone(), "pager_header_yield.db").unwrap();
+        let db = Database::open_file(io.clone(), "pager_header_yield.db", Arc::new(SqliteDialect))
+            .unwrap();
         let conn = db.connect().unwrap();
         conn.execute("CREATE TABLE t(x)").unwrap();
 
@@ -516,7 +525,12 @@ mod tests {
     fn overflow_delete_yields_for_header_validation_without_internal_step() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(StepGuardedIO::new());
-        let db = Database::open_file(io.clone(), "overflow_delete_yield.db").unwrap();
+        let db = Database::open_file(
+            io.clone(),
+            "overflow_delete_yield.db",
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
         conn.execute("CREATE TABLE t(x BLOB)").unwrap();
         conn.execute("INSERT INTO t VALUES (zeroblob(20000))")
@@ -544,5 +558,92 @@ mod tests {
             io_yields > 0,
             "overflow DELETE should yield while clearing overflow pages"
         );
+    }
+
+    /// Local reproduction of the OPFS/WASM "insert hang" reported against
+    /// `@tursodatabase/database-wasm`: seeding a database stalls while adding
+    /// records, and a larger page size avoids it.
+    ///
+    /// This needs no WASM build or browser — it models the exact browser
+    /// constraint. On the browser main thread OPFS completions are delivered
+    /// only when control returns to the JS event loop, and `IO::step()` is a
+    /// no-op there. `StepGuardedIO` enforces that: `io.step()` may run only from
+    /// the driver loop below (mirroring the JS `stepSync()`/`await io()` loop),
+    /// never from inside `stmt.step()`. If the engine drives IO internally, the
+    /// assertion in `StepGuardedIO::step` fires — that is the browser hang.
+    ///
+    /// The trigger is mid-transaction cache spilling: a small page cache with
+    /// spilling enabled and a single transaction that dirties far more pages
+    /// than the cache can hold. The pager spills dirty pages to the WAL via
+    /// `WalFile::append_frames_vectored`, which awaits the write with a blocking
+    /// `io.drain_completions(...)` (core/storage/wal.rs) instead of yielding
+    /// `StepResult::IO`. That blocking wait is the bug.
+    ///
+    /// Run it with:
+    ///   cargo test -p turso_core --features io_memory_yield \
+    ///       memory_yield::tests::wasm_opfs_cache_spill_insert_hang
+    #[test]
+    fn wasm_opfs_cache_spill_insert_hang() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let io = Arc::new(StepGuardedIO::new());
+        let db = Database::open_file(
+            io.clone(),
+            "wasm_opfs_spill_hang.db",
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+
+        // Drive one statement to completion exactly like the WASM/OPFS JS
+        // binding does: step, and on StepResult::IO hand control back to the
+        // "event loop" (the driver's io.step()). The engine must only ever
+        // *yield* IO here, never drive it itself.
+        let run = |sql: &str| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            loop {
+                io.set_step_allowed(false);
+                let step = stmt.step();
+                io.set_step_allowed(true);
+                match step.unwrap() {
+                    StepResult::IO => io.step().unwrap(),
+                    StepResult::Row => {}
+                    StepResult::Done => break,
+                    other => panic!("unexpected step result: {other:?}"),
+                }
+            }
+        };
+
+        // Small cache + spilling enabled (this is the WASM default for spill,
+        // but we set it explicitly so the test is platform-independent).
+        run("PRAGMA cache_size=200");
+        run("PRAGMA cache_spill=ON");
+        run("CREATE TABLE t(x)");
+
+        // One transaction that dirties far more than 200 pages, forcing the
+        // pager to spill dirty pages to the WAL before COMMIT.
+        run("BEGIN");
+        for _ in 0..500 {
+            run("INSERT INTO t VALUES (randomblob(4000))");
+        }
+        run("COMMIT");
+
+        let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
+        io.set_step_allowed(false);
+        loop {
+            let step = stmt.step();
+            match step.unwrap() {
+                StepResult::IO => {
+                    io.set_step_allowed(true);
+                    io.step().unwrap();
+                    io.set_step_allowed(false);
+                }
+                StepResult::Row => {
+                    let n = stmt.row().unwrap().get_values().next().unwrap().clone();
+                    assert_eq!(n, crate::Value::from_i64(500));
+                }
+                StepResult::Done => break,
+                other => panic!("unexpected step result: {other:?}"),
+            }
+        }
     }
 }

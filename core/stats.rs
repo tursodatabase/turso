@@ -1,6 +1,7 @@
 use crate::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
 
+use crate::alloc::TursoVecExt;
 use crate::schema::Schema;
 use crate::translate::emitter::TransactionMode;
 use crate::types::IOResult;
@@ -120,9 +121,11 @@ pub fn refresh_analyze_stats(conn: &Arc<Connection>) {
 
     let mv_tx = conn.get_mv_tx();
     if let Ok(stats) = gather_sqlite_stat1(conn, &schema_snapshot, mv_tx) {
-        conn.with_schema_mut(|schema| {
+        if let Err(e) = conn.with_schema_mut(|schema| {
             schema.analyze_stats = stats;
-        });
+        }) {
+            tracing::warn!("Failed to refresh analyze stats: {e}");
+        }
     }
 }
 
@@ -179,9 +182,11 @@ pub fn refresh_analyze_stats_nonblock(
                     Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                     Ok(IOResult::Done(())) => {
                         let stats = std::mem::take(stats);
-                        conn.with_schema_mut(|schema| {
+                        if let Err(e) = conn.with_schema_mut(|schema| {
                             schema.analyze_stats = stats;
-                        });
+                        }) {
+                            tracing::warn!("Failed to refresh analyze stats: {e}");
+                        }
                         *st = RefreshAnalyzeStatsState::Start;
                         return Ok(IOResult::Done(()));
                     }
@@ -342,8 +347,9 @@ impl StatAccum {
     }
 
     /// Serialize to bytes for storage in a blob register.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(8 + 8 + 8 * self.n_col);
+    pub fn to_bytes(&self) -> crate::ValueBlob {
+        let mut bytes =
+            <crate::ValueBlob as TursoVecExt<u8>>::with_capacity(8 + 8 + 8 * self.n_col);
         bytes.extend_from_slice(&(self.n_col as u64).to_le_bytes());
         bytes.extend_from_slice(&self.n_row.to_le_bytes());
         for &d in &self.distinct {

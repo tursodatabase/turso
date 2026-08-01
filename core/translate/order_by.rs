@@ -14,7 +14,7 @@ use crate::{
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u16, IdxInsertFlags, Insn},
+        insn::{to_u32, IdxInsertFlags, Insn},
     },
     Result,
 };
@@ -232,14 +232,7 @@ impl EmitOrderBy {
             })?;
             for _ in remappings.iter().filter(|r| !r.deduplicated) {
                 let pos_in_table = index_columns.len();
-                index_columns.try_push(IndexColumn {
-                    name: pos_in_table.to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                })?;
+                index_columns.try_push(IndexColumn::new(pos_in_table.to_string(), pos_in_table))?;
             }
             let index = Arc::new(Index {
                 name: index_name,
@@ -668,9 +661,9 @@ impl EmitOrderBy {
 
         if *use_heap_sort {
             program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u16(start_reg),
-                count: to_u16(orderby_sorter_column_count),
-                dest_reg: to_u16(*reg_sorter_data),
+                start_reg: to_u32(start_reg),
+                count: to_u32(orderby_sorter_column_count),
+                dest_reg: to_u32(*reg_sorter_data),
                 index_name: None,
                 affinity_str: None,
             });
@@ -705,9 +698,9 @@ pub fn sorter_insert(
     record_reg: usize,
 ) {
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(start_reg),
-        count: to_u16(column_count),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(start_reg),
+        count: to_u32(column_count),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
     });
@@ -752,20 +745,23 @@ pub fn order_by_deduplicate_result_columns(
             .iter()
             .enumerate()
             .find(|(_, (expr, _, _))| exprs_are_equivalent(expr, &rc.expr));
-        // No need to use `try_push` as we preallocated enough capacity already
         if let Some((j, _)) = found {
-            result_column_remapping.push(OrderByRemapping {
-                orderby_sorter_idx: j,
-                deduplicated: true,
-            });
+            result_column_remapping
+                .push_within_capacity(OrderByRemapping {
+                    orderby_sorter_idx: j,
+                    deduplicated: true,
+                })
+                .expect("ORDER BY remapping vector was preallocated to result_columns.len()");
         } else {
             // This result column is not a duplicate of any ORDER BY key, so its sorter
             // index comes after all ORDER BY entries (hence the +order_by_len). The
             // counter `i` tracks how many such non-duplicate result columns we've seen.
-            result_column_remapping.push(OrderByRemapping {
-                orderby_sorter_idx: order_by_len + sequence_offset + i,
-                deduplicated: false,
-            });
+            result_column_remapping
+                .push_within_capacity(OrderByRemapping {
+                    orderby_sorter_idx: order_by_len + sequence_offset + i,
+                    deduplicated: false,
+                })
+                .expect("ORDER BY remapping vector was preallocated to result_columns.len()");
             i += 1;
         }
     }

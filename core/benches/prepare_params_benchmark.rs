@@ -14,6 +14,7 @@
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{
@@ -40,7 +41,7 @@ fn run_to_completion(stmt: &mut turso_core::Statement, db: &Arc<Database>) {
 
 fn open_with_table() -> (Arc<Database>, Arc<turso_core::Connection>) {
     let io = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:").unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect().unwrap();
     let mut stmt = conn
         .query(

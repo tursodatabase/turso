@@ -5,7 +5,7 @@ import {
   type QueryOptions
 } from './protocol.js';
 import { Session, type SessionConfig } from './session.js';
-import { type AsyncLock } from './async-lock.js';
+import { type Lock } from './async-lock.js';
 import { DatabaseError } from './error.js';
 import { normalizeArgs } from './args.js';
 import { createExpandedRow } from './row.js';
@@ -25,7 +25,7 @@ export class Statement {
   private presentationMode: 'expanded' | 'raw' | 'pluck' = 'expanded';
   private safeIntegerMode: boolean = false;
   private columnMetadata: Column[];
-  private execLock?: AsyncLock;
+  private execLock?: Lock;
 
   constructor(sessionConfig: SessionConfig, sql: string, columns?: Column[]) {
     this.session = new Session(sessionConfig);
@@ -38,7 +38,7 @@ export class Statement {
    * through the given lock. Used by Connection.prepare() so prepared statements
    * participate in the connection's transaction scope.
    */
-  static fromSession(session: Session, sql: string, columns: Column[] | undefined, execLock: AsyncLock): Statement {
+  static fromSession(session: Session, sql: string, columns: Column[] | undefined, execLock: Lock): Statement {
     const stmt = Object.create(Statement.prototype) as Statement;
     stmt.session = session;
     stmt.sql = sql;

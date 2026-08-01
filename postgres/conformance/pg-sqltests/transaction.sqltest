@@ -1,0 +1,41 @@
+# Transaction control through the PostgreSQL frontend.
+
+@database :memory:
+
+setup counter {
+    CREATE TABLE counter (n int);
+    INSERT INTO counter VALUES (0);
+}
+
+@setup counter
+test txn-commit-persists {
+    BEGIN;
+    UPDATE counter SET n = 1;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    1
+}
+
+@setup counter
+test txn-rollback-discards {
+    BEGIN;
+    UPDATE counter SET n = 1;
+    ROLLBACK;
+    SELECT n FROM counter;
+}
+expect {
+    0
+}
+
+@setup counter
+test txn-rollback-insert {
+    BEGIN;
+    INSERT INTO counter VALUES (99);
+    ROLLBACK;
+    SELECT count(*) FROM counter;
+}
+expect {
+    1
+}

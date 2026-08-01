@@ -43,7 +43,7 @@ pub fn json_patch(
         target = patch;
     } else {
         if target.element_type()? != super::jsonb::ElementType::OBJECT {
-            target = super::jsonb::Jsonb::make_empty_obj(0);
+            target = super::jsonb::Jsonb::make_empty_obj(0)?;
         }
         target.patch(&patch)?;
     }
@@ -75,7 +75,7 @@ pub fn jsonb_patch(
         target = patch;
     } else {
         if target.element_type()? != super::jsonb::ElementType::OBJECT {
-            target = super::jsonb::Jsonb::make_empty_obj(0);
+            target = super::jsonb::Jsonb::make_empty_obj(0)?;
         }
         target.patch(&patch)?;
     }
@@ -367,7 +367,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "blob is not supported!")]
     fn test_blob_not_supported() {
-        let target = Value::Blob(vec![1, 2, 3]);
+        let target = Value::from_slice(&[1, 2, 3]).expect(crate::alloc::ALLOC_ERR_MSG);
         let patch = create_text("{}");
         let cache = JsonCacheCell::new();
 

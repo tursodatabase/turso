@@ -1,0 +1,13 @@
+<Project>
+  <PropertyGroup>
+    <_TursoDataSqliteStaticNativeLibrary Condition="'$(_TursoDataSqliteStaticNativeLibrary)' == '' and '$(RuntimeIdentifier)' == 'win-x64' and Exists('$(MSBuildThisFileDirectory)native\win-x64\turso_sdk_kit.lib')">$(MSBuildThisFileDirectory)native\win-x64\turso_sdk_kit.lib</_TursoDataSqliteStaticNativeLibrary>
+    <_TursoDataSqliteStaticNativeLibrary Condition="'$(_TursoDataSqliteStaticNativeLibrary)' == '' and '$(RuntimeIdentifier)' == 'win-arm64' and Exists('$(MSBuildThisFileDirectory)native\win-arm64\turso_sdk_kit.lib')">$(MSBuildThisFileDirectory)native\win-arm64\turso_sdk_kit.lib</_TursoDataSqliteStaticNativeLibrary>
+    <_TursoDataSqliteStaticNativeLibrary Condition="'$(_TursoDataSqliteStaticNativeLibrary)' == '' and '$(RuntimeIdentifier)' == 'linux-x64' and Exists('$(MSBuildThisFileDirectory)native\linux-x64\libturso_sdk_kit.a')">$(MSBuildThisFileDirectory)native\linux-x64\libturso_sdk_kit.a</_TursoDataSqliteStaticNativeLibrary>
+    <_TursoDataSqliteStaticNativeLibrary Condition="'$(_TursoDataSqliteStaticNativeLibrary)' == '' and '$(RuntimeIdentifier)' == 'linux-arm64' and Exists('$(MSBuildThisFileDirectory)native\linux-arm64\libturso_sdk_kit.a')">$(MSBuildThisFileDirectory)native\linux-arm64\libturso_sdk_kit.a</_TursoDataSqliteStaticNativeLibrary>
+    <_TursoDataSqliteStaticNativeLibrary Condition="'$(_TursoDataSqliteStaticNativeLibrary)' == '' and '$(RuntimeIdentifier)' == 'osx-x64' and Exists('$(MSBuildThisFileDirectory)native\osx-x64\libturso_sdk_kit.a')">$(MSBuildThisFileDirectory)native\osx-x64\libturso_sdk_kit.a</_TursoDataSqliteStaticNativeLibrary>
+    <_TursoDataSqliteStaticNativeLibrary Condition="'$(_TursoDataSqliteStaticNativeLibrary)' == '' and '$(RuntimeIdentifier)' == 'osx-arm64' and Exists('$(MSBuildThisFileDirectory)native\osx-arm64\libturso_sdk_kit.a')">$(MSBuildThisFileDirectory)native\osx-arm64\libturso_sdk_kit.a</_TursoDataSqliteStaticNativeLibrary>
+
+    <_TursoDataSqliteStaticNativeDependencyDirectory Condition="'$(RuntimeIdentifier)' == 'win-x64' and '$(_TursoDataSqliteStaticNativeLibrary)' != ''">$(MSBuildThisFileDirectory)native\win-x64\</_TursoDataSqliteStaticNativeDependencyDirectory>
+    <_TursoDataSqliteStaticNativeDependencyDirectory Condition="'$(RuntimeIdentifier)' == 'win-arm64' and '$(_TursoDataSqliteStaticNativeLibrary)' != ''">$(MSBuildThisFileDirectory)native\win-arm64\</_TursoDataSqliteStaticNativeDependencyDirectory>
+  </PropertyGroup>
+</Project>

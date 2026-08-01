@@ -5,7 +5,10 @@ use pyo3::{
     types::{PyBytes, PyList, PyTuple},
     PyResult, Python,
 };
-use turso_sdk_kit::rsapi::{TursoDatabaseConfig, TursoStatusCode};
+use turso_sdk_kit::{
+    rsapi::{TursoDatabaseConfig, TursoStatusCode},
+    IoBackend,
+};
 use turso_sync_sdk_kit::{
     rsapi::{
         self, PartialBootstrapStrategy, PartialSyncOpts, TursoDatabaseSync,
@@ -85,7 +88,7 @@ impl PyRemoteEncryptionCipher {
 pub struct PyTursoSyncDatabaseConfig {
     // path to the main database file (auxilary files like metadata, WAL, revert, changes will derive names from this path)
     pub path: String,
-    // optional remote url (libsql://..., https://... or http://...)
+    // optional remote url (libsql://..., turso://..., https://... or http://...)
     // this URL will be saved in the database metadata file in order to be able to reuse it if later client will be constructed without explicit remote url
     pub remote_url: Option<String>,
     // arbitrary client name which will be used as a prefix for unique client id
@@ -101,6 +104,19 @@ pub struct PyTursoSyncDatabaseConfig {
     pub remote_encryption_key: Option<String>,
     // encryption cipher for the remote database (used to calculate reserved_bytes)
     pub remote_encryption_cipher: Option<PyRemoteEncryptionCipher>,
+    // optional cap on the number of CDC operations packed into a single push HTTP batch.
+    // when set, push splits on transaction boundaries once the current batch has accumulated
+    // at least this many operations. a single user transaction is never split across batches.
+    // None (default) sends the entire change set in one batch.
+    pub push_operations_threshold: Option<usize>,
+    // optional hint, in bytes, that splits the bootstrap download into multiple
+    // /pull-updates HTTP requests of >= this many bytes each. None (default) bootstraps
+    // in a single round-trip. no-op when partial-sync uses the query bootstrap strategy.
+    pub pull_bytes_threshold: Option<usize>,
+    // sync-protocol override: None (default) auto-detects the remote protocol
+    // from the first pull-updates response; Some(true) forces MVCC logical-log
+    // streams; Some(false) forces page streams
+    pub logical_mvcc_pull: Option<bool>,
 }
 
 #[pymethods]
@@ -116,6 +132,9 @@ impl PyTursoSyncDatabaseConfig {
         partial_sync=None,
         remote_encryption_key=None,
         remote_encryption_cipher=None,
+        push_operations_threshold=None,
+        pull_bytes_threshold=None,
+        logical_mvcc_pull=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -128,6 +147,9 @@ impl PyTursoSyncDatabaseConfig {
         partial_sync: Option<&PyTursoPartialSyncOpts>,
         remote_encryption_key: Option<String>,
         remote_encryption_cipher: Option<PyRemoteEncryptionCipher>,
+        push_operations_threshold: Option<usize>,
+        pull_bytes_threshold: Option<usize>,
+        logical_mvcc_pull: Option<bool>,
     ) -> Self {
         Self {
             path,
@@ -139,6 +161,9 @@ impl PyTursoSyncDatabaseConfig {
             partial_sync: partial_sync.cloned(),
             remote_encryption_key,
             remote_encryption_cipher,
+            push_operations_threshold,
+            pull_bytes_threshold,
+            logical_mvcc_pull,
         }
     }
 }
@@ -154,7 +179,7 @@ pub fn py_turso_sync_new(
         experimental_features: db_config.experimental_features.clone(),
         async_io: true, // we will drive IO externally which is especially important for partial sync
         encryption: None,
-        vfs: None,
+        vfs: IoBackend::Default,
         io: None,
         db_file: None,
     };
@@ -194,8 +219,9 @@ pub fn py_turso_sync_new(
             None => None,
         },
         remote_encryption_key: sync_config.remote_encryption_key.clone(),
-        push_operations_threshold: None,
-        pull_bytes_threshold: None,
+        push_operations_threshold: sync_config.push_operations_threshold,
+        pull_bytes_threshold: sync_config.pull_bytes_threshold,
+        logical_mvcc_pull: sync_config.logical_mvcc_pull,
     };
     let database =
         TursoDatabaseSync::<Vec<u8>>::new(db_config, sync_config).map_err(turso_error_to_py_err)?;

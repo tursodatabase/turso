@@ -13,11 +13,34 @@ cargo run -q --bin tursodb -- -q # run the interactive cli. never run with --rel
 
 make test                      # TCL compat + sqlite3 + extensions + MVCC
 make test-single TEST=foo.test # single TCL test
-make -C testing/sqltests run-rust ARGS='--snapshot-filter __never__'  # sqltest runner (preferred for new tests)
-CI=1 make -C testing/sqltests run-rust  # use only if snapshot tests are required
+make -C sqlite/conformance run-rust ARGS='--snapshot-filter __never__'  # sqltest runner (preferred for new tests)
+CI=1 make -C sqlite/conformance run-rust  # use only if snapshot tests are required
 
 scripts/diff.sh "SQL" [label]  # compare sqlite3 vs tursodb output
 ```
+
+## Testing
+
+### Running Tests
+
+- `cargo test` - Rust unit and integration tests
+- `make test` - broad compatibility suite (TCL, sqlite3, extensions, MVCC)
+- `make test-single TEST=foo.test` - single legacy TCL test
+- `make -C sqlite/conformance run-rust ARGS='--snapshot-filter __never__'` - preferred `.sqltest` runner for new coverage
+- `CI=1 make -C sqlite/conformance run-rust` - only when snapshot tests are required
+
+### Test Organization
+
+Default: add coverage to the narrowest existing test harness that can express the bug. Prefer extending an existing test file or directory over creating a new one.
+
+- `sqlite/conformance/sqlite-sqltests/` - preferred for SQL conformance coverage. These tests run the same scenario against both Turso and SQLite, so use them first for parser, planner, executor, and SQL semantics work that fits the `.sqltest` DSL.
+- `tests/integration/` - primary fallback when the behavior cannot be expressed cleanly in `.sqltest`. Put API-level regressions, multi-connection orchestration, storage assertions, injected failures, timeout behavior, and other Rust-driven scenarios here.
+- `sqlite/conformance/upstream/` - imported upstream SQLite golden tests. Do not modify these for Turso behavior changes; use them as fixed compatibility coverage, and only touch them for intentional upstream sync or harness maintenance.
+- `postgres/conformance/pg-sqltests/` - `.sqltest` coverage for the PostgreSQL frontend, run via `make -C postgres/conformance run` (spawns a tursopg server per test and drives it over the wire protocol). Only assert behavior real PostgreSQL also exhibits, so the corpus stays valid for differential runs.
+- `testing/cli_tests/` - CLI-focused Python coverage for shell behavior and end-to-end command workflows.
+- `tests/fuzz/` - minimized fuzz regressions and targeted edge cases that are easier to keep as Rust tests.
+- `testing/simulator/` and `testing/concurrent-simulator/` - deterministic concurrency, scheduling, and failure-injection coverage for state-machine and I/O correctness.
+- `testing/differential-oracle/` and `testing/stress/` - differential and long-running stress tooling. Use these for deeper investigation or specialized validation, not as the first stop for a focused regression test.
 
 ## Structure
 
@@ -47,7 +70,7 @@ limbo/
 | Add extension | `extensions/core/` | ExtensionApi, scalar/aggregate/vtab traits |
 | Add binding | `bindings/` | PyO3, NAPI, JNI, FRB, CGO patterns |
 | Deterministic tests | `testing/simulator/` | Fault injection, differential testing |
-| New SQL tests | `testing/sqltests/tests/` | `.sqltest` format preferred |
+| New SQL tests | `sqlite/conformance/sqlite-sqltests/` | `.sqltest` format preferred |
 | Quick sqlite3 diff | `scripts/diff.sh` | Compare sqlite3 vs tursodb output for a query |
 | MVCC testing REPL | `cli/mvcc_repl.rs` | Multi-conn concurrent txn testing REPL        |
 
@@ -62,6 +85,29 @@ limbo/
 - **[Async I/O Model](docs/agent-guides/async-io-model.md)** - IOResult, state machines, re-entrancy
 - **[MVCC](docs/agent-guides/mvcc.md)** - experimental multi-version concurrency (WIP)
 
+## Commit Messages
+
+Use an optional component scope followed by a lowercase imperative summary with
+no trailing period:
+
+```text
+[scope: ]<imperative summary>
+
+<why the change is needed and what invariant or bug it addresses>
+
+<non-obvious implementation details or tradeoffs, if needed>
+
+Tests: <relevant validation, if useful>
+
+Fixes #1234
+```
+
+For example: `core/mvcc: preserve B-tree cleanup markers in commit logs`.
+Explain intent rather than narrating the diff. Omit the body only when the
+subject fully explains a trivial change. Conventional Commit prefixes such as
+`feat(scope):` are not required. See [CONTRIBUTING.md](CONTRIBUTING.md) for a
+complete example.
+
 ## Benchmark Naming
 
 - Criterion benchmark functions must use `#[turso_macros::codspeed_criterion_benchmark]` so stable and nightly CodSpeed runs get distinct benchmark names.
@@ -75,6 +121,22 @@ limbo/
 4. **Assert invariants.** Don't silently fail. Don't hedge with if-statements
 5. **Own your regressions.** If tests fail after your change, they are your regressions. Debug them directly. Never stash/revert to "check if they fail on main" — that wastes time and is categorically banned.
 6. **Validate your hypotheses.**: If you suspect a given cause for a bug, validate it and provide incontrovertible evidence. NEVER make unearned assumptions.
+
+## Always use plain language instead of complex jargon
+
+OOGA BOOGA! Programming already complex! Use simple word! Say what you mean! Examples:
+
+```diff
+-    /// Number of generated statements outside the engines' shared executable domain.
++    /// Number of statements skipped because EXPLAIN failed in at least one engine.
+
+...
+
+-    fn empty_schema_only_selects_bootstrap_safe_statements() {
++    fn empty_schema_never_chooses_a_statement_that_needs_a_table() {
+```
+
+No-one knows what the hell a bootstrap-safe statement is. Everyone knows what "a statement that needs a table" is.
 
 ## CI Note
 

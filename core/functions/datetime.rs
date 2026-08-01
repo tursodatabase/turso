@@ -542,6 +542,15 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
             }
             if p.raw_s {
                 let r = p.s * 1000.0 + 210866760000000.0;
+                // Range check before the cast, as SQLite's date.c does. `as i64`
+                // saturates, so an out-of-range value would park i64::MIN in
+                // `i_jd`, which 'localtime'/'utc' then subtract the epoch from.
+                // The check in exec_datetime_general runs too late. Rejects NaN.
+                if !(r >= 0.0 && r < (MAX_JD + 1) as f64) {
+                    return Err(InvalidModifier(format!(
+                        "Unixepoch value out of range: {z}"
+                    )));
+                }
                 p.i_jd = (r + 0.5) as i64;
                 p.valid_jd = true;
                 p.raw_s = false;
@@ -1519,17 +1528,17 @@ mod tests {
             Value::build_text("2024-07-21 23:60:00"), // Invalid minute
             Value::build_text("2024-07-21 22:58:60"), // Invalid second
             // Note: Invalid days now overflow like SQLite (2024-07-32 -> 2024-08-01)
-            Value::build_text("2024-13-01"),   // Invalid month
-            Value::build_text("invalid_date"), // Completely invalid string
-            Value::build_text(""),             // Empty string
-            Value::from_i64(i64::MAX),         // Large Julian day
-            Value::from_i64(-1),               // Negative Julian day
-            Value::from_f64(f64::MAX),         // Large float
-            Value::from_f64(-1.0),             // Negative Julian day as float
-            Value::from_f64(f64::NAN),         // NaN
-            Value::from_f64(f64::INFINITY),    // Infinity
-            Value::Null,                       // Null value
-            Value::Blob(vec![1, 2, 3]),        // Blob (unsupported type)
+            Value::build_text("2024-13-01"),          // Invalid month
+            Value::build_text("invalid_date"),        // Completely invalid string
+            Value::build_text(""),                    // Empty string
+            Value::from_i64(i64::MAX),                // Large Julian day
+            Value::from_i64(-1),                      // Negative Julian day
+            Value::from_f64(f64::MAX),                // Large float
+            Value::from_f64(-1.0),                    // Negative Julian day as float
+            Value::from_f64(f64::NAN),                // NaN
+            Value::from_f64(f64::INFINITY),           // Infinity
+            Value::Null,                              // Null value
+            Value::Blob(crate::alloc::vec![1, 2, 3]), // Blob (unsupported type)
             // Invalid timezone tests
             Value::build_text("2024-07-21T12:00:00+24:00"), // Invalid timezone offset (too large)
             Value::build_text("2024-07-21T12:00:00-24:00"), // Invalid timezone offset (too small)
@@ -1648,17 +1657,17 @@ mod tests {
             Value::build_text("2024-07-21 23:60:00"), // Invalid minute
             Value::build_text("2024-07-21 22:58:60"), // Invalid second
             // Note: Invalid days now overflow like SQLite (2024-07-32 -> 2024-08-01)
-            Value::build_text("2024-13-01"),   // Invalid month
-            Value::build_text("invalid_date"), // Completely invalid string
-            Value::build_text(""),             // Empty string
-            Value::from_i64(i64::MAX),         // Large Julian day
-            Value::from_i64(-1),               // Negative Julian day
-            Value::from_f64(f64::MAX),         // Large float
-            Value::from_f64(-1.0),             // Negative Julian day as float
-            Value::from_f64(f64::NAN),         // NaN
-            Value::from_f64(f64::INFINITY),    // Infinity
-            Value::Null,                       // Null value
-            Value::Blob(vec![1, 2, 3]),        // Blob (unsupported type)
+            Value::build_text("2024-13-01"),          // Invalid month
+            Value::build_text("invalid_date"),        // Completely invalid string
+            Value::build_text(""),                    // Empty string
+            Value::from_i64(i64::MAX),                // Large Julian day
+            Value::from_i64(-1),                      // Negative Julian day
+            Value::from_f64(f64::MAX),                // Large float
+            Value::from_f64(-1.0),                    // Negative Julian day as float
+            Value::from_f64(f64::NAN),                // NaN
+            Value::from_f64(f64::INFINITY),           // Infinity
+            Value::Null,                              // Null value
+            Value::Blob(crate::alloc::vec![1, 2, 3]), // Blob (unsupported type)
             // Invalid timezone tests
             Value::build_text("2024-07-21T12:00:00+24:00"), // Invalid timezone offset (too large)
             Value::build_text("2024-07-21T12:00:00-24:00"), // Invalid timezone offset (too small)

@@ -19,6 +19,16 @@ on:
         required: false
         default: ""
         type: string
+      notify_email:
+        description: "Custom email to notify of test results"
+        required: false
+        default: ""
+        type: string
+      notify_everyone:
+        description: "Notify everyone of test results"
+        required: false
+        default: false
+        type: boolean
   workflow_call:
     inputs:
       test_name:
@@ -31,6 +41,14 @@ on:
         required: false
         default: ""
         type: string
+      notify_email:
+        required: false
+        default: ""
+        type: string
+      notify_everyone:
+        required: false
+        default: false
+        type: boolean
 
 env:
   ANTITHESIS_DOCKER_HOST: us-central1-docker.pkg.dev
@@ -44,9 +62,6 @@ jobs:
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@v4
-
-    - name: Publish workload
-      run: bash ./scripts/antithesis/publish-workload.sh
 
     - name: Generate diff for targeted testing
       if: ${{ inputs.diff_base != '' }}
@@ -62,6 +77,11 @@ jobs:
           -H "X-GitHub-Api-Version: 2022-11-28" \
           "https://api.github.com/repos/$REPO/compare/$DIFF_BASE...$HEAD_SHA" \
           -o testing/stress/git.diff
+        python3 scripts/antithesis/diff_to_targeted_coverage.py \
+          testing/stress/git.diff -o testing/stress/targeted_coverage.json
+
+    - name: Publish workload
+      run: bash ./scripts/antithesis/publish-workload.sh
 
     - name: Publish config
       run: bash ./scripts/antithesis/publish-config.sh
@@ -80,8 +100,9 @@ jobs:
           Turso - ${{ github.event_name }}
           on ${{ github.ref_name }} (${{ github.sha }})
           by ${{ github.actor }}${{ inputs.test_name && format(' ({0})', inputs.test_name) || '' }}${{ inputs.diff_base && format(' diff vs {0}', inputs.diff_base) || '' }}
-        email_recipients: ${{ secrets.ANTITHESIS_EMAIL }}
+        email_recipients: ${{ inputs.notify_everyone && secrets.ANTITHESIS_EMAIL || '' }}${{ (inputs.notify_everyone && secrets.ANTITHESIS_EMAIL != '' && inputs.notify_email != '') && ';' || '' }}${{ inputs.notify_email }}
         test_name: ${{ inputs.test_name }}
         additional_parameters: |-
           antithesis.duration=${{ inputs.duration }}
           antithesis.source=${{ github.ref_name }}
+          custom.use_targeted_fuzzing=${{ inputs.diff_base != '' }}

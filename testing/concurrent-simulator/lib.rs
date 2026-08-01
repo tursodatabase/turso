@@ -16,6 +16,7 @@ use std::fmt::Write;
 use std::ops::Bound;
 use std::sync::Arc;
 use tracing::{debug, error, trace};
+use turso_core::SqliteDialect;
 #[cfg(target_os = "windows")]
 use turso_core::WindowsIOCP;
 use turso_core::schema::SEQ_BACKING_TABLE_PREFIX;
@@ -25,6 +26,7 @@ use turso_core::{
 use turso_parser::ast::{ColumnConstraint, SortOrder};
 
 mod allocation_fault;
+pub mod chaotic_btree;
 pub mod chaotic_elle;
 pub mod elle;
 pub mod error_handling;
@@ -276,6 +278,8 @@ pub struct WhopperOpts {
     pub keep_files: bool,
     /// Enable MVCC (Multi-Version Concurrency Control).
     pub enable_mvcc: bool,
+    /// Enable the experimental non-blocking (passive) MVCC checkpoint.
+    pub experimental_mvcc_passive_checkpoint: bool,
     /// Enable database encryption with random cipher.
     pub enable_encryption: bool,
     /// Elle tables to create: vec of (table_name, create_sql).
@@ -336,6 +340,7 @@ impl Default for WhopperOpts {
             cosmic_ray_probability: 0.0,
             keep_files: false,
             enable_mvcc: false,
+            experimental_mvcc_passive_checkpoint: false,
             enable_encryption: false,
             elle_tables: vec![],
             workloads: vec![],
@@ -392,6 +397,35 @@ impl WhopperOpts {
         }
     }
 
+    pub fn schema_clone_faults() -> Self {
+        Self {
+            max_steps: 200_000,
+            schema_bias: SchemaBias {
+                non_rowid_pk_prob: 0.4,
+                unique_col_prob: 0.8,
+                num_tables_range: 6..=12,
+                num_columns_range: 8..=16,
+                initial_rows_per_table: 2,
+            },
+            reopen_probability: 0.05,
+            ..Default::default()
+        }
+    }
+
+    pub fn btree_rebalance() -> Self {
+        Self {
+            max_steps: 500_000,
+            schema_bias: SchemaBias {
+                non_rowid_pk_prob: 0.0,
+                unique_col_prob: 0.0,
+                num_tables_range: 0..=0,
+                num_columns_range: 2..=2,
+                initial_rows_per_table: 0,
+            },
+            ..Default::default()
+        }
+    }
+
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
@@ -424,6 +458,11 @@ impl WhopperOpts {
 
     pub fn with_enable_mvcc(mut self, enable: bool) -> Self {
         self.enable_mvcc = enable;
+        self
+    }
+
+    pub fn with_experimental_mvcc_passive_checkpoint(mut self, enable: bool) -> Self {
+        self.experimental_mvcc_passive_checkpoint = enable;
         self
     }
 
@@ -610,6 +649,8 @@ pub struct Whopper {
     chaotic_profiles: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>,
     /// Setting this to true sets `pramga mvcc_checkpoint_threshold = -1` (disabled).
     disable_mvcc_auto_checkpoint: bool,
+    /// Open databases with the experimental non-blocking (passive) MVCC checkpoint enabled.
+    experimental_mvcc_passive_checkpoint: bool,
     /// If false, drop fiber connections without first closing them.
     close_connections_gracefully: bool,
     allocation_fault_injector: Option<&'static SimulatorAllocationFaultInjector>,
@@ -659,7 +700,11 @@ impl Whopper {
         };
 
         let db = {
-            let db_opts = DatabaseOpts::new().with_encryption(encryption_opts.is_some());
+            let db_opts = DatabaseOpts::new()
+                .with_encryption(encryption_opts.is_some())
+                .with_experimental_mvcc_passive_checkpoint(
+                    opts.experimental_mvcc_passive_checkpoint,
+                );
 
             match Database::open_file_with_flags(
                 io.clone(),
@@ -667,6 +712,7 @@ impl Whopper {
                 OpenFlags::default(),
                 db_opts,
                 encryption_opts.clone(),
+                Arc::new(SqliteDialect),
             ) {
                 Ok(db) => db,
                 Err(e) => {
@@ -763,6 +809,7 @@ impl Whopper {
             stats: Stats::default(),
             chaotic_profiles: opts.chaotic_profiles,
             disable_mvcc_auto_checkpoint: opts.disable_mvcc_auto_checkpoint,
+            experimental_mvcc_passive_checkpoint: opts.experimental_mvcc_passive_checkpoint,
             close_connections_gracefully: opts.close_connections_gracefully,
             allocation_fault_injector,
         };
@@ -1262,24 +1309,8 @@ impl Whopper {
         }
     }
 
-    /// Reopen the database by closing all connections and recreating them.
-    /// This simulates a database restart/reopen scenario.
-    /// Active statements are run to completion before closing.
-    pub fn reopen(&mut self) -> anyhow::Result<()> {
-        debug!(
-            "Restarting database, completing active statements for {} fibers",
-            self.context.fibers.len()
-        );
-
-        // Drain active statements with a per-reopen budget independent of
-        // `max_steps`. The main loop's step budget governs how long the
-        // simulator runs overall; drain is a finalization phase that runs
-        // until either every fiber's in-flight statement has terminated
-        // (Done/Busy/Err) or `max_drain_steps` iterations elapse. The latter
-        // catches genuine engine-side infinite loops (leaked lock,
-        // unresolvable IO yield). Legitimate IO-heavy operations like
-        // `PRAGMA integrity_check` can run for thousands of yields per page,
-        // so the cap needs to comfortably exceed that.
+    /// Drain in-flight statements on all fibers. Used before reopen.
+    fn drain_active_statements(&mut self, reason: &str) -> anyhow::Result<()> {
         let mut drain_iterations = 0usize;
         while self
             .context
@@ -1296,7 +1327,7 @@ impl Whopper {
                     .filter_map(|(i, f)| f.statement.borrow().is_some().then_some(i))
                     .collect();
                 anyhow::bail!(
-                    "reopen drain exceeded max_drain_steps ({}) with statements still live on \
+                    "{reason} drain exceeded max_drain_steps ({}) with statements still live on \
                      fibers {:?}; likely a leaked lock or other infinite loop in the engine",
                     self.max_drain_steps,
                     stuck,
@@ -1309,24 +1340,24 @@ impl Whopper {
                 let Some(op_result) = self.step_drained_statement(fiber_idx) else {
                     continue;
                 };
-                // Statement finished during drain. Notify properties
-                // so committed_watermark and friends stay in sync
-                // with what the engine actually committed to disk —
-                // a drained autocommit that reached StepResult::Done
-                // ran its inline backing-table writes + commit_txn
-                // before returning, so its sequence writes are durable
-                // on disk even though the user-level statement never
-                // returned to the original generate→init→complete
-                // pipeline. Without this notification, the post-
-                // restart disk can be more (or less) advanced than
-                // the checker's committed_watermark and the restart
-                // assertion misfires.
                 self.finalize_drained_statement(fiber_idx, op_result);
             }
-            self.io.step().unwrap();
+            self.io.step()?;
             drain_iterations += 1;
         }
+        Ok(())
+    }
 
+    /// Reopen the database by closing all connections and recreating them.
+    /// This simulates a database restart/reopen scenario.
+    /// Active statements are run to completion before closing.
+    pub fn reopen(&mut self) -> anyhow::Result<()> {
+        debug!(
+            "Restarting database, completing active statements for {} fibers",
+            self.context.fibers.len()
+        );
+
+        self.drain_active_statements("reopen")?;
         // Close and drop all fiber connections to release database Arc references
         {
             let fibers = self.context.fibers.drain(..).collect::<Vec<_>>();
@@ -1489,13 +1520,16 @@ impl Whopper {
 
     /// Open database connections for all fibers.
     fn open_connections(&mut self) -> anyhow::Result<()> {
-        let db_opts = DatabaseOpts::new().with_encryption(self.encryption_opts.is_some());
+        let db_opts = DatabaseOpts::new()
+            .with_encryption(self.encryption_opts.is_some())
+            .with_experimental_mvcc_passive_checkpoint(self.experimental_mvcc_passive_checkpoint);
         let db = Database::open_file_with_flags(
             self.io.clone(),
             &self.db_path,
             OpenFlags::default(),
             db_opts,
             self.encryption_opts.clone(),
+            Arc::new(SqliteDialect),
         )
         .map_err(|e| anyhow::anyhow!("Database open failed: {}", e))?;
 
