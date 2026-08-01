@@ -60,6 +60,27 @@ fn test_pragma_module_list_generate_series(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_pragma_table_info_preserves_declared_types(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (a VARCHAR(10), b DECIMAL(10,2))")
+        .unwrap();
+
+    let mut rows = conn.query("PRAGMA table_info(t)").unwrap().unwrap();
+    let mut declared_types = vec![];
+
+    while let StepResult::Row = rows.step().unwrap() {
+        let row = rows.row().unwrap();
+        let Value::Text(declared_type) = row.get_value(2) else {
+            panic!("expected text type value");
+        };
+        declared_types.push(declared_type.to_string());
+    }
+
+    assert_eq!(declared_types, vec!["VARCHAR(10)", "DECIMAL(10,2)"]);
+}
+
+#[turso_macros::test(mvcc)]
 fn test_pragma_page_sizes_without_writes_persists(db: TempDatabase) {
     let opts = db.db_opts;
     let flags = db.db_flags;

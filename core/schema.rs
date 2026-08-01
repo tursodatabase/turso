@@ -224,6 +224,16 @@ pub fn rewrite_value_to_column(expr: &ast::Expr, col_name: &str) -> Box<ast::Exp
     Box::new(cloned)
 }
 
+fn ast_to_declared_type(t: &ast::Type) -> String {
+    match &t.size {
+        Some(ast::TypeSize::MaxSize(expr)) => format!("{}({})", t.name, expr),
+        Some(ast::TypeSize::TypeSize(precision, scale)) => {
+            format!("{}({},{})", t.name, precision, scale)
+        }
+        None => t.name.clone(),
+    }
+}
+
 /// Field definition within a StructDef.
 #[derive(Debug, Clone)]
 pub struct StructFieldDef {
@@ -3394,9 +3404,9 @@ impl BTreeTable {
             let column_name = column.name.as_ref().expect("column name is None");
             sql.push_str(&quote_ident(column_name));
 
-            if !column.ty_str.is_empty() {
+            if !column.declared_type.is_empty() {
                 sql.push(' ');
-                sql.push_str(&column.ty_str);
+                sql.push_str(&column.declared_type);
                 if column.is_array() {
                     sql.push_str("[]");
                 }
@@ -4380,6 +4390,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     .map(|ast::Type { name, .. }| name)
                     .unwrap_or_default();
 
+                let declared_type = col_type
+                    .as_ref()
+                    .map(ast_to_declared_type)
+                    .unwrap_or_default();
+
                 let ty_params: std::vec::Vec<Box<Expr>> = match col_type {
                     Some(ast::Type {
                         size: Some(ast::TypeSize::MaxSize(ref expr)),
@@ -4608,6 +4623,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     },
                 );
                 col.ty_params = ty_params;
+                col.declared_type = declared_type;
                 if let Some(t) = col_type.as_ref() {
                     if t.is_array() {
                         col.set_array_dimensions(t.array_dimensions);
@@ -4908,6 +4924,7 @@ impl ResolvedFkRef {
 pub struct Column {
     pub name: Option<String>,
     pub ty_str: String,
+    pub declared_type: String,
     pub ty_params: std::vec::Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
     generated_type: GeneratedType,
@@ -5069,7 +5086,8 @@ impl Column {
         }
         Self {
             name,
-            ty_str,
+            ty_str: ty_str.clone(),
+            declared_type: ty_str,
             ty_params: std::vec::Vec::new(),
             default,
             generated_type,
@@ -5302,6 +5320,12 @@ impl TryFrom<&ColumnDefinition> for Column {
             .map(|t| t.name.to_string())
             .unwrap_or_default();
 
+        let declared_type = value
+            .col_type
+            .as_ref()
+            .map(ast_to_declared_type)
+            .unwrap_or_default();
+
         let ty_params: std::vec::Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
             Some(ast::Type {
                 size: Some(ast::TypeSize::MaxSize(ref expr)),
@@ -5334,6 +5358,7 @@ impl TryFrom<&ColumnDefinition> for Column {
             },
         );
         col.ty_params = ty_params;
+        col.declared_type = declared_type;
         if let Some(t) = value.col_type.as_ref() {
             if t.is_array() {
                 col.set_array_dimensions(t.array_dimensions);
@@ -6080,6 +6105,24 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
         assert_eq!(column.ty_str, "InTeGeR");
+        Ok(())
+    }
+
+    #[test]
+    fn test_declared_type_is_preserved_in_to_sql() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a VARCHAR(10), b DECIMAL(10,2));"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+
+        let column_a = table.get_column("a").unwrap().1;
+        assert_eq!(column_a.declared_type, "VARCHAR(10)");
+
+        let column_b = table.get_column("b").unwrap().1;
+        assert_eq!(column_b.declared_type, "DECIMAL(10,2)");
+
+        assert_eq!(
+            table.to_sql(),
+            "CREATE TABLE t1 (a VARCHAR(10), b DECIMAL(10,2))"
+        );
         Ok(())
     }
 
