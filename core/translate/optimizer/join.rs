@@ -1354,9 +1354,17 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                             && other.join_info.as_ref().is_some_and(|ji| ji.is_outer())
                     })
                 });
+                // A recursive CTE input cannot be the build side of the hash
+                // join that FULL OUTER requires, so no plan exists for
+                // `recursive_table FULL JOIN other`.
+                let has_recursive_input = joined_tables
+                    .iter()
+                    .any(|t| matches!(t.table, crate::schema::Table::RecursiveCteInput(_)));
                 let has_correlated_subquery = subqueries.iter().any(|sq| sq.correlated);
                 let msg = if build_is_outer {
                     "FULL OUTER JOIN chaining is not yet supported"
+                } else if has_recursive_input {
+                    "FULL OUTER JOIN with a recursive reference is not yet supported"
                 } else if has_correlated_subquery {
                     "FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables"
                 } else {

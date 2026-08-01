@@ -79,11 +79,11 @@ test-sqltest-pg:
 .PHONY: test-sqltest-pg
 
 test-extensions: build uv-sync-test
-	RUST_LOG=$(RUST_LOG) uv run --project limbo_test test-extensions
+	RUST_LOG=$(RUST_LOG) uv run --package turso_test test-extensions
 .PHONY: test-extensions
 
 test-shell: build uv-sync-test
-	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-shell
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --package turso_test test-shell
 .PHONY: test-shell
 
 test-compat: check-tcl-version
@@ -114,12 +114,12 @@ test-sqlite3: reset-db
 .PHONY: test-sqlite3
 
 test-memory: build uv-sync-test
-	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-memory
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --package turso_test test-memory
 .PHONY: test-memory
 
 test-write: build uv-sync-test
 	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
-		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-write; \
+		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --package turso_test test-write; \
 	else \
 		echo "Skipping test-write: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
 	fi
@@ -127,7 +127,7 @@ test-write: build uv-sync-test
 
 test-update: build uv-sync-test
 	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
-		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-update; \
+		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --package turso_test test-update; \
 	else \
 		echo "Skipping test-update: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
 	fi
@@ -135,7 +135,7 @@ test-update: build uv-sync-test
 
 test-collate: build uv-sync-test
 	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
-		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-collate; \
+		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --package turso_test test-collate; \
 	else \
 		echo "Skipping test-collate: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
 	fi
@@ -143,7 +143,7 @@ test-collate: build uv-sync-test
 
 test-constraint: build uv-sync-test
 	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
-		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-constraint; \
+		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --package turso_test test-constraint; \
 	else \
 		echo "Skipping test-constraint: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
 	fi
@@ -161,10 +161,10 @@ whopper-coverage:
 .PHONY: whopper-coverage
 
 bench-vfs: uv-sync-test build-release
-	RUST_LOG=$(RUST_LOG) uv run --project limbo_test bench-vfs "$(SQL)" "$(N)"
+	RUST_LOG=$(RUST_LOG) uv run --package turso_test bench-vfs "$(SQL)" "$(N)"
 
 bench-sqlite: uv-sync-test build-release
-	RUST_LOG=$(RUST_LOG) uv run --project limbo_test bench-sqlite "$(VFS)" "$(SQL)" "$(N)"
+	RUST_LOG=$(RUST_LOG) uv run --package turso_test bench-sqlite "$(VFS)" "$(SQL)" "$(N)"
 
 clickbench:
 	./perf/clickbench/benchmark.sh

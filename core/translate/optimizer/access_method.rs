@@ -109,6 +109,8 @@ pub enum AccessMethodParams {
     /// subqueries may also be scanned backwards when their intrinsic order
     /// matches the requested extremum order.
     Subquery { iter_dir: IterationDirection },
+    /// The single row currently being expanded by a recursive CTE.
+    RecursiveCteInput,
     /// Materialized subquery with an ephemeral index for seeking.
     /// The subquery results are materialized once into an ephemeral index,
     /// which can then be seeked using join conditions.
@@ -757,6 +759,22 @@ pub fn find_best_access_method_for_join_order(
             base_row_count,
             params,
         ),
+        Table::RecursiveCteInput(_) => Ok(Some(AccessMethod {
+            cost: estimate_cost_for_scan_or_seek(
+                None,
+                &[],
+                &[],
+                input_cardinality,
+                RowCountEstimate::HardcodedFallback(1.0),
+                false,
+                params,
+                None,
+            ),
+            estimated_rows_per_outer_row: 1.0,
+            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+            consumed_where_terms: SmallVec::new(),
+            params: AccessMethodParams::RecursiveCteInput,
+        })),
     }
 }
 
@@ -1430,8 +1448,6 @@ fn find_best_access_method_for_subquery(
     use super::constraints::ConstraintRef;
     let maybe_order_target = planning_context.maybe_order_target;
 
-    let table_materialization_required = subquery.requires_table_materialization();
-    let can_direct_materialize_index = subquery.supports_direct_index_materialization();
     let coroutine_scan_cost = estimate_cost_for_scan_or_seek(
         None,
         &[],
@@ -1445,6 +1461,8 @@ fn find_best_access_method_for_subquery(
     let coroutine_reexecution_overhead =
         Cost((input_cardinality - 1.0).max(0.0) * *base_row_count * params.cpu_cost_per_seek);
     let coroutine_cost = coroutine_scan_cost + coroutine_reexecution_overhead;
+    let table_materialization_required = subquery.requires_table_materialization();
+    let can_direct_materialize_index = subquery.supports_direct_index_materialization();
     let scan_cost = if table_materialization_required {
         // Explicit MATERIALIZED hints and shared CTEs already produce a table-backed
         // row source. Scanning them behaves like rescanning cached rows, not rerunning

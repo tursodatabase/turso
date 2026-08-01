@@ -7,6 +7,8 @@ use crate::sync::RwLock;
 use crate::turso_assert;
 use std::fmt::Debug;
 
+#[cfg(test)]
+mod discard_pending_tests;
 pub mod logical_log;
 use crate::mvcc::database::{LogRecord, RowVersion};
 use crate::mvcc::persistent_storage::logical_log::{
@@ -102,9 +104,7 @@ pub trait DurableStorage: Send + Sync + Debug {
         id = "logical_log_pending_crc_cleared_on_abort",
         verify = "full"
     )]
-    fn discard_pending_log_write(&self) -> Result<()> {
-        Ok(())
-    }
+    fn discard_pending_log_write(&self) -> Result<()>;
     fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32);
 
     /// Set the in-memory log header from a previously-read on-disk header.
@@ -119,6 +119,8 @@ pub trait DurableStorage: Send + Sync + Debug {
 
     /// Called after the checkpoint has fully completed: rows are flushed, WAL is
     /// truncated, and the logical log is reset.
+    ///
+    /// Runs while checkpoint locks are still held.
     fn on_checkpoint_end(&self, _result: Result<&CheckpointResult>) -> Result<()> {
         Ok(())
     }
@@ -270,6 +272,11 @@ impl DurableStorage for Storage {
     fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()> {
         self.logical_log.write().advance_offset_after_success(bytes);
         self.shadow_offset_advance(bytes);
+        Ok(())
+    }
+
+    fn discard_pending_log_write(&self) -> Result<()> {
+        self.logical_log.write().discard_pending_write();
         Ok(())
     }
 

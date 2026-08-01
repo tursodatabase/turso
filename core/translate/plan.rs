@@ -1,8 +1,9 @@
 use crate::{
-    alloc::{self, TursoIteratorExt},
+    alloc::{self, TursoIteratorExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
     schema::{
-        BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table, Type, ROWID_SENTINEL,
+        BTreeTable, ColDef, Column, FromClauseSubquery, Index, PseudoCursorType, RecursiveCteInput,
+        Schema, Table, Type, ROWID_SENTINEL,
     },
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
@@ -384,8 +385,24 @@ pub enum Plan {
         /// ORDER BY for compound selects, or `None` when the query has none.
         order_by: Option<Vec<CompoundOrderByKey>>,
     },
+    /// Runs the initial query once, then runs the recursive query for each queued row.
+    RecursiveCte(Box<RecursiveCtePlan>),
     Delete(Box<DeletePlan>),
     Update(Box<UpdatePlan>),
+}
+
+#[derive(Debug, Clone)]
+/// Everything needed to emit one self-referencing CTE.
+pub struct RecursiveCtePlan {
+    pub name: String,
+    pub initial_query: Box<Plan>,
+    pub recursive_query: Box<Plan>,
+    pub input_table_id: TableInternalId,
+    pub union_all: bool,
+    pub limit: Option<Box<Expr>>,
+    pub offset: Option<Box<Expr>>,
+    pub queue_order: Option<Vec<CompoundOrderByKey>>,
+    pub query_destination: QueryDestination,
 }
 
 impl Plan {
@@ -403,6 +420,10 @@ impl Plan {
                         .iter()
                         .any(|(plan, _)| plan.table_references.contains_table(table))
             }
+            Plan::RecursiveCte(plan) => {
+                plan.initial_query.select_contains_table(table)
+                    || plan.recursive_query.select_contains_table(table)
+            }
             Plan::Delete(_) | Plan::Update(_) => false,
         }
     }
@@ -413,6 +434,7 @@ impl Plan {
         match self {
             Plan::Select(select_plan) => Some(&select_plan.query_destination),
             Plan::CompoundSelect { right_most, .. } => Some(&right_most.query_destination),
+            Plan::RecursiveCte(plan) => Some(&plan.query_destination),
             Plan::Delete(_) | Plan::Update(_) => None,
         }
     }
@@ -423,6 +445,7 @@ impl Plan {
         match self {
             Plan::Select(select_plan) => Some(&mut select_plan.query_destination),
             Plan::CompoundSelect { right_most, .. } => Some(&mut right_most.query_destination),
+            Plan::RecursiveCte(plan) => Some(&mut plan.query_destination),
             Plan::Delete(_) | Plan::Update(_) => None,
         }
     }
@@ -439,6 +462,7 @@ impl Plan {
         match self {
             Plan::Select(select_plan) => &select_plan.result_columns,
             Plan::CompoundSelect { right_most, .. } => &right_most.result_columns,
+            Plan::RecursiveCte(plan) => plan.initial_query.select_result_columns(),
             Plan::Delete(_) | Plan::Update(_) => {
                 panic!("select_result_columns called on a non-SELECT plan")
             }
@@ -456,6 +480,7 @@ impl Plan {
         match self {
             Plan::Select(select_plan) => &select_plan.table_references,
             Plan::CompoundSelect { right_most, .. } => &right_most.table_references,
+            Plan::RecursiveCte(plan) => plan.initial_query.select_table_references(),
             Plan::Delete(_) | Plan::Update(_) => {
                 panic!("select_table_references called on a non-SELECT plan")
             }
@@ -485,6 +510,10 @@ impl Plan {
                 }
                 collect_from_select(right_most, &mut ids);
             }
+            Plan::RecursiveCte(plan) => {
+                ids.extend(plan.initial_query.used_outer_query_ref_ids());
+                ids.extend(plan.recursive_query.used_outer_query_ref_ids());
+            }
             Plan::Delete(_) | Plan::Update(_) => {}
         }
         ids
@@ -501,6 +530,10 @@ impl Plan {
                 left.iter()
                     .any(|(select_plan, _)| select_plan.reads_table(database_id, table_name))
                     || right_most.reads_table(database_id, table_name)
+            }
+            Plan::RecursiveCte(plan) => {
+                plan.initial_query.reads_table(database_id, table_name)
+                    || plan.recursive_query.reads_table(database_id, table_name)
             }
             Plan::Delete(_) | Plan::Update(_) => false,
         }
@@ -554,6 +587,15 @@ pub enum QueryDestination {
         /// How to determine the rowid key for inserts.
         rowid_mode: EphemeralRowidMode,
     },
+    /// Insert rows produced by a recursive CTE into its work queue.
+    RecursiveCteQueue {
+        cursor_id: CursorID,
+        index: Arc<Index>,
+        /// Result columns that determine which queued row is read next.
+        sort_keys: alloc::Vec<RecursiveCteQueueKey>,
+        /// Index of rows already produced by a recursive `UNION`.
+        seen_rows: Option<(CursorID, Arc<Index>)>,
+    },
     /// The result of an EXISTS subquery are stored in a single register.
     ExistsSubqueryResult {
         /// The register that holds the result of the EXISTS subquery.
@@ -574,6 +616,15 @@ pub enum QueryDestination {
     },
     /// Decision made at some point after query plan construction.
     Unset,
+}
+
+#[derive(Debug, Clone, Copy)]
+/// One result column used to order the recursive CTE work queue.
+pub struct RecursiveCteQueueKey {
+    pub result_column_index: usize,
+    /// `None` when the index sort order already puts NULLs in the requested
+    /// position.
+    pub nulls_override: Option<ast::NullsOrder>,
 }
 
 impl QueryDestination {
@@ -760,7 +811,7 @@ impl SelectPlan {
                     Table::FromClauseSubquery(subquery) => {
                         subquery.plan.reads_table(database_id, table_name)
                     }
-                    Table::BTree(_) | Table::Virtual(_) => false,
+                    Table::BTree(_) | Table::Virtual(_) | Table::RecursiveCteInput(_) => false,
                 }
         }) || self
             .non_from_clause_subqueries
@@ -2226,6 +2277,7 @@ impl Operation {
             Table::FromClauseSubquery(_) => Operation::Scan(Scan::Subquery {
                 iter_dir: IterationDirection::Forwards,
             }),
+            Table::RecursiveCteInput(_) => Operation::Scan(Scan::RecursiveCteInput),
         }
     }
 
@@ -2274,6 +2326,76 @@ impl Operation {
             _ => false,
         }
     }
+}
+
+fn query_output_columns(
+    plan: &Plan,
+    explicit_columns: Option<&[String]>,
+) -> Result<alloc::Vec<Column>> {
+    let (result_columns, table_references): (&[ResultSetColumn], &TableReferences) = match plan {
+        Plan::Select(select_plan) => (&select_plan.result_columns, &select_plan.table_references),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => left
+            .first()
+            .map(|(select, _)| (&select.result_columns[..], &select.table_references))
+            .unwrap_or((&right_most.result_columns, &right_most.table_references)),
+        Plan::RecursiveCte(recursive_cte) => (
+            recursive_cte.initial_query.select_result_columns(),
+            recursive_cte.initial_query.select_table_references(),
+        ),
+        Plan::Delete(_) | Plan::Update(_) => {
+            unreachable!("DELETE/UPDATE plans cannot define query output columns")
+        }
+    };
+
+    let compound_arms = match plan {
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            let mut arms = left
+                .iter()
+                .map(|(select, _)| select)
+                .try_collect::<alloc::Vec<_>>()?;
+            arms.try_push(right_most)?;
+            Some(arms)
+        }
+        _ => None,
+    };
+
+    let mut columns = result_columns
+        .iter()
+        .enumerate()
+        .map(|(column_index, result_column)| {
+            let name = explicit_columns
+                .and_then(|names| names.get(column_index).cloned())
+                .or_else(|| result_column.name(table_references).map(String::from));
+            let column_type = compound_arms
+                .as_ref()
+                .map(|arms| compound_column_affinity(arms, column_index).to_type())
+                .unwrap_or_else(|| {
+                    infer_type_from_expr(&result_column.expr, Some(table_references))
+                });
+            Column::new(
+                name,
+                column_type.to_string(),
+                None,
+                None,
+                column_type,
+                None,
+                ColDef::default(),
+            )
+        })
+        .try_collect::<alloc::Vec<_>>()?;
+
+    for (column_index, column) in columns.iter_mut().enumerate() {
+        let result_expr = &result_columns[column_index].expr;
+        if super::expr::expr_is_array(result_expr, Some(table_references)) {
+            column.set_array_dimensions(1);
+        }
+        column.set_collation(get_collseq_from_expr(result_expr, table_references)?);
+    }
+    Ok(columns)
 }
 
 impl JoinedTable {
@@ -2371,80 +2493,8 @@ impl JoinedTable {
         cte_id: Option<usize>,
         materialize_hint: bool,
     ) -> Result<Self> {
+        let columns = query_output_columns(&plan, explicit_columns)?;
         // Get result columns and table references from the plan
-        let (result_columns, table_references) = match &plan {
-            Plan::Select(select_plan) => {
-                (&select_plan.result_columns, &select_plan.table_references)
-            }
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => {
-                // For compound selects, SQLite uses the leftmost select's column names.
-                // The leftmost select is left[0] if the vec is not empty, otherwise right_most.
-                if !left.is_empty() {
-                    (&left[0].0.result_columns, &left[0].0.table_references)
-                } else {
-                    (&right_most.result_columns, &right_most.table_references)
-                }
-            }
-            Plan::Delete(_) | Plan::Update(_) => {
-                unreachable!("DELETE/UPDATE plans cannot be subqueries")
-            }
-        };
-
-        // Note: column count validation (explicit_columns.len() vs result_columns.len())
-        // is intentionally NOT done here. SQLite defers this check until the CTE is
-        // actually referenced. Callers that represent actual CTE references should
-        // validate the count before calling this method.
-
-        // For a compound select, a column's affinity is combined across every arm
-        // (not just the leftmost one), so collect the arms to fold over.
-        let compound_arms: Option<Vec<&SelectPlan>> = match &plan {
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => {
-                let mut arms: Vec<&SelectPlan> = left.iter().map(|(p, _)| p).collect();
-                arms.push(right_most);
-                Some(arms)
-            }
-            _ => None,
-        };
-
-        let mut columns = result_columns
-            .iter()
-            .enumerate()
-            .map(|(i, rc)| {
-                // Use explicit column name if provided, otherwise derive from result column
-                let col_name = explicit_columns
-                    .and_then(|cols| cols.get(i).cloned())
-                    .or_else(|| rc.name(table_references).map(String::from));
-                let col_type = match &compound_arms {
-                    Some(arms) => compound_column_affinity(arms, i).to_type(),
-                    None => infer_type_from_expr(&rc.expr, Some(table_references)),
-                };
-                let type_name = col_type.to_string();
-                Column::new(
-                    col_name,
-                    type_name,
-                    None,
-                    None,
-                    col_type,
-                    None,
-                    ColDef::default(),
-                )
-            })
-            .try_collect::<alloc::Vec<_>>()?;
-
-        for (i, column) in columns.iter_mut().enumerate() {
-            if super::expr::expr_is_array(&result_columns[i].expr, Some(table_references)) {
-                column.set_array_dimensions(1);
-            }
-            column.set_collation(get_collseq_from_expr(
-                &result_columns[i].expr,
-                table_references,
-            )?);
-        }
-
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
         // and they may be materialized regardless of explicit keyword usage.
@@ -2467,6 +2517,38 @@ impl JoinedTable {
             identifier,
             internal_id,
             join_info,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: MAIN_DB_ID,
+            indexed: None,
+        })
+    }
+
+    pub fn new_recursive_cte_input(
+        identifier: String,
+        query: &Plan,
+        internal_id: TableInternalId,
+        explicit_columns: Option<&[String]>,
+    ) -> Result<Self> {
+        let mut columns = query_output_columns(query, explicit_columns)?;
+        // The recursive self-reference reads SQLite's queue table, whose
+        // columns have no declared type: comparisons in the recursive term
+        // see the stored value without the anchor query's affinity. Only the
+        // outer read of the CTE keeps the derived affinity.
+        for column in columns.iter_mut() {
+            column.set_base_affinity(Affinity::Blob);
+        }
+        let table = Table::RecursiveCteInput(Arc::new(RecursiveCteInput {
+            name: identifier.clone(),
+            columns,
+        }));
+        Ok(Self {
+            op: Operation::default_scan_for(&table),
+            table,
+            identifier,
+            internal_id,
+            join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
@@ -2644,6 +2726,13 @@ impl JoinedTable {
                     })
                     .transpose()?;
                 Ok((None, index_cursor_id))
+            }
+            Table::RecursiveCteInput(input) => {
+                let cursor_id = program.alloc_cursor_id_keyed_if_not_exists(
+                    CursorKey::table(self.internal_id),
+                    CursorType::Pseudo(PseudoCursorType::new_with_columns(&input.columns)),
+                );
+                Ok((Some(cursor_id), None))
             }
         }
     }
@@ -2939,6 +3028,8 @@ pub enum Scan {
         /// subquery order for an extremum fast path.
         iter_dir: IterationDirection,
     },
+    /// The one-row input consumed by the recursive part of a recursive CTE.
+    RecursiveCteInput,
 }
 
 /// An enum that represents a search operation that can be used to search for a row in a table using an index
@@ -3085,6 +3176,19 @@ impl Window {
         })
     }
 
+    /// Build an unnamed window from partition/order expressions inherited from
+    /// a named base window.
+    pub fn from_unnamed_bound(bound: NamedWindowBound, frame: Frame) -> Self {
+        Window {
+            name: None,
+            partition_by: bound.partition_by,
+            deduplicated_partition_by_len: None,
+            order_by: bound.order_by,
+            frame,
+            functions: vec![],
+        }
+    }
+
     /// Build a `Window` from a previously-bound named definition plus a
     /// resolved frame.
     pub fn from_named_bound(name: String, bound: NamedWindowBound, frame: Frame) -> Self {
@@ -3135,6 +3239,28 @@ impl Window {
             })
     }
 
+    pub fn is_equivalent_to_bound(&self, bound: &NamedWindowBound, frame: &Frame) -> bool {
+        if &self.frame != frame || self.partition_by.len() != bound.partition_by.len() {
+            return false;
+        }
+        if !self
+            .partition_by
+            .iter()
+            .zip(&bound.partition_by)
+            .all(|(a, b)| exprs_are_equivalent(a, b))
+        {
+            return false;
+        }
+        if self.order_by.len() != bound.order_by.len() {
+            return false;
+        }
+        self.order_by.iter().zip(&bound.order_by).all(
+            |((expr_a, order_a, nulls_a), (expr_b, order_b, nulls_b))| {
+                exprs_are_equivalent(expr_a, expr_b) && order_a == order_b && nulls_a == nulls_b
+            },
+        )
+    }
+
     pub(crate) fn is_default_frame_spec(frame: &Option<FrameClause>) -> bool {
         if let Some(frame_clause) = frame {
             let FrameClause {
@@ -3162,10 +3288,10 @@ impl Window {
     }
 }
 
-/// A named WINDOW clause definition, captured before any function
-/// references it. The frame is intentionally absent: it belongs to the
-/// resolved `Window` instance the planner spawns when a function
-/// attaches (the function's coerced frame decides).
+/// A named WINDOW clause definition, captured before any function references
+/// it. The effective frame belongs to the resolved `Window` instance the
+/// planner spawns when a function attaches. Whether the user wrote a frame is
+/// retained because SQLite forbids chaining from a framed base window.
 ///
 /// `bound` holds the already-bound `partition_by` / `order_by`. The
 /// first `resolve_window` that needs them *takes* them by moving;
@@ -3177,6 +3303,7 @@ impl Window {
 pub struct NamedWindowDef {
     pub name: String,
     pub bound: Option<NamedWindowBound>,
+    pub has_frame_clause: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3425,6 +3552,13 @@ fn eval_at_for_plan(
             )?);
             Ok(eval_at)
         }
+        Plan::RecursiveCte(recursive_cte) => {
+            let initial_query =
+                eval_at_for_plan(&recursive_cte.initial_query, join_order, table_references)?;
+            let recursive_query =
+                eval_at_for_plan(&recursive_cte.recursive_query, join_order, table_references)?;
+            Ok(initial_query.max(recursive_query))
+        }
         Plan::Delete(_) | Plan::Update(_) => Ok(EvalAt::BeforeLoop),
     }
 }
@@ -3436,6 +3570,10 @@ pub fn plan_is_correlated(plan: &Plan) -> bool {
         Plan::CompoundSelect {
             left, right_most, ..
         } => left.iter().any(|(plan, _)| plan.is_correlated()) || right_most.is_correlated(),
+        Plan::RecursiveCte(recursive_cte) => {
+            plan_is_correlated(&recursive_cte.initial_query)
+                || plan_is_correlated(&recursive_cte.recursive_query)
+        }
         Plan::Delete(_) | Plan::Update(_) => false,
     }
 }
@@ -3510,6 +3648,15 @@ fn plan_has_outer_scope_dependency_with_tables(
                 )
             }) || select_plan_has_outer_scope_dependency_with_tables(
                 right_most,
+                accessible_table_ids,
+            )
+        }
+        Plan::RecursiveCte(recursive_cte) => {
+            plan_has_outer_scope_dependency_with_tables(
+                &recursive_cte.initial_query,
+                accessible_table_ids,
+            ) || plan_has_outer_scope_dependency_with_tables(
+                &recursive_cte.recursive_query,
                 accessible_table_ids,
             )
         }

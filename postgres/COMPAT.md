@@ -40,7 +40,7 @@ Basics not enumerated by the official feature matrix.
 | SELECT (projections, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET) | ✅ Supported | |
 | JOINs (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL, USING) | ✅ Supported | |
 | UNION / UNION ALL / INTERSECT / EXCEPT | ✅ Supported | Including ORDER BY/LIMIT on compounds |
-| Subqueries (FROM, IN, EXISTS, scalar) | ✅ Supported | `= ANY(array)` is stubbed to false (pg_catalog hack); `ALL`/row comparison subqueries error |
+| Subqueries (FROM, IN, EXISTS, scalar) | ✅ Supported | `= ANY(array)` and `<> ALL(array)` work, including bound text-array parameters; other ANY/ALL array operators are rejected; `ALL`/row comparison subqueries error |
 | INSERT (column lists, multi-row VALUES, DEFAULT, INSERT ... SELECT) | ✅ Supported | |
 | UPDATE (incl. FROM clause) | ✅ Supported | Multi-column `SET (a,b) = (...)` not supported |
 | DELETE | 🟡 Partial | `USING` clause silently dropped |
@@ -77,8 +77,12 @@ plus `pg_input_error_info`. Present but always empty: `pg_policy`,
 `pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_userbyid`,
 `pg_*_is_visible`, `pg_encoding_to_char`, `pg_input_is_valid`, `to_char`
 (numeric), `now`/`clock_timestamp`/`transaction_timestamp`/`statement_timestamp`.
-DML against pg_catalog is rejected. `version()`, `pg_typeof`, and
-`current_schema` are not implemented.
+Session information functions: `version()`, `current_database()` /
+`current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
+forms), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
+`obj_description()`/`col_description()` always return NULL because COMMENT ON
+is not persisted. DML against pg_catalog is rejected. `pg_typeof` is not
+implemented.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -179,7 +183,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Non-decimal integer literals | ✅ Supported | `0x`, `0o`, `0b` |
 | ORDER BY NULLS FIRST/LAST | ✅ Supported | Honored in SELECT, window, and compound SELECT ORDER BY; rejected (matching SQLite) in CREATE INDEX |
 | range_agg range type aggregation function | ❌ Not supported | |
-| Recursive queries | ❌ Not supported | WITH RECURSIVE translates but the engine rejects it ("Recursive CTEs are not yet supported") |
+| Recursive queries | 🟡 Partial | WITH RECURSIVE works with SQLite semantics (row-at-a-time recursive term, so e.g. DISTINCT in the recursive term over a multi-row anchor can differ from PG); SEARCH/CYCLE clauses are rejected |
 | regexp_count, regexp_instr, regexp_like | ❌ Not supported | Regex *operators* (`~`, `~*`, SIMILAR TO) work |
 | Return OLD and NEW values from modified rows | ❌ Not supported | |
 | Row-wise comparison | ❌ Not supported | Row constructors `(a,b) < (c,d)` fail to translate |
@@ -194,7 +198,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Window functions | 🟡 Partial | Aggregate window functions (COUNT/SUM/AVG/MIN/MAX OVER), row_number, PARTITION BY/ORDER BY, frame clauses, and named WINDOW clauses work; rank, dense_rank, lag, lead, etc. are not implemented |
 | WITHIN GROUP clause | ❌ Not supported | Silently dropped; ordered-set aggregates (percentile_cont) missing |
 | WITH ORDINALITY clause | ❌ Not supported | |
-| WITH queries (Common Table Expressions) | ✅ Supported | Non-recursive only; MATERIALIZED hints accepted |
+| WITH queries (Common Table Expressions) | ✅ Supported | Including WITH RECURSIVE; MATERIALIZED hints accepted |
 | Writable WITH queries (Common Table Expressions) | ❌ Not supported | "CTE query is not a SELECT statement" |
 
 ## Data Definition Language (DDL)

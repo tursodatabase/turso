@@ -3449,3 +3449,85 @@ fn test_postgres_statement_reprepare_uses_pg_dialect(db: TempDatabase) {
         1
     );
 }
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_eq_any_bound_array_param(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (id int)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (5)").unwrap();
+
+    // Drivers like psycopg bind list parameters as PG text arrays.
+    let mut stmt = conn
+        .prepare("SELECT id FROM t WHERE id = ANY($1) ORDER BY id")
+        .unwrap();
+    stmt.bind_at(
+        std::num::NonZero::new(1).unwrap(),
+        Value::from_text("{1,2}".to_owned()),
+    )
+    .unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_eq_any_empty_bound_array(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (id int)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let mut stmt = conn.prepare("SELECT id FROM t WHERE id = ANY($1)").unwrap();
+    stmt.bind_at(
+        std::num::NonZero::new(1).unwrap(),
+        Value::from_text("{}".to_owned()),
+    )
+    .unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(rows, Vec::<Vec<Value>>::new());
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_ne_all_bound_array_param(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (id int)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (5)").unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT id FROM t WHERE id != ALL($1)")
+        .unwrap();
+    stmt.bind_at(
+        std::num::NonZero::new(1).unwrap(),
+        Value::from_text("{1,2}".to_owned()),
+    )
+    .unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(5)]]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_catalog_conkey_any_matches_no_rows(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE pkt (a int, b int, PRIMARY KEY (a, b))")
+        .unwrap();
+
+    let mut stmt = conn.prepare("SELECT count(*) FROM pg_constraint").unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![Value::from_i64(1)]],
+        "pkey constraint row must be present"
+    );
+
+    // conkey is space-separated TEXT, not a PG array; array_contains
+    // yields NULL over it, so attnum = ANY(conkey) matches no rows.
+    let mut stmt = conn
+        .prepare(
+            "SELECT count(*) FROM pg_attribute a, pg_constraint c \
+             WHERE a.attnum = ANY(c.conkey)",
+        )
+        .unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(0)]]);
+}

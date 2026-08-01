@@ -753,16 +753,16 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
 
         let match_reg = self.program.alloc_register();
         self.program.emit_insn(Insn::HashProbe {
-            hash_table_id: to_u16(hash_table_id),
-            key_start_reg: to_u16(probe_key_start_reg),
-            num_keys: to_u16(num_keys),
-            dest_reg: to_u16(match_reg),
+            hash_table_id: to_u32(hash_table_id),
+            key_start_reg: to_u32(probe_key_start_reg),
+            num_keys: to_u32(num_keys),
+            dest_reg: to_u32(match_reg),
             target_pc: hash_probe_miss_label,
-            payload_dest_reg: payload_dest_reg.map(to_u16),
-            num_payload: to_u16(num_payload),
+            payload_dest_reg: payload_dest_reg.map(to_u32),
+            num_payload: to_u32(num_payload),
             // Main probe loop always carries the probe rowid so spilled build
             // partitions are deferred to grace processing instead of loaded here.
-            probe_rowid_reg: probe_rowid_reg.map(to_u16),
+            probe_rowid_reg: probe_rowid_reg.map(to_u32),
         });
 
         let match_found_label = self.program.allocate_label();
@@ -1229,7 +1229,7 @@ impl GraceHashLoop {
 
         // HashGraceInit: finalize probe spill + grace_begin
         program.emit_insn(Insn::HashGraceInit {
-            hash_table_id: to_u16(hash_table_reg),
+            hash_table_id: to_u32(hash_table_reg),
             target_pc: grace_done,
         });
 
@@ -1242,7 +1242,7 @@ impl GraceHashLoop {
         // grace_partition_top: load build partition + first probe chunk
         program.preassign_label_to_next_insn(grace_partition_top);
         program.emit_insn(Insn::HashGraceLoadPartition {
-            hash_table_id: to_u16(hash_table_reg),
+            hash_table_id: to_u32(hash_table_reg),
             target_pc: grace_cleanup,
         });
 
@@ -1261,10 +1261,10 @@ impl GraceHashLoop {
         }
 
         program.emit_insn(Insn::HashGraceNextProbe {
-            hash_table_id: to_u16(hash_table_reg),
-            key_start_reg: to_u16(hash_ctx.key_start_reg),
-            num_keys: to_u16(hash_ctx.num_keys),
-            probe_rowid_dest: to_u16(probe_rowid_reg),
+            hash_table_id: to_u32(hash_table_reg),
+            key_start_reg: to_u32(hash_ctx.key_start_reg),
+            num_keys: to_u32(hash_ctx.num_keys),
+            probe_rowid_dest: to_u32(probe_rowid_reg),
             target_pc: grace_advance,
         });
 
@@ -1286,13 +1286,13 @@ impl GraceHashLoop {
 
         // HashProbe the loaded build partition with the probe keys
         program.emit_insn(Insn::HashProbe {
-            hash_table_id: to_u16(hash_table_reg),
-            key_start_reg: to_u16(hash_ctx.key_start_reg),
-            num_keys: to_u16(hash_ctx.num_keys),
-            dest_reg: to_u16(match_reg),
+            hash_table_id: to_u32(hash_table_reg),
+            key_start_reg: to_u32(hash_ctx.key_start_reg),
+            num_keys: to_u32(hash_ctx.num_keys),
+            dest_reg: to_u32(match_reg),
             target_pc: grace_outer_check,
-            payload_dest_reg: payload_dest_reg.map(to_u16),
-            num_payload: to_u16(num_payload),
+            payload_dest_reg: payload_dest_reg.map(to_u32),
+            num_payload: to_u32(num_payload),
             probe_rowid_reg: None, // grace-only: HashGraceLoadPartition already loaded this partition
         });
 
@@ -1440,7 +1440,7 @@ impl GraceHashLoop {
 
         // Evict current partition, advance to next
         program.emit_insn(Insn::HashGraceAdvancePartition {
-            hash_table_id: to_u16(hash_table_reg),
+            hash_table_id: to_u32(hash_table_reg),
             target_pc: grace_cleanup,
         });
         program.emit_insn(Insn::Goto {

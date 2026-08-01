@@ -76,6 +76,7 @@ def connect_sync(
     isolation_level: Optional[str] = "DEFERRED",
     push_operations_threshold: Optional[int] = None,
     pull_bytes_threshold: Optional[int] = None,
+    logical_mvcc_pull: Optional[bool] = None,
 ) -> ConnectionSync:
     # Connector creating the blocking synchronized connection in the worker thread
     def _connector() -> BlockingConnectionSync:
@@ -91,6 +92,7 @@ def connect_sync(
             isolation_level=isolation_level,
             push_operations_threshold=push_operations_threshold,
             pull_bytes_threshold=pull_bytes_threshold,
+            logical_mvcc_pull=logical_mvcc_pull,
         )
 
     # Return awaitable async wrapper with sync extras

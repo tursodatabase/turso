@@ -30,15 +30,15 @@ use crate::{
     io_operations::IoOperations,
     server_proto::{
         self, Batch, BatchCond, BatchStep, BatchStreamReq, PageData, PageUpdatesEncodingReq,
-        PullUpdatesApplyMode, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
-        PullUpdatesStreamKind, Stmt, StmtResult, StreamRequest,
+        PullUpdatesApplyMode, PullUpdatesProtocol, PullUpdatesReqProtoBody,
+        PullUpdatesRespProtoBody, PullUpdatesStreamKind, Stmt, StmtResult, StreamRequest,
     },
     types::{
         parse_bin_record, Coro, DatabasePullRevision, DatabaseRowMutation,
         DatabaseRowTransformResult, DatabaseSchemaKind, DatabaseSchemaReplay,
         DatabaseStatementReplay, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
         DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbSyncInfo, DbSyncStatus,
-        PartialBootstrapStrategy, PartialSyncOpts, SyncEngineIoResult,
+        PartialBootstrapStrategy, PartialSyncOpts, RemotePullProtocol, SyncEngineIoResult,
     },
     wal_session::WalSession,
     Result,
@@ -72,6 +72,7 @@ const MVCC_OP_UPDATE_HEADER: u8 = 4;
 const MVCC_OP_FLAG_PORTABLE_EXTENSION: u8 = 1 << 1;
 const MVCC_SQLITE_SCHEMA_TABLE_ID: i64 = -1;
 const MVCC_DELETE_EXT_IDENTITY_RECORD_FIELD: u64 = 1;
+const MVCC_DELETE_EXT_PK_RECORD_FIELD: u64 = 2;
 const PORTABLE_TXN_META_CLIENT_KEY: &str = "client";
 const SQLITE_INTERNAL_PREFIX: &str = "sqlite_";
 const SQLITE_SCHEMA_TABLE: &str = "sqlite_schema";
@@ -125,6 +126,21 @@ fn pull_updates_apply_mode(header: &PullUpdatesRespProtoBody) -> Result<PullUpda
             header.apply_mode
         ))
     })
+}
+
+/// Detects the remote's sync protocol from the `protocol` field of a
+/// pull-updates response header.
+///
+/// Servers deploy before SDK releases, so a response without the field (or
+/// with an unknown future value) comes from a page-protocol server by
+/// definition — MVCC databases only exist behind servers that advertise it.
+pub(crate) fn detect_remote_pull_protocol(header: &PullUpdatesRespProtoBody) -> RemotePullProtocol {
+    match PullUpdatesProtocol::try_from(header.protocol) {
+        Ok(PullUpdatesProtocol::MvccLogical) => RemotePullProtocol::MvccLogical,
+        Ok(PullUpdatesProtocol::Pages | PullUpdatesProtocol::Unspecified) | Err(_) => {
+            RemotePullProtocol::Pages
+        }
+    }
 }
 
 fn ensure_page_stream(header: &PullUpdatesRespProtoBody, context: &str) -> Result<()> {
@@ -194,6 +210,11 @@ fn logical_op_to_tape_operations(
                     change_time: commit_ts,
                     change: DatabaseTapeRowChangeType::Delete {
                         before: turso_core::alloc::vec![],
+                        key: if op.record.is_empty() {
+                            None
+                        } else {
+                            Some(parse_bin_record(&op.record)?)
+                        },
                     },
                     table_name: op.table_name,
                     id: op.rowid,
@@ -313,7 +334,7 @@ fn sqlite_schema_change_name(change: &DatabaseTapeRowChange) -> Result<Option<St
         return Ok(None);
     }
     let values = match &change.change {
-        DatabaseTapeRowChangeType::Delete { before } => before,
+        DatabaseTapeRowChangeType::Delete { before, .. } => before,
         DatabaseTapeRowChangeType::Insert { after } => after,
         DatabaseTapeRowChangeType::Update { after, .. } => after,
     };
@@ -1052,37 +1073,35 @@ fn skip_mvcc_proto_field(buf: &[u8], cursor: &mut usize, wire_type: u64) -> Resu
     Ok(())
 }
 
-fn decode_mvcc_delete_identity_record(extension: &[u8]) -> Result<Vec<u8>> {
+fn decode_mvcc_delete_record(extension: &[u8], record_field: u64) -> Result<Vec<u8>> {
     let mut cursor = 0usize;
-    let mut identity_record = Vec::new();
+    let mut record = Vec::new();
     while cursor < extension.len() {
         let key = read_mvcc_proto_varint(extension, &mut cursor)?;
         let field = key >> 3;
         let wire_type = key & 7;
-        if field == MVCC_DELETE_EXT_IDENTITY_RECORD_FIELD && wire_type == 2 {
+        if field == record_field && wire_type == 2 {
             let len =
                 usize::try_from(read_mvcc_proto_varint(extension, &mut cursor)?).map_err(|_| {
                     Error::DatabaseSyncEngineError(
-                        "MVCC delete identity record length overflows usize".to_string(),
+                        "MVCC delete record length overflows usize".to_string(),
                     )
                 })?;
             let end = cursor.checked_add(len).ok_or_else(|| {
-                Error::DatabaseSyncEngineError(
-                    "MVCC delete identity record length overflow".to_string(),
-                )
+                Error::DatabaseSyncEngineError("MVCC delete record length overflow".to_string())
             })?;
             if end > extension.len() {
                 return Err(Error::DatabaseSyncEngineError(
-                    "truncated MVCC delete identity record".to_string(),
+                    "truncated MVCC delete record".to_string(),
                 ));
             }
-            identity_record = extension[cursor..end].to_vec();
+            record = extension[cursor..end].to_vec();
             cursor = end;
         } else {
             skip_mvcc_proto_field(extension, &mut cursor, wire_type)?;
         }
     }
-    Ok(identity_record)
+    Ok(record)
 }
 
 fn portable_string(strings: &[String], idx: u64, context: &str) -> Result<String> {
@@ -1357,7 +1376,10 @@ fn decode_recovery_ops_to_logical_txn(
                 let mut payload_cursor = 0usize;
                 let rowid = read_mvcc_sqlite_varint(payload, &mut payload_cursor)? as i64;
                 if table_id == MVCC_SQLITE_SCHEMA_TABLE_ID {
-                    let identity_record = decode_mvcc_delete_identity_record(portable_extension)?;
+                    let identity_record = decode_mvcc_delete_record(
+                        portable_extension,
+                        MVCC_DELETE_EXT_IDENTITY_RECORD_FIELD,
+                    )?;
                     if identity_record.is_empty() {
                         return Err(Error::DatabaseSyncEngineError(
                             "MVCC sqlite_schema delete is missing portable identity record"
@@ -1367,11 +1389,15 @@ fn decode_recovery_ops_to_logical_txn(
                     schema_deltas.entry(rowid).or_default().old =
                         Some(decode_schema_row(&identity_record)?);
                 } else if let Some(table_name) = object_names.get(&table_id) {
+                    let primary_key_record = decode_mvcc_delete_record(
+                        portable_extension,
+                        MVCC_DELETE_EXT_PK_RECORD_FIELD,
+                    )?;
                     row_ops.push(LogicalOp {
                         op_type: LogicalOpType::DeleteRow as i32,
                         table_name: table_name.clone(),
                         rowid,
-                        record: Bytes::new(),
+                        record: Bytes::from(primary_key_record),
                         sql: String::new(),
                         user_version: None,
                         application_id: None,
@@ -1817,7 +1843,11 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
     revision: &str,
     long_poll_timeout: Option<std::time::Duration>,
     logical_updates: bool,
-) -> Result<(DatabasePullRevision, PullUpdatesV1Result)> {
+) -> Result<(
+    DatabasePullRevision,
+    PullUpdatesV1Result,
+    RemotePullProtocol,
+)> {
     tracing::info!(
         "pull_updates_v1: remote_url={:?} revision={} logical_updates={} long_poll_timeout_ms={}",
         ctx.remote_url,
@@ -1884,6 +1914,7 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
     let next_revision = DatabasePullRevision::V1 {
         revision: header.server_revision.clone(),
     };
+    let remote_protocol = detect_remote_pull_protocol(&header);
     let apply_mode = pull_updates_apply_mode(&header)?;
     match pull_updates_stream_kind(&header)? {
         PullUpdatesStreamKind::Pages => {
@@ -1948,7 +1979,11 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
                 next_revision,
                 replace_base
             );
-            Ok((next_revision, PullUpdatesV1Result::Pages { replace_base }))
+            Ok((
+                next_revision,
+                PullUpdatesV1Result::Pages { replace_base },
+                remote_protocol,
+            ))
         }
         PullUpdatesStreamKind::MvccLogicalLog => {
             if matches!(apply_mode, PullUpdatesApplyMode::ReplaceBase) {
@@ -1976,7 +2011,11 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
                 txns,
                 ops
             );
-            Ok((next_revision, PullUpdatesV1Result::Logical { txns, ops }))
+            Ok((
+                next_revision,
+                PullUpdatesV1Result::Logical { txns, ops },
+                remote_protocol,
+            ))
         }
     }
 }
@@ -2382,6 +2421,28 @@ fn convert_to_args(
             },
         })
         .collect()
+}
+
+/// Lists user-created tables (i.e. anything beyond sqlite/turso internals).
+/// Used to decide whether local data exists that a replace-base apply would
+/// need to preserve.
+pub async fn list_user_tables<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'turso_%' AND name NOT LIKE '\\_\\_turso\\_%' ESCAPE '\\'",
+    )?;
+    let mut names = Vec::new();
+    while let Some(row) = run_stmt_once(coro, &mut stmt).await? {
+        let name = row
+            .get_value(0)
+            .to_text()
+            .ok_or_else(|| Error::DatabaseSyncEngineError("unexpected column type".to_string()))?
+            .to_string();
+        names.push(name);
+    }
+    Ok(names)
 }
 
 pub async fn has_table<Ctx>(
@@ -2975,14 +3036,13 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
                     }
                 }
                 match &change.change {
-                    DatabaseTapeRowChangeType::Delete { before } => {
-                        let values = generator.replay_values(
+                    DatabaseTapeRowChangeType::Delete { before, key } => {
+                        let values = generator.replay_delete_values(
                             &replay_info,
-                            replay_info.change_type,
                             change.id,
                             before.clone(),
-                            None,
-                        );
+                            key.clone(),
+                        )?;
                         sql_over_http_requests
                             .push(step(replay_info.query.clone(), convert_to_args(values)))
                     }
@@ -3190,7 +3250,7 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
     protocol: DatabaseSyncEngineProtocolVersion,
     partial_sync: Option<PartialSyncOpts>,
     pull_bytes_threshold: Option<usize>,
-) -> Result<DatabasePullRevision> {
+) -> Result<(DatabasePullRevision, RemotePullProtocol)> {
     match protocol {
         DatabaseSyncEngineProtocolVersion::Legacy => {
             if partial_sync.is_some() {
@@ -3198,7 +3258,9 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
                     "can't bootstrap prefix of database with legacy protocol".to_string(),
                 ));
             }
-            bootstrap_db_file_legacy(ctx, io, main_db_path).await
+            // The legacy wire protocol has no MVCC variant; it is pages by definition.
+            let revision = bootstrap_db_file_legacy(ctx, io, main_db_path).await?;
+            Ok((revision, RemotePullProtocol::Pages))
         }
         DatabaseSyncEngineProtocolVersion::V1 => {
             bootstrap_db_file_v1(ctx, io, main_db_path, partial_sync, pull_bytes_threshold).await
@@ -3327,7 +3389,7 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     main_db_path: &str,
     partial_sync: Option<PartialSyncOpts>,
     pull_bytes_threshold: Option<usize>,
-) -> Result<DatabasePullRevision> {
+) -> Result<(DatabasePullRevision, RemotePullProtocol)> {
     if let Some(PartialSyncOpts {
         bootstrap_strategy: None,
         ..
@@ -3416,9 +3478,13 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     // with unflushed pages while the metadata claims a completed bootstrap.
     sync_file(ctx.coro, &file).await?;
 
-    Ok(DatabasePullRevision::V1 {
-        revision: header.server_revision,
-    })
+    let remote_protocol = detect_remote_pull_protocol(&header);
+    Ok((
+        DatabasePullRevision::V1 {
+            revision: header.server_revision,
+        },
+        remote_protocol,
+    ))
 }
 
 fn decode_page(header: &PullUpdatesRespProtoBody, page_data: PageData) -> Result<Vec<u8>> {
@@ -3837,10 +3903,10 @@ mod tests {
         database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
         database_sync_operations::{
             apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats,
-            ensure_incremental_page_stream, ensure_page_stream, is_logically_replayable_table,
-            logical_txn_to_tape_operations, pull_pages_v1, pull_updates_v1, should_push_change,
-            should_replay_local_change, wait_proto_message, wal_pull_to_file_v1,
-            PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx,
+            detect_remote_pull_protocol, ensure_incremental_page_stream, ensure_page_stream,
+            is_logically_replayable_table, logical_txn_to_tape_operations, pull_pages_v1,
+            pull_updates_v1, should_push_change, should_replay_local_change, wait_proto_message,
+            wal_pull_to_file_v1, PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx,
         },
         database_tape::{run_stmt_once, DatabaseReplaySessionOpts, DatabaseTape},
         server_proto,
@@ -4266,6 +4332,32 @@ mod tests {
         recovery_payload.extend_from_slice(&payload);
     }
 
+    fn append_test_table_delete(
+        recovery_payload: &mut Vec<u8>,
+        table_id: i64,
+        rowid: i64,
+        primary_key_record: &[u8],
+    ) {
+        let mut payload = Vec::new();
+        write_test_varint(rowid as u64, &mut payload);
+
+        let mut extension = Vec::new();
+        write_test_varint(
+            (super::MVCC_DELETE_EXT_PK_RECORD_FIELD << 3) | 2,
+            &mut extension,
+        );
+        write_test_varint(primary_key_record.len() as u64, &mut extension);
+        extension.extend_from_slice(primary_key_record);
+
+        recovery_payload.push(super::MVCC_OP_DELETE_TABLE);
+        recovery_payload.push(super::MVCC_OP_FLAG_PORTABLE_EXTENSION);
+        recovery_payload.extend_from_slice(&(table_id as i32).to_le_bytes());
+        write_test_varint(payload.len() as u64, recovery_payload);
+        recovery_payload.extend_from_slice(&payload);
+        write_test_varint(extension.len() as u64, recovery_payload);
+        recovery_payload.extend_from_slice(&extension);
+    }
+
     fn raw_mvcc_log_frame_from_payloads(
         commit_ts: u64,
         portable_payload: &[u8],
@@ -4385,6 +4477,7 @@ mod tests {
             turso_core::Value::from_i64(1),
             turso_core::Value::build_text("one"),
         ]);
+        let primary_key_record = record(&[turso_core::Value::from_i64(1)]);
         let portable_txn = super::PortableLogicalTxn {
             end_offset: 104,
             commit_ts: 77,
@@ -4411,14 +4504,16 @@ mod tests {
             &schema_record,
         );
         append_test_table_upsert(&mut recovery_payload, table_id, 1, &row_record);
+        append_test_table_delete(&mut recovery_payload, table_id, 1, &primary_key_record);
 
         let salt = 0x0123_4567_89ab_cdefu64;
         let log_header = raw_mvcc_log_header(salt);
         let initial_crc = crc32c::crc32c(&salt.to_le_bytes());
         let (frame, _) =
-            raw_mvcc_log_frame_with_crc(77, &portable_payload, &recovery_payload, 2, initial_crc);
+            raw_mvcc_log_frame_with_crc(77, &portable_payload, &recovery_payload, 3, initial_crc);
         let end_offset = (log_header.len() + frame.len()) as u64;
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: format!("g1:o{end_offset}"),
             db_size: 0,
             raw_encoding: None,
@@ -4445,7 +4540,7 @@ mod tests {
         assert_eq!(txns[0].end_offset, 104);
         assert_eq!(txns[0].commit_ts, 77);
         assert_eq!(txns[0].origin_client_id, "client-a");
-        assert_eq!(txns[0].ops.len(), 2);
+        assert_eq!(txns[0].ops.len(), 3);
         assert_eq!(txns[0].ops[0].op_type, LogicalOpType::Schema as i32);
         assert_eq!(txns[0].ops[0].schema_name, "t");
         assert_eq!(txns[0].ops[0].stable_table_id, 0);
@@ -4453,6 +4548,10 @@ mod tests {
         assert_eq!(txns[0].ops[1].table_name, "t");
         assert_eq!(txns[0].ops[1].rowid, 1);
         assert_eq!(txns[0].ops[1].record, row_record);
+        assert_eq!(txns[0].ops[2].op_type, LogicalOpType::DeleteRow as i32);
+        assert_eq!(txns[0].ops[2].table_name, "t");
+        assert_eq!(txns[0].ops[2].rowid, 1);
+        assert_eq!(txns[0].ops[2].record, primary_key_record);
     }
 
     #[test]
@@ -4496,6 +4595,7 @@ mod tests {
         let range_start = super::MVCC_LOG_HEADER_SIZE as u64;
         let range_end = range_start + raw_frame.len() as u64;
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: format!("g1:o{range_end}"),
             db_size: 0,
             raw_encoding: None,
@@ -4543,7 +4643,8 @@ mod tests {
                     Some("https://example.com".to_string()),
                     None,
                 );
-                let (revision, result) = pull_updates_v1(&ctx, &file, "g1:o56", None, true).await?;
+                let (revision, result, _) =
+                    pull_updates_v1(&ctx, &file, "g1:o56", None, true).await?;
                 let DatabasePullRevision::V1 { revision } = revision else {
                     panic!("expected V1 revision");
                 };
@@ -4578,6 +4679,7 @@ mod tests {
     fn pull_updates_v1_accepts_page_stream_when_logical_pull_is_requested() {
         let page = vec![7u8; super::PAGE_SIZE];
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: "g1:o45".to_string(),
             db_size: 1,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -4619,7 +4721,8 @@ mod tests {
                     Some("https://example.com".to_string()),
                     None,
                 );
-                let (revision, result) = pull_updates_v1(&ctx, &file, "g1:o40", None, true).await?;
+                let (revision, result, _) =
+                    pull_updates_v1(&ctx, &file, "g1:o40", None, true).await?;
                 let DatabasePullRevision::V1 { revision } = revision else {
                     panic!("expected V1 revision");
                 };
@@ -4662,6 +4765,7 @@ mod tests {
     fn pull_updates_v1_preserves_replace_base_page_fallback() {
         let page = vec![9u8; super::PAGE_SIZE];
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: "g1:o80".to_string(),
             db_size: 1,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -4703,7 +4807,8 @@ mod tests {
                     Some("https://example.com".to_string()),
                     None,
                 );
-                let (revision, result) = pull_updates_v1(&ctx, &file, "g1:o40", None, true).await?;
+                let (revision, result, _) =
+                    pull_updates_v1(&ctx, &file, "g1:o40", None, true).await?;
                 let DatabasePullRevision::V1 { revision } = revision else {
                     panic!("expected V1 revision");
                 };
@@ -4734,6 +4839,7 @@ mod tests {
     #[test]
     fn wal_pull_to_file_v1_rejects_replace_base_page_stream() {
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: "g1:o80".to_string(),
             db_size: 1,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -4799,6 +4905,7 @@ mod tests {
     fn pull_pages_v1_accepts_replace_base_page_stream_for_revision_pinned_reads() {
         let page = vec![11u8; super::PAGE_SIZE];
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: "g1:o80".to_string(),
             db_size: 3,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -4927,6 +5034,7 @@ mod tests {
         let range_start = super::MVCC_LOG_HEADER_SIZE as u64;
         let range_end = range_start + frame.len() as u64;
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: format!("g1:o{range_end}"),
             db_size: 0,
             raw_encoding: None,
@@ -4970,6 +5078,7 @@ mod tests {
         log_header[super::MVCC_LOG_HEADER_CRC_START] ^= 0x01;
         let end_offset = (log_header.len() + frame.len()) as u64;
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: format!("g1:o{end_offset}"),
             db_size: 0,
             raw_encoding: None,
@@ -5004,6 +5113,7 @@ mod tests {
         frame[super::MVCC_TX_EXT_HEADER_SIZE + super::MVCC_EXTENSION_RECORD_HEADER_SIZE] ^= 0x01;
         let end_offset = (log_header.len() + frame.len()) as u64;
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: format!("g1:o{end_offset}"),
             db_size: 0,
             raw_encoding: None,
@@ -5219,11 +5329,24 @@ mod tests {
                     schema_name: String::new(),
                     stable_table_id: 9,
                 },
+                LogicalOp {
+                    op_type: LogicalOpType::DeleteRow as i32,
+                    table_name: String::new(),
+                    rowid: 99,
+                    record: record(&[turso_core::Value::from_i64(1)]),
+                    sql: String::new(),
+                    user_version: None,
+                    application_id: None,
+                    schema_action: None,
+                    schema_kind: None,
+                    schema_name: String::new(),
+                    stable_table_id: 9,
+                },
             ],
         };
 
         let operations = logical_txn_to_tape_operations(&txn).unwrap();
-        assert_eq!(operations.len(), 2);
+        assert_eq!(operations.len(), 3);
         assert!(matches!(
             &operations[0],
             DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Create { sql })
@@ -5237,6 +5360,20 @@ mod tests {
                 assert!(matches!(
                     change.change,
                     DatabaseTapeRowChangeType::Insert { .. }
+                ));
+            }
+            other => panic!("expected row change, got {other:?}"),
+        }
+        match &operations[2] {
+            DatabaseTapeOperation::RowChange(change) => {
+                assert_eq!(change.table_name, "items");
+                assert_eq!(change.id, 99);
+                assert!(matches!(
+                    &change.change,
+                    DatabaseTapeRowChangeType::Delete {
+                        before,
+                        key: Some(key)
+                    } if before.is_empty() && *key == vec![turso_core::Value::from_i64(1)]
                 ));
             }
             other => panic!("expected row change, got {other:?}"),
@@ -5284,7 +5421,7 @@ mod tests {
             remote_encryption_key: None,
             push_operations_threshold: None,
             pull_bytes_threshold: None,
-            logical_mvcc_pull: true,
+            logical_mvcc_pull: Some(true),
         };
         let internal_schema_change = DatabaseTapeRowChange {
             change_id: 1,
@@ -5365,6 +5502,7 @@ mod tests {
 
     fn page_header(stream_kind: i32, apply_mode: i32) -> PullUpdatesRespProtoBody {
         PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: "rev".to_string(),
             db_size: 1,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -5465,5 +5603,41 @@ mod tests {
         assert!(super::rewrite_create_ddl_as_if_not_exists("ALTER TABLE q ADD COLUMN w").is_none());
         assert!(super::rewrite_create_ddl_as_if_not_exists("DROP TABLE q").is_none());
         assert!(super::rewrite_create_ddl_as_if_not_exists("not valid sql").is_none());
+    }
+
+    #[test]
+    fn detect_remote_pull_protocol_reads_the_explicit_field_only() {
+        use crate::server_proto::PullUpdatesProtocol;
+        use crate::types::RemotePullProtocol;
+
+        let header = |protocol: i32| PullUpdatesRespProtoBody {
+            server_revision: "g1:o0".to_string(),
+            db_size: 0,
+            raw_encoding: Some(PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Pages as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: None,
+            protocol,
+        };
+
+        assert_eq!(
+            detect_remote_pull_protocol(&header(PullUpdatesProtocol::MvccLogical as i32)),
+            RemotePullProtocol::MvccLogical
+        );
+        assert_eq!(
+            detect_remote_pull_protocol(&header(PullUpdatesProtocol::Pages as i32)),
+            RemotePullProtocol::Pages
+        );
+        // Servers deploy before SDK releases: a missing field (old server)
+        // or an unknown future value means a page-protocol server.
+        assert_eq!(
+            detect_remote_pull_protocol(&header(PullUpdatesProtocol::Unspecified as i32)),
+            RemotePullProtocol::Pages
+        );
+        assert_eq!(
+            detect_remote_pull_protocol(&header(99)),
+            RemotePullProtocol::Pages
+        );
     }
 }

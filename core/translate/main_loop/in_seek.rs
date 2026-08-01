@@ -60,9 +60,9 @@ pub(super) fn open_in_seek_source_cursor(
                     NoConstantOptReason::InListEphemeral,
                 )?;
                 program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u16(val_reg),
+                    start_reg: to_u32(val_reg),
                     count: 1,
-                    dest_reg: to_u16(record_reg),
+                    dest_reg: to_u32(record_reg),
                     index_name: None,
                     affinity_str: Some(affinity_str.clone()),
                 });

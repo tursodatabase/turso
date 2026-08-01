@@ -53,6 +53,13 @@ pub struct SqlGenBackend {
 
 impl SqlGenBackend {
     pub fn new(seed: u64) -> Self {
+        Self::new_with_window_weight(seed, 0.0)
+    }
+
+    /// Construct with a non-zero probability that each expression-list
+    /// result column is a window function. Used by the window-function-
+    /// focused fuzzing path.
+    pub fn new_with_window_weight(seed: u64, window_function_probability: f64) -> Self {
         let ctx = sql_gen::Context::new_with_seed(seed);
         let mut policy = Policy::default()
             .with_stmt_weights(sql_gen::StmtWeights {
@@ -63,6 +70,7 @@ impl SqlGenBackend {
                 sql_gen::FunctionConfig::deterministic().disable(&["LIKELY", "UNLIKELY"]),
             );
         policy.select_config.require_order_by_with_limit = true;
+        policy.select_config.window_function_probability = window_function_probability;
         // Disable expression values for inserts, enable conflict clauses for updates
         policy.insert_config.expression_value_probability = 0.0;
         policy.insert_config.or_replace_probability = 0.0;
@@ -119,10 +127,11 @@ impl SqlGenerator for SqlGenBackend {
 pub struct PropTestBackend {
     test_runner: TestRunner,
     profile: sql_gen_prop::StatementProfile,
+    recursive_cte_focus: bool,
 }
 
 impl PropTestBackend {
-    pub fn new(seed_bytes: [u8; 32]) -> Self {
+    pub fn new(seed_bytes: [u8; 32], recursive_cte_focus: bool) -> Self {
         let test_runner = TestRunner::new_with_rng(
             proptest::test_runner::Config::default(),
             proptest::test_runner::TestRng::from_seed(
@@ -136,9 +145,21 @@ impl PropTestBackend {
             .expression
             .base
             .order_by_allow_integer_positions = false;
+        if recursive_cte_focus {
+            profile = profile.read_only();
+            profile.generation.expression = profile.generation.expression.clone().simple();
+            profile.select.extra.allow_aggregates = false;
+            let cte = &mut profile.select.extra.cte_profile;
+            cte.cte_weight = 100;
+            cte.no_cte_weight = 0;
+            cte.cte_count_range = 1..=3;
+            cte.recursive_weight = 100;
+            cte.non_recursive_weight = 0;
+        }
         Self {
             test_runner,
             profile,
+            recursive_cte_focus,
         }
     }
 }
@@ -146,11 +167,31 @@ impl PropTestBackend {
 impl SqlGenerator for PropTestBackend {
     fn generate(&mut self, schema: &sql_gen::Schema) -> Result<GeneratedStatement> {
         let prop_schema = to_prop_schema(schema);
-        let strategy = sql_gen_prop::strategies::statement_for_schema(&prop_schema, &self.profile);
+        let bootstrap_profile;
+        let profile = if self.recursive_cte_focus && prop_schema.tables.is_empty() {
+            bootstrap_profile = sql_gen_prop::StatementProfile::default();
+            &bootstrap_profile
+        } else {
+            &self.profile
+        };
+        let strategy = sql_gen_prop::strategies::statement_for_schema(&prop_schema, profile);
         let value_tree = strategy
             .new_tree(&mut self.test_runner)
             .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;
-        let stmt = value_tree.current();
+        let mut stmt = value_tree.current();
+        // SQLite 3.50.2, currently bundled by rusqlite in this workspace,
+        // has an ORDER BY elision regression for recursive CTEs that was
+        // fixed in later SQLite versions. Avoid an outer LIMIT/OFFSET on any
+        // statement with a recursive CTE - the default profile generates them
+        // too - so that this oracle bug cannot change the compared row set.
+        // Recursive LIMIT/OFFSET and priority ordering remain fully generated
+        // inside the CTE.
+        if let sql_gen_prop::SqlStatement::Select(select) = &mut stmt {
+            if select.has_recursive_cte() {
+                select.limit = None;
+                select.offset = None;
+            }
+        }
         let sql = stmt.to_string();
         let stmt_kind = sql_gen_prop::StatementKind::from(&stmt);
         let is_ddl = stmt_kind.is_ddl();

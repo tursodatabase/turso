@@ -81,6 +81,13 @@ func TestSyncDSNParsing(t *testing.T) {
 	}
 }
 
+func TestSyncNormalizeUrl(t *testing.T) {
+	require.Equal(t, "https://db.turso.io", normalizeUrl("libsql://db.turso.io"))
+	require.Equal(t, "https://db.turso.io", normalizeUrl("turso://db.turso.io"))
+	require.Equal(t, "https://db.turso.io", normalizeUrl("https://db.turso.io"))
+	require.Equal(t, "http://localhost:8080", normalizeUrl("http://localhost:8080"))
+}
+
 func TestSyncBusyTimeoutConfigPrecedence(t *testing.T) {
 	// Test that explicit BusyTimeout in config takes precedence over DSN
 	t.Run("config overrides DSN", func(t *testing.T) {

@@ -17,8 +17,8 @@ use turso_sync_engine::server_proto::{
     BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, Col, Error,
     ExecuteStreamReq, ExecuteStreamResp, MvccLogicalLogMetadataProto, MvccLogicalLogRangeProto,
     PageData, PageSetRawEncodingProto, PageUpdatesEncodingReq, PipelineReqBody, PipelineRespBody,
-    PullUpdatesApplyMode, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, PullUpdatesStreamKind,
-    Row, StmtResult, StreamRequest, StreamResponse, StreamResult, Value,
+    PullUpdatesApplyMode, PullUpdatesProtocol, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
+    PullUpdatesStreamKind, Row, StmtResult, StreamRequest, StreamResponse, StreamResult, Value,
 };
 
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -597,6 +597,15 @@ impl TursoSyncServer {
             stream_kind: PullUpdatesStreamKind::Pages as i32,
             apply_mode: apply_mode as i32,
             mvcc_log: None,
+            // The protocol hint reflects the database, not the response shape:
+            // page bootstraps of an MVCC database advertise MvccLogical so
+            // auto-detecting clients switch to logical pulls, mirroring the
+            // production server.
+            protocol: if conn.mvcc_enabled() {
+                PullUpdatesProtocol::MvccLogical as i32
+            } else {
+                PullUpdatesProtocol::Pages as i32
+            },
         };
 
         let mut response_body = Vec::new();
@@ -723,6 +732,7 @@ impl TursoSyncServer {
             stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
             apply_mode: PullUpdatesApplyMode::Incremental as i32,
             mvcc_log,
+            protocol: PullUpdatesProtocol::MvccLogical as i32,
         };
 
         let header_bytes = header.encode_to_vec();
@@ -774,6 +784,7 @@ impl TursoSyncServer {
             stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
             apply_mode: PullUpdatesApplyMode::Incremental as i32,
             mvcc_log: None,
+            protocol: PullUpdatesProtocol::MvccLogical as i32,
         };
 
         let mut response_body = Vec::new();
@@ -798,6 +809,8 @@ impl TursoSyncServer {
             stream_kind: PullUpdatesStreamKind::Pages as i32,
             apply_mode: PullUpdatesApplyMode::ReplaceBase as i32,
             mvcc_log: None,
+            // Replace-base is only served from the MVCC logical flow here.
+            protocol: PullUpdatesProtocol::MvccLogical as i32,
         };
 
         let mut response_body = Vec::new();

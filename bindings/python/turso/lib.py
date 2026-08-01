@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import TracebackType
@@ -204,6 +205,14 @@ def _step_once_with_io(stmt: PyTursoStatement, extra_io: Optional[Callable[[], N
                 extra_io()
             continue
         return status
+
+
+def _reject_stdlib_row_factory(rf: Any) -> None:
+    stdlib_sqlite3 = sys.modules.get("sqlite3")
+    if stdlib_sqlite3 is None:
+        return
+    if isinstance(rf, type) and issubclass(rf, stdlib_sqlite3.Row):
+        raise TypeError("sqlite3.Row is not supported as a row_factory on turso connections; use turso.Row instead")
 
 
 @dataclass
@@ -847,7 +856,11 @@ class Cursor:
         if isinstance(rf, type) and issubclass(rf, Row):
             return rf(self, Row(self, row_values))  # type: ignore[call-arg]
         if callable(rf):
-            return rf(self, Row(self, row_values))  # type: ignore[misc]
+            try:
+                return rf(self, Row(self, row_values))  # type: ignore[misc]
+            except TypeError:
+                _reject_stdlib_row_factory(rf)
+                raise
         # Fallback: return tuple
         return row_values
 

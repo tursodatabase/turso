@@ -15448,7 +15448,14 @@ fn test_mvcc_portable_changes_emit_header_only_commits() {
     let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
     let recovery_ops = collect_mvcc_recovery_ops(&db.conn);
 
-    assert!(portable_changes.is_empty());
+    // Header-only commits touch no user object, but a portable-enabled writer
+    // still emits the extension block so readers can tell an empty change set
+    // apart from pre-portable history. The payload therefore carries the frame
+    // cursor and commit timestamp and nothing else.
+    let txns = decode_portable_change_txns(&portable_changes);
+    assert_eq!(txns.len(), 2);
+    assert!(decoded_object_maps(&txns).is_empty());
+    assert!(txns.iter().all(|txn| txn.metadata.is_empty()));
     assert_eq!(
         recovery_ops
             .iter()
@@ -15697,6 +15704,55 @@ fn test_mvcc_portable_changes_do_not_infer_origin_from_application_table() {
 
 #[cfg(feature = "conn_raw_api")]
 #[test]
+fn test_mvcc_portable_changes_mark_internal_only_commits_explicitly() {
+    // A push whose user statements match no row commits only the sync
+    // bookkeeping upsert. That transaction has recovery ops but no user-visible
+    // change, and it must still be written as an extension frame: a plain frame
+    // is indistinguishable from pre-portable history, so a sync server planning
+    // a logical pull has to refuse the range, which wedges the database into a
+    // replace-base loop (no fresh replica can bootstrap again).
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute(
+            "CREATE TABLE turso_sync_last_change_id(client_id TEXT PRIMARY KEY, change_id INTEGER)",
+        )
+        .unwrap();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES (1, 'alpha')")
+        .unwrap();
+
+    let before = decode_portable_change_txns(&collect_mvcc_portable_change_bytes(&db.conn)).len();
+
+    db.conn.execute("BEGIN").unwrap();
+    db.conn
+        .execute("DELETE FROM items WHERE payload = 'no-such-row'")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO turso_sync_last_change_id VALUES ('client-a', 7)")
+        .unwrap();
+    db.conn.execute("COMMIT").unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+
+    assert_eq!(
+        txns.len(),
+        before + 1,
+        "internal-only commit must still emit a portable extension frame"
+    );
+    let internal_only = txns.last().unwrap();
+    assert!(internal_only.objects.is_empty());
+    assert!(!bytes_contain(
+        &portable_changes,
+        b"turso_sync_last_change_id"
+    ));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
 fn test_mvcc_portable_changes_metadata_does_not_auto_enable_or_get_consumed() {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
@@ -15755,6 +15811,64 @@ fn test_mvcc_portable_changes_are_encrypted_with_log_body() {
     let objects = decoded_object_maps(&txns);
 
     assert!(objects.iter().any(|object| object.name == "secret_items"));
+}
+
+/// After a checkpoint, log records reference tables by the canonical
+/// -(root_page) id, but `table_id_to_rootpage` keeps entries keyed by the
+/// original in-memory counter ids. Root pages drift away from the
+/// -(counter id) alignment as `sqlite_schema` page splits interleave with
+/// btree creation (the fat multi-column DDL below forces those splits), so a
+/// canonical id aliases the still-live counter-id entry of an unrelated
+/// object (typically an autoindex). Resolving portable object-map names
+/// through the map first then followed the wrong root page, failing the
+/// commit with "portable changes cannot resolve user data table id ...".
+/// Post-checkpoint inserts must resolve every table to its own name.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_resolve_checkpointed_table_despite_counter_id_alias() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    let tables = 40;
+    let columns = (0..12)
+        .map(|c| format!("column_with_a_long_name_{c:02} TEXT"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    for i in 0..tables {
+        db.conn
+            .execute(format!(
+                "CREATE TABLE t{i}({columns}, \
+                 UNIQUE(column_with_a_long_name_00), \
+                 UNIQUE(column_with_a_long_name_01), \
+                 UNIQUE(column_with_a_long_name_02))"
+            ))
+            .unwrap();
+        db.conn
+            .execute(format!(
+                "INSERT INTO t{i} VALUES ('a{i}', 'b{i}', 'c{i}', 'd{i}', 'e{i}', 'f{i}', \
+                 'g{i}', 'h{i}', 'i{i}', 'j{i}', 'k{i}', 'l{i}')"
+            ))
+            .unwrap();
+    }
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    for i in 0..tables {
+        db.conn
+            .execute(format!(
+                "INSERT INTO t{i} VALUES ('A{i}', 'B{i}', 'C{i}', 'D{i}', 'E{i}', 'F{i}', \
+                 'G{i}', 'H{i}', 'I{i}', 'J{i}', 'K{i}', 'L{i}')"
+            ))
+            .unwrap();
+    }
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+    for i in 0..tables {
+        let name = format!("t{i}");
+        assert!(
+            objects.iter().any(|object| object.name == name),
+            "{name} missing from portable object maps"
+        );
+    }
 }
 
 /// Encrypted version of test_recovery_checkpoint_then_more_writes.
@@ -18635,6 +18749,57 @@ fn test_nextval_no_inner_tx_retry_on_concurrent_mvcc() {
     );
 }
 
+#[test]
+fn test_sequence_write_conflict_rolls_back_outer_tx_and_rejects_commit() {
+    let db = MvccTestDbNoConn::new();
+    let setup = db.connect();
+    setup.execute("CREATE TABLE t(a INTEGER)").unwrap();
+    setup.execute("CREATE SEQUENCE s").unwrap();
+    setup.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let nextval_conn = db.connect();
+    let setval_conn = db.connect();
+
+    nextval_conn.execute("BEGIN CONCURRENT").unwrap();
+    setval_conn.execute("BEGIN CONCURRENT").unwrap();
+    nextval_conn.execute("DELETE FROM t WHERE TRUE").unwrap();
+
+    let setval_rows = get_rows(&setval_conn, "SELECT setval('s', 100, true)");
+    assert_eq!(setval_rows[0][0].as_int().unwrap(), 100);
+
+    let nextval = nextval_conn.execute("SELECT nextval('s')");
+    assert!(
+        matches!(nextval, Err(LimboError::WriteWriteConflict)),
+        "conflicting nextval must abort with WriteWriteConflict, got {nextval:?}"
+    );
+
+    setval_conn.execute("COMMIT").unwrap();
+
+    assert!(
+        nextval_conn.get_auto_commit(),
+        "write-write conflict must leave the losing connection in autocommit"
+    );
+    assert_eq!(
+        nextval_conn.get_mv_tx_id(),
+        None,
+        "write-write conflict must clear the losing connection's MVCC tx"
+    );
+
+    let commit = nextval_conn.execute("COMMIT");
+    let expected = "cannot commit - no transaction is active";
+    assert!(
+        matches!(commit, Err(LimboError::TxError(ref msg)) if msg == expected),
+        "COMMIT after conflict rollback must report no active transaction, got {commit:?}"
+    );
+
+    let rows = get_rows(&setup, "SELECT count(*) FROM t");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        1,
+        "the DELETE from the rolled-back transaction must not persist"
+    );
+}
+
 /// Regression: a multi-row `INSERT INTO autoinc_table VALUES (...), (...)`
 /// inside `BEGIN CONCURRENT` whose second-row nextval exhausts the
 /// AUTOINCREMENT sequence must leave NO partial row committed — even
@@ -19775,4 +19940,206 @@ fn test_passive_checkpoint_preserves_late_dropped_root_tracking() {
         integrity_after_checkpoint, expected_integrity,
         "checkpoint lost the late DROP's still-allocated root {keep_root}"
     );
+}
+
+/// Unlocking before `on_checkpoint_end` races writers and the next checkpoint.
+#[test]
+fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
+    use crate::io::FileSyncType;
+    use crate::mvcc;
+    use crate::mvcc::database::{LogRecord, RowVersion};
+    use crate::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
+    use crate::mvcc::persistent_storage::DurableStorage;
+    use crate::storage::encryption::EncryptionContext;
+    use crate::storage::sqlite3_ondisk::DatabaseHeader;
+    use crate::storage::wal::{CheckpointMode, TursoRwLock};
+    use crate::{CheckpointResult, File, Result, IO};
+
+    #[derive(Debug)]
+    struct ObserveCheckpointEndStorage {
+        inner: Arc<dyn DurableStorage>,
+        /// Set after open; probed from `on_checkpoint_end`.
+        lock: Mutex<Option<Arc<TursoRwLock>>>,
+        lock_held_during_end: AtomicBool,
+        end_called: AtomicBool,
+    }
+
+    impl ObserveCheckpointEndStorage {
+        fn new(inner: Arc<dyn DurableStorage>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                lock: Mutex::new(None),
+                lock_held_during_end: AtomicBool::new(false),
+                end_called: AtomicBool::new(false),
+            })
+        }
+
+        fn set_lock(&self, lock: Arc<TursoRwLock>) {
+            *self.lock.lock() = Some(lock);
+        }
+    }
+
+    impl DurableStorage for ObserveCheckpointEndStorage {
+        fn serialize_row_version(
+            &self,
+            log_record: &mut LogRecord,
+            row_version: &RowVersion,
+            portable_extension: Option<&[u8]>,
+        ) -> Result<()> {
+            self.inner
+                .serialize_row_version(log_record, row_version, portable_extension)
+        }
+        fn serialize_database_header(
+            &self,
+            log_record: &mut LogRecord,
+            header: &DatabaseHeader,
+        ) -> Result<()> {
+            self.inner.serialize_database_header(log_record, header)
+        }
+        fn log_tx(
+            &self,
+            m: LogRecord,
+            c: OnSerializationComplete<'_>,
+        ) -> Result<(Completion, u64)> {
+            self.inner.log_tx(m, c)
+        }
+        fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
+            self.inner.upgrade_header_for_log_tx(m)
+        }
+        fn sync(&self, t: FileSyncType) -> Result<Completion> {
+            self.inner.sync(t)
+        }
+        fn update_header(&self) -> Result<Completion> {
+            self.inner.update_header()
+        }
+        fn truncate(
+            &self,
+            checkpointed_through_ts: u64,
+        ) -> Result<(
+            Completion,
+            crate::mvcc::persistent_storage::LogicalLogTruncateOutcome,
+        )> {
+            self.inner.truncate(checkpointed_through_ts)
+        }
+        fn reset_to_fresh_header(&self) -> Result<Completion> {
+            self.inner.reset_to_fresh_header()
+        }
+        fn get_logical_log_file(&self) -> Arc<dyn File> {
+            self.inner.get_logical_log_file()
+        }
+        fn logical_log_offset(&self) -> u64 {
+            self.inner.logical_log_offset()
+        }
+        fn should_checkpoint(&self) -> bool {
+            self.inner.should_checkpoint()
+        }
+        fn set_checkpoint_threshold(&self, t: i64) {
+            self.inner.set_checkpoint_threshold(t)
+        }
+        fn checkpoint_threshold(&self) -> i64 {
+            self.inner.checkpoint_threshold()
+        }
+        fn advance_logical_log_offset_after_success(&self, b: u64) -> Result<()> {
+            self.inner.advance_logical_log_offset_after_success(b)
+        }
+        fn discard_pending_log_write(&self) -> Result<()> {
+            self.inner.discard_pending_log_write()
+        }
+        fn restore_logical_log_state_after_recovery(&self, o: u64, c: u32) {
+            self.inner.restore_logical_log_state_after_recovery(o, c)
+        }
+        fn set_header(&self, h: LogHeader) {
+            self.inner.set_header(h)
+        }
+        fn on_checkpoint_start(&self) -> Result<()> {
+            self.inner.on_checkpoint_start()
+        }
+        fn on_checkpoint_end(&self, r: Result<&CheckpointResult>) -> Result<()> {
+            self.end_called.store(true, Ordering::Release);
+            let held = match self.lock.lock().as_ref() {
+                Some(lock) => {
+                    // write() fails if the checkpoint still holds the lock.
+                    if lock.write() {
+                        lock.unlock();
+                        false
+                    } else {
+                        true
+                    }
+                }
+                None => false,
+            };
+            self.lock_held_during_end.store(held, Ordering::Release);
+            self.inner.on_checkpoint_end(r)
+        }
+        fn encryption_ctx(&self) -> Option<EncryptionContext> {
+            self.inner.encryption_ctx()
+        }
+    }
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join(format!("test_{}.db", rand::random::<u64>()));
+    let path_str = path.to_str().unwrap().to_string();
+    {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            &path_str,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+        DATABASE_MANAGER.lock().clear();
+    }
+
+    let log_path = path.with_extension("db-log");
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let log_file = io
+        .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)
+        .unwrap();
+    let inner_storage: Arc<dyn DurableStorage> = Arc::new(mvcc::persistent_storage::Storage::new(
+        log_file,
+        io.clone(),
+        None,
+    ));
+    let observe = ObserveCheckpointEndStorage::new(inner_storage);
+    let db = Database::open(
+        io,
+        &path_str,
+        crate::OpenOptions::new(Arc::new(SqliteDialect))
+            .durable_storage(observe.clone() as Arc<dyn DurableStorage>),
+    )
+    .unwrap();
+
+    let mv_store = db.get_mv_store().clone().unwrap();
+    observe.set_lock(mv_store.blocking_checkpoint_lock.clone());
+
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.checkpoint(CheckpointMode::Truncate {
+        upper_bound_inclusive: None,
+    })
+    .unwrap();
+
+    assert!(
+        observe.end_called.load(Ordering::Acquire),
+        "on_checkpoint_end must run for a successful truncate checkpoint"
+    );
+    assert!(
+        observe.lock_held_during_end.load(Ordering::Acquire),
+        "blocking_checkpoint_lock must still be held during on_checkpoint_end"
+    );
+    assert!(
+        mv_store.blocking_checkpoint_lock.write(),
+        "blocking_checkpoint_lock must be released after checkpoint returns"
+    );
+    mv_store.blocking_checkpoint_lock.unlock();
 }

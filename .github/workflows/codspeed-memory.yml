@@ -22,7 +22,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: ./.github/actions/setup-rust-toolchain
+        with:
+          toolchain: "1.88.0"
 
       - name: Setup mold linker
         uses: rui314/setup-mold@v1
@@ -71,7 +73,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: ./.github/actions/setup-rust-toolchain
+        with:
+          toolchain: "1.88.0"
 
       - name: Install cargo-codspeed
         uses: taiki-e/install-action@v2

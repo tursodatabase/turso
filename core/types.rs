@@ -139,6 +139,39 @@ pub trait Extendable<T> {
     fn do_extend(&mut self, other: &T) -> Result<()>;
 }
 
+/// Copies non-overlapping bytes while keeping common small lengths visible to the optimizer.
+///
+/// # Safety
+///
+/// `src` and `dst` must be valid for `len` bytes and must not overlap.
+#[inline(always)]
+unsafe fn copy_nonoverlapping_inline(src: *const u8, dst: *mut u8, len: usize) {
+    // Record decoding frequently reuses registers for short values. Fixed-size
+    // copies compile inline instead of calling the platform memcpy routine.
+    unsafe {
+        match len {
+            0 => {}
+            1 => std::ptr::copy_nonoverlapping(src, dst, 1),
+            2 => std::ptr::copy_nonoverlapping(src, dst, 2),
+            3 => std::ptr::copy_nonoverlapping(src, dst, 3),
+            4 => std::ptr::copy_nonoverlapping(src, dst, 4),
+            5 => std::ptr::copy_nonoverlapping(src, dst, 5),
+            6 => std::ptr::copy_nonoverlapping(src, dst, 6),
+            7 => std::ptr::copy_nonoverlapping(src, dst, 7),
+            8 => std::ptr::copy_nonoverlapping(src, dst, 8),
+            9 => std::ptr::copy_nonoverlapping(src, dst, 9),
+            10 => std::ptr::copy_nonoverlapping(src, dst, 10),
+            11 => std::ptr::copy_nonoverlapping(src, dst, 11),
+            12 => std::ptr::copy_nonoverlapping(src, dst, 12),
+            13 => std::ptr::copy_nonoverlapping(src, dst, 13),
+            14 => std::ptr::copy_nonoverlapping(src, dst, 14),
+            15 => std::ptr::copy_nonoverlapping(src, dst, 15),
+            16 => std::ptr::copy_nonoverlapping(src, dst, 16),
+            _ => std::ptr::copy_nonoverlapping(src, dst, len),
+        }
+    }
+}
+
 impl<T: AnyText> Extendable<T> for Text {
     #[inline(always)]
     fn do_extend(&mut self, other: &T) -> Result<()> {
@@ -154,7 +187,7 @@ impl<T: AnyText> Extendable<T> for Text {
                         "source and destination ranges must not overlap"
                     );
                     unsafe {
-                        std::ptr::copy_nonoverlapping(other_str.as_ptr(), s.as_mut_ptr(), needed);
+                        copy_nonoverlapping_inline(other_str.as_ptr(), s.as_mut_ptr(), needed);
                         s.as_mut_vec().set_len(needed);
                     }
                 } else {
@@ -183,7 +216,7 @@ impl<T: AnyBlob> Extendable<T> for ValueBlob {
                 "source and destination ranges must not overlap"
             );
             unsafe {
-                std::ptr::copy_nonoverlapping(other_slice.as_ptr(), self.as_mut_ptr(), needed);
+                copy_nonoverlapping_inline(other_slice.as_ptr(), self.as_mut_ptr(), needed);
                 self.set_len(needed);
             }
         } else {
@@ -3341,6 +3374,11 @@ impl Cursor {
         match self {
             Self::BTree(cursor) => cursor.set_null_flag(flag),
             Self::Virtual(cursor) => cursor.set_null_flag(flag),
+            // A pseudo cursor always decodes columns from its content
+            // register. SQLite's OP_NullRow likewise leaves pseudo-cursor
+            // column reads untouched: nullRow is the steady state for pseudo
+            // cursors there, and OP_Column keeps routing to the register.
+            Self::Pseudo(_) => {}
             _ => {
                 mark_unlikely();
                 panic!("set_null_flag on unexpected cursor type");

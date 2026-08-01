@@ -1,6 +1,7 @@
 use crate::io::FileSyncType;
 use crate::storage::checksum::ChecksumContext;
 use crate::storage::encryption::EncryptionContext;
+use crate::storage::sqlite3_ondisk::PageSize;
 use crate::sync::Arc;
 use crate::{io::Completion, Buffer, CompletionError, LimboError, Result};
 use crate::{
@@ -39,6 +40,12 @@ impl IOContext {
 
     pub fn set_encryption(&mut self, encryption_ctx: EncryptionContext) {
         self.encryption_or_checksum = EncryptionOrChecksum::Encryption(encryption_ctx);
+    }
+
+    pub(crate) fn reset_page_size_in_encryption_ctx(&mut self, page_size: PageSize) {
+        if let EncryptionOrChecksum::Encryption(ctx) = &mut self.encryption_or_checksum {
+            ctx.set_page_size(page_size);
+        }
     }
 
     pub fn encryption_or_checksum(&self) -> &EncryptionOrChecksum {

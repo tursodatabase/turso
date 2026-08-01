@@ -542,6 +542,15 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
             }
             if p.raw_s {
                 let r = p.s * 1000.0 + 210866760000000.0;
+                // Range check before the cast, as SQLite's date.c does. `as i64`
+                // saturates, so an out-of-range value would park i64::MIN in
+                // `i_jd`, which 'localtime'/'utc' then subtract the epoch from.
+                // The check in exec_datetime_general runs too late. Rejects NaN.
+                if !(r >= 0.0 && r < (MAX_JD + 1) as f64) {
+                    return Err(InvalidModifier(format!(
+                        "Unixepoch value out of range: {z}"
+                    )));
+                }
                 p.i_jd = (r + 0.5) as i64;
                 p.valid_jd = true;
                 p.raw_s = false;

@@ -685,14 +685,22 @@ impl LogicalLog {
         let payload_size = tx.buf.len() - LOG_RECORD_PREFIX_SIZE;
         let payload_size_u64 = payload_size as u64;
 
+        // Every commit from a portable-enabled writer gets an extension block,
+        // including one whose portable object map is empty. A transaction that
+        // touches only internal objects (`turso_sync_*`, `turso_cdc*`,
+        // `sqlite_*`, indexes) would otherwise be written as a plain frame with
+        // recovery ops, which is byte-identical to pre-portable LML2 history: a
+        // reader planning a logical sync range cannot tell "no user-visible
+        // changes here" from "user data this reader cannot replay", so it must
+        // refuse the range. Emitting the block makes the empty change set
+        // explicit; readers that decode it produce no ops for the frame.
         #[cfg(feature = "conn_raw_api")]
-        let has_portable_changes = tx.portable_changes_required || !tx.portable_changes.is_empty();
-        #[cfg(not(feature = "conn_raw_api"))]
-        let has_portable_changes = false;
-        #[cfg(feature = "conn_raw_api")]
-        let portable_changes_enabled = tx.portable_changes_enabled || has_portable_changes;
+        let portable_changes_enabled = tx.portable_changes_enabled
+            || tx.portable_changes_required
+            || !tx.portable_changes.is_empty();
         #[cfg(not(feature = "conn_raw_api"))]
         let portable_changes_enabled = false;
+        let has_portable_changes = portable_changes_enabled;
 
         // 1. Ensure we have a log header object (created lazily on first write).
         // Non-portable logs remain LML2 so a deployment that does not enable
@@ -945,6 +953,15 @@ impl LogicalLog {
             .pending_running_crc
             .take()
             .expect("advance_offset_after_success called without pending deferred write");
+    }
+
+    /// Discard the pending running CRC staged by a deferred write whose
+    /// two-phase commit aborted before the offset advanced.
+    ///
+    /// This must be called on the abort path so no later write chains its
+    /// running CRC from a value staged for a write that never confirmed.
+    pub fn discard_pending_write(&mut self) {
+        self.pending_running_crc = None;
     }
 
     pub fn sync(&mut self, sync_type: FileSyncType) -> Result<Completion> {
@@ -7224,13 +7241,19 @@ mod tests {
         let mut reader = StreamingLogicalLogReader::new(file, None);
         reader.read_header(&io).unwrap();
         assert_eq!(reader.header().unwrap().version, LOG_VERSION);
+        // A portable-enabled writer marks an empty change set explicitly: the
+        // frame carries an extension record whose payload has the frame cursor
+        // and commit timestamp but no object map, so readers decode it into no
+        // logical ops instead of having to guess whether a plain frame predates
+        // portable changes.
         let first = io
             .block(|| reader.next_portable_change_frame())
             .unwrap()
             .unwrap();
         assert_eq!(first.commit_ts, 10);
-        assert_eq!(first.extension_record_count, 0);
-        assert!(first.payload.is_empty());
+        assert_eq!(first.extension_record_count, 1);
+        assert!(!first.payload.is_empty());
+        assert_eq!(first.end_offset, reader.last_valid_offset() as u64);
 
         let second = io
             .block(|| reader.next_portable_change_frame())

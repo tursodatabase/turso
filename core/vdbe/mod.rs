@@ -2076,6 +2076,16 @@ impl Program {
         mv_store: Option<&Arc<MvStore>>,
         rollback: bool,
     ) -> Result<IOResult<()>> {
+        if !rollback {
+            turso_assert!(
+                !matches!(
+                    program_state.sequence_inner_tx_pending.as_ref(),
+                    Some(pending) if pending.saved_outer.is_some()
+                ),
+                "cannot commit while a sequence inner tx has a saved outer user tx"
+            );
+        }
+
         // Apply view deltas with I/O handling
         match self.apply_view_deltas(program_state, rollback, &pager)? {
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
@@ -2719,6 +2729,13 @@ impl Program {
                     // These MVCC errors mean the current transaction cannot
                     // commit. Roll it back even if this statement opened a
                     // statement savepoint, as DDL does.
+                    if let Err(err) = self.rollback_pending_sequence_outer_tx(state) {
+                        capture_abort_error(
+                            &mut abort_error,
+                            err,
+                            "Failed to rollback saved outer transaction after sequence conflict",
+                        );
+                    }
                     self.rollback_current_txn(pager);
                     self.connection.set_changes(0);
                 }
@@ -2877,6 +2894,44 @@ impl Program {
 
     fn rollback_current_txn(&self, pager: &Arc<Pager>) {
         self.connection.rollback_current_txn_state(pager, true);
+    }
+
+    /// MVCC sequence operations run in a separate inner tx, which temporarily
+    /// replaces the connection's `mv_tx` slot. If a transaction-level conflict
+    /// happens while that swap is active, the user transaction lives only in
+    /// `saved_outer`, not in `connection.mv_tx`. Roll it back here and clear
+    /// `saved_outer` so later statement cleanup cannot restore a transaction
+    /// that has already been aborted.
+    fn rollback_pending_sequence_outer_tx(&self, state: &mut ProgramState) -> Result<()> {
+        let Some(pending) = state.sequence_inner_tx_pending.as_mut() else {
+            return Ok(());
+        };
+        let db = pending.db;
+        let (outer_tx_id, _) = pending.saved_outer.take().ok_or_else(|| {
+            LimboError::InternalError(
+                "sequence conflict rollback had pending inner transaction without saved outer \
+                 transaction"
+                    .to_string(),
+            )
+        })?;
+        let mv_store = self.connection.mv_store_for_db(db).ok_or_else(|| {
+            LimboError::InternalError(
+                "sequence inner transaction has no MV store during conflict rollback".to_string(),
+            )
+        })?;
+        let pager = self.connection.get_pager_from_database_index(&db)?;
+        if !mv_store.is_tx_rollbackable(outer_tx_id) {
+            return Err(LimboError::InternalError(format!(
+                "saved sequence outer transaction {outer_tx_id} is not rollbackable during \
+                 conflict rollback"
+            )));
+        }
+        mv_store.rollback_tx(outer_tx_id, pager, &self.connection, db);
+        // `rollback_tx` clears the connection's MVCC tx slot for this db. The caller's
+        // generic rollback then has no current tx to inspect, so it will not flip
+        // autocommit for us.
+        self.connection.auto_commit.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn is_trigger_subprogram(&self) -> bool {
@@ -3217,18 +3272,11 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 }
                 self.set_data_section(&data[content_size..]);
                 let text_data = &data[..content_size];
-                // SAFETY: TEXT serial type contains valid UTF-8
-                let text_str = if cfg!(debug_assertions) {
-                    match std::str::from_utf8(text_data) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return Some(Err(LimboError::InternalError(format!(
-                                "Invalid UTF-8 in TEXT serial type: {e}"
-                            ))));
-                        }
-                    }
-                } else {
-                    unsafe { std::str::from_utf8_unchecked(text_data) }
+                let Ok(text_str) = simdutf8::basic::from_utf8(text_data) else {
+                    mark_unlikely();
+                    return Some(Err(LimboError::Corrupt(
+                        "TEXT value contains invalid UTF-8".into(),
+                    )));
                 };
                 match dest {
                     Register::Value(Value::Text(existing_text)) => {
@@ -3271,6 +3319,26 @@ mod tests {
         ));
         state.active_op_state.clear();
         assert!(state.active_op_state.parse_schema().is_none());
+    }
+
+    #[test]
+    fn nth_into_register_rejects_invalid_utf8_text() {
+        let payload = [2, 15, 0xff];
+        let mut iterator = crate::types::ValueIterator::new(&payload).unwrap();
+        let mut destination = Register::Value(Value::Null);
+
+        let result = iterator
+            .nth_into_register(0, &mut destination)
+            .expect("record contains one value");
+
+        assert!(
+            matches!(
+                result,
+                Err(LimboError::Corrupt(ref message))
+                    if message == "TEXT value contains invalid UTF-8"
+            ),
+            "unexpected result: {result:?}"
+        );
     }
 
     #[test]

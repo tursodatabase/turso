@@ -17,10 +17,13 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         | "pg_get_function_result"
         | "pg_get_function_arguments"
         | "pg_get_statisticsobjdef_columns"
-        | "pg_relation_is_publishable" => &[1],
-        "format_type" | "pg_get_constraintdef" | "pg_get_indexdef" => &[1, 2],
+        | "pg_relation_is_publishable"
+        | "quote_ident"
+        | "quote_literal" => &[1],
+        "format_type" | "pg_get_constraintdef" | "pg_get_indexdef" | "obj_description" => &[1, 2],
         "pg_get_expr" => &[2, 3],
-        "to_char" | "pg_input_is_valid" | "booleq" | "boolne" => &[2],
+        "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" => &[2],
+        "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
         _ => return false,
     };
     arities.contains(&(arg_count as i64))
@@ -53,12 +56,30 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         )),
         "booleq" => Ok(Value::from_i64((args.first() == args.get(1)) as i64)),
         "boolne" => Ok(Value::from_i64((args.first() != args.get(1)) as i64)),
+        "version" => Ok(exec_version()),
+        "current_database" => Ok(Value::build_text(crate::catalog::db_name_from_path(
+            conn.db_file_path(),
+        ))),
+        // pg_catalog presents every user object under the hardcoded "public"
+        // namespace, so that is always the current schema.
+        "current_schema" => Ok(Value::build_text("public")),
+        "pg_backend_pid" => Ok(Value::from_i64(std::process::id() as i64)),
+        "quote_ident" => match args.first() {
+            Some(Value::Null) | None => Ok(Value::Null),
+            _ => Ok(Value::build_text(turso_pg_parser::quote_identifier(
+                &text_arg(0),
+            ))),
+        },
+        "quote_literal" => Ok(exec_quote_literal(args.first().unwrap_or(&Value::Null))),
         // Catalog introspection stubs: accepted for compatibility, no output.
+        // obj_description/col_description are NULL because COMMENT ON is not persisted.
         "pg_get_expr"
         | "pg_get_statisticsobjdef_columns"
         | "pg_relation_is_publishable"
         | "pg_get_function_result"
-        | "pg_get_function_arguments" => Ok(Value::Null),
+        | "pg_get_function_arguments"
+        | "obj_description"
+        | "col_description" => Ok(Value::Null),
         _ => Err(LimboError::ParseError(format!("no such function: {name}"))),
     }
 }
@@ -69,6 +90,40 @@ fn exec_pg_get_user_by_id(_oid: i64) -> Value {
 
 fn exec_pg_is_visible(_oid: i64) -> Value {
     Value::from_i64(1)
+}
+
+/// PostgreSQL version advertised by version(). The major version matches the
+/// server_version startup parameter pgwire's DefaultServerParameterProvider
+/// sends, so the two claims agree.
+const SERVER_VERSION: &str = "16.6";
+
+/// Clients sometimes gate connection setup on this string: knex and TypeORM regex
+/// parse it as `^PostgreSQL ([\d.]+)`, so it must lead with a numeric version.
+fn exec_version() -> Value {
+    Value::build_text(format!(
+        "PostgreSQL {SERVER_VERSION} (Turso v{})",
+        env!("CARGO_PKG_VERSION")
+    ))
+}
+
+/// PostgreSQL's quote_literal(): wrap a value in single quotes for inclusion
+/// in SQL, doubling embedded quotes. Backslashes force the E'' escape-string
+/// form so the result reads back identically regardless of
+/// standard_conforming_strings.
+fn exec_quote_literal(value: &Value) -> Value {
+    if matches!(value, Value::Null) {
+        return Value::Null;
+    }
+    let text = match value {
+        Value::Text(t) => t.as_str().to_string(),
+        other => other.to_string(),
+    };
+    let quoted = if text.contains('\\') {
+        format!("E'{}'", text.replace('\\', "\\\\").replace('\'', "''"))
+    } else {
+        format!("'{}'", text.replace('\'', "''"))
+    };
+    Value::build_text(quoted)
 }
 
 fn exec_pg_encoding_to_char(encoding: i64) -> Value {

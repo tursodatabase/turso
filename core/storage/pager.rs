@@ -443,14 +443,16 @@ impl PageInner {
         Ok(rowid as i64)
     }
 
-    /// Fast path for index cells: returns payload slice and overflow info without constructing BTreeCell.
+    /// Returns a cell's record payload and overflow info without constructing
+    /// a `BTreeCell`.
     ///
-    /// This bypasses the full `cell_get()` to `read_btree_cell()` path for binary search hot loops.
+    /// This bypasses the full `cell_get()` to `read_btree_cell()` path for
+    /// record reads and index binary-search hot loops.
     /// The returned slice is valid as long as the page is alive.
     ///
     /// Returns: (payload_slice, payload_size, first_overflow_page)
     #[inline(always)]
-    pub fn cell_index_read_payload_ptr(
+    pub fn cell_read_payload_ptr(
         &self,
         idx: usize,
         usable_size: usize,
@@ -461,21 +463,29 @@ impl PageInner {
         let cell_offset = self.read_u16(cell_pointer) as usize;
 
         let page_type = self.page_type()?;
-        let (payload_size, varint_len, header_skip) = match page_type {
+        let (payload_size, payload_start) = match page_type {
             PageType::IndexInterior => {
                 let (size, len) =
                     read_varint(crate::slice_in_bounds_or_corrupt!(buf, cell_offset + 4..))?;
-                (size, len, 4usize)
+                (size, cell_offset + 4 + len)
             }
             PageType::IndexLeaf => {
                 let (size, len) =
                     read_varint(crate::slice_in_bounds_or_corrupt!(buf, cell_offset..))?;
-                (size, len, 0usize)
+                (size, cell_offset + len)
             }
-            _ => unreachable!("cell_index_read_payload_ptr called on non-index page"),
+            PageType::TableLeaf => {
+                let (size, payload_size_len) =
+                    read_varint(crate::slice_in_bounds_or_corrupt!(buf, cell_offset..))?;
+                let rowid_start = cell_offset + payload_size_len;
+                let (_, rowid_len) =
+                    read_varint(crate::slice_in_bounds_or_corrupt!(buf, rowid_start..))?;
+                (size, rowid_start + rowid_len)
+            }
+            PageType::TableInterior => {
+                unreachable!("table interior cells do not contain record payloads")
+            }
         };
-
-        let payload_start = cell_offset + header_skip + varint_len;
 
         let max_local = payload_overflow_threshold_max(page_type, usable_size);
         let min_local = payload_overflow_threshold_min(page_type, usable_size);
@@ -2795,7 +2805,25 @@ impl Pager {
         // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
         // Rebuilding init_page_1 must not leak any stale 4 KiB page-1 image into the first write.
         self.dirty_pages.write().clear();
+
+        // Encryption can be configured before a fresh database chooses its page
+        // size, so keep the IO context aligned with the pager before the first
+        // page write.
+        self.reset_page_size_in_encryption_ctx(size);
         Ok(())
+    }
+
+    /// Update the encryption page size in the pager IO context and its WAL copy.
+    ///
+    /// This is a no-op when encryption is not configured.
+    fn reset_page_size_in_encryption_ctx(&self, size: PageSize) {
+        self.io_ctx.write().reset_page_size_in_encryption_ctx(size);
+        if !self.is_encryption_ctx_set() {
+            return;
+        }
+        if let Some(wal) = self.wal.as_ref() {
+            wal.set_io_context(self.io_ctx.read().clone());
+        }
     }
 
     /// Set the initial journal version in page 1 before the database is initialized.

@@ -708,7 +708,22 @@ fn portable_table_name_for_mv_table_id<Clock: LogicalClock, A: ConcurrentAllocat
     mvcc_store: &MvStore<Clock, A>,
     table_id: MVTableId,
 ) -> Option<String> {
+    // `table_id` is the id as serialized into the log (see
+    // `canonicalize_table_id`), so interpret it directly as a rootpage first;
+    // `table_id_to_rootpage` is keyed by in-memory counter ids and a canonical
+    // -(root_page) id can alias an unrelated object's counter id. The map is
+    // only a fallback for a stale id serialized before a concurrent checkpoint
+    // published new roots.
+    let direct = i64::from(table_id);
+    if let Some(name) = table_name_for_rootpage(connection, direct)
+        .or_else(|| table_name_for_rootpage_in_mvcc_schema(mvcc_store, direct))
+    {
+        return Some(name);
+    }
     let rootpage = rootpage_for_mv_table_id(mvcc_store, table_id);
+    if rootpage == direct {
+        return None;
+    }
     table_name_for_rootpage(connection, rootpage)
         .or_else(|| table_name_for_rootpage_in_mvcc_schema(mvcc_store, rootpage))
 }
@@ -2569,13 +2584,31 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 }
             }
 
+            // A data table id parsed back out of the serialized payload is
+            // already in its log form: either the schema's negative rootpage
+            // placeholder (table not yet checkpointed) or the canonical
+            // -(root_page) written by `canonicalize_table_id`. Interpret it
+            // directly as a rootpage first. Consulting `table_id_to_rootpage`
+            // first is wrong: its keys are the original in-memory counter ids,
+            // so a canonical id like -159 can alias an unrelated object whose
+            // counter id happened to be -159 (and now has a checkpointed root
+            // page), sending resolution to the wrong rootpage. The map is only
+            // a fallback for a payload id serialized before a concurrent
+            // checkpoint published new roots.
             let rootpage_for_table_id = |table_id: MVTableId| -> i64 {
+                let direct = i64::from(table_id);
+                if table_name_for_rootpage(&self.connection, direct)
+                    .or_else(|| table_name_for_rootpage_in_mvcc_schema(mvcc_store, direct))
+                    .is_some()
+                {
+                    return direct;
+                }
                 mvcc_store
                     .table_id_to_rootpage
                     .get(&table_id)
                     .and_then(|entry| entry.value().root_page)
                     .map(|rootpage| rootpage as i64)
-                    .unwrap_or_else(|| i64::from(table_id))
+                    .unwrap_or(direct)
             };
 
             let mut unresolved_data_tables = Vec::new();

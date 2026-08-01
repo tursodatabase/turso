@@ -91,7 +91,8 @@ impl std::str::FromStr for RemoteEncryptionCipher {
 pub struct Builder {
     // Absolute or relative path to local database file (":memory:" is supported).
     path: String,
-    // Remote URL base. Supports https://, http:// and libsql:// (translated to https://).
+    // Remote URL base. Supports https://, http://, libsql:// and turso:// (the latter two are
+    // translated to https://).
     remote_url: Option<String>,
     // Optional authorization token provider (static string or async callback).
     auth_token: Option<AuthTokenFn>,
@@ -107,8 +108,10 @@ pub struct Builder {
     remote_encryption_key: Option<String>,
     // Encryption cipher for the Turso Cloud database
     remote_encryption_cipher: Option<RemoteEncryptionCipher>,
-    // Use MVCC logical-log incremental pulls instead of page-stream pulls.
-    logical_mvcc_pull: bool,
+    // Sync-protocol override: None (default) auto-detects the remote protocol
+    // from the first pull-updates response; Some(true) forces MVCC logical-log
+    // pulls; Some(false) forces page-stream pulls.
+    logical_mvcc_pull: Option<bool>,
     // Experimental engine features to enable on the local synced database.
     // These mirror the local [`crate::Builder`] flags so synced databases
     // expose the same SQL surface as their local-only counterparts. Local
@@ -138,7 +141,7 @@ impl Builder {
             partial_sync_config_experimental: None,
             remote_encryption_key: None,
             remote_encryption_cipher: None,
-            logical_mvcc_pull: false,
+            logical_mvcc_pull: None,
             enable_attach: false,
             enable_custom_types: false,
             enable_index_method: false,
@@ -292,12 +295,14 @@ impl Builder {
         self
     }
 
-    /// Use MVCC logical-log incremental pulls.
+    /// Override the sync protocol used for incremental pulls.
     ///
-    /// MVCC-mode remotes accept page-stream pulls only for bootstrap; callers
-    /// using legacy WAL/page sync should keep the default `false` value.
+    /// By default the protocol is auto-detected from the first pull-updates
+    /// response and persisted in the sync metadata, so calling this is only
+    /// needed for tests or as an escape hatch: `true` forces MVCC logical-log
+    /// pulls, `false` forces page-stream pulls.
     pub fn with_logical_mvcc_pull(mut self, enable: bool) -> Self {
-        self.logical_mvcc_pull = enable;
+        self.logical_mvcc_pull = Some(enable);
         self
     }
 
@@ -592,10 +597,14 @@ impl Future for AsyncOpFuture {
     }
 }
 
-// Normalize remote base URL, mapping libsql:// to https:// and validating allowed schemes.
+// Normalize remote base URL, mapping libsql:// and turso:// to https:// and validating allowed
+// schemes.
 fn normalize_base_url(input: &str) -> std::result::Result<String, String> {
     let s = input.trim();
-    let s = if let Some(rest) = s.strip_prefix("libsql://") {
+    let s = if let Some(rest) = s
+        .strip_prefix("libsql://")
+        .or_else(|| s.strip_prefix("turso://"))
+    {
         format!("https://{rest}")
     } else {
         s.to_string()
@@ -932,7 +941,7 @@ mod tests {
         env,
         process::{Child, Command, Stdio},
         thread::sleep,
-        time::Duration,
+        time::{Duration, Instant},
     };
     use tempfile::TempDir;
     use turso_sync_sdk_kit::rsapi::PartialBootstrapStrategy;
@@ -949,6 +958,29 @@ mod tests {
             .take(8)
             .map(char::from)
             .collect()
+    }
+
+    #[test]
+    fn normalize_base_url_schemes() {
+        use crate::sync::normalize_base_url;
+
+        assert_eq!(
+            normalize_base_url("libsql://db.turso.io").unwrap(),
+            "https://db.turso.io"
+        );
+        assert_eq!(
+            normalize_base_url("turso://db.turso.io").unwrap(),
+            "https://db.turso.io"
+        );
+        assert_eq!(
+            normalize_base_url("https://db.turso.io/").unwrap(),
+            "https://db.turso.io"
+        );
+        assert_eq!(
+            normalize_base_url("http://localhost:8080").unwrap(),
+            "http://localhost:8080"
+        );
+        assert!(normalize_base_url("ftp://db.turso.io").is_err());
     }
 
     #[test]
@@ -989,14 +1021,21 @@ mod tests {
     }
 
     #[test]
-    fn logical_mvcc_pull_is_opt_in() {
+    fn logical_mvcc_pull_defaults_to_auto_detection() {
         use crate::sync::Builder;
 
-        assert!(!Builder::new_remote(":memory:").logical_mvcc_pull);
-        assert!(
+        assert_eq!(Builder::new_remote(":memory:").logical_mvcc_pull, None);
+        assert_eq!(
             Builder::new_remote(":memory:")
                 .with_logical_mvcc_pull(true)
-                .logical_mvcc_pull
+                .logical_mvcc_pull,
+            Some(true)
+        );
+        assert_eq!(
+            Builder::new_remote(":memory:")
+                .with_logical_mvcc_pull(false)
+                .logical_mvcc_pull,
+            Some(false)
         );
     }
 
@@ -1063,38 +1102,76 @@ mod tests {
                     client,
                 })
             } else {
-                let port: u16 = rand::rng().random_range(10_000..=65_535);
                 let server_bin = env::var("LOCAL_SYNC_SERVER").unwrap();
 
-                // IMPORTANT: do not use Stdio::piped() here. Nothing reads from
-                // those pipes, so once the kernel pipe buffer (~64 KiB on Linux)
-                // fills, the child blocks forever inside write() and stops
-                // servicing HTTP requests, deadlocking sync operations in
-                // long-running tests like test_sync_parallel_writes_with_sync_ops.
-                let child = Command::new(server_bin)
-                    .args(["--sync-server", &format!("0.0.0.0:{port}")])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .context("failed to spawn local sync server")?;
+                // The random port can be unusable: Windows runners reserve
+                // large chunks of 10_000..=65_535 for Hyper-V (bind fails with
+                // WSAEACCES), and concurrently running tests can collide on
+                // the same port. In both cases the server child exits right
+                // away, so waiting for readiness without watching the child
+                // hangs the test forever. Detect child exit and retry with a
+                // fresh port instead.
+                const SPAWN_ATTEMPTS: u32 = 10;
+                const READY_TIMEOUT: Duration = Duration::from_secs(60);
+                for attempt in 1..=SPAWN_ATTEMPTS {
+                    let port: u16 = rand::rng().random_range(10_000..=65_535);
 
-                let user_url = format!("http://localhost:{port}");
+                    // IMPORTANT: do not use Stdio::piped() here. Nothing reads from
+                    // those pipes, so once the kernel pipe buffer (~64 KiB on Linux)
+                    // fills, the child blocks forever inside write() and stops
+                    // servicing HTTP requests, deadlocking sync operations in
+                    // long-running tests like test_sync_parallel_writes_with_sync_ops.
+                    let mut child = Command::new(&server_bin)
+                        .args(["--sync-server", &format!("0.0.0.0:{port}")])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .context("failed to spawn local sync server")?;
 
-                // wait for server readiness
-                loop {
-                    if client.get(&user_url).send().await.is_ok() {
-                        break;
+                    let user_url = format!("http://localhost:{port}");
+
+                    // wait for server readiness
+                    let started = Instant::now();
+                    loop {
+                        if client.get(&user_url).send().await.is_ok() {
+                            return Ok(Self {
+                                user_url: user_url.clone(),
+                                db_url: user_url,
+                                host: String::new(),
+                                server: Some(child),
+                                client,
+                            });
+                        }
+                        match child
+                            .try_wait()
+                            .context("failed to poll local sync server")?
+                        {
+                            Some(status) => {
+                                // Child exited (most likely the port was
+                                // reserved or already taken): retry.
+                                eprintln!(
+                                    "local sync server on port {port} exited with {status} \
+                                     before becoming ready (attempt {attempt}/{SPAWN_ATTEMPTS})"
+                                );
+                                break;
+                            }
+                            None => {
+                                if started.elapsed() > READY_TIMEOUT {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                    return Err(anyhow!(
+                                        "local sync server on port {port} did not become ready \
+                                         within {READY_TIMEOUT:?}"
+                                    ));
+                                }
+                            }
+                        }
+                        sleep(Duration::from_millis(100));
                     }
-                    sleep(Duration::from_millis(100));
                 }
-
-                Ok(Self {
-                    user_url: user_url.clone(),
-                    db_url: user_url,
-                    host: String::new(),
-                    server: Some(child),
-                    client,
-                })
+                Err(anyhow!(
+                    "local sync server failed to start after {SPAWN_ATTEMPTS} attempts"
+                ))
             }
         }
 

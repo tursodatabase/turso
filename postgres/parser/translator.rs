@@ -1831,6 +1831,59 @@ impl PostgreSQLTranslator {
             .as_ref()
             .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
 
+        // PostgreSQL exposes scalar functions in FROM position as one-row,
+        // one-column tables (clients issue `SELECT * FROM current_schema()`),
+        // but core's TableCall path resolves only table-valued functions, so
+        // desugar these zero-argument session functions into a subselect.
+        // The TEXT cast keeps the wire column text-typed; a bare subselect
+        // column comes back as bytea.
+        if args.is_empty() && matches!(func_name, "current_schema" | "current_database" | "version")
+        {
+            let column_name = match &alias {
+                Some(ast::As::As(name) | ast::As::Elided(name)) => name.clone(),
+                _ => ast::Name::from_string(func_name),
+            };
+            let call = ast::Expr::FunctionCall {
+                name: ast::Name::from_string(func_name),
+                distinctness: None,
+                args: vec![],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            };
+            let cast = ast::Expr::Cast {
+                expr: Box::new(call),
+                type_name: Some(ast::Type {
+                    name: "TEXT".to_string(),
+                    size: None,
+                    array_dimensions: 0,
+                }),
+            };
+            let select = ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns: vec![ast::ResultColumn::Expr(
+                            Box::new(cast),
+                            Some(ast::As::Elided(column_name)),
+                        )],
+                        from: None,
+                        where_clause: None,
+                        group_by: None,
+                        window_clause: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            };
+            return Ok(ast::SelectTable::Select(select, alias));
+        }
+
         Ok(ast::SelectTable::TableCall(
             ast::QualifiedName::single(ast::Name::from_string(func_name)),
             args,
@@ -2005,7 +2058,8 @@ impl PostgreSQLTranslator {
                         } else {
                             let expr = self.translate_expr(val)?;
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
-                                None
+                                derived_column_name(val)
+                                    .map(|name| ast::As::Elided(ast::Name::from_string(name)))
                             } else {
                                 Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
                             };
@@ -2240,9 +2294,30 @@ impl PostgreSQLTranslator {
                         // Return empty string stub for user functions
                         Ok(ast::Expr::Literal(ast::Literal::String("''".into())))
                     }
-                    Ok(SqlValueFunctionOp::SvfopCurrentCatalog) => {
-                        Ok(ast::Expr::Literal(ast::Literal::String("'main'".into())))
-                    }
+                    // The bare keywords route through the frontend scalars so both
+                    // syntaxes share one implementation and agree with pg_catalog.
+                    Ok(SqlValueFunctionOp::SvfopCurrentSchema) => Ok(ast::Expr::FunctionCall {
+                        name: ast::Name::from_string("current_schema"),
+                        distinctness: None,
+                        args: vec![],
+                        order_by: vec![],
+                        within_group: vec![],
+                        filter_over: ast::FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    }),
+                    Ok(SqlValueFunctionOp::SvfopCurrentCatalog) => Ok(ast::Expr::FunctionCall {
+                        name: ast::Name::from_string("current_database"),
+                        distinctness: None,
+                        args: vec![],
+                        order_by: vec![],
+                        within_group: vec![],
+                        filter_over: ast::FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    }),
                     _ => Err(ParseError::ParseError(format!(
                         "Unsupported SqlValueFunction op: {}",
                         svf.op
@@ -2422,12 +2497,8 @@ impl PostgreSQLTranslator {
                 // ILIKE/NOT ILIKE → LOWER(lhs) LIKE LOWER(rhs)
                 self.translate_ilike_expr(a_expr)
             }
-            AExprKind::AexprOpAny => {
-                // expr = ANY(array) → stub as 0 (false).
-                // Our pg_catalog tables that use arrays are empty stubs,
-                // so this never actually evaluates.
-                Ok(ast::Expr::Literal(ast::Literal::Numeric("0".to_string())))
-            }
+            AExprKind::AexprOpAny => self.translate_any_all_expr(a_expr, false),
+            AExprKind::AexprOpAll => self.translate_any_all_expr(a_expr, true),
             AExprKind::AexprBetween | AExprKind::AexprBetweenSym => {
                 self.translate_between_expr(a_expr, false)
             }
@@ -2740,6 +2811,80 @@ impl PostgreSQLTranslator {
             .unwrap_or(false);
 
         Ok(ast::Expr::InList { lhs, not, rhs })
+    }
+
+    /// Translate `<lhs> <op> ANY(<array>)` / `<lhs> <op> ALL(<array>)`.
+    /// Only the membership forms are supported: `= ANY` (IN) and `<> ALL`
+    /// (NOT IN); other operators error as not supported. A literal ARRAY[...]
+    /// operand lowers to IN/NOT IN. Any other operand (bound parameter, column,
+    /// expression) lowers to array_contains(array, elem). `= ANY(<subquery>)`
+    /// parses as a SubLink and lowers to InSelect, so it never reaches here.
+    fn translate_any_all_expr(
+        &self,
+        a_expr: &pg_query::protobuf::AExpr,
+        is_all: bool,
+    ) -> Result<ast::Expr, ParseError> {
+        let kw = if is_all { "ALL" } else { "ANY" };
+        let op_name = a_expr
+            .name
+            .first()
+            .and_then(|n| match &n.node {
+                Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .ok_or_else(|| ParseError::ParseError(format!("{kw}: missing operator name")))?;
+
+        // The PG lexer rewrites != to <>.
+        let not = match (op_name, is_all) {
+            ("=", false) => false,
+            ("<>", true) => true,
+            _ => {
+                return Err(ParseError::ParseError(format!(
+                    "{op_name} {kw} (array) is not supported"
+                )));
+            }
+        };
+
+        let lhs_node = a_expr
+            .lexpr
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError(format!("{kw}: missing lhs")))?;
+        let rhs_node = a_expr
+            .rexpr
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError(format!("{kw}: missing rhs")))?;
+        let lhs = self.translate_expr(lhs_node)?;
+
+        if let Some(pg_query::protobuf::node::Node::AArrayExpr(arr)) = &rhs_node.node {
+            let rhs = arr
+                .elements
+                .iter()
+                .map(|e| Ok(Box::new(self.translate_expr(e)?)))
+                .collect::<Result<Vec<_>, ParseError>>()?;
+            return Ok(ast::Expr::InList {
+                lhs: Box::new(lhs),
+                not,
+                rhs,
+            });
+        }
+
+        let array = self.translate_expr(rhs_node)?;
+        let call = ast::Expr::FunctionCall {
+            name: ast::Name::from_string("array_contains"),
+            distinctness: None,
+            args: vec![Box::new(array), Box::new(lhs)],
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        Ok(if not {
+            ast::Expr::Unary(ast::UnaryOperator::Not, Box::new(call))
+        } else {
+            call
+        })
     }
 
     fn translate_like_expr(
@@ -3356,6 +3501,20 @@ impl PostgreSQLTranslator {
 
             let tbl_name = ast::Name::from_string(&cte.ctename);
 
+            // PostgreSQL evaluates SEARCH/CYCLE by adding computed columns to
+            // the recursion; silently dropping them would change results (and
+            // a CYCLE clause is often what makes the query terminate at all).
+            if cte.search_clause.is_some() {
+                return Err(ParseError::ParseError(
+                    "SEARCH clause on a common table expression is not supported".into(),
+                ));
+            }
+            if cte.cycle_clause.is_some() {
+                return Err(ParseError::ParseError(
+                    "CYCLE clause on a common table expression is not supported".into(),
+                ));
+            }
+
             // Translate column aliases if specified
             let columns: Vec<ast::IndexedColumn> = cte
                 .aliascolnames
@@ -3805,6 +3964,43 @@ impl PostgreSQLTranslator {
             not_null,
             constraints,
         })
+    }
+}
+
+/// PostgreSQL derives a name for result columns without an explicit alias
+/// (FigureColname in the server): function calls are named after the function
+/// and SQL value functions after their keyword. Clients read columns by these
+/// names, e.g. knex reads rows[0].version from `select version()`.
+fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+    match &node.node {
+        Some(Node::FuncCall(func_call)) => func_call
+            .funcname
+            .iter()
+            .filter_map(|n| match &n.node {
+                Some(Node::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .next_back(),
+        Some(Node::SqlvalueFunction(svf)) => {
+            use pg_query::protobuf::SqlValueFunctionOp as Op;
+            let name = match Op::try_from(svf.op) {
+                Ok(Op::SvfopCurrentDate) => "current_date",
+                Ok(Op::SvfopCurrentTime | Op::SvfopCurrentTimeN) => "current_time",
+                Ok(Op::SvfopCurrentTimestamp | Op::SvfopCurrentTimestampN) => "current_timestamp",
+                Ok(Op::SvfopLocaltime | Op::SvfopLocaltimeN) => "localtime",
+                Ok(Op::SvfopLocaltimestamp | Op::SvfopLocaltimestampN) => "localtimestamp",
+                Ok(Op::SvfopCurrentRole) => "current_role",
+                Ok(Op::SvfopCurrentUser) => "current_user",
+                Ok(Op::SvfopUser) => "user",
+                Ok(Op::SvfopSessionUser) => "session_user",
+                Ok(Op::SvfopCurrentCatalog) => "current_catalog",
+                Ok(Op::SvfopCurrentSchema) => "current_schema",
+                _ => return None,
+            };
+            Some(name.to_string())
+        }
+        _ => None,
     }
 }
 
@@ -6466,6 +6662,87 @@ mod tests {
         }
     }
 
+    /// Extract the WHERE clause of a translated single SELECT.
+    fn where_clause_of(sql: &str) -> ast::Expr {
+        let translator = PostgreSQLTranslator::new();
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+        let ast::Stmt::Select(select) = translated else {
+            panic!("Expected Select statement");
+        };
+        let ast::OneSelect::Select { where_clause, .. } = &select.body.select else {
+            panic!("Expected Select variant");
+        };
+        *where_clause
+            .as_ref()
+            .expect("Expected WHERE clause")
+            .clone()
+    }
+
+    #[test]
+    fn test_eq_any_array_literal_becomes_in_list() {
+        let wc = where_clause_of("SELECT id FROM t WHERE id = ANY(ARRAY[1, 2, 3])");
+        let ast::Expr::InList { not, rhs, .. } = wc else {
+            panic!("Expected InList for = ANY(array literal), got: {wc:?}");
+        };
+        assert!(!not);
+        assert_eq!(rhs.len(), 3);
+    }
+
+    #[test]
+    fn test_eq_any_param_becomes_array_contains() {
+        let wc = where_clause_of("SELECT id FROM t WHERE id = ANY($1)");
+        let ast::Expr::FunctionCall { name, args, .. } = wc else {
+            panic!("Expected FunctionCall for = ANY(param), got: {wc:?}");
+        };
+        assert_eq!(name.as_str(), "array_contains");
+        assert_eq!(args.len(), 2);
+        assert!(
+            matches!(&*args[0], ast::Expr::Variable(_)),
+            "array argument must come first, got: {:?}",
+            args[0]
+        );
+    }
+
+    #[test]
+    fn test_ne_all_array_literal_becomes_not_in_list() {
+        let wc = where_clause_of("SELECT id FROM t WHERE id <> ALL(ARRAY[1, 2])");
+        let ast::Expr::InList { not, rhs, .. } = wc else {
+            panic!("Expected InList for != ALL(array literal), got: {wc:?}");
+        };
+        assert!(not);
+        assert_eq!(rhs.len(), 2);
+    }
+
+    #[test]
+    fn test_ne_all_param_becomes_not_array_contains() {
+        let wc = where_clause_of("SELECT id FROM t WHERE id != ALL($1)");
+        let ast::Expr::Unary(ast::UnaryOperator::Not, inner) = wc else {
+            panic!("Expected NOT(...) for != ALL(param), got: {wc:?}");
+        };
+        let ast::Expr::FunctionCall { name, .. } = &*inner else {
+            panic!("Expected FunctionCall under NOT, got: {inner:?}");
+        };
+        assert_eq!(name.as_str(), "array_contains");
+    }
+
+    #[test]
+    fn test_unsupported_any_all_operators_error() {
+        let translator = PostgreSQLTranslator::new();
+        for sql in [
+            "SELECT 1 WHERE 2 > ANY(ARRAY[1, 5])",
+            "SELECT 1 WHERE 2 <> ANY(ARRAY[1, 5])",
+            "SELECT 1 WHERE 2 = ALL(ARRAY[2, 2])",
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let err = translator.translate(&parsed).unwrap_err();
+            assert!(
+                err.to_string().contains("not supported"),
+                "expected loud error for {sql}, got: {err}"
+            );
+        }
+    }
+
     #[test]
     fn test_array_overlaps_operator() {
         let translator = PostgreSQLTranslator::new();
@@ -6934,5 +7211,35 @@ mod tests {
             }
             other => panic!("Expected CreateSequence, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_recursive_cte_cycle_clause_rejected() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "WITH RECURSIVE walk(dst) AS (
+            SELECT 1 UNION ALL SELECT w.dst + 1 FROM walk w WHERE w.dst < 3
+        ) CYCLE dst SET is_cycle USING path
+        SELECT * FROM walk";
+        let parse_result = crate::parse(sql).unwrap();
+        let err = translator.translate(&parse_result).unwrap_err();
+        assert!(
+            err.to_string().contains("CYCLE clause"),
+            "expected CYCLE clause rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_recursive_cte_search_clause_rejected() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "WITH RECURSIVE walk(dst) AS (
+            SELECT 1 UNION ALL SELECT w.dst + 1 FROM walk w WHERE w.dst < 3
+        ) SEARCH DEPTH FIRST BY dst SET ordercol
+        SELECT * FROM walk";
+        let parse_result = crate::parse(sql).unwrap();
+        let err = translator.translate(&parse_result).unwrap_err();
+        assert!(
+            err.to_string().contains("SEARCH clause"),
+            "expected SEARCH clause rejection, got: {err}"
+        );
     }
 }

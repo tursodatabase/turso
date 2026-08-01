@@ -1,0 +1,675 @@
+@database :memory:
+
+# percent_rank() computes (rows in earlier peer groups) / (nTotal - 1).
+# Frame is GROUPS CURRENT ROW TO UNBOUNDED FOLLOWING — xStep counts every
+# row, xInverse increments nStep once per row of the leaving peer group,
+# xValue divides. Single-row partitions return 0.0.
+
+setup vals5 {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (1),(2),(3),(4),(5);
+}
+
+# 5 distinct rows: ranks 1..5; percent_rank = 0, 1/4, 2/4, 3/4, 1.
+# Picked 5 rows so denominators are 4 and every value has a clean f64.
+@setup vals5
+test percent-rank-no-peers {
+    SELECT x, percent_rank() OVER (ORDER BY x) FROM t;
+}
+expect {
+    1|0.0
+    2|0.25
+    3|0.5
+    4|0.75
+    5|1.0
+}
+expect @js {
+    1|0
+    2|0.25
+    3|0.5
+    4|0.75
+    5|1
+}
+
+# Peer groups share the same percent_rank value.
+setup peers {
+    CREATE TABLE p(x INTEGER);
+    INSERT INTO p VALUES (1),(1),(3),(3),(5);
+}
+
+@setup peers
+test percent-rank-with-peers {
+    SELECT x, percent_rank() OVER (ORDER BY x) FROM p;
+}
+expect {
+    1|0.0
+    1|0.0
+    3|0.5
+    3|0.5
+    5|1.0
+}
+expect @js {
+    1|0
+    1|0
+    3|0.5
+    3|0.5
+    5|1
+}
+
+# Single row → 0.0 (SQLite returns 0 when nTotal <= 1, avoiding the
+# divide-by-zero that the formula would otherwise produce).
+setup one_row {
+    CREATE TABLE r(x INTEGER);
+    INSERT INTO r VALUES (1);
+}
+
+@setup one_row
+test percent-rank-single-row {
+    SELECT percent_rank() OVER (ORDER BY x) FROM r;
+}
+expect {
+    0.0
+}
+expect @js {
+    0
+}
+
+# Empty table → no rows out.
+setup empty {
+    CREATE TABLE e(x INTEGER);
+}
+
+@setup empty
+test percent-rank-empty {
+    SELECT x, percent_rank() OVER (ORDER BY x) FROM e;
+}
+expect {
+}
+
+# All rows peers → all 0.0.
+setup all_peers {
+    CREATE TABLE ap(x INTEGER);
+    INSERT INTO ap VALUES (1),(1),(1);
+}
+
+@setup all_peers
+test percent-rank-all-peers {
+    SELECT percent_rank() OVER (ORDER BY x) FROM ap;
+}
+expect {
+    0.0
+    0.0
+    0.0
+}
+expect @js {
+    0
+    0
+    0
+}
+
+# PARTITION BY resets the rank within each partition.
+setup partitioned {
+    CREATE TABLE pa(g INTEGER, x INTEGER);
+    INSERT INTO pa VALUES (1,1),(1,2),(1,3),(1,4),(1,5),(2,10),(2,20);
+}
+
+@setup partitioned
+test percent-rank-with-partition {
+    SELECT g, x, percent_rank() OVER (PARTITION BY g ORDER BY x) FROM pa;
+}
+expect {
+    1|1|0.0
+    1|2|0.25
+    1|3|0.5
+    1|4|0.75
+    1|5|1.0
+    2|10|0.0
+    2|20|1.0
+}
+expect @js {
+    1|1|0
+    1|2|0.25
+    1|3|0.5
+    1|4|0.75
+    1|5|1
+    2|10|0
+    2|20|1
+}
+
+# DESC ordering — rows traverse in reverse, percent_rank assigns from
+# the largest x down.
+@setup vals5
+test percent-rank-order-desc {
+    SELECT x, percent_rank() OVER (ORDER BY x DESC) FROM t;
+}
+expect {
+    5|0.0
+    4|0.25
+    3|0.5
+    2|0.75
+    1|1.0
+}
+expect @js {
+    5|0
+    4|0.25
+    3|0.5
+    2|0.75
+    1|1
+}
+
+# Mixed with rank() in the same SELECT — different coerced frames
+# (rank's is RANGE UP→CURRENT, percent_rank's is GROUPS CURRENT→UF), so
+# the planner splits the window and each function gets its own pass.
+@setup vals5
+test percent-rank-mixed-with-rank {
+    SELECT x, rank() OVER (ORDER BY x), percent_rank() OVER (ORDER BY x) FROM t;
+}
+expect {
+    1|1|0.0
+    2|2|0.25
+    3|3|0.5
+    4|4|0.75
+    5|5|1.0
+}
+expect @js {
+    1|1|0
+    2|2|0.25
+    3|3|0.5
+    4|4|0.75
+    5|5|1
+}
+
+# OVER () — no PARTITION, no ORDER BY. With no ORDER BY every row is a
+# peer of every other row, so percent_rank is always 0.0.
+@setup vals5
+test percent-rank-over-empty {
+    SELECT percent_rank() OVER () FROM t;
+}
+expect {
+    0.0
+    0.0
+    0.0
+    0.0
+    0.0
+}
+expect @js {
+    0
+    0
+    0
+    0
+    0
+}
+
+# Format with printf to guarantee identical formatting against SQLite
+# for divisors that don't have a clean f64 representation (1/3, etc.).
+setup vals4 {
+    CREATE TABLE t4(x INTEGER);
+    INSERT INTO t4 VALUES (1),(2),(3),(4);
+}
+
+@setup vals4
+test percent-rank-printf-format {
+    SELECT printf('%.4f', percent_rank() OVER (ORDER BY x)) FROM t4;
+}
+expect {
+    0.0000
+    0.3333
+    0.6667
+    1.0000
+}
+
+# NULLs form their own peer group at the start of an ASC ordering.
+setup vals_nulls {
+    CREATE TABLE tn(v);
+    INSERT INTO tn VALUES (NULL),(1),(NULL),(2);
+}
+
+@setup vals_nulls
+test percent-rank-null-peers {
+    SELECT v, printf('%.4f', percent_rank() OVER (ORDER BY v)) FROM tn ORDER BY v;
+}
+expect {
+    |0.0000
+    |0.0000
+    1|0.6667
+    2|1.0000
+}
+
+# Regression companion to cume_dist's streaming-delete crash:
+# percent_rank's coerced frame starts at CURRENT ROW, so its buffered
+# rows are deleted at AGGINVERSE (SQLite's eDelete default arm,
+# window.c:2866-2868) — the start cursor trails the emit cursor, so
+# the delete-then-reinsert cycle across partition flushes must leave
+# the ephemeral btree consistent.
+setup stream_del {
+    CREATE TABLE sd(g INTEGER, x INTEGER);
+    INSERT INTO sd VALUES (1,10),(1,10),(1,20),(1,30),
+                          (2,5),(2,6),
+                          (3,1),(3,1),(3,2),(3,2);
+}
+
+@setup stream_del
+@cross-check-integrity
+test percent-rank-streaming-delete-multi-partition {
+    SELECT g, x, printf('%.4f', percent_rank() OVER (PARTITION BY g ORDER BY x))
+    FROM sd;
+}
+expect {
+    1|10|0.0000
+    1|10|0.0000
+    1|20|0.6667
+    1|30|1.0000
+    2|5|0.0000
+    2|6|1.0000
+    3|1|0.0000
+    3|1|0.0000
+    3|2|0.6667
+    3|2|0.6667
+}
+
+# 2000 rows spanning many ephemeral pages, deleted at AGGINVERSE as
+# the frame start advances. sum(percent_rank) over n distinct rows is
+# sum(k/(n-1) for k=0..n-1) = n/2 exactly.
+setup gen2000 {
+    CREATE TABLE d(x);
+    INSERT INTO d VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);
+    CREATE TABLE n(i INTEGER PRIMARY KEY);
+    INSERT INTO n SELECT a.x*100 + b.x*10 + c.x + 1 FROM d a, d b, d c;
+    INSERT INTO n SELECT i + 1000 FROM n;
+}
+
+@setup gen2000
+test percent-rank-2000-rows-aggregate {
+    SELECT round(sum(r), 6), count(*)
+    FROM (SELECT percent_rank() OVER (ORDER BY i) r FROM n);
+}
+expect {
+    1000.0|2000
+}
+expect @js {
+    1000|2000
+}
+
+# 40 partitions of 50 rows: each flush deletes the partition's rows,
+# the next partition reuses the freed pages.
+@setup gen2000
+test percent-rank-2000-rows-40-partitions {
+    SELECT round(sum(r), 6)
+    FROM (SELECT percent_rank() OVER (PARTITION BY i%40 ORDER BY i) r FROM n);
+}
+expect {
+    1000.0
+}
+expect @js {
+    1000
+}
+
+# 500 singleton partitions: nTotal-1 is 0 in every partition, so every
+# row is 0.0 — and the buffer churns through insert/flush/delete per row.
+@setup gen2000
+test percent-rank-singleton-partition-churn {
+    SELECT round(sum(r), 6), count(*)
+    FROM (SELECT percent_rank() OVER (PARTITION BY i ORDER BY i) r FROM n
+          WHERE i <= 500);
+}
+expect {
+    0.0|500
+}
+expect @js {
+    0|500
+}
+
+# 64 rows with 5KB payloads across 7 partitions: AGGINVERSE deletes
+# walk overflow-page chains, partition flushes recycle overflow pages.
+setup overflow64 {
+    CREATE TABLE ovp(i INTEGER PRIMARY KEY, pad TEXT);
+    INSERT INTO ovp SELECT 1, printf('%.*c', 5000, 'y');
+    INSERT INTO ovp SELECT i + 1, pad FROM ovp;
+    INSERT INTO ovp SELECT i + 2, pad FROM ovp;
+    INSERT INTO ovp SELECT i + 4, pad FROM ovp;
+    INSERT INTO ovp SELECT i + 8, pad FROM ovp;
+    INSERT INTO ovp SELECT i + 16, pad FROM ovp;
+    INSERT INTO ovp SELECT i + 32, pad FROM ovp;
+}
+
+@setup overflow64
+@cross-check-integrity
+test percent-rank-overflow-payload-partitioned {
+    SELECT round(sum(r), 6), sum(length(pad))
+    FROM (SELECT pad, percent_rank() OVER (PARTITION BY i%7 ORDER BY i) r
+          FROM ovp);
+}
+expect {
+    32.0|320000
+}
+expect @js {
+    32|320000
+}
+
+# Mixed-affinity ORDER BY key: NULL < numerics < text < blob, with the
+# integer 1 / real 1.0 pair forming a cross-type peer group.
+setup mixed_affinity {
+    CREATE TABLE ma(v);
+    INSERT INTO ma VALUES (1),('1'),(1.0),('a'),(X'61'),(NULL),(2),('10');
+}
+
+@setup mixed_affinity
+test percent-rank-mixed-affinity-order-key {
+    SELECT typeof(v), printf('%.4f', percent_rank() OVER (ORDER BY v)) FROM ma;
+}
+expect {
+    null|0.0000
+    integer|0.1429
+    real|0.1429
+    integer|0.4286
+    text|0.5714
+    text|0.7143
+    text|0.8571
+    blob|1.0000
+}
+
+# BLOB order keys compare bytewise with length tiebreak; the two X'01'
+# rows are peers.
+setup blob_keys {
+    CREATE TABLE bl(v);
+    INSERT INTO bl VALUES (X'00'),(X'0000'),(X'01'),(X'01'),(X'FF');
+}
+
+@setup blob_keys
+test percent-rank-blob-order-key {
+    SELECT hex(v), percent_rank() OVER (ORDER BY v) FROM bl;
+}
+expect {
+    00|0.0
+    0000|0.25
+    01|0.5
+    01|0.5
+    FF|1.0
+}
+expect @js {
+    00|0
+    0000|0.25
+    01|0.5
+    01|0.5
+    FF|1
+}
+
+# An explicit COLLATE in the OVER clause overrides the column default.
+setup binary_col {
+    CREATE TABLE co(v TEXT);
+    INSERT INTO co VALUES ('a'),('A'),('b'),('B');
+}
+
+@setup binary_col
+test percent-rank-collate-in-over-clause {
+    SELECT v, printf('%.4f', percent_rank() OVER (ORDER BY v COLLATE NOCASE))
+    FROM co;
+}
+expect {
+    a|0.0000
+    A|0.0000
+    b|0.6667
+    B|0.6667
+}
+
+# DESC with NULLS FIRST: the NULL peer group leads the ordering.
+setup nulls_mix {
+    CREATE TABLE nu(v);
+    INSERT INTO nu VALUES (NULL),(1),(NULL),(2),(3);
+}
+
+@setup nulls_mix
+test percent-rank-desc-nulls-first {
+    SELECT v, percent_rank() OVER (ORDER BY v DESC NULLS FIRST) FROM nu;
+}
+expect {
+    |0.0
+    |0.0
+    3|0.5
+    2|0.75
+    1|1.0
+}
+expect @js {
+    |0
+    |0
+    3|0.5
+    2|0.75
+    1|1
+}
+
+# +0.0 and -0.0 compare equal → one peer group; five rows keep the
+# n-1 divisor clean.
+setup neg_zero {
+    CREATE TABLE nz(v REAL);
+    INSERT INTO nz VALUES (0.0),(-0.0),(1.0),(2.0),(3.0);
+}
+
+@setup neg_zero
+test percent-rank-negative-zero-tie {
+    SELECT percent_rank() OVER (ORDER BY v) FROM nz;
+}
+expect {
+    0.0
+    0.0
+    0.5
+    0.75
+    1.0
+}
+expect @js {
+    0
+    0
+    0.5
+    0.75
+    1
+}
+
+# Integer 1 and real 1.0 are numerically equal → peers, despite
+# differing storage classes.
+setup cross_type {
+    CREATE TABLE xt(v);
+    INSERT INTO xt VALUES (1),(1.0),(2),(2.0),(3);
+}
+
+@setup cross_type
+test percent-rank-int-real-cross-type-ties {
+    SELECT v, percent_rank() OVER (ORDER BY v) FROM xt;
+}
+expect {
+    1|0.0
+    1.0|0.0
+    2|0.5
+    2.0|0.5
+    3|1.0
+}
+expect @js {
+    1|0
+    1|0
+    2|0.5
+    2|0.5
+    3|1
+}
+
+# NULL is a regular partition value: both NULL rows land in one
+# partition.
+setup part_null {
+    CREATE TABLE pn(p, v);
+    INSERT INTO pn VALUES (NULL,1),(NULL,2),(1,3),(1,4),(2,5);
+}
+
+@setup part_null
+test percent-rank-partition-by-null {
+    SELECT p, percent_rank() OVER (PARTITION BY p ORDER BY v) FROM pn;
+}
+expect {
+    |0.0
+    |1.0
+    1|0.0
+    1|1.0
+    2|0.0
+}
+expect @js {
+    |0
+    |1
+    1|0
+    1|1
+    2|0
+}
+
+# Sharing a window with first_value() flips the buffering strategy:
+# first_value makes the window cache the whole partition (csr_app),
+# which suppresses the AGGINVERSE deletes percent_rank would otherwise
+# trigger. Values must not change.
+setup with_fv {
+    CREATE TABLE lg(v);
+    INSERT INTO lg VALUES (10),(20),(20),(30),(40);
+}
+
+@setup with_fv
+test percent-rank-with-first-value-same-window {
+    SELECT v, percent_rank() OVER w, first_value(v) OVER w
+    FROM lg WINDOW w AS (ORDER BY v);
+}
+expect {
+    10|0.0|10
+    20|0.25|10
+    20|0.25|10
+    30|0.75|10
+    40|1.0|10
+}
+expect @js {
+    10|0|10
+    20|0.25|10
+    20|0.25|10
+    30|0.75|10
+    40|1|10
+}
+
+# percent_rank over percent_rank: the inner window's output feeds the
+# outer window's ORDER BY through a subquery.
+setup nested_vals {
+    CREATE TABLE ww(v);
+    INSERT INTO ww VALUES (1),(2),(2),(4),(5);
+}
+
+@setup nested_vals
+test percent-rank-window-over-window {
+    SELECT r, percent_rank() OVER (ORDER BY r)
+    FROM (SELECT percent_rank() OVER (ORDER BY v) r FROM ww);
+}
+expect {
+    0.0|0.0
+    0.25|0.25
+    0.25|0.25
+    0.75|0.75
+    1.0|1.0
+}
+expect @js {
+    0|0
+    0.25|0.25
+    0.25|0.25
+    0.75|0.75
+    1|1
+}
+
+# Referenced through a view with an outer WHERE on the window result;
+# five source rows keep the n-1 divisor clean.
+setup view_base {
+    CREATE TABLE tv(v);
+    INSERT INTO tv VALUES (1),(2),(2),(4),(5);
+}
+
+@setup view_base
+test percent-rank-in-view {
+    CREATE VIEW vw2 AS SELECT v, percent_rank() OVER (ORDER BY v) r FROM tv;
+    SELECT * FROM vw2 WHERE r > 0;
+}
+expect {
+    2|0.25
+    2|0.25
+    4|0.75
+    5|1.0
+}
+expect @js {
+    2|0.25
+    2|0.25
+    4|0.75
+    5|1
+}
+
+# UPDATE reading percent_rank through a correlated scalar subquery.
+setup update_base {
+    CREATE TABLE up(v INTEGER, r REAL);
+    INSERT INTO up(v) VALUES (1),(2),(3),(4),(5);
+}
+
+@setup update_base
+test percent-rank-in-update-subquery {
+    UPDATE up SET r = (SELECT rr FROM
+        (SELECT v vv, percent_rank() OVER (ORDER BY v) rr FROM up)
+        WHERE vv = up.v);
+    SELECT v, r FROM up ORDER BY v;
+}
+expect {
+    1|0.0
+    2|0.25
+    3|0.5
+    4|0.75
+    5|1.0
+}
+expect @js {
+    1|0
+    2|0.25
+    3|0.5
+    4|0.75
+    5|1
+}
+
+# FILTER is only legal on aggregate window functions; percent_rank
+# must reject it like SQLite does.
+@setup vals5
+test percent-rank-filter-rejected {
+    SELECT percent_rank() FILTER (WHERE x > 1) OVER (ORDER BY x) FROM t;
+}
+expect error {
+    FILTER clause may only be used with aggregate window functions
+}
+
+# Window functions run after grouping, so aggregate results form the input
+# rows and equal aggregate values form peer groups.
+test percent-rank-over-grouped-input {
+    WITH t(g, x) AS (
+        VALUES (1, 1), (2, 1), (2, 2), (3, 1), (3, 2)
+    )
+    SELECT g, count(*), percent_rank() OVER (ORDER BY count(*))
+    FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    1|1|0.0
+    2|2|0.5
+    3|2|0.5
+}
+expect @js {
+    1|1|0
+    2|2|0.5
+    3|2|0.5
+}
+
+# A derived named window inherits PARTITION BY from its base window.
+test percent-rank-derived-window-inherits-partition {
+    WITH t(g, x) AS (VALUES (1, 1), (1, 2), (2, 3), (2, 4))
+    SELECT g, x, percent_rank() OVER w
+    FROM t
+    WINDOW base AS (PARTITION BY g), w AS (base ORDER BY x);
+}
+expect {
+    1|1|0.0
+    1|2|1.0
+    2|3|0.0
+    2|4|1.0
+}
+expect @js {
+    1|1|0
+    1|2|1
+    2|3|0
+    2|4|1
+}

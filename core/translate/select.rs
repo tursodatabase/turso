@@ -101,6 +101,14 @@ pub fn emit_select_plan(
                         .sum::<usize>(),
             }
         }
+        Plan::RecursiveCte(recursive_cte) => {
+            num_result_cols = recursive_cte.initial_query.select_result_columns().len();
+            ProgramBuilderOpts {
+                num_cursors: count_required_cursors_for_plan(&plan),
+                approx_num_insns: estimate_num_instructions_for_plan(&plan),
+                approx_num_labels: estimate_num_labels_for_plan(&plan),
+            }
+        }
         _ => crate::bail_parse_error!("emit_select_plan called with non-SELECT plan"),
     };
 
@@ -118,6 +126,10 @@ fn plan_first_virtual_table_name(plan: &Plan) -> Option<String> {
             left.iter()
                 .find_map(|(plan, _)| select_plan_first_virtual_table_name(plan))
         }),
+        Plan::RecursiveCte(recursive_cte) => {
+            plan_first_virtual_table_name(&recursive_cte.initial_query)
+                .or_else(|| plan_first_virtual_table_name(&recursive_cte.recursive_query))
+        }
         Plan::Delete(_) | Plan::Update(_) => None,
     }
 }
@@ -148,7 +160,6 @@ fn select_plan_first_virtual_table_name(select_plan: &SelectPlan) -> Option<Stri
     None
 }
 
-#[turso_macros::trace_stack]
 pub fn prepare_select_plan(
     select: ast::Select,
     resolver: &Resolver,
@@ -157,105 +168,113 @@ pub fn prepare_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
-    let compounds = select.body.compounds;
-    match compounds.is_empty() {
-        true => Ok(Plan::Select(Box::new(prepare_one_select_plan(
-            select.body.select,
+    prepare_select_plan_from_arms(
+        select.body.select,
+        select.body.compounds,
+        select.with,
+        select.order_by,
+        select.limit,
+        resolver,
+        program,
+        outer_query_refs,
+        query_destination,
+        connection,
+    )
+}
+
+/// Plans a first SELECT arm followed by zero or more compound arms.
+///
+/// Accepting the arms directly lets recursive CTE planning divide a stored
+/// SELECT without allocating temporary compound-arm vectors.
+#[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
+pub(crate) fn prepare_select_plan_from_arms(
+    first_arm: ast::OneSelect,
+    compound_arms: impl IntoIterator<Item = CompoundSelect>,
+    with: Option<ast::With>,
+    order_by: Vec<ast::SortedColumn>,
+    limit: Option<ast::Limit>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    outer_query_refs: &[OuterQueryReference],
+    query_destination: QueryDestination,
+    connection: &Arc<crate::Connection>,
+) -> Result<Plan> {
+    let mut compound_arms = compound_arms.into_iter().peekable();
+    if compound_arms.peek().is_none() {
+        return Ok(Plan::Select(Box::new(prepare_one_select_plan(
+            first_arm,
             resolver,
             program,
-            select.limit,
-            select.order_by,
-            select.with,
+            limit,
+            order_by,
+            with,
             outer_query_refs,
             query_destination,
             connection,
-        )?))),
-        false => {
-            // For compound SELECTs, the WITH clause applies to all parts.
-            // We clone the WITH clause for each SELECT in the compound so that
-            // each one can resolve CTE references independently.
-            let with = select.with;
+        )?)));
+    }
 
-            let mut last = prepare_one_select_plan(
-                select.body.select,
-                resolver,
-                program,
-                None,
-                vec![],
-                with.clone(),
-                outer_query_refs,
-                query_destination.clone(),
-                connection,
-            )?;
+    // The WITH clause applies to every arm, so each arm needs its own copy
+    // while names are resolved.
+    let mut last = prepare_one_select_plan(
+        first_arm,
+        resolver,
+        program,
+        None,
+        vec![],
+        with.clone(),
+        outer_query_refs,
+        query_destination.clone(),
+        connection,
+    )?;
 
-            let mut left = Vec::with_capacity(compounds.len());
-            for CompoundSelect {
-                select: compound_select,
-                operator,
-            } in compounds
-            {
-                left.push((last, operator));
-                last = prepare_one_select_plan(
-                    compound_select,
-                    resolver,
-                    program,
-                    None,
-                    vec![],
-                    with.clone(),
-                    outer_query_refs,
-                    query_destination.clone(),
-                    connection,
-                )?;
-            }
+    let mut left = Vec::with_capacity(compound_arms.size_hint().0);
+    for CompoundSelect {
+        select: compound_select,
+        operator,
+    } in compound_arms
+    {
+        left.push((last, operator));
+        last = prepare_one_select_plan(
+            compound_select,
+            resolver,
+            program,
+            None,
+            vec![],
+            with.clone(),
+            outer_query_refs,
+            query_destination.clone(),
+            connection,
+        )?;
+    }
 
-            // Ensure all subplans have the same number of result columns
-            let right_most_num_result_columns = last.result_columns.len();
-            for (plan, operator) in left.iter() {
-                if plan.result_columns.len() != right_most_num_result_columns {
-                    crate::bail_parse_error!(
-                        "SELECTs to the left and right of {} do not have the same number of result columns",
-                        operator
-                    );
-                }
-            }
-            let (limit, offset) = select
-                .limit
-                .map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
-
-            // Parse ORDER BY for compound selects.
-            // ORDER BY can reference columns by number (1-based) or by name/alias
-            // from any constituent SELECT's result columns.
-            let all_plans: Vec<&SelectPlan> = left
-                .iter()
-                .map(|(plan, _)| plan)
-                .chain(std::iter::once(&last))
-                .collect();
-            let order_by = if select.order_by.is_empty() {
-                None
-            } else {
-                let mut key = Vec::with_capacity(select.order_by.len());
-                for (i, o) in select.order_by.iter().enumerate() {
-                    let (col_idx, collation) =
-                        resolve_compound_order_by_expr(&o.expr, &all_plans, i + 1)?;
-                    key.push((
-                        col_idx,
-                        o.order.unwrap_or(ast::SortOrder::Asc),
-                        o.nulls,
-                        collation,
-                    ));
-                }
-                Some(key)
-            };
-
-            Ok(Plan::CompoundSelect {
-                left,
-                right_most: Box::new(last),
-                limit,
-                offset,
-                order_by,
-            })
+    let right_most_num_result_columns = last.result_columns.len();
+    for (plan, operator) in &left {
+        if plan.result_columns.len() != right_most_num_result_columns {
+            crate::bail_parse_error!(
+                "SELECTs to the left and right of {} do not have the same number of result columns",
+                operator
+            );
         }
     }
+    let (limit, offset) = limit.map_or(Ok((None, None)), |limit| parse_limit(limit, resolver))?;
+
+    // ORDER BY names can come from any arm of a compound SELECT.
+    let all_plans: Vec<&SelectPlan> = left
+        .iter()
+        .map(|(plan, _)| plan)
+        .chain(std::iter::once(&last))
+        .collect();
+    let order_by = resolve_compound_order_by(&order_by, &all_plans)?;
+
+    Ok(Plan::CompoundSelect {
+        left,
+        right_most: Box::new(last),
+        limit,
+        offset,
+        order_by,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -423,12 +442,47 @@ fn prepare_one_select_plan(
                             BindingBehavior::ResultColumnsNotAllowed,
                         )?;
                     }
+                    if let Some(base_name) = window_def.window.base.as_ref() {
+                        let base_name = normalize_ident(base_name.as_str());
+                        // SQLite chains WINDOW-clause definitions only to an
+                        // earlier definition. An unresolved base here is left
+                        // alone and may still be used as an ordinary name.
+                        if let Some(base) = named_windows
+                            .iter()
+                            .rfind(|window| window.name == base_name)
+                        {
+                            if !partition_by.is_empty() {
+                                crate::bail_parse_error!(
+                                    "cannot override PARTITION clause of window: {base_name}"
+                                );
+                            }
+                            if base.has_frame_clause {
+                                crate::bail_parse_error!(
+                                    "cannot override frame specification of window: {base_name}"
+                                );
+                            }
+                            let base_bound = base
+                                .bound
+                                .as_ref()
+                                .expect("named windows are bound before functions are resolved");
+                            if !base_bound.order_by.is_empty() && !order_by.is_empty() {
+                                crate::bail_parse_error!(
+                                    "cannot override ORDER BY clause of window: {base_name}"
+                                );
+                            }
+                            partition_by.clone_from(&base_bound.partition_by);
+                            if order_by.is_empty() {
+                                order_by.clone_from(&base_bound.order_by);
+                            }
+                        }
+                    }
                     named_windows.push(NamedWindowDef {
                         name,
                         bound: Some(NamedWindowBound {
                             partition_by,
                             order_by,
                         }),
+                        has_frame_clause: window_def.window.frame_clause.is_some(),
                     });
                 }
             }
@@ -1019,6 +1073,16 @@ fn reject_outer_scope_refs_inside_plan_tree(
             }
             reject_outer_scope_refs_inside_select_plan(right_most, current_scope_table_refs)
         }
+        Plan::RecursiveCte(recursive_cte) => {
+            reject_outer_scope_refs_inside_plan_tree(
+                &recursive_cte.initial_query,
+                current_scope_table_refs,
+            )?;
+            reject_outer_scope_refs_inside_plan_tree(
+                &recursive_cte.recursive_query,
+                current_scope_table_refs,
+            )
+        }
         Plan::Delete(_) | Plan::Update(_) => Ok(()),
     }
 }
@@ -1133,7 +1197,7 @@ fn replace_column_number_with_copy_of_column_expr(
         }
         ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
             if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner.as_ref() {
-                if num.parse::<usize>().is_ok() {
+                if num.parse::<i32>().is_ok() {
                     crate::bail_parse_error!(
                         "1st {} term out of range - should be between 1 and {}",
                         clause_name,
@@ -1146,17 +1210,19 @@ fn replace_column_number_with_copy_of_column_expr(
         _ => None,
     };
     if let Some(num) = num_str {
-        // Only treat as column reference if it parses as a positive integer.
-        // Float literals like "0.5" or "1.0" are valid constant expressions, not column references.
-        if let Ok(column_number) = num.parse::<usize>() {
-            if column_number == 0 || column_number > columns.len() {
+        // Only treat as column reference if it parses as an integer that fits
+        // a 32-bit int, mirroring SQLite's sqlite3ExprIsInteger. Float
+        // literals like "0.5" and integers past the 32-bit range are valid
+        // constant expressions, not column references.
+        if let Ok(column_number) = num.parse::<i32>() {
+            if column_number <= 0 || column_number as usize > columns.len() {
                 crate::bail_parse_error!(
                     "1st {} term out of range - should be between 1 and {}",
                     clause_name,
                     columns.len()
                 );
             }
-            let ResultSetColumn { expr, .. } = &columns[column_number - 1];
+            let ResultSetColumn { expr, .. } = &columns[column_number as usize - 1];
             *order_by_or_group_by_expr = expr.clone();
         }
         // Otherwise, leave the expression as-is (constant expression, case 3 per SQLite docs)
@@ -1182,17 +1248,19 @@ fn resolve_compound_order_by_expr(
             let (col_idx, _) = resolve_compound_order_by_expr(inner, all_plans, term_number)?;
             Ok((col_idx, Some(CollationSeq::new(collation_name.as_str())?)))
         }
-        // Case 1: Numeric column reference (e.g., ORDER BY 1)
+        // Case 1: Numeric column reference (e.g., ORDER BY 1). As in SQLite's
+        // sqlite3ExprIsInteger, only literals that fit a 32-bit int count as
+        // column positions.
         ast::Expr::Literal(ast::Literal::Numeric(num)) => {
-            if let Ok(column_number) = num.parse::<usize>() {
-                if column_number == 0 || column_number > num_result_columns {
+            if let Ok(column_number) = num.parse::<i32>() {
+                if column_number <= 0 || column_number as usize > num_result_columns {
                     crate::bail_parse_error!(
                         "{} ORDER BY term out of range - should be between 1 and {}",
                         column_number,
                         num_result_columns
                     );
                 }
-                Ok((column_number - 1, None))
+                Ok((column_number as usize - 1, None))
             } else {
                 crate::bail_parse_error!(
                     "{} ORDER BY term does not match any column in the result set",
@@ -1238,6 +1306,55 @@ fn resolve_compound_order_by_expr(
     }
 }
 
+fn resolve_compound_order_by(
+    order_by: &[ast::SortedColumn],
+    plans: &[&SelectPlan],
+) -> Result<Option<Vec<super::plan::CompoundOrderByKey>>> {
+    if order_by.is_empty() {
+        return Ok(None);
+    }
+    order_by
+        .iter()
+        .enumerate()
+        .map(|(index, term)| {
+            let (column, collation) = resolve_compound_order_by_expr(&term.expr, plans, index + 1)?;
+            Ok((
+                column,
+                term.order.unwrap_or(ast::SortOrder::Asc),
+                term.nulls,
+                collation,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+pub(crate) fn resolve_recursive_cte_queue_order(
+    order_by: &[ast::SortedColumn],
+    initial_query: &Plan,
+    recursive_query: &Plan,
+) -> Result<Option<Vec<super::plan::CompoundOrderByKey>>> {
+    fn collect_selects<'a>(plan: &'a Plan, out: &mut Vec<&'a SelectPlan>) {
+        match plan {
+            Plan::Select(plan) => out.push(plan),
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                out.extend(left.iter().map(|(plan, _)| plan));
+                out.push(right_most);
+            }
+            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {
+                unreachable!("recursive CTE queries must be SELECT plans")
+            }
+        }
+    }
+
+    let mut plans = Vec::new();
+    collect_selects(initial_query, &mut plans);
+    collect_selects(recursive_query, &mut plans);
+    resolve_compound_order_by(order_by, &plans)
+}
+
 fn ordinal(n: usize) -> String {
     let suffix = match (n % 10, n % 100) {
         (1, 11) | (2, 12) | (3, 13) => "th",
@@ -1249,8 +1366,8 @@ fn ordinal(n: usize) -> String {
     format!("{n}{suffix}")
 }
 
-/// Count required cursors for a Plan (either Select or CompoundSelect)
-fn count_required_cursors_for_simple_or_compound_select(plan: &Plan) -> usize {
+/// Counts cursors needed to emit a query plan.
+fn count_required_cursors_for_plan(plan: &Plan) -> usize {
     match plan {
         Plan::Select(select_plan) => count_required_cursors_for_simple_select(select_plan),
         Plan::CompoundSelect {
@@ -1261,6 +1378,11 @@ fn count_required_cursors_for_simple_or_compound_select(plan: &Plan) -> usize {
                     .iter()
                     .map(|(p, _)| count_required_cursors_for_simple_select(p))
                     .sum::<usize>()
+        }
+        Plan::RecursiveCte(recursive_cte) => {
+            count_required_cursors_for_plan(&recursive_cte.initial_query)
+                + count_required_cursors_for_plan(&recursive_cte.recursive_query)
+                + 2
         }
         Plan::Delete(_) | Plan::Update(_) => 0,
     }
@@ -1287,7 +1409,7 @@ fn count_required_cursors_for_simple_select(plan: &SelectPlan) -> usize {
             // One table cursor + one cursor per index branch
             Operation::MultiIndexScan(multi_idx) => 1 + multi_idx.branches.len(),
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
-            count_required_cursors_for_simple_or_compound_select(&from_clause_subquery.plan)
+            count_required_cursors_for_plan(&from_clause_subquery.plan)
         } else {
             0
         })
@@ -1302,8 +1424,8 @@ fn count_required_cursors_for_simple_select(plan: &SelectPlan) -> usize {
     num_table_cursors + num_sorter_cursors + num_pseudo_cursors
 }
 
-/// Estimate number of instructions for a Plan (either Select or CompoundSelect)
-fn estimate_num_instructions_for_simple_or_compound_select(plan: &Plan) -> usize {
+/// Estimates bytecode instructions needed to emit a query plan.
+fn estimate_num_instructions_for_plan(plan: &Plan) -> usize {
     match plan {
         Plan::Select(select_plan) => estimate_num_instructions_for_simple_select(select_plan),
         Plan::CompoundSelect {
@@ -1315,6 +1437,11 @@ fn estimate_num_instructions_for_simple_or_compound_select(plan: &Plan) -> usize
                     .map(|(p, _)| estimate_num_instructions_for_simple_select(p))
                     .sum::<usize>()
                 + 20 // overhead for compound select operations
+        }
+        Plan::RecursiveCte(recursive_cte) => {
+            estimate_num_instructions_for_plan(&recursive_cte.initial_query)
+                + estimate_num_instructions_for_plan(&recursive_cte.recursive_query)
+                + 32
         }
         Plan::Delete(_) | Plan::Update(_) => 0,
     }
@@ -1332,7 +1459,7 @@ fn estimate_num_instructions_for_simple_select(select: &SelectPlan) -> usize {
             // Multi-index scan: scan overhead per branch + deduplication + final rowid fetch
             Operation::MultiIndexScan(multi_idx) => 15 * multi_idx.branches.len() + 10,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
-            10 + estimate_num_instructions_for_simple_or_compound_select(&from_clause_subquery.plan)
+            10 + estimate_num_instructions_for_plan(&from_clause_subquery.plan)
         } else {
             0
         })
@@ -1546,8 +1673,8 @@ fn select_has_non_from_subqueries(
     false
 }
 
-/// Estimate number of labels for a Plan (either Select or CompoundSelect)
-fn estimate_num_labels_for_simple_or_compound_select(plan: &Plan) -> usize {
+/// Estimates jump labels needed to emit a query plan.
+fn estimate_num_labels_for_plan(plan: &Plan) -> usize {
     match plan {
         Plan::Select(select_plan) => estimate_num_labels_for_simple_select(select_plan),
         Plan::CompoundSelect {
@@ -1559,6 +1686,11 @@ fn estimate_num_labels_for_simple_or_compound_select(plan: &Plan) -> usize {
                     .map(|(p, _)| estimate_num_labels_for_simple_select(p))
                     .sum::<usize>()
                 + 10 // overhead for compound select operations
+        }
+        Plan::RecursiveCte(recursive_cte) => {
+            estimate_num_labels_for_plan(&recursive_cte.initial_query)
+                + estimate_num_labels_for_plan(&recursive_cte.recursive_query)
+                + 4
         }
         Plan::Delete(_) | Plan::Update(_) => 0,
     }
@@ -1578,7 +1710,7 @@ fn estimate_num_labels_for_simple_select(select: &SelectPlan) -> usize {
             // Multi-index scan needs extra labels for each branch + rowset loop
             Operation::MultiIndexScan(multi_idx) => 3 + multi_idx.branches.len() * 2,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
-            3 + estimate_num_labels_for_simple_or_compound_select(&from_clause_subquery.plan)
+            3 + estimate_num_labels_for_plan(&from_clause_subquery.plan)
         } else {
             0
         })

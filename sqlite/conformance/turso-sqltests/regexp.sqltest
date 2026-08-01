@@ -176,3 +176,12 @@ test regexp_mixed_types_in_table {
 expect {
     1|1|1|1
 }
+
+# A single argument used to be admitted and then index args[1]. The panic
+# cannot unwind through the extern "C" shim, so it aborted the process.
+test regexp_wrong_arity {
+    SELECT regexp('a');
+}
+expect error {
+    wrong number of arguments to function regexp\(\)
+}

@@ -14,7 +14,7 @@ use crate::{
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u16, IdxInsertFlags, Insn},
+        insn::{to_u32, IdxInsertFlags, Insn},
     },
     Result,
 };
@@ -661,9 +661,9 @@ impl EmitOrderBy {
 
         if *use_heap_sort {
             program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u16(start_reg),
-                count: to_u16(orderby_sorter_column_count),
-                dest_reg: to_u16(*reg_sorter_data),
+                start_reg: to_u32(start_reg),
+                count: to_u32(orderby_sorter_column_count),
+                dest_reg: to_u32(*reg_sorter_data),
                 index_name: None,
                 affinity_str: None,
             });
@@ -698,9 +698,9 @@ pub fn sorter_insert(
     record_reg: usize,
 ) {
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(start_reg),
-        count: to_u16(column_count),
-        dest_reg: to_u16(record_reg),
+        start_reg: to_u32(start_reg),
+        count: to_u32(column_count),
+        dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
     });
