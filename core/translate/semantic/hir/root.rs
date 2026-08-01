@@ -1,0 +1,142 @@
+//! Resolved statement and trigger roots.
+
+use turso_parser::ast::{ResolveType, SortOrder};
+
+use super::{
+    Expr, From, Limit, OrderTerm, Output, QueryId, ResolvedCollation, ResolvedIndex, ResolvedTable,
+    SourceId,
+};
+
+#[derive(Clone, Debug)]
+pub enum HirRoot {
+    Query(QueryRoot),
+    Insert(Insert),
+    Update(Update),
+    Delete(Delete),
+    TriggerPredicate(TriggerPredicate),
+}
+
+#[derive(Clone, Debug)]
+pub struct QueryRoot {
+    pub query: QueryId,
+    pub trigger: Option<TriggerEnvironment>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TriggerPredicate {
+    pub expression: Expr,
+    pub environment: TriggerEnvironment,
+}
+
+/// Pseudo-sources visible while analyzing one trigger command or predicate.
+#[derive(Clone, Debug)]
+pub struct TriggerEnvironment {
+    pub table: ResolvedTable,
+    pub new_source: Option<SourceId>,
+    pub old_source: Option<SourceId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Insert {
+    pub target: SourceId,
+    pub columns: Vec<TargetColumn>,
+    pub defaults: Vec<ResolvedDefault>,
+    pub source: InsertSource,
+    pub conflict: Option<ResolveType>,
+    pub upserts: Vec<Upsert>,
+    pub excluded_source: Option<SourceId>,
+    pub returning: Option<Returning>,
+    pub trigger: Option<TriggerEnvironment>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedDefault {
+    pub column: usize,
+    pub value: Expr,
+}
+
+#[derive(Clone, Debug)]
+pub enum InsertSource {
+    DefaultValues,
+    Values(Vec<Vec<Expr>>),
+    Query(QueryId),
+}
+
+#[derive(Clone, Debug)]
+pub struct Upsert {
+    /// `None` is the final catch-all ON CONFLICT clause.
+    pub target: Option<ConflictTarget>,
+    pub action: UpsertAction,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConflictTarget {
+    pub terms: Vec<ConflictTerm>,
+    pub predicate: Option<Expr>,
+    pub matched_index: Option<ResolvedIndex>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConflictTerm {
+    pub expr: Expr,
+    pub collation: Option<ResolvedCollation>,
+    pub order: SortOrder,
+}
+
+#[derive(Clone, Debug)]
+pub enum UpsertAction {
+    Nothing,
+    Update {
+        assignments: Vec<Assignment>,
+        predicate: Option<Expr>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct Assignment {
+    pub columns: Vec<TargetColumn>,
+    pub value: Expr,
+}
+
+/// A writable destination in a DML target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetColumn {
+    Column(usize),
+    RowId,
+}
+
+#[derive(Clone, Debug)]
+pub struct Update {
+    pub target: SourceId,
+    pub defaults: Vec<ResolvedDefault>,
+    pub from: Option<From>,
+    pub assignments: Vec<Assignment>,
+    pub predicate: Option<Expr>,
+    pub order_by: Vec<OrderTerm>,
+    pub limit: Option<Limit>,
+    pub conflict: Option<ResolveType>,
+    pub returning: Option<Returning>,
+    pub trigger: Option<TriggerEnvironment>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Delete {
+    pub target: SourceId,
+    pub predicate: Option<Expr>,
+    pub order_by: Vec<OrderTerm>,
+    pub limit: Option<Limit>,
+    pub returning: Option<Returning>,
+    pub trigger: Option<TriggerEnvironment>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Returning {
+    pub outputs: Vec<Output>,
+}
+
+/// The final type fact for a writable DML destination.
+#[derive(Clone, Debug)]
+pub struct DestinationType {
+    pub column: TargetColumn,
+    pub type_fact: super::TypeFact,
+}
