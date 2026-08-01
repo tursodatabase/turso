@@ -3597,6 +3597,21 @@ fn open_connection_named_savepoints_for_db(
     })
 }
 
+fn load_active_non_main_wal_headers_for_named_savepoint(conn: &Connection) -> Result<IOResult<()>> {
+    conn.with_all_attached_pagers_with_index(|pagers| {
+        for (db_id, pager) in pagers {
+            if conn.mv_store_for_db(*db_id).is_some() || !pager.holds_read_lock() {
+                continue;
+            }
+            match pager_db_size_for_named_savepoint(pager)? {
+                IOResult::Done(_) => {}
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            }
+        }
+        Ok(IOResult::Done(()))
+    })
+}
+
 enum SavepointMirror<'a> {
     Begin(&'a crate::connection::NamedSavepointFrame),
     Release(&'a str),
@@ -4491,6 +4506,12 @@ pub fn op_savepoint(
 
     match *op {
         SavepointOp::Begin => {
+            // Mirroring mutates several pager savepoint stacks and therefore
+            // cannot yield halfway through. Load every active WAL header
+            // before opening the first savepoint so an I/O yield is restartable.
+            if let IOResult::IO(io) = load_active_non_main_wal_headers_for_named_savepoint(&conn)? {
+                return Ok(InsnFunctionStepResult::IO(io));
+            }
             conn.with_savepoint_schema_snapshot(
                 |main_schema_snapshot, temp_schema_snapshot, staged_schema_snapshot| {
                     let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
@@ -17848,6 +17869,31 @@ mod tests {
         })
         .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_savepoint_loads_evicted_attached_header_before_mirroring() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            "savepoint-main.db",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_attach(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("ATTACH 'savepoint-aux.db' AS aux").unwrap();
+        conn.execute("CREATE TABLE aux.t(x)").unwrap();
+
+        let attached_db_id = conn.get_database_id_by_name("aux").unwrap();
+        let attached_pager = conn.get_pager_from_database_index(&attached_db_id).unwrap();
+        attached_pager.begin_read_tx().unwrap();
+        attached_pager.clear_page_cache(false);
+
+        conn.execute("SAVEPOINT s").unwrap();
+        conn.execute("RELEASE s").unwrap();
     }
 
     #[test]
