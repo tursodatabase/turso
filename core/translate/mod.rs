@@ -35,6 +35,9 @@ pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;
 pub(crate) mod select;
+#[cfg(test)]
+#[path = "semantic/scope_properties.rs"]
+mod semantic_scope_properties;
 pub(crate) mod sequence;
 pub(crate) mod stmt_journal;
 pub(crate) mod subquery;
