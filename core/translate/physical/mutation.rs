@@ -18,9 +18,9 @@ use crate::{
 
 use super::{
     emit_delete_child_repairs, emit_delete_parent_actions, emit_delete_parent_checks,
-    emit_index_delete, emit_index_insert, emit_index_key, emit_insert_parent_repairs,
-    emit_replace_parent_checks, emit_update_child_checks, emit_update_parent_actions,
-    emit_update_parent_checks, CursorId, ExpressionEmitter, IndexKey, OpenedIndex,
+    emit_index_delete, emit_index_insert, emit_index_key, emit_replace_parent_checks,
+    emit_update_child_checks, emit_update_parent_actions, emit_update_parent_checks,
+    emit_update_parent_repairs, CursorId, ExpressionEmitter, IndexKey, OpenedIndex,
     PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError, PreparedTriggers,
     RegisterId, RegisterRange, RuntimeBindingError, RuntimeBindings, SourceRuntime,
 };
@@ -103,7 +103,7 @@ pub(crate) fn prepare_delete_row(
     old_columns: Option<RegisterRange>,
     foreign_keys: &hir::DmlForeignKeys,
 ) -> Result<(), PhysicalMutationError> {
-    prepare_delete_row_for_replacement(
+    prepare_delete_row_inner(
         program,
         bindings,
         source,
@@ -117,7 +117,7 @@ pub(crate) fn prepare_delete_row(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_delete_row_for_replacement(
+fn prepare_delete_row_inner(
     program: &mut ProgramBuilder,
     bindings: &mut RuntimeBindings<'_>,
     source: hir::SourceId,
@@ -193,8 +193,8 @@ pub(crate) fn finish_delete_row(
 }
 
 /// Delete a row found by a REPLACE conflict using the same physical operation
-/// as an explicit DELETE. The replacement image is only used to apply
-/// SQLite's deferred NO ACTION rule.
+/// as an explicit DELETE. The following insert or update repairs any deferred
+/// NO ACTION debt for parent keys that it restores.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_replace_conflicting_row(
     program: &mut ProgramBuilder,
@@ -218,7 +218,7 @@ pub(crate) fn emit_replace_conflicting_row(
     });
     let proposed = bindings.replace_source(source, SourceRuntime::Cursor(CursorId(cursor)))?;
     let old_columns = freeze_cursor_row(program, bindings, source, table.columns().len())?;
-    prepare_delete_row_for_replacement(
+    prepare_delete_row_inner(
         program,
         bindings,
         source,
@@ -388,11 +388,13 @@ pub(crate) fn finish_update_row(
         table_name: table.name.clone(),
     });
     if !foreign_keys.incoming.is_empty() {
-        emit_insert_parent_repairs(
+        emit_update_parent_repairs(
             program,
             &foreign_keys.incoming,
             table,
+            old_columns,
             new_columns,
+            old_rowid,
             new_rowid,
         )?;
         emit_update_parent_actions(

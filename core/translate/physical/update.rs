@@ -521,17 +521,6 @@ pub(crate) fn emit_root_update_with_context_and_after(
         src_reg: rowid.0,
         target_pc: write_next,
     });
-    if !update.foreign_keys.outgoing.is_empty() || !update.foreign_keys.incoming.is_empty() {
-        super::prepare_update_row(
-            program,
-            &table,
-            old_columns.expect("foreign keys require the frozen OLD row"),
-            logical,
-            rowid,
-            new_rowid,
-            &update.foreign_keys,
-        )?;
-    }
     let mut new_keys = Vec::with_capacity(indexes.len());
     for index in &indexes {
         let key = emit_index_key(
@@ -567,6 +556,17 @@ pub(crate) fn emit_root_update_with_context_and_after(
             emit_unique_check(program, index, &key, Some(rowid), conflict, write_next)?;
         }
         new_keys.push(key);
+    }
+    if !update.foreign_keys.outgoing.is_empty() || !update.foreign_keys.incoming.is_empty() {
+        super::prepare_update_row(
+            program,
+            &table,
+            old_columns.expect("foreign keys require the frozen OLD row"),
+            logical,
+            rowid,
+            new_rowid,
+            &update.foreign_keys,
+        )?;
     }
     emit_stored_record(
         program,

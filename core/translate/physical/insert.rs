@@ -1424,15 +1424,6 @@ fn emit_upsert_action<'document>(
         src_reg: conflicting_rowid.0,
         target_pc: skip_row,
     });
-    super::prepare_update_row(
-        program,
-        table,
-        old_columns,
-        updated,
-        conflicting_rowid,
-        updated_rowid,
-        &insert.foreign_keys,
-    )?;
     let mut new_keys = Vec::with_capacity(indexes.len());
     for index in indexes {
         let key = emit_index_key(program, bindings, insert.target, updated_rowid, index, true)?;
@@ -1446,6 +1437,15 @@ fn emit_upsert_action<'document>(
         )?;
         new_keys.push(key);
     }
+    super::prepare_update_row(
+        program,
+        table,
+        old_columns,
+        updated,
+        conflicting_rowid,
+        updated_rowid,
+        &insert.foreign_keys,
+    )?;
     emit_stored_record(program, bindings, insert.target, table, updated, record)?;
     bindings.replace_source(insert.target, cursor_target)?;
     super::finish_update_row(

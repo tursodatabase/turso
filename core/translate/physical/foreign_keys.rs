@@ -65,6 +65,40 @@ pub(crate) fn emit_insert_parent_repairs(
     Ok(())
 }
 
+pub(crate) fn emit_update_parent_repairs(
+    program: &mut ProgramBuilder,
+    foreign_keys: &[ResolvedForeignKey],
+    parent_table: &BTreeTable,
+    old_columns: RegisterRange,
+    new_columns: RegisterRange,
+    old_rowid: RegisterId,
+    new_rowid: RegisterId,
+) -> ForeignKeyResult<()> {
+    for foreign_key in foreign_keys
+        .iter()
+        .filter(|foreign_key| foreign_key.declaration.deferred)
+    {
+        let complete = program.allocate_label();
+        let changed = program.allocate_label();
+        emit_key_change_branch(
+            program,
+            foreign_key,
+            parent_table,
+            &foreign_key.parent_positions,
+            old_columns,
+            new_columns,
+            old_rowid,
+            new_rowid,
+            changed,
+            complete,
+        )?;
+        program.preassign_label_to_next_insn(changed);
+        emit_new_parent_repair(program, foreign_key, parent_table, new_columns, new_rowid)?;
+        program.preassign_label_to_next_insn(complete);
+    }
+    Ok(())
+}
+
 pub(crate) fn emit_update_child_checks(
     program: &mut ProgramBuilder,
     foreign_keys: &[ResolvedForeignKey],
@@ -75,10 +109,26 @@ pub(crate) fn emit_update_child_checks(
     new_rowid: RegisterId,
 ) -> ForeignKeyResult<()> {
     for foreign_key in foreign_keys {
+        let complete = program.allocate_label();
+        let changed = program.allocate_label();
+        emit_key_change_branch(
+            program,
+            foreign_key,
+            child_table,
+            &foreign_key.child_positions,
+            old_columns,
+            new_columns,
+            old_rowid,
+            new_rowid,
+            changed,
+            complete,
+        )?;
+        program.preassign_label_to_next_insn(changed);
         if foreign_key.declaration.deferred {
             emit_old_child_repair(program, foreign_key, child_table, old_columns, old_rowid)?;
         }
         emit_new_child_check(program, foreign_key, child_table, new_columns, new_rowid)?;
+        program.preassign_label_to_next_insn(complete);
     }
     Ok(())
 }
@@ -134,14 +184,17 @@ pub(crate) fn emit_replace_parent_checks(
             RefAct::NoAction | RefAct::Restrict
         )
     }) {
-        if !replacement_can_satisfy_delete(foreign_key.declaration.on_delete) {
+        if !can_skip_transient_replace_check(
+            foreign_key.declaration.on_delete,
+            foreign_key.declaration.deferred,
+        ) {
             emit_delete_parent_check(program, foreign_key, parent_table, old_columns, old_rowid)?;
             continue;
         }
 
-        // NO ACTION is checked after the whole row replacement. If the new
-        // row restores the exact parent key, the implicit delete creates no
-        // violation. RESTRICT above remains immediate and must still fail.
+        // An immediate NO ACTION check may ignore the transient delete only
+        // when this replacement restores the exact parent key. Deferred
+        // checks instead record and later repair debt in the shared counter.
         let changed = program.allocate_label();
         let complete = program.allocate_label();
         let (old_key, replacement_key) = copy_parent_change_keys(
@@ -176,8 +229,8 @@ pub(crate) fn emit_replace_parent_checks(
     Ok(())
 }
 
-fn replacement_can_satisfy_delete(action: turso_parser::ast::RefAct) -> bool {
-    action == turso_parser::ast::RefAct::NoAction
+fn can_skip_transient_replace_check(action: turso_parser::ast::RefAct, deferred: bool) -> bool {
+    action == turso_parser::ast::RefAct::NoAction && !deferred
 }
 
 pub(crate) fn emit_update_parent_checks(
@@ -932,6 +985,45 @@ fn child_register(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn emit_key_change_branch(
+    program: &mut ProgramBuilder,
+    foreign_key: &ResolvedForeignKey,
+    table: &BTreeTable,
+    positions: &[usize],
+    old_columns: RegisterRange,
+    new_columns: RegisterRange,
+    old_rowid: RegisterId,
+    new_rowid: RegisterId,
+    changed: crate::vdbe::BranchOffset,
+    unchanged: crate::vdbe::BranchOffset,
+) -> ForeignKeyResult<()> {
+    if positions.is_empty() {
+        return Err(PhysicalForeignKeyError::Invalid(
+            "foreign key has no key positions",
+        ));
+    }
+    for (offset, position) in positions.iter().copied().enumerate() {
+        let next_equal = (offset + 1 != positions.len()).then(|| program.allocate_label());
+        program.emit_insn(Insn::Eq {
+            lhs: child_register(table, old_columns, old_rowid, position)?,
+            rhs: child_register(table, new_columns, new_rowid, position)?,
+            target_pc: next_equal.unwrap_or(unchanged),
+            flags: CmpInsFlags::default().null_eq(),
+            collation: foreign_key
+                .parent_unique_index
+                .as_ref()
+                .and_then(|index| index.value().columns.get(offset))
+                .and_then(|column| column.collation),
+        });
+        program.emit_insn(Insn::Goto { target_pc: changed });
+        if let Some(next_equal) = next_equal {
+            program.preassign_label_to_next_insn(next_equal);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn copy_parent_change_keys(
     program: &mut ProgramBuilder,
     parent_table: &BTreeTable,
@@ -1062,13 +1154,13 @@ mod properties {
     }
 
     // Examples:
-    // - `INSERT OR REPLACE` of parent key `1` may satisfy `ON DELETE NO ACTION`
-    //   by inserting key `1` again before the statement finishes;
-    // - the same replacement must fail immediately for `ON DELETE RESTRICT`.
-    //   CASCADE, SET NULL, and SET DEFAULT are actions, not checks that the
-    //   replacement row can satisfy.
+    // - immediate `INSERT OR REPLACE parent VALUES (1)` may skip the transient
+    //   NO ACTION violation when the replacement restores parent key `1`;
+    // - deferred NO ACTION must record the delete and let the later insert
+    //   repair it, so an unrelated violation already in the counter survives;
+    // - `ON DELETE RESTRICT` is immediate and can never be skipped.
     #[hegel::test]
-    fn only_no_action_can_be_satisfied_by_the_replacement_row(tc: hegel::TestCase) {
+    fn only_immediate_no_action_can_skip_a_restored_replace_key(tc: hegel::TestCase) {
         let action = match tc.draw(generators::integers::<u8>().max_value(4)) {
             0 => turso_parser::ast::RefAct::NoAction,
             1 => turso_parser::ast::RefAct::Restrict,
@@ -1076,10 +1168,11 @@ mod properties {
             3 => turso_parser::ast::RefAct::SetNull,
             _ => turso_parser::ast::RefAct::SetDefault,
         };
+        let deferred = tc.draw(generators::integers::<u8>().max_value(1)) == 1;
 
         assert_eq!(
-            replacement_can_satisfy_delete(action),
-            action == turso_parser::ast::RefAct::NoAction
+            can_skip_transient_replace_check(action, deferred),
+            action == turso_parser::ast::RefAct::NoAction && !deferred
         );
     }
 }
