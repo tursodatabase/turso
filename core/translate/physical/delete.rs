@@ -421,9 +421,6 @@ fn preflight_delete<'plan>(
             "target does not carry complete index metadata",
         ));
     };
-    if !source.index_method_patterns.is_empty() {
-        return Err(PhysicalDeleteError::Unsupported("custom index methods"));
-    }
     let physical_source = plan
         .source(delete.target)
         .ok_or(PhysicalDeleteError::Invalid(

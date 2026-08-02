@@ -10,9 +10,10 @@ use crate::{
     sync::Arc,
     translate::semantic::hir::{self, Expr},
     vdbe::{
-        builder::{CursorType, ProgramBuilder},
+        builder::ProgramBuilder,
         insn::{to_u32, CmpInsFlags, IdxInsertFlags, Insn, RegisterOrLiteral},
     },
+    LimboError,
 };
 
 use super::{
@@ -21,26 +22,30 @@ use super::{
 
 #[derive(Debug)]
 pub(crate) enum PhysicalIndexError {
+    Engine(LimboError),
     Runtime(RuntimeBindingError),
     Expression(PhysicalExpressionError),
     Invalid(&'static str),
-    Unsupported(&'static str),
 }
 
 impl fmt::Display for PhysicalIndexError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Engine(error) => error.fmt(formatter),
             Self::Runtime(error) => error.fmt(formatter),
             Self::Expression(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical index: {message}"),
-            Self::Unsupported(message) => {
-                write!(formatter, "physical index is not emitted yet: {message}")
-            }
         }
     }
 }
 
 impl std::error::Error for PhysicalIndexError {}
+
+impl From<LimboError> for PhysicalIndexError {
+    fn from(error: LimboError) -> Self {
+        Self::Engine(error)
+    }
+}
 
 impl From<PhysicalExpressionError> for PhysicalIndexError {
     fn from(error: PhysicalExpressionError) -> Self {
@@ -74,9 +79,6 @@ pub(crate) fn open_indexes<'hir>(
     source: &'hir hir::Source,
     database: usize,
 ) -> IndexResult<Vec<OpenedIndex<'hir>>> {
-    if !source.index_method_patterns.is_empty() {
-        return Err(PhysicalIndexError::Unsupported("custom index methods"));
-    }
     let hir::IndexCoverage::Complete { indexes } = &source.index_coverage else {
         return Err(PhysicalIndexError::Invalid(
             "DML target does not carry complete index metadata",
@@ -91,15 +93,12 @@ pub(crate) fn open_indexes<'hir>(
     let mut opened = Vec::with_capacity(source.index_expressions.len());
     for expressions in &source.index_expressions {
         let index = expressions.index.handle();
-        if index.index_method.is_some() {
-            return Err(PhysicalIndexError::Unsupported("custom index methods"));
-        }
         if expressions.columns.len() != index.columns.len() {
             return Err(PhysicalIndexError::Invalid(
                 "index expression and catalog column widths differ",
             ));
         }
-        let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+        let cursor = program.alloc_cursor_index(None, &index)?;
         program.emit_insn(Insn::OpenWrite {
             cursor_id: cursor,
             root_page: RegisterOrLiteral::Literal(index.root_page),
