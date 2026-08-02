@@ -236,12 +236,11 @@ fn a_root_table_scan_emits_only_from_closed_hir(tc: hegel::TestCase) {
         .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 2, .. })));
 }
 
-// Examples: `position_args(?1)`, `position_args(?1, ?2)`, and
-// `position_args(?1, ?2, ?3)` bind arguments to the hidden first, second, and
-// third columns in that exact order. Physical lowering must ask the frozen
-// virtual table for its filter contract, place those parameters in the exact
-// contiguous register range passed to `VFilter`, and read/advance the same
-// virtual cursor after the schema and symbol catalog have been dropped.
+// Examples: `position_args(?1, ?2)` and `position_args WHERE second = ?2 AND
+// first = ?1` both bind arguments to the hidden first and second columns in
+// schema order. The WHERE spelling becomes the same HIR source and consumes
+// the omitted equality terms. Physical lowering must place parameters in the
+// exact contiguous range passed to `VFilter` after the catalog is dropped.
 #[hegel::test]
 fn table_function_arguments_keep_their_bound_hidden_column_order(tc: hegel::TestCase) {
     let arity = usize::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(3)));
@@ -249,6 +248,7 @@ fn table_function_arguments_keep_their_bound_hidden_column_order(tc: hegel::Test
         .map(|position| format!("?{position}"))
         .collect::<Vec<_>>()
         .join(", ");
+    let via_where = tc.draw(generators::booleans());
     let mut schema = Schema::new();
     schema
         .add_virtual_table(
@@ -259,9 +259,44 @@ fn table_function_arguments_keep_their_bound_hidden_column_order(tc: hegel::Test
     let symbols = SymbolTable::new();
     let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
     let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
-    let statement = parse_statement(&format!("SELECT value FROM position_args({arguments})"));
+    let sql = if via_where {
+        let names = ["first", "second", "third"];
+        let constraints = (1..=arity)
+            .rev()
+            .map(|position| format!("{} = ?{position}", names[position - 1]))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        format!("SELECT value FROM position_args WHERE {constraints}")
+    } else {
+        format!("SELECT value FROM position_args({arguments})")
+    };
+    let statement = parse_statement(&sql);
     let document = analyze(&context, AnalyzeInput::Statement(&statement))
         .expect("generated table-function query has valid SQL meaning");
+    let source = document
+        .sources
+        .iter()
+        .find(|source| source.name == "position_args")
+        .expect("the table-function source exists");
+    let crate::translate::semantic::hir::SourceKind::TableFunction {
+        arguments: bound_arguments,
+        ..
+    } = &source.kind
+    else {
+        panic!("both spellings bind to one table-function HIR source");
+    };
+    assert_eq!(bound_arguments.len(), arity);
+    if via_where {
+        let root = match &document.root {
+            HirRoot::Query(root) => root,
+            _ => unreachable!("the fixture is a query"),
+        };
+        let query = document.query(root.query).expect("the root query exists");
+        assert!(matches!(
+            query.blocks[0].body,
+            QueryBlockBody::Select { filter: None, .. }
+        ));
+    }
     drop(context);
     drop(schema);
     drop(symbols);

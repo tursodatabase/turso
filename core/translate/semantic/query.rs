@@ -1163,6 +1163,7 @@ impl Analyzer<'_, '_> {
                 )
             })
             .transpose()?;
+        let filter = self.bind_hidden_virtual_table_arguments(from.as_ref(), filter)?;
         let grouping = group_by
             .as_ref()
             .map(|grouping| self.analyze_grouping(grouping, &scope, block_id))
@@ -1184,6 +1185,75 @@ impl Analyzer<'_, '_> {
             },
             scope,
         ))
+    }
+
+    /// Normalize `FROM vtab WHERE hidden0 = x AND hidden1 = y` into the same
+    /// closed HIR source as `FROM vtab(x, y)`. Only a contiguous prefix of
+    /// hidden columns is consumed, and only source-free argument expressions
+    /// are safe before the virtual cursor is opened.
+    fn bind_hidden_virtual_table_arguments(
+        &mut self,
+        from: Option<&hir::From>,
+        mut filter: Option<hir::Expr>,
+    ) -> Result<Option<hir::Expr>> {
+        let Some(from) = from else {
+            return Ok(filter);
+        };
+        let source_ids = std::iter::once(from.first)
+            .chain(from.joins.iter().map(|join| join.right))
+            .collect::<Vec<_>>();
+        for source_id in source_ids {
+            let Some(current_filter) = filter.as_ref() else {
+                break;
+            };
+            let Some((table, hidden_columns)) = self.source(source_id).and_then(|source| {
+                let hir::SourceKind::Table(table) = &source.kind else {
+                    return None;
+                };
+                let virtual_table = table.value().virtual_table()?;
+                let hidden = virtual_table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, column)| column.hidden().then_some(position))
+                    .collect::<Vec<_>>();
+                (!hidden.is_empty()).then(|| (table.clone(), hidden))
+            }) else {
+                continue;
+            };
+
+            let mut counts = vec![0usize; hidden_columns.len()];
+            count_hidden_virtual_equalities(
+                current_filter,
+                source_id,
+                &hidden_columns,
+                &mut counts,
+            );
+            let prefix = counts.iter().take_while(|count| **count == 1).count();
+            if prefix == 0 {
+                continue;
+            }
+            let mut arguments = vec![None; prefix];
+            filter = extract_hidden_virtual_equalities(
+                filter.take().expect("the filter was checked above"),
+                source_id,
+                &hidden_columns[..prefix],
+                &mut arguments,
+            );
+            let arguments = arguments
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    LimboError::InternalError(
+                        "hidden virtual-table argument extraction was incomplete".to_string(),
+                    )
+                })?;
+            let source = self.source_mut(source_id).ok_or_else(|| {
+                LimboError::InternalError(format!("missing virtual-table source {source_id}"))
+            })?;
+            source.kind = hir::SourceKind::TableFunction { table, arguments };
+        }
+        Ok(filter)
     }
 
     fn analyze_values_query_block(
@@ -2324,6 +2394,114 @@ fn output_storage_classes(output: &hir::Output) -> (bool, bool) {
 
 fn table_has_rowid(table: &Table) -> bool {
     table.btree().is_some_and(|table| table.has_rowid) || table.virtual_table().is_some()
+}
+
+fn count_hidden_virtual_equalities(
+    expression: &hir::Expr,
+    source: hir::SourceId,
+    hidden_columns: &[usize],
+    counts: &mut [usize],
+) {
+    if let hir::Expr::Binary {
+        lhs,
+        operator: ast::Operator::And,
+        rhs,
+        ..
+    } = expression
+    {
+        count_hidden_virtual_equalities(lhs, source, hidden_columns, counts);
+        count_hidden_virtual_equalities(rhs, source, hidden_columns, counts);
+        return;
+    }
+    if let Some((position, _)) = hidden_virtual_equality(expression, source, hidden_columns) {
+        counts[position] += 1;
+    }
+}
+
+fn extract_hidden_virtual_equalities(
+    expression: hir::Expr,
+    source: hir::SourceId,
+    hidden_columns: &[usize],
+    arguments: &mut [Option<hir::Expr>],
+) -> Option<hir::Expr> {
+    if let Some((position, argument)) = hidden_virtual_equality(&expression, source, hidden_columns)
+    {
+        arguments[position] = Some(argument.clone());
+        return None;
+    }
+    match expression {
+        hir::Expr::Binary {
+            lhs,
+            operator: ast::Operator::And,
+            rhs,
+            array_concat,
+            custom,
+            comparison,
+        } => {
+            let lhs = extract_hidden_virtual_equalities(*lhs, source, hidden_columns, arguments);
+            let rhs = extract_hidden_virtual_equalities(*rhs, source, hidden_columns, arguments);
+            match (lhs, rhs) {
+                (Some(lhs), Some(rhs)) => Some(hir::Expr::Binary {
+                    lhs: Box::new(lhs),
+                    operator: ast::Operator::And,
+                    rhs: Box::new(rhs),
+                    array_concat,
+                    custom,
+                    comparison,
+                }),
+                (Some(expression), None) | (None, Some(expression)) => Some(expression),
+                (None, None) => None,
+            }
+        }
+        expression => Some(expression),
+    }
+}
+
+fn hidden_virtual_equality<'expression>(
+    expression: &'expression hir::Expr,
+    source: hir::SourceId,
+    hidden_columns: &[usize],
+) -> Option<(usize, &'expression hir::Expr)> {
+    let hir::Expr::Binary {
+        lhs,
+        operator: ast::Operator::Equals,
+        rhs,
+        custom: None,
+        ..
+    } = expression
+    else {
+        return None;
+    };
+    let candidate = |column: &hir::Expr, argument: &'expression hir::Expr| {
+        let hir::Expr::Column(reference) = column else {
+            return None;
+        };
+        if reference.source != source || !is_source_free_virtual_argument(argument) {
+            return None;
+        }
+        hidden_columns
+            .iter()
+            .position(|column| *column == reference.column)
+            .map(|position| (position, argument))
+    };
+    candidate(lhs, rhs).or_else(|| candidate(rhs, lhs))
+}
+
+fn is_source_free_virtual_argument(expression: &hir::Expr) -> bool {
+    let mut source_free = true;
+    expression.walk(&mut |expression| {
+        if matches!(
+            expression,
+            hir::Expr::Column(_)
+                | hir::Expr::MergedColumn(_)
+                | hir::Expr::RowId(_)
+                | hir::Expr::Output(_)
+                | hir::Expr::Subquery(_)
+        ) {
+            source_free = false;
+        }
+    });
+    source_free
 }
 
 fn pseudo_source_name(kind: hir::PseudoSource) -> &'static str {
