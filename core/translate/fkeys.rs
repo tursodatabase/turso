@@ -8,7 +8,7 @@ use crate::{
     sync::{Arc, OnceLock, Weak},
     translate::{
         collate::CollationSeq,
-        emitter::Resolver,
+        emitter::DdlContext,
         physical::{
             emit_root_schema_expression_into, CursorId, PhysicalPlan, RootRuntimeInputs,
             SourceRuntime,
@@ -155,7 +155,7 @@ fn build_parent_key(
     parent_cursor_id: usize,
     parent_rowid_reg: usize,
     dest_start: usize,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     connection: &Arc<Connection>,
     database_id: usize,
 ) -> Result<()> {
@@ -191,11 +191,11 @@ fn build_parent_key(
         None
     } else {
         let context = SemanticContext::new(
-            resolver.schema(),
+            ddl_context.schema(),
             connection.database_schemas(),
             &connection.temp.database,
             connection.attached_databases(),
-            resolver.symbol_table,
+            ddl_context.symbol_table,
             connection.experimental_custom_types_enabled(),
             connection.get_dqs_dml().into(),
             connection.dialect(),
@@ -288,7 +288,7 @@ const FK_SUBPROGRAM_OPTS: ProgramBuilderOpts = ProgramBuilderOpts::new(2, 32, 4)
 
 fn emit_fk_action_subprogram(
     program: &mut ProgramBuilder,
-    resolver: &mut Resolver,
+    ddl_context: &mut DdlContext,
     connection: &Arc<Connection>,
     stmt: ast::Stmt,
     ctx: &FkActionContext,
@@ -296,7 +296,7 @@ fn emit_fk_action_subprogram(
     description: &'static str,
 ) -> Result<()> {
     let parent_change = ctx.parent_change();
-    let compile_stack = resolver.fk_action_compile_stack.clone();
+    let compile_stack = ddl_context.fk_action_compile_stack.clone();
 
     let subprogram = if let Some(slot) = compile_stack.find(&foreign_key, parent_change) {
         assert!(
@@ -314,12 +314,12 @@ fn emit_fk_action_subprogram(
         subprogram_builder.prologue();
         translate_inner(
             stmt,
-            resolver,
+            ddl_context,
             &mut subprogram_builder,
             connection,
             description,
         )?;
-        subprogram_builder.epilogue(resolver.schema());
+        subprogram_builder.epilogue(ddl_context.schema());
         let built = subprogram_builder.build(connection.clone(), true, description)?;
         let prepared = built.prepared().clone();
         entry
@@ -473,14 +473,14 @@ fn build_fk_match_where_clause(child_cols: &[String], ctx: &FkSubprogramContext)
 /// This creates a sub-program that deletes all child rows matching the parent key.
 fn fire_fk_cascade_delete(
     program: &mut ProgramBuilder,
-    resolver: &mut Resolver,
+    ddl_context: &mut DdlContext,
     fk_ref: &ResolvedFkRef,
     connection: &Arc<Connection>,
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
     let db_name = if database_id != crate::MAIN_DB_ID {
-        resolver.get_database_name_by_index(database_id)
+        ddl_context.get_database_name_by_index(database_id)
     } else {
         None
     };
@@ -494,7 +494,7 @@ fn fire_fk_cascade_delete(
     );
     emit_fk_action_subprogram(
         program,
-        resolver,
+        ddl_context,
         connection,
         stmt,
         ctx,
@@ -507,14 +507,14 @@ fn fire_fk_cascade_delete(
 /// This creates a sub-program that sets FK columns to NULL for all matching child rows.
 fn fire_fk_set_null(
     program: &mut ProgramBuilder,
-    resolver: &mut Resolver,
+    ddl_context: &mut DdlContext,
     fk_ref: &ResolvedFkRef,
     connection: &Arc<Connection>,
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
     let db_name = if database_id != crate::MAIN_DB_ID {
-        resolver.get_database_name_by_index(database_id)
+        ddl_context.get_database_name_by_index(database_id)
     } else {
         None
     };
@@ -528,7 +528,7 @@ fn fire_fk_set_null(
     );
     emit_fk_action_subprogram(
         program,
-        resolver,
+        ddl_context,
         connection,
         stmt,
         ctx,
@@ -541,14 +541,14 @@ fn fire_fk_set_null(
 /// This creates a sub-program that sets FK columns to their default values for all matching child rows.
 fn fire_fk_set_default(
     program: &mut ProgramBuilder,
-    resolver: &mut Resolver,
+    ddl_context: &mut DdlContext,
     fk_ref: &ResolvedFkRef,
     connection: &Arc<Connection>,
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
     let db_name = if database_id != crate::MAIN_DB_ID {
-        resolver.get_database_name_by_index(database_id)
+        ddl_context.get_database_name_by_index(database_id)
     } else {
         None
     };
@@ -562,7 +562,7 @@ fn fire_fk_set_default(
     );
     emit_fk_action_subprogram(
         program,
-        resolver,
+        ddl_context,
         connection,
         stmt,
         ctx,
@@ -573,19 +573,19 @@ fn fire_fk_set_default(
 
 pub fn emit_fk_drop_table_check(
     program: &mut ProgramBuilder,
-    resolver: &mut Resolver,
+    ddl_context: &mut DdlContext,
     parent_table_name: &str,
     connection: &Arc<Connection>,
     database_id: usize,
 ) -> Result<()> {
-    let parent_tbl = resolver
+    let parent_tbl = ddl_context
         .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
         .ok_or_else(|| {
             LimboError::InternalError(format!("parent table {parent_table_name} not found"))
         })?;
 
     // Get all FK references to this parent table
-    let fk_refs = resolver.with_schema(database_id, |s| {
+    let fk_refs = ddl_context.with_schema(database_id, |s| {
         s.resolved_fks_referencing(parent_table_name)
     })?;
 
@@ -687,7 +687,7 @@ pub fn emit_fk_drop_table_check(
             parent_write_cur,
             current_rowid_reg,
             key_regs_start,
-            resolver,
+            ddl_context,
             connection,
             database_id,
         )?;
@@ -697,13 +697,20 @@ pub fn emit_fk_drop_table_check(
 
         match fk_ref.fk.on_delete {
             RefAct::Cascade => {
-                fire_fk_cascade_delete(program, resolver, fk_ref, connection, &ctx, database_id)?;
+                fire_fk_cascade_delete(
+                    program,
+                    ddl_context,
+                    fk_ref,
+                    connection,
+                    &ctx,
+                    database_id,
+                )?;
             }
             RefAct::SetNull => {
-                fire_fk_set_null(program, resolver, fk_ref, connection, &ctx, database_id)?;
+                fire_fk_set_null(program, ddl_context, fk_ref, connection, &ctx, database_id)?;
             }
             RefAct::SetDefault => {
-                fire_fk_set_default(program, resolver, fk_ref, connection, &ctx, database_id)?;
+                fire_fk_set_default(program, ddl_context, fk_ref, connection, &ctx, database_id)?;
             }
             RefAct::NoAction | RefAct::Restrict => {
                 // These are handled below in the check_fk_refs loop
@@ -729,7 +736,7 @@ pub fn emit_fk_drop_table_check(
             parent_write_cur,
             current_rowid_reg,
             parent_key_start,
-            resolver,
+            ddl_context,
             connection,
             database_id,
         )?;

@@ -36,7 +36,7 @@ pub(crate) mod view;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
-use crate::translate::emitter::Resolver;
+use crate::translate::emitter::DdlContext;
 use crate::translate::physical::{emit_root_with_context, PhysicalPlan};
 use crate::translate::result::ResultSetColumn;
 use crate::translate::semantic::{
@@ -101,9 +101,9 @@ pub fn translate(
         }
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
-            let resolver = new_resolver(schema, &connection, syms, origin);
+            let ddl_context = new_ddl_context(schema, &connection, syms, origin);
             pragma::translate_pragma(
-                &resolver,
+                &ddl_context,
                 name,
                 body.clone(),
                 pager,
@@ -112,8 +112,8 @@ pub fn translate(
             )?;
         }
         _ => {
-            let mut resolver = new_resolver(schema, &connection, syms, origin);
-            translate_inner(stmt, &mut resolver, &mut program, &connection, input)?;
+            let mut ddl_context = new_ddl_context(schema, &connection, syms, origin);
+            translate_inner(stmt, &mut ddl_context, &mut program, &connection, input)?;
         }
     };
 
@@ -196,20 +196,19 @@ fn translate_semantic_root(
     Ok(())
 }
 
-fn new_resolver<'a>(
+fn new_ddl_context<'a>(
     schema: &'a Schema,
     connection: &'a Arc<Connection>,
     syms: &'a SymbolTable,
     origin: crate::statement::StatementOrigin,
-) -> Resolver<'a> {
-    Resolver::new(
+) -> DdlContext<'a> {
+    DdlContext::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
         syms,
         connection.experimental_custom_types_enabled(),
-        connection.get_dqs_dml().into(),
         if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
             Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
         } else {
@@ -471,7 +470,7 @@ pub(super) fn set_semantic_statement_journal_flags(
 #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
 pub fn translate_inner(
     stmt: ast::Stmt,
-    resolver: &mut Resolver,
+    ddl_context: &mut DdlContext,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
@@ -516,18 +515,25 @@ pub fn translate_inner(
     );
     match stmt {
         ast::Stmt::AlterTable(alter) => {
-            translate_alter_table(alter, resolver, program, connection, input)?;
+            translate_alter_table(alter, ddl_context, program, connection, input)?;
         }
-        ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
+        ast::Stmt::Analyze { name } => translate_analyze(name, ddl_context, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
-            attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
+            attach::translate_attach(
+                &expr,
+                ddl_context,
+                &db_name,
+                &key,
+                program,
+                connection.clone(),
+            )?;
         }
-        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
+        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, ddl_context, program)?,
         ast::Stmt::Commit { name } => {
-            translate_tx_commit(name, resolver.schema(), resolver, program)?
+            translate_tx_commit(name, ddl_context.schema(), ddl_context, program)?
         }
         ast::Stmt::CreateIndex { .. } => {
-            translate_create_index(program, connection, resolver, stmt)?;
+            translate_create_index(program, connection, ddl_context, stmt)?;
         }
         ast::Stmt::CreateTable {
             temporary,
@@ -536,7 +542,7 @@ pub fn translate_inner(
             body,
         } => translate_create_table(
             tbl_name,
-            resolver,
+            ddl_context,
             temporary,
             if_not_exists,
             body,
@@ -569,7 +575,7 @@ pub fn translate_inner(
             );
             trigger::translate_create_trigger(
                 trigger_name,
-                resolver,
+                ddl_context,
                 temporary,
                 if_not_exists,
                 time,
@@ -588,7 +594,7 @@ pub fn translate_inner(
             ..
         } => view::translate_create_view(
             &view_name,
-            resolver,
+            ddl_context,
             &select,
             &columns,
             if_not_exists,
@@ -601,45 +607,45 @@ pub fn translate_inner(
             ..
         } => view::translate_create_materialized_view(
             &view_name,
-            resolver,
+            ddl_context,
             &select,
             if_not_exists,
             connection.clone(),
             program,
         )?,
         ast::Stmt::CreateVirtualTable(vtab) => {
-            translate_create_virtual_table(vtab, resolver, program, connection)?
+            translate_create_virtual_table(vtab, ddl_context, program, connection)?
         }
         statement @ (ast::Stmt::Select(_)
         | ast::Stmt::Insert { .. }
         | ast::Stmt::Update(_)
         | ast::Stmt::Delete { .. }) => translate_semantic_root(
-            resolver.schema(),
+            ddl_context.schema(),
             &statement,
             program,
             connection,
-            resolver.symbol_table,
+            ddl_context.symbol_table,
             crate::statement::StatementOrigin::Root,
         )?,
         ast::Stmt::Detach { name } => {
-            attach::translate_detach(&name, resolver, program, connection.clone())?
+            attach::translate_detach(&name, ddl_context, program, connection.clone())?
         }
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
-        } => translate_drop_index(&idx_name, resolver, if_exists, program)?,
+        } => translate_drop_index(&idx_name, ddl_context, if_exists, program)?,
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
-        } => translate_drop_table(tbl_name, resolver, if_exists, program, connection)?,
+        } => translate_drop_table(tbl_name, ddl_context, if_exists, program, connection)?,
         ast::Stmt::DropTrigger {
             if_exists,
             trigger_name,
-        } => trigger::translate_drop_trigger(resolver, &trigger_name, if_exists, program)?,
+        } => trigger::translate_drop_trigger(ddl_context, &trigger_name, if_exists, program)?,
         ast::Stmt::DropView {
             if_exists,
             view_name,
-        } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
+        } => view::translate_drop_view(ddl_context, &view_name, if_exists, program)?,
         ast::Stmt::CreateType {
             if_not_exists,
             type_name,
@@ -648,7 +654,7 @@ pub fn translate_inner(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?
+            schema::translate_create_type(&type_name, &body, if_not_exists, ddl_context, program)?
         }
         ast::Stmt::CreateDomain {
             if_not_exists,
@@ -668,7 +674,7 @@ pub fn translate_inner(
                 &constraints,
                 default,
                 if_not_exists,
-                resolver,
+                ddl_context,
                 program,
             )?
         }
@@ -679,7 +685,7 @@ pub fn translate_inner(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_drop_type(&type_name, if_exists, false, resolver, program)?
+            schema::translate_drop_type(&type_name, if_exists, false, ddl_context, program)?
         }
         ast::Stmt::DropDomain {
             if_exists,
@@ -688,14 +694,14 @@ pub fn translate_inner(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_drop_type(&domain_name, if_exists, true, resolver, program)?
+            schema::translate_drop_type(&domain_name, if_exists, true, ddl_context, program)?
         }
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
-        ast::Stmt::Reindex { name } => translate_reindex(name, resolver, program, connection)?,
+        ast::Stmt::Reindex { name } => translate_reindex(name, ddl_context, program, connection)?,
         ast::Stmt::Optimize { idx_name } => {
-            translate_optimize(idx_name, resolver, program, connection)?
+            translate_optimize(idx_name, ddl_context, program, connection)?
         }
         ast::Stmt::Release { name } => translate_release(program, name)?,
         ast::Stmt::Rollback {
@@ -723,7 +729,7 @@ pub fn translate_inner(
                 &min_value,
                 &max_value,
                 cycle,
-                resolver,
+                ddl_context,
                 program,
             )?;
         }
@@ -731,7 +737,7 @@ pub fn translate_inner(
             if_exists,
             seq_name,
         } => {
-            sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
+            sequence::translate_drop_sequence(&seq_name, if_exists, ddl_context, program)?;
         }
     };
 

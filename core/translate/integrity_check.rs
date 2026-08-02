@@ -2,7 +2,7 @@ use crate::vdbe::affinity::Affinity;
 use crate::{
     schema::{GeneratedType, Index, Schema, Table, EXPR_INDEX_SENTINEL},
     translate::{
-        emitter::Resolver,
+        emitter::DdlContext,
         physical::{
             emit_root_schema_expression_into, CursorId, PhysicalPlan, RootRuntimeInputs,
             SourceRuntime,
@@ -44,7 +44,7 @@ struct BoundIntegrityIndex {
 pub fn translate_integrity_check(
     schema: &Schema,
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     database_id: usize,
     max_errors: usize,
     connection: &std::sync::Arc<crate::Connection>,
@@ -52,7 +52,7 @@ pub fn translate_integrity_check(
     translate_integrity_check_impl(
         schema,
         program,
-        resolver,
+        ddl_context,
         database_id,
         max_errors,
         false,
@@ -64,7 +64,7 @@ pub fn translate_integrity_check(
 pub fn translate_quick_check(
     schema: &Schema,
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     database_id: usize,
     max_errors: usize,
     connection: &std::sync::Arc<crate::Connection>,
@@ -72,7 +72,7 @@ pub fn translate_quick_check(
     translate_integrity_check_impl(
         schema,
         program,
-        resolver,
+        ddl_context,
         database_id,
         max_errors,
         true,
@@ -137,7 +137,7 @@ fn emit_row_missing_from_index_error(
 fn translate_integrity_check_impl(
     schema: &Schema,
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     database_id: usize,
     max_errors: usize,
     quick: bool,
@@ -367,14 +367,14 @@ fn translate_integrity_check_impl(
         let main_schema = if database_id == crate::MAIN_DB_ID {
             schema
         } else {
-            resolver.schema()
+            ddl_context.schema()
         };
         let context = SemanticContext::new(
             main_schema,
             connection.database_schemas(),
             &connection.temp.database,
             connection.attached_databases(),
-            resolver.symbol_table,
+            ddl_context.symbol_table,
             connection.experimental_custom_types_enabled(),
             connection.get_dqs_dml().into(),
             connection.dialect(),

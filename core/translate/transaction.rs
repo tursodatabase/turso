@@ -1,5 +1,5 @@
 use crate::schema::Schema;
-use crate::translate::emitter::{emit_cdc_explicit_commit_insns, Resolver, TransactionMode};
+use crate::translate::emitter::{emit_cdc_explicit_commit_insns, DdlContext, TransactionMode};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::Insn;
 use crate::Result;
@@ -8,7 +8,7 @@ use turso_parser::ast::{Name, TransactionType};
 pub fn translate_tx_begin(
     tx_type: Option<TransactionType>,
     _tx_name: Option<Name>,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     program.extend(&ProgramBuilderOpts {
@@ -16,7 +16,7 @@ pub fn translate_tx_begin(
         approx_num_insns: 0,
         approx_num_labels: 0,
     });
-    let schema = resolver.schema();
+    let schema = ddl_context.schema();
     let tx_type = tx_type.unwrap_or(TransactionType::Deferred);
     match tx_type {
         TransactionType::Deferred => {
@@ -37,14 +37,15 @@ pub fn translate_tx_begin(
                 tx_mode: TransactionMode::Write,
                 schema_cookie: schema.schema_version,
             });
-            let temp_schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
+            let temp_schema_cookie =
+                ddl_context.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
             program.emit_insn(Insn::Transaction {
                 db: crate::TEMP_DB_ID,
                 tx_mode: TransactionMode::Write,
                 schema_cookie: temp_schema_cookie,
             });
-            for db_id in resolver.attached_database_ids_in_search_order()? {
-                let cookie = resolver.with_schema(db_id, |s| s.schema_version);
+            for db_id in ddl_context.attached_database_ids_in_search_order()? {
+                let cookie = ddl_context.with_schema(db_id, |s| s.schema_version);
                 program.emit_insn(Insn::Transaction {
                     db: db_id,
                     tx_mode: TransactionMode::Write,
@@ -65,14 +66,15 @@ pub fn translate_tx_begin(
             // Temp has no MVCC, so it uses a plain write lock even in
             // Concurrent mode. The op_transaction handler detects this via
             // `mv_store_for_db(TEMP) == None` and skips the MVCC path.
-            let temp_schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
+            let temp_schema_cookie =
+                ddl_context.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
             program.emit_insn(Insn::Transaction {
                 db: crate::TEMP_DB_ID,
                 tx_mode: TransactionMode::Write,
                 schema_cookie: temp_schema_cookie,
             });
-            for db_id in resolver.attached_database_ids_in_search_order()? {
-                let cookie = resolver.with_schema(db_id, |s| s.schema_version);
+            for db_id in ddl_context.attached_database_ids_in_search_order()? {
+                let cookie = ddl_context.with_schema(db_id, |s| s.schema_version);
                 program.emit_insn(Insn::Transaction {
                     db: db_id,
                     tx_mode: TransactionMode::Write,
@@ -91,14 +93,14 @@ pub fn translate_tx_begin(
 pub fn translate_tx_commit(
     _tx_name: Option<Name>,
     schema: &Schema,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     program.extend(&ProgramBuilderOpts::new(0, 0, 0));
 
     let cdc_info = program.capture_data_changes_info().as_ref();
     if cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
-        emit_cdc_explicit_commit_insns(program, schema, resolver)?;
+        emit_cdc_explicit_commit_insns(program, schema, ddl_context)?;
     }
 
     program.emit_insn(Insn::AutoCommit {

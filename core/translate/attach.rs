@@ -1,6 +1,6 @@
 use crate::function::{Func, ScalarFunc};
 use crate::translate::{
-    emitter::Resolver,
+    emitter::DdlContext,
     expr::sanitize_string,
     physical::{
         emit_root_schema_expression_into, PhysicalPlan, RegisterRange, RootRuntimeInputs,
@@ -17,16 +17,16 @@ use turso_parser::ast::{Expr, Literal};
 fn emit_scalar(
     syntax: &Expr,
     target: usize,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     connection: &Connection,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let context = SemanticContext::new(
-        resolver.schema(),
+        ddl_context.schema(),
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
-        resolver.symbol_table,
+        ddl_context.symbol_table,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
         connection.dialect(),
@@ -53,7 +53,7 @@ fn emit_scalar(
 /// Translate ATTACH statement
 pub fn translate_attach(
     expr: &Expr,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     db_name: &Expr,
     key: &Option<Box<Expr>>,
     program: &mut ProgramBuilder,
@@ -97,7 +97,7 @@ pub fn translate_attach(
             });
         }
         _ => {
-            emit_scalar(expr, arg_reg, resolver, &connection, program)?;
+            emit_scalar(expr, arg_reg, ddl_context, &connection, program)?;
         }
     }
 
@@ -128,13 +128,13 @@ pub fn translate_attach(
             });
         }
         _ => {
-            emit_scalar(db_name, arg_reg + 1, resolver, &connection, program)?;
+            emit_scalar(db_name, arg_reg + 1, ddl_context, &connection, program)?;
         }
     }
 
     // Load key argument (NULL if not provided)
     if let Some(key_expr) = key {
-        emit_scalar(key_expr, arg_reg + 2, resolver, &connection, program)?;
+        emit_scalar(key_expr, arg_reg + 2, ddl_context, &connection, program)?;
     } else {
         program.emit_insn(Insn::Null {
             dest: arg_reg + 2,
@@ -159,7 +159,7 @@ pub fn translate_attach(
 /// Translate DETACH statement
 pub fn translate_detach(
     expr: &Expr,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     program: &mut ProgramBuilder,
     connection: Arc<Connection>,
 ) -> Result<()> {
@@ -200,7 +200,7 @@ pub fn translate_detach(
             });
         }
         _ => {
-            emit_scalar(expr, arg_reg, resolver, &connection, program)?;
+            emit_scalar(expr, arg_reg, ddl_context, &connection, program)?;
         }
     }
 

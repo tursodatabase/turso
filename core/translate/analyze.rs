@@ -6,7 +6,7 @@ use crate::{
     schema::{BTreeTable, Index, RESERVED_TABLE_PREFIXES},
     storage::pager::CreateBTreeFlags,
     translate::{
-        emitter::Resolver,
+        emitter::DdlContext,
         schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
     },
     util::normalize_ident,
@@ -32,7 +32,7 @@ type AnalyzeTarget = (Arc<BTreeTable>, Option<Arc<Index>>);
 /// - An index name: analyze just that index
 fn resolve_analyze_targets(
     target_opt: &Option<ast::QualifiedName>,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
 ) -> Result<(usize, Vec<AnalyzeTarget>)> {
     match target_opt {
         Some(target) => {
@@ -40,12 +40,12 @@ fn resolve_analyze_targets(
 
             // If db_name is specified, resolve to that database
             if let Some(db_name) = &target.db_name {
-                let database_id = resolver.resolve_database_id(target)?;
+                let database_id = ddl_context.resolve_database_id(target)?;
                 let db_normalized = normalize_ident(db_name.as_str());
 
                 // "ANALYZE db.table" — the name part is the table/index
                 // But first check if the name is actually a database name too (shouldn't be with db_name set)
-                let targets = resolve_targets_in_db(&normalized, database_id, resolver)?;
+                let targets = resolve_targets_in_db(&normalized, database_id, ddl_context)?;
                 if targets.is_empty() {
                     bail_parse_error!("no such table or index: {}.{}", db_normalized, normalized);
                 }
@@ -54,18 +54,18 @@ fn resolve_analyze_targets(
 
             // No db_name — check if the name is a database name first
             if normalized.eq_ignore_ascii_case("main") {
-                let targets = collect_all_tables_in_db(0, resolver);
+                let targets = collect_all_tables_in_db(0, ddl_context);
                 return Ok((0, targets));
             }
 
             // Check if it's an attached database name
-            if let Some((db_id, _)) = resolver.get_attached_database(&normalized) {
-                let targets = collect_all_tables_in_db(db_id, resolver);
+            if let Some((db_id, _)) = ddl_context.get_attached_database(&normalized) {
+                let targets = collect_all_tables_in_db(db_id, ddl_context);
                 return Ok((db_id, targets));
             }
 
             // Not a database name — search main schema for table/index
-            let targets = resolve_targets_in_db(&normalized, 0, resolver)?;
+            let targets = resolve_targets_in_db(&normalized, 0, ddl_context)?;
             if targets.is_empty() {
                 bail_parse_error!("no such table or index: {}", target.name);
             }
@@ -73,15 +73,15 @@ fn resolve_analyze_targets(
         }
         None => {
             // ANALYZE with no target — analyze all tables in main
-            let targets = collect_all_tables_in_db(0, resolver);
+            let targets = collect_all_tables_in_db(0, ddl_context);
             Ok((0, targets))
         }
     }
 }
 
 /// Collect all user tables in the given database.
-fn collect_all_tables_in_db(database_id: usize, resolver: &Resolver) -> Vec<AnalyzeTarget> {
-    resolver.with_schema(database_id, |schema| {
+fn collect_all_tables_in_db(database_id: usize, ddl_context: &DdlContext) -> Vec<AnalyzeTarget> {
+    ddl_context.with_schema(database_id, |schema| {
         schema
             .tables
             .iter()
@@ -102,18 +102,18 @@ fn collect_all_tables_in_db(database_id: usize, resolver: &Resolver) -> Vec<Anal
 fn resolve_targets_in_db(
     name: &str,
     database_id: usize,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
 ) -> Result<Vec<AnalyzeTarget>> {
     // Try as a table first
     let table_opt: Option<Arc<BTreeTable>> =
-        resolver.with_schema(database_id, |s| s.get_btree_table(name));
+        ddl_context.with_schema(database_id, |s| s.get_btree_table(name));
     if let Some(table) = table_opt {
         return Ok(vec![(table, None)]);
     }
 
     // Try as an index
     let found: Option<(Arc<BTreeTable>, Arc<Index>)> =
-        resolver.with_schema(database_id, |schema| {
+        ddl_context.with_schema(database_id, |schema| {
             for (table_name, indexes) in schema.indexes.iter() {
                 if let Some(index) = indexes
                     .iter()
@@ -135,11 +135,11 @@ fn resolve_targets_in_db(
 
 pub fn translate_analyze(
     target_opt: Option<ast::QualifiedName>,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     // Resolve the target database and collect analyze targets.
-    let (database_id, analyze_targets) = resolve_analyze_targets(&target_opt, resolver)?;
+    let (database_id, analyze_targets) = resolve_analyze_targets(&target_opt, ddl_context)?;
 
     if analyze_targets.is_empty() {
         return Ok(());
@@ -148,7 +148,7 @@ pub fn translate_analyze(
     // Register a write transaction for the target database so that the
     // epilogue emits a Transaction instruction (which starts the MVCC
     // exclusive transaction required by OpenWrite on sqlite_schema).
-    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    let schema_cookie = ddl_context.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     program.begin_write_operation()?;
 
@@ -166,7 +166,7 @@ pub fn translate_analyze(
     let sqlite_stat1_source: RegisterOrLiteral<_>;
 
     let stat1_table: Option<Arc<BTreeTable>> =
-        resolver.with_schema(database_id, |s| s.get_btree_table("sqlite_stat1"));
+        ddl_context.with_schema(database_id, |s| s.get_btree_table("sqlite_stat1"));
     if let Some(sqlite_stat1) = stat1_table {
         sqlite_stat1_btreetable = sqlite_stat1.clone();
         sqlite_stat1_source = RegisterOrLiteral::Literal(sqlite_stat1.root_page);
@@ -197,7 +197,7 @@ pub fn translate_analyze(
         sqlite_stat1_btreetable = Arc::new(BTreeTable::from_sql(sql, 0)?);
         sqlite_stat1_source = RegisterOrLiteral::Register(table_root_reg);
 
-        let table = resolver
+        let table = ddl_context
             .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
             .unwrap();
         let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
@@ -210,7 +210,7 @@ pub fn translate_analyze(
         // Add the table entry to sqlite_schema
         emit_schema_entry(
             program,
-            resolver,
+            ddl_context,
             sqlite_schema_cursor_id,
             None,
             SchemaEntryType::Table,
@@ -228,7 +228,7 @@ pub fn translate_analyze(
         });
 
         // Bump schema cookie so subsequent statements reparse schema.
-        let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
+        let schema_version = ddl_context.with_schema(database_id, |s| s.schema_version);
         program.emit_insn(Insn::SetCookie {
             db: database_id,
             cookie: Cookie::SchemaVersion,
@@ -358,7 +358,7 @@ pub fn translate_analyze(
         let is_specific_index_target = target_index.is_some();
         let indexes: Vec<Arc<Index>> = match target_index {
             Some(idx) => vec![idx],
-            None => resolver.with_schema(database_id, |s| {
+            None => ddl_context.with_schema(database_id, |s| {
                 s.get_indices(&target_table.name)
                     .filter(|idx| idx.index_method.is_none()) // skip custom for now
                     .cloned()

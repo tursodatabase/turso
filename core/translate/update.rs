@@ -7,7 +7,7 @@
 use crate::{
     sync::Arc,
     translate::{
-        emitter::Resolver,
+        emitter::DdlContext,
         physical::{emit_root_update_with_context_and_after, PhysicalPlan, RootRuntimeInputs},
         semantic::{analyze, context::DmlPolicy, context::SemanticContext, AnalyzeInput},
     },
@@ -18,7 +18,7 @@ use turso_parser::ast;
 
 pub fn translate_update_for_schema_change(
     body: ast::Update,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     ddl_query: &str,
@@ -26,11 +26,11 @@ pub fn translate_update_for_schema_change(
 ) -> Result<()> {
     let statement = ast::Stmt::Update(body);
     let context = SemanticContext::new(
-        resolver.schema(),
+        ddl_context.schema(),
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
-        resolver.symbol_table,
+        ddl_context.symbol_table,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
         connection.dialect(),

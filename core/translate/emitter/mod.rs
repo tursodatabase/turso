@@ -16,35 +16,11 @@ use rustc_hash::FxHashMap as HashMap;
 use std::cell::RefCell;
 use turso_parser::ast;
 
-// Would make more sense to not have RwLock for the attached databases and get all the schemas on prepare,
-// because there could be some data race where at 1 point you check the attached db, it has a table,
-// but after some write it could not be there anymore. However, leaving it as it is to avoid more complicated logic on something that is experimental
-/// Whether SQLite's DQS (double-quoted strings) misfeature is enabled for DML.
-/// When `Enabled`, unresolved double-quoted identifiers fall back to string literals;
-/// when `Disabled`, they raise "no such column" errors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DoubleQuotedDml {
-    Enabled,
-    Disabled,
-}
-
-impl DoubleQuotedDml {
-    pub fn is_enabled(self) -> bool {
-        matches!(self, DoubleQuotedDml::Enabled)
-    }
-}
-
-impl From<bool> for DoubleQuotedDml {
-    fn from(value: bool) -> Self {
-        if value {
-            DoubleQuotedDml::Enabled
-        } else {
-            DoubleQuotedDml::Disabled
-        }
-    }
-}
-
-pub struct Resolver<'a> {
+/// Catalog access used while compiling DDL and control statements.
+///
+/// SQL expression binding belongs to `semantic::Analyzer`; this context only
+/// performs the live catalog operations that DDL cannot freeze into HIR.
+pub struct DdlContext<'a> {
     schema: &'a Schema,
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
     temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
@@ -55,16 +31,11 @@ pub struct Resolver<'a> {
     /// Schema dialect of the database being compiled against; used when a
     /// fresh placeholder schema must be constructed during resolution.
     pub(crate) dialect: Arc<dyn crate::dialect::Dialect>,
-    /// When set, we are compiling a trigger subprogram for this database.
-    /// Ordinary triggers are restricted to their own database, but temp-backed
-    /// triggers follow SQLite's looser resolution rules and may access objects
-    /// across schemas.
-    pub(crate) trigger_context: Option<TriggerDatabaseContext>,
     /// Cached flag: true when this connection has an active temp database.
     ///
-    /// Computed once at Resolver construction to avoid repeated
-    /// `RwLock` reads on every table-name resolution. Safe because a
-    /// `Resolver` is short-lived (single translate pass) and a
+    /// Computed once at construction to avoid repeated `RwLock` reads on every
+    /// table-name lookup. Safe because this context is short-lived (one
+    /// translate pass) and a
     /// connection is single-threaded at the VDBE layer: the temp
     /// database can only be initialized / torn down *between*
     /// Resolvers on the same connection, not during. If you add a
@@ -72,31 +43,16 @@ pub struct Resolver<'a> {
     /// (e.g. via a nested sub-program), update this field on that
     /// path or switch to a live read.
     has_temp_schema: bool,
-    /// Foreign-key action programs currently being compiled by this resolver.
+    /// Foreign-key action programs currently being compiled by this ddl_context.
     ///
     /// This is shared with forked resolvers because `translate_inner` can fork
-    /// the resolver while compiling generated foreign-key action SQL. Without
+    /// the ddl_context while compiling generated foreign-key action SQL. Without
     /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
 }
 
-/// Context for restricting table resolution during trigger subprogram compilation.
-#[derive(Debug, Clone)]
-pub(crate) struct TriggerDatabaseContext {
-    /// The database ID the trigger belongs to.
-    database_id: usize,
-    /// The trigger name (for error messages).
-    trigger_name: String,
-}
-
-impl TriggerDatabaseContext {
-    fn restricts_db_references(&self) -> bool {
-        self.database_id != crate::TEMP_DB_ID
-    }
-}
-
-impl<'a> Resolver<'a> {
+impl<'a> DdlContext<'a> {
     const MAIN_DB: &'static str = "main";
     const TEMP_DB: &'static str = "temp";
 
@@ -108,7 +64,6 @@ impl<'a> Resolver<'a> {
         attached_databases: &'a RwLock<DatabaseCatalog>,
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
-        dqs_dml: DoubleQuotedDml,
         dialect: Arc<dyn crate::dialect::Dialect>,
     ) -> Self {
         let has_temp_schema = temp_database.read().is_some();
@@ -121,7 +76,6 @@ impl<'a> Resolver<'a> {
             symbol_table,
             enable_custom_types,
             dialect,
-            trigger_context: None,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
         }
@@ -186,14 +140,6 @@ impl<'a> Resolver<'a> {
             .borrow_mut()
             .insert(database_id, loaded_schema.clone());
         loaded_schema
-    }
-
-    /// Set trigger database context to restrict table resolution to the trigger's database.
-    pub(crate) fn set_trigger_context(&mut self, database_id: usize, trigger_name: String) {
-        self.trigger_context = Some(TriggerDatabaseContext {
-            database_id,
-            trigger_name,
-        });
     }
 
     pub fn resolve_function(
@@ -321,17 +267,6 @@ impl<'a> Resolver<'a> {
     }
 
     pub(crate) fn resolve_existing_table_database_id(&self, table_name: &str) -> Result<usize> {
-        if let Some(ref ctx) = self.trigger_context {
-            if ctx.restricts_db_references() {
-                return Ok(ctx.database_id);
-            }
-
-            return self.resolve_unqualified_existing_database_id(
-                table_name,
-                Self::schema_has_table_like_object,
-            );
-        }
-
         if let Some(database_id) = Self::resolve_schema_table_database_id(table_name) {
             return Ok(database_id);
         }
@@ -388,39 +323,8 @@ impl<'a> Resolver<'a> {
                 }
             }
         } else {
-            // Unqualified table name — when compiling a trigger subprogram,
-            // resolve to the trigger's database (matching SQLite behavior).
-            // Otherwise default to main.
-            if let Some(ref ctx) = self.trigger_context {
-                if ctx.restricts_db_references() {
-                    Ok(ctx.database_id)
-                } else {
-                    Ok(crate::MAIN_DB_ID)
-                }
-            } else {
-                Ok(0)
-            }
+            Ok(crate::MAIN_DB_ID)
         }?;
-
-        // Triggers can only reference tables in their own database.
-        // This only fires for explicitly qualified names (e.g. "aux.table")
-        // since unqualified names already resolve to the trigger's database above.
-        if let Some(ref ctx) = self.trigger_context {
-            if !ctx.restricts_db_references() {
-                return Ok(resolved_id);
-            }
-            if resolved_id != ctx.database_id {
-                let db_name = qualified_name
-                    .db_name
-                    .as_ref()
-                    .map(|n| n.as_str())
-                    .unwrap_or("main");
-                return Err(LimboError::ParseError(format!(
-                    "trigger {} cannot reference objects in database {}",
-                    ctx.trigger_name, db_name
-                )));
-            }
-        }
 
         Ok(resolved_id)
     }
@@ -616,7 +520,7 @@ pub fn emit_cdc_full_record(
 /// unchanged and pays no per-row sequence cost.
 fn emit_cdc_change_id(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     cdc_cursor_id: usize,
     dest_reg: usize,
 ) -> Result<()> {
@@ -638,7 +542,7 @@ fn emit_cdc_change_id(
         ));
     };
     let seq_name = crate::schema::autoincrement_sequence_name(&cdc_table);
-    let seq = resolver
+    let seq = ddl_context
         .with_schema(crate::MAIN_DB_ID, |s| s.get_sequence(&seq_name).cloned())
         .ok_or_else(|| {
             crate::LimboError::InternalError(format!(
@@ -647,7 +551,7 @@ fn emit_cdc_change_id(
         })?;
     crate::translate::sequence::emit_disk_read_nextval(
         program,
-        resolver,
+        ddl_context,
         crate::MAIN_DB_ID,
         &seq_name,
         &seq,
@@ -659,7 +563,7 @@ fn emit_cdc_change_id(
 #[allow(clippy::too_many_arguments)]
 pub fn emit_cdc_insns(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     operation_mode: OperationMode,
     cdc_cursor_id: usize,
     rowid_reg: usize,
@@ -672,7 +576,7 @@ pub fn emit_cdc_insns(
     match cdc_info.map(|info| info.cdc_version()) {
         Some(crate::CdcVersion::V2) => emit_cdc_insns_v2(
             program,
-            resolver,
+            ddl_context,
             operation_mode,
             cdc_cursor_id,
             rowid_reg,
@@ -810,7 +714,7 @@ fn emit_cdc_insns_v1(
 #[allow(clippy::too_many_arguments)]
 fn emit_cdc_insns_v2(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     operation_mode: OperationMode,
     cdc_cursor_id: usize,
     rowid_reg: usize,
@@ -844,7 +748,7 @@ fn emit_cdc_insns_v2(
     // for get-or-set. In MVCC mode this draws from the CDC AUTOINCREMENT sequence
     // (see `emit_cdc_change_id`); in WAL mode it is a plain NewRowid.
     let candidate_reg = program.alloc_register();
-    emit_cdc_change_id(program, resolver, cdc_cursor_id, candidate_reg)?;
+    emit_cdc_change_id(program, ddl_context, cdc_cursor_id, candidate_reg)?;
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
@@ -937,7 +841,7 @@ fn emit_cdc_insns_v2(
 /// change_type=2, all other data fields NULL.
 pub fn emit_cdc_commit_insns(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     cdc_cursor_id: usize,
 ) -> Result<()> {
     // v2 COMMIT record: (NULL, unixepoch(), conn_txn_id(-1), 2, NULL, NULL, NULL, NULL, NULL)
@@ -991,7 +895,7 @@ pub fn emit_cdc_commit_insns(
     // (the CDC AUTOINCREMENT sequence in MVCC mode) so COMMIT and row change ids
     // stay in one monotonic, never-reused stream.
     let rowid_reg = program.alloc_register();
-    emit_cdc_change_id(program, resolver, cdc_cursor_id, rowid_reg)?;
+    emit_cdc_change_id(program, ddl_context, cdc_cursor_id, rowid_reg)?;
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
@@ -1018,7 +922,7 @@ pub fn emit_cdc_commit_insns(
 /// This should be called once per statement, after the main loop, not per-row.
 pub fn emit_cdc_autocommit_commit(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     cdc_cursor_id: usize,
 ) -> Result<()> {
     let cdc_info = program.capture_data_changes_info().as_ref();
@@ -1044,7 +948,7 @@ pub fn emit_cdc_autocommit_commit(
             jump_if_null: true,
         });
 
-        emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
+        emit_cdc_commit_insns(program, ddl_context, cdc_cursor_id)?;
 
         program.preassign_label_to_next_insn(skip_label);
     }
@@ -1071,7 +975,7 @@ pub fn emit_cdc_autocommit_commit(
 pub fn emit_cdc_explicit_commit_insns(
     program: &mut ProgramBuilder,
     schema: &Schema,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
 ) -> Result<()> {
     let minus_one_reg = program.alloc_register();
     program.emit_int(-1, minus_one_reg);
@@ -1100,7 +1004,7 @@ pub fn emit_cdc_explicit_commit_insns(
 
     // A COMMIT record has no associated table, so pass `None` (no self-exclusion check).
     if let Some((cdc_cursor_id, _)) = prepare_cdc_if_necessary(program, schema, None)? {
-        emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
+        emit_cdc_commit_insns(program, ddl_context, cdc_cursor_id)?;
     }
 
     program.preassign_label_to_next_insn(skip_label);

@@ -20,7 +20,7 @@ use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
-use crate::translate::emitter::{Resolver, TransactionMode};
+use crate::translate::emitter::{DdlContext, TransactionMode};
 use crate::translate::plan::BitSet;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
@@ -88,7 +88,7 @@ fn normalize_table_pragma_lookup_name(database_id: usize, name: &str) -> String 
 }
 
 fn resolve_table_pragma_database_id(
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     default_database_id: usize,
     schema_was_explicit: bool,
     table_name: &str,
@@ -102,11 +102,11 @@ fn resolve_table_pragma_database_id(
     {
         return Ok(crate::TEMP_DB_ID);
     }
-    resolver.resolve_existing_table_database_id(table_name)
+    ddl_context.resolve_existing_table_database_id(table_name)
 }
 
 fn resolve_index_pragma_database_id(
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     default_database_id: usize,
     schema_was_explicit: bool,
     index_name: &str,
@@ -120,7 +120,7 @@ fn resolve_index_pragma_database_id(
         name: ast::Name::exact(index_name.to_string()),
         alias: None,
     };
-    resolver.resolve_existing_index_database_id(&qualified_name)
+    ddl_context.resolve_existing_index_database_id(&qualified_name)
 }
 
 fn foreign_key_action_name(action: ast::RefAct) -> &'static str {
@@ -210,7 +210,7 @@ fn emit_table_list_rows_for_schema(
 }
 
 pub fn translate_pragma(
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     name: &ast::QualifiedName,
     body: Option<ast::PragmaBody>,
     pager: Arc<Pager>,
@@ -230,13 +230,13 @@ pub fn translate_pragma(
         return Ok(());
     };
 
-    let database_id = resolver.resolve_database_id(name)?;
+    let database_id = ddl_context.resolve_database_id(name)?;
     let schema_was_explicit = name.db_name.is_some();
 
     let mode = match body {
         None => query_pragma(
             pragma,
-            resolver,
+            ddl_context,
             None,
             pager,
             connection,
@@ -257,7 +257,7 @@ pub fn translate_pragma(
             | PragmaName::DatabaseList
             | PragmaName::QuickCheck => query_pragma(
                 pragma,
-                resolver,
+                ddl_context,
                 Some(*value),
                 pager,
                 connection,
@@ -267,7 +267,7 @@ pub fn translate_pragma(
             )?,
             _ => update_pragma(
                 pragma,
-                resolver,
+                ddl_context,
                 *value,
                 pager,
                 connection,
@@ -280,12 +280,12 @@ pub fn translate_pragma(
     match mode {
         TransactionMode::None => {}
         TransactionMode::Read => {
-            let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+            let schema_cookie = ddl_context.with_schema(database_id, |s| s.schema_version);
             program.begin_read_on_database(database_id, schema_cookie)?;
             program.begin_read_operation()?;
         }
         TransactionMode::Write => {
-            let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+            let schema_cookie = ddl_context.with_schema(database_id, |s| s.schema_version);
             program.begin_write_on_database(database_id, schema_cookie)?;
             program.begin_write_operation()?;
         }
@@ -300,7 +300,7 @@ pub fn translate_pragma(
 #[allow(clippy::too_many_arguments)]
 fn update_pragma(
     pragma: PragmaName,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     value: ast::Expr,
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
@@ -402,7 +402,7 @@ fn update_pragma(
             });
             query_pragma(
                 PragmaName::LockingMode,
-                resolver,
+                ddl_context,
                 None,
                 pager,
                 connection,
@@ -426,7 +426,7 @@ fn update_pragma(
         }
         PragmaName::WalCheckpoint => query_pragma(
             PragmaName::WalCheckpoint,
-            resolver,
+            ddl_context,
             Some(value),
             pager,
             connection,
@@ -437,7 +437,7 @@ fn update_pragma(
         PragmaName::ModuleList => Ok(TransactionMode::None),
         PragmaName::PageCount => query_pragma(
             PragmaName::PageCount,
-            resolver,
+            ddl_context,
             None,
             pager,
             connection,
@@ -515,7 +515,7 @@ fn update_pragma(
                 ));
             }
 
-            let is_empty = is_database_empty(resolver.schema(), &pager)?;
+            let is_empty = is_database_empty(ddl_context.schema(), &pager)?;
             tracing::debug!(
                 "Checking if database is empty for auto_vacuum pragma: {}",
                 is_empty
@@ -614,7 +614,7 @@ fn update_pragma(
         PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
-            resolver,
+            ddl_context,
             Some(value),
             pager,
             connection,
@@ -624,7 +624,7 @@ fn update_pragma(
         ),
         PragmaName::FreelistCount => query_pragma(
             PragmaName::FreelistCount,
-            resolver,
+            ddl_context,
             Some(value),
             pager,
             connection,
@@ -774,7 +774,7 @@ fn update_pragma(
 
         PragmaName::FunctionList => query_pragma(
             PragmaName::FunctionList,
-            resolver,
+            ddl_context,
             Some(value),
             pager,
             connection,
@@ -788,7 +788,7 @@ fn update_pragma(
 #[allow(clippy::too_many_arguments)]
 fn query_pragma(
     pragma: PragmaName,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     value: Option<ast::Expr>,
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
@@ -796,7 +796,7 @@ fn query_pragma(
     schema_was_explicit: bool,
     program: &mut ProgramBuilder,
 ) -> crate::Result<TransactionMode> {
-    let schema = resolver.schema();
+    let schema = ddl_context.schema();
     let register = program.alloc_register();
     match pragma {
         PragmaName::ApplicationId => {
@@ -1027,12 +1027,12 @@ fn query_pragma(
 
             if let Some(index_name) = index_name {
                 let index_database_id = resolve_index_pragma_database_id(
-                    resolver,
+                    ddl_context,
                     database_id,
                     schema_was_explicit,
                     &index_name,
                 )?;
-                resolver.with_schema(index_database_id, |schema| {
+                ddl_context.with_schema(index_database_id, |schema| {
                     let index = schema
                         .indexes
                         .values()
@@ -1068,12 +1068,12 @@ fn query_pragma(
 
             if let Some(index_name) = index_name {
                 let index_database_id = resolve_index_pragma_database_id(
-                    resolver,
+                    ddl_context,
                     database_id,
                     schema_was_explicit,
                     &index_name,
                 )?;
-                resolver.with_schema(index_database_id, |schema| {
+                ddl_context.with_schema(index_database_id, |schema| {
                     let index = schema
                         .indexes
                         .values()
@@ -1130,12 +1130,12 @@ fn query_pragma(
 
             if let Some(table_name) = table_name {
                 let table_database_id = resolve_table_pragma_database_id(
-                    resolver,
+                    ddl_context,
                     database_id,
                     schema_was_explicit,
                     &table_name,
                 )?;
-                resolver.with_schema(table_database_id, |schema| {
+                ddl_context.with_schema(table_database_id, |schema| {
                     if let Some(table) = schema.get_table(&table_name) {
                         let pk_cols: Vec<String> = table
                             .btree()
@@ -1195,12 +1195,12 @@ fn query_pragma(
             if let Some(table_name) = table_name {
                 let table_name = table_name.as_str();
                 let table_database_id = resolve_table_pragma_database_id(
-                    resolver,
+                    ddl_context,
                     database_id,
                     schema_was_explicit,
                     table_name,
                 )?;
-                resolver.with_schema(table_database_id, |schema| {
+                ddl_context.with_schema(table_database_id, |schema| {
                     let Some(table) = schema.get_table(table_name).and_then(|table| table.btree())
                     else {
                         return;
@@ -1266,7 +1266,7 @@ fn query_pragma(
                 let database_name = connection
                     .get_database_name_by_index(current_database_id)
                     .unwrap_or_else(|| "main".to_string());
-                resolver.with_schema(current_database_id, |schema| {
+                ddl_context.with_schema(current_database_id, |schema| {
                     emit_table_list_rows_for_schema(
                         program,
                         schema,
@@ -1295,13 +1295,13 @@ fn query_pragma(
             program.alloc_registers(5);
             if let Some(name) = name {
                 let table_database_id = resolve_table_pragma_database_id(
-                    resolver,
+                    ddl_context,
                     database_id,
                     schema_was_explicit,
                     &name,
                 )?;
                 let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
-                resolver.with_schema(table_database_id, |db_schema| {
+                ddl_context.with_schema(table_database_id, |db_schema| {
                     if let Some(table) = db_schema.get_table(&lookup_name) {
                         let primary_key_columns = match table.as_ref() {
                             Table::BTree(bt) => Some(bt.primary_key_columns.as_slice()),
@@ -1355,13 +1355,13 @@ fn query_pragma(
             program.alloc_registers(6);
             if let Some(name) = name {
                 let table_database_id = resolve_table_pragma_database_id(
-                    resolver,
+                    ddl_context,
                     database_id,
                     schema_was_explicit,
                     &name,
                 )?;
                 let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
-                resolver.with_schema(table_database_id, |db_schema| {
+                ddl_context.with_schema(table_database_id, |db_schema| {
                     if let Some(table) = db_schema.get_table(&lookup_name) {
                         let primary_key_columns = match table.as_ref() {
                             Table::BTree(bt) => Some(bt.primary_key_columns.as_slice()),
@@ -1474,7 +1474,7 @@ fn query_pragma(
             translate_integrity_check(
                 schema,
                 program,
-                resolver,
+                ddl_context,
                 database_id,
                 max_errors,
                 &connection,
@@ -1489,7 +1489,7 @@ fn query_pragma(
             translate_quick_check(
                 schema,
                 program,
-                resolver,
+                ddl_context,
                 database_id,
                 max_errors,
                 &connection,
