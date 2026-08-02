@@ -247,7 +247,7 @@ impl Analyzer<'_, '_> {
         let database_id = resolved_table_database_id(&resolved_table)?;
         let table = resolved_table.handle();
         validate_dml_target(self.context(), database_id, &table, DmlOperation::Insert)?;
-        self.populate_dml_check_constraints(target, &table)?;
+        self.populate_dml_check_constraints(target, &table, None)?;
 
         let columns = resolve_insert_columns(&table, columns)?;
         let autoincrement = self.resolve_autoincrement_table(database_id, &table)?;
@@ -374,7 +374,6 @@ impl Analyzer<'_, '_> {
         let database_id = resolved_table_database_id(&resolved_table)?;
         let table = resolved_table.handle();
         validate_dml_target(self.context(), database_id, &table, DmlOperation::Update)?;
-        self.populate_dml_check_constraints(target, &table)?;
         let defaults = self.analyze_insert_defaults(&table, target, database_id)?;
         let (from, mut read_scope) = match from_syntax {
             Some(syntax) => {
@@ -392,6 +391,7 @@ impl Analyzer<'_, '_> {
 
         let assignments =
             self.analyze_assignments(sets, &table, target, &read_scope, trigger.is_some(), true)?;
+        self.populate_dml_check_constraints(target, &table, Some(&assignments))?;
         let predicate = predicate_syntax
             .map(|syntax| {
                 self.analyze_expr(syntax, &read_scope, scalar_expr_policy(trigger.is_some()))

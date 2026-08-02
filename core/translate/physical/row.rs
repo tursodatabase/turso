@@ -136,8 +136,8 @@ pub(crate) fn emit_complete_logical_row(
     Ok(())
 }
 
-/// Enforce every CHECK program frozen for this exact DML source. SQLite CHECK
-/// succeeds for true or NULL and fails only for false.
+/// Enforce every CHECK program selected and frozen for this exact DML source.
+/// SQLite CHECK succeeds for true or NULL and fails only for false.
 pub(crate) fn emit_check_constraints(
     program: &mut ProgramBuilder,
     bindings: &mut RuntimeBindings<'_>,

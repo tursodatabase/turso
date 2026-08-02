@@ -1693,11 +1693,34 @@ impl<'document> HirValidator<'document> {
                     format!("non-B-tree source {} carries CHECK metadata", source.id),
                 );
             };
-            self.require(
-                constraints.len() == table.check_constraints.len(),
-                format!("source {} has incomplete CHECK metadata", source.id),
-            )?;
-            for (constraint, catalog) in constraints.iter().zip(&table.check_constraints) {
+            let require_complete = matches!(
+                &self.document.root,
+                HirRoot::Insert(insert) if insert.target == source.id
+            );
+            if require_complete {
+                self.require(
+                    constraints.len() == table.check_constraints.len(),
+                    format!("source {} has incomplete INSERT CHECK metadata", source.id),
+                )?;
+            }
+            let mut previous = None;
+            for constraint in constraints {
+                self.require(
+                    constraint.catalog_position < table.check_constraints.len(),
+                    format!(
+                        "source {} CHECK position is outside its catalog table",
+                        source.id
+                    ),
+                )?;
+                self.require(
+                    previous.is_none_or(|position| position < constraint.catalog_position),
+                    format!(
+                        "source {} CHECK positions are not unique and ordered",
+                        source.id
+                    ),
+                )?;
+                previous = Some(constraint.catalog_position);
+                let catalog = &table.check_constraints[constraint.catalog_position];
                 let expected = catalog
                     .name
                     .clone()

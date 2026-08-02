@@ -169,6 +169,8 @@ pub enum SourceOwner {
 
 #[derive(Clone, Debug)]
 pub struct CheckConstraint {
+    /// Position in the frozen catalog table's CHECK list.
+    pub catalog_position: usize,
     /// CHECK expression instantiated for one exact source occurrence.
     pub expression: Expr,
     /// Constraint name, or the stored expression rendered against its table
@@ -207,9 +209,10 @@ pub struct Source {
     /// Custom-type encode/decode programs aligned with `columns`. Plain and
     /// built-in typed columns contain `None`.
     pub column_type_programs: Vec<Option<BoundColumnTypePrograms>>,
-    /// CHECK constraints instantiated for this exact DML target. `None`
-    /// means this source does not enforce CHECKs for the current statement;
-    /// `Some([])` means enforcement is active and the table has no checks.
+    /// CHECK constraints selected and instantiated for this exact DML target.
+    /// `None` means this source does not enforce CHECKs for the current
+    /// statement; `Some([])` means enforcement is active but no catalog CHECK
+    /// can be changed by this write.
     pub check_constraints: Option<Vec<CheckConstraint>>,
     pub rowid_available: bool,
     pub index_hint: IndexHint,

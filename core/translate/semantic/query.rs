@@ -543,6 +543,7 @@ impl Analyzer<'_, '_> {
         &mut self,
         source: hir::SourceId,
         table: &Table,
+        assignments: Option<&[hir::Assignment]>,
     ) -> Result<()> {
         if self.context().dml_policy().check_constraints_ignored() {
             let constraints = table
@@ -551,7 +552,9 @@ impl Analyzer<'_, '_> {
                     table
                         .check_constraints
                         .iter()
-                        .map(|check| hir::CheckConstraint {
+                        .enumerate()
+                        .map(|(catalog_position, check)| hir::CheckConstraint {
+                            catalog_position,
                             expression: hir::Expr::Literal(ast::Literal::True),
                             description: check
                                 .name
@@ -570,8 +573,30 @@ impl Analyzer<'_, '_> {
         let Table::BTree(table) = table else {
             return Ok(());
         };
+        let affected = assignments
+            .map(|assignments| {
+                let updated_columns = assignments.iter().flat_map(|assignment| {
+                    assignment.columns.iter().filter_map(|column| match column {
+                        hir::TargetColumn::Column(position) => Some(*position),
+                        hir::TargetColumn::RowId => None,
+                    })
+                });
+                table.columns_affected_by_update(updated_columns)
+            })
+            .transpose()?;
+        let updates_rowid = assignments.is_some_and(|assignments| {
+            assignments.iter().any(|assignment| {
+                assignment.columns.iter().any(|column| match column {
+                    hir::TargetColumn::RowId => true,
+                    hir::TargetColumn::Column(position) => table
+                        .columns()
+                        .get(*position)
+                        .is_some_and(|column| column.is_rowid_alias()),
+                })
+            })
+        });
         let mut check_constraints = Vec::with_capacity(table.check_constraints.len());
-        for check in &table.check_constraints {
+        for (catalog_position, check) in table.check_constraints.iter().enumerate() {
             let description = match &check.name {
                 Some(name) => name.clone(),
                 None => check.expr.to_string(),
@@ -583,7 +608,24 @@ impl Analyzer<'_, '_> {
                 },
                 source,
             )?;
+            let applies = affected.as_ref().is_none_or(|affected| {
+                let mut applies = false;
+                expression.walk(&mut |expression| match expression {
+                    hir::Expr::Column(reference) if reference.source == source => {
+                        applies |= affected.get(reference.column);
+                    }
+                    hir::Expr::RowId(reference) if *reference == source => {
+                        applies |= updates_rowid;
+                    }
+                    _ => {}
+                });
+                applies
+            });
+            if !applies {
+                continue;
+            }
             check_constraints.push(hir::CheckConstraint {
+                catalog_position,
                 expression,
                 description,
             });

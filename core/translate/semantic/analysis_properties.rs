@@ -833,6 +833,61 @@ fn ignored_checks_still_close_the_dml_row_contract(tc: hegel::TestCase) {
         .expect("the explicit empty CHECK program set closes HIR");
 }
 
+// Example: for `UPDATE items SET x = 1`, binding keeps `CHECK(x > 0)` and
+// `CHECK(g > 0)` when `g AS (x + 1)`, but drops unrelated `CHECK(y > 0)` and
+// `CHECK(rowid > 0)`. Updating `y` keeps only its check; updating `rowid`
+// keeps only the rowid check. The physical layer receives exactly this list.
+#[hegel::test]
+fn update_check_programs_follow_changed_positions_and_generated_dependents(tc: hegel::TestCase) {
+    let table = BTreeTable::from_sql(
+        "CREATE TABLE items(\
+         x INTEGER, \
+         y INTEGER, \
+         g INTEGER AS (x + 1) VIRTUAL, \
+         CONSTRAINT check_x CHECK(x > 0), \
+         CONSTRAINT check_y CHECK(y > 0), \
+         CONSTRAINT check_g CHECK(g > 0), \
+         CONSTRAINT check_rowid CHECK(rowid > 0))",
+        2,
+    )
+    .expect("the generated-column CHECK table is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(table))
+        .expect("the table name is unique");
+    let symbols = SymbolTable::new();
+    let context = semantic_context(&schema, &symbols);
+    let choice = tc.draw(generators::integers::<u8>().max_value(2));
+    let (sql, expected_positions) = match choice {
+        0 => ("UPDATE items SET x = 1", vec![0, 2]),
+        1 => ("UPDATE items SET y = 1", vec![1]),
+        _ => ("UPDATE items SET rowid = rowid + 1", vec![3]),
+    };
+    let statement = parse_statement(sql);
+
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("the generated UPDATE has valid SQL meaning");
+    let HirRoot::Update(update) = &document.root else {
+        unreachable!("the fixture is an UPDATE");
+    };
+    let checks = document
+        .source(update.target)
+        .expect("the UPDATE target exists")
+        .check_constraints
+        .as_ref()
+        .expect("the UPDATE target carries its selected CHECK programs");
+    assert_eq!(
+        checks
+            .iter()
+            .map(|check| check.catalog_position)
+            .collect::<Vec<_>>(),
+        expected_positions
+    );
+    document
+        .validate()
+        .expect("the selected positional CHECK programs close HIR");
+}
+
 // Example: `INSERT INTO items(c0) VALUES (1)` on a table with generated `c1`,
 // defaulted `c2`, `CHECK(c0 >= 0)`, and
 // `CREATE INDEX items_expr ON items(c0 + 1) WHERE c0 > 0` closes every program
