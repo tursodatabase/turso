@@ -19699,9 +19699,8 @@ fn dropped_journal_mode_mvcc_checkpoint_releases_lock() {
         .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
 
-    let injector = FixedYieldInjector::new([
-        CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
-    ]);
+    let injector =
+        FixedYieldInjector::new([CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point()]);
 
     conn.set_yield_injector(Some(injector.clone()));
 
