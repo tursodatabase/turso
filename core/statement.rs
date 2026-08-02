@@ -1620,8 +1620,8 @@ mod tests {
 
         assert_eq!(
             stmt.metrics().rows_written,
-            6,
-            "cumulative metrics should include root and trigger writes"
+            4,
+            "two root table writes and two trigger table writes should be counted"
         );
     }
 }
