@@ -27,6 +27,7 @@ pub(crate) enum PhysicalUpdateError {
     Expression(PhysicalExpressionError),
     Row(PhysicalRowError),
     Index(PhysicalIndexError),
+    Query(super::PhysicalQueryError),
     Invalid(&'static str),
     Unsupported(&'static str),
 }
@@ -38,6 +39,7 @@ impl fmt::Display for PhysicalUpdateError {
             Self::Expression(error) => error.fmt(formatter),
             Self::Row(error) => error.fmt(formatter),
             Self::Index(error) => error.fmt(formatter),
+            Self::Query(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical UPDATE: {message}"),
             Self::Unsupported(message) => {
                 write!(formatter, "physical UPDATE is not emitted yet: {message}")
@@ -69,6 +71,12 @@ impl From<PhysicalRowError> for PhysicalUpdateError {
 impl From<PhysicalIndexError> for PhysicalUpdateError {
     fn from(error: PhysicalIndexError) -> Self {
         Self::Index(error)
+    }
+}
+
+impl From<super::PhysicalQueryError> for PhysicalUpdateError {
+    fn from(error: super::PhysicalQueryError) -> Self {
+        Self::Query(error)
     }
 }
 
@@ -104,50 +112,80 @@ pub(crate) fn emit_root_update(
         db: database,
     });
     let indexes = open_indexes(program, source, database)?;
+    let from_rows = update
+        .from
+        .as_ref()
+        .map(|from| {
+            super::emit_update_from_rows(
+                plan,
+                program,
+                &mut bindings,
+                update.target,
+                cursor,
+                from,
+                update.predicate.as_ref(),
+                &update.assignments,
+            )
+        })
+        .transpose()?;
 
-    let scan_start = program.allocate_label();
-    let scan_next = program.allocate_label();
-    let scan_done = program.allocate_label();
-    program.emit_insn(Insn::Rewind {
-        cursor_id: cursor,
-        pc_if_empty: scan_done,
-    });
-    program.preassign_label_to_next_insn(scan_start);
-    if let Some(predicate) = &update.predicate {
-        let condition = ExpressionEmitter::new(program, &mut bindings).emit_new(predicate)?;
-        if condition.width != 1 {
-            return Err(PhysicalUpdateError::Invalid("WHERE result is not scalar"));
-        }
-        program.emit_insn(Insn::IfNot {
-            reg: condition.first.0,
-            target_pc: scan_next,
-            jump_if_null: true,
+    if from_rows.is_none() {
+        let scan_start = program.allocate_label();
+        let scan_next = program.allocate_label();
+        let scan_done = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: cursor,
+            pc_if_empty: scan_done,
         });
+        program.preassign_label_to_next_insn(scan_start);
+        if let Some(predicate) = &update.predicate {
+            let condition = ExpressionEmitter::new(program, &mut bindings).emit_new(predicate)?;
+            if condition.width != 1 {
+                return Err(PhysicalUpdateError::Invalid("WHERE result is not scalar"));
+            }
+            program.emit_insn(Insn::IfNot {
+                reg: condition.first.0,
+                target_pc: scan_next,
+                jump_if_null: true,
+            });
+        }
+        program.emit_insn(Insn::RowId {
+            cursor_id: cursor,
+            dest: rowid.0,
+        });
+        program.emit_insn(Insn::RowSetAdd {
+            rowset_reg: rowset,
+            value_reg: rowid.0,
+        });
+        program.preassign_label_to_next_insn(scan_next);
+        program.emit_insn(Insn::Next {
+            cursor_id: cursor,
+            pc_if_next: scan_start,
+        });
+        program.preassign_label_to_next_insn(scan_done);
     }
-    program.emit_insn(Insn::RowId {
-        cursor_id: cursor,
-        dest: rowid.0,
-    });
-    program.emit_insn(Insn::RowSetAdd {
-        rowset_reg: rowset,
-        value_reg: rowid.0,
-    });
-    program.preassign_label_to_next_insn(scan_next);
-    program.emit_insn(Insn::Next {
-        cursor_id: cursor,
-        pc_if_next: scan_start,
-    });
-    program.preassign_label_to_next_insn(scan_done);
 
     let write_start = program.allocate_label();
     let write_next = program.allocate_label();
     let write_done = program.allocate_label();
-    program.preassign_label_to_next_insn(write_start);
-    program.emit_insn(Insn::RowSetRead {
-        rowset_reg: rowset,
-        pc_if_empty: write_done,
-        dest_reg: rowid.0,
-    });
+    if let Some(from_rows) = &from_rows {
+        program.emit_insn(Insn::Rewind {
+            cursor_id: from_rows.cursor,
+            pc_if_empty: write_done,
+        });
+        program.preassign_label_to_next_insn(write_start);
+        program.emit_insn(Insn::RowId {
+            cursor_id: from_rows.cursor,
+            dest: rowid.0,
+        });
+    } else {
+        program.preassign_label_to_next_insn(write_start);
+        program.emit_insn(Insn::RowSetRead {
+            rowset_reg: rowset,
+            pc_if_empty: write_done,
+            dest_reg: rowid.0,
+        });
+    }
     program.emit_insn(Insn::NotExists {
         cursor,
         rowid_reg: rowid.0,
@@ -164,14 +202,45 @@ pub(crate) fn emit_root_update(
         )?;
     }
     let mut assignments = Vec::with_capacity(update.assignments.len());
-    for assignment in &update.assignments {
-        let values = ExpressionEmitter::new(program, &mut bindings).emit_new(&assignment.value)?;
-        if values.width != assignment.columns.len() {
+    if let Some(from_rows) = &from_rows {
+        let expected_width = update
+            .assignments
+            .iter()
+            .map(|assignment| assignment.columns.len())
+            .sum::<usize>();
+        if from_rows.width != expected_width {
             return Err(PhysicalUpdateError::Invalid(
-                "assignment width does not match its target columns",
+                "materialized UPDATE FROM values have the wrong width",
             ));
         }
-        assignments.push((&assignment.columns, values));
+        let mut offset = 0;
+        for assignment in &update.assignments {
+            let values = RegisterRange::new(
+                program.alloc_registers(assignment.columns.len()),
+                assignment.columns.len(),
+            );
+            for position in 0..assignment.columns.len() {
+                program.emit_insn(Insn::Column {
+                    cursor_id: from_rows.cursor,
+                    column: offset + position,
+                    dest: values.first.0 + position,
+                    default: None,
+                });
+            }
+            offset += assignment.columns.len();
+            assignments.push((&assignment.columns, values));
+        }
+    } else {
+        for assignment in &update.assignments {
+            let values =
+                ExpressionEmitter::new(program, &mut bindings).emit_new(&assignment.value)?;
+            if values.width != assignment.columns.len() {
+                return Err(PhysicalUpdateError::Invalid(
+                    "assignment width does not match its target columns",
+                ));
+            }
+            assignments.push((&assignment.columns, values));
+        }
     }
     for (columns, values) in assignments {
         for (position, column) in columns.iter().enumerate() {
@@ -266,12 +335,22 @@ pub(crate) fn emit_root_update(
         emit_returning_result(program, result);
     }
     program.preassign_label_to_next_insn(write_next);
-    program.emit_insn(Insn::Goto {
-        target_pc: write_start,
-    });
+    if let Some(from_rows) = &from_rows {
+        program.emit_insn(Insn::Next {
+            cursor_id: from_rows.cursor,
+            pc_if_next: write_start,
+        });
+    } else {
+        program.emit_insn(Insn::Goto {
+            target_pc: write_start,
+        });
+    }
     program.preassign_label_to_next_insn(write_done);
     close_indexes(program, &indexes);
     program.emit_insn(Insn::Close { cursor_id: cursor });
+    if let Some(from_rows) = from_rows {
+        from_rows.close(program);
+    }
     Ok(())
 }
 
@@ -283,9 +362,6 @@ fn preflight_update<'plan>(
     crate::sync::Arc<crate::schema::BTreeTable>,
     usize,
 )> {
-    if update.from.is_some() {
-        return Err(PhysicalUpdateError::Unsupported("UPDATE FROM"));
-    }
     if !update.order_by.is_empty() || update.limit.is_some() {
         return Err(PhysicalUpdateError::Unsupported("ORDER BY or LIMIT"));
     }

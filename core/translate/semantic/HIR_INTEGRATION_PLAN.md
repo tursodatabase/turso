@@ -100,7 +100,10 @@ operations are not SQL binding.
         index layer.
   - [x] RETURNING reads OLD before DELETE and the complete written NEW row
         after UPDATE, using the same HIR runtime bindings as the write.
-  - [ ] UPDATE FROM, triggers, and foreign keys.
+  - [x] UPDATE FROM evaluates predicates and assignments while target and FROM
+        SourceIds are live, then materializes one stable value row per target
+        rowid before the write phase.
+  - [ ] Triggers and foreign keys.
 - [ ] INSERT, VALUES, INSERT SELECT, UPSERT, excluded, defaults, and RETURNING.
   - [x] VALUES and DEFAULT VALUES build supplied fields, frozen defaults, and
         generated columns through the shared row-image layer for simple rowid

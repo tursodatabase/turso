@@ -17,8 +17,9 @@ use crate::{
     sync::Arc,
     translate::collate::CollationSeq,
     translate::semantic::hir::{
-        CteBody, CteId, Expr, Grouping, JoinConstraint, JoinKind, OrderTerm, QueryBlockBody,
-        QueryBlockId, QueryId, SourceId, SubqueryExpr, TypeFact,
+        Assignment, CteBody, CteId, Expr, From as HirFrom, Grouping, Join, JoinConstraint,
+        JoinKind, OrderTerm, QueryBlockBody, QueryBlockId, QueryId, SourceId, SubqueryExpr,
+        TypeFact,
     },
     types::KeyInfo,
     vdbe::{
@@ -82,6 +83,7 @@ struct OpenedScan {
     cursor: ScanCursor,
     runtime_cursor: usize,
     deferred_table: Option<usize>,
+    owned: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -99,6 +101,12 @@ enum ScanRowAction<'hir, 'destination> {
     GroupSortInsert {
         sorter: &'destination GroupSorter<'hir>,
     },
+    UpdateCandidate {
+        target: SourceId,
+        assignments: &'hir [Assignment],
+        cursor: usize,
+        table: &'destination BTreeTable,
+    },
 }
 
 impl ScanRowAction<'_, '_> {
@@ -107,7 +115,9 @@ impl ScanRowAction<'_, '_> {
             Self::Project {
                 destination, limit, ..
             } => row_cleanup_label(destination, limit),
-            Self::Aggregate { .. } | Self::GroupSortInsert { .. } => None,
+            Self::Aggregate { .. }
+            | Self::GroupSortInsert { .. }
+            | Self::UpdateCandidate { .. } => None,
         }
     }
 }
@@ -216,6 +226,19 @@ struct MaterializedCtes {
 pub(crate) struct MaterializedQuery {
     pub(crate) cursor: usize,
     cleanup_cursors: Vec<usize>,
+}
+
+pub(crate) struct MaterializedUpdateRows {
+    pub(crate) cursor: usize,
+    pub(crate) width: usize,
+}
+
+impl MaterializedUpdateRows {
+    pub(crate) fn close(self, program: &mut ProgramBuilder) {
+        program.emit_insn(Insn::Close {
+            cursor_id: self.cursor,
+        });
+    }
 }
 
 impl MaterializedQuery {
@@ -443,6 +466,122 @@ pub(crate) fn emit_query_for_dml<'document>(
         cursor,
         cleanup_cursors,
     })
+}
+
+/// Materialize one stable UPDATE FROM candidate per target rowid. Assignment
+/// values are evaluated while every FROM SourceId is still bound; inserting
+/// by target rowid makes a later match replace an earlier match, matching
+/// SQLite's unspecified single-match choice without carrying source cursors
+/// into the write phase.
+pub(crate) fn emit_update_from_rows<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    target: SourceId,
+    target_cursor: usize,
+    from: &HirFrom,
+    filter: Option<&Expr>,
+    assignments: &'document [Assignment],
+) -> QueryResult<MaterializedUpdateRows> {
+    let width = assignments
+        .iter()
+        .map(|assignment| assignment.columns.len())
+        .sum::<usize>();
+    if width == 0 {
+        return Err(PhysicalQueryError::Invalid(
+            "UPDATE FROM has no assignment values",
+        ));
+    }
+    let table = ephemeral_table(format!("update_from_{}", target.index()), width);
+    let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: cursor,
+        is_table: true,
+    });
+
+    let source_ids = std::iter::once(from.first)
+        .chain(from.joins.iter().map(|join| join.right))
+        .collect::<Vec<_>>();
+    let mut ctes = MaterializedCtes::default();
+    for source_id in &source_ids {
+        let source = plan
+            .source(*source_id)
+            .ok_or(PhysicalQueryError::Invalid("UPDATE FROM source is missing"))?;
+        match source.kind {
+            PhysicalSourceKind::Cte(cte) => {
+                materialize_cte(plan, program, bindings, &mut ctes, cte)?;
+            }
+            PhysicalSourceKind::Derived(query) => {
+                for cte in query_tree_ctes(plan, query)? {
+                    materialize_cte(plan, program, bindings, &mut ctes, cte)?;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut scans = Vec::with_capacity(source_ids.len() + 1);
+    scans.push(OpenedScan {
+        cursor: ScanCursor::BTree(target_cursor),
+        runtime_cursor: target_cursor,
+        deferred_table: None,
+        owned: false,
+    });
+    for source_id in &source_ids {
+        let source = plan
+            .source(*source_id)
+            .ok_or(PhysicalQueryError::Invalid("UPDATE FROM source is missing"))?;
+        let scan = open_source(plan, program, bindings, &mut ctes, source)?;
+        bindings.bind_source(
+            source.id,
+            SourceRuntime::Cursor(super::CursorId(scan.runtime_cursor)),
+        )?;
+        scans.push(scan);
+    }
+    let mut joins = Vec::with_capacity(from.joins.len() + 1);
+    joins.push(Join {
+        right: from.first,
+        kind: JoinKind::Comma,
+        constraint: JoinConstraint::None,
+    });
+    joins.extend(from.joins.iter().cloned());
+    emit_nested_scan(
+        plan,
+        program,
+        bindings,
+        &mut ctes,
+        &scans,
+        0,
+        &joins,
+        filter,
+        ScanRowAction::UpdateCandidate {
+            target,
+            assignments,
+            cursor,
+            table: &table,
+        },
+    )?;
+    for scan in scans.iter().rev().filter(|scan| scan.owned) {
+        program.emit_insn(Insn::Close {
+            cursor_id: scan.cursor.id(),
+        });
+        if let Some(table_cursor) = scan.deferred_table {
+            program.emit_insn(Insn::Close {
+                cursor_id: table_cursor,
+            });
+        }
+    }
+    for cursor_id in ctes.temporary_cursors.iter().rev() {
+        program.emit_insn(Insn::Close {
+            cursor_id: *cursor_id,
+        });
+    }
+    for cte in ctes.by_id.values() {
+        program.emit_insn(Insn::Close {
+            cursor_id: cte.cursor_id,
+        });
+    }
+    Ok(MaterializedUpdateRows { cursor, width })
 }
 
 fn emit_query<'document>(
@@ -1647,6 +1786,9 @@ fn emit_table_scans<'document>(
         program.preassign_label_to_next_insn(done);
     }
     for scan in scans.iter().rev() {
+        if !scan.owned {
+            continue;
+        }
         program.emit_insn(Insn::Close {
             cursor_id: scan.cursor.id(),
         });
@@ -1865,6 +2007,53 @@ fn emit_scan_action<'document>(
         ScanRowAction::GroupSortInsert { sorter } => {
             emit_group_sort_insert(plan, program, bindings, ctes, sorter)
         }
+        ScanRowAction::UpdateCandidate {
+            target,
+            assignments,
+            cursor,
+            table,
+        } => {
+            let SourceRuntime::Cursor(target_cursor) = bindings.source(target)? else {
+                return Err(PhysicalQueryError::Invalid(
+                    "UPDATE FROM target is not cursor-backed",
+                ));
+            };
+            let rowid = program.alloc_register();
+            program.emit_insn(Insn::RowId {
+                cursor_id: target_cursor.0,
+                dest: rowid,
+            });
+            let width = assignments
+                .iter()
+                .map(|assignment| assignment.columns.len())
+                .sum::<usize>();
+            let values = program.alloc_registers(width);
+            let mut offset = 0;
+            for assignment in assignments {
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries).emit_into(
+                    &assignment.value,
+                    RegisterRange::new(values + offset, assignment.columns.len()),
+                )?;
+                offset += assignment.columns.len();
+            }
+            let record = program.alloc_register();
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u32(values),
+                count: to_u32(width),
+                dest_reg: to_u32(record),
+                index_name: Some(table.name.clone()),
+                affinity_str: None,
+            });
+            program.emit_insn(Insn::Insert {
+                cursor,
+                key_reg: rowid,
+                record_reg: record,
+                flag: InsertFlags::new(),
+                table_name: table.name.clone(),
+            });
+            Ok(())
+        }
     }
 }
 
@@ -1925,6 +2114,7 @@ fn open_source<'document>(
             cursor: ScanCursor::BTree(index_cursor),
             runtime_cursor: table_cursor,
             deferred_table: Some(table_cursor),
+            owned: true,
         });
     }
 
@@ -1940,6 +2130,7 @@ fn open_source<'document>(
                 cursor: ScanCursor::BTree(cursor),
                 runtime_cursor: cursor,
                 deferred_table: None,
+                owned: true,
             })
         }
         Table::Virtual(table) => {
@@ -1949,6 +2140,7 @@ fn open_source<'document>(
                 cursor: ScanCursor::Virtual(cursor),
                 runtime_cursor: cursor,
                 deferred_table: None,
+                owned: true,
             })
         }
         Table::FromClauseSubquery(_) | Table::RecursiveCteInput(_) => {
@@ -2015,6 +2207,7 @@ fn open_derived_source<'document>(
         cursor: ScanCursor::BTree(cursor),
         runtime_cursor: cursor,
         deferred_table: None,
+        owned: true,
     })
 }
 
@@ -2120,6 +2313,7 @@ fn open_cte_source(
         cursor: ScanCursor::BTree(cursor),
         runtime_cursor: cursor,
         deferred_table: None,
+        owned: true,
     })
 }
 
