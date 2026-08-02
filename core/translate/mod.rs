@@ -251,7 +251,7 @@ fn semantic_outputs(document: &hir::HirDocument) -> Option<&[hir::Output]> {
             .returning
             .as_ref()
             .map(|returning| returning.outputs.as_slice()),
-        hir::HirRoot::TriggerPredicate(_) => None,
+        hir::HirRoot::TriggerPredicate(_) | hir::HirRoot::SchemaExpressions(_) => None,
     }
 }
 
@@ -279,7 +279,9 @@ pub(super) fn set_semantic_transactions(
         hir::HirRoot::Insert(insert) => Some(insert.target),
         hir::HirRoot::Update(update) => Some(update.target),
         hir::HirRoot::Delete(delete) => Some(delete.target),
-        hir::HirRoot::Query(_) | hir::HirRoot::TriggerPredicate(_) => None,
+        hir::HirRoot::Query(_)
+        | hir::HirRoot::TriggerPredicate(_)
+        | hir::HirRoot::SchemaExpressions(_) => None,
     }
     .and_then(|source| document.source(source))
     .and_then(|source| match &source.kind {
@@ -342,9 +344,10 @@ fn set_semantic_conflict_policy(program: &mut ProgramBuilder, document: &hir::Hi
     let conflict = match &document.root {
         hir::HirRoot::Insert(root) => root.conflict,
         hir::HirRoot::Update(root) => root.conflict,
-        hir::HirRoot::Delete(_) | hir::HirRoot::Query(_) | hir::HirRoot::TriggerPredicate(_) => {
-            None
-        }
+        hir::HirRoot::Delete(_)
+        | hir::HirRoot::Query(_)
+        | hir::HirRoot::TriggerPredicate(_)
+        | hir::HirRoot::SchemaExpressions(_) => None,
     };
     program.flags.set_has_statement_conflict(conflict.is_some());
     if let Some(conflict) = conflict {
@@ -360,7 +363,9 @@ pub(super) fn set_semantic_statement_journal_flags(
         hir::HirRoot::Insert(root) => root.target,
         hir::HirRoot::Update(root) => root.target,
         hir::HirRoot::Delete(root) => root.target,
-        hir::HirRoot::Query(_) | hir::HirRoot::TriggerPredicate(_) => return Ok(()),
+        hir::HirRoot::Query(_)
+        | hir::HirRoot::TriggerPredicate(_)
+        | hir::HirRoot::SchemaExpressions(_) => return Ok(()),
     };
     let source = document.source(target).ok_or_else(|| {
         crate::LimboError::InternalError("HIR DML target source is missing".to_string())
@@ -473,7 +478,9 @@ pub(super) fn set_semantic_statement_journal_flags(
                 !root.foreign_keys.outgoing.is_empty() || !root.foreign_keys.incoming.is_empty();
             program.set_may_abort(has_triggers || has_foreign_keys);
         }
-        hir::HirRoot::Query(_) | hir::HirRoot::TriggerPredicate(_) => unreachable!(),
+        hir::HirRoot::Query(_)
+        | hir::HirRoot::TriggerPredicate(_)
+        | hir::HirRoot::SchemaExpressions(_) => unreachable!(),
     }
     Ok(())
 }

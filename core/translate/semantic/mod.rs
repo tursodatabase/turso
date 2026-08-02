@@ -358,7 +358,9 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
             HirRoot::Insert(root) => root.target,
             HirRoot::Update(root) => root.target,
             HirRoot::Delete(root) => root.target,
-            HirRoot::Query(_) | HirRoot::TriggerPredicate(_) => return Ok(None),
+            HirRoot::Query(_) | HirRoot::TriggerPredicate(_) | HirRoot::SchemaExpressions(_) => {
+                return Ok(None)
+            }
         };
         let Some(info) = self.context.capture_data_changes().cloned() else {
             return Ok(None);

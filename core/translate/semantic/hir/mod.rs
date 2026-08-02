@@ -614,7 +614,9 @@ impl HirDocument {
                     .outputs
                     .get(id.index)
                     .filter(|output| output.id == id),
-                HirRoot::Query(_) | HirRoot::TriggerPredicate(_) => None,
+                HirRoot::Query(_)
+                | HirRoot::TriggerPredicate(_)
+                | HirRoot::SchemaExpressions(_) => None,
             },
         }
     }

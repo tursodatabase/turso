@@ -22,6 +22,14 @@ pub enum HirRoot {
     Update(Update),
     Delete(Delete),
     TriggerPredicate(TriggerPredicate),
+    SchemaExpressions(SchemaExpressionRoot),
+}
+
+/// A closed batch of stored expressions sharing one positional source.
+#[derive(Clone, Debug)]
+pub struct SchemaExpressionRoot {
+    pub source: SourceId,
+    pub expressions: Vec<Expr>,
 }
 
 #[derive(Clone, Debug)]

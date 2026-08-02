@@ -386,7 +386,9 @@ impl Analyzer<'_, '_> {
             hir::HirRoot::Insert(insert) => Some(insert.target),
             hir::HirRoot::Update(update) => Some(update.target),
             hir::HirRoot::Delete(delete) => Some(delete.target),
-            hir::HirRoot::Query(_) | hir::HirRoot::TriggerPredicate(_) => None,
+            hir::HirRoot::Query(_)
+            | hir::HirRoot::TriggerPredicate(_)
+            | hir::HirRoot::SchemaExpressions(_) => None,
         };
         if let Some(target) = dml_target {
             let column_count = self

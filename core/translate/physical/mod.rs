@@ -14,6 +14,7 @@ mod query;
 mod returning;
 mod row;
 mod runtime_bindings;
+mod schema_expression;
 mod trigger;
 mod update;
 
@@ -28,6 +29,7 @@ pub(crate) use query::*;
 pub(crate) use returning::*;
 pub(crate) use row::*;
 pub(crate) use runtime_bindings::*;
+pub(crate) use schema_expression::*;
 pub(crate) use trigger::*;
 pub(crate) use update::*;
 
@@ -54,6 +56,9 @@ mod query_properties;
 
 #[cfg(test)]
 mod runtime_binding_properties;
+
+#[cfg(test)]
+mod schema_expression_properties;
 
 #[cfg(test)]
 mod row_properties;

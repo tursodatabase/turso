@@ -527,7 +527,8 @@ fn emit_root_query_to_destination(
         PhysicalRoot::Insert(_)
         | PhysicalRoot::Update(_)
         | PhysicalRoot::Delete(_)
-        | PhysicalRoot::TriggerPredicate(_) => {
+        | PhysicalRoot::TriggerPredicate(_)
+        | PhysicalRoot::SchemaExpressions(_) => {
             return Err(PhysicalQueryError::Unsupported("non-query HIR root"));
         }
     };

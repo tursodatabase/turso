@@ -16,20 +16,16 @@ use crate::util::{check_literal_equivalency, normalize_ident, type_from_name};
 use crate::vdbe::affinity::Affinity;
 use crate::{LimboError, Result};
 
-use super::hir::{
-    self, CatalogObject, CatalogSnapshot, DatabaseId, SourceId, SourceKind, SourceOwner, TypeFact,
-};
+use super::hir::{self, CatalogObject, DatabaseId, SourceId, SourceKind, SourceOwner, TypeFact};
 use super::{context::SemanticContext, scope::Scope, Analyzer, CatalogObjectKind};
 
 /// One stored expression analyzed against one explicit source occurrence.
 ///
-/// This deliberately is not a query document. Schema-expression consumers
-/// retain the resolved source and snapshot long enough to map its identity
-/// into their own plan before emitting the expression.
+/// This deliberately is not a query document. The closed document retains the
+/// resolved source and catalog snapshot so physical consumers only provide the
+/// runtime row or cursor before emitting the expression.
 pub(crate) struct AnalyzedSchemaExpr {
-    pub(crate) snapshot: CatalogSnapshot,
-    pub(crate) source: hir::Source,
-    pub(crate) expression: hir::Expr,
+    pub(crate) document: hir::HirDocument,
 }
 
 /// Several stored expressions analyzed against one shared table occurrence.
@@ -37,9 +33,7 @@ pub(crate) struct AnalyzedSchemaExpr {
 /// Batch analysis is useful for schema operations such as index rebuilds: all
 /// keys, predicates, and generated columns must use one source identity.
 pub(crate) struct AnalyzedSchemaExprs {
-    pub(crate) snapshot: CatalogSnapshot,
-    pub(crate) source: hir::Source,
-    pub(crate) expressions: Vec<hir::Expr>,
+    pub(crate) document: hir::HirDocument,
 }
 
 /// One positional input to a schema expression that is not owned by a table.
@@ -125,13 +119,8 @@ pub(crate) fn analyze_schema_expr(
     expression: &ValidSchemaExpr,
 ) -> Result<AnalyzedSchemaExpr> {
     let analyzed = analyze_schema_exprs(context, database_id, table, &[expression])?;
-    let expression = analyzed.expressions.into_iter().next().ok_or_else(|| {
-        LimboError::InternalError("stored expression batch returned no expression".to_string())
-    })?;
     Ok(AnalyzedSchemaExpr {
-        snapshot: analyzed.snapshot,
-        source: analyzed.source,
-        expression,
+        document: analyzed.document,
     })
 }
 
@@ -199,14 +188,11 @@ pub(crate) fn analyze_schema_exprs(
         .iter()
         .map(|expression| analyzer.instantiate_schema_expr(expression, source_id))
         .collect::<Result<Vec<_>>>()?;
-    let source = analyzer.source(source_id).cloned().ok_or_else(|| {
-        LimboError::InternalError(format!("stored expression source {source_id} is missing"))
-    })?;
-    Ok(AnalyzedSchemaExprs {
-        snapshot: context.snapshot(),
-        source,
+    let document = analyzer.finish(hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
+        source: source_id,
         expressions,
-    })
+    }))?;
+    Ok(AnalyzedSchemaExprs { document })
 }
 
 /// Analyze an ENCODE or DECODE expression against the synthetic positional
@@ -255,14 +241,11 @@ fn analyze_synthetic_schema_expr(
     let mut analyzer = Analyzer::new(context);
     let (source_id, expression) =
         analyzer.instantiate_synthetic_schema_expr(database_id, expression, inputs)?;
-    let source = analyzer.source(source_id).cloned().ok_or_else(|| {
-        LimboError::InternalError(format!("stored expression source {source_id} is missing"))
-    })?;
-    Ok(AnalyzedSchemaExpr {
-        snapshot: context.snapshot(),
-        source,
-        expression,
-    })
+    let document = analyzer.finish(hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
+        source: source_id,
+        expressions: vec![expression],
+    }))?;
+    Ok(AnalyzedSchemaExpr { document })
 }
 
 fn schema_expr_input_affinity(type_fact: &TypeFact) -> Affinity {

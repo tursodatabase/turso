@@ -209,6 +209,13 @@ impl<'document> HirValidator<'document> {
                 self.visit_trigger_environment(&predicate.environment)?;
                 self.visit_expr(&predicate.expression)
             }
+            HirRoot::SchemaExpressions(root) => {
+                self.visit_source(root.source, Some(SourceOwner::Root))?;
+                for expression in &root.expressions {
+                    self.visit_expr(expression)?;
+                }
+                Ok(())
+            }
         }
     }
 

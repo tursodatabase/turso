@@ -239,9 +239,10 @@ fn prepare_document_foreign_key_actions(
             update.foreign_keys.incoming.as_slice(),
             ForeignKeyParentChange::Update,
         ),
-        hir::HirRoot::Insert(_) | hir::HirRoot::Query(_) | hir::HirRoot::TriggerPredicate(_) => {
-            return Ok(())
-        }
+        hir::HirRoot::Insert(_)
+        | hir::HirRoot::Query(_)
+        | hir::HirRoot::TriggerPredicate(_)
+        | hir::HirRoot::SchemaExpressions(_) => return Ok(()),
     };
     for foreign_key in foreign_keys {
         let action = match parent_change {
@@ -599,6 +600,7 @@ fn trigger_environment(document: &HirDocument) -> Option<&TriggerEnvironment> {
         hir::HirRoot::Update(root) => root.trigger.as_ref(),
         hir::HirRoot::Delete(root) => root.trigger.as_ref(),
         hir::HirRoot::TriggerPredicate(root) => Some(&root.environment),
+        hir::HirRoot::SchemaExpressions(_) => None,
     }
 }
 
@@ -619,7 +621,9 @@ fn trigger_target(document: &HirDocument) -> Result<Option<TriggerTarget<'_>>> {
             root.triggers.as_slice(),
         ),
         hir::HirRoot::Delete(root) => (root.target, false, true, None, root.triggers.as_slice()),
-        hir::HirRoot::Query(_) | hir::HirRoot::TriggerPredicate(_) => return Ok(None),
+        hir::HirRoot::Query(_)
+        | hir::HirRoot::TriggerPredicate(_)
+        | hir::HirRoot::SchemaExpressions(_) => return Ok(None),
     };
     if triggers.is_empty() {
         return Ok(None);

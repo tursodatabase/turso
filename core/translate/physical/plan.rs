@@ -41,6 +41,7 @@ pub(crate) enum PhysicalRoot<'hir> {
     Update(&'hir hir::Update),
     Delete(&'hir hir::Delete),
     TriggerPredicate(&'hir hir::TriggerPredicate),
+    SchemaExpressions(&'hir hir::SchemaExpressionRoot),
 }
 
 #[derive(Debug)]
@@ -120,6 +121,9 @@ impl<'hir> PhysicalPlan<'hir> {
             hir::HirRoot::Update(update) => PhysicalRoot::Update(update),
             hir::HirRoot::Delete(delete) => PhysicalRoot::Delete(delete),
             hir::HirRoot::TriggerPredicate(predicate) => PhysicalRoot::TriggerPredicate(predicate),
+            hir::HirRoot::SchemaExpressions(expressions) => {
+                PhysicalRoot::SchemaExpressions(expressions)
+            }
         };
         let queries = document
             .queries

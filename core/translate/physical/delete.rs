@@ -169,6 +169,9 @@ pub(crate) fn emit_root_with_context(
         PhysicalRoot::TriggerPredicate(_) => {
             Err(PhysicalRootError::Unsupported("trigger predicate root"))
         }
+        PhysicalRoot::SchemaExpressions(_) => Err(PhysicalRootError::Unsupported(
+            "schema-expression root requires runtime inputs",
+        )),
     }
 }
 
