@@ -3,6 +3,7 @@
 use std::fmt;
 
 use crate::{
+    error::SQLITE_CONSTRAINT_PRIMARYKEY,
     schema::Table,
     translate::semantic::hir::{self, IndexCoverage, InsertSource},
     vdbe::{
@@ -12,11 +13,11 @@ use crate::{
 };
 
 use super::{
-    close_indexes, emit_check_constraints, emit_complete_logical_row, emit_index_insert,
-    emit_index_key, emit_stored_record, emit_unique_check, open_indexes, ExpressionEmitter,
-    OpenedIndex, PhysicalExpressionError, PhysicalIndexError, PhysicalPlan, PhysicalRoot,
-    PhysicalRowError, PhysicalSourceKind, RegisterId, RegisterRange, RuntimeBindingError,
-    RuntimeBindings, SourceRuntime, TableAccess,
+    close_indexes, emit_complete_logical_row, emit_index_insert, emit_index_key,
+    emit_new_row_constraints, emit_stored_record, emit_unique_check, open_indexes,
+    ExpressionEmitter, OpenedIndex, PhysicalExpressionError, PhysicalIndexError, PhysicalPlan,
+    PhysicalRoot, PhysicalRowError, PhysicalSourceKind, RegisterId, RegisterRange,
+    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
 };
 
 #[derive(Debug)]
@@ -166,16 +167,22 @@ fn emit_insert_row(
         dest: logical.first.0,
         dest_end: Some(logical.first.0 + logical.width - 1),
     });
+    program.emit_insn(Insn::Null {
+        dest: rowid.0,
+        dest_end: None,
+    });
 
     for (target, value) in insert.columns.iter().zip(values) {
-        let hir::TargetColumn::Column(column) = target else {
-            return Err(PhysicalInsertError::Unsupported("explicit rowid"));
+        let destination = match target {
+            hir::TargetColumn::Column(column) => {
+                logical
+                    .register(*column)
+                    .ok_or(PhysicalInsertError::Invalid(
+                        "target column is outside the row",
+                    ))?
+            }
+            hir::TargetColumn::RowId => rowid,
         };
-        let destination = logical
-            .register(*column)
-            .ok_or(PhysicalInsertError::Invalid(
-                "target column is outside the row",
-            ))?;
         ExpressionEmitter::new(program, bindings)
             .emit_into(value, RegisterRange::new(destination.0, 1))?;
     }
@@ -189,11 +196,37 @@ fn emit_insert_row(
             .emit_into(&default.value, RegisterRange::new(destination.0, 1))?;
     }
 
+    if let Some((position, _)) = table.get_rowid_alias_column().filter(|(position, _)| {
+        insert
+            .columns
+            .contains(&hir::TargetColumn::Column(*position))
+    }) {
+        program.emit_insn(Insn::Copy {
+            src_reg: logical.first.0 + position,
+            dst_reg: rowid.0,
+            extra_amount: 0,
+        });
+    }
+    let explicit_rowid = program.allocate_label();
+    let rowid_ready = program.allocate_label();
+    program.emit_insn(Insn::NotNull {
+        reg: rowid.0,
+        target_pc: explicit_rowid,
+    });
     program.emit_insn(Insn::NewRowid {
         cursor,
         rowid_reg: rowid.0,
         prev_largest_reg: 0,
     });
+    program.emit_insn(Insn::Goto {
+        target_pc: rowid_ready,
+    });
+    program.preassign_label_to_next_insn(explicit_rowid);
+    program.emit_insn(Insn::MustBeInt {
+        reg: rowid.0,
+        target_pc: None,
+    });
+    program.preassign_label_to_next_insn(rowid_ready);
     if let Some((position, _)) = table.get_rowid_alias_column() {
         program.emit_insn(Insn::Copy {
             src_reg: rowid.0,
@@ -201,8 +234,25 @@ fn emit_insert_row(
             extra_amount: 0,
         });
     }
+    let rowid_is_unique = program.allocate_label();
+    program.emit_insn(Insn::NotExists {
+        cursor,
+        rowid_reg: rowid.0,
+        target_pc: rowid_is_unique,
+    });
+    let rowid_name = table
+        .get_rowid_alias_column()
+        .and_then(|(_, column)| column.name.as_deref())
+        .unwrap_or("rowid");
+    program.emit_insn(Insn::Halt {
+        err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+        description: format!("{}.{}", table.name, rowid_name),
+        on_error: Some(turso_parser::ast::ResolveType::Abort),
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(rowid_is_unique);
     emit_complete_logical_row(program, bindings, insert.target, table, logical)?;
-    emit_check_constraints(program, bindings, insert.target)?;
+    emit_new_row_constraints(program, bindings, insert.target, table, logical)?;
     let mut keys = Vec::with_capacity(indexes.len());
     for index in indexes {
         let key = emit_index_key(program, bindings, insert.target, rowid, index, true)?;
@@ -234,6 +284,9 @@ fn preflight_insert<'plan>(
     if insert.returning.is_some() {
         return Err(PhysicalInsertError::Unsupported("RETURNING"));
     }
+    if insert.conflict.is_some() {
+        return Err(PhysicalInsertError::Unsupported("conflict policy"));
+    }
     if !insert.upserts.is_empty() || insert.excluded_source.is_some() {
         return Err(PhysicalInsertError::Unsupported("UPSERT"));
     }
@@ -242,13 +295,6 @@ fn preflight_insert<'plan>(
     }
     if !insert.foreign_keys.outgoing.is_empty() || !insert.foreign_keys.incoming.is_empty() {
         return Err(PhysicalInsertError::Unsupported("foreign-key checks"));
-    }
-    if insert
-        .columns
-        .iter()
-        .any(|column| matches!(column, hir::TargetColumn::RowId))
-    {
-        return Err(PhysicalInsertError::Unsupported("explicit rowid"));
     }
     let source = plan
         .document
@@ -289,14 +335,19 @@ fn preflight_insert<'plan>(
     if !table.has_rowid {
         return Err(PhysicalInsertError::Unsupported("WITHOUT ROWID target"));
     }
-    if table.is_strict {
-        return Err(PhysicalInsertError::Unsupported("STRICT table checks"));
+    if table
+        .columns()
+        .iter()
+        .any(|column| column.notnull_conflict_clause.is_some())
+    {
+        return Err(PhysicalInsertError::Unsupported(
+            "column NOT NULL conflict policy",
+        ));
     }
-    if table.columns().iter().any(|column| column.notnull()) {
-        return Err(PhysicalInsertError::Unsupported("NOT NULL constraints"));
-    }
-    if table.get_rowid_alias_column().is_some() {
-        return Err(PhysicalInsertError::Unsupported("INTEGER PRIMARY KEY"));
+    if table.rowid_alias_conflict_clause.is_some() {
+        return Err(PhysicalInsertError::Unsupported(
+            "INTEGER PRIMARY KEY conflict policy",
+        ));
     }
     Ok((source, table.clone(), database))
 }

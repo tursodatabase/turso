@@ -5,7 +5,7 @@ use std::fmt;
 use turso_parser::ast::ResolveType;
 
 use crate::{
-    error::SQLITE_CONSTRAINT_CHECK,
+    error::{SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL},
     schema::BTreeTable,
     translate::semantic::hir::{self, ColumnReadExpression},
     vdbe::{
@@ -138,6 +138,35 @@ pub(crate) fn emit_check_constraints(
         program.preassign_label_to_next_insn(passed);
     }
     Ok(())
+}
+
+/// Enforce the row constraints that depend only on the completed logical NEW
+/// image. Stored-value encoders run later while the record is assembled.
+pub(crate) fn emit_new_row_constraints(
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
+    source: hir::SourceId,
+    table: &crate::sync::Arc<BTreeTable>,
+    logical: RegisterRange,
+) -> RowResult<()> {
+    for (position, column) in table.columns().iter().enumerate() {
+        if column.notnull() && !column.is_rowid_alias() {
+            program.emit_insn(Insn::HaltIfNull {
+                target_reg: logical.first.0 + position,
+                description: format!("{}.{}", table.name, column.name.as_deref().unwrap_or("")),
+                err_code: SQLITE_CONSTRAINT_NOTNULL,
+            });
+        }
+    }
+    if table.is_strict {
+        program.emit_insn(Insn::TypeCheck {
+            start_reg: logical.first.0,
+            count: logical.width,
+            check_generated: true,
+            table_reference: table.clone(),
+        });
+    }
+    emit_check_constraints(program, bindings, source)
 }
 
 /// Encode one complete logical row and build its on-disk table record.

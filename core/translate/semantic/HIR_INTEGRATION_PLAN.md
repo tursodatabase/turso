@@ -105,7 +105,11 @@ operations are not SQL binding.
         B-tree targets.
   - [x] CHECK and UNIQUE constraints run against the complete frozen-HIR row
         before any mutation.
-  - [ ] INSERT SELECT, explicit rowids, remaining constraints,
+  - [x] Explicit rowid and INTEGER PRIMARY KEY inputs share one generated or
+        validated table-key path with pre-write uniqueness checks.
+  - [x] Default NOT NULL enforcement and STRICT built-in type checks run on the
+        complete NEW row before any mutation.
+  - [ ] INSERT SELECT, conflict-policy variants and remaining constraints,
         UPSERT/excluded, and RETURNING.
 - [ ] Trigger commands and predicates with explicit OLD/NEW runtime bindings.
 - [ ] Generated columns, defaults, CHECK constraints, expression and partial

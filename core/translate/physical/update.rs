@@ -12,11 +12,11 @@ use crate::{
 };
 
 use super::{
-    close_indexes, emit_check_constraints, emit_complete_logical_row, emit_index_delete,
-    emit_index_insert, emit_index_key, emit_stored_record, emit_unique_check, open_indexes,
-    CursorId, ExpressionEmitter, PhysicalExpressionError, PhysicalIndexError, PhysicalPlan,
-    PhysicalRoot, PhysicalRowError, PhysicalSourceKind, RegisterId, RegisterRange,
-    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
+    close_indexes, emit_complete_logical_row, emit_index_delete, emit_index_insert, emit_index_key,
+    emit_new_row_constraints, emit_stored_record, emit_unique_check, open_indexes, CursorId,
+    ExpressionEmitter, PhysicalExpressionError, PhysicalIndexError, PhysicalPlan, PhysicalRoot,
+    PhysicalRowError, PhysicalSourceKind, RegisterId, RegisterRange, RuntimeBindingError,
+    RuntimeBindings, SourceRuntime, TableAccess,
 };
 
 #[derive(Debug)]
@@ -204,7 +204,7 @@ pub(crate) fn emit_root_update(
         },
     )?;
     emit_complete_logical_row(program, &mut bindings, update.target, &table, logical)?;
-    emit_check_constraints(program, &mut bindings, update.target)?;
+    emit_new_row_constraints(program, &mut bindings, update.target, &table, logical)?;
     let mut new_keys = Vec::with_capacity(indexes.len());
     for index in &indexes {
         let key = emit_index_key(program, &mut bindings, update.target, rowid, index, true)?;
@@ -322,11 +322,14 @@ fn preflight_update<'plan>(
     if !table.has_rowid {
         return Err(PhysicalUpdateError::Unsupported("WITHOUT ROWID target"));
     }
-    if table.is_strict {
-        return Err(PhysicalUpdateError::Unsupported("STRICT table checks"));
-    }
-    if table.columns().iter().any(|column| column.notnull()) {
-        return Err(PhysicalUpdateError::Unsupported("NOT NULL constraints"));
+    if table
+        .columns()
+        .iter()
+        .any(|column| column.notnull_conflict_clause.is_some())
+    {
+        return Err(PhysicalUpdateError::Unsupported(
+            "column NOT NULL conflict policy",
+        ));
     }
     if table.get_rowid_alias_column().is_some() {
         return Err(PhysicalUpdateError::Unsupported("INTEGER PRIMARY KEY"));
