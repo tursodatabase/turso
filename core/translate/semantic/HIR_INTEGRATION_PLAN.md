@@ -87,6 +87,8 @@ operations are not SQL binding.
         whose equality collations come from the left HIR outputs.
   - [x] Mixed and multi-arm duplicate-removing compounds preserve SQLite's
         left-to-right set boundaries, including trailing UNION ALL duplicates.
+  - [x] Compound scalar and EXISTS subqueries materialize behind QueryId and
+        read exactly the first row or existence bit after every arm is closed.
   - [x] LEFT JOIN preserves the separate HIR join constraint and WHERE phases
         and null-extends the right SourceId only when no join match exists.
   - [ ] Window execution, RIGHT/FULL OUTER JOIN, and the remaining compound

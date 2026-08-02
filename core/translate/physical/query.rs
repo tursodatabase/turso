@@ -25,7 +25,7 @@ use crate::{
     types::KeyInfo,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u32, HashDistinctData, IdxInsertFlags, InsertFlags, Insn, SortComparatorType},
+        insn::{HashDistinctData, IdxInsertFlags, InsertFlags, Insn, SortComparatorType, to_u32},
     },
 };
 
@@ -307,6 +307,43 @@ impl<'document> PhysicalSubqueryEmitter<'document> for QuerySubqueryEmitter<'_, 
                 });
                 let runtime = QueryRuntime::Registers(registers);
                 bindings.bind_query(query_id, runtime)?;
+                if !query.hir.compounds.is_empty() {
+                    let table =
+                        ephemeral_table(format!("scalar_compound_{}", query_id.index()), width);
+                    let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+                    program.emit_insn(Insn::OpenEphemeral {
+                        cursor_id: cursor,
+                        is_table: true,
+                    });
+                    emit_query(
+                        self.plan,
+                        program,
+                        bindings,
+                        self.ctes,
+                        query_id,
+                        QueryDestination::EphemeralTable {
+                            cursor_id: cursor,
+                            table: &table,
+                        },
+                    )
+                    .map_err(|error| PhysicalExpressionError::Subquery(error.to_string()))?;
+                    let done = program.allocate_label();
+                    program.emit_insn(Insn::Rewind {
+                        cursor_id: cursor,
+                        pc_if_empty: done,
+                    });
+                    for position in 0..width {
+                        program.emit_insn(Insn::Column {
+                            cursor_id: cursor,
+                            column: position,
+                            dest: first + position,
+                            default: None,
+                        });
+                    }
+                    program.preassign_label_to_next_insn(done);
+                    program.emit_insn(Insn::Close { cursor_id: cursor });
+                    return Ok(runtime);
+                }
                 let done = program.allocate_label();
                 emit_query(
                     self.plan,
@@ -331,6 +368,41 @@ impl<'document> PhysicalSubqueryEmitter<'document> for QuerySubqueryEmitter<'_, 
                 });
                 let runtime = QueryRuntime::Exists(register);
                 bindings.bind_query(query_id, runtime)?;
+                if !query.hir.compounds.is_empty() {
+                    let table = ephemeral_table(
+                        format!("exists_compound_{}", query_id.index()),
+                        query.hir.output.len(),
+                    );
+                    let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+                    program.emit_insn(Insn::OpenEphemeral {
+                        cursor_id: cursor,
+                        is_table: true,
+                    });
+                    emit_query(
+                        self.plan,
+                        program,
+                        bindings,
+                        self.ctes,
+                        query_id,
+                        QueryDestination::EphemeralTable {
+                            cursor_id: cursor,
+                            table: &table,
+                        },
+                    )
+                    .map_err(|error| PhysicalExpressionError::Subquery(error.to_string()))?;
+                    let done = program.allocate_label();
+                    program.emit_insn(Insn::Rewind {
+                        cursor_id: cursor,
+                        pc_if_empty: done,
+                    });
+                    program.emit_insn(Insn::Integer {
+                        value: 1,
+                        dest: register.0,
+                    });
+                    program.preassign_label_to_next_insn(done);
+                    program.emit_insn(Insn::Close { cursor_id: cursor });
+                    return Ok(runtime);
+                }
                 let done = program.allocate_label();
                 emit_query(
                     self.plan,
