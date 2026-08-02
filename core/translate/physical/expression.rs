@@ -489,12 +489,16 @@ impl<'program, 'bindings, 'document> ExpressionEmitter<'program, 'bindings, 'doc
             }
             hir::ColumnReadExpression::Absent => {}
         }
+        if matches!(source.kind, hir::SourceKind::SchemaExpression) {
+            self.program.emit_column_or_rowid(cursor.0, column, target);
+            return Ok(());
+        }
         let table = match &source.kind {
             hir::SourceKind::Table(table)
             | hir::SourceKind::TableFunction { table, .. }
             | hir::SourceKind::Pseudo { table, .. } => Some(table),
-            hir::SourceKind::SchemaExpression
-            | hir::SourceKind::Cte(_)
+            hir::SourceKind::SchemaExpression => unreachable!("handled above"),
+            hir::SourceKind::Cte(_)
             | hir::SourceKind::Derived(_)
             | hir::SourceKind::RecursiveInput(_) => None,
         };

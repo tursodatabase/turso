@@ -72,3 +72,21 @@ expect {
     1
     2
 }
+
+# The generated column sits between two stored columns, so its expression must
+# read logical column c through the table's logical-to-physical column map.
+# Keep ALTER in the sequence to cover the live-schema path from the simulator.
+@cross-check-integrity
+test gencol-index-integrity-uses-physical-column-map-after-rename {
+    CREATE TABLE t5(a INTEGER, b TEXT UNIQUE AS (c) VIRTUAL, c TEXT);
+    ALTER TABLE t5 RENAME COLUMN a TO renamed_a;
+    INSERT INTO t5(renamed_a, c) VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    PRAGMA integrity_check;
+    SELECT renamed_a, b FROM t5 ORDER BY renamed_a;
+}
+expect {
+    ok
+    1|x
+    2|y
+    3|z
+}
