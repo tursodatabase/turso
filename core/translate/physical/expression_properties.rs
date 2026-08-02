@@ -339,6 +339,61 @@ fn comparisons_lower_from_frozen_hir_after_catalog_is_gone(tc: hegel::TestCase) 
     ));
 }
 
+// Examples: `SELECT c0 || '-tail' FROM items` for `c0 TEXT` must emit text
+// concatenation, while `SELECT c0 || c0 FROM items` for `c0 INTEGER[]` must
+// emit array concatenation. The choice comes from the bound HIR type facts and
+// remains valid after the catalog that declared `c0` has been dropped.
+#[hegel::test]
+fn concatenation_kind_lowers_from_frozen_operand_types(tc: hegel::TestCase) {
+    let array = tc.draw(generators::booleans());
+    let declaration = if array { "INTEGER[]" } else { "TEXT" };
+    let rhs = if array { "c0" } else { "'-tail'" };
+    let table = BTreeTable::from_sql(&format!("CREATE TABLE items(c0 {declaration})"), 2)
+        .expect("generated table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(table))
+        .expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!("SELECT c0 || {rhs} FROM items"));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated concatenation has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let Expr::Binary { array_concat, .. } = root_output(&document, 0) else {
+        panic!("output is a binary concatenation");
+    };
+    assert_eq!(*array_concat, array);
+
+    let HirRoot::Query(root) = &document.root else {
+        panic!("fixture is a query");
+    };
+    let source = document.sources[0].id;
+    let mut bindings =
+        RuntimeBindings::new(&document, document.snapshot).expect("analyzed document is closed");
+    bindings
+        .enter_query(root.query)
+        .expect("root query enters from root scope");
+    let mut program = program();
+    let cursor = program.alloc_cursor_id(CursorType::BTreeTable(btree_source(&document, 0)));
+    bindings
+        .bind_source(source, SourceRuntime::Cursor(CursorId(cursor)))
+        .expect("items belongs to the root query");
+    ExpressionEmitter::new(&mut program, &mut bindings)
+        .emit_new(root_output(&document, 0))
+        .expect("closed concatenation lowers without a catalog");
+
+    assert!(program.insns.iter().any(|(instruction, _)| if array {
+        matches!(instruction, Insn::ArrayConcat { .. })
+    } else {
+        matches!(instruction, Insn::Concat { .. })
+    }));
+}
+
 // Example: each of `c0 BETWEEN ?1 AND ?2`,
 // `CASE c0 WHEN ?1 THEN 10 ELSE 20 END`, and `c0 IN (?1, ?2, NULL)`
 // carries all comparison facts out of binding. Direct lowering must accept any

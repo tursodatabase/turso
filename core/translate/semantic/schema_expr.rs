@@ -648,6 +648,13 @@ impl Analyzer<'_, '_> {
                 let rhs = self.instantiate_schema_node(rhs, source)?;
                 let custom =
                     self.resolve_custom_binary_operator(&lhs, *operator, &rhs, &Scope::default())?;
+                let array_concat = *operator == ast::Operator::Concat
+                    && (self
+                        .expression_type_fact(&lhs, &Scope::default())
+                        .is_array()
+                        || self
+                            .expression_type_fact(&rhs, &Scope::default())
+                            .is_array());
                 let comparison = operator
                     .is_comparison()
                     .then(|| self.comparison_semantics(&lhs, &rhs, &Scope::default(), false))
@@ -656,6 +663,7 @@ impl Analyzer<'_, '_> {
                     lhs: Box::new(lhs),
                     operator: *operator,
                     rhs: Box::new(rhs),
+                    array_concat,
                     custom,
                     comparison,
                 })
@@ -1313,6 +1321,7 @@ pub(crate) fn equivalent(lhs: &hir::Expr, rhs: &hir::Expr) -> bool {
                 lhs: lhs_left,
                 operator: lhs_operator,
                 rhs: lhs_right,
+                array_concat: lhs_array_concat,
                 custom: lhs_custom,
                 comparison: lhs_comparison,
             },
@@ -1320,11 +1329,13 @@ pub(crate) fn equivalent(lhs: &hir::Expr, rhs: &hir::Expr) -> bool {
                 lhs: rhs_left,
                 operator: rhs_operator,
                 rhs: rhs_right,
+                array_concat: rhs_array_concat,
                 custom: rhs_custom,
                 comparison: rhs_comparison,
             },
         ) => {
             lhs_operator == rhs_operator
+                && lhs_array_concat == rhs_array_concat
                 && lhs_comparison == rhs_comparison
                 && ((equivalent(lhs_left, rhs_left)
                     && equivalent(lhs_right, rhs_right)

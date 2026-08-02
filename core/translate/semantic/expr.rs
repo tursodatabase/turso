@@ -151,6 +151,9 @@ impl Analyzer<'_, '_> {
                 let lhs = self.analyze_expr(lhs, scope, policy.clone())?;
                 let rhs = self.analyze_expr(rhs, scope, policy)?;
                 let custom = self.resolve_custom_binary_operator(&lhs, *operator, &rhs, scope)?;
+                let array_concat = *operator == ast::Operator::Concat
+                    && (self.expression_type_fact(&lhs, scope).is_array()
+                        || self.expression_type_fact(&rhs, scope).is_array());
                 let comparison = operator
                     .is_comparison()
                     .then(|| self.comparison_semantics(&lhs, &rhs, scope, false))
@@ -159,6 +162,7 @@ impl Analyzer<'_, '_> {
                     lhs: Box::new(lhs),
                     operator: *operator,
                     rhs: Box::new(rhs),
+                    array_concat,
                     custom,
                     comparison,
                 })
@@ -868,11 +872,15 @@ impl Analyzer<'_, '_> {
                 lhs,
                 operator,
                 rhs,
+                array_concat,
                 custom,
                 comparison,
             } => {
                 self.refresh_expression_semantics(lhs, scope, finalize_custom_operators)?;
                 self.refresh_expression_semantics(rhs, scope, finalize_custom_operators)?;
+                *array_concat = *operator == ast::Operator::Concat
+                    && (self.expression_type_fact(lhs, scope).is_array()
+                        || self.expression_type_fact(rhs, scope).is_array());
                 if finalize_custom_operators {
                     *custom = self.resolve_custom_binary_operator(lhs, *operator, rhs, scope)?;
                 }

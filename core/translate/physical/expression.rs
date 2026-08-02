@@ -178,13 +178,21 @@ impl<'program, 'bindings, 'document> ExpressionEmitter<'program, 'bindings, 'doc
                 lhs,
                 operator,
                 rhs,
+                array_concat,
                 custom,
                 comparison,
             } => {
                 if let Some(custom) = custom {
                     return self.emit_custom_binary(lhs, rhs, custom, target);
                 }
-                self.emit_binary(lhs, *operator, rhs, comparison.as_ref(), target)
+                self.emit_binary(
+                    lhs,
+                    *operator,
+                    rhs,
+                    *array_concat,
+                    comparison.as_ref(),
+                    target,
+                )
             }
             Expr::Cast { expr, target: cast } => {
                 self.emit_into(expr, RegisterRange::new(target, 1))?;
@@ -704,9 +712,19 @@ impl<'program, 'bindings, 'document> ExpressionEmitter<'program, 'bindings, 'doc
         lhs: &Expr,
         operator: Operator,
         rhs: &Expr,
+        array_concat: bool,
         comparison: Option<&ComparisonSemantics>,
         target: usize,
     ) -> ExpressionResult<()> {
+        if matches!(
+            operator,
+            Operator::ArrowRight
+                | Operator::ArrowRightShift
+                | Operator::ArrayContains
+                | Operator::ArrayOverlap
+        ) {
+            return self.emit_binary_function(lhs, operator, rhs, target);
+        }
         let lhs = scalar_register(self.emit_new(lhs)?)?;
         let rhs = scalar_register(self.emit_new(rhs)?)?;
 
@@ -783,15 +801,20 @@ impl<'program, 'bindings, 'document> ExpressionEmitter<'program, 'bindings, 'doc
                 reg: rhs,
                 dest: target,
             },
-            Operator::Concat
-            | Operator::ArrowRight
+            Operator::Concat if array_concat => Insn::ArrayConcat {
+                lhs,
+                rhs,
+                dest: target,
+            },
+            Operator::Concat => Insn::Concat {
+                lhs,
+                rhs,
+                dest: target,
+            },
+            Operator::ArrowRight
             | Operator::ArrowRightShift
             | Operator::ArrayContains
-            | Operator::ArrayOverlap => {
-                return Err(PhysicalExpressionError::Unsupported(
-                    "special binary operator",
-                ));
-            }
+            | Operator::ArrayOverlap => unreachable!("function operators were handled above"),
             Operator::Equals
             | Operator::NotEquals
             | Operator::Less
@@ -802,6 +825,45 @@ impl<'program, 'bindings, 'document> ExpressionEmitter<'program, 'bindings, 'doc
             | Operator::IsNot => unreachable!("comparisons were handled above"),
         };
         self.program.emit_insn(instruction);
+        Ok(())
+    }
+
+    fn emit_binary_function(
+        &mut self,
+        lhs: &Expr,
+        operator: Operator,
+        rhs: &Expr,
+        target: usize,
+    ) -> ExpressionResult<()> {
+        let arguments = self.program.alloc_registers(2);
+        self.emit_into(lhs, RegisterRange::new(arguments, 1))?;
+        self.emit_into(rhs, RegisterRange::new(arguments + 1, 1))?;
+
+        let func = match operator {
+            #[cfg(feature = "json")]
+            Operator::ArrowRight => Func::Json(crate::function::JsonFunc::JsonArrowExtract),
+            #[cfg(feature = "json")]
+            Operator::ArrowRightShift => {
+                Func::Json(crate::function::JsonFunc::JsonArrowShiftExtract)
+            }
+            #[cfg(not(feature = "json"))]
+            Operator::ArrowRight | Operator::ArrowRightShift => {
+                return Err(PhysicalExpressionError::Unsupported("JSON operator"));
+            }
+            Operator::ArrayContains => Func::Scalar(ScalarFunc::ArrayContainsAll),
+            Operator::ArrayOverlap => Func::Scalar(ScalarFunc::ArrayOverlap),
+            _ => {
+                return Err(PhysicalExpressionError::Invalid(
+                    "non-function binary operator",
+                ))
+            }
+        };
+        self.program.emit_insn(Insn::Function {
+            constant_mask: 0,
+            start_reg: arguments,
+            dest: target,
+            func: FuncCtx { func, arg_count: 2 },
+        });
         Ok(())
     }
 

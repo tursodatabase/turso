@@ -283,6 +283,10 @@ pub enum Expr {
         lhs: Box<Expr>,
         operator: Operator,
         rhs: Box<Expr>,
+        /// `||` uses the array opcode when either operand is an array. This
+        /// decision depends on bound type facts and must not be rediscovered
+        /// during physical emission.
+        array_concat: bool,
         custom: Option<CustomBinaryOperator>,
         comparison: Option<ComparisonSemantics>,
     },

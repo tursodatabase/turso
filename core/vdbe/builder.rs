@@ -1294,6 +1294,23 @@ impl ProgramBuilder {
         self.label_to_resolved_offset[label_number as usize] = Some(anchor);
     }
 
+    /// Anchor a shared cleanup label only when a more precise producer has
+    /// not already done so. Query destinations use this after emission as a
+    /// safety net for shapes such as source-free or ungrouped aggregates;
+    /// scan loops may already have anchored the same label before cursor
+    /// cleanup and must keep that earlier target.
+    #[inline]
+    pub fn preassign_label_to_next_insn_if_unassigned(&mut self, label: BranchOffset) {
+        let BranchOffset::Label(label_number) = label else {
+            unreachable!(
+                "preassign_label_to_next_insn_if_unassigned requires a Label, got {label:?}"
+            );
+        };
+        if self.label_to_resolved_offset[label_number as usize].is_none() {
+            self.preassign_label_to_next_insn(label);
+        }
+    }
+
     /// Resolve `dest` so that it ends up pointing at the same final offset as
     /// `anchor`. `anchor` must already be preassigned. Use when several labels
     /// have to target the same logical program point but the point was

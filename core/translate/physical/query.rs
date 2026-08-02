@@ -308,6 +308,10 @@ impl<'document> PhysicalSubqueryEmitter<'document> for QuerySubqueryEmitter<'_, 
                     QueryDestination::Scalar { registers, done },
                 )
                 .map_err(|error| PhysicalExpressionError::Subquery(error.to_string()))?;
+                // Both an empty scan and the first produced row leave the
+                // scalar subquery here. Anchor the shared destination after
+                // every child-query shape, including ungrouped aggregates.
+                program.preassign_label_to_next_insn_if_unassigned(done);
                 Ok(runtime)
             }
             SubqueryExpr::Exists(_) => {
@@ -328,6 +332,7 @@ impl<'document> PhysicalSubqueryEmitter<'document> for QuerySubqueryEmitter<'_, 
                     QueryDestination::Exists { register, done },
                 )
                 .map_err(|error| PhysicalExpressionError::Subquery(error.to_string()))?;
+                program.preassign_label_to_next_insn_if_unassigned(done);
                 Ok(runtime)
             }
             SubqueryExpr::In { comparison, .. } => {

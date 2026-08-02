@@ -1281,6 +1281,7 @@ impl<'document> HirValidator<'document> {
                 lhs,
                 operator,
                 rhs,
+                array_concat,
                 custom,
                 comparison,
             } => {
@@ -1289,6 +1290,10 @@ impl<'document> HirValidator<'document> {
                 self.require(
                     operator.is_comparison() == comparison.is_some(),
                     "binary expression has incorrect comparison metadata",
+                )?;
+                self.require(
+                    !*array_concat || *operator == turso_parser::ast::Operator::Concat,
+                    "non-concatenation expression is marked as array concatenation",
                 )?;
                 if let Some(comparison) = comparison {
                     self.visit_expression_comparison(comparison, lhs, rhs, "binary comparison")?;
