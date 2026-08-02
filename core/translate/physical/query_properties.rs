@@ -10,7 +10,7 @@ use super::*;
 use crate::{
     dialect::{Dialect, SqliteDialect},
     schema::{BTreeTable, Index, Schema},
-    sync::Arc,
+    sync::{Arc, RwLock},
     translate::{
         collate::CollationSeq,
         semantic::{
@@ -26,8 +26,79 @@ use crate::{
         insn::Insn,
         BranchOffset,
     },
-    QueryMode, SymbolTable,
+    vtab::{InternalVirtualTable, InternalVirtualTableCursor, VirtualTable},
+    Connection, LimboError, QueryMode, SymbolTable, Value,
 };
+
+#[derive(Debug)]
+struct PositionArgsTableFunction;
+
+impl InternalVirtualTable for PositionArgsTableFunction {
+    fn name(&self) -> String {
+        "position_args".to_string()
+    }
+
+    fn open(
+        &self,
+        _conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(EmptyTableFunctionCursor)))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[turso_ext::ConstraintInfo],
+        _order_by: &[turso_ext::OrderByInfo],
+    ) -> std::result::Result<turso_ext::IndexInfo, turso_ext::ResultCode> {
+        let idx_num = constraints.iter().fold(0, |mask, constraint| {
+            mask | (1 << (constraint.column_index - 1))
+        });
+        Ok(turso_ext::IndexInfo {
+            idx_num,
+            idx_str: Some(idx_num.to_string()),
+            constraint_usages: constraints
+                .iter()
+                .enumerate()
+                .map(|(position, _)| turso_ext::ConstraintUsage {
+                    argv_index: Some(position as u32 + 1),
+                    omit: true,
+                })
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE position_args(\
+         value INTEGER, first INTEGER HIDDEN, second INTEGER HIDDEN, third INTEGER HIDDEN)"
+            .to_string()
+    }
+}
+
+struct EmptyTableFunctionCursor;
+
+impl InternalVirtualTableCursor for EmptyTableFunctionCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        Ok(false)
+    }
+
+    fn rowid(&self) -> i64 {
+        0
+    }
+
+    fn column(&self, _column: usize) -> Result<Value, LimboError> {
+        Ok(Value::Null)
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        Ok(false)
+    }
+}
 
 fn parse_statement(sql: &str) -> ast::Stmt {
     let command = Parser::new(sql.as_bytes())
@@ -163,6 +234,94 @@ fn a_root_table_scan_emits_only_from_closed_hir(tc: hegel::TestCase) {
         .insns
         .iter()
         .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 2, .. })));
+}
+
+// Examples: `position_args(?1)`, `position_args(?1, ?2)`, and
+// `position_args(?1, ?2, ?3)` bind arguments to the hidden first, second, and
+// third columns in that exact order. Physical lowering must ask the frozen
+// virtual table for its filter contract, place those parameters in the exact
+// contiguous register range passed to `VFilter`, and read/advance the same
+// virtual cursor after the schema and symbol catalog have been dropped.
+#[hegel::test]
+fn table_function_arguments_keep_their_bound_hidden_column_order(tc: hegel::TestCase) {
+    let arity = usize::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(3)));
+    let arguments = (1..=arity)
+        .map(|position| format!("?{position}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut schema = Schema::new();
+    schema
+        .add_virtual_table(
+            VirtualTable::wrap_internal_table(PositionArgsTableFunction)
+                .expect("the test table function has valid schema SQL"),
+        )
+        .expect("the test table function name is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!("SELECT value FROM position_args({arguments})"));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated table-function query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed table-function HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("table function lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("all table-function branches are closed");
+
+    let (filter_position, cursor, args_reg, idx_str) = program
+        .insns
+        .iter()
+        .enumerate()
+        .find_map(|(position, (instruction, _))| match instruction {
+            Insn::VFilter {
+                cursor_id,
+                arg_count,
+                args_reg,
+                idx_str,
+                idx_num,
+                ..
+            } if *arg_count == arity && *idx_num == (1 << arity) - 1 => {
+                Some((position, *cursor_id, *args_reg, *idx_str))
+            }
+            _ => None,
+        })
+        .expect("the virtual filter receives every bound hidden-column argument");
+    assert!(idx_str.is_some());
+    assert!(program.insns[..filter_position].iter().any(
+        |(instruction, _)| matches!(instruction, Insn::VOpen { cursor_id } if *cursor_id == cursor)
+    ));
+
+    let parameters = program.insns[..filter_position]
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::Variable { index, dest } if *dest >= args_reg && *dest < args_reg + arity => {
+                Some((index.get() as usize, *dest))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(parameters.len(), arity);
+    for (position, (parameter, destination)) in parameters.into_iter().enumerate() {
+        assert_eq!(parameter, position + 1);
+        assert_eq!(destination, args_reg + position);
+    }
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::VColumn {
+            cursor_id,
+            column: 0,
+            ..
+        } if *cursor_id == cursor
+    )));
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::VNext { cursor_id, .. } if *cursor_id == cursor
+    )));
 }
 
 // Example: `SELECT c7 FROM items INDEXED BY items_idx WHERE c2 >= ?1` must

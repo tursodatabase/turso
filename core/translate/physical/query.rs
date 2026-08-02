@@ -7,7 +7,8 @@
 use std::fmt;
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use turso_parser::ast::{CompoundOperator, Distinctness, SortOrder};
+use turso_ext::{ConstraintInfo, ConstraintOp};
+use turso_parser::ast::{CompoundOperator, Distinctness, Literal, SortOrder};
 
 use crate::{
     function::{AccumulatorFunc, AggFunc, Func},
@@ -18,8 +19,8 @@ use crate::{
     translate::collate::CollationSeq,
     translate::semantic::hir::{
         Assignment, CteBody, CteId, Expr, From as HirFrom, Grouping, Join, JoinConstraint,
-        JoinKind, OrderTerm, QueryBlockBody, QueryBlockId, QueryId, SourceId, SubqueryExpr,
-        TypeFact,
+        JoinKind, OrderTerm, QueryBlockBody, QueryBlockId, QueryId, ResolvedTable, SourceId,
+        SubqueryExpr, TypeFact,
     },
     types::KeyInfo,
     vdbe::{
@@ -78,11 +79,17 @@ enum ScanCursor {
     Virtual(usize),
 }
 
-#[derive(Clone, Copy)]
-struct OpenedScan {
+struct VirtualFilter<'hir> {
+    arguments: Vec<&'hir Expr>,
+    idx_str: Option<usize>,
+    idx_num: usize,
+}
+
+struct OpenedScan<'hir> {
     cursor: ScanCursor,
     runtime_cursor: usize,
     deferred_table: Option<usize>,
+    virtual_filter: Option<VirtualFilter<'hir>>,
     owned: bool,
 }
 
@@ -534,6 +541,7 @@ pub(crate) fn emit_update_from_rows<'document>(
         cursor: ScanCursor::BTree(target_cursor),
         runtime_cursor: target_cursor,
         deferred_table: None,
+        virtual_filter: None,
         owned: false,
     });
     for source_id in &source_ids {
@@ -1816,7 +1824,7 @@ fn emit_nested_scan<'document>(
     program: &mut ProgramBuilder,
     bindings: &mut RuntimeBindings<'document>,
     ctes: &mut MaterializedCtes,
-    scans: &[OpenedScan],
+    scans: &[OpenedScan<'document>],
     level: usize,
     joins: &[crate::translate::semantic::hir::Join],
     filter: Option<&Expr>,
@@ -1847,14 +1855,18 @@ fn emit_nested_scan<'document>(
             cursor_id,
             pc_if_empty: empty,
         }),
-        ScanCursor::Virtual(cursor_id) => program.emit_insn(Insn::VFilter {
-            cursor_id,
-            pc_if_empty: empty,
-            arg_count: 0,
-            args_reg: 0,
-            idx_str: None,
-            idx_num: 0,
-        }),
+        ScanCursor::Virtual(cursor_id) => {
+            let (arg_count, args_reg, idx_str, idx_num) =
+                emit_virtual_filter_arguments(plan, program, bindings, ctes, scan)?;
+            program.emit_insn(Insn::VFilter {
+                cursor_id,
+                pc_if_empty: empty,
+                arg_count,
+                args_reg,
+                idx_str,
+                idx_num,
+            });
+        }
     }
     program.preassign_label_to_next_insn(loop_start);
     if let Some(table_cursor_id) = scan.deferred_table {
@@ -1940,6 +1952,33 @@ fn emit_nested_scan<'document>(
     }
     program.preassign_label_to_next_insn(loop_end);
     Ok(())
+}
+
+fn emit_virtual_filter_arguments<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    ctes: &mut MaterializedCtes,
+    scan: &OpenedScan<'document>,
+) -> QueryResult<(usize, usize, Option<usize>, usize)> {
+    let Some(filter) = &scan.virtual_filter else {
+        return Ok((0, 0, None, 0));
+    };
+    if filter.arguments.is_empty() {
+        return Ok((0, 0, filter.idx_str, filter.idx_num));
+    }
+    let arguments = program.alloc_registers(filter.arguments.len());
+    for (position, argument) in filter.arguments.iter().enumerate() {
+        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+            .emit_into(argument, RegisterRange::new(arguments + position, 1))?;
+    }
+    Ok((
+        filter.arguments.len(),
+        arguments,
+        filter.idx_str,
+        filter.idx_num,
+    ))
 }
 
 fn emit_join_constraint<'document>(
@@ -2071,15 +2110,17 @@ fn open_source<'document>(
     program: &mut ProgramBuilder,
     bindings: &mut RuntimeBindings<'document>,
     ctes: &mut MaterializedCtes,
-    source: &PhysicalSource<'_>,
-) -> QueryResult<OpenedScan> {
+    source: &PhysicalSource<'document>,
+) -> QueryResult<OpenedScan<'document>> {
     let PhysicalSourceKind::CatalogTable { table, access } = &source.kind else {
         return match &source.kind {
             PhysicalSourceKind::Derived(query) => {
                 open_derived_source(plan, program, bindings, ctes, source, *query)
             }
-            PhysicalSourceKind::TableFunction { .. }
-            | PhysicalSourceKind::RecursiveInput(_)
+            PhysicalSourceKind::TableFunction { table, arguments } => {
+                open_table_function(program, table, arguments)
+            }
+            PhysicalSourceKind::RecursiveInput(_)
             | PhysicalSourceKind::Pseudo { .. }
             | PhysicalSourceKind::SchemaExpression => {
                 Err(PhysicalQueryError::Unsupported("non-table FROM source"))
@@ -2123,6 +2164,7 @@ fn open_source<'document>(
             cursor: ScanCursor::BTree(index_cursor),
             runtime_cursor: table_cursor,
             deferred_table: Some(table_cursor),
+            virtual_filter: None,
             owned: true,
         });
     }
@@ -2139,6 +2181,7 @@ fn open_source<'document>(
                 cursor: ScanCursor::BTree(cursor),
                 runtime_cursor: cursor,
                 deferred_table: None,
+                virtual_filter: None,
                 owned: true,
             })
         }
@@ -2149,6 +2192,7 @@ fn open_source<'document>(
                 cursor: ScanCursor::Virtual(cursor),
                 runtime_cursor: cursor,
                 deferred_table: None,
+                virtual_filter: None,
                 owned: true,
             })
         }
@@ -2158,14 +2202,112 @@ fn open_source<'document>(
     }
 }
 
+fn open_table_function<'document>(
+    program: &mut ProgramBuilder,
+    resolved: &'document ResolvedTable,
+    arguments: &'document [Expr],
+) -> QueryResult<OpenedScan<'document>> {
+    let Table::Virtual(table) = resolved.value() else {
+        return Err(PhysicalQueryError::Invalid(
+            "table function did not resolve to a virtual table",
+        ));
+    };
+    let hidden_columns = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(position, column)| column.hidden().then_some(position))
+        .collect::<Vec<_>>();
+    if arguments.len() > hidden_columns.len() {
+        return Err(PhysicalQueryError::Invalid(
+            "table function has more arguments than hidden columns",
+        ));
+    }
+    let constraints = arguments
+        .iter()
+        .zip(hidden_columns)
+        .enumerate()
+        .map(|(position, (argument, column_index))| ConstraintInfo {
+            column_index: column_index as u32,
+            op: if matches!(argument, Expr::Literal(Literal::Null)) {
+                ConstraintOp::IsNull
+            } else {
+                ConstraintOp::Eq
+            },
+            usable: true,
+            index: position,
+        })
+        .collect::<Vec<_>>();
+    let index = table
+        .best_index(&constraints, &[])
+        .map_err(|_| PhysicalQueryError::Unsupported("table-function argument constraints"))?;
+    if index.constraint_usages.len() != constraints.len() {
+        return Err(PhysicalQueryError::Invalid(
+            "table function returned the wrong constraint count",
+        ));
+    }
+    let mut ordered_arguments = vec![None; arguments.len()];
+    for (position, usage) in index.constraint_usages.iter().enumerate() {
+        let Some(argv_index) = usage.argv_index else {
+            return Err(PhysicalQueryError::Unsupported(
+                "table-function argument was not accepted",
+            ));
+        };
+        if !usage.omit {
+            return Err(PhysicalQueryError::Unsupported(
+                "table-function residual argument constraint",
+            ));
+        }
+        let argv_index = argv_index as usize;
+        if argv_index == 0 || argv_index > ordered_arguments.len() {
+            return Err(PhysicalQueryError::Invalid(
+                "table function returned an invalid argument position",
+            ));
+        }
+        let slot = &mut ordered_arguments[argv_index - 1];
+        if slot.replace(&arguments[position]).is_some() {
+            return Err(PhysicalQueryError::Invalid(
+                "table function returned a duplicate argument position",
+            ));
+        }
+    }
+    let ordered_arguments = ordered_arguments
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or(PhysicalQueryError::Invalid(
+            "table function returned a gapped argument order",
+        ))?;
+    let idx_str = index.idx_str.map(|value| {
+        let register = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            value,
+            dest: register,
+        });
+        register
+    });
+    let cursor = program.alloc_cursor_id(CursorType::VirtualTable(table.clone()));
+    program.emit_insn(Insn::VOpen { cursor_id: cursor });
+    Ok(OpenedScan {
+        cursor: ScanCursor::Virtual(cursor),
+        runtime_cursor: cursor,
+        deferred_table: None,
+        virtual_filter: Some(VirtualFilter {
+            arguments: ordered_arguments,
+            idx_str,
+            idx_num: index.idx_num as usize,
+        }),
+        owned: true,
+    })
+}
+
 fn open_derived_source<'document>(
     plan: &PhysicalPlan<'document>,
     program: &mut ProgramBuilder,
     bindings: &mut RuntimeBindings<'document>,
     ctes: &mut MaterializedCtes,
-    source: &PhysicalSource<'_>,
+    source: &PhysicalSource<'document>,
     query: crate::translate::semantic::hir::QueryId,
-) -> QueryResult<OpenedScan> {
+) -> QueryResult<OpenedScan<'document>> {
     let query_plan = plan
         .query(query)
         .ok_or(PhysicalQueryError::Invalid("derived query is missing"))?;
@@ -2216,6 +2358,7 @@ fn open_derived_source<'document>(
         cursor: ScanCursor::BTree(cursor),
         runtime_cursor: cursor,
         deferred_table: None,
+        virtual_filter: None,
         owned: true,
     })
 }
@@ -2299,12 +2442,12 @@ fn materialize_cte<'document>(
     Ok(())
 }
 
-fn open_cte_source(
+fn open_cte_source<'document>(
     program: &mut ProgramBuilder,
     ctes: &MaterializedCtes,
-    source: &PhysicalSource<'_>,
+    source: &PhysicalSource<'document>,
     cte_id: CteId,
-) -> QueryResult<OpenedScan> {
+) -> QueryResult<OpenedScan<'document>> {
     let materialized = ctes.by_id.get(&cte_id).ok_or(PhysicalQueryError::Invalid(
         "CTE source was not materialized before its query",
     ))?;
@@ -2322,6 +2465,7 @@ fn open_cte_source(
         cursor: ScanCursor::BTree(cursor),
         runtime_cursor: cursor,
         deferred_table: None,
+        virtual_filter: None,
         owned: true,
     })
 }
