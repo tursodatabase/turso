@@ -3966,6 +3966,114 @@ fn a_full_join_after_an_inner_prefix_preserves_the_prefix_as_one_left_side(tc: h
     ));
 }
 
+// Example: `SELECT l.c0, r.c1 FROM l FULL JOIN r ON l.c2 = r.c2
+// WHERE r.c3 IN (SELECT v.c4 FROM v)` can enter the matched, unmatched-left,
+// or unmatched-right filter first. The one uncorrelated `IN` row set must be
+// open before all three paths, and every path must reuse that same cursor.
+#[hegel::test]
+fn uncorrelated_in_subqueries_are_ready_before_every_full_join_filter_path(
+    tc: hegel::TestCase,
+) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
+    let left_output = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let right_output = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let join_column = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let filter_column = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let subquery_column = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let columns = (0..width)
+        .map(|position| format!("c{position} INTEGER"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut schema = Schema::new();
+    for (name, root_page) in [("l", 83), ("r", 89), ("v", 97)] {
+        let table = BTreeTable::from_sql(&format!("CREATE TABLE {name}({columns})"), root_page)
+            .expect("generated table SQL is valid");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("fixture table name is unique");
+    }
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT l.c{left_output}, r.c{right_output} \
+         FROM l FULL JOIN r ON l.c{join_column} = r.c{join_column} \
+         WHERE r.c{filter_column} IN (SELECT v.c{subquery_column} FROM v)"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated FULL join with an IN subquery has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed FULL-join HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("FULL join with an IN subquery emits from HIR");
+    program
+        .resolve_labels()
+        .expect("all FULL-join and IN-subquery branches are closed");
+
+    let cursor_for_root = |root_page| {
+        program
+            .insns
+            .iter()
+            .find_map(|(instruction, _)| match instruction {
+                Insn::OpenRead {
+                    cursor_id,
+                    root_page: actual,
+                    ..
+                } if *actual == root_page => Some(*cursor_id),
+                _ => None,
+            })
+            .expect("resolved table cursor is opened")
+    };
+    let left_cursor = cursor_for_root(83);
+    let right_cursor = cursor_for_root(89);
+    let (row_set_open, row_set_cursor) = program
+        .insns
+        .iter()
+        .enumerate()
+        .find_map(|(position, (instruction, _))| match instruction {
+            Insn::OpenEphemeral {
+                cursor_id,
+                is_table: true,
+            } => Some((position, *cursor_id)),
+            _ => None,
+        })
+        .expect("the IN query opens one row set");
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(
+                instruction,
+                Insn::OpenEphemeral { cursor_id, .. } if *cursor_id == row_set_cursor
+            ))
+            .count(),
+        1
+    );
+    for outer_cursor in [left_cursor, right_cursor] {
+        let outer_rewind = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| matches!(
+                instruction,
+                Insn::Rewind { cursor_id, .. } if *cursor_id == outer_cursor
+            ))
+            .expect("each FULL-join side starts a scan");
+        assert!(row_set_open < outer_rewind);
+    }
+    assert!(program
+        .insns
+        .iter()
+        .enumerate()
+        .filter(|(_, (instruction, _))| matches!(
+            instruction,
+            Insn::Rewind { cursor_id, .. } if *cursor_id == row_set_cursor
+        ))
+        .all(|(position, _)| row_set_open < position));
+}
+
 // Examples:
 // - `SELECT (SELECT 7 UNION ALL SELECT 9)` returns the first compound row, so
 //   later arms must not overwrite the scalar result after an early jump.

@@ -460,9 +460,10 @@ impl<'document> PhysicalSubqueryEmitter<'document> for QuerySubqueryEmitter<'_, 
             .ok_or(PhysicalExpressionError::Subquery(
                 "query is missing from the physical plan".to_string(),
             ))?;
+        let has_outer_dependency = query_tree_has_outer_dependency(self.plan, query_id);
         match subquery {
             SubqueryExpr::Scalar { .. } => {
-                let once_done = query.hir.captures.is_empty().then(|| {
+                let once_done = (!has_outer_dependency).then(|| {
                     let done = program.allocate_label();
                     program.emit_insn(Insn::Once {
                         target_pc_when_reentered: done,
@@ -546,7 +547,7 @@ impl<'document> PhysicalSubqueryEmitter<'document> for QuerySubqueryEmitter<'_, 
                 Ok(runtime)
             }
             SubqueryExpr::Exists(_) => {
-                let once_done = query.hir.captures.is_empty().then(|| {
+                let once_done = (!has_outer_dependency).then(|| {
                     let done = program.allocate_label();
                     program.emit_insn(Insn::Once {
                         target_pc_when_reentered: done,
@@ -1275,6 +1276,7 @@ fn emit_query<'document>(
     }
     bindings.enter_query(query_id)?;
     materialize_ctes_owned_by_current_query(plan, program, bindings, ctes, query_id)?;
+    prepare_uncorrelated_subqueries(plan, program, bindings, ctes, query)?;
     let sorter = if query.hir.order_by.is_empty()
         || matches!(destination, QueryDestination::Exists { .. })
     {
@@ -1374,6 +1376,174 @@ fn emit_query<'document>(
     }
 }
 
+/// Return whether this query tree reads a source owned outside the tree.
+/// Direct captures are not enough: an otherwise capture-free scalar query can
+/// contain a derived query that reaches through it to the scalar query's
+/// parent.
+fn query_tree_has_outer_dependency(plan: &PhysicalPlan<'_>, root: QueryId) -> bool {
+    let mut tree = FxHashSet::default();
+    let mut pending = vec![root];
+    while let Some(query_id) = pending.pop() {
+        if !tree.insert(query_id) {
+            continue;
+        }
+        pending.extend(
+            plan.queries
+                .iter()
+                .filter(|query| query.hir.parent == Some(query_id))
+                .map(|query| query.id),
+        );
+    }
+    tree.iter().any(|query_id| {
+        plan.query(*query_id).is_some_and(|query| {
+            query.hir.captures.iter().any(|source_id| {
+                !matches!(
+                    plan.document.source(*source_id).map(|source| source.owner),
+                    Some(crate::translate::semantic::hir::SourceOwner::QueryBlock(block))
+                        if tree.contains(&block.query)
+                )
+            })
+        })
+    })
+}
+
+/// Emit query-independent subqueries before any row-production branch can use
+/// their runtime result. FULL joins emit the same filter for matched and
+/// unmatched rows, and either branch may run first. Keeping this setup at the
+/// query boundary matches the old planner's `BeforeLoop` phase without
+/// copying HIR expressions into each scan branch.
+fn prepare_uncorrelated_subqueries<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    ctes: &mut MaterializedCtes,
+    query: &super::PhysicalQuery<'document>,
+) -> QueryResult<()> {
+    let mut seen = FxHashSet::default();
+    let mut subqueries = Vec::new();
+    let mut collect = |expression: &'document Expr| {
+        expression.walk(&mut |expression| {
+            let Expr::Subquery(subquery) = expression else {
+                return;
+            };
+            let query_id = match subquery {
+                SubqueryExpr::Scalar { query, .. }
+                | SubqueryExpr::Exists(query)
+                | SubqueryExpr::In { query, .. } => *query,
+            };
+            if seen.insert(query_id) {
+                subqueries.push(subquery);
+            }
+        });
+    };
+
+    for block in &query.blocks {
+        if let Some(from) = &block.hir.from {
+            for source_id in
+                std::iter::once(from.first).chain(from.joins.iter().map(|join| join.right))
+            {
+                if let Some(PhysicalSource {
+                    kind: PhysicalSourceKind::TableFunction { arguments, .. },
+                    ..
+                }) = plan.source(source_id)
+                {
+                    for argument in *arguments {
+                        collect(argument);
+                    }
+                }
+            }
+            for join in &from.joins {
+                match &join.constraint {
+                    JoinConstraint::On(expression) => collect(expression),
+                    JoinConstraint::Using(columns) | JoinConstraint::Natural(columns) => {
+                        for column in columns {
+                            collect(&column.left);
+                        }
+                    }
+                    JoinConstraint::None => {}
+                }
+            }
+        }
+        for output in block.outputs {
+            collect(&output.expr);
+        }
+        match &block.hir.body {
+            QueryBlockBody::Select {
+                filter,
+                grouping,
+                windows,
+                ..
+            } => {
+                if let Some(filter) = filter {
+                    collect(filter);
+                }
+                if let Some(grouping) = grouping {
+                    for key in &grouping.keys {
+                        collect(key);
+                    }
+                    if let Some(having) = &grouping.having {
+                        collect(having);
+                    }
+                }
+                for window in windows {
+                    for expression in &window.spec.partition_by {
+                        collect(expression);
+                    }
+                    for term in &window.spec.order_by {
+                        collect(&term.expr);
+                    }
+                    if let Some(frame) = &window.spec.frame {
+                        for bound in std::iter::once(&frame.start).chain(frame.end.iter()) {
+                            match bound {
+                                crate::translate::semantic::hir::WindowFrameBound::Following(
+                                    expression,
+                                )
+                                | crate::translate::semantic::hir::WindowFrameBound::Preceding(
+                                    expression,
+                                ) => collect(expression),
+                                crate::translate::semantic::hir::WindowFrameBound::CurrentRow
+                                | crate::translate::semantic::hir::WindowFrameBound::UnboundedFollowing
+                                | crate::translate::semantic::hir::WindowFrameBound::UnboundedPreceding => {}
+                            }
+                        }
+                    }
+                }
+            }
+            QueryBlockBody::Values { rows } => {
+                for expression in rows.iter().flatten() {
+                    collect(expression);
+                }
+            }
+        }
+    }
+    for term in &query.hir.order_by {
+        collect(&term.expr);
+    }
+    if let Some(limit) = &query.hir.limit {
+        collect(&limit.limit);
+        if let Some(offset) = &limit.offset {
+            collect(offset);
+        }
+    }
+
+    for subquery in subqueries {
+        let query_id = match subquery {
+            SubqueryExpr::Scalar { query, .. }
+            | SubqueryExpr::Exists(query)
+            | SubqueryExpr::In { query, .. } => *query,
+        };
+        let child = plan.query(query_id).ok_or(PhysicalQueryError::Invalid(
+            "subquery is missing from the physical plan",
+        ))?;
+        if query_tree_has_outer_dependency(plan, child.id) {
+            continue;
+        }
+        let mut emitter = QuerySubqueryEmitter { plan, ctes };
+        emitter.emit_subquery(program, bindings, subquery)?;
+    }
+    Ok(())
+}
+
 fn emit_set_compound_query<'document>(
     plan: &PhysicalPlan<'document>,
     program: &mut ProgramBuilder,
@@ -1396,6 +1566,8 @@ fn emit_set_compound_query<'document>(
 
     bindings.enter_query(query.id)?;
     let emission = (|| -> QueryResult<()> {
+        materialize_ctes_owned_by_current_query(plan, program, bindings, ctes, query.id)?;
+        prepare_uncorrelated_subqueries(plan, program, bindings, ctes, query)?;
         let sorter = if query.hir.order_by.is_empty()
             || matches!(destination, QueryDestination::Exists { .. })
         {
