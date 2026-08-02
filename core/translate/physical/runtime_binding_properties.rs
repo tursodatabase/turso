@@ -1,6 +1,7 @@
 //! Properties for the catalog-free HIR-to-runtime binding boundary.
 
 use hegel::generators;
+use turso_parser::ast;
 
 use super::*;
 use crate::{
@@ -258,6 +259,52 @@ fn query_parents_and_output_slots_define_runtime_scope(tc: hegel::TestCase) {
         .bind_output(inner_output, inner_runtime)
         .expect("the q1 output belongs to q1");
     assert_eq!(bindings.output(inner_output), Ok(inner_runtime));
+}
+
+// Example: `SELECT * FROM saved_view` may enter the view's independent root
+// query while the caller query is active. Because that view query has no HIR
+// parent or captures, it still cannot read any caller source by accident.
+#[hegel::test]
+fn independent_queries_can_nest_without_inheriting_the_caller_scope(tc: hegel::TestCase) {
+    let width = generated_width(&tc);
+    let mut document = correlated_document(width);
+    let outer_query = QueryId::new(0);
+    let independent_query = QueryId::new(1);
+    let outer_source = SourceId::new(0);
+    document.queries[0].blocks[0].outputs[0].expr = Expr::column(outer_source, 0);
+    document.queries[1].parent = None;
+    document.queries[1].captures.clear();
+    document.queries[1].blocks[0].outputs[0].expr = Expr::Literal(ast::Literal::Null);
+    document.sources[outer_source.index()].kind = SourceKind::Derived(independent_query);
+    document.sources[outer_source.index()].columns.truncate(1);
+    document.sources[outer_source.index()]
+        .generated_expressions
+        .truncate(1);
+    document.sources[outer_source.index()]
+        .default_expressions
+        .truncate(1);
+    document.sources[outer_source.index()]
+        .column_type_programs
+        .truncate(1);
+    document
+        .validate()
+        .expect("the generated queries are independent closed roots");
+    let mut bindings = RuntimeBindings::new(&document, document.snapshot)
+        .expect("the generated HIR document is closed");
+
+    bindings
+        .enter_query(outer_query)
+        .expect("the caller query enters from the root frame");
+    bindings
+        .bind_source(outer_source, SourceRuntime::Cursor(CursorId(11)))
+        .expect("the caller owns its source");
+    bindings
+        .enter_query(independent_query)
+        .expect("an independent view query may execute inside its caller");
+    assert_eq!(
+        bindings.source(outer_source),
+        Err(RuntimeBindingError::SourceNotCaptured(outer_source))
+    );
 }
 
 // Example: a three-column OLD/NEW row image must map to three contiguous

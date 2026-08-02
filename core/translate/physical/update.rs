@@ -683,7 +683,7 @@ pub(crate) fn emit_root_update_with_context_and_after(
                 rowid: Some(new_rowid),
             },
         )?;
-        let result = emit_returning_values(program, &mut bindings, returning)?;
+        let result = emit_returning_values(plan, program, &mut bindings, returning)?;
         bindings.replace_source(update.target, old_runtime)?;
         emit_returning_result(program, result);
     }

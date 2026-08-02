@@ -315,7 +315,7 @@ pub(crate) fn emit_root_delete_with_context(
                 )
             })
             .transpose()?;
-        let result = emit_returning_values(program, &mut bindings, returning)?;
+        let result = emit_returning_values(plan, program, &mut bindings, returning)?;
         if let Some(previous) = previous {
             bindings.replace_source(delete.target, previous)?;
         }

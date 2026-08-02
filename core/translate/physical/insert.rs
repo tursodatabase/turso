@@ -694,7 +694,7 @@ fn finish_insert_row<'document>(
         )?;
     }
     if let Some(returning) = &insert.returning {
-        let result = emit_returning_values(program, bindings, returning)?;
+        let result = emit_returning_values(plan, program, bindings, returning)?;
         emit_returning_result(program, result);
     }
     Ok(())
@@ -1340,7 +1340,7 @@ fn emit_upsert_action<'document>(
         table_name: table.name.clone(),
     });
     if let Some(returning) = &insert.returning {
-        let result = emit_returning_values(program, bindings, returning)?;
+        let result = emit_returning_values(plan, program, bindings, returning)?;
         emit_returning_result(program, result);
     }
     bindings.replace_source(insert.target, old_target)?;

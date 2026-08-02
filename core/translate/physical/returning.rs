@@ -5,25 +5,35 @@ use crate::{
     vdbe::{builder::ProgramBuilder, insn::Insn},
 };
 
-use super::{ExpressionEmitter, PhysicalExpressionError, RegisterRange, RuntimeBindings};
+use super::{
+    emit_expression_for_dml, PhysicalPlan, PhysicalQueryError, RegisterRange, RuntimeBindings,
+};
 
-pub(crate) fn emit_returning_values(
+pub(crate) fn emit_returning_values<'document>(
+    plan: &PhysicalPlan<'document>,
     program: &mut ProgramBuilder,
-    bindings: &mut RuntimeBindings<'_>,
+    bindings: &mut RuntimeBindings<'document>,
     returning: &hir::Returning,
-) -> Result<RegisterRange, PhysicalExpressionError> {
+) -> Result<RegisterRange, PhysicalQueryError> {
     if returning.outputs.is_empty() {
-        return Err(PhysicalExpressionError::Invalid("RETURNING has no outputs"));
+        return Err(PhysicalQueryError::Invalid("RETURNING has no outputs"));
     }
     let result = RegisterRange::new(
         program.alloc_registers(returning.outputs.len()),
         returning.outputs.len(),
     );
     for (position, output) in returning.outputs.iter().enumerate() {
-        ExpressionEmitter::new(program, bindings).emit_into(
-            &output.expr,
-            RegisterRange::new(result.first.0 + position, 1),
-        )?;
+        let value = emit_expression_for_dml(plan, program, bindings, &output.expr)?;
+        if value.width != 1 {
+            return Err(PhysicalQueryError::Invalid(
+                "RETURNING output is not scalar",
+            ));
+        }
+        program.emit_insn(Insn::Copy {
+            src_reg: value.first.0,
+            dst_reg: result.first.0 + position,
+            extra_amount: 0,
+        });
     }
     Ok(result)
 }

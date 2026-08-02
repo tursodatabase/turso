@@ -223,7 +223,7 @@ impl<'document> RuntimeBindings<'document> {
             .document
             .query(query)
             .ok_or(RuntimeBindingError::UnknownQuery(query))?;
-        if definition.parent != self.current_query() {
+        if definition.parent.is_some() && definition.parent != self.current_query() {
             return Err(RuntimeBindingError::WrongScope("query"));
         }
         self.frames.push(RuntimeFrame {
