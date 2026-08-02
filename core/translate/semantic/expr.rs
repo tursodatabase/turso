@@ -3253,6 +3253,8 @@ fn validate_function_call(
         Func::Math(function) => arity_list_accepts(function.arities(), argument_count),
         Func::Vector(function) => arity_list_accepts(function.arities(), argument_count),
         #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+        Func::Fts(crate::function::FtsFunc::Highlight) => argument_count >= 4,
+        #[cfg(all(feature = "fts", not(target_family = "wasm")))]
         Func::Fts(function) => arity_list_accepts(function.arities(), argument_count),
         #[cfg(feature = "json")]
         Func::Json(function) => arity_list_accepts(function.arities(), argument_count),

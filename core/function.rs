@@ -392,7 +392,7 @@ pub enum FtsFunc {
     /// fts_match(col1, col2, ..., query): returns true if document matches query
     /// Used in WHERE clause for filtering rows by FTS match
     Match,
-    /// fts_highlight(text, query, before_tag, after_tag): returns text with matching terms highlighted
+    /// fts_highlight(text..., before_tag, after_tag, query): highlights matching terms
     /// Wraps matching query terms in the text with before_tag and after_tag markers
     Highlight,
 }
@@ -405,9 +405,8 @@ impl FtsFunc {
 
     pub fn arities(&self) -> &'static [i32] {
         match self {
-            Self::Highlight => &[4],
-            // Score and Match take variable columns + query
-            Self::Score | Self::Match => &[-1],
+            // All FTS functions accept a variable number of leading columns.
+            Self::Score | Self::Match | Self::Highlight => &[-1],
         }
     }
 }
