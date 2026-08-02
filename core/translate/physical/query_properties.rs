@@ -2286,15 +2286,17 @@ fn correlated_in_subqueries_use_captures_and_frozen_comparison_facts(tc: hegel::
     assert!(outer_next < row_set_close);
 }
 
-// Example: `SELECT sum(c4), count(*), avg(c1) FROM items WHERE c2 >= 0`
-// gives each aggregate a stable identity owned by this SELECT block. Physical
-// planning must borrow those exact HIR calls, step each identity once per
-// accepted row, finalize it once, and read its bound register for the output.
+// Example: `SELECT c3, sum(c4), count(*), avg(c1) FROM items
+// WHERE c2 >= 0 LIMIT 1` gives each aggregate a stable identity owned by this
+// SELECT block. Physical planning must also close the LIMIT branch after the
+// one aggregate result, even when bare columns retain values from the first row.
 #[hegel::test]
 fn ungrouped_aggregates_keep_hir_identity_through_physical_emission(tc: hegel::TestCase) {
     let width = usize::from(tc.draw(generators::integers::<u8>().max_value(11))) + 1;
     let aggregate_count = usize::from(tc.draw(generators::integers::<u8>().max_value(5))) + 1;
     let filter_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let bare_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let limit = tc.draw(generators::integers::<u8>().max_value(2));
     let columns = (0..width)
         .map(|position| format!("c{position} INTEGER"))
         .collect::<Vec<_>>()
@@ -2321,7 +2323,7 @@ fn ungrouped_aggregates_keep_hir_identity_through_physical_emission(tc: hegel::T
     let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
     let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
     let statement = parse_statement(&format!(
-        "SELECT {} FROM items WHERE c{filter_position} >= 0",
+        "SELECT c{bare_position}, {} FROM items WHERE c{filter_position} >= 0 LIMIT {limit}",
         functions.join(", ")
     ));
     let document = analyze(&context, AnalyzeInput::Statement(&statement))

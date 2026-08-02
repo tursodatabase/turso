@@ -2502,6 +2502,9 @@ fn emit_ungrouped_aggregate<'document>(
         )?;
         program.preassign_label_to_next_insn(skip);
         close_aggregate_distinct_sets(program, bindings, &block.aggregates)?;
+        if let Some(done) = row_cleanup_label(destination, limit) {
+            program.preassign_label_to_next_insn(done);
+        }
         Ok(())
     })();
     for (source, runtime) in original_sources.into_iter().rev() {
