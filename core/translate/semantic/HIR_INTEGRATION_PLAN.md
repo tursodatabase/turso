@@ -186,6 +186,8 @@ operations are not SQL binding.
         programs execute only from frozen HIR metadata.
   - [x] DDL index rebuilds use the same closed stored-expression HIR boundary;
         partial predicates run before expression keys for excluded rows.
+  - [x] Integrity and quick checks analyze CHECK, generated-column, partial,
+        and expression-index programs into one closed HIR batch per table.
 
 One syntax root uses exactly one semantic implementation. Falling back after a
 semantic error is forbidden because it would hide analyzer defects.
