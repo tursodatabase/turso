@@ -12,6 +12,7 @@ use turso_parser::ast::{CompoundOperator, Distinctness, Literal, NullsOrder, Sor
 
 use crate::{
     alloc::{TursoFromIterator, TursoIteratorExt, TursoVecExt},
+    emit_explain,
     function::{AccumulatorFunc, AggFunc, Func, WindowFunc},
     schema::{
         BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, PseudoCursorType, Table,
@@ -5422,6 +5423,7 @@ fn open_source<'document>(
     ctes: &mut MaterializedCtes,
     source: &PhysicalSource<'document>,
 ) -> QueryResult<OpenedScan<'document>> {
+    emit_source_explain(plan, program, source)?;
     let PhysicalSourceKind::CatalogTable { table, access } = &source.kind else {
         return match &source.kind {
             PhysicalSourceKind::Derived(query) => {
@@ -5582,6 +5584,67 @@ fn open_source<'document>(
                 owned: true,
             })
         }
+    }
+}
+
+fn emit_source_explain(
+    plan: &PhysicalPlan<'_>,
+    program: &mut ProgramBuilder,
+    source: &PhysicalSource<'_>,
+) -> QueryResult<()> {
+    let hir_source = plan
+        .document
+        .source(source.id)
+        .ok_or(PhysicalQueryError::Invalid(
+            "physical source has no HIR source",
+        ))?;
+    match &source.kind {
+        PhysicalSourceKind::CatalogTable { access, .. } => match access {
+            TableAccess::IndexMethod(access) => {
+                let method = access.pattern.index.value().index_method.as_ref().ok_or(
+                    PhysicalQueryError::Invalid("custom index access has no index method"),
+                )?;
+                emit_explain!(
+                    program,
+                    false,
+                    format!("QUERY INDEX METHOD {}", method.definition().method_name)
+                );
+            }
+            TableAccess::ForcedIndex(index) => emit_explain!(
+                program,
+                false,
+                format!(
+                    "SCAN {} USING INDEX {}",
+                    explain_source_name(hir_source),
+                    index.value().name
+                )
+            ),
+            TableAccess::Scan => emit_explain!(
+                program,
+                false,
+                format!("SCAN {}", explain_source_name(hir_source))
+            ),
+        },
+        PhysicalSourceKind::TableFunction { .. }
+        | PhysicalSourceKind::Cte(_)
+        | PhysicalSourceKind::Derived(_)
+        | PhysicalSourceKind::RecursiveInput(_) => {
+            emit_explain!(
+                program,
+                false,
+                format!("SCAN {}", explain_source_name(hir_source))
+            );
+        }
+        PhysicalSourceKind::Pseudo { .. } | PhysicalSourceKind::SchemaExpression => {}
+    }
+    Ok(())
+}
+
+fn explain_source_name(source: &crate::translate::semantic::hir::Source) -> String {
+    match source.alias.as_deref() {
+        None => source.name.clone(),
+        Some(alias) if alias == source.name => alias.to_string(),
+        Some(alias) => format!("{} AS {alias}", source.name),
     }
 }
 
