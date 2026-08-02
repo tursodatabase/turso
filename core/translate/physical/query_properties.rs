@@ -3670,18 +3670,18 @@ fn left_join_keeps_join_matching_separate_from_where(tc: hegel::TestCase) {
     );
 }
 
-// Examples: `l RIGHT JOIN r ON l.k = r.k` must null-extend `l` for an
-// unmatched right row; `l FULL JOIN r USING(k)` must additionally null-extend
-// `r` for an unmatched left row. NATURAL joins use the same frozen HIR merge
-// rule, and a later WHERE predicate runs only after either null extension.
+// Examples: `l RIGHT JOIN r USING(k)` must null-extend `l` for an unmatched
+// right row; `l FULL JOIN r ON l.k = r.k` must additionally null-extend `r`
+// for an unmatched left row. A later WHERE predicate runs only after either
+// null extension.
 #[hegel::test]
 fn two_source_right_and_full_joins_preserve_the_hir_sides(tc: hegel::TestCase) {
     let full = tc.draw(generators::integers::<u8>().max_value(1)) == 1;
     let keyword = if full { "FULL JOIN" } else { "RIGHT JOIN" };
-    let join = match tc.draw(generators::integers::<u8>().max_value(2)) {
-        0 => format!("{keyword} r ON l.k = r.k"),
-        1 => format!("{keyword} r USING(k)"),
-        _ => format!("NATURAL {keyword} r"),
+    let join = match (full, tc.draw(generators::integers::<u8>().max_value(2))) {
+        (true, _) | (false, 0) => format!("{keyword} r ON l.k = r.k"),
+        (false, 1) => format!("{keyword} r USING(k)"),
+        (false, _) => format!("NATURAL {keyword} r"),
     };
     let left = BTreeTable::from_sql("CREATE TABLE l(k INTEGER, lv TEXT)", 41)
         .expect("left table SQL is valid");
@@ -3757,6 +3757,83 @@ fn two_source_right_and_full_joins_preserve_the_hir_sides(tc: hegel::TestCase) {
         .insns
         .iter()
         .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 4, .. })));
+}
+
+// Examples: `l FULL JOIN r USING(k)` and `l NATURAL FULL JOIN r` both bind the
+// shared `k` column into HIR. The current executor cannot use that frozen merge
+// rule as its FULL JOIN key, so physical planning must return the established
+// compatibility error instead of rejecting SQL during binding or changing it.
+#[hegel::test]
+fn full_join_using_binds_before_the_physical_limit(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
+    let key_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let natural = tc.draw(generators::integers::<u8>().max_value(1)) == 1;
+    let left_columns = (0..width)
+        .map(|position| {
+            if position == key_position {
+                "k INTEGER".to_string()
+            } else {
+                format!("l{position} INTEGER")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let right_columns = (0..width)
+        .map(|position| {
+            if position == key_position {
+                "k INTEGER".to_string()
+            } else {
+                format!("r{position} INTEGER")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let left = BTreeTable::from_sql(&format!("CREATE TABLE l({left_columns})"), 41)
+        .expect("generated left table SQL is valid");
+    let right = BTreeTable::from_sql(&format!("CREATE TABLE r({right_columns})"), 43)
+        .expect("generated right table SQL is valid");
+    let mut schema = Schema::new();
+    schema.add_btree_table(Arc::new(left)).expect("l is unique");
+    schema
+        .add_btree_table(Arc::new(right))
+        .expect("r is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let join = if natural {
+        "NATURAL FULL JOIN r"
+    } else {
+        "FULL JOIN r USING(k)"
+    };
+    let statement = parse_statement(&format!("SELECT * FROM l {join}"));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("USING and NATURAL FULL JOIN bind into closed HIR");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let HirRoot::Query(root) = &document.root else {
+        panic!("the fixture is a query");
+    };
+    let query = &document.queries[root.query.index()];
+    let block = &query.blocks[query.first.index];
+    let join = &block.from.as_ref().expect("FULL JOIN has FROM").joins[0];
+    assert_eq!(join.kind, crate::translate::semantic::hir::JoinKind::Full);
+    match (&join.constraint, natural) {
+        (crate::translate::semantic::hir::JoinConstraint::Natural(columns), true)
+        | (crate::translate::semantic::hir::JoinConstraint::Using(columns), false) => {
+            assert_eq!(columns.len(), 1);
+        }
+        _ => panic!("binding preserves the generated join rule"),
+    }
+
+    let error = PhysicalPlan::new(&document).expect_err("the executor cannot plan this join rule");
+    assert_eq!(
+        error,
+        PhysicalPlanError::UnsupportedQuery(
+            "FULL OUTER JOIN requires an equality condition in the ON clause"
+        )
+    );
 }
 
 // Examples:

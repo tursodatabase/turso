@@ -14,12 +14,14 @@ use crate::translate::semantic::hir::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PhysicalPlanError {
     InvalidDocument(String),
+    UnsupportedQuery(&'static str),
 }
 
 impl fmt::Display for PhysicalPlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidDocument(message) => write!(formatter, "invalid HIR document: {message}"),
+            Self::UnsupportedQuery(message) => formatter.write_str(message),
         }
     }
 }
@@ -115,6 +117,11 @@ impl<'hir> PhysicalPlan<'hir> {
         document
             .validate()
             .map_err(|error| PhysicalPlanError::InvalidDocument(error.to_string()))?;
+        for query in &document.queries {
+            for block in &query.blocks {
+                reject_unsupported_full_join_constraint(block)?;
+            }
+        }
         let root = match &document.root {
             hir::HirRoot::Query(root) => PhysicalRoot::Query(root.query),
             hir::HirRoot::Insert(insert) => PhysicalRoot::Insert(insert),
@@ -199,6 +206,26 @@ impl<'hir> PhysicalPlan<'hir> {
             .get(id.index())
             .filter(|source| source.id == id)
     }
+}
+
+fn reject_unsupported_full_join_constraint(block: &QueryBlock) -> Result<(), PhysicalPlanError> {
+    let Some(from) = &block.from else {
+        return Ok(());
+    };
+    for join in &from.joins {
+        let has_using_columns = match &join.constraint {
+            hir::JoinConstraint::Using(columns) | hir::JoinConstraint::Natural(columns) => {
+                !columns.is_empty()
+            }
+            hir::JoinConstraint::None | hir::JoinConstraint::On(_) => false,
+        };
+        if join.kind == hir::JoinKind::Full && has_using_columns {
+            return Err(PhysicalPlanError::UnsupportedQuery(
+                "FULL OUTER JOIN requires an equality condition in the ON clause",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn collect_block_functions<'hir>(
