@@ -498,6 +498,57 @@ pub(crate) fn emit_query_for_dml<'document>(
     })
 }
 
+/// Emit one DML expression with the same subquery and CTE machinery used by
+/// query blocks. The caller only supplies the already-bound row sources; all
+/// QueryId destinations stay private to the physical query layer.
+pub(crate) fn emit_expression_for_dml<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    expression: &Expr,
+) -> QueryResult<RegisterRange> {
+    let mut query_ids = Vec::new();
+    expression.walk(&mut |expression| {
+        let Expr::Subquery(subquery) = expression else {
+            return;
+        };
+        let query_id = match subquery {
+            SubqueryExpr::Scalar { query, .. }
+            | SubqueryExpr::Exists(query)
+            | SubqueryExpr::In { query, .. } => *query,
+        };
+        if !query_ids.contains(&query_id) {
+            query_ids.push(query_id);
+        }
+    });
+
+    let mut ctes = MaterializedCtes::default();
+    for query_id in query_ids {
+        for cte in query_tree_ctes(plan, query_id)? {
+            materialize_cte(plan, program, bindings, &mut ctes, cte)?;
+        }
+    }
+    let mut subqueries = QuerySubqueryEmitter {
+        plan,
+        ctes: &mut ctes,
+    };
+    let result =
+        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries).emit_new(expression);
+    if result.is_ok() {
+        for cursor_id in ctes.temporary_cursors.iter().rev() {
+            program.emit_insn(Insn::Close {
+                cursor_id: *cursor_id,
+            });
+        }
+        for cte in ctes.by_id.values() {
+            program.emit_insn(Insn::Close {
+                cursor_id: cte.cursor_id,
+            });
+        }
+    }
+    result.map_err(Into::into)
+}
+
 /// Materialize one stable UPDATE FROM candidate per target rowid. Assignment
 /// values are evaluated while every FROM SourceId is still bound; inserting
 /// by target rowid makes a later match replace an earlier match, matching

@@ -15,8 +15,8 @@ use crate::{
 };
 
 use super::{
-    close_indexes, emit_complete_logical_row, emit_index_insert, emit_index_key,
-    emit_new_row_constraints, emit_query_for_dml, emit_replace_conflicting_row,
+    close_indexes, emit_complete_logical_row, emit_expression_for_dml, emit_index_insert,
+    emit_index_key, emit_new_row_constraints, emit_query_for_dml, emit_replace_conflicting_row,
     emit_replace_not_null_defaults, emit_replace_unique_check, emit_returning_result,
     emit_returning_values, emit_stored_record, emit_trigger_programs, emit_unique_check,
     open_indexes, record_from_registers, CdcChange, CursorId, ExpressionEmitter, OpenedIndex,
@@ -199,6 +199,7 @@ pub(crate) fn emit_root_insert_with_context(
         InsertSource::DefaultValues => {
             let skip_row = program.allocate_label();
             emit_insert_row(
+                plan,
                 program,
                 &mut bindings,
                 insert,
@@ -220,6 +221,7 @@ pub(crate) fn emit_root_insert_with_context(
             for row in rows {
                 let skip_row = program.allocate_label();
                 emit_insert_row(
+                    plan,
                     program,
                     &mut bindings,
                     insert,
@@ -250,6 +252,7 @@ pub(crate) fn emit_root_insert_with_context(
             });
             program.preassign_label_to_next_insn(next);
             emit_insert_query_row(
+                plan,
                 program,
                 &mut bindings,
                 insert,
@@ -290,9 +293,10 @@ pub(crate) fn emit_root_insert_with_context(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_insert_row(
+fn emit_insert_row<'document>(
+    plan: &PhysicalPlan<'document>,
     program: &mut ProgramBuilder,
-    bindings: &mut RuntimeBindings<'_>,
+    bindings: &mut RuntimeBindings<'document>,
     insert: &hir::Insert,
     table: &crate::sync::Arc<crate::schema::BTreeTable>,
     cursor: usize,
@@ -316,11 +320,19 @@ fn emit_insert_row(
 
     for (target, value) in insert.columns.iter().zip(values) {
         let destination = target_register(*target, logical, rowid)?;
-        ExpressionEmitter::new(program, bindings)
-            .emit_into(value, RegisterRange::new(destination.0, 1))?;
+        let result = emit_expression_for_dml(plan, program, bindings, value)?;
+        if result.width != 1 {
+            return Err(PhysicalInsertError::Invalid("INSERT value is not scalar"));
+        }
+        program.emit_insn(Insn::Copy {
+            src_reg: result.first.0,
+            dst_reg: destination.0,
+            extra_amount: 0,
+        });
     }
-    emit_insert_defaults(program, bindings, insert, logical)?;
+    emit_insert_defaults(plan, program, bindings, insert, logical)?;
     finish_insert_row(
+        plan,
         program,
         bindings,
         insert,
@@ -338,9 +350,10 @@ fn emit_insert_row(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_insert_query_row(
+fn emit_insert_query_row<'document>(
+    plan: &PhysicalPlan<'document>,
     program: &mut ProgramBuilder,
-    bindings: &mut RuntimeBindings<'_>,
+    bindings: &mut RuntimeBindings<'document>,
     insert: &hir::Insert,
     table: &crate::sync::Arc<crate::schema::BTreeTable>,
     cursor: usize,
@@ -359,8 +372,9 @@ fn emit_insert_query_row(
         let destination = target_register(*target, logical, rowid)?;
         program.emit_column_or_rowid(query_cursor, position, destination.0);
     }
-    emit_insert_defaults(program, bindings, insert, logical)?;
+    emit_insert_defaults(plan, program, bindings, insert, logical)?;
     finish_insert_row(
+        plan,
         program,
         bindings,
         insert,
@@ -401,9 +415,10 @@ fn target_register(
     }
 }
 
-fn emit_insert_defaults(
+fn emit_insert_defaults<'document>(
+    plan: &PhysicalPlan<'document>,
     program: &mut ProgramBuilder,
-    bindings: &mut RuntimeBindings<'_>,
+    bindings: &mut RuntimeBindings<'document>,
     insert: &hir::Insert,
     logical: RegisterRange,
 ) -> InsertResult<()> {
@@ -416,8 +431,15 @@ fn emit_insert_defaults(
             .ok_or(PhysicalInsertError::Invalid(
                 "default column is outside the row",
             ))?;
-        ExpressionEmitter::new(program, bindings)
-            .emit_into(&default.value, RegisterRange::new(destination.0, 1))?;
+        let result = emit_expression_for_dml(plan, program, bindings, &default.value)?;
+        if result.width != 1 {
+            return Err(PhysicalInsertError::Invalid("INSERT default is not scalar"));
+        }
+        program.emit_insn(Insn::Copy {
+            src_reg: result.first.0,
+            dst_reg: destination.0,
+            extra_amount: 0,
+        });
     }
     Ok(())
 }
@@ -435,9 +457,10 @@ pub(super) fn column_needs_default(columns: &[hir::TargetColumn], column: usize)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn finish_insert_row(
+fn finish_insert_row<'document>(
+    plan: &PhysicalPlan<'document>,
     program: &mut ProgramBuilder,
-    bindings: &mut RuntimeBindings<'_>,
+    bindings: &mut RuntimeBindings<'document>,
     insert: &hir::Insert,
     table: &crate::sync::Arc<crate::schema::BTreeTable>,
     cursor: usize,
@@ -546,8 +569,8 @@ fn finish_insert_row(
         .unwrap_or("rowid");
     if let Some(upsert) = upsert_for_rowid(insert) {
         emit_upsert_action(
-            program, bindings, insert, upsert, table, cursor, logical, record, indexes, rowid,
-            skip_row,
+            plan, program, bindings, insert, upsert, table, cursor, logical, record, indexes,
+            rowid, skip_row,
         )?;
     } else if insert
         .conflict
@@ -592,8 +615,8 @@ fn finish_insert_row(
         let key = emit_index_key(program, bindings, insert.target, rowid, index, true)?;
         if let Some(upsert) = upsert_for_index(insert, index) {
             emit_upsert_unique_check(
-                program, bindings, insert, upsert, table, cursor, logical, record, indexes, index,
-                &key, skip_row,
+                plan, program, bindings, insert, upsert, table, cursor, logical, record, indexes,
+                index, &key, skip_row,
             )?;
         } else {
             let conflict = insert
@@ -1083,9 +1106,10 @@ fn upsert_for_index<'insert>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_upsert_unique_check(
+fn emit_upsert_unique_check<'document>(
+    plan: &PhysicalPlan<'document>,
     program: &mut ProgramBuilder,
-    bindings: &mut RuntimeBindings<'_>,
+    bindings: &mut RuntimeBindings<'document>,
     insert: &hir::Insert,
     upsert: &hir::Upsert,
     table: &crate::sync::Arc<crate::schema::BTreeTable>,
@@ -1120,6 +1144,7 @@ fn emit_upsert_unique_check(
         dest: conflicting_rowid.0,
     });
     emit_upsert_action(
+        plan,
         program,
         bindings,
         insert,
@@ -1137,9 +1162,10 @@ fn emit_upsert_unique_check(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_upsert_action(
+fn emit_upsert_action<'document>(
+    plan: &PhysicalPlan<'document>,
     program: &mut ProgramBuilder,
-    bindings: &mut RuntimeBindings<'_>,
+    bindings: &mut RuntimeBindings<'document>,
     insert: &hir::Insert,
     upsert: &hir::Upsert,
     table: &crate::sync::Arc<crate::schema::BTreeTable>,
@@ -1169,7 +1195,7 @@ fn emit_upsert_action(
     let proposed_target =
         bindings.replace_source(insert.target, SourceRuntime::Cursor(CursorId(cursor)))?;
     if let Some(predicate) = predicate {
-        let condition = ExpressionEmitter::new(program, bindings).emit_new(predicate)?;
+        let condition = emit_expression_for_dml(plan, program, bindings, predicate)?;
         if condition.width != 1 {
             return Err(PhysicalInsertError::Invalid(
                 "UPSERT WHERE result is not scalar",
@@ -1184,7 +1210,7 @@ fn emit_upsert_action(
 
     let mut assignment_values = Vec::with_capacity(assignments.len());
     for assignment in assignments {
-        let value = ExpressionEmitter::new(program, bindings).emit_new(&assignment.value)?;
+        let value = emit_expression_for_dml(plan, program, bindings, &assignment.value)?;
         if value.width != assignment.columns.len() {
             return Err(PhysicalInsertError::Invalid(
                 "UPSERT assignment width does not match its target columns",

@@ -15,15 +15,15 @@ use crate::{
 };
 
 use super::{
-    CdcChange, CursorId, ExpressionEmitter, PhysicalExpressionError, PhysicalForeignKeyError,
-    PhysicalIndexError, PhysicalPlan, PhysicalRoot, PhysicalRowError, PhysicalSourceKind,
-    PhysicalTriggerError, PreparedCdc, PreparedTriggers, RegisterId, RegisterRange,
-    RootRuntimeInputs, RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
-    TriggerRow, TriggerRows, close_indexes, emit_complete_logical_row, emit_index_delete,
+    close_indexes, emit_complete_logical_row, emit_expression_for_dml, emit_index_delete,
     emit_index_insert, emit_index_key, emit_new_row_constraints, emit_replace_conflicting_row,
     emit_replace_not_null_defaults, emit_replace_unique_check, emit_returning_result,
     emit_returning_values, emit_stored_record, emit_trigger_programs, emit_unique_check,
-    open_indexes, record_from_registers, update_record,
+    open_indexes, record_from_registers, update_record, CdcChange, CursorId, ExpressionEmitter,
+    PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError, PhysicalPlan,
+    PhysicalRoot, PhysicalRowError, PhysicalSourceKind, PhysicalTriggerError, PreparedCdc,
+    PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs, RuntimeBindingError,
+    RuntimeBindings, SourceRuntime, TableAccess, TriggerRow, TriggerRows,
 };
 
 #[derive(Debug)]
@@ -203,7 +203,7 @@ pub(crate) fn emit_root_update_with_context(
         });
         program.preassign_label_to_next_insn(scan_start);
         if let Some(predicate) = &update.predicate {
-            let condition = ExpressionEmitter::new(program, &mut bindings).emit_new(predicate)?;
+            let condition = emit_expression_for_dml(plan, program, &mut bindings, predicate)?;
             if condition.width != 1 {
                 return Err(PhysicalUpdateError::Invalid("WHERE result is not scalar"));
             }
@@ -307,8 +307,7 @@ pub(crate) fn emit_root_update_with_context(
         }
     } else {
         for assignment in &update.assignments {
-            let values =
-                ExpressionEmitter::new(program, &mut bindings).emit_new(&assignment.value)?;
+            let values = emit_expression_for_dml(plan, program, &mut bindings, &assignment.value)?;
             if values.width != assignment.columns.len() {
                 return Err(PhysicalUpdateError::Invalid(
                     "assignment width does not match its target columns",

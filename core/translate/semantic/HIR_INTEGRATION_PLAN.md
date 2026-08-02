@@ -80,7 +80,9 @@ operations are not SQL binding.
   - [x] Grouped core aggregates emit from frozen HIR grouping type/collation
         facts and preserve source and aggregate identities through sorter
         materialization.
-  - [ ] Ordered, DISTINCT, comparison-based, custom, and external aggregates.
+  - [x] DISTINCT, comparison-based, custom, and external aggregates carry
+        independent runtime state from their frozen HIR calls.
+  - [ ] Aggregate argument ORDER BY.
   - [x] Binary `UNION`, `INTERSECT`, and `EXCEPT` use temporary set indexes
         whose equality collations come from the left HIR outputs.
   - [x] Mixed and multi-arm duplicate-removing compounds preserve SQLite's
@@ -109,9 +111,12 @@ operations are not SQL binding.
   - [x] UPDATE FROM evaluates predicates and assignments while target and FROM
         SourceIds are live, then materializes one stable value row per target
         rowid before the write phase.
+  - [x] Correlated scalar and EXISTS subqueries in UPDATE predicates and
+        assignments, and DELETE predicates, share the query layer's QueryId
+        destinations and CTE lifetime rules.
   - [x] UPDATE child-key changes remove deferred OLD violations and validate
         the complete NEW row through frozen parent table/index identities.
-  - [ ] Triggers and foreign keys.
+  - [x] Triggers and foreign keys.
 - [ ] INSERT, VALUES, INSERT SELECT, UPSERT, excluded, defaults, and RETURNING.
   - [x] VALUES and DEFAULT VALUES build supplied fields, frozen defaults, and
         generated columns through the shared row-image layer for simple rowid
@@ -140,6 +145,8 @@ operations are not SQL binding.
   - [x] INSERT probes frozen rowid or UNIQUE parent identities for child keys,
         accepts NEW self-references, and repairs deferred counters when a new
         parent key satisfies existing child rows.
+  - [x] VALUES and UPSERT expressions use the same subquery-capable physical
+        HIR expression boundary as query roots.
 - [x] Trigger commands and predicates with explicit OLD/NEW runtime bindings.
 - [ ] Generated columns, defaults, CHECK constraints, expression and partial
       indexes, and custom-type schema programs.

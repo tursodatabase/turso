@@ -12,7 +12,7 @@ use turso_parser::ast::{RefAct, TriggerTime};
 
 use crate::{
     schema::Table,
-    translate::semantic::hir::{Expr, IndexCoverage, SourceKind},
+    translate::semantic::hir::{IndexCoverage, SourceKind},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{Insn, RegisterOrLiteral},
@@ -20,12 +20,13 @@ use crate::{
 };
 
 use super::{
-    close_indexes, emit_index_delete, emit_index_key, emit_returning_result, emit_returning_values,
-    emit_trigger_programs, open_indexes, record_from_cursor, CdcChange, CursorId,
-    ExpressionEmitter, PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError,
-    PhysicalPlan, PhysicalQueryError, PhysicalRoot, PhysicalSourceKind, PhysicalTriggerError,
-    PreparedCdc, PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs,
-    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess, TriggerRow, TriggerRows,
+    close_indexes, emit_expression_for_dml, emit_index_delete, emit_index_key,
+    emit_returning_result, emit_returning_values, emit_trigger_programs, open_indexes,
+    record_from_cursor, CdcChange, CursorId, PhysicalExpressionError, PhysicalForeignKeyError,
+    PhysicalIndexError, PhysicalPlan, PhysicalQueryError, PhysicalRoot, PhysicalSourceKind,
+    PhysicalTriggerError, PreparedCdc, PreparedTriggers, RegisterId, RegisterRange,
+    RootRuntimeInputs, RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
+    TriggerRow, TriggerRows,
 };
 
 #[derive(Debug)]
@@ -35,6 +36,7 @@ pub(crate) enum PhysicalDeleteError {
     Index(PhysicalIndexError),
     Trigger(PhysicalTriggerError),
     ForeignKey(PhysicalForeignKeyError),
+    Query(PhysicalQueryError),
     Cdc(crate::LimboError),
     Invalid(&'static str),
     Unsupported(&'static str),
@@ -48,6 +50,7 @@ impl fmt::Display for PhysicalDeleteError {
             Self::Index(error) => error.fmt(formatter),
             Self::Trigger(error) => error.fmt(formatter),
             Self::ForeignKey(error) => error.fmt(formatter),
+            Self::Query(error) => error.fmt(formatter),
             Self::Cdc(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical DELETE: {message}"),
             Self::Unsupported(message) => {
@@ -86,6 +89,12 @@ impl From<PhysicalTriggerError> for PhysicalDeleteError {
 impl From<PhysicalForeignKeyError> for PhysicalDeleteError {
     fn from(error: PhysicalForeignKeyError) -> Self {
         Self::ForeignKey(error)
+    }
+}
+
+impl From<PhysicalQueryError> for PhysicalDeleteError {
+    fn from(error: PhysicalQueryError) -> Self {
+        Self::Query(error)
     }
 }
 
@@ -221,7 +230,7 @@ pub(crate) fn emit_root_delete_with_context(
     });
     program.preassign_label_to_next_insn(loop_start);
     if let Some(predicate) = &delete.predicate {
-        let condition = ExpressionEmitter::new(program, &mut bindings).emit_new(predicate)?;
+        let condition = emit_expression_for_dml(plan, program, &mut bindings, predicate)?;
         if condition.width != 1 {
             return Err(PhysicalDeleteError::Invalid("WHERE result is not scalar"));
         }
@@ -412,10 +421,6 @@ fn preflight_delete<'plan>(
             "mutating foreign-key action has no prepared HIR program",
         ));
     }
-    if delete.predicate.as_ref().is_some_and(contains_subquery) {
-        return Err(PhysicalDeleteError::Unsupported("subquery in WHERE"));
-    }
-
     let source = plan
         .document
         .source(delete.target)
@@ -459,10 +464,4 @@ fn preflight_delete<'plan>(
         return Err(PhysicalDeleteError::Unsupported("WITHOUT ROWID target"));
     }
     Ok((source, table.clone(), database))
-}
-
-fn contains_subquery(expression: &Expr) -> bool {
-    let mut found = false;
-    expression.walk(&mut |expression| found |= matches!(expression, Expr::Subquery(_)));
-    found
 }

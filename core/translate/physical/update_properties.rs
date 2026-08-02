@@ -538,3 +538,79 @@ fn update_from_materializes_hir_assignment_values_before_writing(tc: hegel::Test
             .any(|(instruction, _)| matches!(instruction, Insn::RowSetAdd { .. }))
     );
 }
+
+// Examples:
+// - `DELETE FROM items WHERE EXISTS (SELECT 1 FROM lookup WHERE
+//   lookup.c0 = items.c0)` must keep the outer target SourceId live while the
+//   nested query scans its own resolved source, then close that query before
+//   deleting the matching row.
+// - `UPDATE items SET c1 = (SELECT lookup.c1 FROM lookup WHERE
+//   lookup.c0 = items.c0 LIMIT 1) WHERE EXISTS (...)` must use the same query
+//   layer for both the predicate and assignment; neither expression may fall
+//   back to a DML-only binder or catalog lookup.
+#[hegel::test]
+fn dml_subqueries_share_the_closed_hir_query_layer(tc: hegel::TestCase) {
+    let update = tc.draw(generators::booleans());
+    let offset = i64::from(tc.draw(generators::integers::<u8>().max_value(31)));
+    let items = Arc::new(
+        BTreeTable::from_sql("CREATE TABLE items(c0 INTEGER, c1 INTEGER)", 12)
+            .expect("fixture target SQL is valid"),
+    );
+    let lookup = Arc::new(
+        BTreeTable::from_sql("CREATE TABLE lookup(c0 INTEGER, c1 INTEGER)", 13)
+            .expect("fixture lookup SQL is valid"),
+    );
+    let mut schema = Schema::new();
+    schema.add_btree_table(items).expect("items is unique");
+    schema.add_btree_table(lookup).expect("lookup is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let sql = if update {
+        format!(
+            "UPDATE items SET c1 = (SELECT lookup.c1 FROM lookup \
+             WHERE lookup.c0 = items.c0 LIMIT 1) \
+             WHERE EXISTS (SELECT 1 FROM lookup \
+             WHERE lookup.c0 = items.c0 AND lookup.c1 > {offset})"
+        )
+    } else {
+        format!(
+            "DELETE FROM items WHERE EXISTS (SELECT 1 FROM lookup \
+             WHERE lookup.c0 = items.c0 AND lookup.c1 > {offset})"
+        )
+    };
+    let statement = parse_statement(&sql);
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("correlated DML subqueries have valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed DML subqueries have a physical plan");
+    let mut program = program();
+    emit_root(&plan, &mut program).expect("DML subqueries emit without a resolver");
+    program
+        .resolve_labels()
+        .expect("all DML subquery branches are closed");
+
+    let lookup_scans = program
+        .insns
+        .iter()
+        .filter(|(instruction, _)| matches!(instruction, Insn::OpenRead { root_page: 13, .. }))
+        .count();
+    assert_eq!(lookup_scans, if update { 2 } else { 1 });
+    assert!(program.insns.iter().any(|(instruction, _)| {
+        matches!(
+            instruction,
+            Insn::Delete {
+                table_name,
+                ..
+            } if table_name == "items"
+        )
+    }));
+    if update {
+        assert!(program.insns.iter().any(|(instruction, _)| {
+            matches!(instruction, Insn::Insert { table_name, .. } if table_name == "items")
+        }));
+    }
+}
