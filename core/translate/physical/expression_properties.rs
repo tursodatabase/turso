@@ -5,14 +5,13 @@ use turso_parser::{ast, parser::Parser};
 
 use super::*;
 use crate::{
-    QueryMode, SymbolTable,
     dialect::{Dialect, SqliteDialect},
     schema::{BTreeTable, Schema, Type},
     sync::Arc,
     translate::{
         collate::CollationSeq,
         semantic::{
-            AnalyzeInput, analyze,
+            analyze,
             context::SemanticContext,
             hir::{
                 BoundCastPrograms, BoundSchemaCall, BoundSchemaProgram, CatalogSnapshot,
@@ -21,6 +20,7 @@ use crate::{
                 QueryId, QueryRoot, SchemaProgramId, Source, SourceColumn, SourceId, SourceKind,
                 SourceOwner, TypeFact, TypeName,
             },
+            AnalyzeInput,
         },
     },
     vdbe::{
@@ -28,6 +28,7 @@ use crate::{
         builder::{CursorType, ProgramBuilder, ProgramBuilderOpts},
         insn::Insn,
     },
+    QueryMode, SymbolTable,
 };
 
 fn parse_statement(sql: &str) -> ast::Stmt {
@@ -499,16 +500,12 @@ fn stored_column_reads_use_frozen_hir_and_physical_positions(tc: hegel::TestCase
             ..
         } if *cursor_id == cursor
     )));
-    assert!(
-        generated_insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::Add { .. }))
-    );
-    assert!(
-        !generated_insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::Column { column: 1, .. }))
-    );
+    assert!(generated_insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::Add { .. })));
+    assert!(!generated_insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::Column { column: 1, .. })));
 
     let default_start = program.insns.len();
     ExpressionEmitter::new(&mut program, &mut bindings)
@@ -714,28 +711,24 @@ fn lazy_scalar_functions_do_not_evaluate_unselected_branches(tc: hegel::TestCase
         })
         .expect("unselected branch still has runtime bytecode");
     if coalesce {
-        assert!(
-            program.insns[..random]
-                .iter()
-                .any(|(instruction, _)| matches!(
-                    instruction,
-                    Insn::NotNull {
-                        target_pc: crate::vdbe::BranchOffset::Offset(target),
-                        ..
-                    } if *target as usize == random + 1
-                ))
-        );
+        assert!(program.insns[..random]
+            .iter()
+            .any(|(instruction, _)| matches!(
+                instruction,
+                Insn::NotNull {
+                    target_pc: crate::vdbe::BranchOffset::Offset(target),
+                    ..
+                } if *target as usize == random + 1
+            )));
     } else {
-        assert!(
-            program.insns[..random]
-                .iter()
-                .any(|(instruction, _)| matches!(
-                    instruction,
-                    Insn::Goto {
-                        target_pc: crate::vdbe::BranchOffset::Offset(target),
-                    } if *target as usize == random + 1
-                ))
-        );
+        assert!(program.insns[..random]
+            .iter()
+            .any(|(instruction, _)| matches!(
+                instruction,
+                Insn::Goto {
+                    target_pc: crate::vdbe::BranchOffset::Offset(target),
+                } if *target as usize == random + 1
+            )));
     }
 }
 

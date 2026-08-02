@@ -63,6 +63,8 @@ type DeleteResult<T> = std::result::Result<T, PhysicalDeleteError>;
 #[derive(Debug)]
 pub(crate) enum PhysicalRootError {
     Query(PhysicalQueryError),
+    Insert(super::PhysicalInsertError),
+    Update(super::PhysicalUpdateError),
     Delete(PhysicalDeleteError),
     Unsupported(&'static str),
 }
@@ -71,6 +73,8 @@ impl fmt::Display for PhysicalRootError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Query(error) => error.fmt(formatter),
+            Self::Insert(error) => error.fmt(formatter),
+            Self::Update(error) => error.fmt(formatter),
             Self::Delete(error) => error.fmt(formatter),
             Self::Unsupported(message) => {
                 write!(formatter, "physical root is not emitted yet: {message}")
@@ -93,8 +97,12 @@ pub(crate) fn emit_root(
         PhysicalRoot::Delete(_) => {
             emit_root_delete(plan, program).map_err(PhysicalRootError::Delete)
         }
-        PhysicalRoot::Insert(_) => Err(PhysicalRootError::Unsupported("INSERT root")),
-        PhysicalRoot::Update(_) => Err(PhysicalRootError::Unsupported("UPDATE root")),
+        PhysicalRoot::Insert(_) => {
+            super::emit_root_insert(plan, program).map_err(PhysicalRootError::Insert)
+        }
+        PhysicalRoot::Update(_) => {
+            super::emit_root_update(plan, program).map_err(PhysicalRootError::Update)
+        }
         PhysicalRoot::TriggerPredicate(_) => {
             Err(PhysicalRootError::Unsupported("trigger predicate root"))
         }

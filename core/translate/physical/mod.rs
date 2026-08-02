@@ -5,15 +5,21 @@
 
 mod delete;
 mod expression;
+mod insert;
 mod plan;
 mod query;
+mod row;
 mod runtime_bindings;
+mod update;
 
 pub(crate) use delete::*;
 pub(crate) use expression::*;
+pub(crate) use insert::*;
 pub(crate) use plan::*;
 pub(crate) use query::*;
+pub(crate) use row::*;
 pub(crate) use runtime_bindings::*;
+pub(crate) use update::*;
 
 #[cfg(test)]
 mod delete_properties;
@@ -22,7 +28,13 @@ mod delete_properties;
 mod expression_properties;
 
 #[cfg(test)]
+mod insert_properties;
+
+#[cfg(test)]
 mod query_properties;
 
 #[cfg(test)]
 mod runtime_binding_properties;
+
+#[cfg(test)]
+mod update_properties;

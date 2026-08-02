@@ -340,6 +340,31 @@ impl<'program, 'bindings, 'document> ExpressionEmitter<'program, 'bindings, 'doc
         Ok(RegisterRange::new(target, 1))
     }
 
+    /// Apply the frozen storage rules for one logical table field. DML calls
+    /// this only after SQL expressions for the row have finished evaluating.
+    pub(crate) fn emit_column_storage_value(
+        &mut self,
+        source: hir::SourceId,
+        column: usize,
+        target: usize,
+    ) -> ExpressionResult<()> {
+        let definition = self
+            .document
+            .source(source)
+            .ok_or(RuntimeBindingError::UnknownSource(source))?;
+        let metadata = definition
+            .columns
+            .get(column)
+            .ok_or(PhysicalExpressionError::Invalid(
+                "column position is outside its source",
+            ))?;
+        self.program.emit_column_affinity(target, metadata.affinity);
+        if let Some(programs) = &definition.column_type_programs[column] {
+            self.emit_column_storage_encode(programs, target)?;
+        }
+        Ok(())
+    }
+
     fn emit_column(&mut self, column: hir::ColumnRef, target: usize) -> ExpressionResult<()> {
         let source = self
             .bindings
