@@ -6,6 +6,7 @@
 mod cdc;
 mod delete;
 mod expression;
+mod foreign_keys;
 mod index;
 mod insert;
 mod plan;
@@ -19,6 +20,7 @@ mod update;
 pub(crate) use cdc::*;
 pub(crate) use delete::*;
 pub(crate) use expression::*;
+pub(crate) use foreign_keys::*;
 pub(crate) use index::*;
 pub(crate) use insert::*;
 pub(crate) use plan::*;

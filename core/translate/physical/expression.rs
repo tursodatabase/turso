@@ -855,7 +855,7 @@ impl<'program, 'bindings, 'document> ExpressionEmitter<'program, 'bindings, 'doc
             _ => {
                 return Err(PhysicalExpressionError::Invalid(
                     "non-function binary operator",
-                ))
+                ));
             }
         };
         self.program.emit_insn(Insn::Function {

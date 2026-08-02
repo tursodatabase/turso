@@ -9,7 +9,7 @@ use crate::{
     sync::Arc,
     translate::semantic::{
         analyze,
-        context::SemanticContext,
+        context::{DmlPolicy, SemanticContext},
         hir::{ColumnReadExpression, HirRoot, InsertSource, TargetColumn},
         AnalyzeInput,
     },
@@ -85,6 +85,114 @@ fn parse_statement(sql: &str) -> ast::Stmt {
 
 fn program() -> ProgramBuilder {
     ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 32, 8))
+}
+
+// Examples: `INSERT INTO children(c2) VALUES (7)` probes the frozen
+// `parents.p1 INTEGER PRIMARY KEY` rowid before writing the child; inserting
+// NULL skips the probe, and `INSERT INTO node(id,parent) VALUES(4,4)` accepts
+// the NEW row as its own parent. The generated position proves the emitter
+// uses HIR offsets, not a new lookup of the SQL column names.
+#[hegel::test]
+fn insert_child_foreign_keys_probe_the_frozen_parent_position(tc: hegel::TestCase) {
+    let child_width = usize::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(10)));
+    let parent_width =
+        usize::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(10)));
+    let child_position = tc.draw(generators::integers::<usize>().max_value(child_width - 1));
+    let parent_position = tc.draw(generators::integers::<usize>().max_value(parent_width - 1));
+    let parent_columns = (0..parent_width)
+        .map(|position| {
+            if position == parent_position {
+                format!("p{position} INTEGER PRIMARY KEY")
+            } else {
+                format!("p{position} INTEGER")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let child_columns = (0..child_width)
+        .map(|position| {
+            if position == child_position {
+                format!("c{position} INTEGER REFERENCES parents(p{parent_position})")
+            } else {
+                format!("c{position} INTEGER")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let parent = BTreeTable::from_sql(&format!("CREATE TABLE parents({parent_columns})"), 17)
+        .expect("generated parent table is valid");
+    let child = BTreeTable::from_sql(&format!("CREATE TABLE children({child_columns})"), 19)
+        .expect("generated child table is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(parent))
+        .expect("parents is unique");
+    schema
+        .add_btree_table(Arc::new(child))
+        .expect("children is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect)
+        .with_dml_policy(DmlPolicy::new(false, false, false, false, true));
+    let statement = parse_statement(&format!(
+        "INSERT INTO children(c{child_position}) VALUES (7)"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated FK insert has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed FK INSERT has a physical plan");
+    let mut program = program();
+    emit_root_insert(&plan, &mut program).expect("child FK emits without a resolver");
+    program
+        .resolve_labels()
+        .expect("all child FK branches are closed");
+
+    let (parent_open, parent_cursor) = program
+        .insns
+        .iter()
+        .enumerate()
+        .find_map(|(position, (instruction, _))| match instruction {
+            Insn::OpenRead {
+                cursor_id,
+                root_page: 17,
+                ..
+            } => Some((position, *cursor_id)),
+            _ => None,
+        })
+        .expect("the frozen parent table is opened directly");
+    let probe = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(
+                instruction,
+                Insn::NotExists { cursor, .. } if *cursor == parent_cursor
+            )
+        })
+        .expect("the parent rowid is probed");
+    let child_write = program
+        .insns
+        .iter()
+        .rposition(|(instruction, _)| {
+            matches!(
+                instruction,
+                Insn::Insert { table_name, .. } if table_name == "children"
+            )
+        })
+        .expect("the child row is written");
+    assert!(parent_open < probe && probe < child_write);
+    assert!(program.insns[probe..child_write]
+        .iter()
+        .any(|(instruction, _)| matches!(
+            instruction,
+            Insn::FkCounter {
+                increment_value: 1,
+                ..
+            }
+        )));
 }
 
 // Example: for

@@ -6,7 +6,7 @@ use turso_parser::ast::{ResolveType, TriggerTime};
 
 use crate::{
     error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_FULL},
-    schema::{Table, SQLITE_SEQUENCE_TABLE_NAME},
+    schema::{SQLITE_SEQUENCE_TABLE_NAME, Table},
     translate::semantic::hir::{self, IndexCoverage, InsertSource, UpsertAction},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -15,15 +15,15 @@ use crate::{
 };
 
 use super::{
-    close_indexes, emit_complete_logical_row, emit_index_insert, emit_index_key,
-    emit_new_row_constraints, emit_query_for_dml, emit_replace_conflicting_row,
-    emit_replace_not_null_defaults, emit_replace_unique_check, emit_returning_result,
-    emit_returning_values, emit_stored_record, emit_trigger_programs, emit_unique_check,
-    open_indexes, record_from_registers, CdcChange, CursorId, ExpressionEmitter, OpenedIndex,
-    PhysicalExpressionError, PhysicalIndexError, PhysicalPlan, PhysicalQueryError, PhysicalRoot,
+    CdcChange, CursorId, ExpressionEmitter, OpenedIndex, PhysicalExpressionError,
+    PhysicalForeignKeyError, PhysicalIndexError, PhysicalPlan, PhysicalQueryError, PhysicalRoot,
     PhysicalRowError, PhysicalSourceKind, PhysicalTriggerError, PreparedCdc, PreparedTriggers,
     RegisterId, RegisterRange, RootRuntimeInputs, RuntimeBindingError, RuntimeBindings,
-    SourceRuntime, TableAccess, TriggerRow, TriggerRows,
+    SourceRuntime, TableAccess, TriggerRow, TriggerRows, close_indexes, emit_complete_logical_row,
+    emit_index_insert, emit_index_key, emit_new_row_constraints, emit_query_for_dml,
+    emit_replace_conflicting_row, emit_replace_not_null_defaults, emit_replace_unique_check,
+    emit_returning_result, emit_returning_values, emit_stored_record, emit_trigger_programs,
+    emit_unique_check, open_indexes, record_from_registers,
 };
 
 #[derive(Debug)]
@@ -34,6 +34,7 @@ pub(crate) enum PhysicalInsertError {
     Index(PhysicalIndexError),
     Query(PhysicalQueryError),
     Trigger(PhysicalTriggerError),
+    ForeignKey(PhysicalForeignKeyError),
     Sequence(crate::LimboError),
     Invalid(&'static str),
     Unsupported(&'static str),
@@ -48,6 +49,7 @@ impl fmt::Display for PhysicalInsertError {
             Self::Index(error) => error.fmt(formatter),
             Self::Query(error) => error.fmt(formatter),
             Self::Trigger(error) => error.fmt(formatter),
+            Self::ForeignKey(error) => error.fmt(formatter),
             Self::Sequence(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical INSERT: {message}"),
             Self::Unsupported(message) => {
@@ -92,6 +94,12 @@ impl From<PhysicalQueryError> for PhysicalInsertError {
 impl From<PhysicalTriggerError> for PhysicalInsertError {
     fn from(error: PhysicalTriggerError) -> Self {
         Self::Trigger(error)
+    }
+}
+
+impl From<PhysicalForeignKeyError> for PhysicalInsertError {
+    fn from(error: PhysicalForeignKeyError) -> Self {
+        Self::ForeignKey(error)
     }
 }
 
@@ -599,6 +607,20 @@ fn finish_insert_row(
         }
         keys.push(key);
     }
+    super::emit_insert_child_checks(
+        program,
+        &insert.foreign_keys.outgoing,
+        table,
+        logical,
+        rowid,
+    )?;
+    super::emit_insert_parent_repairs(
+        program,
+        &insert.foreign_keys.incoming,
+        table,
+        logical,
+        rowid,
+    )?;
     emit_stored_record(program, bindings, insert.target, table, logical, record)?;
     for (index, key) in indexes.iter().zip(&keys) {
         emit_index_insert(program, index, key)?;
@@ -985,9 +1007,6 @@ fn preflight_insert<'plan>(
         return Err(PhysicalInsertError::Invalid(
             "resolved trigger has no prepared program",
         ));
-    }
-    if !insert.foreign_keys.outgoing.is_empty() || !insert.foreign_keys.incoming.is_empty() {
-        return Err(PhysicalInsertError::Unsupported("foreign-key checks"));
     }
     let source = plan
         .document

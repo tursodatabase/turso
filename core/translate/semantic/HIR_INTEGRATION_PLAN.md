@@ -135,6 +135,9 @@ operations are not SQL binding.
         its frozen default and falls back to ABORT when the default is NULL.
   - [x] AUTOINCREMENT freezes the resolved sqlite_sequence table in HIR and
         maintains its high-water mark without a catalog lookup during emission.
+  - [x] INSERT probes frozen rowid or UNIQUE parent identities for child keys,
+        accepts NEW self-references, and repairs deferred counters when a new
+        parent key satisfies existing child rows.
 - [x] Trigger commands and predicates with explicit OLD/NEW runtime bindings.
 - [ ] Generated columns, defaults, CHECK constraints, expression and partial
       indexes, and custom-type schema programs.
