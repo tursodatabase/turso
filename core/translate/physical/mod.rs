@@ -12,6 +12,7 @@ mod query;
 mod returning;
 mod row;
 mod runtime_bindings;
+mod trigger;
 mod update;
 
 pub(crate) use delete::*;
@@ -23,6 +24,7 @@ pub(crate) use query::*;
 pub(crate) use returning::*;
 pub(crate) use row::*;
 pub(crate) use runtime_bindings::*;
+pub(crate) use trigger::*;
 pub(crate) use update::*;
 
 #[cfg(test)]
@@ -51,6 +53,9 @@ mod row_properties;
 
 #[cfg(test)]
 mod returning_properties;
+
+#[cfg(test)]
+mod trigger_properties;
 
 #[cfg(test)]
 mod update_properties;

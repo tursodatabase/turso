@@ -31,8 +31,8 @@ use crate::{
 use super::{
     AggregateRuntime, ExpressionEmitter, ExpressionResult, OutputRuntime, PhysicalAggregate,
     PhysicalExpressionError, PhysicalPlan, PhysicalRoot, PhysicalSource, PhysicalSourceKind,
-    PhysicalSubqueryEmitter, QueryRuntime, RegisterId, RegisterRange, RuntimeBindingError,
-    RuntimeBindings, SourceRuntime, TableAccess,
+    PhysicalSubqueryEmitter, QueryRuntime, RegisterId, RegisterRange, RootRuntimeInputs,
+    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
 };
 
 #[derive(Debug)]
@@ -374,6 +374,14 @@ pub(crate) fn emit_root_query(
     plan: &PhysicalPlan<'_>,
     program: &mut ProgramBuilder,
 ) -> QueryResult<()> {
+    emit_root_query_with_inputs(plan, program, &RootRuntimeInputs::default())
+}
+
+pub(crate) fn emit_root_query_with_inputs(
+    plan: &PhysicalPlan<'_>,
+    program: &mut ProgramBuilder,
+    inputs: &RootRuntimeInputs,
+) -> QueryResult<()> {
     let query_id = match &plan.root {
         PhysicalRoot::Query(query) => *query,
         PhysicalRoot::Insert(_)
@@ -392,6 +400,7 @@ pub(crate) fn emit_root_query(
         ));
     }
     let mut bindings = RuntimeBindings::new(plan.document, plan.document.snapshot)?;
+    inputs.apply(&mut bindings)?;
     let mut ctes = MaterializedCtes::default();
     for cte in query_tree_ctes(plan, query_id)? {
         materialize_cte(plan, program, &mut bindings, &mut ctes, cte)?;

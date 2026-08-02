@@ -18,7 +18,8 @@ use super::{
     emit_new_row_constraints, emit_returning_result, emit_returning_values, emit_stored_record,
     emit_unique_check, open_indexes, CursorId, ExpressionEmitter, PhysicalExpressionError,
     PhysicalIndexError, PhysicalPlan, PhysicalRoot, PhysicalRowError, PhysicalSourceKind,
-    RegisterId, RegisterRange, RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
+    RegisterId, RegisterRange, RootRuntimeInputs, RuntimeBindingError, RuntimeBindings,
+    SourceRuntime, TableAccess,
 };
 
 #[derive(Debug)]
@@ -86,6 +87,14 @@ pub(crate) fn emit_root_update(
     plan: &PhysicalPlan<'_>,
     program: &mut ProgramBuilder,
 ) -> UpdateResult<()> {
+    emit_root_update_with_inputs(plan, program, &RootRuntimeInputs::default())
+}
+
+pub(crate) fn emit_root_update_with_inputs(
+    plan: &PhysicalPlan<'_>,
+    program: &mut ProgramBuilder,
+    inputs: &RootRuntimeInputs,
+) -> UpdateResult<()> {
     let update = match &plan.root {
         PhysicalRoot::Update(update) => *update,
         _ => return Err(PhysicalUpdateError::Unsupported("non-UPDATE HIR root")),
@@ -93,6 +102,7 @@ pub(crate) fn emit_root_update(
     let (source, table, database) = preflight_update(plan, update)?;
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     let mut bindings = RuntimeBindings::new(plan.document, plan.document.snapshot)?;
+    inputs.apply(&mut bindings)?;
     bindings.bind_source(update.target, SourceRuntime::Cursor(CursorId(cursor)))?;
 
     let rowset = program.alloc_register();
@@ -368,7 +378,7 @@ fn preflight_update<'plan>(
     if update.conflict == Some(ResolveType::Replace) {
         return Err(PhysicalUpdateError::Unsupported("REPLACE conflict policy"));
     }
-    if update.trigger.is_some() || !update.triggers.is_empty() {
+    if !update.triggers.is_empty() {
         return Err(PhysicalUpdateError::Unsupported("trigger execution"));
     }
     if !update.foreign_keys.outgoing.is_empty() || !update.foreign_keys.incoming.is_empty() {

@@ -46,6 +46,32 @@ pub(crate) enum SourceRuntime {
     },
 }
 
+/// Runtime rows supplied by the caller of one HIR root.
+///
+/// Ordinary statements have no inputs. Trigger commands and predicates use
+/// this map for their explicit OLD and NEW pseudo-sources. Keeping the map in
+/// physical terms means HIR remains independent of registers and parameters.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RootRuntimeInputs {
+    sources: Vec<(SourceId, SourceRuntime)>,
+}
+
+impl RootRuntimeInputs {
+    pub(crate) fn bind_source(&mut self, source: SourceId, runtime: SourceRuntime) {
+        self.sources.push((source, runtime));
+    }
+
+    pub(crate) fn apply<'document>(
+        &self,
+        bindings: &mut RuntimeBindings<'document>,
+    ) -> BindingResult<()> {
+        for (source, runtime) in &self.sources {
+            bindings.bind_source(*source, *runtime)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OutputRuntime {
     pub(crate) register: RegisterId,

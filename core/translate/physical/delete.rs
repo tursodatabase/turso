@@ -21,7 +21,7 @@ use super::{
     close_indexes, emit_index_delete, emit_index_key, emit_returning_result, emit_returning_values,
     open_indexes, CursorId, ExpressionEmitter, PhysicalExpressionError, PhysicalIndexError,
     PhysicalPlan, PhysicalQueryError, PhysicalRoot, PhysicalSourceKind, RegisterId,
-    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
+    RootRuntimeInputs, RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
 };
 
 #[derive(Debug)]
@@ -99,19 +99,24 @@ pub(crate) fn emit_root(
     plan: &PhysicalPlan<'_>,
     program: &mut ProgramBuilder,
 ) -> Result<(), PhysicalRootError> {
+    emit_root_with_inputs(plan, program, &RootRuntimeInputs::default())
+}
+
+pub(crate) fn emit_root_with_inputs(
+    plan: &PhysicalPlan<'_>,
+    program: &mut ProgramBuilder,
+    inputs: &RootRuntimeInputs,
+) -> Result<(), PhysicalRootError> {
     match plan.root {
-        PhysicalRoot::Query(_) => {
-            super::emit_root_query(plan, program).map_err(PhysicalRootError::Query)
-        }
+        PhysicalRoot::Query(_) => super::emit_root_query_with_inputs(plan, program, inputs)
+            .map_err(PhysicalRootError::Query),
         PhysicalRoot::Delete(_) => {
-            emit_root_delete(plan, program).map_err(PhysicalRootError::Delete)
+            emit_root_delete_with_inputs(plan, program, inputs).map_err(PhysicalRootError::Delete)
         }
-        PhysicalRoot::Insert(_) => {
-            super::emit_root_insert(plan, program).map_err(PhysicalRootError::Insert)
-        }
-        PhysicalRoot::Update(_) => {
-            super::emit_root_update(plan, program).map_err(PhysicalRootError::Update)
-        }
+        PhysicalRoot::Insert(_) => super::emit_root_insert_with_inputs(plan, program, inputs)
+            .map_err(PhysicalRootError::Insert),
+        PhysicalRoot::Update(_) => super::emit_root_update_with_inputs(plan, program, inputs)
+            .map_err(PhysicalRootError::Update),
         PhysicalRoot::TriggerPredicate(_) => {
             Err(PhysicalRootError::Unsupported("trigger predicate root"))
         }
@@ -123,6 +128,14 @@ pub(crate) fn emit_root_delete(
     plan: &PhysicalPlan<'_>,
     program: &mut ProgramBuilder,
 ) -> DeleteResult<()> {
+    emit_root_delete_with_inputs(plan, program, &RootRuntimeInputs::default())
+}
+
+pub(crate) fn emit_root_delete_with_inputs(
+    plan: &PhysicalPlan<'_>,
+    program: &mut ProgramBuilder,
+    inputs: &RootRuntimeInputs,
+) -> DeleteResult<()> {
     let delete = match &plan.root {
         PhysicalRoot::Delete(delete) => *delete,
         _ => return Err(PhysicalDeleteError::Unsupported("non-DELETE HIR root")),
@@ -130,6 +143,7 @@ pub(crate) fn emit_root_delete(
     let (source, table, database) = preflight_delete(plan, delete)?;
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     let mut bindings = RuntimeBindings::new(plan.document, plan.document.snapshot)?;
+    inputs.apply(&mut bindings)?;
     bindings.bind_source(delete.target, SourceRuntime::Cursor(CursorId(cursor)))?;
 
     program.emit_insn(Insn::OpenWrite {
@@ -211,7 +225,7 @@ fn preflight_delete<'plan>(
     if !delete.order_by.is_empty() || delete.limit.is_some() {
         return Err(PhysicalDeleteError::Unsupported("ORDER BY or LIMIT"));
     }
-    if delete.trigger.is_some() || !delete.triggers.is_empty() {
+    if !delete.triggers.is_empty() {
         return Err(PhysicalDeleteError::Unsupported("trigger execution"));
     }
     if !delete.foreign_keys.outgoing.is_empty() || !delete.foreign_keys.incoming.is_empty() {

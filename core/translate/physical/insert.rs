@@ -19,8 +19,8 @@ use super::{
     emit_new_row_constraints, emit_query_for_dml, emit_returning_result, emit_returning_values,
     emit_stored_record, emit_unique_check, open_indexes, CursorId, ExpressionEmitter, OpenedIndex,
     PhysicalExpressionError, PhysicalIndexError, PhysicalPlan, PhysicalQueryError, PhysicalRoot,
-    PhysicalRowError, PhysicalSourceKind, RegisterId, RegisterRange, RuntimeBindingError,
-    RuntimeBindings, SourceRuntime, TableAccess,
+    PhysicalRowError, PhysicalSourceKind, RegisterId, RegisterRange, RootRuntimeInputs,
+    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
 };
 
 #[derive(Debug)]
@@ -88,6 +88,14 @@ pub(crate) fn emit_root_insert(
     plan: &PhysicalPlan<'_>,
     program: &mut ProgramBuilder,
 ) -> InsertResult<()> {
+    emit_root_insert_with_inputs(plan, program, &RootRuntimeInputs::default())
+}
+
+pub(crate) fn emit_root_insert_with_inputs(
+    plan: &PhysicalPlan<'_>,
+    program: &mut ProgramBuilder,
+    inputs: &RootRuntimeInputs,
+) -> InsertResult<()> {
     let insert = match &plan.root {
         PhysicalRoot::Insert(insert) => *insert,
         _ => return Err(PhysicalInsertError::Unsupported("non-INSERT HIR root")),
@@ -101,6 +109,7 @@ pub(crate) fn emit_root_insert(
     let rowid = RegisterId(program.alloc_register());
     let record = program.alloc_register();
     let mut bindings = RuntimeBindings::new(plan.document, plan.document.snapshot)?;
+    inputs.apply(&mut bindings)?;
     bindings.bind_source(
         insert.target,
         SourceRuntime::Registers {
@@ -501,7 +510,7 @@ fn preflight_insert<'plan>(
             "rowid assignment in UPSERT DO UPDATE",
         ));
     }
-    if insert.trigger.is_some() || !insert.triggers.is_empty() {
+    if !insert.triggers.is_empty() {
         return Err(PhysicalInsertError::Unsupported("trigger execution"));
     }
     if !insert.foreign_keys.outgoing.is_empty() || !insert.foreign_keys.incoming.is_empty() {
