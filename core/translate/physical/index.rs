@@ -339,6 +339,11 @@ pub(crate) fn emit_index_insert(
 
 pub(crate) fn close_indexes(program: &mut ProgramBuilder, opened: &[OpenedIndex<'_>]) {
     for index in opened {
+        // Index-method cursors must stay alive until the statement commits so
+        // pre_commit can flush their writes and their Drop can cache the writer.
+        if index.index.index_method.is_some() && !index.index.is_backing_btree_index() {
+            continue;
+        }
         program.emit_insn(Insn::Close {
             cursor_id: index.cursor,
         });
