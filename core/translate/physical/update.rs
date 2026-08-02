@@ -15,12 +15,12 @@ use crate::{
 
 use super::{
     close_indexes, emit_complete_logical_row, emit_index_delete, emit_index_insert, emit_index_key,
-    emit_new_row_constraints, emit_returning_result, emit_returning_values, emit_stored_record,
-    emit_trigger_programs, emit_unique_check, open_indexes, CursorId, ExpressionEmitter,
-    PhysicalExpressionError, PhysicalIndexError, PhysicalPlan, PhysicalRoot, PhysicalRowError,
-    PhysicalSourceKind, PhysicalTriggerError, PreparedTriggers, RegisterId, RegisterRange,
-    RootRuntimeInputs, RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
-    TriggerRow, TriggerRows,
+    emit_new_row_constraints, emit_replace_not_null_defaults, emit_replace_unique_check,
+    emit_returning_result, emit_returning_values, emit_stored_record, emit_trigger_programs,
+    emit_unique_check, open_indexes, CursorId, ExpressionEmitter, PhysicalExpressionError,
+    PhysicalIndexError, PhysicalPlan, PhysicalRoot, PhysicalRowError, PhysicalSourceKind,
+    PhysicalTriggerError, PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs,
+    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess, TriggerRow, TriggerRows,
 };
 
 #[derive(Debug)]
@@ -355,6 +355,9 @@ pub(crate) fn emit_root_update_with_context(
             rowid: Some(rowid),
         },
     )?;
+    if update.conflict == Some(ResolveType::Replace) {
+        emit_replace_not_null_defaults(program, &mut bindings, &update.defaults, &table, logical)?;
+    }
     emit_new_row_constraints(
         program,
         &mut bindings,
@@ -371,7 +374,22 @@ pub(crate) fn emit_root_update_with_context(
             .conflict
             .or(index.index.on_conflict)
             .unwrap_or(ResolveType::Abort);
-        emit_unique_check(program, index, &key, Some(rowid), conflict, write_next)?;
+        if conflict == ResolveType::Replace {
+            emit_replace_unique_check(
+                program,
+                &mut bindings,
+                update.target,
+                &table,
+                cursor,
+                &indexes,
+                index,
+                &key,
+                Some(rowid),
+                write_next,
+            )?;
+        } else {
+            emit_unique_check(program, index, &key, Some(rowid), conflict, write_next)?;
+        }
         new_keys.push(key);
     }
     emit_stored_record(
@@ -469,9 +487,6 @@ fn preflight_update<'plan>(
     if !update.order_by.is_empty() || update.limit.is_some() {
         return Err(PhysicalUpdateError::Unsupported("ORDER BY or LIMIT"));
     }
-    if update.conflict == Some(ResolveType::Replace) {
-        return Err(PhysicalUpdateError::Unsupported("REPLACE conflict policy"));
-    }
     if !triggers.covers(&update.triggers) {
         return Err(PhysicalUpdateError::Invalid(
             "resolved trigger has no prepared program",
@@ -492,13 +507,6 @@ fn preflight_update<'plan>(
         .document
         .source(update.target)
         .ok_or(PhysicalUpdateError::Invalid("target source is missing"))?;
-    if source.index_expressions.iter().any(|index| {
-        update.conflict.or(index.index.value().on_conflict) == Some(ResolveType::Replace)
-    }) {
-        return Err(PhysicalUpdateError::Unsupported(
-            "REPLACE index conflict policy",
-        ));
-    }
     let IndexCoverage::Complete { indexes: _ } = &source.index_coverage else {
         return Err(PhysicalUpdateError::Invalid(
             "target does not carry complete index metadata",

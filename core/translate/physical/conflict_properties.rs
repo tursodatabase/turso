@@ -477,3 +477,113 @@ fn insert_replace_deletes_conflicting_rows_and_uses_frozen_not_null_defaults(tc:
         assert!(old_index < delete && delete < new_index && new_index < replacement);
     }
 }
+
+// Examples:
+// - `UPDATE OR REPLACE items SET c0 = 7` with a UNIQUE index must ignore the
+//   current row's own key, delete a different conflicting row and all of its
+//   OLD index keys, seek back to the current row, then perform the update.
+// - `UPDATE OR REPLACE items SET c0 = NULL` for
+//   `c0 NOT NULL DEFAULT 7` must use the frozen default before the normal NEW
+//   row checks, exactly like INSERT OR REPLACE.
+#[hegel::test]
+fn update_replace_uses_frozen_defaults_and_removes_other_unique_rows(tc: hegel::TestCase) {
+    let not_null_default = tc.draw(generators::booleans());
+    let table_sql = if not_null_default {
+        "CREATE TABLE items(c0 INTEGER NOT NULL DEFAULT 7)"
+    } else {
+        "CREATE TABLE items(c0 INTEGER, c1 INTEGER)"
+    };
+    let table = Arc::new(BTreeTable::from_sql(table_sql, 12).expect("fixture table SQL is valid"));
+    let symbols = SymbolTable::new();
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(table.clone())
+        .expect("items is unique");
+    if !not_null_default {
+        let index = Index::from_sql(
+            &symbols,
+            "CREATE UNIQUE INDEX items_c0 ON items(c0)",
+            13,
+            &table,
+        )
+        .expect("fixture index SQL is valid");
+        schema
+            .add_index(Arc::new(index))
+            .expect("items_c0 is unique");
+    }
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let assignment = if not_null_default { "NULL" } else { "7" };
+    let statement = parse_statement(&format!("UPDATE OR REPLACE items SET c0 = {assignment}"));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated UPDATE OR REPLACE has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed HIR has a physical plan");
+    let mut program = program();
+    emit_root(&plan, &mut program).expect("UPDATE OR REPLACE lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("all UPDATE OR REPLACE branches are closed");
+
+    if not_null_default {
+        let default = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::Integer { value: 7, .. }))
+            .expect("UPDATE REPLACE emits the frozen NOT NULL default");
+        let check = program
+            .insns
+            .iter()
+            .enumerate()
+            .skip(default + 1)
+            .position(|(_, (instruction, _))| matches!(instruction, Insn::NotNull { .. }))
+            .map(|position| position + default + 1)
+            .expect("the substituted value is checked");
+        assert!(default < check);
+        return;
+    }
+
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::Eq { .. })));
+    assert!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::SeekRowid { .. }))
+            .count()
+            >= 2,
+        "replacement must seek the conflict and then restore the current row"
+    );
+    let conflicting_delete = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(
+                instruction,
+                Insn::Delete {
+                    is_part_of_update: false,
+                    ..
+                }
+            )
+        })
+        .expect("UPDATE REPLACE deletes the conflicting row");
+    let current_delete = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(
+                instruction,
+                Insn::Delete {
+                    is_part_of_update: true,
+                    ..
+                }
+            )
+        })
+        .expect("UPDATE then replaces its current row");
+    assert!(conflicting_delete < current_delete);
+}

@@ -193,6 +193,50 @@ pub(crate) fn emit_new_row_constraints(
     emit_check_constraints(program, bindings, source, conflict, skip_row)
 }
 
+/// Apply SQLite's REPLACE rule for NOT NULL columns before the ordinary row
+/// constraints run. The default expressions were bound for this exact target
+/// source during semantic analysis.
+pub(crate) fn emit_replace_not_null_defaults(
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
+    defaults: &[hir::ResolvedDefault],
+    table: &BTreeTable,
+    logical: RegisterRange,
+) -> RowResult<()> {
+    for (position, column) in table.columns().iter().enumerate() {
+        if !column.notnull() || column.is_rowid_alias() {
+            continue;
+        }
+        let present = program.allocate_label();
+        program.emit_insn(Insn::NotNull {
+            reg: logical.first.0 + position,
+            target_pc: present,
+        });
+        let default = defaults
+            .iter()
+            .find(|default| default.column == position)
+            .ok_or(PhysicalRowError::Invalid(
+                "NOT NULL column has no frozen default",
+            ))?;
+        ExpressionEmitter::new(program, bindings).emit_into(
+            &default.value,
+            RegisterRange::new(logical.first.0 + position, 1),
+        )?;
+        program.emit_insn(Insn::NotNull {
+            reg: logical.first.0 + position,
+            target_pc: present,
+        });
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_NOTNULL,
+            description: format!("{}.{}", table.name, column.name.as_deref().unwrap_or("")),
+            on_error: Some(ResolveType::Abort),
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(present);
+    }
+    Ok(())
+}
+
 /// Encode one complete logical row and build its on-disk table record.
 pub(crate) fn emit_stored_record(
     program: &mut ProgramBuilder,

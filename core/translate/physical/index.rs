@@ -15,10 +15,14 @@ use crate::{
     },
 };
 
-use super::{ExpressionEmitter, PhysicalExpressionError, RegisterId, RuntimeBindings};
+use super::{
+    CursorId, ExpressionEmitter, PhysicalExpressionError, RegisterId, RuntimeBindingError,
+    RuntimeBindings, SourceRuntime,
+};
 
 #[derive(Debug)]
 pub(crate) enum PhysicalIndexError {
+    Runtime(RuntimeBindingError),
     Expression(PhysicalExpressionError),
     Invalid(&'static str),
     Unsupported(&'static str),
@@ -27,6 +31,7 @@ pub(crate) enum PhysicalIndexError {
 impl fmt::Display for PhysicalIndexError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Runtime(error) => error.fmt(formatter),
             Self::Expression(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical index: {message}"),
             Self::Unsupported(message) => {
@@ -41,6 +46,12 @@ impl std::error::Error for PhysicalIndexError {}
 impl From<PhysicalExpressionError> for PhysicalIndexError {
     fn from(error: PhysicalExpressionError) -> Self {
         Self::Expression(error)
+    }
+}
+
+impl From<RuntimeBindingError> for PhysicalIndexError {
+    fn from(error: RuntimeBindingError) -> Self {
+        Self::Runtime(error)
     }
 }
 
@@ -244,6 +255,113 @@ pub(crate) fn emit_unique_check(
         });
     }
     program.preassign_label_to_next_insn(done);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_replace_unique_check(
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
+    source: hir::SourceId,
+    table: &Arc<crate::schema::BTreeTable>,
+    table_cursor: usize,
+    indexes: &[OpenedIndex<'_>],
+    opened: &OpenedIndex<'_>,
+    key: &IndexKey,
+    current_rowid: Option<RegisterId>,
+    not_found: crate::vdbe::BranchOffset,
+) -> IndexResult<()> {
+    if !opened.index.unique {
+        return Ok(());
+    }
+    let done = program.allocate_label();
+    if let Some(predicate) = key.predicate {
+        program.emit_insn(Insn::IfNot {
+            reg: predicate,
+            target_pc: done,
+            jump_if_null: true,
+        });
+    }
+    program.emit_insn(Insn::NoConflict {
+        cursor_id: opened.cursor,
+        target_pc: done,
+        record_reg: key.start,
+        num_regs: key.columns,
+    });
+    let conflicting_rowid = RegisterId(program.alloc_register());
+    program.emit_insn(Insn::IdxRowId {
+        cursor_id: opened.cursor,
+        dest: conflicting_rowid.0,
+    });
+    if let Some(current_rowid) = current_rowid {
+        program.emit_insn(Insn::Eq {
+            lhs: current_rowid.0,
+            rhs: conflicting_rowid.0,
+            target_pc: done,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+    }
+    emit_replace_conflicting_row(
+        program,
+        bindings,
+        source,
+        table,
+        table_cursor,
+        indexes,
+        conflicting_rowid,
+        current_rowid,
+        not_found,
+    )?;
+    program.preassign_label_to_next_insn(done);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_replace_conflicting_row(
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
+    source: hir::SourceId,
+    table: &Arc<crate::schema::BTreeTable>,
+    cursor: usize,
+    indexes: &[OpenedIndex<'_>],
+    conflicting_rowid: RegisterId,
+    return_to_rowid: Option<RegisterId>,
+    not_found: crate::vdbe::BranchOffset,
+) -> IndexResult<()> {
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: cursor,
+        src_reg: conflicting_rowid.0,
+        target_pc: not_found,
+    });
+    let proposed = bindings.replace_source(source, SourceRuntime::Cursor(CursorId(cursor)))?;
+    let mut old_keys = Vec::with_capacity(indexes.len());
+    for index in indexes {
+        old_keys.push(emit_index_key(
+            program,
+            bindings,
+            source,
+            conflicting_rowid,
+            index,
+            false,
+        )?);
+    }
+    for (index, key) in indexes.iter().zip(&old_keys) {
+        emit_index_delete(program, index, key);
+    }
+    program.emit_insn(Insn::Delete {
+        cursor_id: cursor,
+        table_name: table.name.clone(),
+        is_part_of_update: false,
+    });
+    bindings.replace_source(source, proposed)?;
+    if let Some(rowid) = return_to_rowid {
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: cursor,
+            src_reg: rowid.0,
+            target_pc: not_found,
+        });
+    }
     Ok(())
 }
 
