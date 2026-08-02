@@ -127,7 +127,9 @@ operations are not SQL binding.
   - [x] INSERT OR REPLACE deletes all OLD index entries and the conflicting
         row before the NEW write for rowid and UNIQUE conflicts; NOT NULL uses
         its frozen default and falls back to ABORT when the default is NULL.
-- [ ] Trigger commands and predicates with explicit OLD/NEW runtime bindings.
+  - [x] AUTOINCREMENT freezes the resolved sqlite_sequence table in HIR and
+        maintains its high-water mark without a catalog lookup during emission.
+- [x] Trigger commands and predicates with explicit OLD/NEW runtime bindings.
 - [ ] Generated columns, defaults, CHECK constraints, expression and partial
       indexes, and custom-type schema programs.
   - [x] Generated/default reads and generated/default DML row construction use

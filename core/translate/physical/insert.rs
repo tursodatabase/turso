@@ -5,8 +5,8 @@ use std::fmt;
 use turso_parser::ast::{ResolveType, TriggerTime};
 
 use crate::{
-    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY},
-    schema::Table,
+    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_FULL},
+    schema::{Table, SQLITE_SEQUENCE_TABLE_NAME},
     translate::semantic::hir::{self, IndexCoverage, InsertSource, UpsertAction},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -93,6 +93,14 @@ impl From<PhysicalTriggerError> for PhysicalInsertError {
 
 type InsertResult<T> = std::result::Result<T, PhysicalInsertError>;
 
+#[derive(Clone, Copy)]
+struct AutoincrementRuntime {
+    cursor: usize,
+    maximum: usize,
+    sequence_rowid: usize,
+    table_name: usize,
+}
+
 pub(crate) fn emit_root_insert(
     plan: &PhysicalPlan<'_>,
     program: &mut ProgramBuilder,
@@ -161,6 +169,8 @@ pub(crate) fn emit_root_insert_with_context(
         root_page: RegisterOrLiteral::Literal(table.root_page),
         db: database,
     });
+    let mut autoincrement =
+        open_autoincrement(program, insert.autoincrement.as_ref(), &table, database)?;
     let indexes = open_indexes(program, source, database)?;
 
     match &insert.source {
@@ -179,6 +189,7 @@ pub(crate) fn emit_root_insert_with_context(
                 &[],
                 skip_row,
                 triggers,
+                autoincrement.as_mut(),
             )?;
             program.preassign_label_to_next_insn(skip_row);
         }
@@ -198,6 +209,7 @@ pub(crate) fn emit_root_insert_with_context(
                     row,
                     skip_row,
                     triggers,
+                    autoincrement.as_mut(),
                 )?;
                 program.preassign_label_to_next_insn(skip_row);
             }
@@ -226,6 +238,7 @@ pub(crate) fn emit_root_insert_with_context(
                 query_rows.cursor,
                 next,
                 triggers,
+                autoincrement.as_mut(),
             )?;
             program.emit_insn(Insn::Next {
                 cursor_id: query_rows.cursor,
@@ -235,6 +248,11 @@ pub(crate) fn emit_root_insert_with_context(
         }
     }
     close_indexes(program, &indexes);
+    if let Some(autoincrement) = autoincrement {
+        program.emit_insn(Insn::Close {
+            cursor_id: autoincrement.cursor,
+        });
+    }
     program.emit_insn(Insn::Close { cursor_id: cursor });
     if let Some(query_rows) = query_rows {
         query_rows.close(program);
@@ -256,6 +274,7 @@ fn emit_insert_row(
     values: &[hir::Expr],
     skip_row: crate::vdbe::BranchOffset,
     triggers: &PreparedTriggers,
+    autoincrement: Option<&mut AutoincrementRuntime>,
 ) -> InsertResult<()> {
     if values.len() != insert.columns.len() {
         return Err(PhysicalInsertError::Invalid(
@@ -271,8 +290,18 @@ fn emit_insert_row(
     }
     emit_insert_defaults(program, bindings, insert, logical)?;
     finish_insert_row(
-        program, bindings, insert, table, cursor, logical, rowid, record, indexes, skip_row,
+        program,
+        bindings,
+        insert,
+        table,
+        cursor,
+        logical,
+        rowid,
+        record,
+        indexes,
+        skip_row,
         triggers,
+        autoincrement,
     )
 }
 
@@ -290,6 +319,7 @@ fn emit_insert_query_row(
     query_cursor: usize,
     skip_row: crate::vdbe::BranchOffset,
     triggers: &PreparedTriggers,
+    autoincrement: Option<&mut AutoincrementRuntime>,
 ) -> InsertResult<()> {
     initialize_insert_row(program, logical, rowid);
     for (position, target) in insert.columns.iter().enumerate() {
@@ -298,8 +328,18 @@ fn emit_insert_query_row(
     }
     emit_insert_defaults(program, bindings, insert, logical)?;
     finish_insert_row(
-        program, bindings, insert, table, cursor, logical, rowid, record, indexes, skip_row,
+        program,
+        bindings,
+        insert,
+        table,
+        cursor,
+        logical,
+        rowid,
+        record,
+        indexes,
+        skip_row,
         triggers,
+        autoincrement,
     )
 }
 
@@ -365,6 +405,7 @@ fn finish_insert_row(
     indexes: &[OpenedIndex<'_>],
     skip_row: crate::vdbe::BranchOffset,
     triggers: &PreparedTriggers,
+    mut autoincrement: Option<&mut AutoincrementRuntime>,
 ) -> InsertResult<()> {
     let statement_conflict = insert.conflict.unwrap_or(ResolveType::Abort);
     if let Some((position, _)) = table.get_rowid_alias_column().filter(|(position, _)| {
@@ -384,11 +425,15 @@ fn finish_insert_row(
         reg: rowid.0,
         target_pc: explicit_rowid,
     });
-    program.emit_insn(Insn::NewRowid {
-        cursor,
-        rowid_reg: rowid.0,
-        prev_largest_reg: 0,
-    });
+    if let Some(autoincrement) = autoincrement.as_deref_mut() {
+        emit_generated_autoincrement_rowid(program, cursor, rowid, *autoincrement)?;
+    } else {
+        program.emit_insn(Insn::NewRowid {
+            cursor,
+            rowid_reg: rowid.0,
+            prev_largest_reg: 0,
+        });
+    }
     program.emit_insn(Insn::Goto {
         target_pc: rowid_ready,
     });
@@ -397,6 +442,9 @@ fn finish_insert_row(
         reg: rowid.0,
         target_pc: None,
     });
+    if let Some(autoincrement) = autoincrement {
+        emit_explicit_autoincrement_rowid(program, rowid, *autoincrement)?;
+    }
     program.preassign_label_to_next_insn(rowid_ready);
     if let Some((position, _)) = table.get_rowid_alias_column() {
         program.emit_insn(Insn::Copy {
@@ -537,6 +585,236 @@ fn finish_insert_row(
         let result = emit_returning_values(program, bindings, returning)?;
         emit_returning_result(program, result);
     }
+    Ok(())
+}
+
+fn open_autoincrement(
+    program: &mut ProgramBuilder,
+    resolved: Option<&hir::ResolvedTable>,
+    target: &crate::schema::BTreeTable,
+    database: usize,
+) -> InsertResult<Option<AutoincrementRuntime>> {
+    let Some(resolved) = resolved else {
+        if target.has_autoincrement {
+            return Err(PhysicalInsertError::Invalid(
+                "AUTOINCREMENT target has no resolved sqlite_sequence table",
+            ));
+        }
+        return Ok(None);
+    };
+    if !target.has_autoincrement {
+        return Err(PhysicalInsertError::Invalid(
+            "non-AUTOINCREMENT target carries sqlite_sequence metadata",
+        ));
+    }
+    if resolved.database().map(hir::DatabaseId::index) != Some(database) {
+        return Err(PhysicalInsertError::Invalid(
+            "sqlite_sequence belongs to a different database",
+        ));
+    }
+    let Table::BTree(sequence) = resolved.value() else {
+        return Err(PhysicalInsertError::Invalid(
+            "resolved sqlite_sequence is not a B-tree table",
+        ));
+    };
+    let cursor = program.alloc_cursor_id(CursorType::BTreeTable(sequence.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: cursor,
+        root_page: RegisterOrLiteral::Literal(sequence.root_page),
+        db: database,
+    });
+    let runtime = AutoincrementRuntime {
+        cursor,
+        maximum: program.alloc_register(),
+        sequence_rowid: program.alloc_register(),
+        table_name: program.emit_string8_new_reg(target.name.clone()),
+    };
+    program.emit_insn(Insn::Integer {
+        dest: runtime.maximum,
+        value: 0,
+    });
+    program.emit_insn(Insn::Null {
+        dest: runtime.sequence_rowid,
+        dest_end: None,
+    });
+    let scan = program.allocate_label();
+    let next = program.allocate_label();
+    let done = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: cursor,
+        pc_if_empty: done,
+    });
+    program.preassign_label_to_next_insn(scan);
+    let name = program.alloc_register();
+    program.emit_column_or_rowid(cursor, 0, name);
+    program.emit_insn(Insn::Ne {
+        lhs: runtime.table_name,
+        rhs: name,
+        target_pc: next,
+        flags: Default::default(),
+        collation: None,
+    });
+    program.emit_column_or_rowid(cursor, 1, runtime.maximum);
+    program.emit_insn(Insn::AddImm {
+        register: runtime.maximum,
+        value: 0,
+    });
+    program.emit_insn(Insn::RowId {
+        cursor_id: cursor,
+        dest: runtime.sequence_rowid,
+    });
+    program.emit_insn(Insn::Goto { target_pc: done });
+    program.preassign_label_to_next_insn(next);
+    program.emit_insn(Insn::Next {
+        cursor_id: cursor,
+        pc_if_next: scan,
+    });
+    program.preassign_label_to_next_insn(done);
+    Ok(Some(runtime))
+}
+
+fn emit_generated_autoincrement_rowid(
+    program: &mut ProgramBuilder,
+    table_cursor: usize,
+    rowid: RegisterId,
+    runtime: AutoincrementRuntime,
+) -> InsertResult<()> {
+    let table_maximum = program.alloc_register();
+    let ignored = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: table_cursor,
+        rowid_reg: ignored,
+        prev_largest_reg: table_maximum,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: runtime.maximum,
+        dst_reg: rowid.0,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::MemMax {
+        dest_reg: rowid.0,
+        src_reg: table_maximum,
+    });
+    let not_full = program.allocate_label();
+    let maximum_i64 = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        dest: maximum_i64,
+        value: i64::MAX,
+    });
+    program.emit_insn(Insn::Ne {
+        lhs: rowid.0,
+        rhs: maximum_i64,
+        target_pc: not_full,
+        flags: Default::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::Halt {
+        err_code: SQLITE_FULL,
+        description: "database or disk is full".to_string(),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(not_full);
+    program.emit_insn(Insn::AddImm {
+        register: rowid.0,
+        value: 1,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: rowid.0,
+        dst_reg: runtime.maximum,
+        extra_amount: 0,
+    });
+    emit_update_sqlite_sequence(program, runtime, rowid.0)
+}
+
+fn emit_explicit_autoincrement_rowid(
+    program: &mut ProgramBuilder,
+    rowid: RegisterId,
+    runtime: AutoincrementRuntime,
+) -> InsertResult<()> {
+    let existing_row = program.allocate_label();
+    let write = program.allocate_label();
+    let done = program.allocate_label();
+    program.emit_insn(Insn::NotNull {
+        reg: runtime.sequence_rowid,
+        target_pc: existing_row,
+    });
+    program.emit_insn(Insn::MemMax {
+        dest_reg: runtime.maximum,
+        src_reg: rowid.0,
+    });
+    program.emit_insn(Insn::Goto { target_pc: write });
+    program.preassign_label_to_next_insn(existing_row);
+    program.emit_insn(Insn::Le {
+        lhs: rowid.0,
+        rhs: runtime.maximum,
+        target_pc: done,
+        flags: Default::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: rowid.0,
+        dst_reg: runtime.maximum,
+        extra_amount: 0,
+    });
+    program.preassign_label_to_next_insn(write);
+    emit_update_sqlite_sequence(program, runtime, runtime.maximum)?;
+    program.preassign_label_to_next_insn(done);
+    Ok(())
+}
+
+fn emit_update_sqlite_sequence(
+    program: &mut ProgramBuilder,
+    runtime: AutoincrementRuntime,
+    value: usize,
+) -> InsertResult<()> {
+    let fields = program.alloc_registers(2);
+    let record = program.alloc_register();
+    program.emit_insn(Insn::Copy {
+        src_reg: runtime.table_name,
+        dst_reg: fields,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: value,
+        dst_reg: fields + 1,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: fields as u32,
+        count: 2,
+        dest_reg: record as u32,
+        index_name: None,
+        affinity_str: Some("BB".to_string()),
+    });
+    let replace = program.allocate_label();
+    let done = program.allocate_label();
+    program.emit_insn(Insn::NotNull {
+        reg: runtime.sequence_rowid,
+        target_pc: replace,
+    });
+    program.emit_insn(Insn::NewRowid {
+        cursor: runtime.cursor,
+        rowid_reg: runtime.sequence_rowid,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: runtime.cursor,
+        key_reg: runtime.sequence_rowid,
+        record_reg: record,
+        flag: InsertFlags::new(),
+        table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+    });
+    program.emit_insn(Insn::Goto { target_pc: done });
+    program.preassign_label_to_next_insn(replace);
+    program.emit_insn(Insn::Insert {
+        cursor: runtime.cursor,
+        key_reg: runtime.sequence_rowid,
+        record_reg: record,
+        flag: InsertFlags(ResolveType::Replace.bit_value() as u8),
+        table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+    });
+    program.preassign_label_to_next_insn(done);
     Ok(())
 }
 

@@ -40,6 +40,8 @@ pub struct TriggerEnvironment {
 #[derive(Clone, Debug)]
 pub struct Insert {
     pub target: SourceId,
+    /// Resolved sqlite_sequence table for an AUTOINCREMENT target.
+    pub autoincrement: Option<ResolvedTable>,
     pub columns: Vec<TargetColumn>,
     pub defaults: Vec<ResolvedDefault>,
     pub source: InsertSource,

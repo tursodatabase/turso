@@ -185,6 +185,10 @@ impl<'document> HirValidator<'document> {
             &[],
         )?;
         self.visit_dml_foreign_keys(insert.target, &insert.foreign_keys)?;
+        self.visit_optional_catalog_object(
+            insert.autoincrement.as_ref(),
+            "AUTOINCREMENT sequence table",
+        )?;
         for column in &insert.columns {
             self.validate_target_column(insert.target, *column)?;
         }

@@ -359,6 +359,7 @@ fn dml_hir_closes_over_target_and_expression_positions(tc: hegel::TestCase) {
     let root = match operation {
         GeneratedDml::Insert => hir::HirRoot::Insert(hir::Insert {
             target: target_id,
+            autoincrement: None,
             columns: vec![TargetColumn::Column(position)],
             defaults: Vec::new(),
             source: hir::InsertSource::Values(vec![vec![hir::Expr::Literal(ast::Literal::Null)]]),
@@ -424,4 +425,64 @@ fn dml_hir_closes_over_target_and_expression_positions(tc: hegel::TestCase) {
         _ => unreachable!("the generator creates a DML root"),
     }
     assert!(document.validate().is_err());
+}
+
+// Example: `INSERT INTO items DEFAULT VALUES` for an AUTOINCREMENT table may
+// carry `main.sqlite_sequence` from the same prepare snapshot; a sequence
+// table retained from an older schema snapshot must make the HIR invalid.
+#[hegel::test]
+fn autoincrement_sequence_belongs_to_the_document_snapshot(tc: hegel::TestCase) {
+    let snapshot_id = u64::from(tc.draw(generators::integers::<u32>())) + 1;
+    let use_stale_snapshot = tc.draw(generators::booleans());
+    let snapshot = hir::CatalogSnapshot::from_id(snapshot_id);
+    let sequence_snapshot = hir::CatalogSnapshot::from_id(if use_stale_snapshot {
+        snapshot_id + 1
+    } else {
+        snapshot_id
+    });
+    let mut target = source(
+        0,
+        "items",
+        None,
+        Some(0),
+        source_columns(1, None, None),
+        true,
+    );
+    target.index_coverage = hir::IndexCoverage::Complete {
+        indexes: Vec::new(),
+    };
+    let target_id = target.id;
+    let sequence = hir::CatalogObject::new(
+        hir::CatalogObjectId::new(1),
+        sequence_snapshot,
+        Some(DatabaseId::new(0)),
+        Arc::new(table_from_sql("CREATE TABLE sqlite_sequence(name,seq)")),
+    );
+    let document = hir::HirDocument {
+        snapshot,
+        databases: vec![hir::DatabaseSnapshot {
+            database: DatabaseId::new(0),
+            schema_version: 0,
+        }],
+        root: hir::HirRoot::Insert(hir::Insert {
+            target: target_id,
+            autoincrement: Some(sequence),
+            columns: Vec::new(),
+            defaults: Vec::new(),
+            source: hir::InsertSource::DefaultValues,
+            conflict: None,
+            upserts: Vec::new(),
+            excluded_source: None,
+            returning: None,
+            trigger: None,
+            triggers: Vec::new(),
+            foreign_keys: hir::DmlForeignKeys::default(),
+        }),
+        queries: Vec::new(),
+        sources: vec![target],
+        ctes: Vec::new(),
+        schema_programs: Vec::new(),
+    };
+
+    assert_eq!(document.validate().is_err(), use_stale_snapshot);
 }

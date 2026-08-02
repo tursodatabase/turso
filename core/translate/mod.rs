@@ -197,6 +197,7 @@ fn translate_semantic_root(
         connection.is_mvcc_bootstrap_connection(),
         false,
         connection.check_constraints_ignored(),
+        connection.foreign_keys_enabled(),
     ));
     let document = analyze(&context, AnalyzeInput::Statement(stmt))?;
     set_semantic_result_columns(program, &document);

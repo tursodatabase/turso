@@ -16,7 +16,9 @@ use super::{
     Analyzer, CatalogObjectKind, TriggerAnalysisInput,
 };
 use crate::{
-    schema::{BTreeTable, Index, IndexColumn, ResolvedFkRef, Table, Trigger},
+    schema::{
+        BTreeTable, Index, IndexColumn, ResolvedFkRef, Table, Trigger, SQLITE_SEQUENCE_TABLE_NAME,
+    },
     schema_expr::SchemaExprProfile,
     sync::Arc,
     translate::expr::{walk_expr, WalkControl},
@@ -248,6 +250,7 @@ impl Analyzer<'_, '_> {
         self.populate_dml_check_constraints(target, &table)?;
 
         let columns = resolve_insert_columns(&table, columns)?;
+        let autoincrement = self.resolve_autoincrement_table(database_id, &table)?;
         let defaults = self.analyze_insert_defaults(&table, target, database_id)?;
         let expected_types = self.destination_expected_types(target, &columns)?;
         let expected_defaults = columns
@@ -302,6 +305,7 @@ impl Analyzer<'_, '_> {
         let foreign_keys = self.resolve_dml_foreign_keys(database_id, table.get_name())?;
         Ok(hir::HirRoot::Insert(hir::Insert {
             target,
+            autoincrement,
             columns,
             defaults,
             source,
@@ -516,11 +520,61 @@ impl Analyzer<'_, '_> {
             .collect()
     }
 
+    fn resolve_autoincrement_table(
+        &mut self,
+        database_id: usize,
+        table: &Table,
+    ) -> Result<Option<hir::ResolvedTable>> {
+        let Some(table) = table.btree().filter(|table| table.has_autoincrement) else {
+            return Ok(None);
+        };
+        let sequence = self
+            .context()
+            .schema(database_id)
+            .and_then(|schema| schema.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME))
+            .ok_or_else(|| {
+                LimboError::Corrupt(format!(
+                    "missing sqlite_sequence table for AUTOINCREMENT table {}",
+                    table.name
+                ))
+            })?;
+        if !sequence.has_rowid {
+            crate::bail_corrupt_error!("malformed sqlite_sequence: table must have rowid");
+        }
+        if sequence.columns().len() != 2 {
+            crate::bail_corrupt_error!(
+                "malformed sqlite_sequence: expected 2 columns, got {}",
+                sequence.columns().len()
+            );
+        }
+        let name = sequence.columns()[0].name.as_deref();
+        let value = sequence.columns()[1].name.as_deref();
+        if !name.is_some_and(|name| name.eq_ignore_ascii_case("name"))
+            || !value.is_some_and(|name| name.eq_ignore_ascii_case("seq"))
+        {
+            crate::bail_corrupt_error!("malformed sqlite_sequence: expected columns (name, seq)");
+        }
+        let id = self.catalog_object_id(
+            Some(database_id),
+            CatalogObjectKind::Table,
+            SQLITE_SEQUENCE_TABLE_NAME,
+        );
+        Ok(Some(CatalogObject::new(
+            id,
+            self.context().snapshot(),
+            Some(DatabaseId::new(database_id)),
+            Arc::new(Table::BTree(sequence)),
+        )))
+    }
+
     fn resolve_dml_foreign_keys(
         &mut self,
         database_id: usize,
         table_name: &str,
     ) -> Result<hir::DmlForeignKeys> {
+        if !self.context().dml_policy().foreign_keys_enabled() {
+            return Ok(hir::DmlForeignKeys::default());
+        }
         let schema = self.context().schema(database_id).ok_or_else(|| {
             LimboError::InternalError(format!(
                 "database {database_id} disappeared while resolving foreign keys"

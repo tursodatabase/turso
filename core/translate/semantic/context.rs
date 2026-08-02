@@ -79,6 +79,7 @@ pub(crate) struct DmlPolicy {
     mvcc_bootstrap_connection: bool,
     internal_schema_change: bool,
     check_constraints_ignored: bool,
+    foreign_keys_enabled: bool,
 }
 
 impl DmlPolicy {
@@ -87,12 +88,14 @@ impl DmlPolicy {
         mvcc_bootstrap_connection: bool,
         internal_schema_change: bool,
         check_constraints_ignored: bool,
+        foreign_keys_enabled: bool,
     ) -> Self {
         Self {
             nested_statement,
             mvcc_bootstrap_connection,
             internal_schema_change,
             check_constraints_ignored,
+            foreign_keys_enabled,
         }
     }
 
@@ -110,6 +113,10 @@ impl DmlPolicy {
 
     pub(crate) const fn check_constraints_ignored(self) -> bool {
         self.check_constraints_ignored
+    }
+
+    pub(crate) const fn foreign_keys_enabled(self) -> bool {
+        self.foreign_keys_enabled
     }
 }
 
