@@ -187,6 +187,8 @@ semantic error is forbidden because it would hide analyzer defects.
 - [x] Both top-level `translate` and nested `translate_inner` route SELECT,
       INSERT, UPDATE, and DELETE directly to the semantic root; the old DML
       entrypoints are no longer executable prepare paths.
+- [x] ALTER TABLE's generated sqlite_schema UPDATE uses the same HIR root and
+      physical UPDATE emitter, including the post-update DDL hook and CDC text.
 
 ### 5. Delete the old representation
 

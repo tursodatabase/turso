@@ -409,6 +409,13 @@ impl Analyzer<'_, '_> {
             &assignments,
         )?;
         let foreign_keys = self.resolve_dml_foreign_keys(database_id, table.get_name())?;
+        let cdc_updates_override = self.context().internal_schema_change_sql().and_then(|sql| {
+            table
+                .columns()
+                .iter()
+                .position(|column| column.name.as_deref() == Some("sql"))
+                .map(|position| (position, sql.to_string()))
+        });
 
         Ok(hir::HirRoot::Update(hir::Update {
             target,
@@ -423,6 +430,7 @@ impl Analyzer<'_, '_> {
             trigger,
             triggers,
             foreign_keys,
+            cdc_updates_override,
         }))
     }
 

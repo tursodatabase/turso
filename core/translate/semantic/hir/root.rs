@@ -136,6 +136,9 @@ pub struct Update {
     pub trigger: Option<TriggerEnvironment>,
     pub triggers: Vec<ResolvedTrigger>,
     pub foreign_keys: DmlForeignKeys,
+    /// For an internal sqlite_schema update, CDC stores the user's DDL text in
+    /// the changed `sql` field instead of the generated UPDATE statement.
+    pub cdc_updates_override: Option<(usize, String)>,
 }
 
 #[derive(Clone, Debug)]

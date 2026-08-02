@@ -162,6 +162,7 @@ pub(crate) struct SemanticContext<'a> {
     trigger: Option<TriggerCatalogContext>,
     dml_policy: DmlPolicy,
     capture_data_changes: Option<CaptureDataChangesInfo>,
+    internal_schema_change_sql: Option<&'a str>,
 }
 
 impl<'a> SemanticContext<'a> {
@@ -197,6 +198,7 @@ impl<'a> SemanticContext<'a> {
             trigger: None,
             dml_policy: DmlPolicy::default(),
             capture_data_changes: None,
+            internal_schema_change_sql: None,
         }
     }
 
@@ -261,6 +263,7 @@ impl<'a> SemanticContext<'a> {
             trigger: None,
             dml_policy: DmlPolicy::default(),
             capture_data_changes: None,
+            internal_schema_change_sql: None,
         }
     }
 
@@ -354,6 +357,16 @@ impl<'a> SemanticContext<'a> {
         let mut context = self.clone();
         context.capture_data_changes = capture_data_changes;
         context
+    }
+
+    pub(crate) fn with_internal_schema_change_sql(&self, sql: &'a str) -> SemanticContext<'a> {
+        let mut context = self.clone();
+        context.internal_schema_change_sql = Some(sql);
+        context
+    }
+
+    pub(crate) const fn internal_schema_change_sql(&self) -> Option<&'a str> {
+        self.internal_schema_change_sql
     }
 
     pub(crate) fn for_trigger(

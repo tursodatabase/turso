@@ -388,6 +388,7 @@ fn dml_hir_closes_over_target_and_expression_positions(tc: hegel::TestCase) {
             trigger: None,
             triggers: Vec::new(),
             foreign_keys: hir::DmlForeignKeys::default(),
+            cdc_updates_override: None,
         }),
         GeneratedDml::Delete => hir::HirRoot::Delete(hir::Delete {
             target: target_id,

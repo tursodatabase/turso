@@ -318,6 +318,7 @@ pub(crate) fn update_record(
     width: usize,
     assignments: &[crate::translate::semantic::hir::Assignment],
     logical: RegisterRange,
+    value_override: Option<(usize, &str)>,
 ) -> usize {
     let fields = program.alloc_registers(width * 2);
     for position in 0..width {
@@ -330,11 +331,17 @@ pub(crate) fn update_record(
                 continue;
             };
             program.emit_bool(true, fields + position);
-            program.emit_insn(Insn::Copy {
-                src_reg: logical.first.0 + position,
-                dst_reg: fields + width + position,
-                extra_amount: 0,
-            });
+            if let Some((_, value)) =
+                value_override.filter(|(override_position, _)| override_position == position)
+            {
+                program.emit_string8(value.to_string(), fields + width + position);
+            } else {
+                program.emit_insn(Insn::Copy {
+                    src_reg: logical.first.0 + position,
+                    dst_reg: fields + width + position,
+                    extra_amount: 0,
+                });
+            }
         }
     }
     let record = program.alloc_register();

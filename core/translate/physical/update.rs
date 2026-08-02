@@ -137,6 +137,16 @@ pub(crate) fn emit_root_update_with_context(
     inputs: &RootRuntimeInputs,
     triggers: &PreparedTriggers,
 ) -> UpdateResult<()> {
+    emit_root_update_with_context_and_after(plan, program, inputs, triggers, |_| {})
+}
+
+pub(crate) fn emit_root_update_with_context_and_after(
+    plan: &PhysicalPlan<'_>,
+    program: &mut ProgramBuilder,
+    inputs: &RootRuntimeInputs,
+    triggers: &PreparedTriggers,
+    after: impl FnOnce(&mut ProgramBuilder),
+) -> UpdateResult<()> {
     let update = match &plan.root {
         PhysicalRoot::Update(update) => *update,
         _ => return Err(PhysicalUpdateError::Unsupported("non-UPDATE HIR root")),
@@ -643,9 +653,18 @@ pub(crate) fn emit_root_update_with_context(
         let after = cdc
             .has_after()
             .then(|| record_from_registers(program, &table, logical, new_rowid));
-        let updates = cdc
-            .has_updates()
-            .then(|| update_record(program, source.columns.len(), &update.assignments, logical));
+        let updates = cdc.has_updates().then(|| {
+            update_record(
+                program,
+                source.columns.len(),
+                &update.assignments,
+                logical,
+                update
+                    .cdc_updates_override
+                    .as_ref()
+                    .map(|(position, value)| (*position, value.as_str())),
+            )
+        });
         cdc.emit_change(
             program,
             CdcChange::Update,
@@ -697,6 +716,7 @@ pub(crate) fn emit_root_update_with_context(
         cdc.emit_autocommit_commit(program)?;
         cdc.close(program);
     }
+    after(program);
     Ok(())
 }
 

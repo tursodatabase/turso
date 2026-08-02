@@ -52,7 +52,7 @@ fn update_records_keep_hir_positions_aligned_with_runtime_columns(tc: hegel::Tes
         value: crate::translate::semantic::hir::Expr::Literal(ast::Literal::Null),
     };
 
-    update_record(&mut program, width, &[assignment], logical);
+    update_record(&mut program, width, &[assignment], logical, None);
 
     let selected_copy = program.insns.iter().find_map(|(instruction, _)| {
         let Insn::Copy {
@@ -77,6 +77,60 @@ fn update_records_keep_hir_positions_aligned_with_runtime_columns(tc: hegel::Tes
         })
         .expect("the update mask is serialized");
     assert_eq!(selected_copy, record + width + position);
+}
+
+// Examples:
+// - `ALTER TABLE items RENAME COLUMN a TO b` updates sqlite_schema.sql, but
+//   CDC's changed value is the original ALTER text rather than generated SQL.
+// - If `sql` is field 4, only CDC slot `width + 4` receives that text; the
+//   ordinary NEW-row register must not overwrite it.
+// For every generated table width and sql-field position, the frozen internal
+// schema override lands in the matching CDC value slot.
+#[hegel::test]
+fn internal_schema_updates_keep_the_user_ddl_in_the_sql_cdc_slot(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(16)));
+    let position = usize::from(
+        tc.draw(generators::integers::<u8>().max_value(u8::try_from(width - 1).unwrap())),
+    );
+    let mut program = program();
+    let logical = RegisterRange::new(program.alloc_registers(width), width);
+    let assignment = crate::translate::semantic::hir::Assignment {
+        columns: vec![crate::translate::semantic::hir::TargetColumn::Column(
+            position,
+        )],
+        value: crate::translate::semantic::hir::Expr::Literal(ast::Literal::Null),
+    };
+    let ddl = "ALTER TABLE items RENAME COLUMN a TO b";
+
+    update_record(
+        &mut program,
+        width,
+        &[assignment],
+        logical,
+        Some((position, ddl)),
+    );
+
+    let record = program
+        .insns
+        .iter()
+        .find_map(|(instruction, _)| match instruction {
+            Insn::MakeRecord {
+                start_reg, count, ..
+            } if *count as usize == width * 2 => Some(*start_reg as usize),
+            _ => None,
+        })
+        .expect("the update mask is serialized");
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::String8 { value, dest }
+            if value == ddl && *dest == record + width + position
+    )));
+    assert!(!program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Copy { src_reg, dst_reg, .. }
+            if *src_reg == logical.first.0 + position
+                && *dst_reg == record + width + position
+    )));
 }
 
 // Examples:
