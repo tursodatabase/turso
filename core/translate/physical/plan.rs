@@ -4,11 +4,15 @@
 //! resolved `INDEXED BY` requirement. Cost-based choices can be added here
 //! after the HIR execution path is complete and measured.
 
-use std::fmt;
+use std::{borrow::Cow, collections::BTreeMap, fmt};
+
+use rustc_hash::FxHashMap;
+use turso_parser::ast::Operator;
 
 use crate::translate::semantic::hir::{
-    self, CteId, HirDocument, IndexHint, Output, Query, QueryBlock, QueryBlockId, QueryId,
-    ResolvedIndex, ResolvedTable, SourceId, SourceKind,
+    self, CteId, Expr, HirDocument, IndexHint, IndexMethodPattern, Output, OutputId, Query,
+    QueryBlock, QueryBlockId, QueryId, ResolvedIndex, ResolvedTable, SourceId, SourceKind,
+    SourceOwner,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +65,11 @@ pub(crate) struct PhysicalQueryBlock<'hir> {
     pub(crate) source_order: Vec<SourceId>,
     /// These are the original resolved HIR outputs, not copied expressions.
     pub(crate) outputs: &'hir [Output],
+    /// WHERE after removing the one term consumed by a custom index method.
+    pub(crate) filter: Option<Cow<'hir, Expr>>,
+    /// Pattern outputs that replace computed query outputs, aligned with
+    /// `outputs`. Ordinary outputs contain `None`.
+    pub(crate) covered_outputs: Vec<Option<OutputId>>,
     /// Aggregate calls indexed by their stable block-local HIR identity.
     pub(crate) aggregates: Vec<PhysicalAggregate<'hir>>,
     /// Window calls indexed by their stable block-local HIR identity.
@@ -110,6 +119,13 @@ pub(crate) enum PhysicalSourceKind<'hir> {
 pub(crate) enum TableAccess<'hir> {
     Scan,
     ForcedIndex(&'hir ResolvedIndex),
+    IndexMethod(IndexMethodAccess<'hir>),
+}
+
+#[derive(Debug)]
+pub(crate) struct IndexMethodAccess<'hir> {
+    pub(crate) pattern: &'hir IndexMethodPattern,
+    pub(crate) arguments: Vec<&'hir Expr>,
 }
 
 impl<'hir> PhysicalPlan<'hir> {
@@ -133,6 +149,7 @@ impl<'hir> PhysicalPlan<'hir> {
                 PhysicalRoot::SchemaExpressions(expressions)
             }
         };
+        let mut index_method_accesses = FxHashMap::default();
         let queries = document
             .queries
             .iter()
@@ -142,6 +159,16 @@ impl<'hir> PhysicalPlan<'hir> {
                     .iter()
                     .map(|block| {
                         let (aggregates, window_functions) = collect_block_functions(query, block)?;
+                        let index_method = choose_index_method(document, query, block);
+                        let (filter, covered_outputs) = if let Some(selection) = index_method {
+                            index_method_accesses.insert(selection.source, selection.access);
+                            (selection.filter, selection.covered_outputs)
+                        } else {
+                            (
+                                block_filter(block).map(Cow::Borrowed),
+                                vec![None; block.outputs.len()],
+                            )
+                        };
                         Ok(PhysicalQueryBlock {
                             id: block.id,
                             hir: block,
@@ -151,6 +178,8 @@ impl<'hir> PhysicalPlan<'hir> {
                                     .collect()
                             }),
                             outputs: &block.outputs,
+                            filter,
+                            covered_outputs,
                             aggregates,
                             window_functions,
                         })
@@ -173,10 +202,13 @@ impl<'hir> PhysicalPlan<'hir> {
                     SourceKind::SchemaExpression => PhysicalSourceKind::SchemaExpression,
                     SourceKind::Table(table) => PhysicalSourceKind::CatalogTable {
                         table,
-                        access: match &source.index_hint {
-                            IndexHint::Indexed(index) => TableAccess::ForcedIndex(index),
-                            IndexHint::None | IndexHint::NotIndexed => TableAccess::Scan,
-                        },
+                        access: index_method_accesses
+                            .remove(&source.id)
+                            .map(TableAccess::IndexMethod)
+                            .unwrap_or_else(|| match &source.index_hint {
+                                IndexHint::Indexed(index) => TableAccess::ForcedIndex(index),
+                                IndexHint::None | IndexHint::NotIndexed => TableAccess::Scan,
+                            }),
                     },
                     SourceKind::TableFunction { table, arguments } => {
                         PhysicalSourceKind::TableFunction { table, arguments }
@@ -518,4 +550,355 @@ fn collect_block_functions<'hir>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok((aggregates, window_functions))
+}
+
+struct IndexMethodSelection<'hir> {
+    source: SourceId,
+    access: IndexMethodAccess<'hir>,
+    filter: Option<Cow<'hir, Expr>>,
+    covered_outputs: Vec<Option<OutputId>>,
+}
+
+fn block_filter(block: &hir::QueryBlock) -> Option<&Expr> {
+    match &block.body {
+        hir::QueryBlockBody::Select { filter, .. } => filter.as_ref(),
+        hir::QueryBlockBody::Values { .. } => None,
+    }
+}
+
+/// Pick the first bound custom-index pattern that can answer this block.
+/// This is deliberately correctness-first: it preserves source order and does
+/// no cost comparison. The semantic layer has already resolved every name and
+/// catalog object in both the query and the patterns.
+fn choose_index_method<'hir>(
+    document: &'hir HirDocument,
+    query: &'hir Query,
+    block: &'hir QueryBlock,
+) -> Option<IndexMethodSelection<'hir>> {
+    if query.blocks.len() != 1 || !query.compounds.is_empty() || block.id != query.first {
+        return None;
+    }
+    let from = block.from.as_ref()?;
+    let source_ids = std::iter::once(from.first).chain(from.joins.iter().map(|join| join.right));
+    for source_id in source_ids {
+        let source = document.source(source_id)?;
+        if source.owner != SourceOwner::QueryBlock(block.id) {
+            continue;
+        }
+        for pattern in &source.index_method_patterns {
+            if let Some(selection) = match_index_method_pattern(document, query, block, pattern) {
+                return Some(IndexMethodSelection {
+                    source: source_id,
+                    access: IndexMethodAccess {
+                        pattern,
+                        arguments: selection.arguments,
+                    },
+                    filter: selection.filter,
+                    covered_outputs: selection.covered_outputs,
+                });
+            }
+        }
+    }
+    None
+}
+
+struct PatternMatch<'hir> {
+    arguments: Vec<&'hir Expr>,
+    filter: Option<Cow<'hir, Expr>>,
+    covered_outputs: Vec<Option<OutputId>>,
+}
+
+fn match_index_method_pattern<'hir>(
+    document: &'hir HirDocument,
+    query: &'hir Query,
+    block: &'hir QueryBlock,
+    pattern: &'hir IndexMethodPattern,
+) -> Option<PatternMatch<'hir>> {
+    let mut parameters = BTreeMap::new();
+    let original_filter = block_filter(block);
+    let mut filter_terms = Vec::new();
+    if let Some(filter) = original_filter {
+        split_and_terms(filter, &mut filter_terms);
+    }
+
+    let consumed_filter = if let Some(pattern_filter) = pattern.predicate.as_ref() {
+        let mut matched = None;
+        for (position, query_filter) in filter_terms.iter().enumerate() {
+            let mut candidate = parameters.clone();
+            if match_expr(document, pattern_filter, query_filter, &mut candidate, true) {
+                parameters = candidate;
+                matched = Some(position);
+                break;
+            }
+        }
+        Some(matched?)
+    } else {
+        None
+    };
+
+    let where_is_fully_consumed = filter_terms.is_empty()
+        || consumed_filter.is_some_and(|position| filter_terms.len() == 1 && position == 0);
+    if !where_is_fully_consumed && (!pattern.order_by.is_empty() || pattern.limit.is_some()) {
+        return None;
+    }
+
+    if !pattern.order_by.is_empty() {
+        if pattern.order_by.len() != query.order_by.len() {
+            return None;
+        }
+        for (pattern_term, query_term) in pattern.order_by.iter().zip(&query.order_by) {
+            if pattern_term.order != query_term.order
+                || query_term.nulls.is_some()
+                || !match_expr(
+                    document,
+                    &pattern_term.expr,
+                    &query_term.expr,
+                    &mut parameters,
+                    true,
+                )
+            {
+                return None;
+            }
+        }
+    }
+
+    if let Some(pattern_limit) = pattern.limit.as_ref() {
+        let query_limit = query.limit.as_ref()?;
+        if !match_expr(
+            document,
+            &pattern_limit.limit,
+            &query_limit.limit,
+            &mut parameters,
+            true,
+        ) {
+            return None;
+        }
+        if let Some(pattern_offset) = pattern_limit.offset.as_ref() {
+            let query_offset = query_limit.offset.as_ref()?;
+            if !match_expr(
+                document,
+                pattern_offset,
+                query_offset,
+                &mut parameters,
+                true,
+            ) {
+                return None;
+            }
+        }
+    }
+
+    let mut covered_outputs = vec![None; block.outputs.len()];
+    for pattern_output in &pattern.outputs {
+        if matches!(
+            resolve_output_expr(document, &pattern_output.expr),
+            Expr::Column(_) | Expr::RowId(_)
+        ) {
+            continue;
+        }
+        for (position, query_output) in block.outputs.iter().enumerate() {
+            let mut candidate = parameters.clone();
+            if match_expr(
+                document,
+                &pattern_output.expr,
+                &query_output.expr,
+                &mut candidate,
+                true,
+            ) {
+                parameters = candidate;
+                covered_outputs[position] = Some(pattern_output.id);
+            }
+        }
+    }
+    // A pattern with no predicate must be anchored by one of its computed
+    // outputs (for example the score-only FTS pattern).
+    if pattern.predicate.is_none() && covered_outputs.iter().all(Option::is_none) {
+        return None;
+    }
+
+    let filter = match consumed_filter {
+        None => original_filter.map(Cow::Borrowed),
+        Some(consumed) => rebuild_and_filter(&filter_terms, consumed).map(Cow::Owned),
+    };
+    Some(PatternMatch {
+        arguments: parameters.into_values().collect(),
+        filter,
+        covered_outputs,
+    })
+}
+
+fn split_and_terms<'hir>(expression: &'hir Expr, terms: &mut Vec<&'hir Expr>) {
+    if let Expr::Binary {
+        lhs,
+        operator: Operator::And,
+        rhs,
+        ..
+    } = expression
+    {
+        split_and_terms(lhs, terms);
+        split_and_terms(rhs, terms);
+    } else {
+        terms.push(expression);
+    }
+}
+
+fn rebuild_and_filter(terms: &[&Expr], consumed: usize) -> Option<Expr> {
+    terms
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| *position != consumed)
+        .map(|(_, expression)| (*expression).clone())
+        .reduce(|lhs, rhs| Expr::Binary {
+            lhs: Box::new(lhs),
+            operator: Operator::And,
+            rhs: Box::new(rhs),
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        })
+}
+
+fn resolve_output_expr<'hir>(document: &'hir HirDocument, expression: &'hir Expr) -> &'hir Expr {
+    if let Expr::Output(output) = expression {
+        document
+            .output(*output)
+            .map_or(expression, |output| &output.expr)
+    } else {
+        expression
+    }
+}
+
+fn match_expr<'hir>(
+    document: &'hir HirDocument,
+    pattern: &'hir Expr,
+    query: &'hir Expr,
+    parameters: &mut BTreeMap<u32, &'hir Expr>,
+    capture_parameters: bool,
+) -> bool {
+    let pattern = resolve_output_expr(document, pattern);
+    let query = resolve_output_expr(document, query);
+    if let Expr::Parameter(parameter) = pattern {
+        if capture_parameters && parameter.name.is_none() {
+            let index = parameter.index.get();
+            if let Some(captured) = parameters.get(&index) {
+                let mut ignored = BTreeMap::new();
+                return match_expr(document, captured, query, &mut ignored, false);
+            }
+            parameters.insert(index, query);
+            return true;
+        }
+    }
+    match (pattern, query) {
+        (Expr::Literal(left), Expr::Literal(right)) => {
+            crate::util::check_literal_equivalency(left, right)
+        }
+        (Expr::Parameter(left), Expr::Parameter(right)) => {
+            left.index == right.index && left.name == right.name
+        }
+        (Expr::Column(left), Expr::Column(right)) => left == right,
+        (Expr::RowId(left), Expr::RowId(right)) => left == right,
+        (Expr::Function(left), Expr::Function(right)) => {
+            if left.function != right.function
+                || left.star != right.star
+                || left.arguments.len() != right.arguments.len()
+            {
+                return false;
+            }
+            let function_name = left.function.value().to_string();
+            let unordered_columns = match function_name.to_ascii_lowercase().as_str() {
+                "fts_match" | "fts_score" => left.arguments.len().saturating_sub(1),
+                "fts_highlight" => left.arguments.len().saturating_sub(3),
+                _ => 0,
+            };
+            if unordered_columns > 0 {
+                let mut matched = vec![false; unordered_columns];
+                for query_column in &right.arguments[..unordered_columns] {
+                    let Some(position) = left.arguments[..unordered_columns]
+                        .iter()
+                        .enumerate()
+                        .position(|(position, pattern_column)| {
+                            !matched[position] && {
+                                let mut ignored = BTreeMap::new();
+                                match_expr(
+                                    document,
+                                    pattern_column,
+                                    query_column,
+                                    &mut ignored,
+                                    false,
+                                )
+                            }
+                        })
+                    else {
+                        return false;
+                    };
+                    matched[position] = true;
+                }
+            }
+            left.arguments[unordered_columns..]
+                .iter()
+                .zip(&right.arguments[unordered_columns..])
+                .all(|(left, right)| {
+                    match_expr(document, left, right, parameters, capture_parameters)
+                })
+        }
+        (
+            Expr::Unary {
+                operator: left_operator,
+                expr: left,
+            },
+            Expr::Unary {
+                operator: right_operator,
+                expr: right,
+            },
+        ) => {
+            left_operator == right_operator
+                && match_expr(document, left, right, parameters, capture_parameters)
+        }
+        (
+            Expr::Binary {
+                lhs: left_lhs,
+                operator: left_operator,
+                rhs: left_rhs,
+                ..
+            },
+            Expr::Binary {
+                lhs: right_lhs,
+                operator: right_operator,
+                rhs: right_rhs,
+                ..
+            },
+        ) => {
+            left_operator == right_operator
+                && match_expr(
+                    document,
+                    left_lhs,
+                    right_lhs,
+                    parameters,
+                    capture_parameters,
+                )
+                && match_expr(
+                    document,
+                    left_rhs,
+                    right_rhs,
+                    parameters,
+                    capture_parameters,
+                )
+        }
+        (Expr::IsNull(left), Expr::IsNull(right)) | (Expr::NotNull(left), Expr::NotNull(right)) => {
+            match_expr(document, left, right, parameters, capture_parameters)
+        }
+        (
+            Expr::Collate {
+                expr: left,
+                collation: left_collation,
+            },
+            Expr::Collate {
+                expr: right,
+                collation: right_collation,
+            },
+        ) => {
+            left_collation == right_collation
+                && match_expr(document, left, right, parameters, capture_parameters)
+        }
+        _ => false,
+    }
 }

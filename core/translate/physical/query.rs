@@ -41,6 +41,7 @@ use super::{
 #[derive(Debug)]
 pub(crate) enum PhysicalQueryError {
     Allocation(crate::alloc::TryReserveError),
+    Engine(crate::LimboError),
     Runtime(RuntimeBindingError),
     Expression(PhysicalExpressionError),
     Invalid(&'static str),
@@ -51,6 +52,7 @@ impl fmt::Display for PhysicalQueryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Allocation(error) => error.fmt(formatter),
+            Self::Engine(error) => error.fmt(formatter),
             Self::Runtime(error) => error.fmt(formatter),
             Self::Expression(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical query: {message}"),
@@ -66,6 +68,12 @@ impl std::error::Error for PhysicalQueryError {}
 impl From<crate::alloc::TryReserveError> for PhysicalQueryError {
     fn from(error: crate::alloc::TryReserveError) -> Self {
         Self::Allocation(error)
+    }
+}
+
+impl From<crate::LimboError> for PhysicalQueryError {
+    fn from(error: crate::LimboError) -> Self {
+        Self::Engine(error)
     }
 }
 
@@ -96,11 +104,19 @@ struct VirtualFilter<'hir> {
     idx_num: usize,
 }
 
+struct IndexMethodFilter<'hir> {
+    database: usize,
+    pattern: usize,
+    arguments: Vec<&'hir Expr>,
+}
+
 struct OpenedScan<'hir> {
     cursor: ScanCursor,
     runtime_cursor: usize,
     deferred_table: Option<usize>,
     virtual_filter: Option<VirtualFilter<'hir>>,
+    index_method_filter: Option<IndexMethodFilter<'hir>>,
+    index_method_outputs: Vec<(usize, usize)>,
     owned: bool,
 }
 
@@ -123,6 +139,8 @@ impl DmlTargetScan {
             runtime_cursor: self.table_cursor,
             deferred_table: self.indexed.then_some(self.table_cursor),
             virtual_filter: None,
+            index_method_filter: None,
+            index_method_outputs: Vec::new(),
             owned: false,
         }
     }
@@ -217,6 +235,9 @@ pub(crate) fn open_dml_target_scan(
                 indexed: true,
             })
         }
+        TableAccess::IndexMethod(_) => Err(PhysicalQueryError::Unsupported(
+            "custom index method for a DML target scan",
+        )),
     }
 }
 
@@ -224,6 +245,7 @@ pub(crate) fn open_dml_target_scan(
 enum ScanRowAction<'hir, 'destination> {
     Project {
         outputs: &'hir [crate::translate::semantic::hir::Output],
+        covered_outputs: &'destination [Option<crate::translate::semantic::hir::OutputId>],
         result: RegisterRange,
         destination: QueryDestination<'destination>,
         limit: Option<LimitRuntime>,
@@ -2013,10 +2035,11 @@ fn emit_query_block<'document>(
                         bindings,
                         ctes,
                         sources,
-                        filter.as_ref(),
+                        block.filter.as_deref(),
                         block.hir.from.as_ref(),
                         ScanRowAction::Project {
                             outputs: block.outputs,
+                            covered_outputs: &block.covered_outputs,
                             result,
                             destination,
                             limit,
@@ -2059,6 +2082,7 @@ fn emit_single_row<'document>(
         bindings,
         ctes,
         outputs,
+        None,
         result,
         destination,
         limit,
@@ -2467,7 +2491,7 @@ fn emit_grouped_aggregate<'document>(
             )?;
             current_sources.push((representative.source, current));
         }
-        emit_output_expressions(plan, program, bindings, ctes, block.outputs, result)?;
+        emit_output_expressions(plan, program, bindings, ctes, block.outputs, None, result)?;
         if let Some(having) = &grouping.having {
             emit_filter(plan, program, bindings, ctes, having, skip_output)?;
         }
@@ -2636,7 +2660,7 @@ fn emit_ungrouped_aggregate<'document>(
         }
 
         let skip = program.allocate_label();
-        emit_output_expressions(plan, program, bindings, ctes, block.outputs, result)?;
+        emit_output_expressions(plan, program, bindings, ctes, block.outputs, None, result)?;
         if let Some(having) = having {
             emit_filter(plan, program, bindings, ctes, having, skip)?;
         }
@@ -3270,6 +3294,7 @@ fn emit_ranking_window_row<'document>(
             bindings,
             ctes,
             block.outputs,
+            None,
             result,
             destination,
             limit,
@@ -4859,6 +4884,7 @@ fn emit_full_join_unmatched_right<'document>(
     let done = program.allocate_label();
     emit_scan_rewind(plan, program, bindings, ctes, right, done)?;
     program.preassign_label_to_next_insn(right_start);
+    emit_scan_prepare_row(program, right);
     let matched = program.alloc_register();
     program.emit_insn(Insn::Integer {
         value: 0,
@@ -4913,12 +4939,7 @@ fn emit_full_join_prefix_matches<'document>(
     let loop_end = program.allocate_label();
     emit_scan_rewind(plan, program, bindings, ctes, scan, loop_end)?;
     program.preassign_label_to_next_insn(loop_start);
-    if let Some(table_cursor_id) = scan.deferred_table {
-        program.emit_insn(Insn::DeferredSeek {
-            index_cursor_id: scan.cursor.id(),
-            table_cursor_id,
-        });
-    }
+    emit_scan_prepare_row(program, scan);
     if let Some(join) = level
         .checked_sub(1)
         .and_then(|position| joins.get(position))
@@ -4959,6 +4980,12 @@ fn emit_null_scan(program: &mut ProgramBuilder, scan: &OpenedScan<'_>) {
             cursor_id: table_cursor,
         });
     }
+    for (register, _) in &scan.index_method_outputs {
+        program.emit_insn(Insn::Null {
+            dest: *register,
+            dest_end: None,
+        });
+    }
 }
 
 fn emit_scan_rewind<'document>(
@@ -4970,10 +4997,29 @@ fn emit_scan_rewind<'document>(
     empty: crate::vdbe::BranchOffset,
 ) -> QueryResult<()> {
     match scan.cursor {
-        ScanCursor::BTree(cursor_id) => program.emit_insn(Insn::Rewind {
-            cursor_id,
-            pc_if_empty: empty,
-        }),
+        ScanCursor::BTree(cursor_id) => {
+            if let Some(filter) = &scan.index_method_filter {
+                let start = program.alloc_registers(filter.arguments.len() + 1);
+                program.emit_int(filter.pattern as i64, start);
+                for (position, argument) in filter.arguments.iter().enumerate() {
+                    let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                    ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                        .emit_into(argument, RegisterRange::new(start + position + 1, 1))?;
+                }
+                program.emit_insn(Insn::IndexMethodQuery {
+                    db: filter.database,
+                    cursor_id,
+                    start_reg: start,
+                    count_reg: filter.arguments.len() + 1,
+                    pc_if_empty: empty,
+                });
+            } else {
+                program.emit_insn(Insn::Rewind {
+                    cursor_id,
+                    pc_if_empty: empty,
+                });
+            }
+        }
         ScanCursor::Virtual(cursor_id) => {
             let (arg_count, args_reg, idx_str, idx_num) =
                 emit_virtual_filter_arguments(plan, program, bindings, ctes, scan)?;
@@ -4989,6 +5035,23 @@ fn emit_scan_rewind<'document>(
         ScanCursor::Single(_) => {}
     }
     Ok(())
+}
+
+fn emit_scan_prepare_row(program: &mut ProgramBuilder, scan: &OpenedScan<'_>) {
+    if let Some(table_cursor_id) = scan.deferred_table {
+        program.emit_insn(Insn::DeferredSeek {
+            index_cursor_id: scan.cursor.id(),
+            table_cursor_id,
+        });
+    }
+    for (register, column) in &scan.index_method_outputs {
+        program.emit_insn(Insn::Column {
+            cursor_id: scan.cursor.id(),
+            column: *column,
+            dest: *register,
+            default: None,
+        });
+    }
 }
 
 fn emit_scan_next(
@@ -5050,32 +5113,9 @@ fn emit_nested_scan<'document>(
         });
     }
     let empty = unmatched.unwrap_or(loop_end);
-    match scan.cursor {
-        ScanCursor::BTree(cursor_id) => program.emit_insn(Insn::Rewind {
-            cursor_id,
-            pc_if_empty: empty,
-        }),
-        ScanCursor::Virtual(cursor_id) => {
-            let (arg_count, args_reg, idx_str, idx_num) =
-                emit_virtual_filter_arguments(plan, program, bindings, ctes, scan)?;
-            program.emit_insn(Insn::VFilter {
-                cursor_id,
-                pc_if_empty: empty,
-                arg_count,
-                args_reg,
-                idx_str,
-                idx_num,
-            });
-        }
-        ScanCursor::Single(_) => {}
-    }
+    emit_scan_rewind(plan, program, bindings, ctes, scan, empty)?;
     program.preassign_label_to_next_insn(loop_start);
-    if let Some(table_cursor_id) = scan.deferred_table {
-        program.emit_insn(Insn::DeferredSeek {
-            index_cursor_id: scan.cursor.id(),
-            table_cursor_id,
-        });
-    }
+    emit_scan_prepare_row(program, scan);
 
     if let Some(join) = join {
         emit_join_constraint(plan, program, bindings, ctes, &join.constraint, loop_next)?;
@@ -5238,6 +5278,7 @@ fn emit_scan_action<'document>(
     match action {
         ScanRowAction::Project {
             outputs,
+            covered_outputs,
             result,
             destination,
             limit,
@@ -5248,6 +5289,7 @@ fn emit_scan_action<'document>(
             bindings,
             ctes,
             outputs,
+            Some(covered_outputs),
             result,
             destination,
             limit,
@@ -5404,6 +5446,8 @@ fn open_source<'document>(
                     runtime_cursor: cursor,
                     deferred_table: None,
                     virtual_filter: None,
+                    index_method_filter: None,
+                    index_method_outputs: Vec::new(),
                     owned: false,
                 })
             }
@@ -5418,6 +5462,58 @@ fn open_source<'document>(
         "catalog table has no database identity",
     ))?;
     let database = database_id.index();
+    if let TableAccess::IndexMethod(access) = access {
+        let Table::BTree(table) = table.value() else {
+            return Err(PhysicalQueryError::Unsupported(
+                "custom index method on a non-B-tree table",
+            ));
+        };
+        if access.pattern.index.database() != Some(database_id) {
+            return Err(PhysicalQueryError::Invalid(
+                "custom index belongs to a different database",
+            ));
+        }
+        let table_cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        let index = access.pattern.index.handle();
+        let index_cursor = program.alloc_cursor_index(None, &index)?;
+        program.emit_insn(Insn::OpenRead {
+            cursor_id: table_cursor,
+            root_page: table.root_page,
+            db: database,
+        });
+        program.emit_insn(Insn::OpenRead {
+            cursor_id: index_cursor,
+            root_page: index.root_page,
+            db: database,
+        });
+        let mut index_method_outputs = Vec::new();
+        for (column, output) in access.pattern.outputs.iter().enumerate() {
+            if matches!(output.expr, Expr::Column(_) | Expr::RowId(_)) {
+                continue;
+            }
+            let register = program.alloc_register();
+            bindings.bind_output(
+                output.id,
+                OutputRuntime {
+                    register: RegisterId(register),
+                },
+            )?;
+            index_method_outputs.push((register, column));
+        }
+        return Ok(OpenedScan {
+            cursor: ScanCursor::BTree(index_cursor),
+            runtime_cursor: table_cursor,
+            deferred_table: Some(table_cursor),
+            virtual_filter: None,
+            index_method_filter: Some(IndexMethodFilter {
+                database,
+                pattern: access.pattern.id.pattern,
+                arguments: access.arguments.clone(),
+            }),
+            index_method_outputs,
+            owned: true,
+        });
+    }
     if let TableAccess::ForcedIndex(index) = access {
         let Table::BTree(table) = table.value() else {
             return Err(PhysicalQueryError::Unsupported(
@@ -5449,6 +5545,8 @@ fn open_source<'document>(
             runtime_cursor: table_cursor,
             deferred_table: Some(table_cursor),
             virtual_filter: None,
+            index_method_filter: None,
+            index_method_outputs: Vec::new(),
             owned: true,
         });
     }
@@ -5466,6 +5564,8 @@ fn open_source<'document>(
                 runtime_cursor: cursor,
                 deferred_table: None,
                 virtual_filter: None,
+                index_method_filter: None,
+                index_method_outputs: Vec::new(),
                 owned: true,
             })
         }
@@ -5477,6 +5577,8 @@ fn open_source<'document>(
                 runtime_cursor: cursor,
                 deferred_table: None,
                 virtual_filter: None,
+                index_method_filter: None,
+                index_method_outputs: Vec::new(),
                 owned: true,
             })
         }
@@ -5577,6 +5679,8 @@ fn open_table_function<'document>(
             idx_str,
             idx_num: index.idx_num as usize,
         }),
+        index_method_filter: None,
+        index_method_outputs: Vec::new(),
         owned: true,
     })
 }
@@ -5635,6 +5739,8 @@ fn open_derived_source<'document>(
         runtime_cursor: cursor,
         deferred_table: None,
         virtual_filter: None,
+        index_method_filter: None,
+        index_method_outputs: Vec::new(),
         owned: true,
     })
 }
@@ -6029,6 +6135,8 @@ fn open_cte_source<'document>(
         runtime_cursor: cursor,
         deferred_table: None,
         virtual_filter: None,
+        index_method_filter: None,
+        index_method_outputs: Vec::new(),
         owned: true,
     })
 }
@@ -6136,6 +6244,7 @@ fn emit_output_row<'document>(
     bindings: &mut RuntimeBindings<'document>,
     ctes: &mut MaterializedCtes,
     outputs: &[crate::translate::semantic::hir::Output],
+    covered_outputs: Option<&[Option<crate::translate::semantic::hir::OutputId>]>,
     result: RegisterRange,
     destination: QueryDestination<'_>,
     limit: Option<LimitRuntime>,
@@ -6153,7 +6262,15 @@ fn emit_output_row<'document>(
             None,
         );
     }
-    emit_output_expressions(plan, program, bindings, ctes, outputs, result)?;
+    emit_output_expressions(
+        plan,
+        program,
+        bindings,
+        ctes,
+        outputs,
+        covered_outputs,
+        result,
+    )?;
     emit_row_destination(
         plan,
         program,
@@ -6172,6 +6289,7 @@ fn emit_output_expressions<'document>(
     bindings: &mut RuntimeBindings<'document>,
     ctes: &mut MaterializedCtes,
     outputs: &[crate::translate::semantic::hir::Output],
+    covered_outputs: Option<&[Option<crate::translate::semantic::hir::OutputId>]>,
     result: RegisterRange,
 ) -> QueryResult<()> {
     for (position, output) in outputs.iter().enumerate() {
@@ -6179,8 +6297,16 @@ fn emit_output_expressions<'document>(
             .register(position)
             .ok_or(PhysicalQueryError::Invalid("output register is missing"))?;
         let mut subqueries = QuerySubqueryEmitter { plan, ctes };
-        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
-            .emit_into(&output.expr, RegisterRange::new(target.0, 1))?;
+        let covered = covered_outputs
+            .and_then(|covered| covered.get(position))
+            .and_then(|output| *output);
+        if let Some(covered) = covered {
+            ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                .emit_into(&Expr::Output(covered), RegisterRange::new(target.0, 1))?;
+        } else {
+            ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                .emit_into(&output.expr, RegisterRange::new(target.0, 1))?;
+        }
     }
     Ok(())
 }
