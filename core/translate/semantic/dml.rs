@@ -251,6 +251,33 @@ impl Analyzer<'_, '_> {
 
         let columns = resolve_insert_columns(&table, columns)?;
         let autoincrement = self.resolve_autoincrement_table(database_id, &table)?;
+        let autoincrement_sequence = table
+            .btree()
+            .filter(|table| table.has_autoincrement)
+            .map(|table| crate::schema::autoincrement_sequence_name(&table.name))
+            .filter(|name| {
+                self.context()
+                    .schema(database_id)
+                    .is_some_and(|schema| schema.get_sequence(name).is_some())
+            })
+            .map(|name| {
+                let user_name = if database_id == crate::MAIN_DB_ID {
+                    name
+                } else {
+                    let database_name =
+                        self.context().database_name(database_id).ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "database {database_id} has no name in semantic snapshot"
+                            ))
+                        })?;
+                    format!("{database_name}.{name}")
+                };
+                self.resolve_sequence_catalog_operation(
+                    hir::SequenceOperationKind::NextValue,
+                    user_name,
+                )
+            })
+            .transpose()?;
         let defaults = self.analyze_insert_defaults(&table, target, database_id)?;
         let expected_types = self.destination_expected_types(target, &columns)?;
         let expected_defaults = columns
@@ -306,6 +333,7 @@ impl Analyzer<'_, '_> {
         Ok(hir::HirRoot::Insert(hir::Insert {
             target,
             autoincrement,
+            autoincrement_sequence,
             columns,
             defaults,
             source,

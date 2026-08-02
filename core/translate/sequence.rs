@@ -463,6 +463,36 @@ pub fn emit_disk_advance_past(
                 "missing backing table for sequence \"{seq_name}\""
             ))
         })?;
+    let sqlite_sequence = seq_name
+        .strip_prefix(AUTOINCREMENT_SEQ_PREFIX)
+        .and_then(|_| {
+            resolver.with_schema(database_id, |schema| {
+                schema.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+            })
+        });
+    emit_disk_advance_past_from_resolved(
+        program,
+        database_id,
+        seq_name,
+        seq,
+        backing_table,
+        sqlite_sequence,
+        value_reg,
+    )
+}
+
+/// Lower an AUTOINCREMENT high-water advance using only catalog objects
+/// frozen in HIR.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_disk_advance_past_from_resolved(
+    program: &mut ProgramBuilder,
+    database_id: usize,
+    seq_name: &str,
+    seq: &Sequence,
+    backing_table: Arc<BTreeTable>,
+    sqlite_sequence: Option<Arc<BTreeTable>>,
+    value_reg: usize,
+) -> Result<()> {
     let root_page = backing_table.root_page;
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(backing_table));
 
@@ -594,7 +624,13 @@ pub fn emit_disk_advance_past(
     // row even though the engine's autoinc state is unchanged. Repro
     // covered by `mvcc-autoinc-explicit-low-rowid-preserves-sqlite-sequence`
     // in `sqlite/conformance/turso-sqltests/mvcc_sequence.sqltest`.
-    emit_autoincrement_sqlite_sequence_sync(program, resolver, database_id, seq_name, value_reg)?;
+    emit_autoincrement_sqlite_sequence_sync_from_resolved(
+        program,
+        database_id,
+        seq_name,
+        value_reg,
+        sqlite_sequence,
+    )?;
 
     program.preassign_label_to_next_insn(done_seek_label);
     program.emit_insn(Insn::Close { cursor_id });

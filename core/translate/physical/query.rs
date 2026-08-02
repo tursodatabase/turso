@@ -1709,7 +1709,12 @@ fn emit_aggregate_steps<'document>(
                 });
                 (one, 0)
             }
-            AggFunc::Avg | AggFunc::Count | AggFunc::Sum | AggFunc::Total => {
+            AggFunc::Avg
+            | AggFunc::Count
+            | AggFunc::Max
+            | AggFunc::Min
+            | AggFunc::Sum
+            | AggFunc::Total => {
                 let [argument] = call.arguments.as_slice() else {
                     return Err(PhysicalQueryError::Invalid(
                         "aggregate has the wrong argument count",

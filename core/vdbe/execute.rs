@@ -4255,19 +4255,20 @@ pub fn op_transaction_inner(
                     }
                 }
                 if is_top_level_statement
-                    && is_main_db
                     && auto_commit
                     && state.auto_txn_cleanup == TxnCleanup::None
                 {
-                    let active_root_statements = program
-                        .connection
-                        .n_active_root_statements
-                        .load(Ordering::SeqCst);
-                    if active_root_statements > 1 {
+                    let joined_implicit_main_transaction = is_main_db
+                        && program
+                            .connection
+                            .n_active_root_statements
+                            .load(Ordering::SeqCst)
+                            > 1;
+                    if is_secondary_db || joined_implicit_main_transaction {
                         // A sibling statement opened the implicit transaction
-                        // before this statement joined it. Mark this statement
-                        // so the last remaining sibling can close the
-                        // transaction.
+                        // before this statement joined it, or this statement
+                        // opened an attached-only transaction. Mark the root so
+                        // Halt commits it (or the last sibling closes it).
                         state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                     }
                 }
@@ -12933,7 +12934,7 @@ pub fn op_sequence_begin_inner_tx(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         SequenceBeginInnerTx {
@@ -12945,6 +12946,7 @@ pub fn op_sequence_begin_inner_tx(
     );
 
     let conn = program.connection.clone();
+    let pager = program.get_pager_from_database_index(db)?;
     let Some(mv_store) = conn.mv_store_for_db(*db) else {
         // WAL mode: no inner tx needed. The WAL single-writer lock
         // already serializes writes across processes.
@@ -13007,7 +13009,7 @@ pub fn op_sequence_commit_inner_tx(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         SequenceCommitInnerTx {
@@ -13036,6 +13038,7 @@ pub fn op_sequence_commit_inner_tx(
     }
 
     let conn = program.connection.clone();
+    let pager = program.get_pager_from_database_index(db)?;
     let mv_store = conn.mv_store_for_db(*db).ok_or_else(|| {
         LimboError::InternalError(
             "SequenceCommitInnerTx: no MV store for db but path was Wrapped".to_string(),

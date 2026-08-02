@@ -189,6 +189,13 @@ impl<'document> HirValidator<'document> {
             insert.autoincrement.as_ref(),
             "AUTOINCREMENT sequence table",
         )?;
+        if let Some(sequence) = &insert.autoincrement_sequence {
+            self.visit_sequence_operation(sequence)?;
+            self.require(
+                insert.autoincrement.is_some(),
+                "MVCC AUTOINCREMENT sequence has no sqlite_sequence table",
+            )?;
+        }
         for column in &insert.columns {
             self.validate_target_column(insert.target, *column)?;
         }

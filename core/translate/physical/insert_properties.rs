@@ -5,7 +5,7 @@ use turso_parser::{ast, parser::Parser};
 
 use crate::{
     dialect::{Dialect, SqliteDialect},
-    schema::{BTreeTable, Schema},
+    schema::{BTreeTable, Schema, Sequence},
     sync::Arc,
     translate::semantic::{
         analyze,
@@ -232,6 +232,102 @@ fn explicit_rowid_and_integer_primary_key_share_one_key_path(tc: hegel::TestCase
             .iter()
             .any(|(instruction, _)| matches!(instruction, Insn::SoftNull { .. })));
     }
+}
+
+// Examples: for
+// `CREATE TABLE items(id INTEGER PRIMARY KEY AUTOINCREMENT, value)`, both
+// `INSERT INTO items(value) VALUES (7)` and `INSERT INTO items DEFAULT VALUES`
+// must allocate `id` through `__turso_internal_autoincrement_items`, update the
+// frozen backing table and `sqlite_sequence`, and keep working after the
+// prepare-time catalog is gone.
+#[hegel::test]
+fn mvcc_autoincrement_lowers_from_the_frozen_sequence_operation(tc: hegel::TestCase) {
+    let value = i64::from(tc.draw(generators::integers::<u16>())) + 1;
+    let default_values = tc.draw(generators::booleans());
+    let target = BTreeTable::from_sql(
+        "CREATE TABLE items(id INTEGER PRIMARY KEY AUTOINCREMENT, value INTEGER)",
+        9,
+    )
+    .expect("fixture target SQL is valid");
+    let sqlite_sequence = BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name,seq)", 10)
+        .expect("fixture sqlite_sequence SQL is valid");
+    let sequence_name = crate::schema::autoincrement_sequence_name("items");
+    let backing = BTreeTable::from_sql(
+        &crate::translate::sequence::sequence_backing_table_sql(&sequence_name),
+        11,
+    )
+    .expect("fixture sequence backing-table SQL is valid");
+    let sequence = Arc::new(
+        Sequence::new(sequence_name.clone(), Some(1), Some(1), None, None, false)
+            .expect("AUTOINCREMENT sequence bounds are valid"),
+    );
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(target))
+        .expect("items is unique");
+    schema
+        .add_btree_table(Arc::new(sqlite_sequence))
+        .expect("sqlite_sequence is unique");
+    schema
+        .add_btree_table(Arc::new(backing))
+        .expect("the sequence backing table is unique");
+    schema.sequences.insert(sequence_name.clone(), sequence);
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let sql = if default_values {
+        "INSERT INTO items DEFAULT VALUES".to_string()
+    } else {
+        format!("INSERT INTO items(value) VALUES ({value})")
+    };
+    let statement = parse_statement(&sql);
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated AUTOINCREMENT INSERT has valid SQL meaning");
+    let HirRoot::Insert(insert) = &document.root else {
+        panic!("INSERT syntax produces an INSERT HIR root");
+    };
+    let operation = insert
+        .autoincrement_sequence
+        .as_ref()
+        .expect("MVCC AUTOINCREMENT carries its hidden sequence operation");
+    assert_eq!(operation.normalized_name, sequence_name);
+    assert_eq!(
+        operation
+            .backing_table
+            .value()
+            .get_root_page()
+            .expect("the backing object is a B-tree table"),
+        11
+    );
+    assert_eq!(
+        operation
+            .sqlite_sequence
+            .as_ref()
+            .expect("AUTOINCREMENT carries sqlite_sequence")
+            .value()
+            .get_root_page()
+            .expect("sqlite_sequence is a B-tree table"),
+        10
+    );
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed HIR has a physical plan");
+    let mut program = program();
+    emit_root(&plan, &mut program).expect("AUTOINCREMENT INSERT lowers without a catalog");
+
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::SequenceComputeNext { .. })));
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::OpenWrite {
+            root_page: crate::vdbe::insn::RegisterOrLiteral::Literal(11),
+            ..
+        }
+    )));
 }
 
 // Example: `INSERT INTO items(c0, c1) SELECT c0 + 7, c1 FROM items WHERE c1`

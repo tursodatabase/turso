@@ -1286,8 +1286,11 @@ impl Statement {
         let Some(mv_store) = conn.mv_store_for_db(pending.db) else {
             return;
         };
+        let pager = conn
+            .get_pager_from_database_index(&pending.db)
+            .expect("a pending sequence transaction must retain its database pager");
         if mv_store.is_tx_rollbackable(pending.inner_tx_id) {
-            mv_store.rollback_tx(pending.inner_tx_id, self.pager.clone(), &conn, pending.db);
+            mv_store.rollback_tx(pending.inner_tx_id, pager, &conn, pending.db);
         }
         conn.set_mv_tx_for_db(pending.db, pending.saved_outer);
         // When the inner tx aborted via the vdbe's catch-all error path

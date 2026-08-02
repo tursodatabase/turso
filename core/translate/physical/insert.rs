@@ -32,6 +32,7 @@ pub(crate) enum PhysicalInsertError {
     Index(PhysicalIndexError),
     Query(PhysicalQueryError),
     Trigger(PhysicalTriggerError),
+    Sequence(crate::LimboError),
     Invalid(&'static str),
     Unsupported(&'static str),
 }
@@ -45,6 +46,7 @@ impl fmt::Display for PhysicalInsertError {
             Self::Index(error) => error.fmt(formatter),
             Self::Query(error) => error.fmt(formatter),
             Self::Trigger(error) => error.fmt(formatter),
+            Self::Sequence(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical INSERT: {message}"),
             Self::Unsupported(message) => {
                 write!(formatter, "physical INSERT is not emitted yet: {message}")
@@ -88,6 +90,12 @@ impl From<PhysicalQueryError> for PhysicalInsertError {
 impl From<PhysicalTriggerError> for PhysicalInsertError {
     fn from(error: PhysicalTriggerError) -> Self {
         Self::Trigger(error)
+    }
+}
+
+impl From<crate::LimboError> for PhysicalInsertError {
+    fn from(error: crate::LimboError) -> Self {
+        Self::Sequence(error)
     }
 }
 
@@ -169,8 +177,11 @@ pub(crate) fn emit_root_insert_with_context(
         root_page: RegisterOrLiteral::Literal(table.root_page),
         db: database,
     });
-    let mut autoincrement =
-        open_autoincrement(program, insert.autoincrement.as_ref(), &table, database)?;
+    let mut autoincrement = if insert.autoincrement_sequence.is_some() {
+        None
+    } else {
+        open_autoincrement(program, insert.autoincrement.as_ref(), &table, database)?
+    };
     let indexes = open_indexes(program, source, database)?;
 
     match &insert.source {
@@ -276,7 +287,8 @@ fn emit_insert_row(
     triggers: &PreparedTriggers,
     autoincrement: Option<&mut AutoincrementRuntime>,
 ) -> InsertResult<()> {
-    if values.len() != insert.columns.len() {
+    if !matches!(insert.source, InsertSource::DefaultValues) && values.len() != insert.columns.len()
+    {
         return Err(PhysicalInsertError::Invalid(
             "VALUES width does not match the target column list",
         ));
@@ -425,7 +437,9 @@ fn finish_insert_row(
         reg: rowid.0,
         target_pc: explicit_rowid,
     });
-    if let Some(autoincrement) = autoincrement.as_deref_mut() {
+    if let Some(sequence) = &insert.autoincrement_sequence {
+        emit_generated_sequence_rowid(program, sequence, rowid)?;
+    } else if let Some(autoincrement) = autoincrement.as_deref_mut() {
         emit_generated_autoincrement_rowid(program, cursor, rowid, *autoincrement)?;
     } else {
         program.emit_insn(Insn::NewRowid {
@@ -442,7 +456,9 @@ fn finish_insert_row(
         reg: rowid.0,
         target_pc: None,
     });
-    if let Some(autoincrement) = autoincrement {
+    if let Some(sequence) = &insert.autoincrement_sequence {
+        emit_explicit_sequence_rowid(program, sequence, rowid)?;
+    } else if let Some(autoincrement) = autoincrement {
         emit_explicit_autoincrement_rowid(program, rowid, *autoincrement)?;
     }
     program.preassign_label_to_next_insn(rowid_ready);
@@ -671,6 +687,76 @@ fn open_autoincrement(
     });
     program.preassign_label_to_next_insn(done);
     Ok(Some(runtime))
+}
+
+fn emit_generated_sequence_rowid(
+    program: &mut ProgramBuilder,
+    operation: &hir::SequenceOperation,
+    rowid: RegisterId,
+) -> InsertResult<()> {
+    if operation.kind != hir::SequenceOperationKind::NextValue {
+        return Err(PhysicalInsertError::Invalid(
+            "AUTOINCREMENT sequence is not a next-value operation",
+        ));
+    }
+    let Table::BTree(backing_table) = operation.backing_table.value() else {
+        return Err(PhysicalInsertError::Invalid(
+            "AUTOINCREMENT backing object is not a B-tree table",
+        ));
+    };
+    let sqlite_sequence = operation
+        .sqlite_sequence
+        .as_ref()
+        .map(|resolved| match resolved.value() {
+            Table::BTree(table) => Ok(table.clone()),
+            _ => Err(PhysicalInsertError::Invalid(
+                "AUTOINCREMENT sqlite_sequence object is not a B-tree table",
+            )),
+        })
+        .transpose()?;
+    crate::translate::sequence::emit_disk_read_nextval_from_resolved(
+        program,
+        operation.database.index(),
+        &operation.normalized_name,
+        &operation.sequence,
+        backing_table.clone(),
+        sqlite_sequence,
+        rowid.0,
+        None,
+    )?;
+    Ok(())
+}
+
+fn emit_explicit_sequence_rowid(
+    program: &mut ProgramBuilder,
+    operation: &hir::SequenceOperation,
+    rowid: RegisterId,
+) -> InsertResult<()> {
+    let Table::BTree(backing_table) = operation.backing_table.value() else {
+        return Err(PhysicalInsertError::Invalid(
+            "AUTOINCREMENT backing object is not a B-tree table",
+        ));
+    };
+    let sqlite_sequence = operation
+        .sqlite_sequence
+        .as_ref()
+        .map(|resolved| match resolved.value() {
+            Table::BTree(table) => Ok(table.clone()),
+            _ => Err(PhysicalInsertError::Invalid(
+                "AUTOINCREMENT sqlite_sequence object is not a B-tree table",
+            )),
+        })
+        .transpose()?;
+    crate::translate::sequence::emit_disk_advance_past_from_resolved(
+        program,
+        operation.database.index(),
+        &operation.normalized_name,
+        &operation.sequence,
+        backing_table.clone(),
+        sqlite_sequence,
+        rowid.0,
+    )?;
+    Ok(())
 }
 
 fn emit_generated_autoincrement_rowid(

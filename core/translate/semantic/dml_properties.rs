@@ -360,6 +360,7 @@ fn dml_hir_closes_over_target_and_expression_positions(tc: hegel::TestCase) {
         GeneratedDml::Insert => hir::HirRoot::Insert(hir::Insert {
             target: target_id,
             autoincrement: None,
+            autoincrement_sequence: None,
             columns: vec![TargetColumn::Column(position)],
             defaults: Vec::new(),
             source: hir::InsertSource::Values(vec![vec![hir::Expr::Literal(ast::Literal::Null)]]),
@@ -467,6 +468,7 @@ fn autoincrement_sequence_belongs_to_the_document_snapshot(tc: hegel::TestCase) 
         root: hir::HirRoot::Insert(hir::Insert {
             target: target_id,
             autoincrement: Some(sequence),
+            autoincrement_sequence: None,
             columns: Vec::new(),
             defaults: Vec::new(),
             source: hir::InsertSource::DefaultValues,

@@ -42,6 +42,10 @@ pub struct Insert {
     pub target: SourceId,
     /// Resolved sqlite_sequence table for an AUTOINCREMENT target.
     pub autoincrement: Option<ResolvedTable>,
+    /// Hidden MVCC sequence used instead of scanning sqlite_sequence for key
+    /// allocation. Present only when the target database exposes that
+    /// sequence in the semantic snapshot.
+    pub autoincrement_sequence: Option<super::SequenceOperation>,
     pub columns: Vec<TargetColumn>,
     pub defaults: Vec<ResolvedDefault>,
     pub source: InsertSource,
