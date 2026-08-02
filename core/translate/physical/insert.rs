@@ -19,11 +19,11 @@ use super::{
     emit_new_row_constraints, emit_query_for_dml, emit_replace_conflicting_row,
     emit_replace_not_null_defaults, emit_replace_unique_check, emit_returning_result,
     emit_returning_values, emit_stored_record, emit_trigger_programs, emit_unique_check,
-    open_indexes, CursorId, ExpressionEmitter, OpenedIndex, PhysicalExpressionError,
-    PhysicalIndexError, PhysicalPlan, PhysicalQueryError, PhysicalRoot, PhysicalRowError,
-    PhysicalSourceKind, PhysicalTriggerError, PreparedTriggers, RegisterId, RegisterRange,
-    RootRuntimeInputs, RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
-    TriggerRow, TriggerRows,
+    open_indexes, record_from_registers, CdcChange, CursorId, ExpressionEmitter, OpenedIndex,
+    PhysicalExpressionError, PhysicalIndexError, PhysicalPlan, PhysicalQueryError, PhysicalRoot,
+    PhysicalRowError, PhysicalSourceKind, PhysicalTriggerError, PreparedCdc, PreparedTriggers,
+    RegisterId, RegisterRange, RootRuntimeInputs, RuntimeBindingError, RuntimeBindings,
+    SourceRuntime, TableAccess, TriggerRow, TriggerRows,
 };
 
 #[derive(Debug)]
@@ -142,6 +142,7 @@ pub(crate) fn emit_root_insert_with_context(
         _ => return Err(PhysicalInsertError::Unsupported("non-INSERT HIR root")),
     };
     let (source, table, database) = preflight_insert(plan, insert, triggers)?;
+    let cdc = PreparedCdc::open(program, plan.document)?;
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     let logical = RegisterRange::new(
         program.alloc_registers(source.columns.len()),
@@ -203,6 +204,7 @@ pub(crate) fn emit_root_insert_with_context(
                 skip_row,
                 triggers,
                 autoincrement.as_mut(),
+                cdc,
             )?;
             program.preassign_label_to_next_insn(skip_row);
         }
@@ -223,6 +225,7 @@ pub(crate) fn emit_root_insert_with_context(
                     skip_row,
                     triggers,
                     autoincrement.as_mut(),
+                    cdc,
                 )?;
                 program.preassign_label_to_next_insn(skip_row);
             }
@@ -252,6 +255,7 @@ pub(crate) fn emit_root_insert_with_context(
                 next,
                 triggers,
                 autoincrement.as_mut(),
+                cdc,
             )?;
             program.emit_insn(Insn::Next {
                 cursor_id: query_rows.cursor,
@@ -269,6 +273,10 @@ pub(crate) fn emit_root_insert_with_context(
     program.emit_insn(Insn::Close { cursor_id: cursor });
     if let Some(query_rows) = query_rows {
         query_rows.close(program);
+    }
+    if let Some(cdc) = cdc {
+        cdc.emit_autocommit_commit(program)?;
+        cdc.close(program);
     }
     Ok(())
 }
@@ -288,6 +296,7 @@ fn emit_insert_row(
     skip_row: crate::vdbe::BranchOffset,
     triggers: &PreparedTriggers,
     autoincrement: Option<&mut AutoincrementRuntime>,
+    cdc: Option<PreparedCdc<'_>>,
 ) -> InsertResult<()> {
     if !matches!(insert.source, InsertSource::DefaultValues) && values.len() != insert.columns.len()
     {
@@ -316,6 +325,7 @@ fn emit_insert_row(
         skip_row,
         triggers,
         autoincrement,
+        cdc,
     )
 }
 
@@ -334,6 +344,7 @@ fn emit_insert_query_row(
     skip_row: crate::vdbe::BranchOffset,
     triggers: &PreparedTriggers,
     autoincrement: Option<&mut AutoincrementRuntime>,
+    cdc: Option<PreparedCdc<'_>>,
 ) -> InsertResult<()> {
     initialize_insert_row(program, logical, rowid);
     for (position, target) in insert.columns.iter().enumerate() {
@@ -354,6 +365,7 @@ fn emit_insert_query_row(
         skip_row,
         triggers,
         autoincrement,
+        cdc,
     )
 }
 
@@ -420,6 +432,7 @@ fn finish_insert_row(
     skip_row: crate::vdbe::BranchOffset,
     triggers: &PreparedTriggers,
     mut autoincrement: Option<&mut AutoincrementRuntime>,
+    cdc: Option<PreparedCdc<'_>>,
 ) -> InsertResult<()> {
     let statement_conflict = insert.conflict.unwrap_or(ResolveType::Abort);
     if let Some((position, _)) = table.get_rowid_alias_column().filter(|(position, _)| {
@@ -601,6 +614,20 @@ fn finish_insert_row(
         after_trigger_done,
     )?;
     program.preassign_label_to_next_insn(after_trigger_done);
+    if let Some(cdc) = cdc {
+        let after = cdc
+            .has_after()
+            .then(|| record_from_registers(program, table, logical, rowid));
+        cdc.emit_change(
+            program,
+            CdcChange::Insert,
+            rowid,
+            None,
+            after,
+            None,
+            &table.name,
+        )?;
+    }
     if let Some(returning) = &insert.returning {
         let result = emit_returning_values(program, bindings, returning)?;
         emit_returning_result(program, result);

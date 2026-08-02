@@ -85,6 +85,7 @@ fn trigger_document(position: usize) -> HirDocument {
         }],
         ctes: Vec::new(),
         schema_programs: Vec::new(),
+        cdc: None,
     }
 }
 

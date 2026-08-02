@@ -334,6 +334,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
 
     pub(crate) fn finish(mut self, root: HirRoot) -> Result<HirDocument> {
         self.materialize_required_source_expressions(&root)?;
+        let cdc = self.resolve_cdc_plan(&root)?;
         let mut document = HirDocument {
             snapshot: self.context.snapshot(),
             databases: self.context.database_snapshots(),
@@ -342,6 +343,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
             sources: Self::finish_arena(self.sources, "source")?,
             ctes: Self::finish_arena(self.ctes, "CTE")?,
             schema_programs: Self::finish_arena(self.schema_programs, "schema program")?,
+            cdc,
         };
         for index in 0..document.queries.len() {
             let id = QueryId::new(index);
@@ -349,6 +351,72 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
             document.queries[index].captures = captures;
         }
         Ok(document)
+    }
+
+    fn resolve_cdc_plan(&mut self, root: &HirRoot) -> Result<Option<hir::CdcPlan>> {
+        let target = match root {
+            HirRoot::Insert(root) => root.target,
+            HirRoot::Update(root) => root.target,
+            HirRoot::Delete(root) => root.target,
+            HirRoot::Query(_) | HirRoot::TriggerPredicate(_) => return Ok(None),
+        };
+        let Some(info) = self.context.capture_data_changes().cloned() else {
+            return Ok(None);
+        };
+        let target_name = self
+            .sources
+            .get(target.index())
+            .and_then(Option::as_ref)
+            .map(|source| source.name.as_str())
+            .ok_or_else(|| {
+                LimboError::InternalError("HIR CDC target source is missing".to_string())
+            })?;
+        if target_name == info.table
+            || target_name == crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
+        {
+            return Ok(None);
+        }
+
+        let table = self
+            .context
+            .main_schema()
+            .get_table(&info.table)
+            .ok_or_else(|| LimboError::ParseError(format!("no such table: {}", info.table)))?;
+        if table.btree().is_none() {
+            return Err(LimboError::ParseError(format!(
+                "no such table: {}",
+                info.table
+            )));
+        }
+        let table_id = self.catalog_object_id(
+            Some(crate::MAIN_DB_ID),
+            CatalogObjectKind::Table,
+            info.table.clone(),
+        );
+        let table = hir::CatalogObject::new(
+            table_id,
+            self.context.snapshot(),
+            Some(hir::DatabaseId::new(crate::MAIN_DB_ID)),
+            table,
+        );
+        let sequence_name = crate::schema::autoincrement_sequence_name(&info.table);
+        let sequence = self
+            .context
+            .main_schema()
+            .get_sequence(&sequence_name)
+            .is_some()
+            .then(|| {
+                self.resolve_sequence_catalog_operation(
+                    hir::SequenceOperationKind::NextValue,
+                    sequence_name,
+                )
+            })
+            .transpose()?;
+        Ok(Some(hir::CdcPlan {
+            info,
+            table,
+            sequence,
+        }))
     }
 
     fn insert_reserved<T>(

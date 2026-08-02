@@ -17,10 +17,11 @@ use super::{
     close_indexes, emit_complete_logical_row, emit_index_delete, emit_index_insert, emit_index_key,
     emit_new_row_constraints, emit_replace_not_null_defaults, emit_replace_unique_check,
     emit_returning_result, emit_returning_values, emit_stored_record, emit_trigger_programs,
-    emit_unique_check, open_indexes, CursorId, ExpressionEmitter, PhysicalExpressionError,
-    PhysicalIndexError, PhysicalPlan, PhysicalRoot, PhysicalRowError, PhysicalSourceKind,
-    PhysicalTriggerError, PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs,
-    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess, TriggerRow, TriggerRows,
+    emit_unique_check, open_indexes, record_from_registers, update_record, CdcChange, CursorId,
+    ExpressionEmitter, PhysicalExpressionError, PhysicalIndexError, PhysicalPlan, PhysicalRoot,
+    PhysicalRowError, PhysicalSourceKind, PhysicalTriggerError, PreparedCdc, PreparedTriggers,
+    RegisterId, RegisterRange, RootRuntimeInputs, RuntimeBindingError, RuntimeBindings,
+    SourceRuntime, TableAccess, TriggerRow, TriggerRows,
 };
 
 #[derive(Debug)]
@@ -31,6 +32,7 @@ pub(crate) enum PhysicalUpdateError {
     Index(PhysicalIndexError),
     Query(super::PhysicalQueryError),
     Trigger(PhysicalTriggerError),
+    Cdc(crate::LimboError),
     Invalid(&'static str),
     Unsupported(&'static str),
 }
@@ -44,6 +46,7 @@ impl fmt::Display for PhysicalUpdateError {
             Self::Index(error) => error.fmt(formatter),
             Self::Query(error) => error.fmt(formatter),
             Self::Trigger(error) => error.fmt(formatter),
+            Self::Cdc(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical UPDATE: {message}"),
             Self::Unsupported(message) => {
                 write!(formatter, "physical UPDATE is not emitted yet: {message}")
@@ -90,6 +93,12 @@ impl From<PhysicalTriggerError> for PhysicalUpdateError {
     }
 }
 
+impl From<crate::LimboError> for PhysicalUpdateError {
+    fn from(error: crate::LimboError) -> Self {
+        Self::Cdc(error)
+    }
+}
+
 type UpdateResult<T> = std::result::Result<T, PhysicalUpdateError>;
 
 pub(crate) fn emit_root_update(
@@ -123,6 +132,7 @@ pub(crate) fn emit_root_update_with_context(
         _ => return Err(PhysicalUpdateError::Unsupported("non-UPDATE HIR root")),
     };
     let (source, table, database) = preflight_update(plan, update, triggers)?;
+    let cdc = PreparedCdc::open(program, plan.document)?;
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     let mut bindings = RuntimeBindings::new(plan.document, plan.document.snapshot)?;
     inputs.apply(&mut bindings)?;
@@ -134,7 +144,9 @@ pub(crate) fn emit_root_update_with_context(
         program.alloc_registers(source.columns.len()),
         source.columns.len(),
     );
-    let old_columns = (!update.triggers.is_empty()).then(|| {
+    let old_columns = (!update.triggers.is_empty()
+        || cdc.is_some_and(|cdc| cdc.has_before() || cdc.has_updates()))
+    .then(|| {
         RegisterRange::new(
             program.alloc_registers(source.columns.len()),
             source.columns.len(),
@@ -443,6 +455,31 @@ pub(crate) fn emit_root_update_with_context(
         )?;
         program.preassign_label_to_next_insn(after_trigger_done);
     }
+    if let Some(cdc) = cdc {
+        let before = cdc.has_before().then(|| {
+            record_from_registers(
+                program,
+                &table,
+                old_columns.expect("CDC BEFORE requires the frozen OLD row"),
+                rowid,
+            )
+        });
+        let after = cdc
+            .has_after()
+            .then(|| record_from_registers(program, &table, logical, rowid));
+        let updates = cdc
+            .has_updates()
+            .then(|| update_record(program, source.columns.len(), &update.assignments, logical));
+        cdc.emit_change(
+            program,
+            CdcChange::Update,
+            rowid,
+            before,
+            after,
+            updates,
+            &table.name,
+        )?;
+    }
     if let Some(returning) = &update.returning {
         let old_runtime = bindings.replace_source(
             update.target,
@@ -471,6 +508,10 @@ pub(crate) fn emit_root_update_with_context(
     program.emit_insn(Insn::Close { cursor_id: cursor });
     if let Some(from_rows) = from_rows {
         from_rows.close(program);
+    }
+    if let Some(cdc) = cdc {
+        cdc.emit_autocommit_commit(program)?;
+        cdc.close(program);
     }
     Ok(())
 }

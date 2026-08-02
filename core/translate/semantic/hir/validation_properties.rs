@@ -121,6 +121,7 @@ fn generated_query_document(tc: &hegel::TestCase) -> HirDocument {
         )],
         ctes: Vec::new(),
         schema_programs: Vec::new(),
+        cdc: None,
     }
 }
 
@@ -274,6 +275,7 @@ fn generated_cte_document(tc: &hegel::TestCase) -> HirDocument {
             body: CteBody::Query(body_query),
         }],
         schema_programs: Vec::new(),
+        cdc: None,
     }
 }
 

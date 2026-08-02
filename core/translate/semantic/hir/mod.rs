@@ -553,6 +553,7 @@ pub struct HirDocument {
     pub sources: Vec<Source>,
     pub ctes: Vec<Cte>,
     pub schema_programs: Vec<BoundSchemaProgram>,
+    pub cdc: Option<CdcPlan>,
 }
 
 /// One database schema frozen into the semantic-analysis snapshot.

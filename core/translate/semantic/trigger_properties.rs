@@ -109,6 +109,7 @@ fn trigger_document(new_visible: bool, old_visible: bool) -> hir::HirDocument {
         sources,
         ctes: Vec::new(),
         schema_programs: Vec::new(),
+        cdc: None,
     }
 }
 

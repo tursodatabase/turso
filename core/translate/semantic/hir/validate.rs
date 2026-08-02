@@ -76,7 +76,45 @@ impl<'document> HirValidator<'document> {
         self.validate_database_snapshots()?;
         self.validate_arena_identities()?;
         self.visit_root(&self.document.root)?;
+        self.visit_cdc()?;
         self.validate_reachability()
+    }
+
+    fn visit_cdc(&self) -> ValidationResult {
+        let Some(cdc) = &self.document.cdc else {
+            return Ok(());
+        };
+        self.require(
+            matches!(
+                self.document.root,
+                HirRoot::Insert(_) | HirRoot::Update(_) | HirRoot::Delete(_)
+            ),
+            "CDC metadata is only valid for a DML root",
+        )?;
+        self.visit_catalog_object(&cdc.table, "CDC table")?;
+        self.require(
+            cdc.table.database().map(DatabaseId::index) == Some(crate::MAIN_DB_ID),
+            "CDC table must belong to the main database",
+        )?;
+        self.require(
+            cdc.table.value().btree().is_some(),
+            "CDC target is not a B-tree table",
+        )?;
+        self.require(
+            cdc.table
+                .value()
+                .get_name()
+                .eq_ignore_ascii_case(&cdc.info.table),
+            "CDC table identity does not match the configured table name",
+        )?;
+        if let Some(sequence) = &cdc.sequence {
+            self.visit_sequence_operation(sequence)?;
+            self.require(
+                sequence.database.index() == crate::MAIN_DB_ID,
+                "CDC sequence must belong to the main database",
+            )?;
+        }
+        Ok(())
     }
 
     fn validate_database_snapshots(&self) -> ValidationResult {

@@ -17,7 +17,8 @@ use crate::{
         Arc, RwLock,
     },
     translate::collate::CollationSeq,
-    DatabaseCatalog, LimboError, Result, SymbolTable, MAIN_DB_ID, TEMP_DB_ID,
+    CaptureDataChangesInfo, DatabaseCatalog, LimboError, Result, SymbolTable, MAIN_DB_ID,
+    TEMP_DB_ID,
 };
 
 use super::hir::{CatalogSnapshot, DatabaseId, DatabaseSnapshot};
@@ -155,6 +156,7 @@ pub(crate) struct SemanticContext<'a> {
     dqs_dml: DoubleQuotedDml,
     trigger: Option<TriggerCatalogContext>,
     dml_policy: DmlPolicy,
+    capture_data_changes: Option<CaptureDataChangesInfo>,
 }
 
 impl<'a> SemanticContext<'a> {
@@ -189,6 +191,7 @@ impl<'a> SemanticContext<'a> {
             dqs_dml: DoubleQuotedDml::Enabled,
             trigger: None,
             dml_policy: DmlPolicy::default(),
+            capture_data_changes: None,
         }
     }
 
@@ -252,6 +255,7 @@ impl<'a> SemanticContext<'a> {
             dqs_dml,
             trigger: None,
             dml_policy: DmlPolicy::default(),
+            capture_data_changes: None,
         }
     }
 
@@ -328,9 +332,22 @@ impl<'a> SemanticContext<'a> {
         self.dml_policy
     }
 
+    pub(crate) fn capture_data_changes(&self) -> Option<&CaptureDataChangesInfo> {
+        self.capture_data_changes.as_ref()
+    }
+
     pub(crate) fn with_dml_policy(&self, policy: DmlPolicy) -> SemanticContext<'a> {
         let mut context = self.clone();
         context.dml_policy = policy;
+        context
+    }
+
+    pub(crate) fn with_capture_data_changes(
+        &self,
+        capture_data_changes: Option<CaptureDataChangesInfo>,
+    ) -> SemanticContext<'a> {
+        let mut context = self.clone();
+        context.capture_data_changes = capture_data_changes;
         context
     }
 

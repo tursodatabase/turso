@@ -9,6 +9,13 @@ use super::{
 };
 
 #[derive(Clone, Debug)]
+pub struct CdcPlan {
+    pub info: crate::CaptureDataChangesInfo,
+    pub table: ResolvedTable,
+    pub sequence: Option<super::SequenceOperation>,
+}
+
+#[derive(Clone, Debug)]
 pub enum HirRoot {
     Query(QueryRoot),
     Insert(Insert),

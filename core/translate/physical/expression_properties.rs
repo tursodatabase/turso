@@ -127,6 +127,7 @@ fn source_document(width: usize, expression: Expr) -> (HirDocument, QueryId, Sou
             }],
             ctes: Vec::new(),
             schema_programs: Vec::new(),
+            cdc: None,
         },
         query,
         source,

@@ -3,6 +3,7 @@
 //! This layer consumes document-local HIR identities. It must not resolve SQL
 //! names or read schemas; all semantic facts arrive in `HirDocument`.
 
+mod cdc;
 mod delete;
 mod expression;
 mod index;
@@ -15,6 +16,7 @@ mod runtime_bindings;
 mod trigger;
 mod update;
 
+pub(crate) use cdc::*;
 pub(crate) use delete::*;
 pub(crate) use expression::*;
 pub(crate) use index::*;
@@ -32,6 +34,9 @@ mod delete_properties;
 
 #[cfg(test)]
 mod conflict_properties;
+
+#[cfg(test)]
+mod cdc_properties;
 
 #[cfg(test)]
 mod expression_properties;

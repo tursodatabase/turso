@@ -21,10 +21,11 @@ use crate::{
 
 use super::{
     close_indexes, emit_index_delete, emit_index_key, emit_returning_result, emit_returning_values,
-    emit_trigger_programs, open_indexes, CursorId, ExpressionEmitter, PhysicalExpressionError,
-    PhysicalIndexError, PhysicalPlan, PhysicalQueryError, PhysicalRoot, PhysicalSourceKind,
-    PhysicalTriggerError, PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs,
-    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess, TriggerRow, TriggerRows,
+    emit_trigger_programs, open_indexes, record_from_cursor, CdcChange, CursorId,
+    ExpressionEmitter, PhysicalExpressionError, PhysicalIndexError, PhysicalPlan,
+    PhysicalQueryError, PhysicalRoot, PhysicalSourceKind, PhysicalTriggerError, PreparedCdc,
+    PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs, RuntimeBindingError,
+    RuntimeBindings, SourceRuntime, TableAccess, TriggerRow, TriggerRows,
 };
 
 #[derive(Debug)]
@@ -33,6 +34,7 @@ pub(crate) enum PhysicalDeleteError {
     Expression(PhysicalExpressionError),
     Index(PhysicalIndexError),
     Trigger(PhysicalTriggerError),
+    Cdc(crate::LimboError),
     Invalid(&'static str),
     Unsupported(&'static str),
 }
@@ -44,6 +46,7 @@ impl fmt::Display for PhysicalDeleteError {
             Self::Expression(error) => error.fmt(formatter),
             Self::Index(error) => error.fmt(formatter),
             Self::Trigger(error) => error.fmt(formatter),
+            Self::Cdc(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical DELETE: {message}"),
             Self::Unsupported(message) => {
                 write!(formatter, "physical DELETE is not emitted yet: {message}")
@@ -75,6 +78,12 @@ impl From<PhysicalIndexError> for PhysicalDeleteError {
 impl From<PhysicalTriggerError> for PhysicalDeleteError {
     fn from(error: PhysicalTriggerError) -> Self {
         Self::Trigger(error)
+    }
+}
+
+impl From<crate::LimboError> for PhysicalDeleteError {
+    fn from(error: crate::LimboError) -> Self {
+        Self::Cdc(error)
     }
 }
 
@@ -173,6 +182,7 @@ pub(crate) fn emit_root_delete_with_context(
         _ => return Err(PhysicalDeleteError::Unsupported("non-DELETE HIR root")),
     };
     let (source, table, database) = preflight_delete(plan, delete, triggers)?;
+    let cdc = PreparedCdc::open(program, plan.document)?;
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     let mut bindings = RuntimeBindings::new(plan.document, plan.document.snapshot)?;
     inputs.apply(&mut bindings)?;
@@ -275,6 +285,20 @@ pub(crate) fn emit_root_delete_with_context(
     for (index, key) in indexes.iter().zip(&keys) {
         emit_index_delete(program, index, key);
     }
+    if let Some(cdc) = cdc {
+        let before = cdc
+            .has_before()
+            .then(|| record_from_cursor(program, &table, cursor, rowid));
+        cdc.emit_change(
+            program,
+            CdcChange::Delete,
+            rowid,
+            before,
+            None,
+            None,
+            &table.name,
+        )?;
+    }
     program.emit_insn(Insn::Delete {
         cursor_id: cursor,
         table_name: table.name.clone(),
@@ -309,6 +333,10 @@ pub(crate) fn emit_root_delete_with_context(
     program.preassign_label_to_next_insn(loop_end);
     close_indexes(program, &indexes);
     program.emit_insn(Insn::Close { cursor_id: cursor });
+    if let Some(cdc) = cdc {
+        cdc.emit_autocommit_commit(program)?;
+        cdc.close(program);
+    }
     Ok(())
 }
 

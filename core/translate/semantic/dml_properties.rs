@@ -411,6 +411,7 @@ fn dml_hir_closes_over_target_and_expression_positions(tc: hegel::TestCase) {
         sources: vec![target],
         ctes: Vec::new(),
         schema_programs: Vec::new(),
+        cdc: None,
     };
 
     document.validate().expect("generated DML HIR is closed");
@@ -484,6 +485,7 @@ fn autoincrement_sequence_belongs_to_the_document_snapshot(tc: hegel::TestCase) 
         sources: vec![target],
         ctes: Vec::new(),
         schema_programs: Vec::new(),
+        cdc: None,
     };
 
     assert_eq!(document.validate().is_err(), use_stale_snapshot);

@@ -156,6 +156,7 @@ fn correlated_document(width: usize) -> HirDocument {
         ],
         ctes: Vec::new(),
         schema_programs: Vec::new(),
+        cdc: None,
     }
 }
 

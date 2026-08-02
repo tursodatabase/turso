@@ -198,7 +198,8 @@ fn translate_semantic_root(
         false,
         connection.check_constraints_ignored(),
         connection.foreign_keys_enabled(),
-    ));
+    ))
+    .with_capture_data_changes(program.capture_data_changes_info().clone());
     let document = analyze(&context, AnalyzeInput::Statement(stmt))?;
     set_semantic_conflict_policy(program, &document);
     set_semantic_statement_journal_flags(program, &document)?;
@@ -322,6 +323,24 @@ pub(super) fn set_semantic_transactions(
         } else {
             program.begin_read_on_database(database.index(), cookie)?;
         }
+    }
+    if let Some(cdc) = &document.cdc {
+        let database = cdc
+            .table
+            .database()
+            .ok_or_else(|| {
+                crate::LimboError::InternalError("HIR CDC table has no database".to_string())
+            })?
+            .index();
+        let cookie = document
+            .databases
+            .iter()
+            .find(|snapshot| snapshot.database.index() == database)
+            .map(|snapshot| snapshot.schema_version)
+            .ok_or_else(|| {
+                crate::LimboError::InternalError("HIR CDC database has no snapshot".to_string())
+            })?;
+        program.begin_write_on_database(database, cookie)?;
     }
     Ok(())
 }
