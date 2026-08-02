@@ -348,7 +348,7 @@ impl Analyzer<'_, '_> {
                 &upsert_assignments,
             )?
         };
-        let foreign_keys = self.resolve_dml_foreign_keys(database_id, table.get_name())?;
+        let foreign_keys = self.resolve_dml_foreign_keys(database_id, target)?;
         Ok(hir::HirRoot::Insert(hir::Insert {
             target,
             autoincrement,
@@ -428,7 +428,7 @@ impl Analyzer<'_, '_> {
             ast::TriggerEvent::Update,
             &assignments,
         )?;
-        let foreign_keys = self.resolve_dml_foreign_keys(database_id, table.get_name())?;
+        let foreign_keys = self.resolve_dml_foreign_keys(database_id, target)?;
         let cdc_updates_override = self.context().internal_schema_change_sql().and_then(|sql| {
             table
                 .columns()
@@ -493,7 +493,7 @@ impl Analyzer<'_, '_> {
             self.analyze_dml_returning(returning_syntax, &environment, target, trigger.is_some())?;
         let triggers =
             self.resolve_dml_triggers(database_id, &table, ast::TriggerEvent::Delete, &[])?;
-        let foreign_keys = self.resolve_dml_foreign_keys(database_id, table.get_name())?;
+        let foreign_keys = self.resolve_dml_foreign_keys(database_id, target)?;
 
         Ok(hir::HirRoot::Delete(hir::Delete {
             target,
@@ -627,7 +627,7 @@ impl Analyzer<'_, '_> {
     fn resolve_dml_foreign_keys(
         &mut self,
         database_id: usize,
-        table_name: &str,
+        target: hir::SourceId,
     ) -> Result<hir::DmlForeignKeys> {
         if !self.context().dml_policy().foreign_keys_enabled() {
             return Ok(hir::DmlForeignKeys::default());
@@ -637,6 +637,8 @@ impl Analyzer<'_, '_> {
                 "database {database_id} disappeared while resolving foreign keys"
             ))
         })?;
+        let target_table = self.resolved_source_table(target)?;
+        let table_name = target_table.value().get_name();
         if schema.get_btree_table(table_name).is_none() {
             return Ok(hir::DmlForeignKeys::default());
         }
@@ -671,13 +673,13 @@ impl Analyzer<'_, '_> {
             outgoing: outgoing
                 .into_iter()
                 .map(|(foreign_key, parent)| {
-                    self.freeze_foreign_key(database_id, foreign_key, parent)
+                    self.freeze_foreign_key(database_id, target, foreign_key, parent)
                 })
                 .collect::<Result<Vec<_>>>()?,
             incoming: incoming
                 .into_iter()
                 .map(|(foreign_key, parent)| {
-                    self.freeze_foreign_key(database_id, foreign_key, parent)
+                    self.freeze_foreign_key(database_id, target, foreign_key, parent)
                 })
                 .collect::<Result<Vec<_>>>()?,
         })
@@ -686,6 +688,7 @@ impl Analyzer<'_, '_> {
     fn freeze_foreign_key(
         &mut self,
         database_id: usize,
+        target: hir::SourceId,
         foreign_key: ResolvedFkRef,
         parent: Arc<BTreeTable>,
     ) -> Result<hir::ResolvedForeignKey> {
@@ -718,13 +721,24 @@ impl Analyzer<'_, '_> {
                 index,
             )
         });
+        let child_table = CatalogObject::new(
+            child_id,
+            self.context().snapshot(),
+            Some(DatabaseId::new(database_id)),
+            Arc::new(Table::BTree(foreign_key.child_table)),
+        );
+        let target_table = self.resolved_source_table(target)?;
+        let child_source = if child_table == target_table {
+            target
+        } else {
+            self.analyze_foreign_key_scan_source(child_table.clone())?
+        };
+        for position in foreign_key.child_pos.iter().copied() {
+            self.require_source_column(child_source, position);
+        }
         Ok(hir::ResolvedForeignKey {
-            child_table: CatalogObject::new(
-                child_id,
-                self.context().snapshot(),
-                Some(DatabaseId::new(database_id)),
-                Arc::new(Table::BTree(foreign_key.child_table)),
-            ),
+            child_table,
+            child_source,
             parent_table: CatalogObject::new(
                 parent_id,
                 self.context().snapshot(),

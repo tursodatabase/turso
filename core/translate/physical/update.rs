@@ -560,6 +560,7 @@ pub(crate) fn emit_root_update_with_context_and_after(
     if !update.foreign_keys.outgoing.is_empty() || !update.foreign_keys.incoming.is_empty() {
         super::prepare_update_row(
             program,
+            &mut bindings,
             &table,
             old_columns.expect("foreign keys require the frozen OLD row"),
             logical,
@@ -580,6 +581,7 @@ pub(crate) fn emit_root_update_with_context_and_after(
 
     super::finish_update_row(
         program,
+        &mut bindings,
         &table,
         cursor,
         &indexes,

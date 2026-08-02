@@ -175,6 +175,9 @@ pub struct DmlForeignKeys {
 #[derive(Clone, Debug)]
 pub struct ResolvedForeignKey {
     pub child_table: ResolvedTable,
+    /// Exact source occurrence used when a parent mutation scans child keys.
+    /// Generated child columns are closed against this identity.
+    pub child_source: SourceId,
     pub parent_table: ResolvedTable,
     pub declaration: Arc<ForeignKey>,
     pub parent_columns: Box<[String]>,

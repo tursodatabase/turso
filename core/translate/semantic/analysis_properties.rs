@@ -6,7 +6,10 @@ use turso_parser::{ast, parser::Parser};
 use super::{
     analyze,
     context::{DmlPolicy, SemanticContext},
-    hir::{Expr, HirDocument, HirRoot, JoinConstraint, QueryBlockBody, SourceOwner, SubqueryExpr},
+    hir::{
+        Expr, HirDocument, HirRoot, JoinConstraint, QueryBlockBody, SourceKind, SourceOwner,
+        SubqueryExpr,
+    },
     AnalyzeInput,
 };
 use crate::{
@@ -759,7 +762,9 @@ fn upsert_analysis_freezes_insert_and_update_trigger_sets_separately(tc: hegel::
 // Example: `INSERT INTO children(c2) VALUES (1)` carries the resolved
 // `children.c2 -> parents.p3` child check, while `DELETE FROM parents` carries
 // the same constraint as an incoming parent check. Both sides use schema
-// positions, and `p3 INTEGER PRIMARY KEY` is recorded as a rowid lookup.
+// positions, and `p3 INTEGER PRIMARY KEY` is recorded as a rowid lookup. For
+// the parent DELETE, the child scan also gets its own source identity instead
+// of borrowing the parent target's runtime cursor.
 #[hegel::test]
 fn dml_analysis_freezes_foreign_key_direction_positions_and_rowid_lookup(tc: hegel::TestCase) {
     let child_width = usize::from(tc.draw(generators::integers::<u8>().max_value(15))) + 1;
@@ -810,9 +815,9 @@ fn dml_analysis_freezes_foreign_key_direction_positions_and_rowid_lookup(tc: heg
 
     let mut document = analyze(&context, AnalyzeInput::Statement(&statement))
         .expect("generated foreign-key DML has valid SQL meaning");
-    let foreign_keys = match &document.root {
-        HirRoot::Insert(insert) => &insert.foreign_keys,
-        HirRoot::Delete(delete) => &delete.foreign_keys,
+    let (target, foreign_keys) = match &document.root {
+        HirRoot::Insert(insert) => (insert.target, &insert.foreign_keys),
+        HirRoot::Delete(delete) => (delete.target, &delete.foreign_keys),
         _ => unreachable!("the generator emits INSERT or DELETE"),
     };
     let foreign_key = if target_is_child {
@@ -832,6 +837,18 @@ fn dml_analysis_freezes_foreign_key_direction_positions_and_rowid_lookup(tc: heg
     );
     assert!(foreign_key.parent_uses_rowid);
     assert!(foreign_key.parent_unique_index.is_none());
+    let child_source = document
+        .source(foreign_key.child_source)
+        .expect("the frozen child scan source exists");
+    assert!(matches!(
+        &child_source.kind,
+        SourceKind::Table(table) if table == &foreign_key.child_table
+    ));
+    if target_is_child {
+        assert_eq!(foreign_key.child_source, target);
+    } else {
+        assert_ne!(foreign_key.child_source, target);
+    }
     document
         .validate()
         .expect("resolved foreign-key facts close the HIR document");

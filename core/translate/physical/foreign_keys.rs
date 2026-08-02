@@ -6,17 +6,22 @@ use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, Index, Table},
     sync::Arc,
-    translate::semantic::hir::ResolvedForeignKey,
+    translate::semantic::hir::{Expr, ResolvedForeignKey},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{CmpInsFlags, Insn},
     },
 };
 
-use super::{ForeignKeyParentChange, PreparedTriggers, RegisterId, RegisterRange};
+use super::{
+    CursorId, ExpressionEmitter, ForeignKeyParentChange, PhysicalExpressionError, PreparedTriggers,
+    RegisterId, RegisterRange, RuntimeBindingError, RuntimeBindings, SourceRuntime,
+};
 
 #[derive(Debug)]
 pub(crate) enum PhysicalForeignKeyError {
+    Runtime(RuntimeBindingError),
+    Expression(PhysicalExpressionError),
     Invalid(&'static str),
     Unsupported(&'static str),
 }
@@ -24,6 +29,8 @@ pub(crate) enum PhysicalForeignKeyError {
 impl fmt::Display for PhysicalForeignKeyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Runtime(error) => error.fmt(formatter),
+            Self::Expression(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid frozen foreign key: {message}"),
             Self::Unsupported(message) => {
                 write!(formatter, "foreign key is not emitted yet: {message}")
@@ -34,7 +41,49 @@ impl fmt::Display for PhysicalForeignKeyError {
 
 impl std::error::Error for PhysicalForeignKeyError {}
 
+impl From<RuntimeBindingError> for PhysicalForeignKeyError {
+    fn from(error: RuntimeBindingError) -> Self {
+        Self::Runtime(error)
+    }
+}
+
+impl From<PhysicalExpressionError> for PhysicalForeignKeyError {
+    fn from(error: PhysicalExpressionError) -> Self {
+        Self::Expression(error)
+    }
+}
+
 type ForeignKeyResult<T> = std::result::Result<T, PhysicalForeignKeyError>;
+
+fn bind_child_scan_cursor(
+    bindings: &mut RuntimeBindings<'_>,
+    source: crate::translate::semantic::hir::SourceId,
+    cursor: usize,
+) -> ForeignKeyResult<Option<SourceRuntime>> {
+    let runtime = SourceRuntime::Cursor(CursorId(cursor));
+    match bindings.source(source) {
+        Ok(previous) => {
+            bindings.replace_source(source, runtime)?;
+            Ok(Some(previous))
+        }
+        Err(RuntimeBindingError::WrongScope("unbound source")) => {
+            bindings.bind_source(source, runtime)?;
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn restore_child_scan_cursor(
+    bindings: &mut RuntimeBindings<'_>,
+    source: crate::translate::semantic::hir::SourceId,
+    previous: Option<SourceRuntime>,
+) -> ForeignKeyResult<()> {
+    if let Some(previous) = previous {
+        bindings.replace_source(source, previous)?;
+    }
+    Ok(())
+}
 
 pub(crate) fn emit_insert_child_checks(
     program: &mut ProgramBuilder,
@@ -51,6 +100,7 @@ pub(crate) fn emit_insert_child_checks(
 
 pub(crate) fn emit_insert_parent_repairs(
     program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
     foreign_keys: &[ResolvedForeignKey],
     parent_table: &BTreeTable,
     columns: RegisterRange,
@@ -60,13 +110,14 @@ pub(crate) fn emit_insert_parent_repairs(
         .iter()
         .filter(|foreign_key| foreign_key.declaration.deferred)
     {
-        emit_new_parent_repair(program, foreign_key, parent_table, columns, rowid)?;
+        emit_new_parent_repair(program, bindings, foreign_key, parent_table, columns, rowid)?;
     }
     Ok(())
 }
 
 pub(crate) fn emit_update_parent_repairs(
     program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
     foreign_keys: &[ResolvedForeignKey],
     parent_table: &BTreeTable,
     old_columns: RegisterRange,
@@ -93,7 +144,14 @@ pub(crate) fn emit_update_parent_repairs(
             complete,
         )?;
         program.preassign_label_to_next_insn(changed);
-        emit_new_parent_repair(program, foreign_key, parent_table, new_columns, new_rowid)?;
+        emit_new_parent_repair(
+            program,
+            bindings,
+            foreign_key,
+            parent_table,
+            new_columns,
+            new_rowid,
+        )?;
         program.preassign_label_to_next_insn(complete);
     }
     Ok(())
@@ -156,6 +214,7 @@ pub(crate) fn emit_delete_child_repairs(
 
 pub(crate) fn emit_delete_parent_checks(
     program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
     foreign_keys: &[ResolvedForeignKey],
     parent_table: &BTreeTable,
     old_columns: RegisterRange,
@@ -167,13 +226,21 @@ pub(crate) fn emit_delete_parent_checks(
             turso_parser::ast::RefAct::NoAction | turso_parser::ast::RefAct::Restrict
         )
     }) {
-        emit_delete_parent_check(program, foreign_key, parent_table, old_columns, rowid)?;
+        emit_delete_parent_check(
+            program,
+            bindings,
+            foreign_key,
+            parent_table,
+            old_columns,
+            rowid,
+        )?;
     }
     Ok(())
 }
 
 pub(crate) fn emit_replace_parent_checks(
     program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
     foreign_keys: &[ResolvedForeignKey],
     parent_table: &BTreeTable,
     old_columns: RegisterRange,
@@ -193,7 +260,14 @@ pub(crate) fn emit_replace_parent_checks(
             foreign_key.declaration.on_delete,
             foreign_key.declaration.deferred,
         ) {
-            emit_delete_parent_check(program, foreign_key, parent_table, old_columns, old_rowid)?;
+            emit_delete_parent_check(
+                program,
+                bindings,
+                foreign_key,
+                parent_table,
+                old_columns,
+                old_rowid,
+            )?;
             continue;
         }
 
@@ -228,7 +302,14 @@ pub(crate) fn emit_replace_parent_checks(
             target_pc: complete,
         });
         program.preassign_label_to_next_insn(changed);
-        emit_delete_parent_check(program, foreign_key, parent_table, old_columns, old_rowid)?;
+        emit_delete_parent_check(
+            program,
+            bindings,
+            foreign_key,
+            parent_table,
+            old_columns,
+            old_rowid,
+        )?;
         program.preassign_label_to_next_insn(complete);
     }
     Ok(())
@@ -240,6 +321,7 @@ fn can_skip_transient_replace_check(action: turso_parser::ast::RefAct, deferred:
 
 pub(crate) fn emit_update_parent_checks(
     program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
     foreign_keys: &[ResolvedForeignKey],
     parent_table: &BTreeTable,
     old_columns: RegisterRange,
@@ -255,6 +337,7 @@ pub(crate) fn emit_update_parent_checks(
     }) {
         emit_update_parent_check(
             program,
+            bindings,
             foreign_key,
             parent_table,
             old_columns,
@@ -389,6 +472,7 @@ pub(crate) fn emit_update_parent_actions(
 
 fn emit_update_parent_check(
     program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
     foreign_key: &ResolvedForeignKey,
     parent_table: &BTreeTable,
     old_columns: RegisterRange,
@@ -462,6 +546,7 @@ fn emit_update_parent_check(
     program.preassign_label_to_next_insn(changed);
 
     let cursor = open_parent_table(program, child_table, database);
+    let previous_child = bind_child_scan_cursor(bindings, foreign_key.child_source, cursor)?;
     let loop_start = program.allocate_label();
     let next = program.allocate_label();
     let scan_done = program.allocate_label();
@@ -472,7 +557,10 @@ fn emit_update_parent_check(
     program.preassign_label_to_next_insn(loop_start);
     for (offset, position) in foreign_key.child_positions.iter().copied().enumerate() {
         let value = program.alloc_register();
-        program.emit_column_or_rowid(cursor, position, value);
+        ExpressionEmitter::new(program, bindings).emit_into(
+            &Expr::column(foreign_key.child_source, position),
+            RegisterRange::new(value, 1),
+        )?;
         program.emit_insn(Insn::IsNull {
             reg: value,
             target_pc: next,
@@ -536,12 +624,14 @@ fn emit_update_parent_check(
     });
     program.preassign_label_to_next_insn(scan_done);
     program.emit_insn(Insn::Close { cursor_id: cursor });
+    restore_child_scan_cursor(bindings, foreign_key.child_source, previous_child)?;
     program.preassign_label_to_next_insn(complete);
     Ok(())
 }
 
 fn emit_delete_parent_check(
     program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
     foreign_key: &ResolvedForeignKey,
     parent_table: &BTreeTable,
     old_columns: RegisterRange,
@@ -592,6 +682,7 @@ fn emit_delete_parent_check(
     }
 
     let cursor = open_parent_table(program, child_table, database);
+    let previous_child = bind_child_scan_cursor(bindings, foreign_key.child_source, cursor)?;
     let loop_start = program.allocate_label();
     let next = program.allocate_label();
     let scan_done = program.allocate_label();
@@ -602,7 +693,10 @@ fn emit_delete_parent_check(
     program.preassign_label_to_next_insn(loop_start);
     for (offset, position) in foreign_key.child_positions.iter().copied().enumerate() {
         let value = program.alloc_register();
-        program.emit_column_or_rowid(cursor, position, value);
+        ExpressionEmitter::new(program, bindings).emit_into(
+            &Expr::column(foreign_key.child_source, position),
+            RegisterRange::new(value, 1),
+        )?;
         program.emit_insn(Insn::IsNull {
             reg: value,
             target_pc: next,
@@ -654,6 +748,7 @@ fn emit_delete_parent_check(
     });
     program.preassign_label_to_next_insn(scan_done);
     program.emit_insn(Insn::Close { cursor_id: cursor });
+    restore_child_scan_cursor(bindings, foreign_key.child_source, previous_child)?;
     program.preassign_label_to_next_insn(complete);
     Ok(())
 }
@@ -756,6 +851,7 @@ fn emit_old_child_repair(
 
 fn emit_new_parent_repair(
     program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
     foreign_key: &ResolvedForeignKey,
     parent_table: &BTreeTable,
     columns: RegisterRange,
@@ -789,6 +885,7 @@ fn emit_new_parent_repair(
     }
 
     let cursor = open_parent_table(program, child_table, database);
+    let previous_child = bind_child_scan_cursor(bindings, foreign_key.child_source, cursor)?;
     let loop_start = program.allocate_label();
     let next = program.allocate_label();
     let scan_done = program.allocate_label();
@@ -799,7 +896,10 @@ fn emit_new_parent_repair(
     program.preassign_label_to_next_insn(loop_start);
     for (offset, position) in foreign_key.child_positions.iter().copied().enumerate() {
         let value = program.alloc_register();
-        program.emit_column_or_rowid(cursor, position, value);
+        ExpressionEmitter::new(program, bindings).emit_into(
+            &Expr::column(foreign_key.child_source, position),
+            RegisterRange::new(value, 1),
+        )?;
         program.emit_insn(Insn::IsNull {
             reg: value,
             target_pc: next,
@@ -827,6 +927,7 @@ fn emit_new_parent_repair(
     });
     program.preassign_label_to_next_insn(scan_done);
     program.emit_insn(Insn::Close { cursor_id: cursor });
+    restore_child_scan_cursor(bindings, foreign_key.child_source, previous_child)?;
     program.preassign_label_to_next_insn(complete);
     Ok(())
 }

@@ -151,6 +151,7 @@ fn prepare_delete_row_inner(
         if let Some(replacement) = replacement {
             emit_replace_parent_checks(
                 program,
+                bindings,
                 &foreign_keys.incoming,
                 table,
                 old_columns,
@@ -159,7 +160,14 @@ fn prepare_delete_row_inner(
                 replacement.rowid,
             )?;
         } else {
-            emit_delete_parent_checks(program, &foreign_keys.incoming, table, old_columns, rowid)?;
+            emit_delete_parent_checks(
+                program,
+                bindings,
+                &foreign_keys.incoming,
+                table,
+                old_columns,
+                rowid,
+            )?;
         }
     }
     Ok(())
@@ -321,6 +329,7 @@ pub(crate) fn emit_replace_unique_check(
 
 pub(crate) fn prepare_update_row(
     program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
     table: &BTreeTable,
     old_columns: RegisterRange,
     new_columns: RegisterRange,
@@ -342,6 +351,7 @@ pub(crate) fn prepare_update_row(
     if !foreign_keys.incoming.is_empty() {
         emit_update_parent_checks(
             program,
+            bindings,
             &foreign_keys.incoming,
             table,
             old_columns,
@@ -356,6 +366,7 @@ pub(crate) fn prepare_update_row(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_update_row(
     program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
     table: &BTreeTable,
     cursor: usize,
     indexes: &[OpenedIndex<'_>],
@@ -423,6 +434,7 @@ pub(crate) fn finish_update_row(
     if !foreign_keys.incoming.is_empty() {
         emit_update_parent_repairs(
             program,
+            bindings,
             &foreign_keys.incoming,
             table,
             old_columns,

@@ -24,8 +24,8 @@ use super::{
     open_dml_target_scan, open_indexes, record_from_cursor, CdcChange, CursorId,
     PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError, PhysicalPlan,
     PhysicalQueryError, PhysicalRoot, PhysicalSourceKind, PhysicalTriggerError, PreparedCdc,
-    PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs, RuntimeBindingError,
-    RuntimeBindings, SourceRuntime, TriggerRow, TriggerRows,
+    PreparedTriggers, RegisterId, RootRuntimeInputs, RuntimeBindingError, RuntimeBindings,
+    SourceRuntime, TriggerRow, TriggerRows,
 };
 
 #[derive(Debug)]
@@ -222,15 +222,9 @@ pub(crate) fn emit_root_delete_with_context(
     });
     let target_scan = open_dml_target_scan(plan, program, delete.target, cursor)?;
     let rowid = RegisterId(program.alloc_register());
-    let old_columns = (!delete.triggers.is_empty()
+    let needs_old_columns = !delete.triggers.is_empty()
         || !delete.foreign_keys.outgoing.is_empty()
-        || !delete.foreign_keys.incoming.is_empty())
-    .then(|| {
-        RegisterRange::new(
-            program.alloc_registers(source.columns.len()),
-            source.columns.len(),
-        )
-    });
+        || !delete.foreign_keys.incoming.is_empty();
     // Freeze every selected rowid before the first write. Besides making
     // ORDER BY/LIMIT stable, this prevents a self-referencing subquery from
     // observing rows deleted earlier by the same statement.
@@ -264,10 +258,12 @@ pub(crate) fn emit_root_delete_with_context(
         rowid_reg: rowid.0,
         target_pc: loop_next,
     });
+    let old_columns = needs_old_columns
+        .then(|| {
+            super::freeze_cursor_row(program, &mut bindings, delete.target, source.columns.len())
+        })
+        .transpose()?;
     if let Some(old_columns) = old_columns {
-        for position in 0..old_columns.width {
-            program.emit_column_or_rowid(cursor, position, old_columns.first.0 + position);
-        }
         let rows = TriggerRows {
             new: None,
             old: Some(TriggerRow {

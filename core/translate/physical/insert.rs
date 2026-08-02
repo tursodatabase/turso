@@ -684,6 +684,7 @@ fn finish_insert_row<'document>(
     )?;
     super::emit_insert_parent_repairs(
         program,
+        bindings,
         &insert.foreign_keys.incoming,
         table,
         logical,
@@ -1439,6 +1440,7 @@ fn emit_upsert_action<'document>(
     }
     super::prepare_update_row(
         program,
+        bindings,
         table,
         old_columns,
         updated,
@@ -1450,6 +1452,7 @@ fn emit_upsert_action<'document>(
     bindings.replace_source(insert.target, cursor_target)?;
     super::finish_update_row(
         program,
+        bindings,
         table,
         cursor,
         indexes,

@@ -562,6 +562,15 @@ impl<'document> HirValidator<'document> {
     ) -> ValidationResult {
         self.visit_catalog_object(&foreign_key.child_table, "foreign-key child table")?;
         self.visit_catalog_object(&foreign_key.parent_table, "foreign-key parent table")?;
+        self.visit_source(
+            foreign_key.child_source,
+            Some(crate::translate::semantic::hir::SourceOwner::Root),
+        )?;
+        let child_source = self.source(foreign_key.child_source)?;
+        self.require(
+            matches!(&child_source.kind, SourceKind::Table(table) if table == &foreign_key.child_table),
+            "foreign-key child scan source belongs to another table",
+        )?;
         self.require(
             foreign_key.child_table.database() == foreign_key.parent_table.database(),
             "foreign-key child and parent tables belong to different databases",

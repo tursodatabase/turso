@@ -252,6 +252,41 @@ impl Analyzer<'_, '_> {
         Ok(source_id)
     }
 
+    /// Create the closed table occurrence used by a foreign-key child scan.
+    /// It deliberately carries no optimizer/index metadata: the FK emitter
+    /// owns the scan shape and needs only logical column read programs.
+    pub(super) fn analyze_foreign_key_scan_source(
+        &mut self,
+        table: hir::ResolvedTable,
+    ) -> Result<hir::SourceId> {
+        let columns = self.source_columns_for_table(&table)?;
+        let database = table.database();
+        let source_id = self.reserve_source();
+        self.insert_source(
+            source_id,
+            hir::Source {
+                id: source_id,
+                owner: hir::SourceOwner::Root,
+                database,
+                name: crate::util::normalize_ident(table.value().get_name()),
+                alias: None,
+                kind: hir::SourceKind::Table(table.clone()),
+                generated_expressions: vec![hir::ColumnReadExpression::Absent; columns.len()],
+                default_expressions: vec![hir::ColumnReadExpression::Absent; columns.len()],
+                column_type_programs: vec![None; columns.len()],
+                check_constraints: None,
+                columns,
+                rowid_available: table_has_rowid(table.value()),
+                index_hint: hir::IndexHint::None,
+                index_expressions: Vec::new(),
+                index_coverage: hir::IndexCoverage::Selective,
+                index_method_patterns: Vec::new(),
+            },
+        )?;
+        self.initialize_table_read_expression_slots(source_id, table.value())?;
+        Ok(source_id)
+    }
+
     /// Return the table handle behind a base source for DML and trigger setup.
     pub(crate) fn resolved_source_table(
         &self,
@@ -378,6 +413,43 @@ impl Analyzer<'_, '_> {
         &mut self,
         root: &hir::HirRoot,
     ) -> Result<()> {
+        // Aggregate, GROUP BY, and window emission preserve a representative
+        // logical row for each input source. Close the complete row here so
+        // physical planning never discovers a generated-column read after the
+        // semantic document has been frozen.
+        let full_row_blocks = self
+            .queries
+            .iter()
+            .flatten()
+            .flat_map(|query| &query.blocks)
+            .filter(|block| {
+                block.aggregate_count > 0
+                    || block.window_function_count > 0
+                    || matches!(
+                        &block.body,
+                        hir::QueryBlockBody::Select {
+                            grouping: Some(_),
+                            ..
+                        }
+                    )
+            })
+            .map(|block| block.id)
+            .collect::<rustc_hash::FxHashSet<_>>();
+        let full_row_sources = self
+            .sources
+            .iter()
+            .flatten()
+            .filter(|source| {
+                matches!(source.owner, hir::SourceOwner::QueryBlock(block) if full_row_blocks.contains(&block))
+            })
+            .map(|source| (source.id, source.columns.len()))
+            .collect::<Vec<_>>();
+        for (source, width) in full_row_sources {
+            for column in 0..width {
+                self.require_source_column(source, column);
+            }
+        }
+
         // Writable targets are complete row images. INSERT and UPDATE build a
         // full NEW record, while DELETE may cache the full OLD record for
         // attached triggers decided during emission. Until row-image demand

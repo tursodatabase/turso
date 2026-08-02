@@ -7,7 +7,7 @@ use super::*;
 use crate::{
     dialect::{Dialect, SqliteDialect},
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
-    schema::{BTreeTable, Schema},
+    schema::{BTreeTable, Index, Schema},
     sync::Arc,
     translate::semantic::{
         analyze,
@@ -243,11 +243,20 @@ fn a_simple_delete_emits_only_from_closed_hir(tc: hegel::TestCase) {
         .join(", ");
     let table = BTreeTable::from_sql(&format!("CREATE TABLE items({columns})"), 7)
         .expect("generated table SQL is valid");
-    let mut schema = Schema::new();
-    schema
-        .add_btree_table(Arc::new(table))
-        .expect("items is unique");
+    let table = Arc::new(table);
     let symbols = SymbolTable::new();
+    let index = Index::from_sql(
+        &symbols,
+        "CREATE INDEX items_generated ON items(c0)",
+        8,
+        &table,
+    )
+    .expect("generated-column index SQL is valid");
+    let mut schema = Schema::new();
+    schema.add_btree_table(table).expect("items is unique");
+    schema
+        .add_index(Arc::new(index))
+        .expect("items_generated is unique");
     let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
     let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
     let statement = parse_statement(&format!("DELETE FROM items WHERE c{predicate_position}"));
@@ -459,6 +468,8 @@ fn delete_returning_captures_old_hir_before_the_write(tc: hegel::TestCase) {
 // the stored HIR read rule before deciding to delete. c1 reads c0 and adds 7;
 // c2 branches on record width and computes 11 for an old short record. Neither
 // case may resolve or parse the stored SQL after the live schema is dropped.
+// `CREATE INDEX items_generated ON items(c1)` also requires DELETE to compute
+// the generated old key from that same frozen HIR before removing the index row.
 #[hegel::test]
 fn delete_predicates_execute_stored_column_hir(tc: hegel::TestCase) {
     let use_generated = tc.draw(generators::booleans());
@@ -476,11 +487,20 @@ fn delete_predicates_execute_stored_column_hir(tc: hegel::TestCase) {
         7,
     )
     .expect("generated table SQL is valid");
-    let mut schema = Schema::new();
-    schema
-        .add_btree_table(Arc::new(table))
-        .expect("items is unique");
+    let table = Arc::new(table);
     let symbols = SymbolTable::new();
+    let index = Index::from_sql(
+        &symbols,
+        "CREATE INDEX items_generated ON items(c1)",
+        8,
+        &table,
+    )
+    .expect("generated-column index SQL is valid");
+    let mut schema = Schema::new();
+    schema.add_btree_table(table).expect("items is unique");
+    schema
+        .add_index(Arc::new(index))
+        .expect("items_generated is unique");
     let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
     let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
     let predicate_column = if use_generated { 1 } else { 2 };

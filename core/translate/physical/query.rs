@@ -2609,12 +2609,11 @@ fn emit_ranking_window_row<'document>(
     };
     let outer_columns = RegisterRange::new(program.alloc_registers(source.width), source.width);
     for position in 0..source.width {
-        program.emit_insn(Insn::Column {
-            cursor_id: outer_cursor.0,
-            column: position,
-            dest: outer_columns.first.0 + position,
-            default: None,
-        });
+        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries).emit_into(
+            &Expr::column(*source_id, position),
+            RegisterRange::new(outer_columns.first.0 + position, 1),
+        )?;
     }
     let outer_rowid = RegisterId(program.alloc_register());
     program.emit_insn(Insn::RowId {
