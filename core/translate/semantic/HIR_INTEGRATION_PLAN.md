@@ -97,6 +97,8 @@ operations are not SQL binding.
         implementation rescans the frozen HIR source for each output row.
   - [x] `percent_rank`, `cume_dist`, and `ntile` derive filtered partition size,
         peer position, and validated arguments from the same frozen HIR rescan.
+  - [x] `lag` and `lead` materialize each filtered HIR partition in resolved
+        window order and seek an ordinal without parser-expression rewrites.
   - [ ] Window execution, RIGHT/FULL OUTER JOIN, and the remaining compound
         combinations.
   - [x] Recursive CTE seeds and arms feed a frozen-HIR priority queue, bind

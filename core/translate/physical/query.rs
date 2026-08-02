@@ -2262,7 +2262,9 @@ fn emit_ranking_window_query<'document>(
             | WindowFunc::DenseRank
             | WindowFunc::PercentRank
             | WindowFunc::CumeDist
-            | WindowFunc::Ntile,
+            | WindowFunc::Ntile
+            | WindowFunc::Lag
+            | WindowFunc::Lead,
         ) = function.call.function.value()
         else {
             return Err(PhysicalQueryError::Unsupported(
@@ -2351,7 +2353,9 @@ fn emit_ranking_window_row<'document>(
                 | WindowFunc::DenseRank
                 | WindowFunc::PercentRank
                 | WindowFunc::CumeDist
-                | WindowFunc::Ntile),
+                | WindowFunc::Ntile
+                | WindowFunc::Lag
+                | WindowFunc::Lead),
             ) = function.call.function.value()
             else {
                 return Err(PhysicalQueryError::Unsupported(
@@ -2365,6 +2369,21 @@ fn emit_ranking_window_row<'document>(
                 .ok_or(PhysicalQueryError::Invalid(
                     "window call has no specification",
                 ))?;
+            if matches!(kind, WindowFunc::Lag | WindowFunc::Lead) {
+                emit_navigation_window(
+                    plan,
+                    program,
+                    bindings,
+                    ctes,
+                    function,
+                    kind,
+                    spec,
+                    source,
+                    filter,
+                    outer_rowid,
+                )?;
+                continue;
+            }
             let outer_partition = program.alloc_registers(spec.partition_by.len());
             for (position, expression) in spec.partition_by.iter().enumerate() {
                 let mut subqueries = QuerySubqueryEmitter { plan, ctes };
@@ -2807,6 +2826,303 @@ fn emit_ranking_window_row<'document>(
     })();
     bindings.replace_source(*source_id, previous_outer)?;
     emission
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_navigation_window<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    ctes: &mut MaterializedCtes,
+    function: &super::PhysicalWindowFunction<'document>,
+    kind: &WindowFunc,
+    spec: &'document crate::translate::semantic::hir::WindowSpec,
+    source: &PhysicalSource<'document>,
+    filter: Option<&'document Expr>,
+    outer_rowid: RegisterId,
+) -> QueryResult<()> {
+    let value = bindings.window_function(function.id)?.register;
+    if let Some(default) = function.call.arguments.get(2) {
+        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+            .emit_into(default, RegisterRange::new(value.0, 1))?;
+    } else {
+        program.emit_insn(Insn::Null {
+            dest: value.0,
+            dest_end: None,
+        });
+    }
+    let offset = if let Some(offset) = function.call.arguments.get(1) {
+        let register = program.alloc_register();
+        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+            .emit_into(offset, RegisterRange::new(register, 1))?;
+        register
+    } else {
+        let register = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: register,
+        });
+        register
+    };
+    let outer_partition = program.alloc_registers(spec.partition_by.len());
+    for (position, expression) in spec.partition_by.iter().enumerate() {
+        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries).emit_into(
+            expression,
+            RegisterRange::new(outer_partition + position, 1),
+        )?;
+    }
+
+    let key_count = spec.order_by.len() + 1;
+    let sorter = program.alloc_cursor_id(CursorType::Sorter);
+    let mut order_collations_nulls = spec
+        .order_by
+        .iter()
+        .map(|term| {
+            (
+                term.order,
+                term.collation.as_ref().map(|collation| *collation.value()),
+                term.nulls,
+            )
+        })
+        .collect::<Vec<_>>();
+    order_collations_nulls.push((SortOrder::Asc, Some(CollationSeq::Binary), None));
+    let mut comparators = spec
+        .order_by
+        .iter()
+        .map(|term| sort_comparator(&term.type_fact))
+        .collect::<Vec<_>>();
+    comparators.push(None);
+    program.emit_insn(Insn::SorterOpen {
+        cursor_id: sorter,
+        columns: key_count,
+        order_collations_nulls,
+        comparators,
+    });
+
+    let inner = open_source(plan, program, bindings, ctes, source)?;
+    let ScanCursor::BTree(inner_cursor) = inner.cursor else {
+        return Err(PhysicalQueryError::Unsupported(
+            "navigation window over a non-B-tree source",
+        ));
+    };
+    let outer_runtime = bindings.replace_source(
+        source.id,
+        SourceRuntime::Cursor(super::CursorId(inner.runtime_cursor)),
+    )?;
+    let scan_start = program.allocate_label();
+    let scan_next = program.allocate_label();
+    let scan_done = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: inner_cursor,
+        pc_if_empty: scan_done,
+    });
+    program.preassign_label_to_next_insn(scan_start);
+    if let Some(filter) = filter {
+        emit_filter(plan, program, bindings, ctes, filter, scan_next)?;
+    }
+    if !spec.partition_by.is_empty() {
+        let inner_partition = program.alloc_registers(spec.partition_by.len());
+        for (position, expression) in spec.partition_by.iter().enumerate() {
+            let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+            ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries).emit_into(
+                expression,
+                RegisterRange::new(inner_partition + position, 1),
+            )?;
+        }
+        program.emit_insn(Insn::Compare {
+            start_reg_a: outer_partition,
+            start_reg_b: inner_partition,
+            count: spec.partition_by.len(),
+            key_info: spec
+                .partition_by
+                .iter()
+                .map(|expression| KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation: expression_collation(plan, expression),
+                    nulls_order: None,
+                })
+                .collect(),
+        });
+        let same_partition = program.allocate_label();
+        program.emit_insn(Insn::Jump {
+            target_pc_lt: scan_next,
+            target_pc_eq: same_partition,
+            target_pc_gt: scan_next,
+        });
+        program.preassign_label_to_next_insn(same_partition);
+    }
+    let fields = program.alloc_registers(key_count + 1);
+    for (position, term) in spec.order_by.iter().enumerate() {
+        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+            .emit_into(&term.expr, RegisterRange::new(fields + position, 1))?;
+    }
+    program.emit_insn(Insn::RowId {
+        cursor_id: inner_cursor,
+        dest: fields + spec.order_by.len(),
+    });
+    let argument = function
+        .call
+        .arguments
+        .first()
+        .ok_or(PhysicalQueryError::Invalid(
+            "navigation window has no value argument",
+        ))?;
+    let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+    ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+        .emit_into(argument, RegisterRange::new(fields + key_count, 1))?;
+    let record = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(fields),
+        count: to_u32(key_count + 1),
+        dest_reg: to_u32(record),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::SorterInsert {
+        cursor_id: sorter,
+        record_reg: record,
+    });
+    program.preassign_label_to_next_insn(scan_next);
+    program.emit_insn(Insn::Next {
+        cursor_id: inner_cursor,
+        pc_if_next: scan_start,
+    });
+    program.preassign_label_to_next_insn(scan_done);
+    bindings.replace_source(source.id, outer_runtime)?;
+    if inner.owned {
+        program.emit_insn(Insn::Close {
+            cursor_id: inner.cursor.id(),
+        });
+    }
+
+    let positions = ephemeral_table("window_navigation".to_string(), 1);
+    let positions_cursor = program.alloc_cursor_id(CursorType::BTreeTable(positions.clone()));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: positions_cursor,
+        is_table: true,
+    });
+    let sorted_record = program.alloc_register();
+    let pseudo = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
+        column_count: key_count + 1,
+    }));
+    program.emit_insn(Insn::OpenPseudo {
+        cursor_id: pseudo,
+        content_reg: sorted_record,
+        num_fields: key_count + 1,
+    });
+    let outer_position = program.alloc_register();
+    program.emit_insn(Insn::Null {
+        dest: outer_position,
+        dest_end: None,
+    });
+    let sort_start = program.allocate_label();
+    let sort_next = program.allocate_label();
+    let sort_done = program.allocate_label();
+    program.emit_insn(Insn::SorterSort {
+        cursor_id: sorter,
+        pc_if_empty: sort_done,
+    });
+    program.preassign_label_to_next_insn(sort_start);
+    program.emit_insn(Insn::SorterData {
+        cursor_id: sorter,
+        dest_reg: sorted_record,
+        pseudo_cursor: pseudo,
+    });
+    let ordinal = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: positions_cursor,
+        rowid_reg: ordinal,
+        prev_largest_reg: 0,
+    });
+    let sorted_rowid = program.alloc_register();
+    program.emit_insn(Insn::Column {
+        cursor_id: pseudo,
+        column: key_count - 1,
+        dest: sorted_rowid,
+        default: None,
+    });
+    program.emit_insn(Insn::Ne {
+        lhs: sorted_rowid,
+        rhs: outer_rowid.0,
+        target_pc: sort_next,
+        flags: crate::vdbe::insn::CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: ordinal,
+        dst_reg: outer_position,
+        extra_amount: 0,
+    });
+    program.preassign_label_to_next_insn(sort_next);
+    let sorted_value = program.alloc_register();
+    program.emit_insn(Insn::Column {
+        cursor_id: pseudo,
+        column: key_count,
+        dest: sorted_value,
+        default: None,
+    });
+    let value_record = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(sorted_value),
+        count: 1,
+        dest_reg: to_u32(value_record),
+        index_name: Some(positions.name.clone()),
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: positions_cursor,
+        key_reg: ordinal,
+        record_reg: value_record,
+        flag: InsertFlags::new().is_ephemeral_table_insert(),
+        table_name: positions.name.clone(),
+    });
+    program.emit_insn(Insn::SorterNext {
+        cursor_id: sorter,
+        pc_if_next: sort_start,
+    });
+    program.preassign_label_to_next_insn(sort_done);
+
+    let target = program.alloc_register();
+    program.emit_insn(match kind {
+        WindowFunc::Lag => Insn::Subtract {
+            lhs: outer_position,
+            rhs: offset,
+            dest: target,
+        },
+        WindowFunc::Lead => Insn::Add {
+            lhs: outer_position,
+            rhs: offset,
+            dest: target,
+        },
+        _ => {
+            return Err(PhysicalQueryError::Invalid(
+                "non-navigation function reached navigation emission",
+            ));
+        }
+    });
+    let missing = program.allocate_label();
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: positions_cursor,
+        src_reg: target,
+        target_pc: missing,
+    });
+    program.emit_insn(Insn::Column {
+        cursor_id: positions_cursor,
+        column: 0,
+        dest: value.0,
+        default: None,
+    });
+    program.preassign_label_to_next_insn(missing);
+    program.emit_insn(Insn::Close { cursor_id: pseudo });
+    program.emit_insn(Insn::Close { cursor_id: sorter });
+    program.emit_insn(Insn::Close {
+        cursor_id: positions_cursor,
+    });
+    Ok(())
 }
 
 fn open_ordered_aggregate_sorters<'document>(
