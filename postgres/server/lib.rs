@@ -186,17 +186,30 @@ impl SimpleQueryHandler for TursoPgHandler {
 
         let mut responses = Vec::new();
         for sql in &statements {
-            let mut stmt = conn
-                .prepare(sql)
-                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            let result = (|| {
+                let mut stmt = conn
+                    .prepare(sql)
+                    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
 
-            self.cleanup_dropped_schema_file(sql);
+                self.cleanup_dropped_schema_file(sql);
 
-            if stmt.num_columns() == 0 || is_pg_non_query(sql) {
-                responses.push(execute_non_query(&mut stmt, sql)?);
-            } else {
-                let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
-                responses.push(execute_query(&mut stmt, header)?);
+                if stmt.num_columns() == 0 || is_pg_non_query(sql) {
+                    execute_non_query(&mut stmt, sql)
+                } else {
+                    let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+                    execute_query(&mut stmt, header)
+                }
+            })();
+            match result {
+                Ok(response) => responses.push(response),
+                // An error ends the message. Report it as a response, not
+                // Err: pgwire drops earlier tags and transaction
+                // transitions on Err, so after a BEGIN the client would
+                // be told idle while the connection is in a transaction.
+                Err(e) => {
+                    responses.push(Response::Error(Box::new(e.into())));
+                    break;
+                }
             }
         }
 
@@ -414,7 +427,34 @@ fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireRes
 
     let affected = stmt.n_change();
     let tag = command_tag(query, affected as usize);
-    Ok(Response::Execution(tag))
+    Ok(transaction_aware_response(query, tag))
+}
+
+/// Pick the Response variant that keeps pgwire's transaction status
+/// accurate. ReadyForQuery echoes that status, and clients that track it
+/// (e.g. psycopg3) skip sending COMMIT when it says idle; reporting BEGIN
+/// as a plain Execution would silently lose the transaction on disconnect.
+fn transaction_aware_response(query: &str, tag: Tag) -> Response {
+    let mut words = query
+        .split_whitespace()
+        .map(|w| w.trim_end_matches(';').to_ascii_uppercase());
+    let Some(first) = words.next() else {
+        return Response::Execution(tag);
+    };
+    match first.as_str() {
+        "BEGIN" | "START" => Response::TransactionStart(tag),
+        "COMMIT" | "END" | "ABORT" => Response::TransactionEnd(tag),
+        "ROLLBACK" => {
+            // ROLLBACK [WORK|TRANSACTION] TO SAVEPOINT stays inside the
+            // transaction; only a full ROLLBACK ends it.
+            if words.take(2).any(|w| w == "TO") {
+                Response::Execution(tag)
+            } else {
+                Response::TransactionEnd(tag)
+            }
+        }
+        _ => Response::Execution(tag),
+    }
 }
 
 /// Extract parameters from a Portal and bind them to a prepared statement.
@@ -680,9 +720,9 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("ALTER TABLE")
     } else if upper.starts_with("BEGIN") || upper.starts_with("START") {
         Tag::new("BEGIN")
-    } else if upper.starts_with("COMMIT") {
+    } else if upper.starts_with("COMMIT") || upper.starts_with("END") {
         Tag::new("COMMIT")
-    } else if upper.starts_with("ROLLBACK") {
+    } else if upper.starts_with("ROLLBACK") || upper.starts_with("ABORT") {
         Tag::new("ROLLBACK")
     } else if upper.starts_with("SAVEPOINT") {
         Tag::new("SAVEPOINT")
@@ -762,6 +802,28 @@ fn error_info(message: &str) -> ErrorInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_transaction_aware_response_classification() {
+        let variant = |sql: &str| match transaction_aware_response(sql, Tag::new("X")) {
+            Response::TransactionStart(_) => "start",
+            Response::TransactionEnd(_) => "end",
+            Response::Execution(_) => "execution",
+            _ => "other",
+        };
+        assert_eq!(variant("BEGIN"), "start");
+        assert_eq!(variant("begin;"), "start");
+        assert_eq!(variant("START TRANSACTION"), "start");
+        assert_eq!(variant("COMMIT"), "end");
+        assert_eq!(variant("END"), "end");
+        assert_eq!(variant("ABORT"), "end");
+        assert_eq!(variant("ROLLBACK"), "end");
+        assert_eq!(variant("ROLLBACK WORK"), "end");
+        assert_eq!(variant("ROLLBACK TO SAVEPOINT s1"), "execution");
+        assert_eq!(variant("ROLLBACK TRANSACTION TO SAVEPOINT s1"), "execution");
+        assert_eq!(variant("INSERT INTO t VALUES (1)"), "execution");
+        assert_eq!(variant("SAVEPOINT s1"), "execution");
+    }
 
     #[test]
     fn test_pg_bytes_to_value_integer() {
