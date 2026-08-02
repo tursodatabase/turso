@@ -6,11 +6,12 @@ use turso_parser::{ast, parser::Parser};
 use super::*;
 use crate::{
     dialect::{Dialect, SqliteDialect},
+    error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, Schema},
     sync::Arc,
     translate::semantic::{
         analyze,
-        context::SemanticContext,
+        context::{DmlPolicy, SemanticContext},
         hir::{ColumnReadExpression, Expr, HirRoot},
         AnalyzeInput,
     },
@@ -35,6 +36,197 @@ fn parse_statement(sql: &str) -> ast::Stmt {
 
 fn program() -> ProgramBuilder {
     ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 32, 8))
+}
+
+// Examples: deleting `parents.p4 = 7` with `children.c2 REFERENCES
+// parents(p4)` must scan child position two before deleting the parent. NO
+// ACTION counts every match using the declaration's immediate/deferred mode;
+// RESTRICT halts at the first match. Varying both positions proves the emitter
+// consumes the frozen HIR offsets and action instead of resolving names again.
+#[hegel::test]
+fn delete_parent_checks_children_before_removing_the_row(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(10)));
+    let child_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let parent_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let restrict = tc.draw(generators::booleans());
+    let deferred = tc.draw(generators::booleans());
+    let parent_columns = (0..width)
+        .map(|position| {
+            if position == parent_position {
+                format!("p{position} INTEGER PRIMARY KEY")
+            } else {
+                format!("p{position} INTEGER")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let child_columns = (0..width)
+        .map(|position| {
+            if position == child_position {
+                format!(
+                    "c{position} INTEGER REFERENCES parents(p{parent_position}) ON DELETE {}{}",
+                    if restrict { "RESTRICT" } else { "NO ACTION" },
+                    if deferred {
+                        " DEFERRABLE INITIALLY DEFERRED"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                format!("c{position} INTEGER")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let parent = BTreeTable::from_sql(&format!("CREATE TABLE parents({parent_columns})"), 23)
+        .expect("parent table SQL is valid");
+    let child = BTreeTable::from_sql(&format!("CREATE TABLE children({child_columns})"), 29)
+        .expect("child table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(parent))
+        .expect("parents is unique");
+    schema
+        .add_btree_table(Arc::new(child))
+        .expect("children is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect)
+        .with_dml_policy(DmlPolicy::new(false, false, false, false, true));
+    let statement = parse_statement("DELETE FROM parents");
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated parent DELETE has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed FK DELETE has a physical plan");
+    let mut program = program();
+    emit_root_delete(&plan, &mut program).expect("parent FK DELETE emits without a resolver");
+    program
+        .resolve_labels()
+        .expect("all parent FK DELETE branches are closed");
+
+    let (child_read, child_cursor) = program
+        .insns
+        .iter()
+        .enumerate()
+        .find_map(|(position, (instruction, _))| match instruction {
+            Insn::OpenRead {
+                cursor_id,
+                root_page: 29,
+                db: 0,
+            } => Some((position, *cursor_id)),
+            _ => None,
+        })
+        .expect("the frozen child table is scanned");
+    let child_column = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(instruction, Insn::Column { cursor_id, column, .. } if *cursor_id == child_cursor && *column == child_position)
+        })
+        .expect("the frozen child position is read");
+    let parent_delete = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(instruction, Insn::Delete { table_name, .. } if table_name == "parents")
+        })
+        .expect("the parent row is deleted after its checks");
+    assert!(child_read < child_column && child_column < parent_delete);
+    if restrict {
+        assert!(program.insns.iter().any(|(instruction, _)| {
+            matches!(instruction, Insn::Halt { err_code, .. } if *err_code == SQLITE_CONSTRAINT_FOREIGNKEY)
+        }));
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::FkCounter { .. })));
+    } else {
+        assert!(program.insns.iter().any(|(instruction, _)| {
+            matches!(instruction, Insn::FkCounter { increment_value: 1, deferred: actual } if *actual == deferred)
+        }));
+    }
+}
+
+// Example: deleting `children.c5 = 99` from a deferred foreign key removes
+// one previously counted missing-parent violation before deleting the child;
+// an immediate constraint has no old counter to repair. Varying the child and
+// parent positions proves the OLD key probe is driven by frozen HIR offsets.
+#[hegel::test]
+fn delete_child_repairs_only_deferred_old_violations(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(10)));
+    let child_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let parent_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let deferred = tc.draw(generators::booleans());
+    let parent_columns = (0..width)
+        .map(|position| {
+            if position == parent_position {
+                format!("p{position} INTEGER PRIMARY KEY")
+            } else {
+                format!("p{position} INTEGER")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let child_columns = (0..width)
+        .map(|position| {
+            if position == child_position {
+                format!(
+                    "c{position} INTEGER REFERENCES parents(p{parent_position}){}",
+                    if deferred {
+                        " DEFERRABLE INITIALLY DEFERRED"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                format!("c{position} INTEGER")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let parent = BTreeTable::from_sql(&format!("CREATE TABLE parents({parent_columns})"), 23)
+        .expect("parent table SQL is valid");
+    let child = BTreeTable::from_sql(&format!("CREATE TABLE children({child_columns})"), 29)
+        .expect("child table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(parent))
+        .expect("parents is unique");
+    schema
+        .add_btree_table(Arc::new(child))
+        .expect("children is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect)
+        .with_dml_policy(DmlPolicy::new(false, false, false, false, true));
+    let statement = parse_statement("DELETE FROM children");
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated child DELETE has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed FK DELETE has a physical plan");
+    let mut program = program();
+    emit_root_delete(&plan, &mut program).expect("child FK DELETE emits without a resolver");
+    program
+        .resolve_labels()
+        .expect("all child FK DELETE branches are closed");
+    assert_eq!(
+        program.insns.iter().any(|(instruction, _)| {
+            matches!(
+                instruction,
+                Insn::FkCounter {
+                    increment_value: -1,
+                    deferred: true
+                }
+            )
+        }),
+        deferred
+    );
 }
 
 // Example: after binding `DELETE FROM items WHERE c7`, direct emission must

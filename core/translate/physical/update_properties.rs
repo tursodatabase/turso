@@ -5,19 +5,20 @@ use turso_parser::{ast, parser::Parser};
 
 use super::*;
 use crate::{
-    QueryMode, SymbolTable,
     dialect::{Dialect, SqliteDialect},
     schema::{BTreeTable, Schema},
     sync::Arc,
     translate::semantic::{
-        AnalyzeInput, analyze,
+        analyze,
         context::{DmlPolicy, SemanticContext},
         hir::{Expr, HirRoot, TargetColumn},
+        AnalyzeInput,
     },
     vdbe::{
         builder::{ProgramBuilder, ProgramBuilderOpts},
         insn::Insn,
     },
+    QueryMode, SymbolTable,
 };
 
 fn parse_statement(sql: &str) -> ast::Stmt {
@@ -201,12 +202,10 @@ fn update_uses_a_stable_rowset_and_recomputes_the_hir_row(tc: hegel::TestCase) {
         2,
         "one addition evaluates the assignment and one recomputes c2"
     );
-    assert!(
-        program
-            .insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::MakeRecord { count: 2, .. }))
-    );
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::MakeRecord { count: 2, .. })));
 }
 
 // Examples:
@@ -311,10 +310,8 @@ fn update_from_materializes_hir_assignment_values_before_writing(tc: hegel::Test
         .expect("SET expression is evaluated");
     assert!(assignment < candidate_insert && candidate_insert < delete);
     assert!(delete < target_insert && target_insert < returning);
-    assert!(
-        !program
-            .insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::RowSetAdd { .. }))
-    );
+    assert!(!program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::RowSetAdd { .. })));
 }

@@ -3,6 +3,7 @@
 use std::{fmt, num::NonZeroUsize};
 
 use crate::{
+    error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, Index, Table},
     sync::Arc,
     translate::semantic::hir::ResolvedForeignKey,
@@ -78,6 +79,153 @@ pub(crate) fn emit_update_child_checks(
         }
         emit_new_child_check(program, foreign_key, child_table, new_columns, rowid)?;
     }
+    Ok(())
+}
+
+pub(crate) fn emit_delete_child_repairs(
+    program: &mut ProgramBuilder,
+    foreign_keys: &[ResolvedForeignKey],
+    child_table: &BTreeTable,
+    old_columns: RegisterRange,
+    rowid: RegisterId,
+) -> ForeignKeyResult<()> {
+    for foreign_key in foreign_keys
+        .iter()
+        .filter(|foreign_key| foreign_key.declaration.deferred)
+    {
+        emit_old_child_repair(program, foreign_key, child_table, old_columns, rowid)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn emit_delete_parent_checks(
+    program: &mut ProgramBuilder,
+    foreign_keys: &[ResolvedForeignKey],
+    parent_table: &BTreeTable,
+    old_columns: RegisterRange,
+    rowid: RegisterId,
+) -> ForeignKeyResult<()> {
+    for foreign_key in foreign_keys {
+        emit_delete_parent_check(program, foreign_key, parent_table, old_columns, rowid)?;
+    }
+    Ok(())
+}
+
+fn emit_delete_parent_check(
+    program: &mut ProgramBuilder,
+    foreign_key: &ResolvedForeignKey,
+    parent_table: &BTreeTable,
+    old_columns: RegisterRange,
+    rowid: RegisterId,
+) -> ForeignKeyResult<()> {
+    use turso_parser::ast::RefAct;
+
+    if !matches!(
+        foreign_key.declaration.on_delete,
+        RefAct::NoAction | RefAct::Restrict
+    ) {
+        return Err(PhysicalForeignKeyError::Unsupported(
+            "mutating ON DELETE action",
+        ));
+    }
+    if foreign_key.child_positions.len() != foreign_key.parent_positions.len()
+        || foreign_key.child_positions.is_empty()
+    {
+        return Err(PhysicalForeignKeyError::Invalid(
+            "child and parent key widths differ",
+        ));
+    }
+    let Table::BTree(child_table) = foreign_key.child_table.value() else {
+        return Err(PhysicalForeignKeyError::Unsupported(
+            "non-B-tree child table",
+        ));
+    };
+    let database = foreign_key
+        .child_table
+        .database()
+        .ok_or(PhysicalForeignKeyError::Invalid(
+            "child table has no database identity",
+        ))?
+        .index();
+    let complete = program.allocate_label();
+    let key = program.alloc_registers(foreign_key.parent_positions.len());
+    for (offset, position) in foreign_key.parent_positions.iter().copied().enumerate() {
+        let source = child_register(parent_table, old_columns, rowid, position)?;
+        program.emit_insn(Insn::Copy {
+            src_reg: source,
+            dst_reg: key + offset,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::IsNull {
+            reg: key + offset,
+            target_pc: complete,
+        });
+    }
+
+    let cursor = open_parent_table(program, child_table, database);
+    let loop_start = program.allocate_label();
+    let next = program.allocate_label();
+    let scan_done = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: cursor,
+        pc_if_empty: scan_done,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+    for (offset, position) in foreign_key.child_positions.iter().copied().enumerate() {
+        let value = program.alloc_register();
+        program.emit_column_or_rowid(cursor, position, value);
+        program.emit_insn(Insn::IsNull {
+            reg: value,
+            target_pc: next,
+        });
+        let collation = foreign_key
+            .parent_unique_index
+            .as_ref()
+            .and_then(|index| index.value().columns.get(offset))
+            .and_then(|column| column.collation);
+        program.emit_insn(Insn::Ne {
+            lhs: value,
+            rhs: key + offset,
+            target_pc: next,
+            flags: CmpInsFlags::default().jump_if_null(),
+            collation,
+        });
+    }
+    if same_table(foreign_key) {
+        let child_rowid = program.alloc_register();
+        program.emit_insn(Insn::RowId {
+            cursor_id: cursor,
+            dest: child_rowid,
+        });
+        program.emit_insn(Insn::Eq {
+            lhs: child_rowid,
+            rhs: rowid.0,
+            target_pc: next,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+    }
+    match foreign_key.declaration.on_delete {
+        RefAct::Restrict => program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_FOREIGNKEY,
+            description: "FOREIGN KEY constraint failed".to_string(),
+            on_error: None,
+            description_reg: None,
+        }),
+        RefAct::NoAction => program.emit_insn(Insn::FkCounter {
+            increment_value: 1,
+            deferred: foreign_key.declaration.deferred,
+        }),
+        RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault => unreachable!(),
+    }
+    program.preassign_label_to_next_insn(next);
+    program.emit_insn(Insn::Next {
+        cursor_id: cursor,
+        pc_if_next: loop_start,
+    });
+    program.preassign_label_to_next_insn(scan_done);
+    program.emit_insn(Insn::Close { cursor_id: cursor });
+    program.preassign_label_to_next_insn(complete);
     Ok(())
 }
 

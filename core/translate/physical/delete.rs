@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use turso_parser::ast::TriggerTime;
+use turso_parser::ast::{RefAct, TriggerTime};
 
 use crate::{
     schema::Table,
@@ -22,10 +22,10 @@ use crate::{
 use super::{
     close_indexes, emit_index_delete, emit_index_key, emit_returning_result, emit_returning_values,
     emit_trigger_programs, open_indexes, record_from_cursor, CdcChange, CursorId,
-    ExpressionEmitter, PhysicalExpressionError, PhysicalIndexError, PhysicalPlan,
-    PhysicalQueryError, PhysicalRoot, PhysicalSourceKind, PhysicalTriggerError, PreparedCdc,
-    PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs, RuntimeBindingError,
-    RuntimeBindings, SourceRuntime, TableAccess, TriggerRow, TriggerRows,
+    ExpressionEmitter, PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError,
+    PhysicalPlan, PhysicalQueryError, PhysicalRoot, PhysicalSourceKind, PhysicalTriggerError,
+    PreparedCdc, PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs,
+    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess, TriggerRow, TriggerRows,
 };
 
 #[derive(Debug)]
@@ -34,6 +34,7 @@ pub(crate) enum PhysicalDeleteError {
     Expression(PhysicalExpressionError),
     Index(PhysicalIndexError),
     Trigger(PhysicalTriggerError),
+    ForeignKey(PhysicalForeignKeyError),
     Cdc(crate::LimboError),
     Invalid(&'static str),
     Unsupported(&'static str),
@@ -46,6 +47,7 @@ impl fmt::Display for PhysicalDeleteError {
             Self::Expression(error) => error.fmt(formatter),
             Self::Index(error) => error.fmt(formatter),
             Self::Trigger(error) => error.fmt(formatter),
+            Self::ForeignKey(error) => error.fmt(formatter),
             Self::Cdc(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical DELETE: {message}"),
             Self::Unsupported(message) => {
@@ -78,6 +80,12 @@ impl From<PhysicalIndexError> for PhysicalDeleteError {
 impl From<PhysicalTriggerError> for PhysicalDeleteError {
     fn from(error: PhysicalTriggerError) -> Self {
         Self::Trigger(error)
+    }
+}
+
+impl From<PhysicalForeignKeyError> for PhysicalDeleteError {
+    fn from(error: PhysicalForeignKeyError) -> Self {
+        Self::ForeignKey(error)
     }
 }
 
@@ -195,7 +203,10 @@ pub(crate) fn emit_root_delete_with_context(
     });
     let indexes = open_indexes(program, source, database)?;
     let rowid = RegisterId(program.alloc_register());
-    let old_columns = (!delete.triggers.is_empty()).then(|| {
+    let old_columns = (!delete.triggers.is_empty()
+        || !delete.foreign_keys.outgoing.is_empty()
+        || !delete.foreign_keys.incoming.is_empty())
+    .then(|| {
         RegisterRange::new(
             program.alloc_registers(source.columns.len()),
             source.columns.len(),
@@ -285,6 +296,24 @@ pub(crate) fn emit_root_delete_with_context(
     for (index, key) in indexes.iter().zip(&keys) {
         emit_index_delete(program, index, key);
     }
+    if !delete.foreign_keys.outgoing.is_empty() {
+        super::emit_delete_child_repairs(
+            program,
+            &delete.foreign_keys.outgoing,
+            &table,
+            old_columns.expect("foreign keys require the frozen OLD row"),
+            rowid,
+        )?;
+    }
+    if !delete.foreign_keys.incoming.is_empty() {
+        super::emit_delete_parent_checks(
+            program,
+            &delete.foreign_keys.incoming,
+            &table,
+            old_columns.expect("foreign keys require the frozen OLD row"),
+            rowid,
+        )?;
+    }
     if let Some(cdc) = cdc {
         let before = cdc
             .has_before()
@@ -357,8 +386,15 @@ fn preflight_delete<'plan>(
             "resolved trigger has no prepared program",
         ));
     }
-    if !delete.foreign_keys.outgoing.is_empty() || !delete.foreign_keys.incoming.is_empty() {
-        return Err(PhysicalDeleteError::Unsupported("foreign-key actions"));
+    if delete.foreign_keys.incoming.iter().any(|foreign_key| {
+        !matches!(
+            foreign_key.declaration.on_delete,
+            RefAct::NoAction | RefAct::Restrict
+        )
+    }) {
+        return Err(PhysicalDeleteError::Unsupported(
+            "mutating foreign-key actions",
+        ));
     }
     if delete.predicate.as_ref().is_some_and(contains_subquery) {
         return Err(PhysicalDeleteError::Unsupported("subquery in WHERE"));
