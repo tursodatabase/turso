@@ -114,7 +114,9 @@ operations are not SQL binding.
   - [x] INSERT SELECT materializes direct HIR query output before opening the
         target write loop, including safe self-inserts.
   - [x] RETURNING projects the written NEW HIR row after INSERT.
-  - [ ] Conflict-policy variants and remaining constraints, UPSERT/excluded.
+  - [x] ABORT, FAIL, ROLLBACK, and IGNORE route NOT NULL, CHECK, rowid, and
+        UNIQUE failures before mutation using the statement or index policy.
+  - [ ] REPLACE conflict paths and UPSERT/excluded.
 - [ ] Trigger commands and predicates with explicit OLD/NEW runtime bindings.
 - [ ] Generated columns, defaults, CHECK constraints, expression and partial
       indexes, and custom-type schema programs.

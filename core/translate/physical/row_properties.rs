@@ -6,7 +6,7 @@ use turso_parser::{ast, parser::Parser};
 use super::*;
 use crate::{
     dialect::{Dialect, SqliteDialect},
-    error::SQLITE_CONSTRAINT_CHECK,
+    error::{SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL},
     schema::{BTreeTable, Schema},
     sync::Arc,
     translate::semantic::{analyze, context::SemanticContext, AnalyzeInput},
@@ -99,8 +99,8 @@ fn insert_and_update_check_the_complete_hir_row_before_writing(tc: hegel::TestCa
 // Examples:
 // - `INSERT INTO strict_items VALUES (1, 'x')` must TypeCheck the completed
 //   NEW registers before MakeRecord or Insert.
-// - `UPDATE items SET c0 = NULL` on `c0 INTEGER NOT NULL` must HaltIfNull
-//   before deleting the old row, so a failed constraint cannot damage data.
+// - `UPDATE items SET c0 = NULL` on `c0 INTEGER NOT NULL` must halt before
+//   deleting the old row, so a failed constraint cannot damage data.
 #[hegel::test]
 fn strict_and_not_null_checks_run_before_any_row_mutation(tc: hegel::TestCase) {
     let update = tc.draw(generators::booleans());
@@ -142,7 +142,9 @@ fn strict_and_not_null_checks_run_before_any_row_mutation(tc: hegel::TestCase) {
             .filter_map(|(position, (instruction, _))| predicate(instruction).then_some(position))
             .collect::<Vec<_>>()
     };
-    let not_null = positions(&|instruction| matches!(instruction, Insn::HaltIfNull { .. }));
+    let not_null = positions(
+        &|instruction| matches!(instruction, Insn::Halt { err_code, .. } if *err_code == SQLITE_CONSTRAINT_NOTNULL),
+    );
     let type_check = positions(&|instruction| matches!(instruction, Insn::TypeCheck { .. }));
     let writes =
         positions(&|instruction| matches!(instruction, Insn::Insert { .. } | Insn::Delete { .. }));

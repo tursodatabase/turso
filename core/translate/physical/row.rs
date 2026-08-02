@@ -106,6 +106,8 @@ pub(crate) fn emit_check_constraints(
     program: &mut ProgramBuilder,
     bindings: &mut RuntimeBindings<'_>,
     source: hir::SourceId,
+    conflict: ResolveType,
+    skip_row: crate::vdbe::BranchOffset,
 ) -> RowResult<()> {
     let checks = bindings
         .document()
@@ -129,12 +131,18 @@ pub(crate) fn emit_check_constraints(
             target_pc: passed,
             jump_if_null: false,
         });
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_CHECK,
-            description: check.description.clone(),
-            on_error: Some(ResolveType::Abort),
-            description_reg: None,
-        });
+        if conflict == ResolveType::Ignore {
+            program.emit_insn(Insn::Goto {
+                target_pc: skip_row,
+            });
+        } else {
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT_CHECK,
+                description: check.description.clone(),
+                on_error: Some(conflict),
+                description_reg: None,
+            });
+        }
         program.preassign_label_to_next_insn(passed);
     }
     Ok(())
@@ -148,14 +156,30 @@ pub(crate) fn emit_new_row_constraints(
     source: hir::SourceId,
     table: &crate::sync::Arc<BTreeTable>,
     logical: RegisterRange,
+    conflict: ResolveType,
+    skip_row: crate::vdbe::BranchOffset,
 ) -> RowResult<()> {
     for (position, column) in table.columns().iter().enumerate() {
         if column.notnull() && !column.is_rowid_alias() {
-            program.emit_insn(Insn::HaltIfNull {
-                target_reg: logical.first.0 + position,
-                description: format!("{}.{}", table.name, column.name.as_deref().unwrap_or("")),
-                err_code: SQLITE_CONSTRAINT_NOTNULL,
-            });
+            if conflict == ResolveType::Ignore {
+                program.emit_insn(Insn::IsNull {
+                    reg: logical.first.0 + position,
+                    target_pc: skip_row,
+                });
+            } else {
+                let present = program.allocate_label();
+                program.emit_insn(Insn::NotNull {
+                    reg: logical.first.0 + position,
+                    target_pc: present,
+                });
+                program.emit_insn(Insn::Halt {
+                    err_code: SQLITE_CONSTRAINT_NOTNULL,
+                    description: format!("{}.{}", table.name, column.name.as_deref().unwrap_or("")),
+                    on_error: Some(conflict),
+                    description_reg: None,
+                });
+                program.preassign_label_to_next_insn(present);
+            }
         }
     }
     if table.is_strict {
@@ -166,7 +190,7 @@ pub(crate) fn emit_new_row_constraints(
             table_reference: table.clone(),
         });
     }
-    emit_check_constraints(program, bindings, source)
+    emit_check_constraints(program, bindings, source, conflict, skip_row)
 }
 
 /// Encode one complete logical row and build its on-disk table record.

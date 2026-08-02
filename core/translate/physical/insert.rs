@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use turso_parser::ast::ResolveType;
+
 use crate::{
     error::SQLITE_CONSTRAINT_PRIMARYKEY,
     schema::Table,
@@ -122,6 +124,7 @@ pub(crate) fn emit_root_insert(
 
     match &insert.source {
         InsertSource::DefaultValues => {
+            let skip_row = program.allocate_label();
             emit_insert_row(
                 program,
                 &mut bindings,
@@ -133,10 +136,13 @@ pub(crate) fn emit_root_insert(
                 record,
                 &indexes,
                 &[],
+                skip_row,
             )?;
+            program.preassign_label_to_next_insn(skip_row);
         }
         InsertSource::Values(rows) => {
             for row in rows {
+                let skip_row = program.allocate_label();
                 emit_insert_row(
                     program,
                     &mut bindings,
@@ -148,7 +154,9 @@ pub(crate) fn emit_root_insert(
                     record,
                     &indexes,
                     row,
+                    skip_row,
                 )?;
+                program.preassign_label_to_next_insn(skip_row);
             }
         }
         InsertSource::Query(_) => {
@@ -173,6 +181,7 @@ pub(crate) fn emit_root_insert(
                 record,
                 &indexes,
                 query_rows.cursor,
+                next,
             )?;
             program.emit_insn(Insn::Next {
                 cursor_id: query_rows.cursor,
@@ -201,6 +210,7 @@ fn emit_insert_row(
     record: usize,
     indexes: &[OpenedIndex<'_>],
     values: &[hir::Expr],
+    skip_row: crate::vdbe::BranchOffset,
 ) -> InsertResult<()> {
     if values.len() != insert.columns.len() {
         return Err(PhysicalInsertError::Invalid(
@@ -216,7 +226,7 @@ fn emit_insert_row(
     }
     emit_insert_defaults(program, bindings, insert, logical)?;
     finish_insert_row(
-        program, bindings, insert, table, cursor, logical, rowid, record, indexes,
+        program, bindings, insert, table, cursor, logical, rowid, record, indexes, skip_row,
     )
 }
 
@@ -232,6 +242,7 @@ fn emit_insert_query_row(
     record: usize,
     indexes: &[OpenedIndex<'_>],
     query_cursor: usize,
+    skip_row: crate::vdbe::BranchOffset,
 ) -> InsertResult<()> {
     initialize_insert_row(program, logical, rowid);
     for (position, target) in insert.columns.iter().enumerate() {
@@ -240,7 +251,7 @@ fn emit_insert_query_row(
     }
     emit_insert_defaults(program, bindings, insert, logical)?;
     finish_insert_row(
-        program, bindings, insert, table, cursor, logical, rowid, record, indexes,
+        program, bindings, insert, table, cursor, logical, rowid, record, indexes, skip_row,
     )
 }
 
@@ -297,7 +308,9 @@ fn finish_insert_row(
     rowid: RegisterId,
     record: usize,
     indexes: &[OpenedIndex<'_>],
+    skip_row: crate::vdbe::BranchOffset,
 ) -> InsertResult<()> {
+    let statement_conflict = insert.conflict.unwrap_or(ResolveType::Abort);
     if let Some((position, _)) = table.get_rowid_alias_column().filter(|(position, _)| {
         insert
             .columns
@@ -346,19 +359,37 @@ fn finish_insert_row(
         .get_rowid_alias_column()
         .and_then(|(_, column)| column.name.as_deref())
         .unwrap_or("rowid");
-    program.emit_insn(Insn::Halt {
-        err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-        description: format!("{}.{}", table.name, rowid_name),
-        on_error: Some(turso_parser::ast::ResolveType::Abort),
-        description_reg: None,
-    });
+    if statement_conflict == ResolveType::Ignore {
+        program.emit_insn(Insn::Goto {
+            target_pc: skip_row,
+        });
+    } else {
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+            description: format!("{}.{}", table.name, rowid_name),
+            on_error: Some(statement_conflict),
+            description_reg: None,
+        });
+    }
     program.preassign_label_to_next_insn(rowid_is_unique);
     emit_complete_logical_row(program, bindings, insert.target, table, logical)?;
-    emit_new_row_constraints(program, bindings, insert.target, table, logical)?;
+    emit_new_row_constraints(
+        program,
+        bindings,
+        insert.target,
+        table,
+        logical,
+        statement_conflict,
+        skip_row,
+    )?;
     let mut keys = Vec::with_capacity(indexes.len());
     for index in indexes {
         let key = emit_index_key(program, bindings, insert.target, rowid, index, true)?;
-        emit_unique_check(program, index, &key, None)?;
+        let conflict = insert
+            .conflict
+            .or(index.index.on_conflict)
+            .unwrap_or(ResolveType::Abort);
+        emit_unique_check(program, index, &key, None, conflict, skip_row)?;
         keys.push(key);
     }
     emit_stored_record(program, bindings, insert.target, table, logical, record)?;
@@ -397,8 +428,8 @@ fn preflight_insert<'plan>(
             ));
         }
     }
-    if insert.conflict.is_some() {
-        return Err(PhysicalInsertError::Unsupported("conflict policy"));
+    if insert.conflict == Some(ResolveType::Replace) {
+        return Err(PhysicalInsertError::Unsupported("REPLACE conflict policy"));
     }
     if !insert.upserts.is_empty() || insert.excluded_source.is_some() {
         return Err(PhysicalInsertError::Unsupported("UPSERT"));
@@ -413,6 +444,13 @@ fn preflight_insert<'plan>(
         .document
         .source(insert.target)
         .ok_or(PhysicalInsertError::Invalid("target source is missing"))?;
+    if source.index_expressions.iter().any(|index| {
+        insert.conflict.or(index.index.value().on_conflict) == Some(ResolveType::Replace)
+    }) {
+        return Err(PhysicalInsertError::Unsupported(
+            "REPLACE index conflict policy",
+        ));
+    }
     let IndexCoverage::Complete { indexes: _ } = &source.index_coverage else {
         return Err(PhysicalInsertError::Invalid(
             "target does not carry complete index metadata",

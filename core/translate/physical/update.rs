@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use turso_parser::ast::ResolveType;
+
 use crate::{
     schema::Table,
     translate::semantic::hir::{self, Expr, IndexCoverage},
@@ -204,11 +206,23 @@ pub(crate) fn emit_root_update(
         },
     )?;
     emit_complete_logical_row(program, &mut bindings, update.target, &table, logical)?;
-    emit_new_row_constraints(program, &mut bindings, update.target, &table, logical)?;
+    emit_new_row_constraints(
+        program,
+        &mut bindings,
+        update.target,
+        &table,
+        logical,
+        update.conflict.unwrap_or(ResolveType::Abort),
+        write_next,
+    )?;
     let mut new_keys = Vec::with_capacity(indexes.len());
     for index in &indexes {
         let key = emit_index_key(program, &mut bindings, update.target, rowid, index, true)?;
-        emit_unique_check(program, index, &key, Some(rowid))?;
+        let conflict = update
+            .conflict
+            .or(index.index.on_conflict)
+            .unwrap_or(ResolveType::Abort);
+        emit_unique_check(program, index, &key, Some(rowid), conflict, write_next)?;
         new_keys.push(key);
     }
     emit_stored_record(
@@ -275,8 +289,8 @@ fn preflight_update<'plan>(
     if !update.order_by.is_empty() || update.limit.is_some() {
         return Err(PhysicalUpdateError::Unsupported("ORDER BY or LIMIT"));
     }
-    if update.conflict.is_some() {
-        return Err(PhysicalUpdateError::Unsupported("conflict policy"));
+    if update.conflict == Some(ResolveType::Replace) {
+        return Err(PhysicalUpdateError::Unsupported("REPLACE conflict policy"));
     }
     if update.trigger.is_some() || !update.triggers.is_empty() {
         return Err(PhysicalUpdateError::Unsupported("trigger execution"));
@@ -296,6 +310,13 @@ fn preflight_update<'plan>(
         .document
         .source(update.target)
         .ok_or(PhysicalUpdateError::Invalid("target source is missing"))?;
+    if source.index_expressions.iter().any(|index| {
+        update.conflict.or(index.index.value().on_conflict) == Some(ResolveType::Replace)
+    }) {
+        return Err(PhysicalUpdateError::Unsupported(
+            "REPLACE index conflict policy",
+        ));
+    }
     let IndexCoverage::Complete { indexes: _ } = &source.index_coverage else {
         return Err(PhysicalUpdateError::Invalid(
             "target does not carry complete index metadata",

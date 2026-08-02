@@ -29,6 +29,9 @@ pub(crate) use update::*;
 mod delete_properties;
 
 #[cfg(test)]
+mod conflict_properties;
+
+#[cfg(test)]
 mod expression_properties;
 
 #[cfg(test)]

@@ -190,6 +190,8 @@ pub(crate) fn emit_unique_check(
     opened: &OpenedIndex<'_>,
     key: &IndexKey,
     current_rowid: Option<RegisterId>,
+    conflict: ResolveType,
+    skip_row: crate::vdbe::BranchOffset,
 ) -> IndexResult<()> {
     if !opened.index.unique {
         return Ok(());
@@ -222,19 +224,25 @@ pub(crate) fn emit_unique_check(
             collation: program.curr_collation(),
         });
     }
-    let description = opened
-        .index
-        .columns
-        .iter()
-        .map(|column| format!("{}.{}", opened.index.table_name, column.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    program.emit_insn(Insn::Halt {
-        err_code: SQLITE_CONSTRAINT_UNIQUE,
-        description,
-        on_error: Some(opened.index.on_conflict.unwrap_or(ResolveType::Abort)),
-        description_reg: None,
-    });
+    if conflict == ResolveType::Ignore {
+        program.emit_insn(Insn::Goto {
+            target_pc: skip_row,
+        });
+    } else {
+        let description = opened
+            .index
+            .columns
+            .iter()
+            .map(|column| format!("{}.{}", opened.index.table_name, column.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_UNIQUE,
+            description,
+            on_error: Some(conflict),
+            description_reg: None,
+        });
+    }
     program.preassign_label_to_next_insn(done);
     Ok(())
 }
