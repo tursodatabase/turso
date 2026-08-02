@@ -7,7 +7,13 @@ impl SchemaExpr {
     /// Render with the owning table's current column names. Unresolved syntax
     /// is rendered exactly from the parser tree retained at schema load.
     pub(crate) fn render<T: AsRef<str>>(&self, column_names: &[T]) -> Result<String> {
-        self.render_with(|position| {
+        Ok(self.render_syntax(column_names)?.to_string())
+    }
+
+    /// Rebuild parser syntax from positional column identities using the
+    /// owning table's current column names.
+    pub(crate) fn render_syntax<T: AsRef<str>>(&self, column_names: &[T]) -> Result<ast::Expr> {
+        self.render_syntax_with(|position| {
             column_names
                 .get(position)
                 .map(|name| name.as_ref().to_owned())
@@ -17,11 +23,18 @@ impl SchemaExpr {
     /// Render with a caller-provided positional column lookup.
     pub(crate) fn render_with(
         &self,
-        mut column_name: impl FnMut(usize) -> Option<String>,
+        column_name: impl FnMut(usize) -> Option<String>,
     ) -> Result<String> {
+        Ok(self.render_syntax_with(column_name)?.to_string())
+    }
+
+    pub(crate) fn render_syntax_with(
+        &self,
+        mut column_name: impl FnMut(usize) -> Option<String>,
+    ) -> Result<ast::Expr> {
         match self {
-            Self::Valid(expr) => expr.render_with(&mut column_name),
-            Self::Unresolved(expr) => Ok(expr.syntax.to_string()),
+            Self::Valid(expr) => to_syntax(&expr.root, &mut column_name),
+            Self::Unresolved(expr) => Ok((*expr.syntax).clone()),
         }
     }
 }

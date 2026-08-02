@@ -1766,6 +1766,7 @@ pub enum Insn {
         column_index: usize,
         definition: Box<turso_parser::ast::ColumnDefinition>,
         rename: bool,
+        renamed_generated_expressions: Vec<Option<Box<turso_parser::ast::Expr>>>,
     },
     /// Try to set the maximum page count for database P1 to the value in P3.
     /// Do not let the maximum page count fall below the current page count and

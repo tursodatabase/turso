@@ -21,7 +21,9 @@ use crate::{
         semantic::{
             context::SemanticContext,
             hir::HirRoot,
-            schema_expr::{analyze_table_schema_syntax, SchemaSyntaxInput},
+            schema_expr::{
+                analyze_table_schema_syntax, resolve_table_schema_syntax, SchemaSyntaxInput,
+            },
         },
         trigger::create_trigger_to_sql,
     },
@@ -2001,6 +2003,46 @@ pub fn translate_alter_table(
                 None
             };
 
+            let renamed_generated_expressions = if rename {
+                let context = SemanticContext::new(
+                    ddl_context.schema(),
+                    connection.database_schemas(),
+                    &connection.temp.database,
+                    connection.attached_databases(),
+                    ddl_context.symbol_table,
+                    connection.experimental_custom_types_enabled(),
+                    connection.get_dqs_dml().into(),
+                    connection.dialect(),
+                );
+                let mut names = btree
+                    .columns()
+                    .iter()
+                    .map(|column| column.name.clone().unwrap_or_default())
+                    .collect::<Vec<_>>();
+                names[column_index] = col_name.to_owned();
+                btree
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(owner_column, column)| {
+                        let Some(expression) = column.generated_expr() else {
+                            return Ok(None);
+                        };
+                        let expression = resolve_table_schema_syntax(
+                            &context,
+                            database_id,
+                            &btree,
+                            expression,
+                            crate::schema_expr::SchemaExprProfile::GeneratedColumn,
+                            Some(owner_column),
+                        )?;
+                        Ok(Some(Box::new(expression.render_syntax(&names)?)))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
+
             // If renaming, rewrite trigger SQL for all triggers that reference this column
             // We'll collect the triggers to rewrite and update them in sqlite_schema
             let mut triggers_to_rewrite: Vec<(usize, String, String)> = Vec::new();
@@ -2362,6 +2404,7 @@ pub fn translate_alter_table(
                 column_index,
                 definition: Box::new(definition),
                 rename,
+                renamed_generated_expressions,
             });
         }
     };

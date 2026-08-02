@@ -242,6 +242,51 @@ pub(crate) fn analyze_table_schema_syntax(
     finish_schema_expression_root(analyzer, source_id, expressions)
 }
 
+/// Resolve catalog-held table syntax into a positional stored expression.
+///
+/// ALTER uses this before changing names so later rendering can use the same
+/// column identities as normal HIR instantiation.
+pub(crate) fn resolve_table_schema_syntax(
+    context: &SemanticContext<'_>,
+    database_id: usize,
+    table: &crate::schema::BTreeTable,
+    syntax: &ast::Expr,
+    profile: crate::schema_expr::SchemaExprProfile,
+    owner_column: Option<usize>,
+) -> Result<SchemaExpr> {
+    let schema_table = SchemaTable::new(
+        table.name.clone(),
+        table
+            .columns()
+            .iter()
+            .map(|column| {
+                SchemaColumn::new(
+                    column.name.clone().unwrap_or_default(),
+                    column.is_rowid_alias(),
+                    (!column.ty_str.is_empty()).then(|| column.ty_str.clone()),
+                )
+            })
+            .collect(),
+        table.has_rowid,
+    );
+    let resolver = SemanticSchemaExprResolver {
+        context,
+        database_id,
+        source_types: Vec::new(),
+    };
+    let expected_type = owner_column
+        .and_then(|position| table.columns().get(position))
+        .map(|column| column.ty_str.as_str())
+        .filter(|declared_type| !declared_type.is_empty());
+    SchemaExpr::resolve(
+        syntax,
+        profile,
+        SchemaExprContext::for_table(&schema_table).with_expected_type(expected_type),
+        &resolver,
+        ResolutionMode::Strict,
+    )
+}
+
 fn create_table_schema_source(
     analyzer: &mut Analyzer<'_, '_>,
     database_id: usize,

@@ -10,8 +10,7 @@ use crate::mvcc::database::{BootstrapState, CheckpointStateMachine, TxID};
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{
-    render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
-    SQLITE_SEQUENCE_TABLE_NAME,
+    Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME, SQLITE_SEQUENCE_TABLE_NAME,
 };
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
@@ -60,7 +59,7 @@ use crate::{
     connection::Row,
     get_cursor, info, is_attached_db,
     storage::wal::CheckpointResult,
-    turso_assert,
+    turso_assert, turso_assert_eq,
     types::{AggContext, Cursor, ExternalAggState, SeekKey, SeekOp, SumAggState, Value, ValueType},
     util::{cast_real_to_integer, checked_cast_text_to_numeric},
     vdbe::{
@@ -15276,6 +15275,7 @@ pub fn op_alter_column(
             column_index,
             definition,
             rename,
+            renamed_generated_expressions,
         },
         insn
     );
@@ -15400,16 +15400,18 @@ pub fn op_alter_column(
         if *rename {
             btree.columns_mut()[*column_index].name = Some(new_name.clone());
 
-            // Refresh the cached sql in generated columns
-            let column_count = btree.columns().len();
-            for i in 0..column_count {
-                let cols_view = btree.columns();
-                if let Some(new_sql) = cols_view[i]
-                    .generated_expr()
-                    .map(render_gencol_expr_sql_with_new_names)
-                {
-                    btree.columns_mut()[i].set_generated_original_sql(new_sql)
-                }
+            turso_assert_eq!(renamed_generated_expressions.len(), btree.columns().len());
+            for (position, expression) in renamed_generated_expressions.iter().enumerate() {
+                let Some(expression) = expression else {
+                    continue;
+                };
+                let sql = expression.to_string();
+                let column = &mut btree.columns_mut()[position];
+                *column
+                    .generated_expr_mut()
+                    .expect("renamed generated expression must keep its owner") =
+                    expression.as_ref().clone();
+                column.set_generated_original_sql(sql);
             }
         } else {
             btree.columns_mut()[*column_index] = new_column.clone();

@@ -370,6 +370,44 @@ fn column_rename_changes_spelling_not_position(tc: hegel::TestCase) {
     assert_eq!(re_resolved.dependencies().unwrap(), dependencies);
 }
 
+// Example: in `b AS (a * 2), c AS (b + a)`, renaming `a` to `x` renders
+// both generated expressions with `x` while their dependency positions stay fixed.
+#[hegel::test]
+fn column_rename_renders_every_repeated_dependency(tc: hegel::TestCase) {
+    let count = generated_column_count(&tc).max(2);
+    let renamed = generated_position(&tc, count);
+    let other = if renamed + 1 == count { 0 } else { renamed + 1 };
+    let table = table_with_columns(count, None, true);
+    let parameters = type_parameters();
+    let syntax = parse_expr(&format!(
+        "{} + {} + {}",
+        column_name(renamed),
+        column_name(other),
+        column_name(renamed)
+    ));
+    let expression = resolve(
+        &syntax,
+        SchemaExprProfile::GeneratedColumn,
+        &table,
+        &parameters,
+        ResolutionMode::Strict,
+    )
+    .expect("generated stored expression resolves");
+    let dependencies = expression.dependencies().unwrap();
+
+    let mut names = column_names(count);
+    let new_name = format!("renamed_{renamed}");
+    names[renamed].clone_from(&new_name);
+    let rendered = expression.render_syntax(&names).unwrap().to_string();
+
+    assert_eq!(rendered.matches(&new_name).count(), 2);
+    assert!(!rendered.contains(&column_name(renamed)));
+    assert_eq!(
+        dependencies.columns(),
+        &[renamed.min(other), renamed.max(other)]
+    );
+}
+
 // Example: after `ALTER TABLE items DROP COLUMN c1`, a stored reference to old
 // position three moves to position two and still renders as the same column name.
 #[hegel::test]
@@ -815,14 +853,16 @@ fn preserve_mode_keeps_parse_failures_explicit(tc: hegel::TestCase) {
     let parameters = type_parameters();
     let syntax = parse_expr("missing + 1");
 
-    assert!(resolve(
-        &syntax,
-        profile,
-        &table,
-        &parameters,
-        ResolutionMode::Strict,
-    )
-    .is_err());
+    assert!(
+        resolve(
+            &syntax,
+            profile,
+            &table,
+            &parameters,
+            ResolutionMode::Strict,
+        )
+        .is_err()
+    );
     let preserved = resolve(
         &syntax,
         profile,
