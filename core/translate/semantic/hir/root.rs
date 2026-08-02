@@ -1,6 +1,6 @@
 //! Resolved statement and trigger roots.
 
-use crate::{schema::ForeignKey, sync::Arc};
+use crate::{alloc::BoxedSlice, schema::ForeignKey, sync::Arc};
 use turso_parser::ast::{ResolveType, SortOrder};
 
 use super::{
@@ -185,8 +185,8 @@ pub struct ResolvedForeignKey {
     pub parent_table: ResolvedTable,
     pub declaration: Arc<ForeignKey>,
     pub parent_columns: Box<[String]>,
-    pub child_positions: Box<[usize]>,
-    pub parent_positions: Box<[usize]>,
+    pub child_positions: BoxedSlice<usize>,
+    pub parent_positions: BoxedSlice<usize>,
     pub parent_uses_rowid: bool,
     pub parent_unique_index: Option<ResolvedIndex>,
     /// This generated CASCADE update copies the key of a parent row that the

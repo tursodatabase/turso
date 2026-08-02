@@ -1038,7 +1038,7 @@ fn emit_ctas_insert(
             outputs.len()
         );
     }
-    let rows = ephemeral_table("ctas_rows".to_string(), col_count);
+    let rows = ephemeral_table("ctas_rows".to_string(), col_count)?;
     let rows_cursor = program.alloc_cursor_id(CursorType::BTreeTable(rows.clone()));
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id: rows_cursor,

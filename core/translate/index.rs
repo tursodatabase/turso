@@ -1,4 +1,6 @@
-use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
+#[cfg(not(nightly))]
+use crate::alloc::TursoVecExt;
+use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;

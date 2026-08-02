@@ -11,6 +11,7 @@ use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{CompoundOperator, Distinctness, Literal, NullsOrder, SortOrder};
 
 use crate::{
+    alloc::{TursoFromIterator, TursoIteratorExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc, Func, WindowFunc},
     schema::{
         BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, PseudoCursorType, Table,
@@ -38,6 +39,7 @@ use super::{
 
 #[derive(Debug)]
 pub(crate) enum PhysicalQueryError {
+    Allocation(crate::alloc::TryReserveError),
     Runtime(RuntimeBindingError),
     Expression(PhysicalExpressionError),
     Invalid(&'static str),
@@ -47,6 +49,7 @@ pub(crate) enum PhysicalQueryError {
 impl fmt::Display for PhysicalQueryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Allocation(error) => error.fmt(formatter),
             Self::Runtime(error) => error.fmt(formatter),
             Self::Expression(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical query: {message}"),
@@ -58,6 +61,12 @@ impl fmt::Display for PhysicalQueryError {
 }
 
 impl std::error::Error for PhysicalQueryError {}
+
+impl From<crate::alloc::TryReserveError> for PhysicalQueryError {
+    fn from(error: crate::alloc::TryReserveError) -> Self {
+        Self::Allocation(error)
+    }
+}
 
 impl From<RuntimeBindingError> for PhysicalQueryError {
     fn from(error: RuntimeBindingError) -> Self {
@@ -476,7 +485,10 @@ impl<'document> PhysicalSubqueryEmitter<'document> for QuerySubqueryEmitter<'_, 
                 bindings.bind_query(query_id, runtime)?;
                 if !query.hir.compounds.is_empty() {
                     let table =
-                        ephemeral_table(format!("scalar_compound_{}", query_id.index()), width);
+                        ephemeral_table(format!("scalar_compound_{}", query_id.index()), width)
+                            .map_err(|error| {
+                                PhysicalExpressionError::Subquery(error.to_string())
+                            })?;
                     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
                     program.emit_insn(Insn::OpenEphemeral {
                         cursor_id: cursor,
@@ -552,7 +564,8 @@ impl<'document> PhysicalSubqueryEmitter<'document> for QuerySubqueryEmitter<'_, 
                     let table = ephemeral_table(
                         format!("exists_compound_{}", query_id.index()),
                         query.hir.output.len(),
-                    );
+                    )
+                    .map_err(|error| PhysicalExpressionError::Subquery(error.to_string()))?;
                     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
                     program.emit_insn(Insn::OpenEphemeral {
                         cursor_id: cursor,
@@ -609,7 +622,8 @@ impl<'document> PhysicalSubqueryEmitter<'document> for QuerySubqueryEmitter<'_, 
                         "IN query width does not match its comparison facts".to_string(),
                     ));
                 }
-                let table = ephemeral_table(format!("in_subquery_{}", query_id.index()), width);
+                let table = ephemeral_table(format!("in_subquery_{}", query_id.index()), width)
+                    .map_err(|error| PhysicalExpressionError::Subquery(error.to_string()))?;
                 let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
                 program.emit_insn(Insn::OpenEphemeral {
                     cursor_id: cursor,
@@ -751,7 +765,7 @@ pub(crate) fn emit_query_for_dml<'document>(
     let table = ephemeral_table(
         format!("dml_query_{}", query_id.index()),
         query.hir.output.len(),
-    );
+    )?;
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id: cursor,
@@ -838,7 +852,7 @@ pub(crate) fn emit_ordered_dml_rowids<'document>(
     order_by: &'document [OrderTerm],
     limit: Option<&'document crate::translate::semantic::hir::Limit>,
 ) -> QueryResult<MaterializedDmlRowids> {
-    let table = ephemeral_table("ordered_dml_rowids".to_string(), 1);
+    let table = ephemeral_table("ordered_dml_rowids".to_string(), 1)?;
     let output_cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id: output_cursor,
@@ -867,11 +881,11 @@ pub(crate) fn emit_ordered_dml_rowids<'document>(
                         term.nulls,
                     )
                 })
-                .collect(),
+                .try_collect()?,
             comparators: order_by
                 .iter()
                 .map(|term| sort_comparator(&term.type_fact))
-                .collect(),
+                .try_collect()?,
         });
         Some(OpenedSorter {
             cursor_id,
@@ -993,7 +1007,7 @@ pub(crate) fn emit_update_from_rows<'document>(
         ));
     }
     let candidate_width = width + order_by.len();
-    let table = ephemeral_table(format!("update_from_{}", target.index()), candidate_width);
+    let table = ephemeral_table(format!("update_from_{}", target.index()), candidate_width)?;
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id: cursor,
@@ -1079,7 +1093,7 @@ pub(crate) fn emit_update_from_rows<'document>(
         let selected_table = ephemeral_table(
             format!("selected_update_from_{}", target.index()),
             width + 1,
-        );
+        )?;
         let selected_cursor =
             program.alloc_cursor_id(CursorType::BTreeTable(selected_table.clone()));
         program.emit_insn(Insn::OpenEphemeral {
@@ -1107,11 +1121,11 @@ pub(crate) fn emit_update_from_rows<'document>(
                             term.nulls,
                         )
                     })
-                    .collect(),
+                    .try_collect()?,
                 comparators: order_by
                     .iter()
                     .map(|term| sort_comparator(&term.type_fact))
-                    .collect(),
+                    .try_collect()?,
             });
             Some(OpenedSorter {
                 cursor_id: sorter_cursor,
@@ -1622,7 +1636,7 @@ fn open_compound_index(
                 .map(|collation| *collation.value());
             column
         })
-        .collect();
+        .try_collect()?;
     let index = Arc::new(Index {
         name: "hir_compound_set".to_string(),
         table_name: String::new(),
@@ -1927,12 +1941,12 @@ fn open_group_sorter<'document>(
                 None,
             )
         })
-        .collect();
+        .try_collect()?;
     let comparators = grouping
         .key_type_facts
         .iter()
         .map(sort_comparator)
-        .collect();
+        .try_collect()?;
     program.emit_insn(Insn::SorterOpen {
         cursor_id,
         columns: grouping.keys.len(),
@@ -3579,14 +3593,14 @@ fn emit_positional_window<'document>(
                 term.nulls,
             )
         })
-        .collect::<Vec<_>>();
-    order_collations_nulls.push((SortOrder::Asc, Some(CollationSeq::Binary), None));
+        .try_collect::<crate::alloc::Vec<_>>()?;
+    order_collations_nulls.try_push((SortOrder::Asc, Some(CollationSeq::Binary), None))?;
     let mut comparators = spec
         .order_by
         .iter()
         .map(|term| sort_comparator(&term.type_fact))
-        .collect::<Vec<_>>();
-    comparators.push(None);
+        .try_collect::<crate::alloc::Vec<_>>()?;
+    comparators.try_push(None)?;
     program.emit_insn(Insn::SorterOpen {
         cursor_id: sorter,
         columns: key_count,
@@ -3691,7 +3705,7 @@ fn emit_positional_window<'document>(
         });
     }
 
-    let positions = ephemeral_table("window_navigation".to_string(), 1);
+    let positions = ephemeral_table("window_navigation".to_string(), 1)?;
     let positions_cursor = program.alloc_cursor_id(CursorType::BTreeTable(positions.clone()));
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id: positions_cursor,
@@ -3767,7 +3781,7 @@ fn emit_positional_window<'document>(
                         .map_or(CollationSeq::Binary, |collation| *collation.value()),
                     nulls_order: term.nulls,
                 })
-                .collect(),
+                .try_collect()?,
         });
         let update_peer = program.allocate_label();
         program.emit_insn(Insn::Jump {
@@ -3936,11 +3950,11 @@ fn open_ordered_aggregate_sorters<'document>(
                         term.nulls,
                     )
                 })
-                .collect(),
+                .try_collect()?,
             comparators: order_by
                 .iter()
                 .map(|term| sort_comparator(&term.type_fact))
-                .collect(),
+                .try_collect()?,
         });
     }
     Ok(())
@@ -5278,16 +5292,16 @@ fn open_derived_source<'document>(
         .map(|position| {
             Column::new_default_text(Some(format!("column_{position}")), "BLOB".to_string(), None)
         })
-        .collect();
+        .try_collect()?;
     let table = Arc::new(BTreeTable::new(
         0,
         format!("derived_{}", source.id.index()),
-        Vec::new(),
+        crate::alloc::vec![],
         columns,
         BTreeCharacteristics::HAS_ROWID,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
         None,
     ));
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
@@ -5374,7 +5388,7 @@ fn materialize_cte<'document>(
         materialize_cte(plan, program, bindings, ctes, dependency)?;
     }
 
-    let table = ephemeral_table(format!("cte_{name}"), width);
+    let table = ephemeral_table(format!("cte_{name}"), width)?;
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id,
@@ -5446,7 +5460,7 @@ fn materialize_recursive_cte<'document>(
         }
     }
 
-    let result_table = ephemeral_table(format!("cte_{name}"), width);
+    let result_table = ephemeral_table(format!("cte_{name}"), width)?;
     let result_cursor = program.alloc_cursor_id(CursorType::BTreeTable(result_table.clone()));
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id: result_cursor,
@@ -5588,17 +5602,17 @@ fn open_recursive_queue(
     width: usize,
     recursive: &RecursiveCte,
 ) -> QueryResult<(usize, Arc<Index>, usize)> {
-    let mut columns = Vec::new();
+    let mut columns = crate::alloc::vec![];
     for (position, term) in recursive.queue_order.iter().enumerate() {
         let default = match term.order {
             SortOrder::Asc => NullsOrder::First,
             SortOrder::Desc => NullsOrder::Last,
         };
         if term.nulls.is_some_and(|nulls| nulls != default) {
-            columns.push(IndexColumn::new(
+            columns.try_push(IndexColumn::new(
                 format!("null-rank-{position}"),
                 columns.len(),
-            ));
+            ))?;
         }
         let mut column = IndexColumn::new(format!("priority-{position}"), columns.len());
         column.order = term.order;
@@ -5613,12 +5627,12 @@ fn open_recursive_queue(
                     .and_then(|collation| collation.as_ref())
                     .map(|collation| *collation.value())
             });
-        columns.push(column);
+        columns.try_push(column)?;
     }
     let sort_width = columns.len();
-    columns.push(IndexColumn::new("sequence", columns.len()));
+    columns.try_push(IndexColumn::new("sequence", columns.len()))?;
     for output in 0..width {
-        columns.push(IndexColumn::new(format!("result-{output}"), columns.len()));
+        columns.try_push(IndexColumn::new(format!("result-{output}"), columns.len()))?;
     }
     let index = Arc::new(Index {
         name: format!("hir_recursive_queue_{name}"),
@@ -5660,7 +5674,7 @@ fn open_recursive_seen(
             column.collation = collation.as_ref().map(|collation| *collation.value());
             column
         })
-        .collect();
+        .try_collect()?;
     let index = Arc::new(Index {
         name: format!("hir_recursive_seen_{name}"),
         table_name: String::new(),
@@ -5709,23 +5723,26 @@ fn open_cte_source<'document>(
     })
 }
 
-pub(crate) fn ephemeral_table(name: String, width: usize) -> Arc<BTreeTable> {
+pub(crate) fn ephemeral_table(
+    name: String,
+    width: usize,
+) -> Result<Arc<BTreeTable>, crate::alloc::TryReserveError> {
     let columns = (0..width)
         .map(|position| {
             Column::new_default_text(Some(format!("column_{position}")), "BLOB".to_string(), None)
         })
-        .collect();
-    Arc::new(BTreeTable::new(
+        .try_collect()?;
+    Ok(Arc::new(BTreeTable::new(
         0,
         name,
-        Vec::new(),
+        crate::alloc::vec![],
         columns,
         BTreeCharacteristics::HAS_ROWID,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
         None,
-    ))
+    )))
 }
 
 fn query_tree_ctes(plan: &PhysicalPlan<'_>, root: QueryId) -> QueryResult<Vec<CteId>> {
@@ -6078,12 +6095,12 @@ fn open_sorter<'hir>(
                 term.nulls,
             )
         })
-        .collect::<Vec<_>>();
+        .try_collect::<crate::alloc::Vec<_>>()?;
     if let Some(order) = tie_breaker {
-        order_collations_nulls.push((order, Some(CollationSeq::Binary), None));
+        order_collations_nulls.try_push((order, Some(CollationSeq::Binary), None))?;
     }
     if let Some((grouping, outputs)) = grouping_ties {
-        order_collations_nulls.extend(grouping.keys.iter().enumerate().filter_map(
+        order_collations_nulls.try_extend(grouping.keys.iter().enumerate().filter_map(
             |(position, key)| {
                 (!grouping_key_is_ordered(key, &query.hir.order_by, outputs)).then(|| {
                     (
@@ -6095,28 +6112,24 @@ fn open_sorter<'hir>(
                     )
                 })
             },
-        ));
+        ))?;
     }
     let mut comparators = query
         .hir
         .order_by
         .iter()
         .map(|term| sort_comparator(&term.type_fact))
-        .collect::<Vec<_>>();
+        .try_collect::<crate::alloc::Vec<_>>()?;
     if tie_breaker.is_some() {
-        comparators.push(None);
+        comparators.try_push(None)?;
     }
     if let Some((grouping, outputs)) = grouping_ties {
-        comparators.extend(
-            grouping
-                .keys
-                .iter()
-                .enumerate()
-                .filter_map(|(position, key)| {
-                    (!grouping_key_is_ordered(key, &query.hir.order_by, outputs))
-                        .then(|| sort_comparator(&grouping.key_type_facts[position]))
-                }),
-        );
+        comparators.try_extend(grouping.keys.iter().enumerate().filter_map(
+            |(position, key)| {
+                (!grouping_key_is_ordered(key, &query.hir.order_by, outputs))
+                    .then(|| sort_comparator(&grouping.key_type_facts[position]))
+            },
+        ))?;
     }
     let grouping_tie_count = grouping_ties.map_or(0, |(grouping, outputs)| {
         grouping
