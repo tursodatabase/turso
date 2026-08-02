@@ -19,8 +19,8 @@ use crate::{
     sync::Arc,
     translate::collate::CollationSeq,
     translate::semantic::hir::{
-        Assignment, CteBody, CteId, Expr, From as HirFrom, Grouping, Join, JoinConstraint,
-        JoinKind, OrderTerm, QueryBlockBody, QueryBlockId, QueryId, RecursiveCte,
+        Assignment, CteBody, CteId, Expr, From as HirFrom, FunctionCall, Grouping, Join,
+        JoinConstraint, JoinKind, OrderTerm, QueryBlockBody, QueryBlockId, QueryId, RecursiveCte,
         RecursiveOrderTerm, ResolvedTable, SourceId, SubqueryExpr, TypeFact,
     },
     types::KeyInfo,
@@ -2448,15 +2448,11 @@ fn emit_grouped_aggregate<'document>(
         program.preassign_label_to_next_insn(output_group);
         drain_ordered_aggregate_sorters(plan, program, bindings, &block.aggregates)?;
         for aggregate in &block.aggregates {
-            let Func::Agg(function) = aggregate.call.function.value() else {
-                return Err(PhysicalQueryError::Unsupported(
-                    "external aggregate function",
-                ));
-            };
+            let function = runtime_aggregate_function(aggregate.call)?;
             let register = bindings.aggregate(aggregate.id)?.register;
             program.emit_insn(Insn::AggFinal {
                 register: register.0,
-                func: AccumulatorFunc::Agg(function.clone()),
+                func: AccumulatorFunc::Agg(function),
             });
         }
         let mut current_sources = Vec::with_capacity(representative_sources.len());
@@ -2630,15 +2626,11 @@ fn emit_ungrouped_aggregate<'document>(
     let emission = (|| -> QueryResult<()> {
         drain_ordered_aggregate_sorters(plan, program, bindings, &block.aggregates)?;
         for aggregate in &block.aggregates {
-            let Func::Agg(function) = aggregate.call.function.value() else {
-                return Err(PhysicalQueryError::Unsupported(
-                    "external aggregate function",
-                ));
-            };
+            let function = runtime_aggregate_function(aggregate.call)?;
             let register = bindings.aggregate(aggregate.id)?.register;
             program.emit_insn(Insn::AggFinal {
                 register: register.0,
-                func: AccumulatorFunc::Agg(function.clone()),
+                func: AccumulatorFunc::Agg(function),
             });
         }
 
@@ -3298,11 +3290,7 @@ fn emit_default_aggregate_window<'document>(
     filter: Option<&'document Expr>,
 ) -> QueryResult<()> {
     let call = window.call;
-    let Func::Agg(function) = call.function.value() else {
-        return Err(PhysicalQueryError::Invalid(
-            "non-aggregate reached aggregate-window emission",
-        ));
-    };
+    let function = runtime_aggregate_function(call)?;
     let spec = call.window.as_ref().ok_or(PhysicalQueryError::Invalid(
         "aggregate window has no specification",
     ))?;
@@ -3429,7 +3417,7 @@ fn emit_default_aggregate_window<'document>(
         if let Some(aggregate_filter) = call.filter.as_deref() {
             emit_filter(plan, program, bindings, ctes, aggregate_filter, loop_next)?;
         }
-        let (column, delimiter, comparator, collation) = match function {
+        let (column, delimiter, comparator, collation) = match &function {
             AggFunc::Count0 => {
                 let one = program.alloc_register();
                 program.emit_insn(Insn::Integer {
@@ -3454,7 +3442,7 @@ fn emit_default_aggregate_window<'document>(
                 let argument_value =
                     ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
                         .emit_new(argument)?;
-                let comparison = matches!(function, AggFunc::Min | AggFunc::Max);
+                let comparison = matches!(&function, AggFunc::Min | AggFunc::Max);
                 (
                     argument_value.first.0,
                     0,
@@ -4114,11 +4102,7 @@ fn drain_ordered_aggregate_sorters<'document>(
         let Some(sorter) = bindings.aggregate(aggregate.id)?.ordered_sorter else {
             continue;
         };
-        let Func::Agg(function) = call.function.value() else {
-            return Err(PhysicalQueryError::Unsupported(
-                "external aggregate function",
-            ));
-        };
+        let function = runtime_aggregate_function(call)?;
         let field_count = call.argument_order.len() + call.arguments.len();
         let data = program.alloc_register();
         let pseudo = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
@@ -4150,7 +4134,7 @@ fn drain_ordered_aggregate_sorters<'document>(
                 default: None,
             });
         }
-        let (column, delimiter, comparator, collation) = match function {
+        let (column, delimiter, comparator, collation) = match &function {
             AggFunc::Count0 => {
                 return Err(PhysicalQueryError::Invalid(
                     "count(*) cannot have argument ORDER BY",
@@ -4168,7 +4152,7 @@ fn drain_ordered_aggregate_sorters<'document>(
                         "ordered aggregate has the wrong argument count",
                     ));
                 }
-                let comparison = matches!(function, AggFunc::Min | AggFunc::Max);
+                let comparison = matches!(&function, AggFunc::Min | AggFunc::Max);
                 (
                     arguments,
                     0,
@@ -4276,6 +4260,31 @@ fn drain_ordered_aggregate_sorters<'document>(
     Ok(())
 }
 
+fn runtime_aggregate_function(call: &FunctionCall) -> QueryResult<AggFunc> {
+    let Func::Agg(function) = call.function.value() else {
+        return Err(PhysicalQueryError::Invalid(
+            "non-aggregate reached aggregate emission",
+        ));
+    };
+    let AggFunc::External(external) = function else {
+        return Ok(function.clone());
+    };
+    let registered_arguments = external.agg_args().map_err(|_| {
+        PhysicalQueryError::Invalid("resolved external function is not an aggregate")
+    })?;
+    if registered_arguments >= 0 && registered_arguments as usize != call.arguments.len() {
+        return Err(PhysicalQueryError::Invalid(
+            "external aggregate has the wrong argument count",
+        ));
+    }
+    let external = if registered_arguments < 0 {
+        Arc::new(external.with_aggregate_arg_count(call.arguments.len()))
+    } else {
+        external.clone()
+    };
+    Ok(AggFunc::External(external))
+}
+
 fn emit_aggregate_steps<'document>(
     plan: &PhysicalPlan<'document>,
     program: &mut ProgramBuilder,
@@ -4324,16 +4333,12 @@ fn emit_aggregate_steps<'document>(
             }
             continue;
         }
-        let Func::Agg(function) = call.function.value() else {
-            return Err(PhysicalQueryError::Unsupported(
-                "external aggregate function",
-            ));
-        };
+        let function = runtime_aggregate_function(call)?;
         let skip = call.filter.as_ref().map(|_| program.allocate_label());
         if let (Some(filter), Some(skip)) = (call.filter.as_deref(), skip) {
             emit_filter(plan, program, bindings, ctes, filter, skip)?;
         }
-        let (column, delimiter, comparator, collation) = match function {
+        let (column, delimiter, comparator, collation) = match &function {
             AggFunc::Count0 => {
                 if !call.arguments.is_empty() {
                     return Err(PhysicalQueryError::Invalid(
@@ -4367,7 +4372,7 @@ fn emit_aggregate_steps<'document>(
                         "aggregate argument is not scalar",
                     ));
                 }
-                let comparison = matches!(function, AggFunc::Min | AggFunc::Max);
+                let comparison = matches!(&function, AggFunc::Min | AggFunc::Max);
                 (
                     value.first.0,
                     0,

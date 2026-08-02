@@ -10,7 +10,7 @@ use turso_parser::ast;
 use crate::{
     connection::TempDatabase,
     dialect::Dialect,
-    function::Func,
+    function::{AggFunc, ExtFunc, Func},
     schema::{Schema, Table},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -442,7 +442,12 @@ impl<'a> SemanticContext<'a> {
             None => Ok(self
                 .symbol_table
                 .resolve_function(name, arg_count)
-                .map(Func::External)),
+                .map(|function| match &function.func {
+                    ExtFunc::Aggregate { .. } => {
+                        Func::Agg(AggFunc::External(Arc::new(function.func.clone())))
+                    }
+                    ExtFunc::Scalar { .. } => Func::External(function),
+                })),
         }
     }
 
