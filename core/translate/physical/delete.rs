@@ -10,7 +10,7 @@ use std::fmt;
 
 use crate::{
     schema::Table,
-    translate::semantic::hir::{ColumnReadExpression, Expr, IndexCoverage, SourceKind},
+    translate::semantic::hir::{Expr, IndexCoverage, SourceKind},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{Insn, RegisterOrLiteral},
@@ -194,20 +194,6 @@ fn preflight_delete(
     if !source.index_method_patterns.is_empty() {
         return Err(PhysicalDeleteError::Unsupported("custom index methods"));
     }
-    if source
-        .generated_expressions
-        .iter()
-        .chain(&source.default_expressions)
-        .any(|expression| matches!(expression, ColumnReadExpression::Planned(_)))
-    {
-        return Err(PhysicalDeleteError::Unsupported(
-            "stored column read expressions",
-        ));
-    }
-    if source.column_type_programs.iter().any(Option::is_some) {
-        return Err(PhysicalDeleteError::Unsupported("custom column decoding"));
-    }
-
     let physical_source = plan
         .source(delete.target)
         .ok_or(PhysicalDeleteError::Invalid(

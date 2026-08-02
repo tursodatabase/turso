@@ -353,27 +353,7 @@ impl<'program, 'bindings, 'document> ExpressionEmitter<'program, 'bindings, 'doc
         }
         match self.bindings.source(column.source)? {
             SourceRuntime::Cursor(cursor) => {
-                if matches!(
-                    &source.kind,
-                    hir::SourceKind::Table(table)
-                        | hir::SourceKind::TableFunction { table, .. }
-                        | hir::SourceKind::Pseudo { table, .. }
-                        if matches!(table.value(), Table::Virtual(_))
-                ) {
-                    self.program.emit_insn(Insn::VColumn {
-                        cursor_id: cursor.0,
-                        column: column.column,
-                        dest: target,
-                    });
-                } else {
-                    self.program.emit_insn(Insn::Column {
-                        cursor_id: cursor.0,
-                        column: column.column,
-                        dest: target,
-                        default: None,
-                    });
-                }
-                Ok(())
+                self.emit_cursor_column(source, column.column, cursor, target)
             }
             SourceRuntime::Registers { columns, .. } => {
                 let source =
@@ -386,6 +366,168 @@ impl<'program, 'bindings, 'document> ExpressionEmitter<'program, 'bindings, 'doc
                 Ok(())
             }
         }
+    }
+
+    fn emit_cursor_column(
+        &mut self,
+        source: &hir::Source,
+        column: usize,
+        cursor: CursorId,
+        target: usize,
+    ) -> ExpressionResult<()> {
+        let table = match &source.kind {
+            hir::SourceKind::Table(table)
+            | hir::SourceKind::TableFunction { table, .. }
+            | hir::SourceKind::Pseudo { table, .. } => Some(table),
+            hir::SourceKind::SchemaExpression
+            | hir::SourceKind::Cte(_)
+            | hir::SourceKind::Derived(_)
+            | hir::SourceKind::RecursiveInput(_) => None,
+        };
+        let Some(table) = table else {
+            self.program.emit_insn(Insn::Column {
+                cursor_id: cursor.0,
+                column,
+                dest: target,
+                default: None,
+            });
+            return Ok(());
+        };
+        let Table::BTree(table) = table.value() else {
+            self.program.emit_insn(Insn::VColumn {
+                cursor_id: cursor.0,
+                column,
+                dest: target,
+            });
+            return Ok(());
+        };
+        let catalog_column =
+            table
+                .columns()
+                .get(column)
+                .ok_or(PhysicalExpressionError::Invalid(
+                    "column position is outside its catalog table",
+                ))?;
+        if catalog_column.is_virtual_generated() {
+            let hir::ColumnReadExpression::Planned(expression) =
+                &source.generated_expressions[column]
+            else {
+                return Err(PhysicalExpressionError::Invalid(
+                    "virtual generated column has no closed read expression",
+                ));
+            };
+            self.emit_into(expression, RegisterRange::new(target, 1))?;
+            self.program
+                .emit_column_affinity(target, source.columns[column].affinity);
+            return Ok(());
+        }
+        if source.columns[column].rowid_alias {
+            self.program.emit_insn(Insn::RowId {
+                cursor_id: cursor.0,
+                dest: target,
+            });
+            return Ok(());
+        }
+
+        let programs = source.column_type_programs[column].as_ref();
+        match &source.default_expressions[column] {
+            hir::ColumnReadExpression::Planned(default) => {
+                let stored = self.program.allocate_label();
+                let merged = self.program.allocate_label();
+                self.program.emit_column_has_field(cursor.0, column, stored);
+                self.emit_into(default, RegisterRange::new(target, 1))?;
+                self.program
+                    .emit_column_affinity(target, source.columns[column].affinity);
+                if let Some(programs) = programs {
+                    self.emit_column_storage_encode(programs, target)?;
+                }
+                self.program.emit_insn(Insn::Goto { target_pc: merged });
+                self.program.preassign_label_to_next_insn(stored);
+                self.program.flags.set_suppress_column_default(true);
+                self.program.emit_column_or_rowid(cursor.0, column, target);
+                self.program.preassign_label_to_next_insn(merged);
+            }
+            hir::ColumnReadExpression::Absent => {
+                self.program.emit_column_or_rowid(cursor.0, column, target);
+            }
+            hir::ColumnReadExpression::NotRequired => {
+                return Err(PhysicalExpressionError::Invalid(
+                    "referenced column has an unplanned default expression",
+                ));
+            }
+        }
+
+        if let Some(programs) = programs {
+            self.emit_column_storage_decode(programs, target)?;
+        } else {
+            self.program
+                .emit_column_affinity(target, source.columns[column].affinity);
+        }
+        Ok(())
+    }
+
+    fn emit_column_storage_encode(
+        &mut self,
+        programs: &hir::BoundColumnTypePrograms,
+        target: usize,
+    ) -> ExpressionResult<()> {
+        if let Some(array) = &programs.array {
+            if !programs.encode.is_empty() {
+                return Err(PhysicalExpressionError::Unsupported(
+                    "custom array element encoding",
+                ));
+            }
+            let skip = self.program.allocate_label();
+            self.program.emit_insn(Insn::IsNull {
+                reg: target,
+                target_pc: skip,
+            });
+            self.program.emit_insn(Insn::ArrayEncode {
+                reg: target,
+                element_affinity: array.element_affinity,
+                element_type: array.element_type.clone().into(),
+                table_name: array.table_name.clone().into(),
+                col_name: array.column_name.clone().into(),
+            });
+            self.program.preassign_label_to_next_insn(skip);
+            return Ok(());
+        }
+
+        let skip = (!programs.encode_nulls && !programs.encode.is_empty())
+            .then(|| self.program.allocate_label());
+        if let Some(skip) = skip {
+            self.program.emit_insn(Insn::IsNull {
+                reg: target,
+                target_pc: skip,
+            });
+        }
+        for call in &programs.encode {
+            self.emit_schema_call(call, target, target)?;
+        }
+        if let Some(skip) = skip {
+            self.program.preassign_label_to_next_insn(skip);
+        }
+        Ok(())
+    }
+
+    fn emit_column_storage_decode(
+        &mut self,
+        programs: &hir::BoundColumnTypePrograms,
+        target: usize,
+    ) -> ExpressionResult<()> {
+        if programs.array.is_some() || programs.decode.is_empty() {
+            return Ok(());
+        }
+        let skip = self.program.allocate_label();
+        self.program.emit_insn(Insn::IsNull {
+            reg: target,
+            target_pc: skip,
+        });
+        for call in &programs.decode {
+            self.emit_schema_call(call, target, target)?;
+        }
+        self.program.preassign_label_to_next_insn(skip);
+        Ok(())
     }
 
     fn emit_rowid(&mut self, source: hir::SourceId, target: usize) -> ExpressionResult<()> {

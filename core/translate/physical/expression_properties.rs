@@ -5,13 +5,14 @@ use turso_parser::{ast, parser::Parser};
 
 use super::*;
 use crate::{
+    QueryMode, SymbolTable,
     dialect::{Dialect, SqliteDialect},
     schema::{BTreeTable, Schema, Type},
     sync::Arc,
     translate::{
         collate::CollationSeq,
         semantic::{
-            analyze,
+            AnalyzeInput, analyze,
             context::SemanticContext,
             hir::{
                 BoundCastPrograms, BoundSchemaCall, BoundSchemaProgram, CatalogSnapshot,
@@ -20,15 +21,13 @@ use crate::{
                 QueryId, QueryRoot, SchemaProgramId, Source, SourceColumn, SourceId, SourceKind,
                 SourceOwner, TypeFact, TypeName,
             },
-            AnalyzeInput,
         },
     },
     vdbe::{
         affinity::Affinity,
-        builder::{ProgramBuilder, ProgramBuilderOpts},
+        builder::{CursorType, ProgramBuilder, ProgramBuilderOpts},
         insn::Insn,
     },
-    QueryMode, SymbolTable,
 };
 
 fn parse_statement(sql: &str) -> ast::Stmt {
@@ -154,6 +153,16 @@ fn root_output(document: &HirDocument, position: usize) -> &Expr {
     };
     let query = document.query(root.query).expect("root query exists");
     &query.blocks[query.first.index].outputs[position].expr
+}
+
+fn btree_source(document: &HirDocument, position: usize) -> Arc<BTreeTable> {
+    let SourceKind::Table(table) = &document.sources[position].kind else {
+        panic!("source is a catalog table");
+    };
+    let crate::schema::Table::BTree(table) = table.value() else {
+        panic!("source is a B-tree table");
+    };
+    table.clone()
 }
 
 // Example: `SELECT c7, rowid FROM items` must read column position 7 from
@@ -290,10 +299,11 @@ fn comparisons_lower_from_frozen_hir_after_catalog_is_gone(tc: hegel::TestCase) 
     bindings
         .enter_query(root.query)
         .expect("root query enters from root scope");
-    bindings
-        .bind_source(source, SourceRuntime::Cursor(CursorId(13)))
-        .expect("items belongs to the root query");
     let mut program = program();
+    let cursor = program.alloc_cursor_id(CursorType::BTreeTable(btree_source(&document, 0)));
+    bindings
+        .bind_source(source, SourceRuntime::Cursor(CursorId(cursor)))
+        .expect("items belongs to the root query");
     ExpressionEmitter::new(&mut program, &mut bindings)
         .emit_new(expression)
         .expect("closed comparison lowers without a catalog");
@@ -318,10 +328,10 @@ fn comparisons_lower_from_frozen_hir_after_catalog_is_gone(tc: hegel::TestCase) 
     assert!(program.insns.iter().any(|(instruction, _)| matches!(
         instruction,
         Insn::Column {
-            cursor_id: 13,
+            cursor_id,
             column: 0,
             ..
-        }
+        } if *cursor_id == cursor
     )));
     assert!(program.insns.iter().any(
         |(instruction, _)| matches!(instruction, Insn::Variable { index, .. } if index.get() == 1)
@@ -370,10 +380,14 @@ fn comparison_forms_lower_as_closed_hir(tc: hegel::TestCase) {
     bindings
         .enter_query(root.query)
         .expect("q0 is a root query");
-    bindings
-        .bind_source(document.sources[0].id, SourceRuntime::Cursor(CursorId(21)))
-        .expect("items belongs to q0");
     let mut program = program();
+    let cursor = program.alloc_cursor_id(CursorType::BTreeTable(btree_source(&document, 0)));
+    bindings
+        .bind_source(
+            document.sources[0].id,
+            SourceRuntime::Cursor(CursorId(cursor)),
+        )
+        .expect("items belongs to q0");
     ExpressionEmitter::new(&mut program, &mut bindings)
         .emit_new(expression)
         .expect("closed comparison form lowers without a catalog");
@@ -403,6 +417,128 @@ fn comparison_forms_lower_as_closed_hir(tc: hegel::TestCase) {
             3
         }
     );
+}
+
+// Example: after analyzing
+// `SELECT c1, c2 FROM items` for
+// `c1 GENERATED ALWAYS AS (c0 + 7) VIRTUAL, c2 DEFAULT 11`, reading c1 must
+// execute the stored `c0 + 7` HIR instead of loading physical field 1. Reading
+// c2 must use `ColumnHasField`: old short records compute 11, while newer
+// records load physical field 1. Both paths must still lower after the live
+// schema and resolver context have been dropped.
+#[hegel::test]
+fn stored_column_reads_use_frozen_hir_and_physical_positions(tc: hegel::TestCase) {
+    let generated_offset =
+        i64::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(31)));
+    let default_value =
+        i64::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(31))) + 40;
+    let table = BTreeTable::from_sql(
+        &format!(
+            "CREATE TABLE items(\
+             c0 INTEGER, \
+             c1 INTEGER GENERATED ALWAYS AS (c0 + {generated_offset}) VIRTUAL, \
+             c2 INTEGER DEFAULT {default_value})"
+        ),
+        2,
+    )
+    .expect("generated table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(table))
+        .expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement("SELECT c1, c2 FROM items");
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("stored-expression fixture has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    assert!(matches!(
+        document.sources[0].generated_expressions[1],
+        ColumnReadExpression::Planned(_)
+    ));
+    assert!(matches!(
+        document.sources[0].default_expressions[2],
+        ColumnReadExpression::Planned(_)
+    ));
+    let SourceKind::Table(resolved_table) = &document.sources[0].kind else {
+        panic!("items is a table source");
+    };
+    let crate::schema::Table::BTree(table) = resolved_table.value() else {
+        panic!("items is a B-tree table");
+    };
+    let table = table.clone();
+    let HirRoot::Query(root) = &document.root else {
+        panic!("fixture is a query");
+    };
+    let source = document.sources[0].id;
+    let mut bindings =
+        RuntimeBindings::new(&document, document.snapshot).expect("analyzed document is closed");
+    bindings
+        .enter_query(root.query)
+        .expect("q0 is a root query");
+    let mut program = program();
+    let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table));
+    bindings
+        .bind_source(source, SourceRuntime::Cursor(CursorId(cursor)))
+        .expect("items belongs to q0");
+
+    let generated_start = program.insns.len();
+    ExpressionEmitter::new(&mut program, &mut bindings)
+        .emit_new(root_output(&document, 0))
+        .expect("virtual generated column lowers from HIR");
+    let generated_insns = &program.insns[generated_start..];
+    assert!(generated_insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Column {
+            cursor_id,
+            column: 0,
+            ..
+        } if *cursor_id == cursor
+    )));
+    assert!(
+        generated_insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Add { .. }))
+    );
+    assert!(
+        !generated_insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Column { column: 1, .. }))
+    );
+
+    let default_start = program.insns.len();
+    ExpressionEmitter::new(&mut program, &mut bindings)
+        .emit_new(root_output(&document, 1))
+        .expect("added-column default lowers from HIR");
+    program
+        .resolve_labels()
+        .expect("stored-column branches are closed");
+    let default_insns = &program.insns[default_start..];
+    assert!(default_insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::ColumnHasField {
+            cursor_id,
+            column: 1,
+            ..
+        } if *cursor_id == cursor
+    )));
+    assert!(default_insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Integer { value, .. } if *value == default_value
+    )));
+    assert!(default_insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Column {
+            cursor_id,
+            column: 1,
+            default: None,
+            ..
+        } if *cursor_id == cursor
+    )));
 }
 
 // Example: `SELECT 'hello' NOT LIKE 'h%'` resolves the exact two-argument
@@ -578,24 +714,28 @@ fn lazy_scalar_functions_do_not_evaluate_unselected_branches(tc: hegel::TestCase
         })
         .expect("unselected branch still has runtime bytecode");
     if coalesce {
-        assert!(program.insns[..random]
-            .iter()
-            .any(|(instruction, _)| matches!(
-                instruction,
-                Insn::NotNull {
-                    target_pc: crate::vdbe::BranchOffset::Offset(target),
-                    ..
-                } if *target as usize == random + 1
-            )));
+        assert!(
+            program.insns[..random]
+                .iter()
+                .any(|(instruction, _)| matches!(
+                    instruction,
+                    Insn::NotNull {
+                        target_pc: crate::vdbe::BranchOffset::Offset(target),
+                        ..
+                    } if *target as usize == random + 1
+                ))
+        );
     } else {
-        assert!(program.insns[..random]
-            .iter()
-            .any(|(instruction, _)| matches!(
-                instruction,
-                Insn::Goto {
-                    target_pc: crate::vdbe::BranchOffset::Offset(target),
-                } if *target as usize == random + 1
-            )));
+        assert!(
+            program.insns[..random]
+                .iter()
+                .any(|(instruction, _)| matches!(
+                    instruction,
+                    Insn::Goto {
+                        target_pc: crate::vdbe::BranchOffset::Offset(target),
+                    } if *target as usize == random + 1
+                ))
+        );
     }
 }
 

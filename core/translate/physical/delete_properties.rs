@@ -5,20 +5,21 @@ use turso_parser::{ast, parser::Parser};
 
 use super::*;
 use crate::{
-    QueryMode, SymbolTable,
     dialect::{Dialect, SqliteDialect},
     schema::{BTreeTable, Schema},
     sync::Arc,
     translate::semantic::{
-        AnalyzeInput, analyze,
+        analyze,
         context::SemanticContext,
-        hir::{Expr, HirRoot},
+        hir::{ColumnReadExpression, Expr, HirRoot},
+        AnalyzeInput,
     },
     vdbe::{
-        BranchOffset,
         builder::{ProgramBuilder, ProgramBuilderOpts},
         insn::{Insn, RegisterOrLiteral},
+        BranchOffset,
     },
+    QueryMode, SymbolTable,
 };
 
 fn parse_statement(sql: &str) -> ast::Stmt {
@@ -218,4 +219,100 @@ fn an_unsupported_delete_obligation_cannot_emit_a_partial_program(tc: hegel::Tes
         PhysicalRootError::Delete(PhysicalDeleteError::Unsupported("RETURNING"))
     ));
     assert!(program.insns.is_empty());
+}
+
+// Example: for
+// `c1 GENERATED ALWAYS AS (c0 + 7) VIRTUAL, c2 INTEGER DEFAULT 11`, either
+// `DELETE FROM items WHERE c1` or `DELETE FROM items WHERE c2` must evaluate
+// the stored HIR read rule before deciding to delete. c1 reads c0 and adds 7;
+// c2 branches on record width and computes 11 for an old short record. Neither
+// case may resolve or parse the stored SQL after the live schema is dropped.
+#[hegel::test]
+fn delete_predicates_execute_stored_column_hir(tc: hegel::TestCase) {
+    let use_generated = tc.draw(generators::booleans());
+    let generated_offset =
+        i64::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(31)));
+    let default_value =
+        i64::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(31))) + 40;
+    let table = BTreeTable::from_sql(
+        &format!(
+            "CREATE TABLE items(\
+             c0 INTEGER, \
+             c1 INTEGER GENERATED ALWAYS AS (c0 + {generated_offset}) VIRTUAL, \
+             c2 INTEGER DEFAULT {default_value})"
+        ),
+        7,
+    )
+    .expect("generated table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(table))
+        .expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let predicate_column = if use_generated { 1 } else { 2 };
+    let statement = parse_statement(&format!("DELETE FROM items WHERE c{predicate_column}"));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("stored-expression DELETE has valid SQL meaning");
+    let HirRoot::Delete(delete) = &document.root else {
+        panic!("DELETE syntax produces a DELETE HIR root");
+    };
+    let source = document
+        .source(delete.target)
+        .expect("DELETE target source exists");
+    assert!(matches!(
+        source.generated_expressions[1],
+        ColumnReadExpression::Planned(_)
+    ));
+    assert!(matches!(
+        source.default_expressions[2],
+        ColumnReadExpression::Planned(_)
+    ));
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed HIR has a physical plan");
+    let mut program = program();
+    emit_root(&plan, &mut program).expect("stored-expression DELETE lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("all stored-expression branches are closed");
+
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::Delete { .. })));
+    if use_generated {
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Column { column: 0, .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Add { .. })));
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Column { column: 1, .. })));
+    } else {
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::ColumnHasField { column: 1, .. })));
+        assert!(program.insns.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::Integer { value, .. } if *value == default_value
+        )));
+        assert!(program.insns.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::Column {
+                column: 1,
+                default: None,
+                ..
+            }
+        )));
+    }
 }
