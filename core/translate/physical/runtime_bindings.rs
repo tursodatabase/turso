@@ -80,6 +80,9 @@ pub(crate) struct OutputRuntime {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AggregateRuntime {
     pub(crate) register: RegisterId,
+    /// Per-aggregate duplicate set. This is runtime state selected by physical
+    /// emission; the HIR only records whether DISTINCT was written.
+    pub(crate) distinct_hash_table: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -25,7 +25,7 @@ use crate::{
     types::KeyInfo,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u32, HashDistinctData, IdxInsertFlags, InsertFlags, Insn, SortComparatorType},
+        insn::{HashDistinctData, IdxInsertFlags, InsertFlags, Insn, SortComparatorType, to_u32},
     },
 };
 
@@ -1456,10 +1456,19 @@ fn emit_grouped_aggregate<'document>(
                 .then_some(accumulator_start + block.aggregates.len() - 1),
         });
         for (position, aggregate) in block.aggregates.iter().enumerate() {
+            let distinct_hash_table = aggregate
+                .call
+                .distinctness
+                .is_some()
+                .then(|| program.alloc_hash_table_id());
+            if let Some(hash_table_id) = distinct_hash_table {
+                program.emit_insn(Insn::HashClear { hash_table_id });
+            }
             bindings.bind_aggregate(
                 aggregate.id,
                 AggregateRuntime {
                     register: RegisterId(accumulator_start + position),
+                    distinct_hash_table,
                 },
             )?;
         }
@@ -1566,6 +1575,7 @@ fn emit_grouped_aggregate<'document>(
                 dest_end: (block.aggregates.len() > 1)
                     .then_some(accumulator_start + block.aggregates.len() - 1),
             });
+            clear_aggregate_distinct_sets(program, bindings, &block.aggregates)?;
         }
 
         program.preassign_label_to_next_insn(start_group);
@@ -1653,6 +1663,7 @@ fn emit_grouped_aggregate<'document>(
         program.emit_insn(Insn::Close {
             cursor_id: sorter.cursor_id,
         });
+        close_aggregate_distinct_sets(program, bindings, &block.aggregates)?;
         Ok(())
     })();
 
@@ -1688,10 +1699,19 @@ fn emit_ungrouped_aggregate<'document>(
             .then_some(accumulator_start + block.aggregates.len() - 1),
     });
     for (position, aggregate) in block.aggregates.iter().enumerate() {
+        let distinct_hash_table = aggregate
+            .call
+            .distinctness
+            .is_some()
+            .then(|| program.alloc_hash_table_id());
+        if let Some(hash_table_id) = distinct_hash_table {
+            program.emit_insn(Insn::HashClear { hash_table_id });
+        }
         bindings.bind_aggregate(
             aggregate.id,
             AggregateRuntime {
                 register: RegisterId(accumulator_start + position),
+                distinct_hash_table,
             },
         )?;
     }
@@ -1753,6 +1773,7 @@ fn emit_ungrouped_aggregate<'document>(
         distinct,
     )?;
     program.preassign_label_to_next_insn(skip);
+    close_aggregate_distinct_sets(program, bindings, &block.aggregates)?;
     Ok(())
 }
 
@@ -1765,12 +1786,9 @@ fn emit_aggregate_steps<'document>(
 ) -> QueryResult<()> {
     for aggregate in aggregates {
         let call = aggregate.call;
-        if call.distinctness.is_some()
-            || !call.argument_order.is_empty()
-            || !call.within_group.is_empty()
-        {
+        if !call.argument_order.is_empty() {
             return Err(PhysicalQueryError::Unsupported(
-                "ordered or DISTINCT aggregate",
+                "aggregate argument ORDER BY",
             ));
         }
         let Func::Agg(function) = call.function.value() else {
@@ -1782,7 +1800,7 @@ fn emit_aggregate_steps<'document>(
         if let (Some(filter), Some(skip)) = (call.filter.as_deref(), skip) {
             emit_filter(plan, program, bindings, ctes, filter, skip)?;
         }
-        let (column, delimiter) = match function {
+        let (column, delimiter, comparator, collation) = match function {
             AggFunc::Count0 => {
                 if !call.arguments.is_empty() {
                     return Err(PhysicalQueryError::Invalid(
@@ -1794,14 +1812,15 @@ fn emit_aggregate_steps<'document>(
                     value: 1,
                     dest: one,
                 });
-                (one, 0)
+                (one, 0, None, None)
             }
             AggFunc::Avg
             | AggFunc::Count
             | AggFunc::Max
             | AggFunc::Min
             | AggFunc::Sum
-            | AggFunc::Total => {
+            | AggFunc::Total
+            | AggFunc::ArrayAgg => {
                 let [argument] = call.arguments.as_slice() else {
                     return Err(PhysicalQueryError::Invalid(
                         "aggregate has the wrong argument count",
@@ -1815,28 +1834,262 @@ fn emit_aggregate_steps<'document>(
                         "aggregate argument is not scalar",
                     ));
                 }
-                (value.first.0, 0)
+                let comparison = matches!(function, AggFunc::Min | AggFunc::Max);
+                (
+                    value.first.0,
+                    0,
+                    comparison
+                        .then(|| expression_type_fact(plan, argument))
+                        .flatten()
+                        .as_ref()
+                        .and_then(sort_comparator),
+                    comparison.then(|| expression_collation(plan, argument)),
+                )
             }
-            _ => {
-                return Err(PhysicalQueryError::Unsupported(
-                    "aggregate function implementation",
-                ));
+            AggFunc::GroupConcat => {
+                let ([argument] | [argument, _]) = call.arguments.as_slice() else {
+                    return Err(PhysicalQueryError::Invalid(
+                        "group_concat has the wrong argument count",
+                    ));
+                };
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                let value = ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                    .emit_new(argument)?;
+                let delimiter = if let Some(delimiter) = call.arguments.get(1) {
+                    let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                    ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                        .emit_new(delimiter)?
+                        .first
+                        .0
+                } else {
+                    let delimiter = program.alloc_register();
+                    program.emit_insn(Insn::String8 {
+                        value: ",".to_string(),
+                        dest: delimiter,
+                    });
+                    delimiter
+                };
+                (value.first.0, delimiter, None, None)
+            }
+            AggFunc::StringAgg => {
+                let [argument, delimiter] = call.arguments.as_slice() else {
+                    return Err(PhysicalQueryError::Invalid(
+                        "string_agg has the wrong argument count",
+                    ));
+                };
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                let value = ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                    .emit_new(argument)?;
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                let delimiter =
+                    ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                        .emit_new(delimiter)?;
+                (value.first.0, delimiter.first.0, None, None)
+            }
+            #[cfg(feature = "json")]
+            AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
+                let [key, value] = call.arguments.as_slice() else {
+                    return Err(PhysicalQueryError::Invalid(
+                        "json_group_object has the wrong argument count",
+                    ));
+                };
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                let key = ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                    .emit_new(key)?;
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                let value = ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                    .emit_new(value)?;
+                (key.first.0, value.first.0, None, None)
+            }
+            #[cfg(feature = "json")]
+            AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
+                let [argument] = call.arguments.as_slice() else {
+                    return Err(PhysicalQueryError::Invalid(
+                        "json_group_array has the wrong argument count",
+                    ));
+                };
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                let value = ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                    .emit_new(argument)?;
+                (value.first.0, 0, None, None)
+            }
+            AggFunc::Mode => {
+                let [term] = call.within_group.as_slice() else {
+                    return Err(PhysicalQueryError::Invalid(
+                        "mode has the wrong WITHIN GROUP shape",
+                    ));
+                };
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                let value = ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                    .emit_new(&term.expr)?;
+                (
+                    value.first.0,
+                    0,
+                    sort_comparator(&term.type_fact),
+                    Some(
+                        term.collation
+                            .as_ref()
+                            .map_or(CollationSeq::Binary, |value| *value.value()),
+                    ),
+                )
+            }
+            AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+                let ([fraction], [term]) =
+                    (call.arguments.as_slice(), call.within_group.as_slice())
+                else {
+                    return Err(PhysicalQueryError::Invalid(
+                        "percentile has the wrong WITHIN GROUP shape",
+                    ));
+                };
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                let value = ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                    .emit_new(&term.expr)?;
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                let fraction =
+                    ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                        .emit_new(fraction)?;
+                (
+                    value.first.0,
+                    fraction.first.0,
+                    sort_comparator(&term.type_fact),
+                    Some(
+                        term.collation
+                            .as_ref()
+                            .map_or(CollationSeq::Binary, |value| *value.value()),
+                    ),
+                )
+            }
+            AggFunc::External(function) => {
+                let registered = function.agg_args().map_err(|_| {
+                    PhysicalQueryError::Invalid("resolved external function is not aggregate")
+                })?;
+                if registered >= 0 && registered as usize != call.arguments.len() {
+                    return Err(PhysicalQueryError::Invalid(
+                        "external aggregate has the wrong argument count",
+                    ));
+                }
+                let first = if call.arguments.is_empty() {
+                    0
+                } else {
+                    let arguments = program.alloc_registers(call.arguments.len());
+                    for (position, argument) in call.arguments.iter().enumerate() {
+                        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                            .emit_into(argument, RegisterRange::new(arguments + position, 1))?;
+                    }
+                    arguments
+                };
+                (first, 0, None, None)
             }
         };
-        let accumulator = bindings.aggregate(aggregate.id)?.register;
-        program.emit_insn(Insn::AggStep {
-            acc_reg: accumulator.0,
-            col: column,
-            delimiter,
-            func: AccumulatorFunc::Agg(function.clone()),
-            comparator: None,
-            collation: None,
-        });
+        let runtime = bindings.aggregate(aggregate.id)?;
+        if call.distinctness.is_some() {
+            if call.arguments.len() != 1 {
+                return Err(PhysicalQueryError::Invalid(
+                    "DISTINCT aggregate does not have exactly one argument",
+                ));
+            }
+            let duplicate = program.allocate_label();
+            let hash_table_id = runtime
+                .distinct_hash_table
+                .ok_or(PhysicalQueryError::Invalid(
+                    "DISTINCT aggregate has no duplicate set",
+                ))?;
+            program.emit_insn(Insn::HashDistinct {
+                data: Box::new(HashDistinctData {
+                    hash_table_id,
+                    key_start_reg: column,
+                    num_keys: 1,
+                    collations: vec![expression_collation(plan, &call.arguments[0])],
+                    target_pc: duplicate,
+                }),
+            });
+            program.emit_insn(Insn::AggStep {
+                acc_reg: runtime.register.0,
+                col: column,
+                delimiter,
+                func: AccumulatorFunc::Agg(function.clone()),
+                comparator,
+                collation,
+            });
+            program.preassign_label_to_next_insn(duplicate);
+        } else {
+            program.emit_insn(Insn::AggStep {
+                acc_reg: runtime.register.0,
+                col: column,
+                delimiter,
+                func: AccumulatorFunc::Agg(function.clone()),
+                comparator,
+                collation,
+            });
+        }
         if let Some(skip) = skip {
             program.preassign_label_to_next_insn(skip);
         }
     }
     Ok(())
+}
+
+fn clear_aggregate_distinct_sets<'document>(
+    program: &mut ProgramBuilder,
+    bindings: &RuntimeBindings<'document>,
+    aggregates: &[PhysicalAggregate<'document>],
+) -> QueryResult<()> {
+    for aggregate in aggregates {
+        if let Some(hash_table_id) = bindings.aggregate(aggregate.id)?.distinct_hash_table {
+            program.emit_insn(Insn::HashClear { hash_table_id });
+        }
+    }
+    Ok(())
+}
+
+fn close_aggregate_distinct_sets<'document>(
+    program: &mut ProgramBuilder,
+    bindings: &RuntimeBindings<'document>,
+    aggregates: &[PhysicalAggregate<'document>],
+) -> QueryResult<()> {
+    for aggregate in aggregates {
+        if let Some(hash_table_id) = bindings.aggregate(aggregate.id)?.distinct_hash_table {
+            program.emit_insn(Insn::HashClose { hash_table_id });
+        }
+    }
+    Ok(())
+}
+
+fn expression_type_fact<'document>(
+    plan: &PhysicalPlan<'document>,
+    expression: &Expr,
+) -> Option<TypeFact> {
+    match expression {
+        Expr::Parameter(parameter) => Some(parameter.type_fact.clone()),
+        Expr::Column(column) => plan
+            .document
+            .source(column.source)
+            .and_then(|source| source.columns.get(column.column))
+            .map(|column| column.type_fact.clone()),
+        Expr::MergedColumn(column) => Some(column.type_fact.clone()),
+        Expr::Cast { target, .. } => Some(target.type_fact.clone()),
+        Expr::Function(call) => Some(call.result_type.clone()),
+        Expr::Collate { expr, .. } => expression_type_fact(plan, expr),
+        _ => None,
+    }
+}
+
+fn expression_collation(plan: &PhysicalPlan<'_>, expression: &Expr) -> CollationSeq {
+    match expression {
+        Expr::Collate { collation, .. } => *collation.value(),
+        Expr::Column(column) => plan
+            .document
+            .source(column.source)
+            .and_then(|source| source.columns.get(column.column))
+            .and_then(|column| column.collation.as_ref())
+            .map_or(CollationSeq::Binary, |collation| *collation.value()),
+        Expr::MergedColumn(column) => column
+            .collation
+            .as_ref()
+            .map_or(CollationSeq::Binary, |collation| *collation.value()),
+        _ => CollationSeq::Binary,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
