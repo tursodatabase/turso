@@ -5930,7 +5930,7 @@ impl Index {
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table, _resolver: &Resolver) -> bool {
+    pub fn validate_where_expr(&self, table: &Table) -> bool {
         let Some(where_clause) = &self.where_clause else {
             return true;
         };

@@ -36,6 +36,14 @@ pub(crate) struct AnalyzedSchemaExprs {
     pub(crate) document: hir::HirDocument,
 }
 
+/// Parser syntax still held by the catalog, together with the schema rule that
+/// defines its legal names and operations.
+pub(crate) struct SchemaSyntaxInput<'syntax> {
+    pub(crate) syntax: &'syntax ast::Expr,
+    pub(crate) profile: crate::schema_expr::SchemaExprProfile,
+    pub(crate) owner_column: Option<usize>,
+}
+
 /// One positional input to a schema expression that is not owned by a table.
 ///
 /// Callers may preserve an already-resolved fact when they have one. Otherwise
@@ -132,11 +140,51 @@ pub(crate) fn analyze_schema_exprs(
     table: Arc<Table>,
     expressions: &[&ValidSchemaExpr],
 ) -> Result<AnalyzedSchemaExprs> {
-    if context.schema(database_id).is_none() {
+    let mut analyzer = Analyzer::new(context);
+    let source_id = create_table_schema_source(&mut analyzer, database_id, table)?;
+    let expressions = expressions
+        .iter()
+        .map(|expression| analyzer.instantiate_schema_expr(expression, source_id))
+        .collect::<Result<Vec<_>>>()?;
+    finish_schema_expression_root(analyzer, source_id, expressions)
+}
+
+/// Resolve catalog-held parser syntax and close it into an independent HIR
+/// root before physical emission begins.
+pub(crate) fn analyze_table_schema_syntax(
+    context: &SemanticContext<'_>,
+    database_id: usize,
+    table: Arc<Table>,
+    expressions: &[SchemaSyntaxInput<'_>],
+) -> Result<AnalyzedSchemaExprs> {
+    let mut analyzer = Analyzer::new(context);
+    let source_id = create_table_schema_source(&mut analyzer, database_id, table)?;
+    let expressions = expressions
+        .iter()
+        .map(|input| match input.owner_column {
+            Some(owner_column) => analyzer.instantiate_column_schema_syntax(
+                input.syntax,
+                input.profile,
+                source_id,
+                owner_column,
+            ),
+            None => {
+                analyzer.instantiate_table_schema_syntax(input.syntax, input.profile, source_id)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    finish_schema_expression_root(analyzer, source_id, expressions)
+}
+
+fn create_table_schema_source(
+    analyzer: &mut Analyzer<'_, '_>,
+    database_id: usize,
+    table: Arc<Table>,
+) -> Result<SourceId> {
+    if analyzer.context().schema(database_id).is_none() {
         return Err(LimboError::SchemaUpdated);
     }
 
-    let mut analyzer = Analyzer::new(context);
     let table_name = normalize_ident(table.get_name());
 
     let mut columns = Vec::with_capacity(table.columns().len());
@@ -184,10 +232,14 @@ pub(crate) fn analyze_schema_exprs(
     )?;
     analyzer.bind_source_catalog_table(source_id, table);
 
-    let expressions = expressions
-        .iter()
-        .map(|expression| analyzer.instantiate_schema_expr(expression, source_id))
-        .collect::<Result<Vec<_>>>()?;
+    Ok(source_id)
+}
+
+fn finish_schema_expression_root(
+    analyzer: Analyzer<'_, '_>,
+    source_id: SourceId,
+    expressions: Vec<hir::Expr>,
+) -> Result<AnalyzedSchemaExprs> {
     let document = analyzer.finish(hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
         source: source_id,
         expressions,

@@ -62,6 +62,8 @@ operations are not SQL binding.
 - [x] Map `QueryId` to subquery plans and destinations in scoped runtime state.
 - [x] Stored schema-expression batches form closed HIR roots with an explicit
       positional `SourceId` input and a catalog-free physical entrypoint.
+- [x] CREATE INDEX and REINDEX resolve partial predicates and expression keys
+      into one closed HIR batch, then bind only their scan cursor at emission.
 - [ ] Express index-method coverage, window inputs, unnesting, and consumed
       predicates as physical metadata instead of synthetic expressions.
 - [x] Prove with a poisoned catalog that planning and emission cannot resolve
@@ -182,6 +184,8 @@ operations are not SQL binding.
         mapping for virtual columns.
   - [x] CHECK constraints plus ordinary, expression, partial, and UNIQUE index
         programs execute only from frozen HIR metadata.
+  - [x] DDL index rebuilds use the same closed stored-expression HIR boundary;
+        partial predicates run before expression keys for excluded rows.
 
 One syntax root uses exactly one semantic implementation. Falling back after a
 semantic error is forbidden because it would hide analyzer defects.

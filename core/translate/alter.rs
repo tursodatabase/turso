@@ -1,10 +1,7 @@
 use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
 use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq, turso_assert_ne};
-use turso_parser::{
-    ast::{self, TableInternalId},
-    parser::Parser,
-};
+use turso_parser::{ast, parser::Parser};
 
 use super::{
     schema::{validate_check_expr, SQLITE_TABLEID},
@@ -13,11 +10,10 @@ use super::{
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
-    schema::{CheckConstraint, Column, ColumnLayout, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
+    schema::{CheckConstraint, Column, ColumnLayout, ForeignKey, RESERVED_TABLE_PREFIXES},
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
-        plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
         trigger::create_trigger_to_sql,
     },
     util::{
@@ -975,55 +971,12 @@ pub fn translate_alter_table(
                     }
                 }
                 // Referenced in partial index
-                if index.where_clause.is_some() {
-                    let mut table_references = TableReferences::new(
-                        vec![],
-                        vec![OuterQueryReference {
-                            identifier: table_name.to_string(),
-                            internal_id: TableInternalId::from(0),
-                            table: Table::BTree(Arc::new(btree.clone())),
-                            using_dedup_hidden_cols: ColumnMask::default(),
-                            col_used_mask: ColumnUsedMask::default(),
-                            cte_select: None,
-                            cte_explicit_columns: vec![],
-                            cte_id: None,
-                            cte_definition_only: false,
-                            rowid_referenced: false,
-                            scope_depth: 0,
-                        }],
-                    );
-                    let where_copy = index
-                        .bind_where_expr(Some(&mut table_references), resolver)
-                        .ok_or_else(|| {
-                            LimboError::ParseError(
-                                "index where clause unexpectedly missing".to_string(),
-                            )
-                        })?;
-                    let mut column_referenced = false;
-                    walk_expr(
-                        &where_copy,
-                        &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
-                            if let ast::Expr::Column {
-                                table,
-                                column: column_index,
-                                ..
-                            } = e
-                            {
-                                if *table == TableInternalId::from(0)
-                                    && *column_index == dropped_index
-                                {
-                                    column_referenced = true;
-                                    return Ok(WalkControl::SkipChildren);
-                                }
-                            }
-                            Ok(WalkControl::Continue)
-                        },
-                    )?;
-                    if column_referenced {
-                        return Err(LimboError::ParseError(format!(
-                            "cannot drop column \"{column_name}\": indexed"
-                        )));
-                    }
+                if index.where_clause.as_deref().is_some_and(|predicate| {
+                    check_expr_references_column(predicate, &col_normalized)
+                }) {
+                    return Err(LimboError::ParseError(format!(
+                        "cannot drop column \"{column_name}\": indexed"
+                    )));
                 }
             }
 

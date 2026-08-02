@@ -11,7 +11,10 @@ use crate::{
         SchemaExprProfile, SchemaTable,
     },
     sync::Arc,
-    translate::semantic::{context::SemanticContext, schema_expr::analyze_schema_expr},
+    translate::semantic::{
+        context::SemanticContext,
+        schema_expr::{analyze_schema_expr, analyze_table_schema_syntax, SchemaSyntaxInput},
+    },
     vdbe::{
         builder::{ProgramBuilder, ProgramBuilderOpts},
         insn::Insn,
@@ -94,4 +97,94 @@ fn stored_column_positions_lower_from_a_closed_hir_root(tc: hegel::TestCase) {
         Insn::Copy { src_reg, dst_reg, extra_amount: 0 }
             if *src_reg == 100 + position && *dst_reg == outputs[0].first.0
     )));
+}
+
+// Examples:
+// - For `CREATE INDEX ... ON items(c0) WHERE c1`, the c1 predicate is emitted
+//   and tested before the c0 key is read.
+// - For `CREATE INDEX ... ON items(c3) WHERE c0`, selecting expression zero
+//   cannot accidentally emit expression one from the same closed batch.
+// For every generated pair of distinct positions, indexed emission preserves
+// the semantic batch order and reads only the requested positional column.
+#[hegel::test]
+fn partial_index_predicate_can_be_emitted_before_its_key(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().min_value(2).max_value(16)));
+    let key_position = usize::from(
+        tc.draw(generators::integers::<u8>().max_value(u8::try_from(width - 1).unwrap())),
+    );
+    let predicate_position = (key_position + 1) % width;
+    let definitions = (0..width)
+        .map(|column| format!("c{column}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = Arc::new(
+        BTreeTable::from_sql(&format!("CREATE TABLE items({definitions})"), 2)
+            .expect("generated table is valid"),
+    );
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(table.clone())
+        .expect("fixture table is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let predicate = ast::Expr::Id(ast::Name::exact(format!("c{predicate_position}")));
+    let key = ast::Expr::Id(ast::Name::exact(format!("c{key_position}")));
+    let analyzed = analyze_table_schema_syntax(
+        &context,
+        0,
+        Arc::new(Table::BTree(table)),
+        &[
+            SchemaSyntaxInput {
+                syntax: &predicate,
+                profile: SchemaExprProfile::PartialIndexPredicate,
+                owner_column: None,
+            },
+            SchemaSyntaxInput {
+                syntax: &key,
+                profile: SchemaExprProfile::IndexKey,
+                owner_column: None,
+            },
+        ],
+    )
+    .expect("catalog syntax closes into one HIR batch");
+    let root = match &analyzed.document.root {
+        crate::translate::semantic::hir::HirRoot::SchemaExpressions(root) => root,
+        _ => panic!("stored analysis returns a schema-expression root"),
+    };
+    let plan = PhysicalPlan::new(&analyzed.document).expect("closed HIR plans");
+    let mut inputs = RootRuntimeInputs::default();
+    inputs.bind_source(
+        root.source,
+        SourceRuntime::Registers {
+            columns: RegisterRange::new(100, width),
+            rowid: Some(RegisterId(200)),
+        },
+    );
+    let mut program =
+        ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 32, 8));
+
+    emit_root_schema_expression_into(&plan, &mut program, &inputs, 0, 300)
+        .expect("predicate emits independently");
+    let predicate_end = program.insns.len();
+    emit_root_schema_expression_into(&plan, &mut program, &inputs, 1, 301)
+        .expect("key emits independently");
+
+    assert!(program.insns[..predicate_end]
+        .iter()
+        .any(|(instruction, _)| {
+            matches!(instruction, Insn::Copy { src_reg, dst_reg, extra_amount: 0 }
+            if *src_reg == 100 + predicate_position && *dst_reg == 300)
+        }));
+    assert!(!program.insns[..predicate_end]
+        .iter()
+        .any(|(instruction, _)| {
+            matches!(instruction, Insn::Copy { src_reg, .. } if *src_reg == 100 + key_position)
+        }));
+    assert!(program.insns[predicate_end..]
+        .iter()
+        .any(|(instruction, _)| {
+            matches!(instruction, Insn::Copy { src_reg, dst_reg, extra_amount: 0 }
+                if *src_reg == 100 + key_position && *dst_reg == 301)
+        }));
 }

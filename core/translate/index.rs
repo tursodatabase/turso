@@ -11,13 +11,17 @@ use crate::translate::{
         emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
         OperationMode, Resolver,
     },
-    expr::{
-        bind_and_rewrite_expr, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
-        BindingBehavior, ConditionMetadata, WalkControl,
+    expr::{unwrap_parens, walk_expr, WalkControl},
+    physical::{
+        emit_root_schema_expression_into, CursorId, PhysicalPlan, RootRuntimeInputs, SourceRuntime,
     },
-    plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
+    semantic::{
+        context::SemanticContext,
+        hir::HirRoot,
+        schema_expr::{analyze_table_schema_syntax, SchemaSyntaxInput},
+    },
 };
-use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
+use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts};
 use crate::vdbe::insn::{to_u32, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEMP_DB_ID};
 use crate::{
@@ -234,7 +238,7 @@ pub fn translate_create_index(
         on_conflict: None,
     });
 
-    if !idx.validate_where_expr(&table, resolver) {
+    if !idx.validate_where_expr(&table) {
         crate::bail_parse_error!(
             "Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:\n {}",
             where_clause
@@ -288,6 +292,7 @@ pub fn translate_create_index(
     emit_refill_index(
         program,
         resolver,
+        connection,
         database_id,
         &tbl,
         &idx,
@@ -328,6 +333,7 @@ pub fn translate_create_index(
 fn emit_refill_index(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
     database_id: usize,
     tbl: &Arc<BTreeTable>,
     idx: &Arc<Index>,
@@ -346,26 +352,58 @@ fn emit_refill_index(
     }));
     let columns = &idx.columns;
     let tbl_name = normalize_ident(tbl.name.as_str());
-
-    let mut table_references = TableReferences::new(
-        vec![JoinedTable {
-            op: Operation::Scan(Scan::BTreeTable {
-                iter_dir: IterationDirection::Forwards,
-                index: None,
-            }),
-            table: Table::BTree(tbl.clone()),
-            identifier: tbl_name.clone(),
-            internal_id: table_ref,
-            join_info: None,
-            col_used_mask: ColumnUsedMask::default(),
-            column_use_counts: Vec::new(),
-            expression_index_usages: Vec::new(),
-            database_id,
-            indexed: None,
-        }],
-        vec![],
+    let context = SemanticContext::new(
+        resolver.schema(),
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        resolver.symbol_table,
+        connection.experimental_custom_types_enabled(),
+        connection.get_dqs_dml().into(),
+        connection.dialect(),
     );
-    let where_clause = idx.bind_where_expr(Some(&mut table_references), resolver);
+    let mut syntax = Vec::new();
+    let predicate_index = idx.where_clause.as_deref().map(|predicate| {
+        let position = syntax.len();
+        syntax.push(SchemaSyntaxInput {
+            syntax: predicate,
+            profile: crate::schema_expr::SchemaExprProfile::PartialIndexPredicate,
+            owner_column: None,
+        });
+        position
+    });
+    let key_indexes = idx
+        .columns
+        .iter()
+        .map(|column| {
+            column.expr.as_deref().map(|expression| {
+                let position = syntax.len();
+                syntax.push(SchemaSyntaxInput {
+                    syntax: expression,
+                    profile: crate::schema_expr::SchemaExprProfile::IndexKey,
+                    owner_column: None,
+                });
+                position
+            })
+        })
+        .collect::<Vec<_>>();
+    let analyzed = analyze_table_schema_syntax(
+        &context,
+        database_id,
+        Arc::new(Table::BTree(tbl.clone())),
+        &syntax,
+    )?;
+    let plan = PhysicalPlan::new(&analyzed.document)
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    let root = match &analyzed.document.root {
+        HirRoot::SchemaExpressions(root) => root,
+        _ => unreachable!("stored schema analysis returns a schema-expression root"),
+    };
+    let mut runtime_inputs = RootRuntimeInputs::default();
+    runtime_inputs.bind_source(
+        root.source,
+        SourceRuntime::Cursor(CursorId(table_cursor_id)),
+    );
 
     if idx
         .index_method
@@ -393,22 +431,22 @@ fn emit_refill_index(
         program.preassign_label_to_next_insn(loop_start_label);
 
         let mut skip_row_label = None;
-        if let Some(where_clause) = where_clause {
+        if let Some(predicate_index) = predicate_index {
             let label = program.allocate_label();
-            let condition_true_label = program.allocate_label();
-            translate_condition_expr(
+            let predicate_register = program.alloc_register();
+            emit_root_schema_expression_into(
+                &plan,
                 program,
-                &table_references,
-                &where_clause,
-                ConditionMetadata {
-                    jump_if_condition_is_true: false,
-                    jump_target_when_false: label,
-                    jump_target_when_true: condition_true_label,
-                    jump_target_when_null: label,
-                },
-                resolver,
-            )?;
-            program.preassign_label_to_next_insn(condition_true_label);
+                &runtime_inputs,
+                predicate_index,
+                predicate_register,
+            )
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+            program.emit_insn(Insn::IfNot {
+                reg: predicate_register,
+                target_pc: label,
+                jump_if_null: true,
+            });
             skip_row_label = Some(label);
         }
 
@@ -416,11 +454,12 @@ fn emit_refill_index(
         for (i, col) in columns.iter().enumerate() {
             emit_index_column_value_from_cursor(
                 program,
-                resolver,
-                &mut table_references,
                 table_cursor_id,
                 tbl,
                 col,
+                key_indexes[i],
+                &plan,
+                &runtime_inputs,
                 start_reg + i,
             )?;
         }
@@ -490,22 +529,22 @@ fn emit_refill_index(
         program.preassign_label_to_next_insn(loop_start_label);
 
         let mut skip_row_label = None;
-        if let Some(where_clause) = where_clause {
+        if let Some(predicate_index) = predicate_index {
             let label = program.allocate_label();
-            let condition_true_label = program.allocate_label();
-            translate_condition_expr(
+            let predicate_register = program.alloc_register();
+            emit_root_schema_expression_into(
+                &plan,
                 program,
-                &table_references,
-                &where_clause,
-                ConditionMetadata {
-                    jump_if_condition_is_true: false,
-                    jump_target_when_false: label,
-                    jump_target_when_true: condition_true_label,
-                    jump_target_when_null: label,
-                },
-                resolver,
-            )?;
-            program.preassign_label_to_next_insn(condition_true_label);
+                &runtime_inputs,
+                predicate_index,
+                predicate_register,
+            )
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+            program.emit_insn(Insn::IfNot {
+                reg: predicate_register,
+                target_pc: label,
+                jump_if_null: true,
+            });
             skip_row_label = Some(label);
         }
 
@@ -513,11 +552,12 @@ fn emit_refill_index(
         for (i, col) in columns.iter().enumerate() {
             emit_index_column_value_from_cursor(
                 program,
-                resolver,
-                &mut table_references,
                 table_cursor_id,
                 tbl,
                 col,
+                key_indexes[i],
+                &plan,
+                &runtime_inputs,
                 start_reg + i,
             )?;
         }
@@ -675,6 +715,7 @@ pub fn translate_reindex(
         emit_refill_index(
             program,
             resolver,
+            connection,
             database_id,
             &table,
             &index,
@@ -1126,34 +1167,20 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
 
 fn emit_index_column_value_from_cursor(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    table_references: &mut TableReferences,
     table_cursor_id: usize,
     table: &BTreeTable,
     idx_col: &IndexColumn,
+    expression_index: Option<usize>,
+    plan: &PhysicalPlan<'_>,
+    runtime_inputs: &RootRuntimeInputs,
     dest_reg: usize,
 ) -> crate::Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let mut expr = expr.as_ref().clone();
-        bind_and_rewrite_expr(
-            &mut expr,
-            Some(table_references),
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
-        let self_table_context =
-            table_references
-                .joined_tables()
-                .first()
-                .map(|jt| SelfTableContext::ForSelect {
-                    table_ref_id: jt.internal_id,
-                    referenced_tables: table_references.clone(),
-                });
-        resolver.with_self_table_context(program, self_table_context.as_ref(), |program, _| {
-            translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
-            Ok(())
+    if idx_col.expr.is_some() {
+        let expression_index = expression_index.ok_or_else(|| {
+            LimboError::InternalError("expression index key has no HIR program".to_string())
         })?;
+        emit_root_schema_expression_into(plan, program, runtime_inputs, expression_index, dest_reg)
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
         // For virtual generated column references, apply the column's
         // declared affinity to the computed expression result.
         if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {

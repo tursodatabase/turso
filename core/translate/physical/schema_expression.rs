@@ -73,3 +73,32 @@ pub(crate) fn emit_root_schema_expressions(
         })
         .collect()
 }
+
+/// Emit one member of a closed schema-expression batch into a caller-owned
+/// register. This lets a partial-index predicate run before its key
+/// expressions, so rows excluded by the predicate cannot raise key errors.
+pub(crate) fn emit_root_schema_expression_into(
+    plan: &PhysicalPlan<'_>,
+    program: &mut ProgramBuilder,
+    inputs: &RootRuntimeInputs,
+    expression_index: usize,
+    target_register: usize,
+) -> Result<(), PhysicalSchemaExpressionError> {
+    let root = match plan.root {
+        PhysicalRoot::SchemaExpressions(root) => root,
+        _ => {
+            return Err(PhysicalSchemaExpressionError::Unsupported(
+                "non-schema-expression HIR root",
+            ))
+        }
+    };
+    let expression = root.expressions.get(expression_index).ok_or(
+        PhysicalSchemaExpressionError::Unsupported("schema-expression index is outside the root"),
+    )?;
+    let mut bindings = RuntimeBindings::new(plan.document, plan.document.snapshot)?;
+    inputs.apply(&mut bindings)?;
+    bindings.source(root.source)?;
+    ExpressionEmitter::new(program, &mut bindings)
+        .emit_into(expression, RegisterRange::new(target_register, 1))?;
+    Ok(())
+}
