@@ -19,7 +19,7 @@ use crate::{
     translate::semantic::{AnalyzeInput, analyze, context::SemanticContext},
     vdbe::{
         builder::{ProgramBuilder, ProgramBuilderOpts},
-        insn::Insn,
+        insn::{InsertFlags, Insn},
     },
 };
 
@@ -671,6 +671,101 @@ fn insert_replace_deletes_conflicting_rows_and_uses_frozen_not_null_defaults(tc:
             .expect("REPLACE inserts the NEW unique key");
         assert!(old_index < delete && delete < new_index && new_index < replacement);
     }
+}
+
+// Examples:
+// - `INSERT OR REPLACE INTO items VALUES (9999, 'a134')` must seek the table
+//   again after deleting the row whose UNIQUE key is `a134`; that replacement
+//   leaves the table cursor positioned at the removed row, not rowid 9999.
+// - `c0 INTEGER PRIMARY KEY ON CONFLICT REPLACE` and
+//   `c0 INTEGER UNIQUE ON CONFLICT REPLACE` require the same table seek even
+//   when the INSERT has no statement-level `OR REPLACE`.
+// Across generated table widths and key positions, both rowid and secondary-
+// index replacement paths must mark the final table Insert as requiring a seek.
+#[hegel::test]
+fn insert_replace_reseeks_table_after_conflicting_row_delete(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
+    let key_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let rowid_key = tc.draw(generators::booleans());
+    let statement_replace = tc.draw(generators::booleans());
+    let columns = (0..width)
+        .map(|position| {
+            if rowid_key && position == key_position {
+                let conflict = (!statement_replace)
+                    .then_some(" ON CONFLICT REPLACE")
+                    .unwrap_or_default();
+                format!("c{position} INTEGER PRIMARY KEY{conflict}")
+            } else {
+                format!("c{position} INTEGER")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = Arc::new(
+        BTreeTable::from_sql(&format!("CREATE TABLE items({columns})"), 12)
+            .expect("generated table SQL is valid"),
+    );
+    let symbols = SymbolTable::new();
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(table.clone())
+        .expect("items is unique");
+    if !rowid_key {
+        let mut index = Index::from_sql(
+            &symbols,
+            &format!("CREATE UNIQUE INDEX items_key ON items(c{key_position})"),
+            13,
+            &table,
+        )
+        .expect("generated unique index SQL is valid");
+        if !statement_replace {
+            index.on_conflict = Some(ResolveType::Replace);
+        }
+        schema
+            .add_index(Arc::new(index))
+            .expect("items_key is unique");
+    }
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let values = (0..width).map(|_| "1").collect::<Vec<_>>().join(", ");
+    let or_replace = statement_replace
+        .then_some(" OR REPLACE")
+        .unwrap_or_default();
+    let statement = parse_statement(&format!("INSERT{or_replace} INTO items VALUES ({values})"));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated REPLACE has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed HIR has a physical plan");
+    let mut program = program();
+    if statement_replace {
+        program.flags.set_has_statement_conflict(true);
+        program.set_resolve_type(ResolveType::Replace);
+    }
+    emit_root(&plan, &mut program).expect("REPLACE lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("all REPLACE branches are closed");
+
+    let delete = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::Delete { .. }))
+        .expect("REPLACE has a conflicting-row delete path");
+    let requires_seek = program
+        .insns
+        .iter()
+        .skip(delete)
+        .find_map(|(instruction, _)| match instruction {
+            Insn::Insert {
+                table_name, flag, ..
+            } if table_name == "items" => Some(flag.has(InsertFlags::REQUIRE_SEEK)),
+            _ => None,
+        })
+        .expect("REPLACE inserts the new table row");
+    assert!(requires_seek);
 }
 
 // Examples:

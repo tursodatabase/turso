@@ -696,11 +696,25 @@ fn finish_insert_row<'document>(
     for (index, key) in indexes.iter().zip(&keys) {
         emit_index_insert(program, index, key)?;
     }
+    let may_have_replaced_row = match insert.conflict {
+        Some(conflict) => conflict == ResolveType::Replace,
+        None => {
+            table.rowid_alias_conflict_clause == Some(ResolveType::Replace)
+                || indexes
+                    .iter()
+                    .any(|index| index.index.on_conflict == Some(ResolveType::Replace))
+        }
+    };
+    let insert_flags = if may_have_replaced_row {
+        InsertFlags::new().require_seek()
+    } else {
+        InsertFlags::new()
+    };
     program.emit_insn(Insn::Insert {
         cursor,
         key_reg: rowid.0,
         record_reg: record,
-        flag: InsertFlags::new(),
+        flag: insert_flags,
         table_name: table.name.clone(),
     });
     let after_trigger_done = program.allocate_label();
