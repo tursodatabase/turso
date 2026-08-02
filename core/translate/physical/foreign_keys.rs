@@ -117,6 +117,69 @@ pub(crate) fn emit_delete_parent_checks(
     Ok(())
 }
 
+pub(crate) fn emit_replace_parent_checks(
+    program: &mut ProgramBuilder,
+    foreign_keys: &[ResolvedForeignKey],
+    parent_table: &BTreeTable,
+    old_columns: RegisterRange,
+    replacement_columns: RegisterRange,
+    old_rowid: RegisterId,
+    replacement_rowid: RegisterId,
+) -> ForeignKeyResult<()> {
+    use turso_parser::ast::RefAct;
+
+    for foreign_key in foreign_keys.iter().filter(|foreign_key| {
+        matches!(
+            foreign_key.declaration.on_delete,
+            RefAct::NoAction | RefAct::Restrict
+        )
+    }) {
+        if !replacement_can_satisfy_delete(foreign_key.declaration.on_delete) {
+            emit_delete_parent_check(program, foreign_key, parent_table, old_columns, old_rowid)?;
+            continue;
+        }
+
+        // NO ACTION is checked after the whole row replacement. If the new
+        // row restores the exact parent key, the implicit delete creates no
+        // violation. RESTRICT above remains immediate and must still fail.
+        let changed = program.allocate_label();
+        let complete = program.allocate_label();
+        let (old_key, replacement_key) = copy_parent_change_keys(
+            program,
+            parent_table,
+            &foreign_key.parent_positions,
+            old_columns,
+            replacement_columns,
+            old_rowid,
+            replacement_rowid,
+        )?;
+        for offset in 0..foreign_key.parent_positions.len() {
+            program.emit_insn(Insn::Ne {
+                lhs: old_key + offset,
+                rhs: replacement_key + offset,
+                target_pc: changed,
+                flags: CmpInsFlags::default().jump_if_null(),
+                collation: foreign_key
+                    .parent_unique_index
+                    .as_ref()
+                    .and_then(|index| index.value().columns.get(offset))
+                    .and_then(|column| column.collation),
+            });
+        }
+        program.emit_insn(Insn::Goto {
+            target_pc: complete,
+        });
+        program.preassign_label_to_next_insn(changed);
+        emit_delete_parent_check(program, foreign_key, parent_table, old_columns, old_rowid)?;
+        program.preassign_label_to_next_insn(complete);
+    }
+    Ok(())
+}
+
+fn replacement_can_satisfy_delete(action: turso_parser::ast::RefAct) -> bool {
+    action == turso_parser::ast::RefAct::NoAction
+}
+
 pub(crate) fn emit_update_parent_checks(
     program: &mut ProgramBuilder,
     foreign_keys: &[ResolvedForeignKey],
@@ -996,5 +1059,27 @@ mod properties {
                 } if src_reg == new_columns.first.0 + offset && dst_reg == new_key + offset
             ));
         }
+    }
+
+    // Examples:
+    // - `INSERT OR REPLACE` of parent key `1` may satisfy `ON DELETE NO ACTION`
+    //   by inserting key `1` again before the statement finishes;
+    // - the same replacement must fail immediately for `ON DELETE RESTRICT`.
+    //   CASCADE, SET NULL, and SET DEFAULT are actions, not checks that the
+    //   replacement row can satisfy.
+    #[hegel::test]
+    fn only_no_action_can_be_satisfied_by_the_replacement_row(tc: hegel::TestCase) {
+        let action = match tc.draw(generators::integers::<u8>().max_value(4)) {
+            0 => turso_parser::ast::RefAct::NoAction,
+            1 => turso_parser::ast::RefAct::Restrict,
+            2 => turso_parser::ast::RefAct::Cascade,
+            3 => turso_parser::ast::RefAct::SetNull,
+            _ => turso_parser::ast::RefAct::SetDefault,
+        };
+
+        assert_eq!(
+            replacement_can_satisfy_delete(action),
+            action == turso_parser::ast::RefAct::NoAction
+        );
     }
 }

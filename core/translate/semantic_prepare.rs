@@ -235,14 +235,26 @@ fn prepare_document_foreign_key_actions(
             delete.foreign_keys.incoming.as_slice(),
             ForeignKeyParentChange::Delete,
         )],
-        hir::HirRoot::Update(update) => vec![(
-            update.foreign_keys.incoming.as_slice(),
-            ForeignKeyParentChange::Update,
-        )],
-        hir::HirRoot::Insert(insert) => vec![(
-            insert.foreign_keys.incoming.as_slice(),
-            ForeignKeyParentChange::Update,
-        )],
+        hir::HirRoot::Update(update) => vec![
+            (
+                update.foreign_keys.incoming.as_slice(),
+                ForeignKeyParentChange::Update,
+            ),
+            (
+                update.foreign_keys.incoming.as_slice(),
+                ForeignKeyParentChange::Delete,
+            ),
+        ],
+        hir::HirRoot::Insert(insert) => vec![
+            (
+                insert.foreign_keys.incoming.as_slice(),
+                ForeignKeyParentChange::Update,
+            ),
+            (
+                insert.foreign_keys.incoming.as_slice(),
+                ForeignKeyParentChange::Delete,
+            ),
+        ],
         hir::HirRoot::Query(_)
         | hir::HirRoot::TriggerPredicate(_)
         | hir::HirRoot::SchemaExpressions(_) => return Ok(()),

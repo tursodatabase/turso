@@ -20,10 +20,11 @@ use super::{
     emit_replace_not_null_defaults, emit_replace_unique_check, emit_returning_result,
     emit_returning_values, emit_stored_record, emit_trigger_programs, emit_unique_check,
     open_indexes, record_from_registers, CdcChange, CursorId, ExpressionEmitter, OpenedIndex,
-    PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError, PhysicalPlan,
-    PhysicalQueryError, PhysicalRoot, PhysicalRowError, PhysicalSourceKind, PhysicalTriggerError,
-    PreparedCdc, PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs,
-    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess, TriggerRow, TriggerRows,
+    PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError, PhysicalMutationError,
+    PhysicalPlan, PhysicalQueryError, PhysicalRoot, PhysicalRowError, PhysicalSourceKind,
+    PhysicalTriggerError, PreparedCdc, PreparedTriggers, RegisterId, RegisterRange,
+    RootRuntimeInputs, RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
+    TriggerRow, TriggerRows,
 };
 
 #[derive(Debug)]
@@ -35,6 +36,7 @@ pub(crate) enum PhysicalInsertError {
     Query(PhysicalQueryError),
     Trigger(PhysicalTriggerError),
     ForeignKey(PhysicalForeignKeyError),
+    Mutation(PhysicalMutationError),
     Sequence(crate::LimboError),
     Invalid(&'static str),
     Unsupported(&'static str),
@@ -50,6 +52,7 @@ impl fmt::Display for PhysicalInsertError {
             Self::Query(error) => error.fmt(formatter),
             Self::Trigger(error) => error.fmt(formatter),
             Self::ForeignKey(error) => error.fmt(formatter),
+            Self::Mutation(error) => error.fmt(formatter),
             Self::Sequence(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical INSERT: {message}"),
             Self::Unsupported(message) => {
@@ -100,6 +103,12 @@ impl From<PhysicalTriggerError> for PhysicalInsertError {
 impl From<PhysicalForeignKeyError> for PhysicalInsertError {
     fn from(error: PhysicalForeignKeyError) -> Self {
         Self::ForeignKey(error)
+    }
+}
+
+impl From<PhysicalMutationError> for PhysicalInsertError {
+    fn from(error: PhysicalMutationError) -> Self {
+        Self::Mutation(error)
     }
 }
 
@@ -604,6 +613,10 @@ fn finish_insert_row<'document>(
             rowid,
             None,
             skip_row,
+            &insert.foreign_keys,
+            logical,
+            rowid,
+            triggers,
         )?;
     } else if insert
         .conflict
@@ -651,6 +664,10 @@ fn finish_insert_row<'document>(
                     &key,
                     None,
                     skip_row,
+                    &insert.foreign_keys,
+                    logical,
+                    rowid,
+                    triggers,
                 )?;
             } else {
                 emit_unique_check(program, index, &key, None, conflict, skip_row)?;
@@ -1068,6 +1085,22 @@ fn preflight_insert<'plan>(
             "UPSERT foreign-key action has no prepared HIR program",
         ));
     }
+    if insert.foreign_keys.incoming.iter().any(|foreign_key| {
+        matches!(
+            foreign_key.declaration.on_delete,
+            RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault
+        ) && triggers
+            .foreign_key_action(
+                foreign_key.child_table.id(),
+                &foreign_key.declaration,
+                super::ForeignKeyParentChange::Delete,
+            )
+            .is_none()
+    }) {
+        return Err(PhysicalInsertError::Invalid(
+            "REPLACE foreign-key action has no prepared HIR program",
+        ));
+    }
     let source = plan
         .document
         .source(insert.target)
@@ -1391,23 +1424,14 @@ fn emit_upsert_action<'document>(
         src_reg: conflicting_rowid.0,
         target_pc: skip_row,
     });
-    super::emit_update_child_checks(
+    super::prepare_update_row(
         program,
-        &insert.foreign_keys.outgoing,
         table,
         old_columns,
         updated,
         conflicting_rowid,
         updated_rowid,
-    )?;
-    super::emit_update_parent_checks(
-        program,
-        &insert.foreign_keys.incoming,
-        table,
-        old_columns,
-        updated,
-        conflicting_rowid,
-        updated_rowid,
+        &insert.foreign_keys,
     )?;
     let mut new_keys = Vec::with_capacity(indexes.len());
     for index in indexes {
@@ -1424,39 +1448,19 @@ fn emit_upsert_action<'document>(
     }
     emit_stored_record(program, bindings, insert.target, table, updated, record)?;
     bindings.replace_source(insert.target, cursor_target)?;
-    for (index, key) in indexes.iter().zip(&old_keys) {
-        super::emit_index_delete(program, index, key);
-    }
-    program.emit_insn(Insn::Delete {
-        cursor_id: cursor,
-        table_name: table.name.clone(),
-        is_part_of_update: true,
-    });
-    for (index, key) in indexes.iter().zip(&new_keys) {
-        emit_index_insert(program, index, key)?;
-    }
-    program.emit_insn(Insn::Insert {
+    super::finish_update_row(
+        program,
+        table,
         cursor,
-        key_reg: updated_rowid.0,
-        record_reg: record,
-        flag: InsertFlags::new(),
-        table_name: table.name.clone(),
-    });
-    super::emit_insert_parent_repairs(
-        program,
-        &insert.foreign_keys.incoming,
-        table,
-        updated,
-        updated_rowid,
-    )?;
-    super::emit_update_parent_actions(
-        program,
-        &insert.foreign_keys.incoming,
-        table,
+        indexes,
+        &old_keys,
+        &new_keys,
+        record,
         old_columns,
         updated,
         conflicting_rowid,
         updated_rowid,
+        &insert.foreign_keys,
         triggers,
     )?;
     let after_trigger_done = program.allocate_label();
