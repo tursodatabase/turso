@@ -5,7 +5,7 @@ use turso_parser::{ast, parser::Parser};
 
 use super::{
     analyze,
-    context::SemanticContext,
+    context::{DmlPolicy, SemanticContext},
     hir::{Expr, HirDocument, HirRoot, JoinConstraint, QueryBlockBody, SourceOwner, SubqueryExpr},
     AnalyzeInput,
 };
@@ -691,7 +691,8 @@ fn dml_analysis_freezes_foreign_key_direction_positions_and_rowid_lookup(tc: heg
         "DELETE FROM parents".to_string()
     };
     let symbols = SymbolTable::new();
-    let context = semantic_context(&schema, &symbols);
+    let context = semantic_context(&schema, &symbols)
+        .with_dml_policy(DmlPolicy::new(false, false, false, false, true));
     let statement = parse_statement(&sql);
 
     let mut document = analyze(&context, AnalyzeInput::Statement(&statement))
@@ -785,7 +786,8 @@ fn outgoing_non_rowid_foreign_keys_carry_the_exact_parent_unique_index(tc: hegel
     schema
         .add_index(Arc::new(parent_key))
         .expect("parent index name is unique");
-    let context = semantic_context(&schema, &symbols);
+    let context = semantic_context(&schema, &symbols)
+        .with_dml_policy(DmlPolicy::new(false, false, false, false, true));
     let statement = parse_statement(&format!(
         "INSERT INTO children(c{child_position}) VALUES ('key')"
     ));
