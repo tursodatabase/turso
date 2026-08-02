@@ -11,7 +11,6 @@ use crate::schema_expr::{
     ValidSchemaExpr,
 };
 use crate::sync::Arc;
-use crate::translate::expr::{walk_expr_mut, WalkControl};
 use crate::util::{check_literal_equivalency, normalize_ident, type_from_name};
 use crate::vdbe::affinity::Affinity;
 use crate::{LimboError, Result};
@@ -572,40 +571,7 @@ impl Analyzer<'_, '_> {
         source: SourceId,
         owner_column: Option<usize>,
     ) -> Result<hir::Expr> {
-        let columns = self
-            .source(source)
-            .ok_or_else(|| {
-                LimboError::InternalError(format!("stored expression source {source} is missing"))
-            })?
-            .columns
-            .iter()
-            .map(|column| column.name.clone())
-            .collect::<Vec<_>>();
-
-        // Generated-column expressions in the current catalog may already
-        // contain the old SELF_TABLE marker. Convert only that catalog-local
-        // marker back to schema syntax. Any statement-bound or runtime AST
-        // node remains untouched and is rejected by SchemaExpr resolution.
-        let mut syntax = syntax.clone();
-        walk_expr_mut(&mut syntax, &mut |node| {
-            match node {
-                ast::Expr::Column { table, column, .. } if table.is_self_table() => {
-                    let name = columns.get(*column).ok_or_else(|| {
-                        LimboError::InternalError(format!(
-                            "stored expression references missing source column {column}"
-                        ))
-                    })?;
-                    *node = ast::Expr::Id(ast::Name::exact(name.clone()));
-                }
-                ast::Expr::RowId { table, .. } if table.is_self_table() => {
-                    *node = ast::Expr::Id(ast::Name::exact("rowid".to_string()));
-                }
-                _ => {}
-            }
-            Ok(WalkControl::Continue)
-        })?;
-
-        let expression = SchemaExpr::preserve_unresolved(syntax, profile);
+        let expression = SchemaExpr::preserve_unresolved(syntax.clone(), profile);
         self.instantiate_source_schema_expr(&expression, source, owner_column)
     }
 

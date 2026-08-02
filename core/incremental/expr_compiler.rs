@@ -139,12 +139,11 @@ impl CompiledExpression {
         input_column_names: &[String],
     ) -> Option<TrivialExpression> {
         match expr {
-            // Column reference or register
+            // Positional inputs use unique syntax names supplied by the caller.
             Expr::Id(name) => input_column_names
                 .iter()
                 .position(|col| col == name.as_str())
                 .map(TrivialExpression::Column),
-            Expr::Register(idx) => Some(TrivialExpression::Column(*idx)),
 
             // Immediate values
             Expr::Literal(lit) => {

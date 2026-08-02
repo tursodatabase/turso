@@ -1056,7 +1056,6 @@ fn resolve_index_column<'a>(
         Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
             table.get_column(col.as_str())?
         }
-        Expr::RowId { .. } => table.get_rowid_alias_column()?,
         _ => return None,
     };
     let column_name = column
@@ -1118,7 +1117,7 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
             ) => {
                 ok = false;
             }
-            Expr::Literal(_) | Expr::RowId { .. } => {}
+            Expr::Literal(_) => {}
             // must be a column of the target table
             Expr::Id(n) | Expr::Name(n) => {
                 if !has_col(n.as_str()) {

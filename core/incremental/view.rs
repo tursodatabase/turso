@@ -790,8 +790,12 @@ impl IncrementalView {
     /// This excludes subqueries, CASE expressions, function calls, etc.
     fn is_simple_comparison(expr: &ast::Expr) -> bool {
         match expr {
-            // Simple column references and literals are OK
-            ast::Expr::Column { .. } | ast::Expr::Literal(_) => true,
+            // Simple syntax-level column references and literals are OK.
+            ast::Expr::Id(_)
+            | ast::Expr::Name(_)
+            | ast::Expr::Qualified(_, _)
+            | ast::Expr::DoublyQualified(_, _, _)
+            | ast::Expr::Literal(_) => true,
 
             // Simple binary operations between simple expressions are OK
             ast::Expr::Binary(left, op, right) => {
@@ -856,14 +860,6 @@ impl IncrementalView {
                 // BETWEEN has a different structure, for safety just exclude it
                 false
             }
-
-            // Qualified references are simple
-            ast::Expr::DoublyQualified(..) => true,
-            ast::Expr::Qualified(_, _) => true,
-
-            // These are simple
-            ast::Expr::Id(_) => true,
-            ast::Expr::Name(_) => true,
 
             // Anything else is not simple
             _ => false,

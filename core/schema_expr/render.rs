@@ -100,7 +100,6 @@ fn to_syntax(
         SchemaExprNode::FieldAccess { base, field, .. } => Ok(ast::Expr::FieldAccess {
             base: Box::new(to_syntax(base, column_name)?),
             field: field.clone(),
-            resolved: None,
         }),
         SchemaExprNode::CustomTypeFunction { call, .. } => to_syntax(call, column_name),
         SchemaExprNode::Function {

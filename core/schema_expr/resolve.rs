@@ -282,12 +282,6 @@ impl ResolverState<'_> {
                 "DEFAULT is prohibited in stored {}",
                 self.profile.description()
             )),
-            ast::Expr::Register(_)
-            | ast::Expr::Column { .. }
-            | ast::Expr::RowId { .. }
-            | ast::Expr::SubqueryResult { .. } => Err(LimboError::InternalError(
-                "stored expression resolution received an already-bound expression".to_string(),
-            )),
         }
     }
 

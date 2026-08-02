@@ -489,12 +489,6 @@ impl Analyzer<'_, '_> {
                     field.as_str(),
                 )
             }
-            ast::Expr::Register(_)
-            | ast::Expr::Column { .. }
-            | ast::Expr::RowId { .. }
-            | ast::Expr::SubqueryResult { .. } => Err(LimboError::InternalError(
-                "semantic analysis received a bound or runtime parser expression".to_string(),
-            )),
             ast::Expr::Default => {
                 crate::bail_parse_error!("DEFAULT is only valid in an INSERT value");
             }

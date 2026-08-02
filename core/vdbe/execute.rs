@@ -15001,7 +15001,6 @@ pub fn op_rename_table(
             Table::Virtual(vtab) => {
                 Arc::make_mut(vtab).name.clone_from(&normalized_to);
             }
-            _ => panic!("only btree and virtual tables can be renamed"),
         }
 
         #[cfg(feature = "conn_raw_api")]
@@ -15160,7 +15159,7 @@ pub fn op_drop_column(
                 .is_none_or(|col| normalize_ident(col) != normalize_ident(&col_name))
         });
 
-        btree.shift_generated_column_indices_after_drop(*column_index)?;
+        btree.validate_generated_columns_after_drop(&column_name)?;
         Ok(())
     })??;
 
@@ -15181,9 +15180,8 @@ pub fn op_drop_column(
         Ok(())
     })?;
 
-    // Shift left pos_in_table in all indexes, and self-table placeholders in generated column
-    // expressions, to account for the dropped column. For example, if the dropped column had index
-    // 2, then anything that was indexed on column 3 or higher should be decremented by 1.
+    // Shift index column positions to account for the dropped column. Stored
+    // expression syntax keeps names and therefore needs no runtime rewrite.
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
             for index in indexes {
@@ -15193,19 +15191,6 @@ pub fn op_drop_column(
                         && index_column.pos_in_table > *column_index
                     {
                         index_column.pos_in_table -= 1;
-                    }
-                    if let Some(ref mut expr) = index_column.expr {
-                        crate::translate::expr::walk_expr_mut(expr, &mut |e| {
-                            if let ast::Expr::Column {
-                                table, column: c, ..
-                            } = e
-                            {
-                                if table.is_self_table() && *c > *column_index {
-                                    *c -= 1;
-                                }
-                            }
-                            Ok(crate::translate::expr::WalkControl::Continue)
-                        })?;
                     }
                 }
             }
@@ -15423,8 +15408,7 @@ pub fn op_alter_column(
                 let cols_view = btree.columns();
                 if let Some(new_sql) = cols_view[i]
                     .generated_expr()
-                    .map(|expr| render_gencol_expr_sql_with_new_names(expr, cols_view))
-                    .transpose()?
+                    .map(render_gencol_expr_sql_with_new_names)
                 {
                     btree.columns_mut()[i].set_generated_original_sql(new_sql)
                 }

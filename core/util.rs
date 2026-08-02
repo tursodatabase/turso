@@ -1,20 +1,20 @@
-use crate::IO;
 use crate::alloc::TursoIteratorExt;
 use crate::numeric::StrToF64;
 use crate::schema::ColDef;
 use crate::translate::emitter::TransactionMode;
-use crate::translate::expr::{WalkControl, walk_expr, walk_expr_mut};
+use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::BitSet;
 use crate::types::IOResult;
+use crate::IO;
 use crate::{
-    LimboError, OpenFlags, Result, Statement, SymbolTable,
-    schema::{Column, Schema, Table, Type},
+    schema::{Column, Schema, Type},
     types::{Value, ValueType},
+    LimboError, OpenFlags, Result, Statement, SymbolTable,
 };
 use either::Either;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::future::Future;
-use tracing::{Level, instrument};
+use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, CreateTableBody, Expr, Literal, UnaryOperator};
 use turso_parser::parser::Parser;
@@ -517,10 +517,7 @@ pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i3
             captured.insert(var, expr.clone());
             Some(captured)
         }
-        (
-            Expr::Id(_) | Expr::Name(_) | Expr::Column { .. },
-            Expr::Id(_) | Expr::Name(_) | Expr::Column { .. },
-        ) => {
+        (Expr::Id(_) | Expr::Name(_), Expr::Id(_) | Expr::Name(_)) => {
             if pattern == query {
                 Some(captured)
             } else {
@@ -829,20 +826,6 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                     .zip(rhs2.iter())
                     .all(|(a, b)| exprs_are_equivalent(a, b))
         }
-        (
-            Expr::Column {
-                database: db1,
-                is_rowid_alias: r1,
-                table: tbl_1,
-                column: col_1,
-            },
-            Expr::Column {
-                database: db2,
-                is_rowid_alias: r2,
-                table: tbl_2,
-                column: col_2,
-            },
-        ) => tbl_1 == tbl_2 && col_1 == col_2 && db1 == db2 && r1 == r2,
         // fall back to naive equality check
         _ => expr1 == expr2,
     }
@@ -1160,7 +1143,11 @@ pub fn trim_ascii_whitespace(s: &str) -> &str {
         .rposition(|&b| !b.is_ascii_whitespace())
         .map(|i| i + 1)
         .unwrap_or(0);
-    if start <= end { &s[start..end] } else { "" }
+    if start <= end {
+        &s[start..end]
+    } else {
+        ""
+    }
 }
 
 /// NUMERIC Casting a TEXT or BLOB value into NUMERIC yields either an INTEGER or a REAL result.
@@ -3370,7 +3357,7 @@ mod rename_column_view {
     }
 }
 
-pub use rename_column_view::{RewrittenView, rewrite_view_sql_for_column_rename};
+pub use rename_column_view::{rewrite_view_sql_for_column_rename, RewrittenView};
 
 /// Rewrite table-qualified column references in a CHECK constraint expression,
 /// replacing the table name from `from` to `to`. For example, `t1.a > 0` becomes
@@ -5509,14 +5496,12 @@ pub mod tests {
     #[test]
     fn test_expressions_both_parenthesized_equivalent() {
         // Same types: (683 + 799) == 799 + 683 (commutative, integers only)
-        let expr1 = Expr::Parenthesized(vec![
-            Expr::Binary(
-                Box::new(Expr::Literal(Literal::Numeric("683".to_string()))),
-                Add,
-                Box::new(Expr::Literal(Literal::Numeric("799".to_string()))),
-            )
-            .into(),
-        ]);
+        let expr1 = Expr::Parenthesized(vec![Expr::Binary(
+            Box::new(Expr::Literal(Literal::Numeric("683".to_string()))),
+            Add,
+            Box::new(Expr::Literal(Literal::Numeric("799".to_string()))),
+        )
+        .into()]);
         let expr2 = Expr::Binary(
             Box::new(Expr::Literal(Literal::Numeric("799".to_string()))),
             Add,
@@ -5526,14 +5511,12 @@ pub mod tests {
     }
     #[test]
     fn test_expressions_parenthesized_equivalent() {
-        let expr7 = Expr::Parenthesized(vec![
-            Expr::Binary(
-                Box::new(Expr::Literal(Literal::Numeric("6".to_string()))),
-                Add,
-                Box::new(Expr::Literal(Literal::Numeric("7".to_string()))),
-            )
-            .into(),
-        ]);
+        let expr7 = Expr::Parenthesized(vec![Expr::Binary(
+            Box::new(Expr::Literal(Literal::Numeric("6".to_string()))),
+            Add,
+            Box::new(Expr::Literal(Literal::Numeric("7".to_string()))),
+        )
+        .into()]);
         let expr8 = Expr::Binary(
             Box::new(Expr::Literal(Literal::Numeric("6".to_string()))),
             Add,

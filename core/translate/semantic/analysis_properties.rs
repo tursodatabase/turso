@@ -498,40 +498,6 @@ fn successful_analysis_is_closed_positional_and_does_not_mutate_syntax(tc: hegel
     assert_eq!(first_output.source, second_output.source);
 }
 
-// Example: neither an old `Expr::Column { .. }` nor a DBSP `Expr::Register(7)`
-// may enter through `semantic::analyze`; both must be rejected at the boundary.
-#[hegel::test]
-fn bound_and_runtime_parser_nodes_are_rejected(tc: hegel::TestCase) {
-    let mut statement = parse_statement("SELECT 1");
-    let ast::Stmt::Select(select) = &mut statement else {
-        unreachable!("the fixture is a SELECT");
-    };
-    let ast::OneSelect::Select { columns, .. } = &mut select.body.select else {
-        unreachable!("the fixture is a SELECT core");
-    };
-    let forbidden = if tc.draw(generators::booleans()) {
-        ast::Expr::Register(7)
-    } else {
-        ast::Expr::Column {
-            database: None,
-            table: 1usize.into(),
-            column: 0,
-            is_rowid_alias: false,
-        }
-    };
-    columns[0] = ast::ResultColumn::Expr(Box::new(forbidden), None);
-    let schema = Schema::new();
-    let symbols = SymbolTable::new();
-    let context = semantic_context(&schema, &symbols);
-
-    let error = analyze(&context, AnalyzeInput::Statement(&statement))
-        .expect_err("bound and runtime parser nodes are not semantic input");
-
-    assert!(
-        matches!(error, LimboError::InternalError(message) if message.contains("bound or runtime parser expression"))
-    );
-}
-
 // Example: in `SELECT (SELECT i.c2 FROM items i WHERE i.c2 = o.c4)
 // FROM items o`, the inner query has the outer query as its lexical parent and
 // captures only `o`; it does not capture its own `i` source.

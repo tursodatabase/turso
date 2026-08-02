@@ -127,9 +127,7 @@ pub(crate) fn validate_check_expr(
 fn validate_default_expr(expr: &ast::Expr, col: &ColumnDefinition) -> Result<()> {
     walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         match e {
-            ast::Expr::Column { .. }
-            | ast::Expr::RowId { .. }
-            | ast::Expr::Name(_)
+            ast::Expr::Name(_)
             | ast::Expr::Qualified(_, _)
             | ast::Expr::DoublyQualified(_, _, _)
             | ast::Expr::Variable(_)
@@ -138,7 +136,6 @@ fn validate_default_expr(expr: &ast::Expr, col: &ColumnDefinition) -> Result<()>
             | ast::Expr::InSelect { .. }
             | ast::Expr::InTable { .. }
             | ast::Expr::Subquery(_)
-            | ast::Expr::SubqueryResult { .. }
             | ast::Expr::Id(_) => {
                 bail_parse_error!(
                     "default value of column [{}] is not constant",

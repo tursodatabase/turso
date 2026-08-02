@@ -42,11 +42,6 @@ where
                     continue;
                 }
                 match expr {
-                    ast::Expr::SubqueryResult { lhs, .. } => {
-                        if let Some(lhs) = lhs {
-                            stack.push(WalkItem::Expr(lhs));
-                        }
-                    }
                     ast::Expr::Between {
                         lhs, start, end, ..
                     } => {
@@ -158,14 +153,11 @@ where
                         )
                     }
                     ast::Expr::Id(_)
-                    | ast::Expr::Column { .. }
-                    | ast::Expr::RowId { .. }
                     | ast::Expr::Literal(_)
                     | ast::Expr::DoublyQualified(..)
                     | ast::Expr::Name(_)
                     | ast::Expr::Qualified(..)
                     | ast::Expr::Variable(_)
-                    | ast::Expr::Register(_)
                     | ast::Expr::Default => {}
                     ast::Expr::FieldAccess { base, .. } => {
                         stack.push(WalkItem::Expr(base));
@@ -222,11 +214,6 @@ where
                     continue;
                 }
                 match expr {
-                    ast::Expr::SubqueryResult { lhs, .. } => {
-                        if let Some(lhs) = lhs {
-                            stack.push(WalkItem::Expr(lhs));
-                        }
-                    }
                     ast::Expr::Between {
                         lhs, start, end, ..
                     } => {
@@ -338,14 +325,11 @@ where
                         )
                     }
                     ast::Expr::Id(_)
-                    | ast::Expr::Column { .. }
-                    | ast::Expr::RowId { .. }
                     | ast::Expr::Literal(_)
                     | ast::Expr::DoublyQualified(..)
                     | ast::Expr::Name(_)
                     | ast::Expr::Qualified(..)
                     | ast::Expr::Variable(_)
-                    | ast::Expr::Register(_)
                     | ast::Expr::Default => {}
                     ast::Expr::FieldAccess { base, .. } => {
                         stack.push(WalkItem::Expr(base));
