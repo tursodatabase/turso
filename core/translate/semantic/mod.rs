@@ -8,6 +8,8 @@ pub(crate) mod context;
 pub(crate) mod hir;
 
 mod cte;
+mod cte_bindings;
+mod cte_rules;
 mod dml;
 mod expr;
 mod query;

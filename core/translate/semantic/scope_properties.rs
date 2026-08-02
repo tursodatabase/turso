@@ -4,19 +4,15 @@
 #[path = "hir/mod.rs"]
 mod hir;
 
-// CTE lookup is tested with the full analyzer once its stored-expression input
-// uses the current schema representation. These tests exercise source and
-// output namespaces, for which an empty CTE environment is the real input.
-mod cte {
-    #[derive(Clone, Debug, Default)]
-    pub(crate) struct CteBindings;
+#[allow(dead_code)]
+#[path = "cte_bindings.rs"]
+mod cte_bindings;
 
-    impl CteBindings {
-        pub(crate) fn find(&self, _name: &str) -> Option<()> {
-            None
-        }
-    }
-}
+#[path = "cte_rules.rs"]
+mod cte_rules;
+
+#[path = "cte_properties.rs"]
+mod cte_properties;
 
 #[allow(dead_code, clippy::type_complexity)]
 #[path = "scope.rs"]

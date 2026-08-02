@@ -3,7 +3,7 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use super::{
-    cte::CteBindings,
+    cte_bindings::CteBindings,
     hir::{self, ColumnRef, OutputId, SourceId, TypeFact},
 };
 use crate::vdbe::affinity::Affinity;

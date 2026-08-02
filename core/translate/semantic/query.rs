@@ -3,7 +3,7 @@
 use turso_parser::ast;
 
 use super::{
-    cte::CteState,
+    cte_bindings::CteState,
     expr::ExprPolicy,
     hir::{self, CatalogObject, DatabaseId, SourceOwner},
     scope::{PseudoSourceVisibility, QueryEnvironment, Scope},
