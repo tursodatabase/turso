@@ -114,37 +114,29 @@ pub fn translate(
     program.set_mvcc_enabled(connection.mvcc_enabled());
 
     program.prologue();
-    let mut resolver = Resolver::new(
-        schema,
-        connection.database_schemas(),
-        &connection.temp.database,
-        connection.attached_databases(),
-        syms,
-        connection.experimental_custom_types_enabled(),
-        connection.get_dqs_dml().into(),
-        // Engine-generated helper statements are always SQLite text and
-        // must resolve functions with SQLite semantics regardless of the
-        // database's dialect — the same invariant as unmarked schema rows.
-        if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
-            Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
-        } else {
-            connection.dialect()
-        },
-    );
-
-    match stmt {
+    match &stmt {
+        ast::Stmt::Select(_)
+        | ast::Stmt::Insert { .. }
+        | ast::Stmt::Update(_)
+        | ast::Stmt::Delete { .. } => {
+            translate_semantic_root(schema, &stmt, &mut program, &connection, syms, origin)?;
+        }
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
+            let resolver = new_resolver(schema, &connection, syms, origin);
             pragma::translate_pragma(
                 &resolver,
-                &name,
-                body,
+                name,
+                body.clone(),
                 pager,
                 connection.clone(),
                 &mut program,
             )?;
         }
-        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
+        _ => {
+            let mut resolver = new_resolver(schema, &connection, syms, origin);
+            translate_inner(stmt, &mut resolver, &mut program, &connection, input)?;
+        }
     };
 
     program.epilogue(schema);
@@ -152,7 +144,6 @@ pub fn translate(
     program.build(connection, change_cnt_on, input)
 }
 
-#[allow(dead_code)]
 fn translate_semantic_root(
     schema: &Schema,
     stmt: &ast::Stmt,
@@ -221,6 +212,28 @@ fn translate_semantic_root(
     )
     .map_err(|error| crate::LimboError::InternalError(error.to_string()))?;
     Ok(())
+}
+
+fn new_resolver<'a>(
+    schema: &'a Schema,
+    connection: &'a Arc<Connection>,
+    syms: &'a SymbolTable,
+    origin: crate::statement::StatementOrigin,
+) -> Resolver<'a> {
+    Resolver::new(
+        schema,
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        syms,
+        connection.experimental_custom_types_enabled(),
+        connection.get_dqs_dml().into(),
+        if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
+            Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
+        } else {
+            connection.dialect()
+        },
+    )
 }
 
 fn semantic_outputs(document: &hir::HirDocument) -> Option<&[hir::Output]> {
