@@ -4,6 +4,10 @@ use turso_parser::ast;
 
 use super::{
     context::SemanticContext,
+    dml_rules::{
+        add_schema_named_target, configure_target_read_scope, configure_upsert_scope,
+        resolve_assignment_columns, resolve_insert_columns, DmlOperation,
+    },
     expr::ExprPolicy,
     hir::{self, CatalogObject, DatabaseId, TargetColumn},
     query::IndexMetadataMode,
@@ -23,23 +27,6 @@ pub(super) enum InsertSourceSyntax<'a> {
         select: &'a ast::Select,
         upsert: Option<&'a ast::Upsert>,
     },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DmlOperation {
-    Insert,
-    Update,
-    Delete,
-}
-
-impl DmlOperation {
-    fn generated_column_verb(self) -> &'static str {
-        match self {
-            Self::Insert => "INSERT into",
-            Self::Update => "UPDATE",
-            Self::Delete => unreachable!("DELETE has no destination columns"),
-        }
-    }
 }
 
 fn validate_dml_target(
@@ -115,72 +102,6 @@ fn validate_dml_target(
             ),
         }
     })
-}
-
-fn resolve_insert_columns(table: &Table, columns: &[ast::Name]) -> Result<Vec<TargetColumn>> {
-    if columns.is_empty() {
-        return Ok(table
-            .columns()
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| !column.hidden() && !column.is_generated())
-            .map(|(index, _)| TargetColumn::Column(index))
-            .collect());
-    }
-
-    columns
-        .iter()
-        .map(|name| resolve_target_column(table, name, DmlOperation::Insert))
-        .collect()
-}
-
-fn resolve_assignment_columns(table: &Table, columns: &[ast::Name]) -> Result<Vec<TargetColumn>> {
-    columns
-        .iter()
-        .map(|name| resolve_target_column(table, name, DmlOperation::Update))
-        .collect()
-}
-
-fn resolve_target_column(
-    table: &Table,
-    name: &ast::Name,
-    operation: DmlOperation,
-) -> Result<TargetColumn> {
-    let normalized = crate::util::normalize_ident(name.as_str());
-    if let Some((index, column)) = table.get_column_by_name(&normalized) {
-        column.ensure_not_generated(operation.generated_column_verb(), &normalized)?;
-        return Ok(TargetColumn::Column(index));
-    }
-
-    if is_rowid_name(&normalized) && table_has_rowid(table) {
-        if let Some((index, _)) = table
-            .columns()
-            .iter()
-            .enumerate()
-            .find(|(_, column)| column.is_rowid_alias())
-        {
-            return Ok(TargetColumn::Column(index));
-        }
-        return Ok(TargetColumn::RowId);
-    }
-
-    match operation {
-        DmlOperation::Insert => crate::bail_parse_error!(
-            "table {} has no column named {}",
-            table.get_name(),
-            normalized
-        ),
-        DmlOperation::Update => crate::bail_parse_error!("no such column: {}", name),
-        DmlOperation::Delete => unreachable!("DELETE has no destination columns"),
-    }
-}
-
-fn table_has_rowid(table: &Table) -> bool {
-    table.btree().is_some_and(|table| table.has_rowid) || table.virtual_table().is_some()
-}
-
-fn is_rowid_name(name: &str) -> bool {
-    matches!(name, "rowid" | "_rowid_" | "oid")
 }
 
 fn target_type_fact(target: TargetColumn, source: &hir::Source) -> hir::TypeFact {
@@ -402,7 +323,10 @@ impl Analyzer<'_, '_> {
             }
             None => (None, self.scope_for_environment(&environment)?),
         };
-        self.add_source_to_scope(&mut read_scope, target, true)?;
+        let target_definition = self.source(target).ok_or_else(|| {
+            LimboError::InternalError(format!("missing UPDATE target source {target}"))
+        })?;
+        configure_target_read_scope(&mut read_scope, target_definition);
 
         let assignments =
             self.analyze_assignments(sets, &table, target, &read_scope, trigger.is_some(), true)?;
@@ -455,7 +379,10 @@ impl Analyzer<'_, '_> {
         validate_dml_target(self.context(), database_id, &table, DmlOperation::Delete)?;
 
         let mut scope = self.scope_for_environment(&environment)?;
-        self.add_source_to_scope(&mut scope, target, true)?;
+        let target_definition = self.source(target).ok_or_else(|| {
+            LimboError::InternalError(format!("missing DELETE target source {target}"))
+        })?;
+        configure_target_read_scope(&mut scope, target_definition);
         let predicate = predicate_syntax
             .map(|syntax| self.analyze_expr(syntax, &scope, scalar_expr_policy(trigger.is_some())))
             .transpose()?;
@@ -480,7 +407,7 @@ impl Analyzer<'_, '_> {
         with: Option<&ast::With>,
     ) -> Result<QueryEnvironment> {
         let environment = trigger
-            .map(super::trigger::query_environment)
+            .map(super::trigger_rules::query_environment)
             .unwrap_or_else(QueryEnvironment::empty);
         self.prepare_query_environment(environment, with)
     }
@@ -633,7 +560,7 @@ impl Analyzer<'_, '_> {
             return Ok(None);
         }
         let mut scope = self.scope_for_environment(environment)?;
-        let mut target_definition = self.source(target).cloned().ok_or_else(|| {
+        let target_definition = self.source(target).ok_or_else(|| {
             LimboError::InternalError(format!("missing DML target source {target}"))
         })?;
         if matches!(
@@ -644,8 +571,7 @@ impl Analyzer<'_, '_> {
         }
         // SQLite resolves RETURNING through the schema table name even when
         // UPDATE or INSERT uses an alias for the writable target.
-        target_definition.alias = None;
-        scope.add_source(&target_definition, true);
+        add_schema_named_target(&mut scope, target_definition);
         let policy = if in_trigger {
             ExprPolicy::trigger_predicate()
         } else {
@@ -747,9 +673,17 @@ impl Analyzer<'_, '_> {
                 ast::UpsertDo::Nothing => hir::UpsertAction::Nothing,
                 ast::UpsertDo::Set { sets, where_clause } => {
                     let mut scope = self.scope_for_environment(environment)?;
-                    self.add_source_to_scope(&mut scope, target, true)?;
-                    self.add_source_to_scope(&mut scope, excluded, false)?;
-                    scope.report_missing_qualified_name_as_column();
+                    let target_definition = self.source(target).ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "missing UPSERT target source {target}"
+                        ))
+                    })?;
+                    let excluded_definition = self.source(excluded).ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "missing UPSERT excluded source {excluded}"
+                        ))
+                    })?;
+                    configure_upsert_scope(&mut scope, target_definition, excluded_definition);
                     let assignments =
                         self.analyze_assignments(sets, table, target, &scope, in_trigger, false)?;
                     let predicate = where_clause
@@ -786,13 +720,12 @@ impl Analyzer<'_, '_> {
         target: hir::SourceId,
     ) -> Result<hir::ConflictTarget> {
         let mut scope = self.scope_for_environment(environment)?;
-        let mut target_definition = self.source(target).cloned().ok_or_else(|| {
+        let target_definition = self.source(target).ok_or_else(|| {
             LimboError::InternalError(format!("missing UPSERT target source {target}"))
         })?;
         // A conflict target names the schema table, even when INSERT itself
         // gave its writable target an alias.
-        target_definition.alias = None;
-        scope.add_source(&target_definition, true);
+        add_schema_named_target(&mut scope, target_definition);
 
         let policy = scalar_expr_policy(false).without_subqueries();
         let mut terms = Vec::with_capacity(syntax.targets.len());

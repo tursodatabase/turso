@@ -281,6 +281,41 @@ impl Scope {
         self.allow_raise
     }
 
+    /// Apply pseudo-table names inherited from a statement environment.
+    pub(crate) fn add_environment_pseudo_sources<'source>(
+        &mut self,
+        environment: &QueryEnvironment,
+        mut source_by_id: impl FnMut(SourceId) -> Option<&'source hir::Source>,
+    ) -> Result<()> {
+        self.set_pseudo_sources(environment.pseudo_sources.clone());
+        self.set_allow_raise(environment.allow_raise);
+        for (kind, qualifier) in [
+            (hir::PseudoSource::New, "new"),
+            (hir::PseudoSource::Old, "old"),
+            (hir::PseudoSource::Excluded, "excluded"),
+        ] {
+            match environment.pseudo_sources.state(kind) {
+                PseudoSourceVisibility::Hidden => {}
+                // An expression subquery reaches pseudo-tables through its
+                // outer scope. Keep their identities in the environment for
+                // LIMIT/OFFSET without adding duplicate current-scope names.
+                PseudoSourceVisibility::Visible(_) if environment.outer.is_some() => {}
+                PseudoSourceVisibility::Visible(source) => {
+                    let definition = source_by_id(*source).ok_or_else(|| {
+                        crate::LimboError::InternalError(format!(
+                            "missing pseudo-source {source} while building scope"
+                        ))
+                    })?;
+                    self.add_source(definition, false);
+                }
+                PseudoSourceVisibility::Forbidden(message) => {
+                    self.forbid_qualifier(qualifier, message);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn insert_window(&mut self, name: &str, window: hir::WindowSpec) {
         let name = crate::util::normalize_ident(name);
         self.named_windows.entry(name).or_insert(window);
@@ -291,10 +326,22 @@ impl Scope {
     }
 
     pub(crate) fn add_source(&mut self, source: &hir::Source, unqualified: bool) {
-        self.add_source_with_qualifier(
+        self.add_source_with_qualifier_and_database_visibility(
             source,
             source.alias.as_deref().unwrap_or(source.name.as_str()),
             unqualified,
+            source.alias.is_none(),
+        );
+    }
+
+    /// Add an aliased DML target under its schema-owned name without cloning
+    /// the complete source merely to clear the alias.
+    pub(crate) fn add_source_with_schema_name(&mut self, source: &hir::Source, unqualified: bool) {
+        self.add_source_with_qualifier_and_database_visibility(
+            source,
+            &source.name,
+            unqualified,
+            true,
         );
     }
 
@@ -306,6 +353,21 @@ impl Scope {
         source: &hir::Source,
         qualifier: &str,
         unqualified: bool,
+    ) {
+        self.add_source_with_qualifier_and_database_visibility(
+            source,
+            qualifier,
+            unqualified,
+            source.alias.is_none(),
+        );
+    }
+
+    fn add_source_with_qualifier_and_database_visibility(
+        &mut self,
+        source: &hir::Source,
+        qualifier: &str,
+        unqualified: bool,
+        database_qualified: bool,
     ) {
         let qualifier = crate::util::normalize_ident(qualifier);
         let columns: Vec<_> = source
@@ -322,7 +384,7 @@ impl Scope {
             qualifier,
             table_name: crate::util::normalize_ident(&source.name),
             database: source.database,
-            database_qualified: source.alias.is_none(),
+            database_qualified,
             columns,
             rowid_available: source.rowid_available,
             unqualified,

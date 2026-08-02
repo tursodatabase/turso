@@ -14,9 +14,22 @@ mod cte_rules;
 #[path = "cte_properties.rs"]
 mod cte_properties;
 
+#[allow(dead_code)]
+#[path = "dml_rules.rs"]
+mod dml_rules;
+
+#[path = "dml_properties.rs"]
+mod dml_properties;
+
 #[allow(dead_code, clippy::type_complexity)]
 #[path = "scope.rs"]
 mod scope;
+
+#[path = "trigger_rules.rs"]
+mod trigger_rules;
+
+#[path = "trigger_properties.rs"]
+mod trigger_properties;
 
 use hegel::generators;
 use turso_parser::ast::Literal;

@@ -11,6 +11,7 @@ mod cte;
 mod cte_bindings;
 mod cte_rules;
 mod dml;
+mod dml_rules;
 mod expr;
 mod query;
 pub(crate) mod schema_expr;
@@ -18,6 +19,7 @@ mod schema_program;
 mod scope;
 mod sequence;
 mod trigger;
+mod trigger_rules;
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use turso_parser::ast;

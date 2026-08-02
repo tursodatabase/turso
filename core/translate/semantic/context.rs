@@ -126,7 +126,7 @@ impl TriggerCatalogContext {
     }
 
     pub(crate) fn restricts_db_references(&self) -> bool {
-        self.database_id != TEMP_DB_ID
+        super::trigger_rules::restricts_database_references(self.database_id)
     }
 }
 
@@ -355,17 +355,13 @@ impl<'a> SemanticContext<'a> {
                     LimboError::InvalidArgument(format!("no such database: {normalized}"))
                 })?
         } else if let Some(trigger) = &self.trigger {
-            if trigger.restricts_db_references() {
-                trigger.database_id
-            } else {
-                MAIN_DB_ID
-            }
+            super::trigger_rules::default_database(trigger.database_id)
         } else {
             MAIN_DB_ID
         };
 
         if let Some(trigger) = &self.trigger {
-            if trigger.restricts_db_references() && resolved != trigger.database_id {
+            if !super::trigger_rules::database_reference_allowed(trigger.database_id, resolved) {
                 let database_name = name
                     .db_name
                     .as_ref()

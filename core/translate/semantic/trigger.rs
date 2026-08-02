@@ -7,28 +7,12 @@ use super::{
     expr::ExprPolicy,
     hir::{self, CatalogObject, DatabaseId, PseudoSource},
     scope::{QueryEnvironment, Scope},
+    trigger_rules::{
+        apply_pseudo_column_affinity, effective_conflict_policy, query_environment,
+    },
     Analyzer, CatalogObjectKind, TriggerAnalysisInput,
 };
 use crate::{LimboError, Result};
-
-const NEW_NOT_VISIBLE: &str = "NEW references are only valid in INSERT and UPDATE triggers";
-const OLD_NOT_VISIBLE: &str = "OLD references are only valid in UPDATE and DELETE triggers";
-
-pub(super) fn query_environment(environment: &hir::TriggerEnvironment) -> QueryEnvironment {
-    let environment_builder = QueryEnvironment::empty().within_trigger_program();
-    let environment_builder = match environment.new_source {
-        Some(source) => environment_builder.with_visible_pseudo_source(PseudoSource::New, source),
-        None => {
-            environment_builder.with_forbidden_pseudo_source(PseudoSource::New, NEW_NOT_VISIBLE)
-        }
-    };
-    match environment.old_source {
-        Some(source) => environment_builder.with_visible_pseudo_source(PseudoSource::Old, source),
-        None => {
-            environment_builder.with_forbidden_pseudo_source(PseudoSource::Old, OLD_NOT_VISIBLE)
-        }
-    }
-}
 
 pub(super) fn expression_scope(
     analyzer: &Analyzer<'_, '_>,
@@ -102,7 +86,7 @@ impl Analyzer<'_, '_> {
                 where_clause,
             } => self.analyze_update_parts(
                 None,
-                input.override_conflict.or(*or_conflict),
+                effective_conflict_policy(input.override_conflict, *or_conflict),
                 &ast::QualifiedName::single(tbl_name.clone()),
                 None,
                 sets,
@@ -122,7 +106,7 @@ impl Analyzer<'_, '_> {
                 returning,
             } => self.analyze_insert_parts(
                 None,
-                input.override_conflict.or(*or_conflict),
+                effective_conflict_policy(input.override_conflict, *or_conflict),
                 &ast::QualifiedName::single(tbl_name.clone()),
                 col_names,
                 InsertSourceSyntax::Select {
@@ -166,12 +150,7 @@ impl Analyzer<'_, '_> {
                 "missing trigger pseudo-source immediately after creating {source}"
             ))
         })?;
-        for column in &mut definition.columns {
-            // SQLite treats NEW/OLD fields as register values rather than table
-            // columns during comparisons. A true rowid alias is the exception:
-            // it keeps INTEGER affinity just like NEW.rowid and OLD.rowid.
-            column.has_affinity = column.rowid_alias;
-        }
+        apply_pseudo_column_affinity(&mut definition.columns);
         Ok(source)
     }
 }

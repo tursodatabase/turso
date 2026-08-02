@@ -6,7 +6,7 @@ use super::{
     cte_bindings::CteState,
     expr::ExprPolicy,
     hir::{self, CatalogObject, DatabaseId, SourceOwner},
-    scope::{PseudoSourceVisibility, QueryEnvironment, Scope},
+    scope::{QueryEnvironment, Scope},
     Analyzer, CatalogObjectKind,
 };
 use crate::{
@@ -111,27 +111,7 @@ impl Analyzer<'_, '_> {
     pub(crate) fn scope_for_environment(&self, environment: &QueryEnvironment) -> Result<Scope> {
         let mut scope = Scope::new(environment.outer.clone());
         scope.set_ctes(environment.ctes.clone());
-        scope.set_pseudo_sources(environment.pseudo_sources.clone());
-        scope.set_allow_raise(environment.allow_raise);
-        for (kind, qualifier) in [
-            (hir::PseudoSource::New, "new"),
-            (hir::PseudoSource::Old, "old"),
-            (hir::PseudoSource::Excluded, "excluded"),
-        ] {
-            match environment.pseudo_sources.state(kind) {
-                PseudoSourceVisibility::Hidden => {}
-                // An expression subquery reaches pseudo-tables through its
-                // outer scope. Keep their identities in the environment for
-                // LIMIT/OFFSET without adding duplicate current-scope names.
-                PseudoSourceVisibility::Visible(_) if environment.outer.is_some() => {}
-                PseudoSourceVisibility::Visible(source) => {
-                    self.add_source_to_scope(&mut scope, *source, false)?;
-                }
-                PseudoSourceVisibility::Forbidden(message) => {
-                    scope.forbid_qualifier(qualifier, message);
-                }
-            }
-        }
+        scope.add_environment_pseudo_sources(environment, |source| self.source(source))?;
         Ok(scope)
     }
 
