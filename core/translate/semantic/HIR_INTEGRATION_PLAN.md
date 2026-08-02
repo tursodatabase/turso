@@ -98,7 +98,9 @@ operations are not SQL binding.
   - [x] Ordinary, expression, partial, and UNIQUE secondary indexes preserve
         SQLite's prepare-before-write mutation order through one shared HIR
         index layer.
-  - [ ] RETURNING, UPDATE FROM, triggers, and foreign keys.
+  - [x] RETURNING reads OLD before DELETE and the complete written NEW row
+        after UPDATE, using the same HIR runtime bindings as the write.
+  - [ ] UPDATE FROM, triggers, and foreign keys.
 - [ ] INSERT, VALUES, INSERT SELECT, UPSERT, excluded, defaults, and RETURNING.
   - [x] VALUES and DEFAULT VALUES build supplied fields, frozen defaults, and
         generated columns through the shared row-image layer for simple rowid
@@ -109,8 +111,10 @@ operations are not SQL binding.
         validated table-key path with pre-write uniqueness checks.
   - [x] Default NOT NULL enforcement and STRICT built-in type checks run on the
         complete NEW row before any mutation.
-  - [ ] INSERT SELECT, conflict-policy variants and remaining constraints,
-        UPSERT/excluded, and RETURNING.
+  - [x] INSERT SELECT materializes direct HIR query output before opening the
+        target write loop, including safe self-inserts.
+  - [x] RETURNING projects the written NEW HIR row after INSERT.
+  - [ ] Conflict-policy variants and remaining constraints, UPSERT/excluded.
 - [ ] Trigger commands and predicates with explicit OLD/NEW runtime bindings.
 - [ ] Generated columns, defaults, CHECK constraints, expression and partial
       indexes, and custom-type schema programs.

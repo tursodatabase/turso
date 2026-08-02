@@ -165,12 +165,12 @@ fn a_simple_delete_emits_only_from_closed_hir(tc: hegel::TestCase) {
     ));
 }
 
-// Example: `DELETE FROM items WHERE c2 RETURNING c7` carries the exact
-// RETURNING position in HIR, but this first DELETE slice must refuse the whole
-// root before emitting `OpenWrite` or any other instruction. This prevents a
-// caller from accidentally running a mutation with an omitted row image.
+// Example: `DELETE FROM items WHERE c2 RETURNING c7` must capture old c7 while
+// the target cursor still names the row, delete its indexes and table record,
+// then emit the captured result. RETURNING may not read the invalidated cursor
+// after Delete, and it may not expose a result for a write that did not happen.
 #[hegel::test]
-fn an_unsupported_delete_obligation_cannot_emit_a_partial_program(tc: hegel::TestCase) {
+fn delete_returning_captures_old_hir_before_the_write(tc: hegel::TestCase) {
     let width = usize::from(tc.draw(generators::integers::<u8>().max_value(15))) + 1;
     let predicate_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
     let returning_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
@@ -212,13 +212,28 @@ fn an_unsupported_delete_obligation_cannot_emit_a_partial_program(tc: hegel::Tes
 
     let plan = PhysicalPlan::new(&document).expect("closed HIR has a physical plan");
     let mut program = program();
-    let error = emit_root(&plan, &mut program).expect_err("RETURNING is not emitted yet");
-
-    assert!(matches!(
-        error,
-        PhysicalRootError::Delete(PhysicalDeleteError::Unsupported("RETURNING"))
-    ));
-    assert!(program.insns.is_empty());
+    emit_root(&plan, &mut program).expect("DELETE RETURNING lowers without a catalog");
+    let delete_position = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::Delete { .. }))
+        .expect("the row is deleted");
+    let result_position = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. }))
+        .expect("one RETURNING field is emitted");
+    let returned_read = program
+        .insns
+        .iter()
+        .enumerate()
+        .filter_map(|(position, (instruction, _))| {
+            matches!(instruction, Insn::Column { column, .. } if *column == returning_position)
+                .then_some(position)
+        })
+        .last()
+        .expect("RETURNING reads its resolved old column");
+    assert!(returned_read < delete_position && delete_position < result_position);
 }
 
 // Example: for

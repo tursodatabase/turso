@@ -13,10 +13,10 @@ use crate::{
 
 use super::{
     close_indexes, emit_complete_logical_row, emit_index_delete, emit_index_insert, emit_index_key,
-    emit_new_row_constraints, emit_stored_record, emit_unique_check, open_indexes, CursorId,
-    ExpressionEmitter, PhysicalExpressionError, PhysicalIndexError, PhysicalPlan, PhysicalRoot,
-    PhysicalRowError, PhysicalSourceKind, RegisterId, RegisterRange, RuntimeBindingError,
-    RuntimeBindings, SourceRuntime, TableAccess,
+    emit_new_row_constraints, emit_returning_result, emit_returning_values, emit_stored_record,
+    emit_unique_check, open_indexes, CursorId, ExpressionEmitter, PhysicalExpressionError,
+    PhysicalIndexError, PhysicalPlan, PhysicalRoot, PhysicalRowError, PhysicalSourceKind,
+    RegisterId, RegisterRange, RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
 };
 
 #[derive(Debug)]
@@ -239,6 +239,18 @@ pub(crate) fn emit_root_update(
         flag: InsertFlags::new(),
         table_name: table.name.clone(),
     });
+    if let Some(returning) = &update.returning {
+        let old_runtime = bindings.replace_source(
+            update.target,
+            SourceRuntime::Registers {
+                columns: logical,
+                rowid: Some(rowid),
+            },
+        )?;
+        let result = emit_returning_values(program, &mut bindings, returning)?;
+        bindings.replace_source(update.target, old_runtime)?;
+        emit_returning_result(program, result);
+    }
     program.preassign_label_to_next_insn(write_next);
     program.emit_insn(Insn::Goto {
         target_pc: write_start,
@@ -262,9 +274,6 @@ fn preflight_update<'plan>(
     }
     if !update.order_by.is_empty() || update.limit.is_some() {
         return Err(PhysicalUpdateError::Unsupported("ORDER BY or LIMIT"));
-    }
-    if update.returning.is_some() {
-        return Err(PhysicalUpdateError::Unsupported("RETURNING"));
     }
     if update.conflict.is_some() {
         return Err(PhysicalUpdateError::Unsupported("conflict policy"));

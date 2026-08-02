@@ -213,6 +213,22 @@ struct MaterializedCtes {
     temporary_cursors: Vec<usize>,
 }
 
+pub(crate) struct MaterializedQuery {
+    pub(crate) cursor: usize,
+    cleanup_cursors: Vec<usize>,
+}
+
+impl MaterializedQuery {
+    pub(crate) fn close(self, program: &mut ProgramBuilder) {
+        program.emit_insn(Insn::Close {
+            cursor_id: self.cursor,
+        });
+        for cursor_id in self.cleanup_cursors.into_iter().rev() {
+            program.emit_insn(Insn::Close { cursor_id });
+        }
+    }
+}
+
 struct QuerySubqueryEmitter<'plan, 'document, 'ctes> {
     plan: &'plan PhysicalPlan<'document>,
     ctes: &'ctes mut MaterializedCtes,
@@ -378,6 +394,55 @@ pub(crate) fn emit_root_query(
         }
     }
     result
+}
+
+/// Materialize a HIR query for a DML consumer. This keeps query production
+/// independent from the target write loop and is safe when source and target
+/// name the same table.
+pub(crate) fn emit_query_for_dml<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    query_id: QueryId,
+) -> QueryResult<MaterializedQuery> {
+    let query = plan
+        .query(query_id)
+        .ok_or(PhysicalQueryError::Invalid("DML query is missing"))?;
+    if query.hir.parent.is_some() {
+        return Err(PhysicalQueryError::Invalid(
+            "DML query has a lexical parent",
+        ));
+    }
+    let mut ctes = MaterializedCtes::default();
+    for cte in query_tree_ctes(plan, query_id)? {
+        materialize_cte(plan, program, bindings, &mut ctes, cte)?;
+    }
+    let table = ephemeral_table(
+        format!("dml_query_{}", query_id.index()),
+        query.hir.output.len(),
+    );
+    let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: cursor,
+        is_table: true,
+    });
+    emit_query(
+        plan,
+        program,
+        bindings,
+        &mut ctes,
+        query_id,
+        QueryDestination::EphemeralTable {
+            cursor_id: cursor,
+            table: &table,
+        },
+    )?;
+    let mut cleanup_cursors = ctes.temporary_cursors;
+    cleanup_cursors.extend(ctes.by_id.into_values().map(|cte| cte.cursor_id));
+    Ok(MaterializedQuery {
+        cursor,
+        cleanup_cursors,
+    })
 }
 
 fn emit_query<'document>(

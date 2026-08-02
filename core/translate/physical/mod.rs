@@ -9,6 +9,7 @@ mod index;
 mod insert;
 mod plan;
 mod query;
+mod returning;
 mod row;
 mod runtime_bindings;
 mod update;
@@ -19,6 +20,7 @@ pub(crate) use index::*;
 pub(crate) use insert::*;
 pub(crate) use plan::*;
 pub(crate) use query::*;
+pub(crate) use returning::*;
 pub(crate) use row::*;
 pub(crate) use runtime_bindings::*;
 pub(crate) use update::*;
@@ -43,6 +45,9 @@ mod runtime_binding_properties;
 
 #[cfg(test)]
 mod row_properties;
+
+#[cfg(test)]
+mod returning_properties;
 
 #[cfg(test)]
 mod update_properties;

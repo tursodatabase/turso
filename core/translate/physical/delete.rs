@@ -18,10 +18,10 @@ use crate::{
 };
 
 use super::{
-    close_indexes, emit_index_delete, emit_index_key, open_indexes, CursorId, ExpressionEmitter,
-    PhysicalExpressionError, PhysicalIndexError, PhysicalPlan, PhysicalQueryError, PhysicalRoot,
-    PhysicalSourceKind, RegisterId, RuntimeBindingError, RuntimeBindings, SourceRuntime,
-    TableAccess,
+    close_indexes, emit_index_delete, emit_index_key, emit_returning_result, emit_returning_values,
+    open_indexes, CursorId, ExpressionEmitter, PhysicalExpressionError, PhysicalIndexError,
+    PhysicalPlan, PhysicalQueryError, PhysicalRoot, PhysicalSourceKind, RegisterId,
+    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
 };
 
 #[derive(Debug)]
@@ -158,6 +158,11 @@ pub(crate) fn emit_root_delete(
             jump_if_null: true,
         });
     }
+    let returning = delete
+        .returning
+        .as_ref()
+        .map(|returning| emit_returning_values(program, &mut bindings, returning))
+        .transpose()?;
     program.emit_insn(Insn::RowId {
         cursor_id: cursor,
         dest: rowid.0,
@@ -181,6 +186,9 @@ pub(crate) fn emit_root_delete(
         table_name: table.name.clone(),
         is_part_of_update: false,
     });
+    if let Some(result) = returning {
+        emit_returning_result(program, result);
+    }
     program.preassign_label_to_next_insn(loop_next);
     program.emit_insn(Insn::Next {
         cursor_id: cursor,
@@ -202,9 +210,6 @@ fn preflight_delete<'plan>(
 )> {
     if !delete.order_by.is_empty() || delete.limit.is_some() {
         return Err(PhysicalDeleteError::Unsupported("ORDER BY or LIMIT"));
-    }
-    if delete.returning.is_some() {
-        return Err(PhysicalDeleteError::Unsupported("RETURNING"));
     }
     if delete.trigger.is_some() || !delete.triggers.is_empty() {
         return Err(PhysicalDeleteError::Unsupported("trigger execution"));

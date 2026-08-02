@@ -14,10 +14,11 @@ use crate::{
 
 use super::{
     close_indexes, emit_complete_logical_row, emit_index_insert, emit_index_key,
-    emit_new_row_constraints, emit_stored_record, emit_unique_check, open_indexes,
-    ExpressionEmitter, OpenedIndex, PhysicalExpressionError, PhysicalIndexError, PhysicalPlan,
-    PhysicalRoot, PhysicalRowError, PhysicalSourceKind, RegisterId, RegisterRange,
-    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
+    emit_new_row_constraints, emit_query_for_dml, emit_returning_result, emit_returning_values,
+    emit_stored_record, emit_unique_check, open_indexes, ExpressionEmitter, OpenedIndex,
+    PhysicalExpressionError, PhysicalIndexError, PhysicalPlan, PhysicalQueryError, PhysicalRoot,
+    PhysicalRowError, PhysicalSourceKind, RegisterId, RegisterRange, RuntimeBindingError,
+    RuntimeBindings, SourceRuntime, TableAccess,
 };
 
 #[derive(Debug)]
@@ -26,6 +27,7 @@ pub(crate) enum PhysicalInsertError {
     Expression(PhysicalExpressionError),
     Row(PhysicalRowError),
     Index(PhysicalIndexError),
+    Query(PhysicalQueryError),
     Invalid(&'static str),
     Unsupported(&'static str),
 }
@@ -37,6 +39,7 @@ impl fmt::Display for PhysicalInsertError {
             Self::Expression(error) => error.fmt(formatter),
             Self::Row(error) => error.fmt(formatter),
             Self::Index(error) => error.fmt(formatter),
+            Self::Query(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical INSERT: {message}"),
             Self::Unsupported(message) => {
                 write!(formatter, "physical INSERT is not emitted yet: {message}")
@@ -71,6 +74,12 @@ impl From<PhysicalIndexError> for PhysicalInsertError {
     }
 }
 
+impl From<PhysicalQueryError> for PhysicalInsertError {
+    fn from(error: PhysicalQueryError) -> Self {
+        Self::Query(error)
+    }
+}
+
 type InsertResult<T> = std::result::Result<T, PhysicalInsertError>;
 
 pub(crate) fn emit_root_insert(
@@ -97,6 +106,12 @@ pub(crate) fn emit_root_insert(
             rowid: Some(rowid),
         },
     )?;
+    let query_rows = match &insert.source {
+        InsertSource::Query(query) => {
+            Some(emit_query_for_dml(plan, program, &mut bindings, *query)?)
+        }
+        InsertSource::DefaultValues | InsertSource::Values(_) => None,
+    };
 
     program.emit_insn(Insn::OpenWrite {
         cursor_id: cursor,
@@ -137,11 +152,40 @@ pub(crate) fn emit_root_insert(
             }
         }
         InsertSource::Query(_) => {
-            return Err(PhysicalInsertError::Unsupported("INSERT SELECT"));
+            let query_rows = query_rows.as_ref().ok_or(PhysicalInsertError::Invalid(
+                "INSERT query was not materialized",
+            ))?;
+            let done = program.allocate_label();
+            let next = program.allocate_label();
+            program.emit_insn(Insn::Rewind {
+                cursor_id: query_rows.cursor,
+                pc_if_empty: done,
+            });
+            program.preassign_label_to_next_insn(next);
+            emit_insert_query_row(
+                program,
+                &mut bindings,
+                insert,
+                &table,
+                cursor,
+                logical,
+                rowid,
+                record,
+                &indexes,
+                query_rows.cursor,
+            )?;
+            program.emit_insn(Insn::Next {
+                cursor_id: query_rows.cursor,
+                pc_if_next: next,
+            });
+            program.preassign_label_to_next_insn(done);
         }
     }
     close_indexes(program, &indexes);
     program.emit_insn(Insn::Close { cursor_id: cursor });
+    if let Some(query_rows) = query_rows {
+        query_rows.close(program);
+    }
     Ok(())
 }
 
@@ -163,6 +207,44 @@ fn emit_insert_row(
             "VALUES width does not match the target column list",
         ));
     }
+    initialize_insert_row(program, logical, rowid);
+
+    for (target, value) in insert.columns.iter().zip(values) {
+        let destination = target_register(*target, logical, rowid)?;
+        ExpressionEmitter::new(program, bindings)
+            .emit_into(value, RegisterRange::new(destination.0, 1))?;
+    }
+    emit_insert_defaults(program, bindings, insert, logical)?;
+    finish_insert_row(
+        program, bindings, insert, table, cursor, logical, rowid, record, indexes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_insert_query_row(
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
+    insert: &hir::Insert,
+    table: &crate::sync::Arc<crate::schema::BTreeTable>,
+    cursor: usize,
+    logical: RegisterRange,
+    rowid: RegisterId,
+    record: usize,
+    indexes: &[OpenedIndex<'_>],
+    query_cursor: usize,
+) -> InsertResult<()> {
+    initialize_insert_row(program, logical, rowid);
+    for (position, target) in insert.columns.iter().enumerate() {
+        let destination = target_register(*target, logical, rowid)?;
+        program.emit_column_or_rowid(query_cursor, position, destination.0);
+    }
+    emit_insert_defaults(program, bindings, insert, logical)?;
+    finish_insert_row(
+        program, bindings, insert, table, cursor, logical, rowid, record, indexes,
+    )
+}
+
+fn initialize_insert_row(program: &mut ProgramBuilder, logical: RegisterRange, rowid: RegisterId) {
     program.emit_insn(Insn::Null {
         dest: logical.first.0,
         dest_end: Some(logical.first.0 + logical.width - 1),
@@ -171,21 +253,27 @@ fn emit_insert_row(
         dest: rowid.0,
         dest_end: None,
     });
+}
 
-    for (target, value) in insert.columns.iter().zip(values) {
-        let destination = match target {
-            hir::TargetColumn::Column(column) => {
-                logical
-                    .register(*column)
-                    .ok_or(PhysicalInsertError::Invalid(
-                        "target column is outside the row",
-                    ))?
-            }
-            hir::TargetColumn::RowId => rowid,
-        };
-        ExpressionEmitter::new(program, bindings)
-            .emit_into(value, RegisterRange::new(destination.0, 1))?;
+fn target_register(
+    target: hir::TargetColumn,
+    logical: RegisterRange,
+    rowid: RegisterId,
+) -> InsertResult<RegisterId> {
+    match target {
+        hir::TargetColumn::Column(column) => logical.register(column).ok_or(
+            PhysicalInsertError::Invalid("target column is outside the row"),
+        ),
+        hir::TargetColumn::RowId => Ok(rowid),
     }
+}
+
+fn emit_insert_defaults(
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
+    insert: &hir::Insert,
+    logical: RegisterRange,
+) -> InsertResult<()> {
     for default in &insert.defaults {
         let destination = logical
             .register(default.column)
@@ -195,7 +283,21 @@ fn emit_insert_row(
         ExpressionEmitter::new(program, bindings)
             .emit_into(&default.value, RegisterRange::new(destination.0, 1))?;
     }
+    Ok(())
+}
 
+#[allow(clippy::too_many_arguments)]
+fn finish_insert_row(
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
+    insert: &hir::Insert,
+    table: &crate::sync::Arc<crate::schema::BTreeTable>,
+    cursor: usize,
+    logical: RegisterRange,
+    rowid: RegisterId,
+    record: usize,
+    indexes: &[OpenedIndex<'_>],
+) -> InsertResult<()> {
     if let Some((position, _)) = table.get_rowid_alias_column().filter(|(position, _)| {
         insert
             .columns
@@ -270,6 +372,10 @@ fn emit_insert_row(
         flag: InsertFlags::new(),
         table_name: table.name.clone(),
     });
+    if let Some(returning) = &insert.returning {
+        let result = emit_returning_values(program, bindings, returning)?;
+        emit_returning_result(program, result);
+    }
     Ok(())
 }
 
@@ -281,8 +387,15 @@ fn preflight_insert<'plan>(
     crate::sync::Arc<crate::schema::BTreeTable>,
     usize,
 )> {
-    if insert.returning.is_some() {
-        return Err(PhysicalInsertError::Unsupported("RETURNING"));
+    if let InsertSource::Query(query) = &insert.source {
+        let query = plan
+            .query(*query)
+            .ok_or(PhysicalInsertError::Invalid("INSERT query is missing"))?;
+        if query.hir.output.len() != insert.columns.len() {
+            return Err(PhysicalInsertError::Invalid(
+                "INSERT query width does not match the target column list",
+            ));
+        }
     }
     if insert.conflict.is_some() {
         return Err(PhysicalInsertError::Unsupported("conflict policy"));

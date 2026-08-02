@@ -212,3 +212,69 @@ fn explicit_rowid_and_integer_primary_key_share_one_key_path(tc: hegel::TestCase
             .any(|(instruction, _)| matches!(instruction, Insn::SoftNull { .. })));
     }
 }
+
+// Example: `INSERT INTO items(c0, c1) SELECT c0 + 7, c1 FROM items WHERE c1`
+// must finish the HIR SELECT into an ephemeral rowset before opening items for
+// writing. The write loop then reads the exact two query positions, applies the
+// ordinary INSERT row/constraint/index path, and cannot see rows it just added.
+#[hegel::test]
+fn insert_select_materializes_hir_rows_before_opening_the_target(tc: hegel::TestCase) {
+    let offset = i64::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(31)));
+    let table = BTreeTable::from_sql("CREATE TABLE items(c0 INTEGER, c1 INTEGER)", 9)
+        .expect("fixture table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(table))
+        .expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "INSERT INTO items(c0, c1) SELECT c0 + {offset}, c1 FROM items WHERE c1"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated INSERT SELECT has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed HIR has a physical plan");
+    let mut program = program();
+    emit_root(&plan, &mut program).expect("INSERT SELECT lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("all query and write-loop branches are closed");
+
+    let target_open = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(
+                instruction,
+                Insn::OpenWrite {
+                    root_page: crate::vdbe::insn::RegisterOrLiteral::Literal(9),
+                    ..
+                }
+            )
+        })
+        .expect("target table is opened for writing");
+    let materialized_insert = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(instruction, Insn::Insert { table_name, .. } if table_name.starts_with("dml_query_"))
+        })
+        .expect("query rows are materialized");
+    let target_insert = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(instruction, Insn::Insert { table_name, .. } if table_name == "items")
+        })
+        .expect("materialized rows enter the target");
+    assert!(materialized_insert < target_open && target_open < target_insert);
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::OpenEphemeral { is_table: true, .. })));
+}
