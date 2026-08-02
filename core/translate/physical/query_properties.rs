@@ -324,7 +324,9 @@ fn table_function_arguments_keep_their_bound_hidden_column_order(tc: hegel::Test
     )));
 }
 
-// Example: `SELECT c7 FROM items INDEXED BY items_idx WHERE c2 >= ?1` must
+// Examples: `SELECT c7 FROM items INDEXED BY items_idx WHERE c2 >= ?1` and
+// `... WHERE c4 IS NOT NULL AND c2 >= ?1` with a partial index declared as
+// `items_idx ON items(c4) WHERE c4 IS NOT NULL` must
 // iterate the exact resolved `items_idx`, seek the matching table row, and
 // still read table positions `c2` and `c7` from the table cursor. Index-key
 // positions are not table-column positions. Dropping `Schema` first proves
@@ -335,6 +337,7 @@ fn forced_indexes_iterate_the_index_but_bind_columns_to_the_table(tc: hegel::Tes
     let index_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
     let filter_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
     let output_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let partial = tc.draw(generators::booleans());
     let columns = (0..width)
         .map(|position| format!("c{position} INTEGER"))
         .collect::<Vec<_>>()
@@ -344,9 +347,14 @@ fn forced_indexes_iterate_the_index_but_bind_columns_to_the_table(tc: hegel::Tes
             .expect("generated table SQL is valid"),
     );
     let symbols = SymbolTable::new();
+    let partial_clause = if partial {
+        format!(" WHERE c{index_position} IS NOT NULL")
+    } else {
+        String::new()
+    };
     let index = Index::from_sql(
         &symbols,
-        &format!("CREATE INDEX items_idx ON items(c{index_position})"),
+        &format!("CREATE INDEX items_idx ON items(c{index_position}){partial_clause}"),
         13,
         &table,
     )
@@ -358,9 +366,12 @@ fn forced_indexes_iterate_the_index_but_bind_columns_to_the_table(tc: hegel::Tes
         .expect("items_idx is unique");
     let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
     let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let partial_filter = partial
+        .then(|| format!("c{index_position} IS NOT NULL AND "))
+        .unwrap_or_default();
     let statement = parse_statement(&format!(
         "SELECT c{output_position} FROM items INDEXED BY items_idx \
-         WHERE c{filter_position} >= ?1"
+         WHERE {partial_filter}c{filter_position} >= ?1"
     ));
     let document = analyze(&context, AnalyzeInput::Statement(&statement))
         .expect("generated forced-index query has valid SQL meaning");
@@ -409,13 +420,13 @@ fn forced_indexes_iterate_the_index_but_bind_columns_to_the_table(tc: hegel::Tes
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        reads,
-        [
-            (table_cursor, filter_position),
-            (table_cursor, output_position),
-        ]
-    );
+    let mut expected_reads = Vec::new();
+    if partial {
+        expected_reads.push((table_cursor, index_position));
+    }
+    expected_reads.push((table_cursor, filter_position));
+    expected_reads.push((table_cursor, output_position));
+    assert_eq!(reads, expected_reads);
     assert!(program.insns.iter().any(|(instruction, _)| matches!(
         instruction,
         Insn::Rewind { cursor_id, .. } if *cursor_id == index_cursor

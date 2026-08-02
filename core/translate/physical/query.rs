@@ -2151,11 +2151,10 @@ fn open_source<'document>(
         };
         if index.database() != Some(database_id)
             || index.value().index_method.is_some()
-            || index.value().where_clause.is_some()
             || !index.value().has_rowid
         {
             return Err(PhysicalQueryError::Unsupported(
-                "partial, custom, or rowid-free forced index",
+                "custom or rowid-free forced index",
             ));
         }
         let table_cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
