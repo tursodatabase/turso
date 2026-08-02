@@ -229,6 +229,22 @@ impl<'document> HirValidator<'document> {
             turso_parser::ast::TriggerEvent::Insert,
             &[],
         )?;
+        let upsert_assignments = insert
+            .upserts
+            .iter()
+            .filter_map(|upsert| match &upsert.action {
+                UpsertAction::Update { assignments, .. } => Some(assignments.as_slice()),
+                UpsertAction::Nothing => None,
+            })
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.visit_dml_triggers(
+            insert.target,
+            &insert.upsert_triggers,
+            turso_parser::ast::TriggerEvent::Update,
+            &upsert_assignments,
+        )?;
         self.visit_dml_foreign_keys(insert.target, &insert.foreign_keys)?;
         self.visit_optional_catalog_object(
             insert.autoincrement.as_ref(),

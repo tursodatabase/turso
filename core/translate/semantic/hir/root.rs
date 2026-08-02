@@ -71,6 +71,8 @@ pub struct Insert {
     pub trigger: Option<TriggerEnvironment>,
     /// Exact schema and temp triggers that can fire for this write.
     pub triggers: Vec<ResolvedTrigger>,
+    /// Exact UPDATE triggers that can fire from an UPSERT DO UPDATE arm.
+    pub upsert_triggers: Vec<ResolvedTrigger>,
     pub foreign_keys: DmlForeignKeys,
 }
 

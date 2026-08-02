@@ -84,7 +84,7 @@ fn prepare_document_triggers(
     foreign_key_stack: &mut Vec<ForeignKeyActionStackEntry>,
 ) -> Result<PreparedTriggers> {
     let mut prepared = PreparedTriggers::default();
-    if let Some(target) = trigger_target(document)? {
+    for target in trigger_targets(document)? {
         for trigger in target.triggers {
             let identity = trigger_identity(trigger)?;
             if stack.contains(&identity) {
@@ -230,38 +230,43 @@ fn prepare_document_foreign_key_actions(
     stack: &mut Vec<ForeignKeyActionStackEntry>,
     prepared: &mut PreparedTriggers,
 ) -> Result<()> {
-    let (foreign_keys, parent_change) = match &document.root {
-        hir::HirRoot::Delete(delete) => (
+    let changes = match &document.root {
+        hir::HirRoot::Delete(delete) => vec![(
             delete.foreign_keys.incoming.as_slice(),
             ForeignKeyParentChange::Delete,
-        ),
-        hir::HirRoot::Update(update) => (
+        )],
+        hir::HirRoot::Update(update) => vec![(
             update.foreign_keys.incoming.as_slice(),
             ForeignKeyParentChange::Update,
-        ),
-        hir::HirRoot::Insert(_)
-        | hir::HirRoot::Query(_)
+        )],
+        hir::HirRoot::Insert(insert) => vec![(
+            insert.foreign_keys.incoming.as_slice(),
+            ForeignKeyParentChange::Update,
+        )],
+        hir::HirRoot::Query(_)
         | hir::HirRoot::TriggerPredicate(_)
         | hir::HirRoot::SchemaExpressions(_) => return Ok(()),
     };
-    for foreign_key in foreign_keys {
-        let action = match parent_change {
-            ForeignKeyParentChange::Delete => foreign_key.declaration.on_delete,
-            ForeignKeyParentChange::Update => foreign_key.declaration.on_update,
-        };
-        if matches!(action, RefAct::NoAction | RefAct::Restrict) {
-            continue;
+    for (foreign_keys, parent_change) in changes {
+        for foreign_key in foreign_keys {
+            let action = match parent_change {
+                ForeignKeyParentChange::Delete => foreign_key.declaration.on_delete,
+                ForeignKeyParentChange::Update => foreign_key.declaration.on_update,
+            };
+            if matches!(action, RefAct::NoAction | RefAct::Restrict) {
+                continue;
+            }
+            prepared.push_foreign_key_action(prepare_one_foreign_key_action(
+                context,
+                foreign_key,
+                parent_change,
+                action,
+                parent,
+                connection,
+                trigger_stack,
+                stack,
+            )?);
         }
-        prepared.push_foreign_key_action(prepare_one_foreign_key_action(
-            context,
-            foreign_key,
-            parent_change,
-            action,
-            parent,
-            connection,
-            trigger_stack,
-            stack,
-        )?);
     }
     Ok(())
 }
@@ -604,48 +609,63 @@ fn trigger_environment(document: &HirDocument) -> Option<&TriggerEnvironment> {
     }
 }
 
-fn trigger_target(document: &HirDocument) -> Result<Option<TriggerTarget<'_>>> {
-    let (source_id, new_visible, old_visible, conflict, triggers) = match &document.root {
-        hir::HirRoot::Insert(root) => (
+fn trigger_targets(document: &HirDocument) -> Result<Vec<TriggerTarget<'_>>> {
+    let targets = match &document.root {
+        hir::HirRoot::Insert(root) => vec![
+            (
+                root.target,
+                true,
+                false,
+                root.conflict,
+                root.triggers.as_slice(),
+            ),
+            (
+                root.target,
+                true,
+                true,
+                Some(ResolveType::Abort),
+                root.upsert_triggers.as_slice(),
+            ),
+        ],
+        hir::HirRoot::Update(root) => vec![(
             root.target,
             true,
-            false,
-            root.conflict,
-            root.triggers.as_slice(),
-        ),
-        hir::HirRoot::Update(root) => (
-            root.target,
-            true,
             true,
             root.conflict,
             root.triggers.as_slice(),
-        ),
-        hir::HirRoot::Delete(root) => (root.target, false, true, None, root.triggers.as_slice()),
+        )],
+        hir::HirRoot::Delete(root) => {
+            vec![(root.target, false, true, None, root.triggers.as_slice())]
+        }
         hir::HirRoot::Query(_)
         | hir::HirRoot::TriggerPredicate(_)
-        | hir::HirRoot::SchemaExpressions(_) => return Ok(None),
+        | hir::HirRoot::SchemaExpressions(_) => return Ok(Vec::new()),
     };
-    if triggers.is_empty() {
-        return Ok(None);
+    let mut resolved = Vec::with_capacity(targets.len());
+    for (source_id, new_visible, old_visible, conflict, triggers) in targets {
+        if triggers.is_empty() {
+            continue;
+        }
+        let source = document
+            .source(source_id)
+            .ok_or_else(|| internal("trigger target source is missing"))?;
+        let hir::SourceKind::Table(table) = &source.kind else {
+            return Err(internal("trigger target is not a resolved table"));
+        };
+        let database_id = table
+            .database()
+            .ok_or_else(|| internal("trigger target has no database identity"))?
+            .index();
+        resolved.push(TriggerTarget {
+            database_id,
+            table: table.handle(),
+            new_visible,
+            old_visible,
+            conflict,
+            triggers,
+        });
     }
-    let source = document
-        .source(source_id)
-        .ok_or_else(|| internal("trigger target source is missing"))?;
-    let hir::SourceKind::Table(table) = &source.kind else {
-        return Err(internal("trigger target is not a resolved table"));
-    };
-    let database_id = table
-        .database()
-        .ok_or_else(|| internal("trigger target has no database identity"))?
-        .index();
-    Ok(Some(TriggerTarget {
-        database_id,
-        table: table.handle(),
-        new_visible,
-        old_visible,
-        conflict,
-        triggers,
-    }))
+    Ok(resolved)
 }
 
 fn trigger_identity(trigger: &ResolvedTrigger) -> Result<TriggerIdentity> {

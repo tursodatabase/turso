@@ -329,6 +329,25 @@ impl Analyzer<'_, '_> {
             self.analyze_dml_returning(returning_syntax, &environment, target, trigger.is_some())?;
         let triggers =
             self.resolve_dml_triggers(database_id, &table, ast::TriggerEvent::Insert, &[])?;
+        let upsert_assignments = upserts
+            .iter()
+            .filter_map(|upsert| match &upsert.action {
+                hir::UpsertAction::Update { assignments, .. } => Some(assignments.as_slice()),
+                hir::UpsertAction::Nothing => None,
+            })
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        let upsert_triggers = if upsert_assignments.is_empty() {
+            Vec::new()
+        } else {
+            self.resolve_dml_triggers(
+                database_id,
+                &table,
+                ast::TriggerEvent::Update,
+                &upsert_assignments,
+            )?
+        };
         let foreign_keys = self.resolve_dml_foreign_keys(database_id, table.get_name())?;
         Ok(hir::HirRoot::Insert(hir::Insert {
             target,
@@ -343,6 +362,7 @@ impl Analyzer<'_, '_> {
             returning,
             trigger,
             triggers,
+            upsert_triggers,
             foreign_keys,
         }))
     }

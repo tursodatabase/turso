@@ -670,6 +670,92 @@ fn dml_analysis_carries_only_triggers_matching_event_and_column_positions(tc: he
     assert_eq!(trigger_count, usize::from(expected));
 }
 
+// Examples:
+// - `INSERT INTO items VALUES (...) ON CONFLICT(c0) DO UPDATE SET c2 = excluded.c2`
+//   freezes INSERT triggers for the attempted row and `UPDATE OF c2` triggers for the
+//   conflict path;
+// - changing the assignment to `c3` must exclude the `UPDATE OF c2` trigger while
+//   keeping the INSERT trigger. This keeps both event sets explicit in the INSERT HIR.
+#[hegel::test]
+fn upsert_analysis_freezes_insert_and_update_trigger_sets_separately(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(16)));
+    let trigger_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let written_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let columns = (0..width)
+        .map(|position| {
+            if position == 0 {
+                "c0 INTEGER PRIMARY KEY".to_string()
+            } else {
+                format!("c{position} INTEGER")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = BTreeTable::from_sql(&format!("CREATE TABLE items({columns})"), 2)
+        .expect("generated table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(table))
+        .expect("generated table has a unique name");
+    schema
+        .add_trigger(
+            Trigger::new(
+                "insert_tr".to_string(),
+                "generated insert trigger".to_string(),
+                "items".to_string(),
+                Some(ast::TriggerTime::Before),
+                ast::TriggerEvent::Insert,
+                true,
+                None,
+                Vec::new(),
+                false,
+                None,
+            ),
+            "items",
+        )
+        .expect("insert trigger name is unique");
+    schema
+        .add_trigger(
+            Trigger::new(
+                "update_tr".to_string(),
+                "generated update trigger".to_string(),
+                "items".to_string(),
+                Some(ast::TriggerTime::After),
+                ast::TriggerEvent::UpdateOf(vec![ast::Name::from_string(&format!(
+                    "c{trigger_position}"
+                ))]),
+                true,
+                None,
+                Vec::new(),
+                false,
+                None,
+            ),
+            "items",
+        )
+        .expect("update trigger name is unique");
+    let symbols = SymbolTable::new();
+    let context = semantic_context(&schema, &symbols);
+    let values = (0..width)
+        .map(|position| position.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let statement = parse_statement(&format!(
+        "INSERT INTO items VALUES ({values}) ON CONFLICT(c0) DO UPDATE SET c{written_position} = excluded.c{written_position}"
+    ));
+
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated UPSERT has valid SQL meaning");
+    let HirRoot::Insert(insert) = &document.root else {
+        panic!("UPSERT analysis produces INSERT HIR");
+    };
+
+    assert_eq!(insert.triggers.len(), 1);
+    assert_eq!(
+        insert.upsert_triggers.len(),
+        usize::from(trigger_position == written_position)
+    );
+}
+
 // Example: `INSERT INTO children(c2) VALUES (1)` carries the resolved
 // `children.c2 -> parents.p3` child check, while `DELETE FROM parents` carries
 // the same constraint as an incoming parent check. Both sides use schema

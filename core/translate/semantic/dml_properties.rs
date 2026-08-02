@@ -370,6 +370,7 @@ fn dml_hir_closes_over_target_and_expression_positions(tc: hegel::TestCase) {
             returning: None,
             trigger: None,
             triggers: Vec::new(),
+            upsert_triggers: Vec::new(),
             foreign_keys: hir::DmlForeignKeys::default(),
         }),
         GeneratedDml::Update => hir::HirRoot::Update(hir::Update {
@@ -480,6 +481,7 @@ fn autoincrement_sequence_belongs_to_the_document_snapshot(tc: hegel::TestCase) 
             returning: None,
             trigger: None,
             triggers: Vec::new(),
+            upsert_triggers: Vec::new(),
             foreign_keys: hir::DmlForeignKeys::default(),
         }),
         queries: Vec::new(),
