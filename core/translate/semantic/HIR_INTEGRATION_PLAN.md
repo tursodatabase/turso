@@ -188,6 +188,8 @@ semantic error is forbidden because it would hide analyzer defects.
 
 ### 5. Delete the old representation
 
+- [x] Delete the unreachable legacy DELETE, INSERT, and UPSERT translators
+      after both root dispatchers switch to HIR; keep no compatibility fallback.
 - [ ] Remove every production use of `bind_and_rewrite_expr` and
       `BindingBehavior`, then delete `expr/binding.rs`.
 - [ ] Remove optimizer, index, integrity-check, stored-expression, DML, UPSERT,

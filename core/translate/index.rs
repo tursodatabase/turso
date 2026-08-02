@@ -15,7 +15,6 @@ use crate::translate::{
         bind_and_rewrite_expr, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
         BindingBehavior, ConditionMetadata, WalkControl,
     },
-    insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
 };
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
@@ -37,6 +36,22 @@ use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
+
+fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
+    if index.columns.len() == 1 {
+        format!("{table_name}.{}", index.columns[0].name)
+    } else {
+        format!(
+            "{table_name}.({})",
+            index
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
 
 fn canonical_create_index_sql(stmt: &ast::Stmt) -> String {
     let mut canonical_stmt = stmt.clone();

@@ -2,7 +2,6 @@ use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
-use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::vdbe::builder::SelfTableContext;
@@ -60,6 +59,23 @@ use std::num::NonZeroUsize;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert, turso_assert_eq};
 use turso_parser::ast::{ResolveType, TriggerEvent, TriggerTime};
+
+fn halt_desc_and_on_error(
+    raw_desc: &str,
+    effective: ResolveType,
+    has_statement_conflict: bool,
+) -> (String, Option<ResolveType>) {
+    if has_statement_conflict {
+        return (raw_desc.to_string(), None);
+    }
+    match effective {
+        ResolveType::Fail | ResolveType::Rollback => (
+            format!("UNIQUE constraint failed: {raw_desc} (19)"),
+            Some(effective),
+        ),
+        _ => (raw_desc.to_string(), None),
+    }
+}
 
 /// Info about position of rowid alias in the table if present + whether the current UPDATE statement will update the rowid.
 struct RowidUpdateInfo {

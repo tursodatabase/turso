@@ -22,7 +22,6 @@ use crate::{
         ROWID_SENTINEL,
     },
     translate::{
-        insert::ROWID_COLUMN,
         optimizer::{
             access_method::AccessMethodParams,
             constraints::{
@@ -50,6 +49,26 @@ use crate::{
     },
     LimboError, Result,
 };
+
+static ROWID_COLUMN: std::sync::LazyLock<Column> = std::sync::LazyLock::new(|| {
+    Column::new(
+        None,
+        String::new(),
+        None,
+        None,
+        Type::Integer,
+        None,
+        ColDef {
+            primary_key: true,
+            rowid_alias: true,
+            notnull: true,
+            explicit_notnull: false,
+            hidden: false,
+            unique: false,
+            notnull_conflict_clause: None,
+        },
+    )
+});
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
 use constraints::{
     can_use_partial_index, constraints_from_where_clause, partial_index,
