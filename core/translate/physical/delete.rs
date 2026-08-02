@@ -20,9 +20,9 @@ use crate::{
 };
 
 use super::{
-    close_indexes, emit_index_delete, emit_index_key, emit_returning_result, emit_returning_values,
-    emit_trigger_programs, open_dml_target_scan, open_indexes, record_from_cursor, CdcChange,
-    CursorId, PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError, PhysicalPlan,
+    close_indexes, emit_returning_result, emit_returning_values, emit_trigger_programs,
+    open_dml_target_scan, open_indexes, record_from_cursor, CdcChange, CursorId,
+    PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError, PhysicalPlan,
     PhysicalQueryError, PhysicalRoot, PhysicalSourceKind, PhysicalTriggerError, PreparedCdc,
     PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs, RuntimeBindingError,
     RuntimeBindings, SourceRuntime, TriggerRow, TriggerRows,
@@ -36,6 +36,7 @@ pub(crate) enum PhysicalDeleteError {
     Trigger(PhysicalTriggerError),
     ForeignKey(PhysicalForeignKeyError),
     Query(PhysicalQueryError),
+    Mutation(super::PhysicalMutationError),
     Cdc(crate::LimboError),
     Invalid(&'static str),
     Unsupported(&'static str),
@@ -50,6 +51,7 @@ impl fmt::Display for PhysicalDeleteError {
             Self::Trigger(error) => error.fmt(formatter),
             Self::ForeignKey(error) => error.fmt(formatter),
             Self::Query(error) => error.fmt(formatter),
+            Self::Mutation(error) => error.fmt(formatter),
             Self::Cdc(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical DELETE: {message}"),
             Self::Unsupported(message) => {
@@ -94,6 +96,12 @@ impl From<PhysicalForeignKeyError> for PhysicalDeleteError {
 impl From<PhysicalQueryError> for PhysicalDeleteError {
     fn from(error: PhysicalQueryError) -> Self {
         Self::Query(error)
+    }
+}
+
+impl From<super::PhysicalMutationError> for PhysicalDeleteError {
+    fn from(error: super::PhysicalMutationError) -> Self {
+        Self::Mutation(error)
     }
 }
 
@@ -303,38 +311,16 @@ pub(crate) fn emit_root_delete_with_context(
     } else {
         None
     };
-    let mut keys = Vec::with_capacity(indexes.len());
-    for index in &indexes {
-        keys.push(emit_index_key(
-            program,
-            &mut bindings,
-            delete.target,
-            rowid,
-            index,
-            false,
-        )?);
-    }
-    for (index, key) in indexes.iter().zip(&keys) {
-        emit_index_delete(program, index, key);
-    }
-    if !delete.foreign_keys.outgoing.is_empty() {
-        super::emit_delete_child_repairs(
-            program,
-            &delete.foreign_keys.outgoing,
-            &table,
-            old_columns.expect("foreign keys require the frozen OLD row"),
-            rowid,
-        )?;
-    }
-    if !delete.foreign_keys.incoming.is_empty() {
-        super::emit_delete_parent_checks(
-            program,
-            &delete.foreign_keys.incoming,
-            &table,
-            old_columns.expect("foreign keys require the frozen OLD row"),
-            rowid,
-        )?;
-    }
+    super::prepare_delete_row(
+        program,
+        &mut bindings,
+        delete.target,
+        &table,
+        &indexes,
+        rowid,
+        old_columns,
+        &delete.foreign_keys,
+    )?;
     if let Some(cdc) = cdc {
         let before = cdc
             .has_before()
@@ -349,21 +335,15 @@ pub(crate) fn emit_root_delete_with_context(
             &table.name,
         )?;
     }
-    program.emit_insn(Insn::Delete {
-        cursor_id: cursor,
-        table_name: table.name.clone(),
-        is_part_of_update: false,
-    });
-    if !delete.foreign_keys.incoming.is_empty() {
-        super::emit_delete_parent_actions(
-            program,
-            &delete.foreign_keys.incoming,
-            &table,
-            old_columns.expect("foreign keys require the frozen OLD row"),
-            rowid,
-            triggers,
-        )?;
-    }
+    super::finish_delete_row(
+        program,
+        &table,
+        cursor,
+        rowid,
+        old_columns,
+        &delete.foreign_keys,
+        triggers,
+    )?;
     if let Some(old_columns) = old_columns {
         emit_trigger_programs(
             program,

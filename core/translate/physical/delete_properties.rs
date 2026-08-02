@@ -230,9 +230,9 @@ fn delete_child_repairs_only_deferred_old_violations(tc: hegel::TestCase) {
 }
 
 // Example: after binding `DELETE FROM items WHERE c7`, direct emission must
-// read position seven from the resolved target cursor, skip false or NULL
-// rows, delete matching rows, and advance that same cursor. Dropping `Schema`
-// first proves that target and column names are never resolved again.
+// first read position seven while collecting stable target rowids, then seek
+// and delete those rows in a separate write pass. Dropping `Schema` first
+// proves that target and column names are never resolved again.
 #[hegel::test]
 fn a_simple_delete_emits_only_from_closed_hir(tc: hegel::TestCase) {
     let width = usize::from(tc.draw(generators::integers::<u8>().max_value(15))) + 1;
@@ -287,6 +287,18 @@ fn a_simple_delete_emits_only_from_closed_hir(tc: hegel::TestCase) {
             _ => None,
         })
         .expect("the resolved target is opened for writing");
+    let (rowids_open_position, rowids_cursor) = program
+        .insns
+        .iter()
+        .enumerate()
+        .find_map(|(position, (instruction, _))| match instruction {
+            Insn::OpenEphemeral {
+                cursor_id,
+                is_table: true,
+            } => Some((position, *cursor_id)),
+            _ => None,
+        })
+        .expect("DELETE freezes selected rowids before writing");
     let position_of = |predicate: &dyn Fn(&Insn) -> bool| {
         program
             .insns
@@ -294,7 +306,7 @@ fn a_simple_delete_emits_only_from_closed_hir(tc: hegel::TestCase) {
             .position(|(instruction, _)| predicate(instruction))
             .expect("expected instruction exists")
     };
-    let rewind_position = position_of(
+    let scan_rewind_position = position_of(
         &|instruction| matches!(instruction, Insn::Rewind { cursor_id, .. } if *cursor_id == cursor),
     );
     let column_position = position_of(&|instruction| {
@@ -308,6 +320,15 @@ fn a_simple_delete_emits_only_from_closed_hir(tc: hegel::TestCase) {
         )
     });
     let filter_position = position_of(&|instruction| matches!(instruction, Insn::IfNot { .. }));
+    let scan_next_position = position_of(
+        &|instruction| matches!(instruction, Insn::Next { cursor_id, .. } if *cursor_id == cursor),
+    );
+    let write_rewind_position = position_of(
+        &|instruction| matches!(instruction, Insn::Rewind { cursor_id, .. } if *cursor_id == rowids_cursor),
+    );
+    let seek_position = position_of(
+        &|instruction| matches!(instruction, Insn::NotExists { cursor: target_cursor, .. } if *target_cursor == cursor),
+    );
     let delete_position = position_of(&|instruction| {
         matches!(
             instruction,
@@ -318,27 +339,31 @@ fn a_simple_delete_emits_only_from_closed_hir(tc: hegel::TestCase) {
             } if *cursor_id == cursor && table_name == "items"
         )
     });
-    let next_position = position_of(
-        &|instruction| matches!(instruction, Insn::Next { cursor_id, .. } if *cursor_id == cursor),
+    let write_next_position = position_of(
+        &|instruction| matches!(instruction, Insn::Next { cursor_id, .. } if *cursor_id == rowids_cursor),
     );
     let close_position = position_of(
         &|instruction| matches!(instruction, Insn::Close { cursor_id } if *cursor_id == cursor),
     );
 
     assert!(
-        open_position < rewind_position
-            && rewind_position < column_position
+        open_position < rowids_open_position
+            && rowids_open_position < scan_rewind_position
+            && scan_rewind_position < column_position
             && column_position < filter_position
-            && filter_position < delete_position
-            && delete_position < next_position
-            && next_position < close_position
+            && filter_position < scan_next_position
+            && scan_next_position < write_rewind_position
+            && write_rewind_position < seek_position
+            && seek_position < delete_position
+            && delete_position < write_next_position
+            && write_next_position < close_position
     );
     assert!(matches!(
-        &program.insns[rewind_position].0,
+        &program.insns[scan_rewind_position].0,
         Insn::Rewind {
             pc_if_empty: BranchOffset::Offset(target),
             ..
-        } if *target as usize == close_position
+        } if *target as usize > filter_position
     ));
     assert!(matches!(
         &program.insns[filter_position].0,
@@ -346,10 +371,10 @@ fn a_simple_delete_emits_only_from_closed_hir(tc: hegel::TestCase) {
             target_pc: BranchOffset::Offset(target),
             jump_if_null: true,
             ..
-        } if *target as usize == next_position
+        } if *target as usize == scan_next_position
     ));
     assert!(matches!(
-        &program.insns[next_position].0,
+        &program.insns[scan_next_position].0,
         Insn::Next {
             pc_if_next: BranchOffset::Offset(target),
             ..
