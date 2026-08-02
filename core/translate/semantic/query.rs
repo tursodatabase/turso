@@ -173,6 +173,13 @@ impl Analyzer<'_, '_> {
                 crate::bail_parse_error!("no such table: {table_name}");
             }
         };
+        if self.context().trigger().is_some()
+            && table
+                .virtual_table()
+                .is_some_and(|virtual_table| !virtual_table.innocuous)
+        {
+            crate::bail_parse_error!("unsafe use of virtual table \"{table_name}\"");
+        }
         let object_id = self.catalog_object_id(
             Some(database_id),
             CatalogObjectKind::Table,
