@@ -283,6 +283,67 @@ fn row_in_lists_keep_per_position_lhs_affinity(tc: hegel::TestCase) {
     document.validate().expect("row IN metadata is closed");
 }
 
+// Example: `text_value IN (SELECT integer_value ...)` uses NUMERIC affinity,
+// so `'01'`, `'1'`, and `'1.0'` all compare equal to integer `1`. When both
+// sides are TEXT (or BLOB), neither side coerces the other and the frozen
+// comparison affinity is BLOB. This differs deliberately from an IN-list.
+#[hegel::test]
+fn in_subqueries_keep_both_sides_declared_affinity(tc: hegel::TestCase) {
+    let declared_types = [
+        ("BLOB", Affinity::Blob),
+        ("TEXT", Affinity::Text),
+        ("NUMERIC", Affinity::Numeric),
+        ("INTEGER", Affinity::Integer),
+        ("REAL", Affinity::Real),
+    ];
+    let lhs_type = tc.draw(generators::integers::<usize>().max_value(declared_types.len() - 1));
+    let rhs_type = tc.draw(generators::integers::<usize>().max_value(declared_types.len() - 1));
+    let lhs = BTreeTable::from_sql(
+        &format!(
+            "CREATE TABLE lhs_items(value {})",
+            declared_types[lhs_type].0
+        ),
+        2,
+    )
+    .expect("the generated left table is valid");
+    let rhs = BTreeTable::from_sql(
+        &format!(
+            "CREATE TABLE rhs_items(value {})",
+            declared_types[rhs_type].0
+        ),
+        3,
+    )
+    .expect("the generated right table is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(lhs))
+        .expect("the left table name is unique");
+    schema
+        .add_btree_table(Arc::new(rhs))
+        .expect("the right table name is unique");
+    let symbols = SymbolTable::new();
+    let context = semantic_context(&schema, &symbols);
+    let statement =
+        parse_statement("SELECT 1 FROM lhs_items WHERE value IN (SELECT value FROM rhs_items)");
+
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("the generated IN subquery has valid SQL meaning");
+    let Expr::Subquery(SubqueryExpr::In { comparison, .. }) = root_select_filter(&document) else {
+        panic!("the WHERE expression is a resolved IN subquery");
+    };
+    let lhs_affinity = declared_types[lhs_type].1;
+    let rhs_affinity = declared_types[rhs_type].1;
+    let expected = if lhs_affinity.is_numeric() || rhs_affinity.is_numeric() {
+        Affinity::Numeric
+    } else {
+        Affinity::Blob
+    };
+    assert_eq!(comparison.components[0].affinity, expected);
+    document
+        .validate()
+        .expect("the two-sided IN comparison facts close HIR");
+}
+
 // Examples: `c0 = c1` uses c0's declared NOCASE; `c0 = c1 COLLATE BINARY`
 // uses the right explicit BINARY; and `c0 IN (SELECT c1 COLLATE BINARY ...)`
 // keeps that explicit origin across the subquery-output boundary.

@@ -1149,6 +1149,21 @@ impl Analyzer<'_, '_> {
             .into_iter()
             .zip(outputs)
             .map(|(lhs, rhs)| {
+                let lhs_affinity = self.expression_affinity(lhs, scope);
+                let lhs_has_affinity = self.expression_has_affinity(lhs, scope);
+                let affinity = if lhs_has_affinity && rhs.has_affinity {
+                    if lhs_affinity.is_numeric() || rhs.affinity.is_numeric() {
+                        Affinity::Numeric
+                    } else {
+                        Affinity::Blob
+                    }
+                } else if lhs_has_affinity {
+                    lhs_affinity
+                } else if rhs.has_affinity {
+                    rhs.affinity
+                } else {
+                    Affinity::Blob
+                };
                 let (lhs_explicit, lhs_implicit) = self.expression_collation_parts(lhs, scope);
                 let (rhs_explicit, rhs_implicit) = if rhs.collation_is_explicit {
                     (rhs.collation.clone(), None)
@@ -1156,8 +1171,9 @@ impl Analyzer<'_, '_> {
                     (None, rhs.collation.clone())
                 };
                 hir::ComparisonComponent {
-                    // SQLite's IN affinity is set by the left-hand expression.
-                    affinity: self.expression_affinity(lhs, scope),
+                    // IN-subquery compares columns like `lhs = rhs`; unlike an
+                    // IN-list, the selected output keeps its own affinity.
+                    affinity,
                     collation: lhs_explicit
                         .or(rhs_explicit)
                         .or(lhs_implicit)

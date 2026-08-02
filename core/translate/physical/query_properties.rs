@@ -2042,7 +2042,8 @@ fn distinct_uses_frozen_output_collations_before_offset_and_limit(tc: hegel::Tes
 // (SELECT inner_items.c1 FROM inner_items
 //  WHERE inner_items.c2 = outer_items.c3) FROM outer_items` must rebuild the
 // correlated row set inside the outer loop, read the exact captured outer
-// column, and compare membership with the HIR-frozen NOCASE/Text rule. The
+// column, and compare membership with HIR-frozen NOCASE affinity rules. A
+// TEXT RHS uses no coercion; an INTEGER RHS makes the comparison NUMERIC. The
 // row-set scan must retain SQL's FALSE/TRUE/NULL outcomes.
 #[hegel::test]
 fn correlated_in_subqueries_use_captures_and_frozen_comparison_facts(tc: hegel::TestCase) {
@@ -2051,13 +2052,19 @@ fn correlated_in_subqueries_use_captures_and_frozen_comparison_facts(tc: hegel::
     let rhs_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
     let inner_filter = tc.draw(generators::integers::<usize>().max_value(width - 1));
     let outer_capture = tc.draw(generators::integers::<usize>().max_value(width - 1));
-    let columns = (0..width)
+    let outer_columns = (0..width)
         .map(|position| format!("c{position} TEXT"))
         .collect::<Vec<_>>()
         .join(", ");
-    let outer = BTreeTable::from_sql(&format!("CREATE TABLE outer_items({columns})"), 7)
+    let rhs_numeric = tc.draw(generators::booleans());
+    let rhs_type = if rhs_numeric { "INTEGER" } else { "TEXT" };
+    let inner_columns = (0..width)
+        .map(|position| format!("c{position} {rhs_type}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let outer = BTreeTable::from_sql(&format!("CREATE TABLE outer_items({outer_columns})"), 7)
         .expect("generated outer table SQL is valid");
-    let inner = BTreeTable::from_sql(&format!("CREATE TABLE inner_items({columns})"), 13)
+    let inner = BTreeTable::from_sql(&format!("CREATE TABLE inner_items({inner_columns})"), 13)
         .expect("generated inner table SQL is valid");
     let mut schema = Schema::new();
     schema
@@ -2182,7 +2189,14 @@ fn correlated_in_subqueries_use_captures_and_frozen_comparison_facts(tc: hegel::
             _ => None,
         })
         .expect("membership uses the frozen explicit collation");
-    assert_eq!(comparison.1.get_affinity(), Affinity::Text);
+    assert_eq!(
+        comparison.1.get_affinity(),
+        if rhs_numeric {
+            Affinity::Numeric
+        } else {
+            Affinity::Blob
+        }
+    );
     let row_set_next = program
         .insns
         .iter()
