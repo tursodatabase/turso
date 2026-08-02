@@ -12,9 +12,11 @@ use crate::{
 };
 
 use super::{
-    emit_complete_logical_row, emit_stored_record, ExpressionEmitter, PhysicalExpressionError,
-    PhysicalPlan, PhysicalRoot, PhysicalRowError, PhysicalSourceKind, RegisterId, RegisterRange,
-    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
+    close_indexes, emit_check_constraints, emit_complete_logical_row, emit_index_insert,
+    emit_index_key, emit_stored_record, emit_unique_check, open_indexes, ExpressionEmitter,
+    OpenedIndex, PhysicalExpressionError, PhysicalIndexError, PhysicalPlan, PhysicalRoot,
+    PhysicalRowError, PhysicalSourceKind, RegisterId, RegisterRange, RuntimeBindingError,
+    RuntimeBindings, SourceRuntime, TableAccess,
 };
 
 #[derive(Debug)]
@@ -22,6 +24,7 @@ pub(crate) enum PhysicalInsertError {
     Runtime(RuntimeBindingError),
     Expression(PhysicalExpressionError),
     Row(PhysicalRowError),
+    Index(PhysicalIndexError),
     Invalid(&'static str),
     Unsupported(&'static str),
 }
@@ -32,6 +35,7 @@ impl fmt::Display for PhysicalInsertError {
             Self::Runtime(error) => error.fmt(formatter),
             Self::Expression(error) => error.fmt(formatter),
             Self::Row(error) => error.fmt(formatter),
+            Self::Index(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical INSERT: {message}"),
             Self::Unsupported(message) => {
                 write!(formatter, "physical INSERT is not emitted yet: {message}")
@@ -57,6 +61,12 @@ impl From<PhysicalExpressionError> for PhysicalInsertError {
 impl From<PhysicalRowError> for PhysicalInsertError {
     fn from(error: PhysicalRowError) -> Self {
         Self::Row(error)
+    }
+}
+
+impl From<PhysicalIndexError> for PhysicalInsertError {
+    fn from(error: PhysicalIndexError) -> Self {
+        Self::Index(error)
     }
 }
 
@@ -92,6 +102,7 @@ pub(crate) fn emit_root_insert(
         root_page: RegisterOrLiteral::Literal(table.root_page),
         db: database,
     });
+    let indexes = open_indexes(program, source, database)?;
 
     match &insert.source {
         InsertSource::DefaultValues => {
@@ -104,6 +115,7 @@ pub(crate) fn emit_root_insert(
                 logical,
                 rowid,
                 record,
+                &indexes,
                 &[],
             )?;
         }
@@ -118,6 +130,7 @@ pub(crate) fn emit_root_insert(
                     logical,
                     rowid,
                     record,
+                    &indexes,
                     row,
                 )?;
             }
@@ -126,6 +139,7 @@ pub(crate) fn emit_root_insert(
             return Err(PhysicalInsertError::Unsupported("INSERT SELECT"));
         }
     }
+    close_indexes(program, &indexes);
     program.emit_insn(Insn::Close { cursor_id: cursor });
     Ok(())
 }
@@ -140,6 +154,7 @@ fn emit_insert_row(
     logical: RegisterRange,
     rowid: RegisterId,
     record: usize,
+    indexes: &[OpenedIndex<'_>],
     values: &[hir::Expr],
 ) -> InsertResult<()> {
     if values.len() != insert.columns.len() {
@@ -187,7 +202,17 @@ fn emit_insert_row(
         });
     }
     emit_complete_logical_row(program, bindings, insert.target, table, logical)?;
+    emit_check_constraints(program, bindings, insert.target)?;
+    let mut keys = Vec::with_capacity(indexes.len());
+    for index in indexes {
+        let key = emit_index_key(program, bindings, insert.target, rowid, index, true)?;
+        emit_unique_check(program, index, &key, None)?;
+        keys.push(key);
+    }
     emit_stored_record(program, bindings, insert.target, table, logical, record)?;
+    for (index, key) in indexes.iter().zip(&keys) {
+        emit_index_insert(program, index, key)?;
+    }
     program.emit_insn(Insn::Insert {
         cursor,
         key_reg: rowid.0,
@@ -229,20 +254,15 @@ fn preflight_insert<'plan>(
         .document
         .source(insert.target)
         .ok_or(PhysicalInsertError::Invalid("target source is missing"))?;
-    let IndexCoverage::Complete { indexes } = &source.index_coverage else {
+    let IndexCoverage::Complete { indexes: _ } = &source.index_coverage else {
         return Err(PhysicalInsertError::Invalid(
             "target does not carry complete index metadata",
         ));
     };
-    if !indexes.is_empty() || !source.index_method_patterns.is_empty() {
-        return Err(PhysicalInsertError::Unsupported("secondary indexes"));
-    }
-    if source
-        .check_constraints
-        .as_ref()
-        .is_some_and(|checks| !checks.is_empty())
-    {
-        return Err(PhysicalInsertError::Unsupported("CHECK constraints"));
+    if source.check_constraints.is_none() {
+        return Err(PhysicalInsertError::Invalid(
+            "target does not carry CHECK metadata",
+        ));
     }
     let physical = plan
         .source(insert.target)

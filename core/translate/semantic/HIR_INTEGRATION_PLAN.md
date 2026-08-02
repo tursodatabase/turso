@@ -95,19 +95,26 @@ operations are not SQL binding.
   - [x] Simple rowid B-tree UPDATE uses a stable HIR rowid set, evaluates
         assignments against OLD, and rebuilds the complete NEW row through the
         shared row-image layer.
-  - [ ] Secondary indexes, RETURNING, UPDATE FROM, triggers, and foreign keys.
+  - [x] Ordinary, expression, partial, and UNIQUE secondary indexes preserve
+        SQLite's prepare-before-write mutation order through one shared HIR
+        index layer.
+  - [ ] RETURNING, UPDATE FROM, triggers, and foreign keys.
 - [ ] INSERT, VALUES, INSERT SELECT, UPSERT, excluded, defaults, and RETURNING.
   - [x] VALUES and DEFAULT VALUES build supplied fields, frozen defaults, and
         generated columns through the shared row-image layer for simple rowid
         B-tree targets.
-  - [ ] INSERT SELECT, explicit rowids, constraints, UPSERT/excluded, and
-        RETURNING.
+  - [x] CHECK and UNIQUE constraints run against the complete frozen-HIR row
+        before any mutation.
+  - [ ] INSERT SELECT, explicit rowids, remaining constraints,
+        UPSERT/excluded, and RETURNING.
 - [ ] Trigger commands and predicates with explicit OLD/NEW runtime bindings.
 - [ ] Generated columns, defaults, CHECK constraints, expression and partial
       indexes, and custom-type schema programs.
   - [x] Generated/default reads and generated/default DML row construction use
         only frozen HIR expressions, including logical-to-physical record
         mapping for virtual columns.
+  - [x] CHECK constraints plus ordinary, expression, partial, and UNIQUE index
+        programs execute only from frozen HIR metadata.
 
 One syntax root uses exactly one semantic implementation. Falling back after a
 semantic error is forbidden because it would hide analyzer defects.

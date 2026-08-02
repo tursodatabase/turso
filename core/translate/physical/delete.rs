@@ -18,8 +18,9 @@ use crate::{
 };
 
 use super::{
-    CursorId, ExpressionEmitter, PhysicalExpressionError, PhysicalPlan, PhysicalQueryError,
-    PhysicalRoot, PhysicalSourceKind, RuntimeBindingError, RuntimeBindings, SourceRuntime,
+    close_indexes, emit_index_delete, emit_index_key, open_indexes, CursorId, ExpressionEmitter,
+    PhysicalExpressionError, PhysicalIndexError, PhysicalPlan, PhysicalQueryError, PhysicalRoot,
+    PhysicalSourceKind, RegisterId, RuntimeBindingError, RuntimeBindings, SourceRuntime,
     TableAccess,
 };
 
@@ -27,6 +28,7 @@ use super::{
 pub(crate) enum PhysicalDeleteError {
     Runtime(RuntimeBindingError),
     Expression(PhysicalExpressionError),
+    Index(PhysicalIndexError),
     Invalid(&'static str),
     Unsupported(&'static str),
 }
@@ -36,6 +38,7 @@ impl fmt::Display for PhysicalDeleteError {
         match self {
             Self::Runtime(error) => error.fmt(formatter),
             Self::Expression(error) => error.fmt(formatter),
+            Self::Index(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical DELETE: {message}"),
             Self::Unsupported(message) => {
                 write!(formatter, "physical DELETE is not emitted yet: {message}")
@@ -55,6 +58,12 @@ impl From<RuntimeBindingError> for PhysicalDeleteError {
 impl From<PhysicalExpressionError> for PhysicalDeleteError {
     fn from(error: PhysicalExpressionError) -> Self {
         Self::Expression(error)
+    }
+}
+
+impl From<PhysicalIndexError> for PhysicalDeleteError {
+    fn from(error: PhysicalIndexError) -> Self {
+        Self::Index(error)
     }
 }
 
@@ -118,7 +127,7 @@ pub(crate) fn emit_root_delete(
         PhysicalRoot::Delete(delete) => *delete,
         _ => return Err(PhysicalDeleteError::Unsupported("non-DELETE HIR root")),
     };
-    let (table, database) = preflight_delete(plan, delete)?;
+    let (source, table, database) = preflight_delete(plan, delete)?;
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     let mut bindings = RuntimeBindings::new(plan.document, plan.document.snapshot)?;
     bindings.bind_source(delete.target, SourceRuntime::Cursor(CursorId(cursor)))?;
@@ -128,6 +137,8 @@ pub(crate) fn emit_root_delete(
         root_page: RegisterOrLiteral::Literal(table.root_page),
         db: database,
     });
+    let indexes = open_indexes(program, source, database)?;
+    let rowid = RegisterId(program.alloc_register());
     let loop_start = program.allocate_label();
     let loop_next = program.allocate_label();
     let loop_end = program.allocate_label();
@@ -147,6 +158,24 @@ pub(crate) fn emit_root_delete(
             jump_if_null: true,
         });
     }
+    program.emit_insn(Insn::RowId {
+        cursor_id: cursor,
+        dest: rowid.0,
+    });
+    let mut keys = Vec::with_capacity(indexes.len());
+    for index in &indexes {
+        keys.push(emit_index_key(
+            program,
+            &mut bindings,
+            delete.target,
+            rowid,
+            index,
+            false,
+        )?);
+    }
+    for (index, key) in indexes.iter().zip(&keys) {
+        emit_index_delete(program, index, key);
+    }
     program.emit_insn(Insn::Delete {
         cursor_id: cursor,
         table_name: table.name.clone(),
@@ -158,14 +187,19 @@ pub(crate) fn emit_root_delete(
         pc_if_next: loop_start,
     });
     program.preassign_label_to_next_insn(loop_end);
+    close_indexes(program, &indexes);
     program.emit_insn(Insn::Close { cursor_id: cursor });
     Ok(())
 }
 
-fn preflight_delete(
-    plan: &PhysicalPlan<'_>,
+fn preflight_delete<'plan>(
+    plan: &'plan PhysicalPlan<'plan>,
     delete: &crate::translate::semantic::hir::Delete,
-) -> DeleteResult<(crate::sync::Arc<crate::schema::BTreeTable>, usize)> {
+) -> DeleteResult<(
+    &'plan crate::translate::semantic::hir::Source,
+    crate::sync::Arc<crate::schema::BTreeTable>,
+    usize,
+)> {
     if !delete.order_by.is_empty() || delete.limit.is_some() {
         return Err(PhysicalDeleteError::Unsupported("ORDER BY or LIMIT"));
     }
@@ -191,14 +225,11 @@ fn preflight_delete(
             "target is not a catalog table",
         ));
     }
-    let IndexCoverage::Complete { indexes } = &source.index_coverage else {
+    let IndexCoverage::Complete { indexes: _ } = &source.index_coverage else {
         return Err(PhysicalDeleteError::Invalid(
             "target does not carry complete index metadata",
         ));
     };
-    if !indexes.is_empty() || !source.index_expressions.is_empty() {
-        return Err(PhysicalDeleteError::Unsupported("secondary indexes"));
-    }
     if !source.index_method_patterns.is_empty() {
         return Err(PhysicalDeleteError::Unsupported("custom index methods"));
     }
@@ -227,7 +258,7 @@ fn preflight_delete(
     if !table.has_rowid {
         return Err(PhysicalDeleteError::Unsupported("WITHOUT ROWID target"));
     }
-    Ok((table.clone(), database))
+    Ok((source, table.clone(), database))
 }
 
 fn contains_subquery(expression: &Expr) -> bool {

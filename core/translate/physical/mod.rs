@@ -5,6 +5,7 @@
 
 mod delete;
 mod expression;
+mod index;
 mod insert;
 mod plan;
 mod query;
@@ -14,6 +15,7 @@ mod update;
 
 pub(crate) use delete::*;
 pub(crate) use expression::*;
+pub(crate) use index::*;
 pub(crate) use insert::*;
 pub(crate) use plan::*;
 pub(crate) use query::*;
@@ -31,10 +33,16 @@ mod expression_properties;
 mod insert_properties;
 
 #[cfg(test)]
+mod index_properties;
+
+#[cfg(test)]
 mod query_properties;
 
 #[cfg(test)]
 mod runtime_binding_properties;
+
+#[cfg(test)]
+mod row_properties;
 
 #[cfg(test)]
 mod update_properties;

@@ -12,9 +12,11 @@ use crate::{
 };
 
 use super::{
-    emit_complete_logical_row, emit_stored_record, CursorId, ExpressionEmitter,
-    PhysicalExpressionError, PhysicalPlan, PhysicalRoot, PhysicalRowError, PhysicalSourceKind,
-    RegisterId, RegisterRange, RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
+    close_indexes, emit_check_constraints, emit_complete_logical_row, emit_index_delete,
+    emit_index_insert, emit_index_key, emit_stored_record, emit_unique_check, open_indexes,
+    CursorId, ExpressionEmitter, PhysicalExpressionError, PhysicalIndexError, PhysicalPlan,
+    PhysicalRoot, PhysicalRowError, PhysicalSourceKind, RegisterId, RegisterRange,
+    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
 };
 
 #[derive(Debug)]
@@ -22,6 +24,7 @@ pub(crate) enum PhysicalUpdateError {
     Runtime(RuntimeBindingError),
     Expression(PhysicalExpressionError),
     Row(PhysicalRowError),
+    Index(PhysicalIndexError),
     Invalid(&'static str),
     Unsupported(&'static str),
 }
@@ -32,6 +35,7 @@ impl fmt::Display for PhysicalUpdateError {
             Self::Runtime(error) => error.fmt(formatter),
             Self::Expression(error) => error.fmt(formatter),
             Self::Row(error) => error.fmt(formatter),
+            Self::Index(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical UPDATE: {message}"),
             Self::Unsupported(message) => {
                 write!(formatter, "physical UPDATE is not emitted yet: {message}")
@@ -57,6 +61,12 @@ impl From<PhysicalExpressionError> for PhysicalUpdateError {
 impl From<PhysicalRowError> for PhysicalUpdateError {
     fn from(error: PhysicalRowError) -> Self {
         Self::Row(error)
+    }
+}
+
+impl From<PhysicalIndexError> for PhysicalUpdateError {
+    fn from(error: PhysicalIndexError) -> Self {
+        Self::Index(error)
     }
 }
 
@@ -91,6 +101,7 @@ pub(crate) fn emit_root_update(
         root_page: RegisterOrLiteral::Literal(table.root_page),
         db: database,
     });
+    let indexes = open_indexes(program, source, database)?;
 
     let scan_start = program.allocate_label();
     let scan_next = program.allocate_label();
@@ -173,6 +184,18 @@ pub(crate) fn emit_root_update(
         }
     }
 
+    let mut old_keys = Vec::with_capacity(indexes.len());
+    for index in &indexes {
+        old_keys.push(emit_index_key(
+            program,
+            &mut bindings,
+            update.target,
+            rowid,
+            index,
+            false,
+        )?);
+    }
+
     let old_runtime = bindings.replace_source(
         update.target,
         SourceRuntime::Registers {
@@ -181,6 +204,13 @@ pub(crate) fn emit_root_update(
         },
     )?;
     emit_complete_logical_row(program, &mut bindings, update.target, &table, logical)?;
+    emit_check_constraints(program, &mut bindings, update.target)?;
+    let mut new_keys = Vec::with_capacity(indexes.len());
+    for index in &indexes {
+        let key = emit_index_key(program, &mut bindings, update.target, rowid, index, true)?;
+        emit_unique_check(program, index, &key, Some(rowid))?;
+        new_keys.push(key);
+    }
     emit_stored_record(
         program,
         &mut bindings,
@@ -191,11 +221,17 @@ pub(crate) fn emit_root_update(
     )?;
     bindings.replace_source(update.target, old_runtime)?;
 
+    for (index, key) in indexes.iter().zip(&old_keys) {
+        emit_index_delete(program, index, key);
+    }
     program.emit_insn(Insn::Delete {
         cursor_id: cursor,
         table_name: table.name.clone(),
         is_part_of_update: true,
     });
+    for (index, key) in indexes.iter().zip(&new_keys) {
+        emit_index_insert(program, index, key)?;
+    }
     program.emit_insn(Insn::Insert {
         cursor,
         key_reg: rowid.0,
@@ -208,6 +244,7 @@ pub(crate) fn emit_root_update(
         target_pc: write_start,
     });
     program.preassign_label_to_next_insn(write_done);
+    close_indexes(program, &indexes);
     program.emit_insn(Insn::Close { cursor_id: cursor });
     Ok(())
 }
@@ -250,20 +287,15 @@ fn preflight_update<'plan>(
         .document
         .source(update.target)
         .ok_or(PhysicalUpdateError::Invalid("target source is missing"))?;
-    let IndexCoverage::Complete { indexes } = &source.index_coverage else {
+    let IndexCoverage::Complete { indexes: _ } = &source.index_coverage else {
         return Err(PhysicalUpdateError::Invalid(
             "target does not carry complete index metadata",
         ));
     };
-    if !indexes.is_empty() || !source.index_method_patterns.is_empty() {
-        return Err(PhysicalUpdateError::Unsupported("secondary indexes"));
-    }
-    if source
-        .check_constraints
-        .as_ref()
-        .is_some_and(|checks| !checks.is_empty())
-    {
-        return Err(PhysicalUpdateError::Unsupported("CHECK constraints"));
+    if source.check_constraints.is_none() {
+        return Err(PhysicalUpdateError::Invalid(
+            "target does not carry CHECK metadata",
+        ));
     }
     let physical = plan
         .source(update.target)

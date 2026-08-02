@@ -2,7 +2,10 @@
 
 use std::fmt;
 
+use turso_parser::ast::ResolveType;
+
 use crate::{
+    error::SQLITE_CONSTRAINT_CHECK,
     schema::BTreeTable,
     translate::semantic::hir::{self, ColumnReadExpression},
     vdbe::{
@@ -93,6 +96,46 @@ pub(crate) fn emit_complete_logical_row(
             logical.first.0 + position,
             source_affinity(bindings, source, position)?,
         );
+    }
+    Ok(())
+}
+
+/// Enforce every CHECK program frozen for this exact DML source. SQLite CHECK
+/// succeeds for true or NULL and fails only for false.
+pub(crate) fn emit_check_constraints(
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
+    source: hir::SourceId,
+) -> RowResult<()> {
+    let checks = bindings
+        .document()
+        .source(source)
+        .and_then(|source| source.check_constraints.as_ref())
+        .ok_or(PhysicalRowError::Invalid(
+            "DML target does not carry CHECK metadata",
+        ))?;
+    for check in checks {
+        let result = ExpressionEmitter::new(program, bindings).emit_new(&check.expression)?;
+        if result.width != 1 {
+            return Err(PhysicalRowError::Invalid("CHECK result is not scalar"));
+        }
+        let passed = program.allocate_label();
+        program.emit_insn(Insn::IsNull {
+            reg: result.first.0,
+            target_pc: passed,
+        });
+        program.emit_insn(Insn::If {
+            reg: result.first.0,
+            target_pc: passed,
+            jump_if_null: false,
+        });
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_CHECK,
+            description: check.description.clone(),
+            on_error: Some(ResolveType::Abort),
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(passed);
     }
     Ok(())
 }
