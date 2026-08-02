@@ -1,4 +1,6 @@
 use crate::alloc::TursoIteratorExt;
+pub use crate::translate::expr::ConstraintOperator;
+pub use crate::translate::plan::{BinaryExprSide, SeekRangeConstraint};
 use crate::{
     schema::{Column, Index, Schema},
     translate::{
@@ -89,34 +91,6 @@ pub struct Constraint {
     /// not yet plumb per-column affinity into the index-selection path, so
     /// such constraints fall through to scans).
     pub comparison_affinity: Option<Affinity>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ConstraintOperator {
-    AstNativeOperator(ast::Operator),
-    Like { not: bool },
-    In { not: bool, estimated_values: f64 },
-}
-
-impl ConstraintOperator {
-    pub fn as_ast_operator(&self) -> Option<ast::Operator> {
-        let ConstraintOperator::AstNativeOperator(op) = self else {
-            return None;
-        };
-        Some(*op)
-    }
-}
-
-impl From<ast::Operator> for ConstraintOperator {
-    fn from(op: ast::Operator) -> Self {
-        ConstraintOperator::AstNativeOperator(op)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BinaryExprSide {
-    Lhs,
-    Rhs,
 }
 
 impl Constraint {
@@ -1028,39 +1002,6 @@ pub struct RangeConstraintRef {
     pub lower_bound: Option<usize>,
     /// upper bound constraint (either < or <=)
     pub upper_bound: Option<usize>,
-}
-
-#[derive(Debug, Clone)]
-/// Represent seek range which can be used in query planning to emit range scan over table or index
-pub struct SeekRangeConstraint {
-    pub sort_order: SortOrder,
-    pub eq: Option<(ast::Operator, ast::Expr, Affinity)>,
-    pub lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
-    pub upper_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
-}
-
-impl SeekRangeConstraint {
-    pub fn new_eq(sort_order: SortOrder, eq: (ast::Operator, ast::Expr, Affinity)) -> Self {
-        Self {
-            sort_order,
-            eq: Some(eq),
-            lower_bound: None,
-            upper_bound: None,
-        }
-    }
-    pub fn new_range(
-        sort_order: SortOrder,
-        lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
-        upper_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
-    ) -> Self {
-        turso_assert!(lower_bound.is_some() || upper_bound.is_some());
-        Self {
-            sort_order,
-            eq: None,
-            lower_bound,
-            upper_bound,
-        }
-    }
 }
 
 impl RangeConstraintRef {

@@ -1,6 +1,7 @@
 use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
+use crate::schema::ROWID_STRS;
 use crate::translate::emitter::emit_columns_and_dependencies;
 use crate::translate::expr::emit_table_column_for_dml;
 use crate::translate::plan::ColumnMask;
@@ -8,7 +9,7 @@ use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef},
     sync::{Arc, OnceLock, Weak},
-    translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
+    translate::{collate::CollationSeq, emitter::Resolver},
     vdbe::{
         builder::{CursorType, DmlColumnContext, QueryMode},
         insn::{CmpInsFlags, Insn, Subprogram},

@@ -1,5 +1,59 @@
 use super::*;
 
+pub(crate) fn single_table_column_usage(
+    expr: &ast::Expr,
+) -> Option<(TableInternalId, crate::translate::plan::ColumnUsedMask)> {
+    let mut table_id = None;
+    let mut columns = crate::translate::plan::ColumnUsedMask::default();
+    let mut valid = true;
+    let _ = walk_expr(expr, &mut |node| {
+        if let ast::Expr::Column { table, column, .. } = node {
+            if table_id.is_some_and(|existing| existing != *table) {
+                valid = false;
+                return Ok(WalkControl::SkipChildren);
+            }
+            table_id = Some(*table);
+            columns.set(*column)?;
+        }
+        Ok(WalkControl::Continue)
+    });
+    valid
+        .then_some(table_id)
+        .flatten()
+        .map(|table| (table, columns))
+}
+
+pub(crate) fn normalize_expr_for_index_matching(
+    expr: &ast::Expr,
+    table_reference: &crate::translate::plan::JoinedTable,
+    table_references: &TableReferences,
+) -> ast::Expr {
+    let mut normalized = expr.clone();
+    assert!(
+        table_references
+            .joined_tables()
+            .iter()
+            .any(|table| table.internal_id == table_reference.internal_id),
+        "expression-index table must belong to its table set"
+    );
+    let columns = table_reference.table.columns();
+    let _ = walk_expr_mut(&mut normalized, &mut |node| {
+        match node {
+            ast::Expr::Column { column, .. } => {
+                if let Some(name) = columns.get(*column).and_then(|column| column.name.as_ref()) {
+                    *node = ast::Expr::Id(ast::Name::exact(name.clone()));
+                }
+            }
+            ast::Expr::RowId { .. } => {
+                *node = ast::Expr::Id(ast::Name::exact(crate::schema::ROWID_STRS[0].to_string()));
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+    normalized
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ConditionMetadata {
     pub jump_if_condition_is_true: bool,

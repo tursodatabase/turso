@@ -3,6 +3,7 @@ use crate::HashMap;
 
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
+use crate::schema::ROWID_STRS;
 use crate::schema::{
     create_table, translate_ident_to_string_literal, BTreeCharacteristics, BTreeTable, ColDef,
     Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME,
@@ -16,7 +17,6 @@ use crate::translate::emitter::{
 };
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
-use crate::translate::planner::ROWID_STRS;
 use crate::translate::{
     physical::{emit_root_query_into_ephemeral, ephemeral_table, PhysicalPlan},
     semantic::{analyze, context::SemanticContext, hir, AnalyzeInput},

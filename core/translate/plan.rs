@@ -1,27 +1,27 @@
 use crate::{
+    MAIN_DB_ID, Result, VirtualTable,
     alloc::{self, TursoIteratorExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
     schema::{
-        BTreeTable, ColDef, Column, FromClauseSubquery, Index, PseudoCursorType, RecursiveCteInput,
-        Schema, Table, Type, ROWID_SENTINEL,
+        BTreeTable, ColDef, Column, FromClauseSubquery, Index, PseudoCursorType, ROWID_SENTINEL,
+        RecursiveCteInput, Schema, Table, Type,
     },
     translate::{
-        collate::{get_collseq_from_expr, CollationSeq},
+        collate::{CollationSeq, get_collseq_from_expr},
         emitter::UpdateRowSource,
-        expr::{as_binary_components, expr_data_type, get_expr_affinity, StorageClassMask},
-        expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
-        optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
-        planner::determine_where_to_eval_term,
+        expr::{
+            StorageClassMask, WalkControl, as_binary_components, expr_data_type, get_expr_affinity,
+            normalize_expr_for_index_matching, single_table_column_usage, walk_expr,
+        },
     },
     types::SeekOp,
     util::exprs_are_equivalent,
     vdbe::{
+        BranchOffset, CursorID,
         affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{HashDistinctData, Insn},
-        BranchOffset, CursorID,
     },
-    Result, VirtualTable, MAIN_DB_ID,
 };
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
@@ -237,10 +237,8 @@ impl WhereTerm {
         if self.consumed {
             return false;
         }
-        let Ok(eval_at) = self.eval_at(join_order, subqueries, table_references) else {
-            return false;
-        };
-        eval_at == EvalAt::BeforeLoop
+        self.eval_at(join_order, subqueries, table_references)
+            .is_ok_and(|eval_at| eval_at == EvalAt::BeforeLoop)
     }
 
     pub fn should_eval_at_loop(
@@ -253,10 +251,8 @@ impl WhereTerm {
         if self.consumed {
             return false;
         }
-        let Ok(eval_at) = self.eval_at(join_order, subqueries, table_references) else {
-            return false;
-        };
-        eval_at == EvalAt::Loop(loop_idx)
+        self.eval_at(join_order, subqueries, table_references)
+            .is_ok_and(|eval_at| eval_at == EvalAt::Loop(loop_idx))
     }
 
     fn eval_at(
@@ -265,7 +261,13 @@ impl WhereTerm {
         subqueries: &[NonFromClauseSubquery],
         table_references: Option<&TableReferences>,
     ) -> Result<EvalAt> {
-        determine_where_to_eval_term(self, join_order, subqueries, table_references)
+        determine_where_to_eval_expr(
+            self.from_outer_join,
+            &self.expr,
+            join_order,
+            subqueries,
+            table_references,
+        )
     }
 }
 
@@ -290,6 +292,97 @@ impl From<Expr> for WhereTerm {
 pub enum EvalAt {
     Loop(usize),
     BeforeLoop,
+}
+
+fn determine_where_to_eval_expr(
+    outer_join_source: Option<TableInternalId>,
+    expression: &Expr,
+    join_order: &[JoinOrderMember],
+    subqueries: &[NonFromClauseSubquery],
+    table_references: Option<&TableReferences>,
+) -> Result<EvalAt> {
+    if let Some(source) = outer_join_source {
+        return Ok(EvalAt::Loop(
+            join_order
+                .iter()
+                .position(|member| member.table_id == source)
+                .unwrap_or(usize::MAX),
+        ));
+    }
+
+    let mut eval_at = EvalAt::BeforeLoop;
+    walk_expr(expression, &mut |node| {
+        match node {
+            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
+                if let Some(position) = join_order
+                    .iter()
+                    .position(|member| member.table_id == *table)
+                {
+                    eval_at = eval_at.max(EvalAt::Loop(position));
+                } else if let Some(tables) = table_references {
+                    for (probe_position, member) in join_order.iter().enumerate() {
+                        let probe = &tables.joined_tables()[member.original_idx];
+                        if let Operation::HashJoin(hash) = &probe.op {
+                            let build = &tables.joined_tables()[hash.build_table_idx];
+                            if build.internal_id == *table {
+                                eval_at = eval_at.max(EvalAt::Loop(probe_position));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            Expr::SubqueryResult { subquery_id, .. } => {
+                let subquery = subqueries
+                    .iter()
+                    .find(|subquery| subquery.internal_id == *subquery_id)
+                    .ok_or_else(|| {
+                        crate::LimboError::InternalError(
+                            "subquery is missing from its plan".to_string(),
+                        )
+                    })?;
+                match &subquery.state {
+                    SubqueryState::Evaluated { evaluated_at, .. } => {
+                        eval_at = eval_at.max(*evaluated_at);
+                    }
+                    SubqueryState::Unevaluated { plan } => {
+                        let plan = plan.as_ref().ok_or_else(|| {
+                            crate::LimboError::InternalError(
+                                "unevaluated subquery has no plan".to_string(),
+                            )
+                        })?;
+                        for outer in plan.used_outer_query_ref_ids() {
+                            let position = join_order
+                                .iter()
+                                .position(|member| member.table_id == outer)
+                                .or_else(|| {
+                                    let tables = table_references?;
+                                    join_order.iter().enumerate().find_map(
+                                        |(probe_position, member)| {
+                                            let probe =
+                                                &tables.joined_tables()[member.original_idx];
+                                            let Operation::HashJoin(hash) = &probe.op else {
+                                                return None;
+                                            };
+                                            (tables.joined_tables()[hash.build_table_idx]
+                                                .internal_id
+                                                == outer)
+                                                .then_some(probe_position)
+                                        },
+                                    )
+                                });
+                            if let Some(position) = position {
+                                eval_at = eval_at.max(EvalAt::Loop(position));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(eval_at)
 }
 
 #[allow(clippy::non_canonical_partial_ord_impl)]
@@ -2108,6 +2201,12 @@ pub struct HashJoinKey {
     pub build_side: BinaryExprSide,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryExprSide {
+    Lhs,
+    Rhs,
+}
+
 impl HashJoinKey {
     /// Get the build table's expression from the WHERE clause.
     pub fn get_build_expr<'a>(&self, where_clause: &'a [WhereTerm]) -> &'a ast::Expr {
@@ -2868,6 +2967,39 @@ pub struct SeekDef {
     pub end: SeekKey,
     /// The direction of the scan that follows the seek.
     pub iter_dir: IterationDirection,
+}
+
+#[derive(Debug, Clone)]
+pub struct SeekRangeConstraint {
+    pub sort_order: SortOrder,
+    pub eq: Option<(ast::Operator, ast::Expr, Affinity)>,
+    pub lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
+    pub upper_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
+}
+
+impl SeekRangeConstraint {
+    pub fn new_eq(sort_order: SortOrder, eq: (ast::Operator, ast::Expr, Affinity)) -> Self {
+        Self {
+            sort_order,
+            eq: Some(eq),
+            lower_bound: None,
+            upper_bound: None,
+        }
+    }
+
+    pub fn new_range(
+        sort_order: SortOrder,
+        lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
+        upper_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
+    ) -> Self {
+        assert!(lower_bound.is_some() || upper_bound.is_some());
+        Self {
+            sort_order,
+            eq: None,
+            lower_bound,
+            upper_bound,
+        }
+    }
 }
 
 pub struct SeekDefKeyIterator<'a, T> {
@@ -3746,8 +3878,8 @@ mod tests {
 
     use super::*;
     use rand_chacha::{
-        rand_core::{RngCore, SeedableRng},
         ChaCha8Rng,
+        rand_core::{RngCore, SeedableRng},
     };
 
     type TestResult = std::result::Result<(), alloc::TryReserveError>;

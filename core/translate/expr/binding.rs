@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::planner::parse_row_id;
 
 /// The precedence of binding identifiers to columns.
 #[derive(Debug, Clone, PartialEq, Eq)]

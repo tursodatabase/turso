@@ -1,12 +1,10 @@
 use crate::error::{SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
-use crate::translate::optimizer::constraints::ConstraintOperator;
 use crate::turso_assert;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 
 use super::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
 use super::emitter::Resolver;
-use super::optimizer::Optimizable;
 use super::plan::TableReferences;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 use crate::function::FtsFunc;
@@ -18,11 +16,7 @@ use crate::schema::{
     BTreeTable, ColDef, Column, ColumnLayout, GeneratedType, Table, Type, TypeDef,
 };
 use crate::sync::Arc;
-use crate::translate::expression_index::{
-    normalize_expr_for_index_matching, single_table_column_usage,
-};
 use crate::translate::plan::{ColumnMask, Operation, ResultSetColumn, Search};
-use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, DmlColumnContext, SelfTableContext};
@@ -102,11 +96,13 @@ pub(crate) use emission::{
     seed_returning_row_image_in_cache,
 };
 pub use metadata::ConditionMetadata;
+pub(crate) use metadata::{normalize_expr_for_index_matching, single_table_column_usage};
 pub use translator::{
     resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
 };
 pub use utils::{
-    as_binary_components, maybe_apply_affinity, sanitize_string, unwrap_parens, unwrap_parens_owned,
+    as_binary_components, maybe_apply_affinity, sanitize_string, unwrap_parens,
+    unwrap_parens_owned, ConstraintOperator,
 };
 pub use vectors::expr_vector_size;
 pub use walk::{

@@ -1,4 +1,5 @@
 use super::*;
+use crate::function::Deterministic;
 
 /// Reason why [translate_expr_no_constant_opt()] was called.
 #[derive(Debug)]
@@ -98,7 +99,7 @@ pub fn translate_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
-    let constant_span = if expr.is_constant(resolver) {
+    let constant_span = if is_constant_expr(expr, resolver) {
         if !program.constant_span_is_open() {
             Some(program.constant_span_start())
         } else {
@@ -3123,4 +3124,94 @@ pub fn translate_expr(
     }
 
     Ok(target_register)
+}
+
+fn is_constant_expr(expr: &ast::Expr, resolver: &Resolver<'_>) -> bool {
+    match expr {
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => {
+            is_constant_expr(lhs, resolver)
+                && is_constant_expr(start, resolver)
+                && is_constant_expr(end, resolver)
+        }
+        ast::Expr::Binary(lhs, _, rhs) => {
+            is_constant_expr(lhs, resolver) && is_constant_expr(rhs, resolver)
+        }
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            base.as_ref()
+                .is_none_or(|base| is_constant_expr(base, resolver))
+                && when_then_pairs.iter().all(|(when, then)| {
+                    is_constant_expr(when, resolver) && is_constant_expr(then, resolver)
+                })
+                && else_expr
+                    .as_ref()
+                    .is_none_or(|else_expr| is_constant_expr(else_expr, resolver))
+        }
+        ast::Expr::Cast { expr, .. }
+        | ast::Expr::Collate(expr, _)
+        | ast::Expr::IsNull(expr)
+        | ast::Expr::NotNull(expr)
+        | ast::Expr::Unary(_, expr) => is_constant_expr(expr, resolver),
+        ast::Expr::FunctionCall {
+            args,
+            name,
+            filter_over,
+            ..
+        } => {
+            filter_over.over_clause.is_none()
+                && resolver
+                    .resolve_function(name.as_str(), args.len())
+                    .ok()
+                    .flatten()
+                    .is_some_and(|function| {
+                        function.is_deterministic()
+                            && args
+                                .iter()
+                                .all(|argument| is_constant_expr(argument, resolver))
+                    })
+        }
+        ast::Expr::InList { lhs, rhs, .. } => {
+            is_constant_expr(lhs, resolver)
+                && rhs.iter().all(|value| is_constant_expr(value, resolver))
+        }
+        ast::Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            is_constant_expr(lhs, resolver)
+                && is_constant_expr(rhs, resolver)
+                && escape
+                    .as_ref()
+                    .is_none_or(|escape| is_constant_expr(escape, resolver))
+        }
+        ast::Expr::Parenthesized(expressions) => expressions
+            .iter()
+            .all(|expression| is_constant_expr(expression, resolver)),
+        ast::Expr::Raise(_, message) => message
+            .as_ref()
+            .is_none_or(|message| is_constant_expr(message, resolver)),
+        ast::Expr::Literal(_) | ast::Expr::Variable(_) | ast::Expr::Default | ast::Expr::Id(_) => {
+            true
+        }
+        ast::Expr::SubqueryResult { .. }
+        | ast::Expr::DoublyQualified(_, _, _)
+        | ast::Expr::Exists(_)
+        | ast::Expr::FunctionCallStar { .. }
+        | ast::Expr::Column { .. }
+        | ast::Expr::RowId { .. }
+        | ast::Expr::InSelect { .. }
+        | ast::Expr::InTable { .. }
+        | ast::Expr::Name(_)
+        | ast::Expr::Qualified(_, _)
+        | ast::Expr::FieldAccess { .. }
+        | ast::Expr::Subquery(_)
+        | ast::Expr::Register(_) => false,
+        ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
+            unreachable!("array syntax is lowered by the parser")
+        }
+    }
 }

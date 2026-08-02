@@ -15,7 +15,6 @@ use crate::translate::expr::{
 use crate::translate::index::{
     reject_explicit_nulls, resolve_index_method_parameters, resolve_sorted_columns,
 };
-use crate::translate::planner::ROWID_STRS;
 use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
@@ -178,6 +177,8 @@ pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
+/// Valid aliases for the implicit row identifier of a rowid table.
+pub const ROWID_STRS: [&str; 3] = ["rowid", "_rowid_", "oid"];
 pub const SEQ_BACKING_TABLE_PREFIX: &str = "__turso_internal_seq_";
 // Prefix for the hidden sequence *name* owned by an AUTOINCREMENT table.
 // This is not itself a table name. Its physical backing table is still named

@@ -1,5 +1,27 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConstraintOperator {
+    AstNativeOperator(ast::Operator),
+    Like { not: bool },
+    In { not: bool, estimated_values: f64 },
+}
+
+impl ConstraintOperator {
+    pub fn as_ast_operator(&self) -> Option<ast::Operator> {
+        match self {
+            Self::AstNativeOperator(operator) => Some(*operator),
+            Self::Like { .. } | Self::In { .. } => None,
+        }
+    }
+}
+
+impl From<ast::Operator> for ConstraintOperator {
+    fn from(operator: ast::Operator) -> Self {
+        Self::AstNativeOperator(operator)
+    }
+}
+
 pub fn maybe_apply_affinity(col_type: Type, target_register: usize, program: &mut ProgramBuilder) {
     if col_type == Type::Real {
         program.emit_insn(Insn::RealAffinity {
