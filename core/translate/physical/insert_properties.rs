@@ -3,7 +3,6 @@
 use hegel::generators;
 use turso_parser::{ast, parser::Parser};
 
-use super::*;
 use crate::{
     dialect::{Dialect, SqliteDialect},
     schema::{BTreeTable, Schema},
@@ -20,6 +19,28 @@ use crate::{
     },
     QueryMode, SymbolTable,
 };
+
+use super::*;
+
+// Example: `INSERT INTO t(a, c) VALUES (1, 3)` keeps the supplied `a` and `c`
+// values and evaluates defaults only for omitted columns such as `b`.
+#[hegel::test]
+fn insert_defaults_fill_exactly_the_omitted_columns(tc: hegel::TestCase) {
+    let supplied = tc.draw(
+        generators::vecs(generators::booleans())
+            .min_size(1)
+            .max_size(16),
+    );
+    let columns = supplied
+        .iter()
+        .enumerate()
+        .filter_map(|(position, supplied)| supplied.then_some(TargetColumn::Column(position)))
+        .collect::<Vec<_>>();
+
+    for (position, supplied) in supplied.into_iter().enumerate() {
+        assert_eq!(column_needs_default(&columns, position), !supplied);
+    }
+}
 
 fn parse_statement(sql: &str) -> ast::Stmt {
     let command = Parser::new(sql.as_bytes())

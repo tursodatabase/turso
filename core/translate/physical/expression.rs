@@ -6,10 +6,12 @@
 
 use std::fmt;
 
-use turso_parser::ast::{LikeOperator, Operator, UnaryOperator};
+use turso_parser::ast::{LikeOperator, Literal, Operator, ResolveType, UnaryOperator};
 
 use crate::{
-    error::{SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL},
+    error::{
+        SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR,
+    },
     function::{Func, FuncCtx, ScalarFunc},
     schema::Table,
     translate::{
@@ -319,9 +321,74 @@ impl<'program, 'bindings, 'document> ExpressionEmitter<'program, 'bindings, 'doc
                 escape.as_deref(),
                 target,
             ),
-            Expr::Raise { .. } => Err(PhysicalExpressionError::Unsupported("RAISE")),
+            Expr::Raise { action, message } => self.emit_raise(*action, message.as_deref(), target),
             Expr::Row(_) => unreachable!("rows are handled before scalar emission"),
         }
+    }
+
+    fn emit_raise(
+        &mut self,
+        action: ResolveType,
+        message: Option<&Expr>,
+        target: usize,
+    ) -> ExpressionResult<()> {
+        let in_trigger = self.program.trigger.is_some();
+        match action {
+            ResolveType::Ignore => {
+                if !in_trigger {
+                    return Err(PhysicalExpressionError::Invalid(
+                        "RAISE(IGNORE) is outside a trigger program",
+                    ));
+                }
+                self.program.emit_insn(Insn::Halt {
+                    err_code: 0,
+                    description: String::new(),
+                    on_error: Some(ResolveType::Ignore),
+                    description_reg: None,
+                });
+            }
+            ResolveType::Fail | ResolveType::Abort | ResolveType::Rollback => {
+                if !in_trigger && action != ResolveType::Abort {
+                    return Err(PhysicalExpressionError::Invalid(
+                        "RAISE action is outside a trigger program",
+                    ));
+                }
+                let message = message.ok_or(PhysicalExpressionError::Invalid(
+                    "RAISE action has no error message",
+                ))?;
+                let err_code = if in_trigger {
+                    SQLITE_CONSTRAINT_TRIGGER
+                } else {
+                    SQLITE_ERROR
+                };
+                match message {
+                    Expr::Literal(Literal::String(message)) => {
+                        self.program.emit_insn(Insn::Halt {
+                            err_code,
+                            description: sanitize_sql_string(message),
+                            on_error: Some(action),
+                            description_reg: None,
+                        });
+                    }
+                    message => {
+                        let value = scalar_register(self.emit_new(message)?)?;
+                        self.program.emit_insn(Insn::Halt {
+                            err_code,
+                            description: String::new(),
+                            on_error: Some(action),
+                            description_reg: Some(value),
+                        });
+                    }
+                }
+            }
+            ResolveType::Replace => {
+                return Err(PhysicalExpressionError::Invalid(
+                    "RAISE(REPLACE) is not valid",
+                ));
+            }
+        }
+        let _ = target;
+        Ok(())
     }
 
     /// Emit the equality predicate carried by one resolved USING/NATURAL
@@ -1620,6 +1687,14 @@ fn scalar_register(range: RegisterRange) -> ExpressionResult<usize> {
         ));
     }
     Ok(range.first.0)
+}
+
+fn sanitize_sql_string(input: &str) -> String {
+    let inner = input
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .unwrap_or(input);
+    inner.replace("''", "'")
 }
 
 fn only_comparison_component(

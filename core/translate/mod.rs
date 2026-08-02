@@ -37,6 +37,7 @@ pub(crate) mod rollback;
 pub(crate) mod schema;
 pub(crate) mod select;
 pub(crate) mod semantic;
+mod semantic_prepare;
 pub(crate) mod sequence;
 pub(crate) mod stmt_journal;
 pub(crate) mod subquery;
@@ -55,14 +56,14 @@ use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::translate::delete::translate_delete;
 use crate::translate::emitter::Resolver;
-use crate::translate::physical::{PhysicalPlan, emit_root};
+use crate::translate::physical::{emit_root_with_context, PhysicalPlan};
 use crate::translate::plan::ResultSetColumn;
 use crate::translate::semantic::{
-    AnalyzeInput, analyze, context::DmlPolicy, context::SemanticContext, hir,
+    analyze, context::DmlPolicy, context::SemanticContext, hir, AnalyzeInput,
 };
-use crate::vdbe::Program;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
-use crate::{Connection, Result, SymbolTable, bail_parse_error};
+use crate::vdbe::Program;
+use crate::{bail_parse_error, Connection, Result, SymbolTable};
 use alter::translate_alter_table;
 use analyze::translate_analyze;
 use index::{translate_create_index, translate_drop_index, translate_optimize, translate_reindex};
@@ -70,7 +71,7 @@ use insert::translate_insert;
 use rollback::{translate_release, translate_rollback, translate_savepoint};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
 use select::translate_select;
-use tracing::{Level, instrument};
+use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
 use turso_parser::ast;
 use update::translate_update;
@@ -209,10 +210,16 @@ fn translate_semantic_root(
     let document = analyze(&context, AnalyzeInput::Statement(stmt))?;
     set_semantic_result_columns(program, &document);
     set_semantic_transactions(program, &document, is_write)?;
+    let triggers = semantic_prepare::prepare_triggers(&context, &document, program, connection)?;
     let plan = PhysicalPlan::new(&document)
         .map_err(|error| crate::LimboError::InternalError(error.to_string()))?;
-    emit_root(&plan, program)
-        .map_err(|error| crate::LimboError::InternalError(error.to_string()))?;
+    emit_root_with_context(
+        &plan,
+        program,
+        &physical::RootRuntimeInputs::default(),
+        &triggers,
+    )
+    .map_err(|error| crate::LimboError::InternalError(error.to_string()))?;
     Ok(())
 }
 
@@ -253,7 +260,7 @@ fn set_semantic_result_columns(program: &mut ProgramBuilder, document: &hir::Hir
         .collect();
 }
 
-fn set_semantic_transactions(
+pub(super) fn set_semantic_transactions(
     program: &mut ProgramBuilder,
     document: &hir::HirDocument,
     is_write: bool,
@@ -689,12 +696,12 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Database;
-    use crate::SqliteDialect;
     use crate::alloc::TryClone;
     use crate::io::MemoryIO;
-    use crate::schema::{BTreeTable, SQLITE_SEQUENCE_TABLE_NAME, Table};
+    use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
     use crate::vdbe::insn::Insn;
+    use crate::Database;
+    use crate::SqliteDialect;
 
     #[test]
     fn semantic_prepare_adapter_owns_root_metadata_and_emission() {
@@ -725,12 +732,74 @@ mod tests {
 
         assert_eq!(built.result_columns.len(), 1);
         assert_eq!(built.result_columns[0].alias.as_deref(), Some("answer"));
-        assert!(
-            built
-                .insns
-                .iter()
-                .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. }))
-        );
+        assert!(built
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. })));
+    }
+
+    #[test]
+    fn semantic_prepare_adapter_executes_trigger_programs_with_old_and_new_rows() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE items(a INTEGER, b INTEGER);
+                 CREATE TABLE audit(kind TEXT, a INTEGER, b INTEGER);
+                 CREATE TRIGGER skip_negative BEFORE INSERT ON items
+                   WHEN NEW.a < 0 BEGIN SELECT RAISE(IGNORE); END;
+                 CREATE TRIGGER log_insert AFTER INSERT ON items BEGIN
+                   INSERT INTO audit VALUES('insert', NEW.a, NEW.b);
+                 END;",
+            )
+            .unwrap();
+
+        let schema = db.schema.lock().clone();
+        let sql = "INSERT INTO items VALUES(-1, 9), (2, 3)";
+        let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+        let ast::Cmd::Stmt(statement) = parser.next().unwrap().unwrap() else {
+            panic!("expected a statement");
+        };
+        let mut builder =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 32, 2));
+        builder.prologue();
+        translate_semantic_root(
+            &schema,
+            &statement,
+            &mut builder,
+            &connection,
+            &SymbolTable::new(),
+            crate::statement::StatementOrigin::Root,
+        )
+        .unwrap();
+        builder.epilogue(&schema);
+        let program = builder.build(connection.clone(), true, sql).unwrap();
+        assert!(program.insns.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::Program {
+                program: crate::vdbe::insn::Subprogram::PreparedProgram(_),
+                ..
+            }
+        )));
+        crate::Statement::new(
+            program,
+            connection.pager.load().clone(),
+            QueryMode::Normal,
+            0,
+        )
+        .run_ignore_rows()
+        .unwrap();
+
+        let mut audit = connection
+            .query("SELECT kind, a, b FROM audit")
+            .unwrap()
+            .unwrap();
+        let rows = audit.run_collect_rows().unwrap();
+        assert_eq!(rows.len(), 1, "unexpected audit rows: {rows:?}");
+        assert_eq!(rows[0][0].to_string(), "insert");
+        assert_eq!(rows[0][1].to_string(), "2");
+        assert_eq!(rows[0][2].to_string(), "3");
     }
 
     /// Verify that REGEXP produces the correct error when no regexp function is registered.

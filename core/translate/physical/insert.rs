@@ -334,6 +334,9 @@ fn emit_insert_defaults(
     logical: RegisterRange,
 ) -> InsertResult<()> {
     for default in &insert.defaults {
+        if !column_needs_default(&insert.columns, default.column) {
+            continue;
+        }
         let destination = logical
             .register(default.column)
             .ok_or(PhysicalInsertError::Invalid(
@@ -343,6 +346,10 @@ fn emit_insert_defaults(
             .emit_into(&default.value, RegisterRange::new(destination.0, 1))?;
     }
     Ok(())
+}
+
+pub(super) fn column_needs_default(columns: &[hir::TargetColumn], column: usize) -> bool {
+    !columns.contains(&hir::TargetColumn::Column(column))
 }
 
 #[allow(clippy::too_many_arguments)]
