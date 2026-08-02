@@ -766,11 +766,32 @@ impl Scope {
 
     pub(crate) fn resolve_using_left(&self, name: &str) -> Result<ResolvedScopeExpr> {
         let normalized = crate::util::normalize_ident(name);
-        self.resolve_source_column(&normalized)?.ok_or_else(|| {
-            crate::LimboError::ParseError(format!(
-                "cannot join using column {name} - column not present in both tables"
-            ))
-        })
+        self.visible_columns
+            .iter()
+            .find(|column| column.lookup_name == normalized)
+            .map(ScopeColumn::resolved)
+            .ok_or_else(|| {
+                crate::LimboError::ParseError(format!(
+                    "cannot join using column {name} - column not present in both tables"
+                ))
+            })
+    }
+
+    pub(crate) fn resolve_natural_left(&self, name: &str) -> Result<ResolvedScopeExpr> {
+        let normalized = crate::util::normalize_ident(name);
+        let mut matches = self
+            .visible_columns
+            .iter()
+            .filter(|column| !column.hidden && column.lookup_name == normalized);
+        let Some(column) = matches.next() else {
+            return Err(crate::LimboError::InternalError(format!(
+                "NATURAL join column {name} disappeared from the visible scope"
+            )));
+        };
+        if matches.next().is_some() {
+            crate::bail_parse_error!("ambiguous column name: {name}");
+        }
+        Ok(column.resolved())
     }
 
     pub(crate) fn natural_common_columns(&self, right: &hir::Source) -> Vec<String> {
@@ -803,23 +824,22 @@ impl Scope {
                 )));
             };
             let lookup_name = crate::util::normalize_ident(&using.name);
-            let mut left_positions = self
+            let left_position = self
                 .visible_columns
                 .iter()
                 .enumerate()
-                .filter(|(position, column)| {
-                    *position != right_position && column.lookup_name == lookup_name
+                .find(|(position, column)| {
+                    *position != right_position
+                        && column.lookup_name == lookup_name
+                        && same_join_column(&column.expr, &using.left)
                 })
                 .map(|(position, _)| position);
-            let Some(left_position) = left_positions.next() else {
+            let Some(left_position) = left_position else {
                 return Err(crate::LimboError::InternalError(format!(
                     "USING column {} did not belong to the left sources",
                     using.name
                 )));
             };
-            if left_positions.next().is_some() {
-                crate::bail_parse_error!("ambiguous reference to {} in USING()", using.name);
-            }
 
             let merged = hir::Expr::MergedColumn(hir::MergedColumn {
                 left: using.left.clone(),
@@ -913,6 +933,18 @@ impl Scope {
                 has_affinity: output.has_affinity,
                 collation: output.collation.clone(),
             })
+    }
+}
+
+fn same_join_column(left: &hir::Expr, right: &hir::Expr) -> bool {
+    match (left, right) {
+        (hir::Expr::Column(left), hir::Expr::Column(right)) => left == right,
+        (hir::Expr::MergedColumn(left), hir::Expr::MergedColumn(right)) => {
+            left.right == right.right
+                && left.value == right.value
+                && same_join_column(&left.left, &right.left)
+        }
+        _ => false,
     }
 }
 

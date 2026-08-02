@@ -1988,7 +1988,11 @@ impl Analyzer<'_, '_> {
 
             let mut using_columns = Vec::with_capacity(using_names.len());
             for name in using_names {
-                let left = scope.resolve_using_left(&name)?;
+                let left = if natural {
+                    scope.resolve_natural_left(&name)?
+                } else {
+                    scope.resolve_using_left(&name)?
+                };
                 let normalized = crate::util::normalize_ident(&name);
                 let (right_index, right_column) = right_definition
                     .columns
