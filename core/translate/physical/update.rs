@@ -160,6 +160,11 @@ pub(crate) fn emit_root_update_with_context_and_after(
         PhysicalRoot::Update(update) => *update,
         _ => return Err(PhysicalUpdateError::Unsupported("non-UPDATE HIR root")),
     };
+    if let Some(table) = virtual_target(plan, update)? {
+        let result = emit_virtual_update(plan, program, inputs, update, table);
+        after(program);
+        return result;
+    }
     let (source, table, database) = preflight_update(plan, update, triggers)?;
     let cdc = PreparedCdc::open(program, plan.document)?;
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
@@ -674,6 +679,182 @@ pub(crate) fn emit_root_update_with_context_and_after(
         cdc.close(program);
     }
     after(program);
+    Ok(())
+}
+
+fn virtual_target(
+    plan: &PhysicalPlan<'_>,
+    update: &hir::Update,
+) -> UpdateResult<Option<crate::sync::Arc<crate::VirtualTable>>> {
+    let physical = plan
+        .source(update.target)
+        .ok_or(PhysicalUpdateError::Invalid(
+            "physical target source is missing",
+        ))?;
+    let PhysicalSourceKind::CatalogTable { table, access } = &physical.kind else {
+        return Err(PhysicalUpdateError::Invalid(
+            "target is not a catalog table",
+        ));
+    };
+    if !matches!(access, super::TableAccess::Scan) {
+        return Err(PhysicalUpdateError::Unsupported("indexed target access"));
+    }
+    Ok(match table.value() {
+        Table::Virtual(table) => Some(table.clone()),
+        Table::BTree(_) => None,
+    })
+}
+
+fn emit_virtual_update<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    inputs: &RootRuntimeInputs,
+    update: &hir::Update,
+    table: crate::sync::Arc<crate::VirtualTable>,
+) -> UpdateResult<()> {
+    if update.from.is_some() {
+        return Err(PhysicalUpdateError::Unsupported(
+            "UPDATE FROM on a virtual table",
+        ));
+    }
+    if !update.order_by.is_empty() || update.limit.is_some() {
+        return Err(PhysicalUpdateError::Unsupported(
+            "ordered or limited virtual table UPDATE",
+        ));
+    }
+    let source = plan
+        .document
+        .source(update.target)
+        .ok_or(PhysicalUpdateError::Invalid("target source is missing"))?;
+    let new_source = plan
+        .document
+        .source(update.new_source)
+        .ok_or(PhysicalUpdateError::Invalid("NEW source is missing"))?;
+    if source.columns.len() != new_source.columns.len() {
+        return Err(PhysicalUpdateError::Invalid(
+            "OLD and NEW row widths differ",
+        ));
+    }
+
+    #[cfg(feature = "cli_only")]
+    let is_dbpage = table.name == crate::dbpage::DBPAGE_TABLE_NAME;
+    #[cfg(not(feature = "cli_only"))]
+    let is_dbpage = false;
+    if table.readonly() && !is_dbpage {
+        return Err(
+            crate::LimboError::Constraint(format!("Table is read-only: {}", table.name)).into(),
+        );
+    }
+
+    let cursor = program.alloc_cursor_id(CursorType::VirtualTable(table));
+    program.emit_insn(Insn::VOpen { cursor_id: cursor });
+    if !is_dbpage {
+        program.emit_insn(Insn::VBegin { cursor_id: cursor });
+    }
+    let mut bindings = RuntimeBindings::new(plan.document, plan.document.snapshot)?;
+    inputs.apply(&mut bindings)?;
+    bindings.bind_source(update.target, SourceRuntime::Cursor(CursorId(cursor)))?;
+
+    let arguments = program.alloc_registers(source.columns.len() + 2);
+    let old_rowid = RegisterId(arguments);
+    let new_rowid = RegisterId(arguments + 1);
+    let logical = RegisterRange::new(arguments + 2, source.columns.len());
+    bindings.bind_source(
+        update.new_source,
+        SourceRuntime::Registers {
+            columns: logical,
+            rowid: Some(new_rowid),
+        },
+    )?;
+
+    let loop_start = program.allocate_label();
+    let loop_next = program.allocate_label();
+    let loop_done = program.allocate_label();
+    program.emit_insn(Insn::VFilter {
+        cursor_id: cursor,
+        pc_if_empty: loop_done,
+        arg_count: 0,
+        args_reg: 0,
+        idx_str: None,
+        idx_num: 0,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+    if let Some(predicate) = &update.predicate {
+        let condition = emit_expression_for_dml(plan, program, &mut bindings, predicate)?;
+        if condition.width != 1 {
+            return Err(PhysicalUpdateError::Invalid("WHERE result is not scalar"));
+        }
+        program.emit_insn(Insn::IfNot {
+            reg: condition.first.0,
+            target_pc: loop_next,
+            jump_if_null: true,
+        });
+    }
+
+    program.emit_insn(Insn::RowId {
+        cursor_id: cursor,
+        dest: old_rowid.0,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: old_rowid.0,
+        dst_reg: new_rowid.0,
+        extra_amount: 0,
+    });
+    for position in 0..source.columns.len() {
+        program.emit_insn(Insn::VColumn {
+            cursor_id: cursor,
+            column: position,
+            dest: logical.first.0 + position,
+        });
+    }
+
+    let mut assignments = Vec::with_capacity(update.assignments.len());
+    for assignment in &update.assignments {
+        let values = emit_expression_for_dml(plan, program, &mut bindings, &assignment.value)?;
+        if values.width != assignment.columns.len() {
+            return Err(PhysicalUpdateError::Invalid(
+                "assignment width does not match its target columns",
+            ));
+        }
+        assignments.push((&assignment.columns, values));
+    }
+    for (columns, values) in assignments {
+        for (position, column) in columns.iter().enumerate() {
+            let destination = match column {
+                hir::TargetColumn::Column(column) => {
+                    logical
+                        .register(*column)
+                        .ok_or(PhysicalUpdateError::Invalid(
+                            "assignment target is outside the row",
+                        ))?
+                        .0
+                }
+                hir::TargetColumn::RowId => new_rowid.0,
+            };
+            program.emit_insn(Insn::Copy {
+                src_reg: values.first.0 + position,
+                dst_reg: destination,
+                extra_amount: 0,
+            });
+        }
+    }
+    program.emit_insn(Insn::VUpdate {
+        cursor_id: cursor,
+        arg_count: source.columns.len() + 2,
+        start_reg: arguments,
+        conflict_action: 0,
+    });
+    if let Some(returning) = &update.returning {
+        let result = emit_returning_values(plan, program, &mut bindings, returning)?;
+        emit_returning_result(program, result);
+    }
+    program.preassign_label_to_next_insn(loop_next);
+    program.emit_insn(Insn::VNext {
+        cursor_id: cursor,
+        pc_if_next: loop_start,
+    });
+    program.preassign_label_to_next_insn(loop_done);
+    program.emit_insn(Insn::Close { cursor_id: cursor });
     Ok(())
 }
 
