@@ -1036,11 +1036,19 @@ impl Analyzer<'_, '_> {
                 .map(|block| block.outputs.clone())
                 .collect::<Vec<_>>()
         });
+        let first_is_aggregate = matches!(
+            &blocks[0].body,
+            hir::QueryBlockBody::Select {
+                grouping: Some(_),
+                ..
+            }
+        ) || self.query_block_function_counts(first_id).0 > 0;
         let order_by = self.analyze_query_order_by_in_block(
             &syntax.order_by,
             &result_scope,
             compound_outputs.as_deref(),
             Some(&blocks[0]),
+            first_is_aggregate,
         )?;
         let limit = self.analyze_query_limit(syntax.limit.as_ref(), &environment)?;
         for block in &mut blocks {
@@ -1159,6 +1167,7 @@ impl Analyzer<'_, '_> {
                     ExprPolicy::source_then_output()
                         .with_raise(scope.allow_raise())
                         .in_query_block(block_id)
+                        .with_expanded_output_references()
                         .without_aggregate(),
                 )
             })
@@ -1359,10 +1368,13 @@ impl Analyzer<'_, '_> {
         let key_policy = ExprPolicy::source_then_output()
             .with_raise(key_scope.allow_raise())
             .in_query_block(block_id)
+            .with_expanded_output_references()
             .without_aggregate();
         for (index, expression) in syntax.exprs.iter().enumerate() {
             let clause = format!("{} GROUP BY", ordinal_name(index));
-            if let Some(resolved) = self.analyze_output_ordinal(expression, &key_scope, &clause)? {
+            if let Some(resolved) =
+                self.analyze_grouping_ordinal(expression, &key_scope, &clause)?
+            {
                 self.validate_existing_expr(&resolved, &key_scope, &key_policy)?;
                 keys.push(resolved);
             } else {
@@ -1399,13 +1411,49 @@ impl Analyzer<'_, '_> {
         })
     }
 
+    fn analyze_grouping_ordinal(
+        &mut self,
+        syntax: &ast::Expr,
+        scope: &Scope,
+        clause: &str,
+    ) -> Result<Option<hir::Expr>> {
+        match syntax {
+            ast::Expr::Collate(inner, collation) => {
+                let Some(inner) = self.analyze_grouping_ordinal(inner, scope, clause)? else {
+                    return Ok(None);
+                };
+                Ok(Some(hir::Expr::Collate {
+                    expr: Box::new(inner),
+                    collation: self.resolve_collation(collation.as_str())?,
+                }))
+            }
+            ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
+                self.analyze_grouping_ordinal(&expressions[0], scope, clause)
+            }
+            _ => expression_ordinal(syntax)
+                .map(|ordinal| {
+                    let resolved = scope
+                        .resolve_output_ordinal(usize::try_from(ordinal).unwrap_or(0), clause)?;
+                    let hir::Expr::Output(output) = resolved.expr else {
+                        unreachable!("an output ordinal always resolves to an output reference");
+                    };
+                    scope.output_expr(output).cloned().ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "resolved output {output:?} has no expression"
+                        ))
+                    })
+                })
+                .transpose(),
+        }
+    }
+
     pub(super) fn analyze_query_order_by(
         &mut self,
         syntax: &[ast::SortedColumn],
         scope: &Scope,
         compound_outputs: Option<&[Vec<hir::Output>]>,
     ) -> Result<Vec<hir::OrderTerm>> {
-        self.analyze_query_order_by_in_block(syntax, scope, compound_outputs, None)
+        self.analyze_query_order_by_in_block(syntax, scope, compound_outputs, None, true)
     }
 
     fn analyze_query_order_by_in_block(
@@ -1414,6 +1462,7 @@ impl Analyzer<'_, '_> {
         scope: &Scope,
         compound_outputs: Option<&[Vec<hir::Output>]>,
         query_block: Option<&hir::QueryBlock>,
+        allow_new_aggregate: bool,
     ) -> Result<Vec<hir::OrderTerm>> {
         if let Some(outputs) = compound_outputs {
             return self.analyze_compound_order_by(syntax, outputs);
@@ -1426,7 +1475,10 @@ impl Analyzer<'_, '_> {
             {
                 expression
             } else {
-                let policy = ExprPolicy::output_then_source().with_raise(scope.allow_raise());
+                let mut policy = ExprPolicy::output_then_source().with_raise(scope.allow_raise());
+                if !allow_new_aggregate {
+                    policy = policy.without_aggregate();
+                }
                 let policy =
                     query_block.map_or(policy.clone(), |block| policy.in_query_block(block.id));
                 self.analyze_expr(&term.expr, scope, policy)?

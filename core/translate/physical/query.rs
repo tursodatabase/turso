@@ -105,6 +105,8 @@ enum ScanRowAction<'hir, 'destination> {
     },
     Aggregate {
         aggregates: &'destination [PhysicalAggregate<'hir>],
+        saved_sources: &'destination [SavedSourceLayout],
+        first_row_seen: RegisterId,
     },
     GroupSortInsert {
         sorter: &'destination GroupSorter<'hir>,
@@ -147,6 +149,12 @@ struct GroupSourceLayout {
     record_offset: usize,
 }
 
+struct SavedSourceLayout {
+    source: SourceId,
+    columns: RegisterRange,
+    rowid: Option<RegisterId>,
+}
+
 struct GroupSorter<'hir> {
     cursor_id: usize,
     record: RegisterId,
@@ -186,6 +194,11 @@ enum QueryDestination<'table> {
         record: RegisterId,
         order_by: &'table [OrderTerm],
         first_block: QueryBlockId,
+        tie_breaker: Option<SortOrder>,
+        grouping_ties: Option<(
+            &'table Grouping,
+            &'table [crate::translate::semantic::hir::Output],
+        )>,
     },
 }
 
@@ -209,6 +222,11 @@ struct OpenedSorter<'hir> {
     order_by: &'hir [OrderTerm],
     first_block: QueryBlockId,
     width: usize,
+    tie_breaker: Option<SortOrder>,
+    grouping_ties: Option<(
+        &'hir Grouping,
+        &'hir [crate::translate::semantic::hir::Output],
+    )>,
 }
 
 #[derive(Clone, Copy)]
@@ -231,6 +249,8 @@ impl<'hir> OpenedSorter<'hir> {
             record: self.record,
             order_by: self.order_by,
             first_block: self.first_block,
+            tie_breaker: self.tie_breaker,
+            grouping_ties: self.grouping_ties,
         }
     }
 }
@@ -717,6 +737,8 @@ pub(crate) fn emit_ordered_dml_rowids<'document>(
             order_by,
             first_block: QueryBlockId::new(QueryId::new(0), 0),
             width: 1,
+            tie_breaker: None,
+            grouping_ties: None,
         })
     };
 
@@ -969,6 +991,8 @@ pub(crate) fn emit_update_from_rows<'document>(
                 order_by,
                 first_block: QueryBlockId::new(QueryId::new(0), 0),
                 width: width + 1,
+                tie_breaker: None,
+                grouping_ties: None,
             })
         };
         let scan_start = program.allocate_label();
@@ -1864,6 +1888,38 @@ fn emit_group_sort_insert<'document>(
     Ok(())
 }
 
+fn load_group_sources(
+    program: &mut ProgramBuilder,
+    bindings: &RuntimeBindings<'_>,
+    sorter: &GroupSorter<'_>,
+    pseudo: usize,
+) -> QueryResult<()> {
+    for source in &sorter.sources {
+        let SourceRuntime::Registers { columns, rowid } = bindings.source(source.source)? else {
+            return Err(PhysicalQueryError::Invalid(
+                "group source is not backed by registers",
+            ));
+        };
+        for column in 0..source.width {
+            program.emit_insn(Insn::Column {
+                cursor_id: pseudo,
+                column: source.record_offset + column,
+                dest: columns.first.0 + column,
+                default: None,
+            });
+        }
+        if let Some(rowid) = rowid {
+            program.emit_insn(Insn::Column {
+                cursor_id: pseudo,
+                column: source.record_offset + source.width,
+                dest: rowid.0,
+                default: None,
+            });
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_grouped_aggregate<'document>(
     plan: &PhysicalPlan<'document>,
@@ -1949,6 +2005,7 @@ fn emit_grouped_aggregate<'document>(
     });
 
     let mut restored_sources = Vec::with_capacity(sorter.sources.len());
+    let mut representative_sources = Vec::with_capacity(sorter.sources.len());
     for source in &sorter.sources {
         let row_start = program.alloc_registers(source.width + 1);
         let original = bindings.replace_source(
@@ -1961,6 +2018,13 @@ fn emit_grouped_aggregate<'document>(
             },
         )?;
         restored_sources.push((source.source, original));
+        representative_sources.push(SavedSourceLayout {
+            source: source.source,
+            columns: RegisterRange::new(program.alloc_registers(source.width), source.width),
+            rowid: source
+                .rowid_available
+                .then(|| RegisterId(program.alloc_register())),
+        });
     }
 
     let emission = (|| -> QueryResult<()> {
@@ -2053,32 +2117,38 @@ fn emit_grouped_aggregate<'document>(
             value: 1,
             dest: has_group,
         });
-
-        program.preassign_label_to_next_insn(step_group);
-        for source in &sorter.sources {
-            let SourceRuntime::Registers { columns, rowid } = bindings.source(source.source)?
+        load_group_sources(program, bindings, &sorter, pseudo)?;
+        for representative in &representative_sources {
+            let SourceRuntime::Registers { columns, rowid } =
+                bindings.source(representative.source)?
             else {
                 return Err(PhysicalQueryError::Invalid(
                     "group source is not backed by registers",
                 ));
             };
-            for column in 0..source.width {
-                program.emit_insn(Insn::Column {
-                    cursor_id: pseudo,
-                    column: source.record_offset + column,
-                    dest: columns.first.0 + column,
-                    default: None,
-                });
-            }
-            if let Some(rowid) = rowid {
-                program.emit_insn(Insn::Column {
-                    cursor_id: pseudo,
-                    column: source.record_offset + source.width,
-                    dest: rowid.0,
-                    default: None,
+            program.emit_insn(Insn::Copy {
+                src_reg: columns.first.0,
+                dst_reg: representative.columns.first.0,
+                extra_amount: columns.width.saturating_sub(1),
+            });
+            if let (Some(source), Some(destination)) = (rowid, representative.rowid) {
+                program.emit_insn(Insn::Copy {
+                    src_reg: source.0,
+                    dst_reg: destination.0,
+                    extra_amount: 0,
                 });
             }
         }
+
+        let step_aggregates = program.allocate_label();
+        program.emit_insn(Insn::Goto {
+            target_pc: step_aggregates,
+        });
+
+        program.preassign_label_to_next_insn(step_group);
+        load_group_sources(program, bindings, &sorter, pseudo)?;
+
+        program.preassign_label_to_next_insn(step_aggregates);
         emit_aggregate_steps(plan, program, bindings, ctes, &block.aggregates)?;
         program.emit_insn(Insn::SorterNext {
             cursor_id: sorter.cursor_id,
@@ -2104,20 +2174,34 @@ fn emit_grouped_aggregate<'document>(
                 func: AccumulatorFunc::Agg(function.clone()),
             });
         }
+        let mut current_sources = Vec::with_capacity(representative_sources.len());
+        for representative in &representative_sources {
+            let current = bindings.replace_source(
+                representative.source,
+                SourceRuntime::Registers {
+                    columns: representative.columns,
+                    rowid: representative.rowid,
+                },
+            )?;
+            current_sources.push((representative.source, current));
+        }
+        emit_output_expressions(plan, program, bindings, ctes, block.outputs, result)?;
         if let Some(having) = &grouping.having {
             emit_filter(plan, program, bindings, ctes, having, skip_output)?;
         }
-        emit_output_row(
+        emit_row_destination(
             plan,
             program,
             bindings,
             ctes,
-            block.outputs,
             result,
             destination,
             limit,
             distinct,
         )?;
+        for (source, runtime) in current_sources.into_iter().rev() {
+            bindings.replace_source(source, runtime)?;
+        }
         program.preassign_label_to_next_insn(skip_output);
         program.emit_insn(Insn::Return {
             return_reg: return_register,
@@ -2189,6 +2273,33 @@ fn emit_ungrouped_aggregate<'document>(
     }
     open_ordered_aggregate_sorters(program, bindings, &block.aggregates)?;
 
+    let mut saved_sources = Vec::with_capacity(block.source_order.len());
+    for source_id in &block.source_order {
+        let source = plan
+            .source(*source_id)
+            .ok_or(PhysicalQueryError::Invalid("aggregate source is missing"))?;
+        let definition = plan
+            .document
+            .source(*source_id)
+            .ok_or(PhysicalQueryError::Invalid(
+                "aggregate HIR source is missing",
+            ))?;
+        let columns = RegisterRange::new(program.alloc_registers(source.width), source.width);
+        let rowid = definition
+            .rowid_available
+            .then(|| RegisterId(program.alloc_register()));
+        saved_sources.push(SavedSourceLayout {
+            source: *source_id,
+            columns,
+            rowid,
+        });
+    }
+    let first_row_seen = RegisterId(program.alloc_register());
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: first_row_seen.0,
+    });
+
     match block.source_order.as_slice() {
         [] => {
             if block.hir.from.is_some() {
@@ -2213,42 +2324,62 @@ fn emit_ungrouped_aggregate<'document>(
             block.hir.from.as_ref(),
             ScanRowAction::Aggregate {
                 aggregates: &block.aggregates,
+                saved_sources: &saved_sources,
+                first_row_seen,
             },
         )?,
     }
 
-    drain_ordered_aggregate_sorters(plan, program, bindings, &block.aggregates)?;
-    for aggregate in &block.aggregates {
-        let Func::Agg(function) = aggregate.call.function.value() else {
-            return Err(PhysicalQueryError::Unsupported(
-                "external aggregate function",
-            ));
-        };
-        let register = bindings.aggregate(aggregate.id)?.register;
-        program.emit_insn(Insn::AggFinal {
-            register: register.0,
-            func: AccumulatorFunc::Agg(function.clone()),
-        });
+    let mut original_sources = Vec::with_capacity(saved_sources.len());
+    for source in &saved_sources {
+        let original = bindings.replace_source(
+            source.source,
+            SourceRuntime::Registers {
+                columns: source.columns,
+                rowid: source.rowid,
+            },
+        )?;
+        original_sources.push((source.source, original));
     }
 
-    let skip = program.allocate_label();
-    if let Some(having) = having {
-        emit_filter(plan, program, bindings, ctes, having, skip)?;
+    let emission = (|| -> QueryResult<()> {
+        drain_ordered_aggregate_sorters(plan, program, bindings, &block.aggregates)?;
+        for aggregate in &block.aggregates {
+            let Func::Agg(function) = aggregate.call.function.value() else {
+                return Err(PhysicalQueryError::Unsupported(
+                    "external aggregate function",
+                ));
+            };
+            let register = bindings.aggregate(aggregate.id)?.register;
+            program.emit_insn(Insn::AggFinal {
+                register: register.0,
+                func: AccumulatorFunc::Agg(function.clone()),
+            });
+        }
+
+        let skip = program.allocate_label();
+        emit_output_expressions(plan, program, bindings, ctes, block.outputs, result)?;
+        if let Some(having) = having {
+            emit_filter(plan, program, bindings, ctes, having, skip)?;
+        }
+        emit_row_destination(
+            plan,
+            program,
+            bindings,
+            ctes,
+            result,
+            destination,
+            limit,
+            distinct,
+        )?;
+        program.preassign_label_to_next_insn(skip);
+        close_aggregate_distinct_sets(program, bindings, &block.aggregates)?;
+        Ok(())
+    })();
+    for (source, runtime) in original_sources.into_iter().rev() {
+        bindings.replace_source(source, runtime)?;
     }
-    emit_output_row(
-        plan,
-        program,
-        bindings,
-        ctes,
-        block.outputs,
-        result,
-        destination,
-        limit,
-        distinct,
-    )?;
-    program.preassign_label_to_next_insn(skip);
-    close_aggregate_distinct_sets(program, bindings, &block.aggregates)?;
-    Ok(())
+    emission
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4668,7 +4799,44 @@ fn emit_scan_action<'document>(
             limit,
             distinct,
         ),
-        ScanRowAction::Aggregate { aggregates } => {
+        ScanRowAction::Aggregate {
+            aggregates,
+            saved_sources,
+            first_row_seen,
+        } => {
+            let already_saved = program.allocate_label();
+            program.emit_insn(Insn::IfPos {
+                reg: first_row_seen.0,
+                target_pc: already_saved,
+                decrement_by: 0,
+            });
+            for source in saved_sources {
+                for position in 0..source.columns.width {
+                    let target =
+                        source
+                            .columns
+                            .register(position)
+                            .ok_or(PhysicalQueryError::Invalid(
+                                "saved aggregate column is missing",
+                            ))?;
+                    let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                    ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                        .emit_into(
+                            &Expr::column(source.source, position),
+                            RegisterRange::new(target.0, 1),
+                        )?;
+                }
+                if let Some(rowid) = source.rowid {
+                    let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                    ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                        .emit_into(&Expr::rowid(source.source), RegisterRange::new(rowid.0, 1))?;
+                }
+            }
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: first_row_seen.0,
+            });
+            program.preassign_label_to_next_insn(already_saved);
             emit_aggregate_steps(plan, program, bindings, ctes, aggregates)
         }
         ScanRowAction::GroupSortInsert { sorter } => {
@@ -5533,14 +5701,7 @@ fn emit_output_row<'document>(
             None,
         );
     }
-    for (position, output) in outputs.iter().enumerate() {
-        let target = result
-            .register(position)
-            .ok_or(PhysicalQueryError::Invalid("output register is missing"))?;
-        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
-        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
-            .emit_into(&output.expr, RegisterRange::new(target.0, 1))?;
-    }
+    emit_output_expressions(plan, program, bindings, ctes, outputs, result)?;
     emit_row_destination(
         plan,
         program,
@@ -5551,6 +5712,25 @@ fn emit_output_row<'document>(
         limit,
         distinct,
     )
+}
+
+fn emit_output_expressions<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    ctes: &mut MaterializedCtes,
+    outputs: &[crate::translate::semantic::hir::Output],
+    result: RegisterRange,
+) -> QueryResult<()> {
+    for (position, output) in outputs.iter().enumerate() {
+        let target = result
+            .register(position)
+            .ok_or(PhysicalQueryError::Invalid("output register is missing"))?;
+        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+            .emit_into(&output.expr, RegisterRange::new(target.0, 1))?;
+    }
+    Ok(())
 }
 
 fn emit_row_destination<'document>(
@@ -5594,8 +5774,19 @@ fn emit_row_destination<'document>(
             record,
             order_by,
             first_block,
+            tie_breaker,
+            grouping_ties,
         } => {
-            let row_start = program.alloc_registers(order_by.len() + result.width);
+            let grouping_tie_count = grouping_ties.map_or(0, |(grouping, outputs)| {
+                grouping
+                    .keys
+                    .iter()
+                    .filter(|key| !grouping_key_is_ordered(key, order_by, outputs))
+                    .count()
+            });
+            let key_width =
+                order_by.len() + grouping_tie_count + usize::from(tie_breaker.is_some());
+            let row_start = program.alloc_registers(key_width + result.width);
             for (position, term) in order_by.iter().enumerate() {
                 let target = row_start + position;
                 if let Some(output) = order_output_position(&term.expr, first_block) {
@@ -5615,7 +5806,25 @@ fn emit_row_destination<'document>(
                         .emit_into(&term.expr, RegisterRange::new(target, 1))?;
                 }
             }
-            let result_start = row_start + order_by.len();
+            let mut next_key = row_start + order_by.len();
+            if let Some((grouping, outputs)) = grouping_ties {
+                for key in &grouping.keys {
+                    if grouping_key_is_ordered(key, order_by, outputs) {
+                        continue;
+                    }
+                    let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                    ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                        .emit_into(key, RegisterRange::new(next_key, 1))?;
+                    next_key += 1;
+                }
+            }
+            if tie_breaker.is_some() {
+                program.emit_insn(Insn::Sequence {
+                    cursor_id,
+                    target_reg: next_key,
+                });
+            }
+            let result_start = row_start + key_width;
             if result.width > 0 {
                 program.emit_insn(Insn::Copy {
                     src_reg: result.first.0,
@@ -5625,7 +5834,7 @@ fn emit_row_destination<'document>(
             }
             program.emit_insn(Insn::MakeRecord {
                 start_reg: to_u32(row_start),
-                count: to_u32(order_by.len() + result.width),
+                count: to_u32(key_width + result.width),
                 dest_reg: to_u32(record.0),
                 index_name: None,
                 affinity_str: None,
@@ -5673,6 +5882,31 @@ fn order_output_position(expression: &Expr, first_block: QueryBlockId) -> Option
     }
 }
 
+fn grouping_key_matches_order(
+    key: &Expr,
+    order: &Expr,
+    outputs: &[crate::translate::semantic::hir::Output],
+) -> bool {
+    let order = match order {
+        Expr::Output(id) => outputs
+            .iter()
+            .find(|output| output.id == *id)
+            .map_or(order, |output| &output.expr),
+        _ => order,
+    };
+    crate::translate::semantic::schema_expr::equivalent(key, order)
+}
+
+fn grouping_key_is_ordered(
+    key: &Expr,
+    order_by: &[OrderTerm],
+    outputs: &[crate::translate::semantic::hir::Output],
+) -> bool {
+    order_by
+        .iter()
+        .any(|term| grouping_key_matches_order(key, &term.expr, outputs))
+}
+
 fn open_sorter<'hir>(
     program: &mut ProgramBuilder,
     query: &super::PhysicalQuery<'hir>,
@@ -5683,8 +5917,32 @@ fn open_sorter<'hir>(
         .ok_or(PhysicalQueryError::Invalid("query has no physical blocks"))?
         .outputs
         .len();
+    let first_block = query
+        .blocks
+        .first()
+        .ok_or(PhysicalQueryError::Invalid("query has no physical blocks"))?;
+    let grouping_ties = match &first_block.hir.body {
+        QueryBlockBody::Select {
+            grouping: Some(grouping),
+            ..
+        } if !grouping.keys.is_empty()
+            && query.hir.order_by.iter().all(|term| {
+                grouping
+                    .keys
+                    .iter()
+                    .any(|key| grouping_key_matches_order(key, &term.expr, first_block.outputs))
+            }) =>
+        {
+            Some((grouping, first_block.outputs))
+        }
+        _ => None,
+    };
     let cursor_id = program.alloc_cursor_id(CursorType::Sorter);
-    let order_collations_nulls = query
+    let tie_breaker = grouping_ties
+        .is_none()
+        .then(|| query.hir.order_by.last().map(|term| term.order))
+        .flatten();
+    let mut order_collations_nulls = query
         .hir
         .order_by
         .iter()
@@ -5695,16 +5953,56 @@ fn open_sorter<'hir>(
                 term.nulls,
             )
         })
-        .collect();
-    let comparators = query
+        .collect::<Vec<_>>();
+    if let Some(order) = tie_breaker {
+        order_collations_nulls.push((order, Some(CollationSeq::Binary), None));
+    }
+    if let Some((grouping, outputs)) = grouping_ties {
+        order_collations_nulls.extend(grouping.keys.iter().enumerate().filter_map(
+            |(position, key)| {
+                (!grouping_key_is_ordered(key, &query.hir.order_by, outputs)).then(|| {
+                    (
+                        SortOrder::Asc,
+                        grouping.key_collations[position]
+                            .as_ref()
+                            .map(|collation| *collation.value()),
+                        None,
+                    )
+                })
+            },
+        ));
+    }
+    let mut comparators = query
         .hir
         .order_by
         .iter()
         .map(|term| sort_comparator(&term.type_fact))
-        .collect();
+        .collect::<Vec<_>>();
+    if tie_breaker.is_some() {
+        comparators.push(None);
+    }
+    if let Some((grouping, outputs)) = grouping_ties {
+        comparators.extend(
+            grouping
+                .keys
+                .iter()
+                .enumerate()
+                .filter_map(|(position, key)| {
+                    (!grouping_key_is_ordered(key, &query.hir.order_by, outputs))
+                        .then(|| sort_comparator(&grouping.key_type_facts[position]))
+                }),
+        );
+    }
+    let grouping_tie_count = grouping_ties.map_or(0, |(grouping, outputs)| {
+        grouping
+            .keys
+            .iter()
+            .filter(|key| !grouping_key_is_ordered(key, &query.hir.order_by, outputs))
+            .count()
+    });
     program.emit_insn(Insn::SorterOpen {
         cursor_id,
-        columns: query.hir.order_by.len(),
+        columns: query.hir.order_by.len() + grouping_tie_count + usize::from(tie_breaker.is_some()),
         order_collations_nulls,
         comparators,
     });
@@ -5714,6 +6012,8 @@ fn open_sorter<'hir>(
         order_by: &query.hir.order_by,
         first_block: query.hir.first,
         width,
+        tie_breaker,
+        grouping_ties,
     })
 }
 
@@ -5798,13 +6098,22 @@ fn emit_sorted_rows(
     limit: Option<LimitRuntime>,
 ) -> QueryResult<()> {
     let data = program.alloc_register();
+    let grouping_tie_count = sorter.grouping_ties.map_or(0, |(grouping, outputs)| {
+        grouping
+            .keys
+            .iter()
+            .filter(|key| !grouping_key_is_ordered(key, sorter.order_by, outputs))
+            .count()
+    });
+    let key_width =
+        sorter.order_by.len() + grouping_tie_count + usize::from(sorter.tie_breaker.is_some());
     let pseudo = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
-        column_count: sorter.order_by.len() + sorter.width,
+        column_count: key_width + sorter.width,
     }));
     program.emit_insn(Insn::OpenPseudo {
         cursor_id: pseudo,
         content_reg: data,
-        num_fields: sorter.order_by.len() + sorter.width,
+        num_fields: key_width + sorter.width,
     });
     let loop_start = program.allocate_label();
     let cleanup = row_cleanup_label(destination, limit).unwrap_or_else(|| program.allocate_label());
@@ -5822,7 +6131,7 @@ fn emit_sorted_rows(
     for position in 0..sorter.width {
         program.emit_insn(Insn::Column {
             cursor_id: pseudo,
-            column: sorter.order_by.len() + position,
+            column: key_width + position,
             dest: result_start + position,
             default: None,
         });

@@ -1034,3 +1034,106 @@ fn dml_analysis_closes_generated_default_check_and_index_programs(tc: hegel::Tes
         "removing one required stored program must break HIR closure"
     );
 }
+
+// Examples: `SELECT c2 AS grouped, sum(c0) FROM items GROUP BY grouped`
+// and `SELECT c2 AS grouped, sum(c0) FROM items GROUP BY 1` must bind the
+// grouping key to `items.c2`. They must not read output register 1 because
+// grouping happens before that output register is populated.
+#[hegel::test]
+fn grouping_aliases_and_ordinals_copy_the_bound_output_expression(tc: hegel::TestCase) {
+    let width = tc.draw(generators::integers::<usize>().min_value(1).max_value(8));
+    let position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let use_ordinal = tc.draw(generators::booleans());
+    let schema = schema_with_items(width);
+    let symbols = SymbolTable::new();
+    let context = semantic_context(&schema, &symbols);
+    let grouping = if use_ordinal { "1" } else { "grouped" };
+    let statement = parse_statement(&format!(
+        "SELECT c{position} AS grouped, sum(c0) FROM items GROUP BY {grouping}"
+    ));
+
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("the generated grouped SELECT has valid SQL meaning");
+    let HirRoot::Query(root) = &document.root else {
+        unreachable!("the fixture is a SELECT");
+    };
+    let block = &document.queries[root.query.index()].blocks[0];
+    let QueryBlockBody::Select {
+        grouping: Some(grouping),
+        ..
+    } = &block.body
+    else {
+        panic!("the fixture has a GROUP BY clause");
+    };
+    let Expr::Column(output_column) = &block.outputs[0].expr else {
+        panic!("the selected item column is bound directly");
+    };
+    let Expr::Column(grouping_column) = &grouping.keys[0] else {
+        panic!("the grouping key copies the selected expression");
+    };
+    assert_eq!(grouping_column, output_column);
+}
+
+// Example: `SELECT c3 AS chosen FROM items WHERE chosen > 0` must bind the
+// WHERE read to `items.c3`. WHERE runs before projection, so keeping `chosen`
+// as an output-register reference would read an uninitialized register.
+#[hegel::test]
+fn where_aliases_copy_the_bound_output_expression(tc: hegel::TestCase) {
+    let width = tc.draw(generators::integers::<usize>().min_value(1).max_value(8));
+    let position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let schema = schema_with_items(width);
+    let symbols = SymbolTable::new();
+    let context = semantic_context(&schema, &symbols);
+    let statement = parse_statement(&format!(
+        "SELECT c{position} AS chosen FROM items WHERE chosen > 0"
+    ));
+
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("the generated SELECT alias has valid SQL meaning");
+    let HirRoot::Query(root) = &document.root else {
+        unreachable!("the fixture is a SELECT");
+    };
+    let block = &document.queries[root.query.index()].blocks[0];
+    let QueryBlockBody::Select {
+        filter: Some(Expr::Binary { lhs, .. }),
+        ..
+    } = &block.body
+    else {
+        panic!("the fixture has a binary WHERE expression");
+    };
+    let Expr::Column(output_column) = &block.outputs[0].expr else {
+        panic!("the selected item column is bound directly");
+    };
+    let Expr::Column(filter_column) = lhs.as_ref() else {
+        panic!("the WHERE alias copies the selected expression");
+    };
+    assert_eq!(filter_column, output_column);
+}
+
+// Examples: `SELECT c0 FROM items ORDER BY sum(c0)` is an aggregate misuse,
+// while `SELECT count(*) FROM items ORDER BY sum(c0)` and
+// `SELECT c0 FROM items GROUP BY c0 ORDER BY sum(c0)` are aggregate queries.
+#[hegel::test]
+fn order_by_cannot_turn_a_scalar_query_into_an_aggregate_query(tc: hegel::TestCase) {
+    let aggregates = ["min", "max", "sum", "count"];
+    let aggregate =
+        aggregates[tc.draw(generators::integers::<usize>().max_value(aggregates.len() - 1))];
+    let query_kind = tc.draw(generators::integers::<u8>().max_value(2));
+    let sql = match query_kind {
+        0 => format!("SELECT c0 FROM items ORDER BY {aggregate}(c0)"),
+        1 => format!("SELECT count(*) FROM items ORDER BY {aggregate}(c0)"),
+        _ => format!("SELECT c0 FROM items GROUP BY c0 ORDER BY {aggregate}(c0)"),
+    };
+    let schema = schema_with_items(1);
+    let symbols = SymbolTable::new();
+    let context = semantic_context(&schema, &symbols);
+    let statement = parse_statement(&sql);
+    let result = analyze(&context, AnalyzeInput::Statement(&statement));
+
+    if query_kind == 0 {
+        let error = result.expect_err("ORDER BY alone cannot create an aggregate query");
+        assert!(error.to_string().contains("misuse of aggregate"));
+    } else {
+        result.expect("an existing aggregate context permits ORDER BY aggregates");
+    }
+}

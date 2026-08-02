@@ -23,6 +23,7 @@ use crate::{
 #[derive(Clone, Debug)]
 pub(crate) struct ExprPolicy {
     precedence: NamePrecedence,
+    expand_output_references: bool,
     allow_subqueries: bool,
     allow_raise: bool,
     allow_aggregate: bool,
@@ -36,6 +37,7 @@ impl ExprPolicy {
     pub(crate) fn select() -> Self {
         Self {
             precedence: NamePrecedence::SourcesOnly,
+            expand_output_references: false,
             allow_subqueries: true,
             allow_raise: false,
             allow_aggregate: true,
@@ -79,6 +81,11 @@ impl ExprPolicy {
     pub(crate) fn without_aggregate(mut self) -> Self {
         self.allow_aggregate = false;
         self.allow_window = false;
+        self
+    }
+
+    pub(crate) fn with_expanded_output_references(mut self) -> Self {
+        self.expand_output_references = true;
         self
     }
 
@@ -246,8 +253,18 @@ impl Analyzer<'_, '_> {
                 if let Some(resolved) =
                     scope.resolve_unqualified(name.as_str(), policy.precedence)?
                 {
-                    self.validate_existing_expr(&resolved.expr, scope, &policy)?;
-                    return Ok(resolved.expr);
+                    let expression = match resolved.expr {
+                        hir::Expr::Output(output) if policy.expand_output_references => {
+                            scope.output_expr(output).cloned().ok_or_else(|| {
+                                LimboError::InternalError(format!(
+                                    "resolved output {output:?} has no expression"
+                                ))
+                            })?
+                        }
+                        expression => expression,
+                    };
+                    self.validate_existing_expr(&expression, scope, &policy)?;
+                    return Ok(expression);
                 }
                 if policy.allow_dqs_fallback
                     && name.quoted_with('"')
@@ -1543,7 +1560,7 @@ impl Analyzer<'_, '_> {
             crate::bail_parse_error!("misuse of window function {}()", function_name);
         }
         if aggregate && !policy.allow_aggregate {
-            crate::bail_parse_error!("misuse of aggregate function {}()", function_name);
+            crate::bail_parse_error!("misuse of aggregate: {}()", function_name);
         }
         if window_only && tail.over_clause.is_none() {
             crate::bail_parse_error!("misuse of window function {}()", function_name);
@@ -1656,7 +1673,7 @@ impl Analyzer<'_, '_> {
             hir::FunctionEvaluation::Window(self.allocate_window_function_id(block))
         } else if aggregate {
             let block = policy.query_block.ok_or_else(|| {
-                LimboError::ParseError(format!("misuse of aggregate function {}()", function_name))
+                LimboError::ParseError(format!("misuse of aggregate: {}()", function_name))
             })?;
             hir::FunctionEvaluation::Aggregate(self.allocate_aggregate_id(block))
         } else {
@@ -2477,7 +2494,7 @@ impl Analyzer<'_, '_> {
         }
         if !policy.allow_aggregate {
             if let Some(function) = features.aggregate {
-                crate::bail_parse_error!("misuse of aggregate function {}()", function);
+                crate::bail_parse_error!("misuse of aggregate: {}()", function);
             }
         }
         Ok(())

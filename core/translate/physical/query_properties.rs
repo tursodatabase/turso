@@ -1463,7 +1463,9 @@ fn recursive_cte_uses_a_closed_hir_queue_and_input_binding(tc: hegel::TestCase) 
 // ORDER BY b COLLATE NOCASE DESC NULLS LAST` binds the ORDER BY output to
 // position one, not permanently to the first arm's `?2` register. Each arm
 // must copy its own position-one value into the sorter key, while the frozen
-// NOCASE/direction/NULL facts configure the sorter without a resolver.
+// NOCASE/direction/NULL facts configure the sorter without a resolver. The
+// implicit sequence key also uses DESC, so equal keys follow SQLite's reverse
+// insertion order; for ASC they retain insertion order.
 #[hegel::test]
 fn compound_order_by_remaps_each_hir_arm_and_keeps_frozen_sort_facts(tc: hegel::TestCase) {
     let width = usize::from(tc.draw(generators::integers::<u8>().max_value(3))) + 1;
@@ -1517,13 +1519,16 @@ fn compound_order_by_remaps_each_hir_arm_and_keeps_frozen_sort_facts(tc: hegel::
         .expect("ORDER BY opens one HIR-configured sorter");
     assert_eq!(
         sort_facts,
-        &[(
-            ast::SortOrder::Desc,
-            Some(CollationSeq::NoCase),
-            Some(ast::NullsOrder::Last),
-        )]
+        &[
+            (
+                ast::SortOrder::Desc,
+                Some(CollationSeq::NoCase),
+                Some(ast::NullsOrder::Last),
+            ),
+            (ast::SortOrder::Desc, Some(CollationSeq::Binary), None,)
+        ]
     );
-    assert_eq!(comparators, &[None]);
+    assert_eq!(comparators, &[None, None]);
 
     let variables = program
         .insns
@@ -1596,7 +1601,7 @@ fn compound_order_by_remaps_each_hir_arm_and_keeps_frozen_sort_facts(tc: hegel::
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(output_positions, (1..=width).collect::<Vec<_>>());
+    assert_eq!(output_positions, (2..=width + 1).collect::<Vec<_>>());
 }
 
 // Example: `SELECT c7 FROM items ORDER BY c2 DESC LIMIT ?1 OFFSET ?2`
