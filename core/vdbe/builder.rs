@@ -1,20 +1,19 @@
-use crate::{Result, Value, ValueRef, alloc, turso_assert, turso_assert_eq, turso_debug_assert};
+use crate::{alloc, turso_assert, turso_assert_eq, turso_debug_assert, Result, Value, ValueRef};
 
 use rustc_hash::FxHashMap as HashMap;
 use std::num::NonZeroU32;
-use tracing::{Level, instrument};
+use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
 use crate::{
-    Arc, CaptureDataChangesInfo, Connection, VirtualTable,
     index_method::IndexMethodAttachment,
     parameters::Parameters,
-    schema::{BTreeTable, Column, ColumnLayout, Index, PseudoCursorType, Schema, Table, Trigger},
+    schema::{BTreeTable, Column, ColumnLayout, Index, PseudoCursorType, Schema, Trigger},
     translate::{
-        collate::CollationSeq,
-        emitter::TransactionMode,
-        plan::{ResultSetColumn, TableReferences},
+        collate::CollationSeq, emitter::TransactionMode, plan::TableReferences,
+        result::ResultSetColumn,
     },
+    Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
 
 // Keep distinct hash-table ids far from table internal ids to avoid collisions.
@@ -41,8 +40,8 @@ impl TableRefIdCounter {
 }
 
 use super::{
-    BranchOffset, CursorID, Insn, InsnReference, PrepareContext, PreparedProgram, Program,
-    affinity::Affinity,
+    affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, PrepareContext,
+    PreparedProgram, Program,
 };
 use crate::translate::plan::BitSet;
 use std::num::NonZeroUsize;
@@ -256,7 +255,6 @@ pub struct ProgramBuilder {
     next_free_register: usize,
     next_free_cursor_id: usize,
     next_hash_table_id: usize,
-    pub table_references: TableReferences,
     /// Current parsing nesting level
     nested_level: usize,
     init_label: BranchOffset,
@@ -649,7 +647,6 @@ impl ProgramBuilder {
             comments: Vec::new(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
-            table_references: TableReferences::new(vec![], vec![]),
             collation: None,
             nested_level: 0,
             // These labels will be filled when `prologue()` is called
@@ -974,15 +971,7 @@ impl ProgramBuilder {
     }
 
     pub fn add_pragma_result_column(&mut self, col_name: String) {
-        // TODO figure out a better type definition for ResultSetColumn
-        // or invent another way to set pragma result columns
-        let expr = ast::Expr::Id(ast::Name::empty());
-        self.result_columns.push(ResultSetColumn {
-            expr,
-            alias: Some(col_name),
-            implicit_column_name: None,
-            contains_aggregates: false,
-        });
+        self.result_columns.push(ResultSetColumn::pragma(col_name));
     }
 
     #[instrument(skip(self), level = Level::DEBUG)]
@@ -1760,11 +1749,6 @@ impl ProgramBuilder {
         }
     }
 
-    /// Checks whether `table` or any of its indices has been opened in the program
-    pub fn is_table_open(&self, table: &Table) -> bool {
-        self.table_references.contains_table(table)
-    }
-
     /// Returns true if the cursor is backed by a table or index B-tree.
     pub fn cursor_is_btree(&self, cursor_id: CursorID) -> bool {
         matches!(
@@ -1975,7 +1959,6 @@ impl ProgramBuilder {
             change_cnt_on,
             readonly: self.flags.readonly(),
             result_columns: self.result_columns,
-            table_references: self.table_references,
             sql: sql.to_string(),
             needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
                 needs_stmt_subtransactions,

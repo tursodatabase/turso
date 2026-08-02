@@ -11,7 +11,6 @@ pub(crate) mod alter;
 pub(crate) mod analyze;
 pub(crate) mod attach;
 pub(crate) mod collate;
-pub(crate) mod display;
 pub(crate) mod emitter;
 pub(crate) mod expr;
 pub(crate) mod fkeys;
@@ -21,6 +20,7 @@ pub(crate) mod logical;
 pub(crate) mod physical;
 pub(crate) mod plan;
 pub(crate) mod pragma;
+pub(crate) mod result;
 pub(crate) mod rollback;
 pub(crate) mod schema;
 pub(crate) mod semantic;
@@ -37,20 +37,20 @@ use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
-use crate::translate::physical::{PhysicalPlan, emit_root_with_context};
-use crate::translate::plan::ResultSetColumn;
+use crate::translate::physical::{emit_root_with_context, PhysicalPlan};
+use crate::translate::result::ResultSetColumn;
 use crate::translate::semantic::{
-    AnalyzeInput, analyze, context::DmlPolicy, context::SemanticContext, hir,
+    analyze, context::DmlPolicy, context::SemanticContext, hir, AnalyzeInput,
 };
-use crate::vdbe::Program;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
-use crate::{Connection, Result, SymbolTable, bail_parse_error};
+use crate::vdbe::Program;
+use crate::{bail_parse_error, Connection, Result, SymbolTable};
 use alter::translate_alter_table;
 use analyze::translate_analyze;
 use index::{translate_create_index, translate_drop_index, translate_optimize, translate_reindex};
 use rollback::{translate_release, translate_rollback, translate_savepoint};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
-use tracing::{Level, instrument};
+use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
 use turso_parser::ast;
 
@@ -246,12 +246,7 @@ fn set_semantic_result_columns(program: &mut ProgramBuilder, document: &hir::Hir
     };
     program.result_columns = outputs
         .iter()
-        .map(|output| ResultSetColumn {
-            expr: ast::Expr::Id(ast::Name::empty()),
-            alias: Some(output.name.clone()),
-            implicit_column_name: None,
-            contains_aggregates: false,
-        })
+        .map(|output| ResultSetColumn::from_hir(output, document))
         .collect();
 }
 
@@ -515,12 +510,10 @@ pub fn translate_inner(
         bail_parse_error!("Cannot execute write statement in query_only mode")
     }
 
-    let is_select = matches!(stmt, ast::Stmt::Select { .. });
     let is_dml = matches!(
         stmt,
         ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }
     );
-
     match stmt {
         ast::Stmt::AlterTable(alter) => {
             translate_alter_table(alter, resolver, program, connection, input)?;
@@ -754,11 +747,6 @@ pub fn translate_inner(
         }
     }
 
-    // Indicate read operations so that in the epilogue we can emit the correct type of transaction
-    if is_select && !program.table_references.is_empty() {
-        program.begin_read_operation()?;
-    }
-
     Ok(())
 }
 
@@ -803,12 +791,12 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Database;
-    use crate::SqliteDialect;
     use crate::alloc::TryClone;
     use crate::io::MemoryIO;
-    use crate::schema::{BTreeTable, SQLITE_SEQUENCE_TABLE_NAME, Table};
+    use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
     use crate::vdbe::insn::Insn;
+    use crate::Database;
+    use crate::SqliteDialect;
 
     #[test]
     fn semantic_prepare_adapter_owns_root_metadata_and_emission() {
@@ -838,13 +826,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(built.result_columns.len(), 1);
-        assert_eq!(built.result_columns[0].alias.as_deref(), Some("answer"));
-        assert!(
-            built
-                .insns
-                .iter()
-                .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. }))
-        );
+        assert_eq!(built.result_columns[0].name, "answer");
+        assert!(built
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. })));
     }
 
     #[test]

@@ -50,7 +50,6 @@ use crate::{
     return_if_io,
     schema::Trigger,
     state_machine::StateMachine,
-    translate::plan::TableReferences,
     types::{IOCompletions, IOResult},
     vdbe::{
         execute::{
@@ -73,7 +72,7 @@ use crate::json::JsonCacheCell;
 use crate::sync::RwLock;
 use crate::{
     storage::pager::Pager,
-    translate::plan::ResultSetColumn,
+    translate::result::ResultSetColumn,
     types::{AggContext, Cursor, ImmutableRecord, RecordBuf, Value},
     vdbe::{builder::CursorType, insn::Insn},
 };
@@ -1503,7 +1502,6 @@ pub struct PreparedProgram {
     /// mirrors: https://sqlite.org/c3ref/stmt_readonly.html.
     pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
-    pub table_references: TableReferences,
     pub sql: String,
     /// Whether the statement needs to be wrapped in a statement subtransaction
     /// when run as part of an interactive (non-autocommit) transaction.
