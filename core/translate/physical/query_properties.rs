@@ -2375,6 +2375,104 @@ fn window_calls_have_separate_stable_hir_identity(tc: hegel::TestCase) {
     }
 }
 
+// Examples:
+// - `row_number() OVER (PARTITION BY g ORDER BY value ASC)` counts equal
+//   values separately, using rowid only to choose a stable order among peers.
+// - `rank() OVER (PARTITION BY g ORDER BY value DESC)` gives peers the same
+//   rank and leaves gaps after them.
+// - `dense_rank() OVER (PARTITION BY g ORDER BY value)` gives peers the same
+//   rank without gaps, so only distinct earlier HIR order keys are counted.
+// The WHERE predicate must apply to both the output scan and every ranking
+// rescan. Dropping the schema before emission proves the physical layer uses
+// the bound SourceId, column positions, collation, and direction from HIR.
+#[hegel::test]
+fn ranking_windows_rescan_the_bound_hir_source(tc: hegel::TestCase) {
+    let descending = tc.draw(generators::booleans());
+    let filter_position = tc.draw(generators::integers::<usize>().max_value(2));
+    let direction = if descending { "DESC" } else { "ASC" };
+    let columns = ["g", "value", "keep"];
+    let items = BTreeTable::from_sql(
+        "CREATE TABLE items(g INTEGER, value INTEGER, keep INTEGER)",
+        53,
+    )
+    .expect("fixture table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(items))
+        .expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT g, value, \
+         row_number() OVER (PARTITION BY g ORDER BY value {direction}), \
+         rank() OVER (PARTITION BY g ORDER BY value {direction}), \
+         dense_rank() OVER (PARTITION BY g ORDER BY value {direction}) \
+         FROM items WHERE {} >= ?1",
+        columns[filter_position]
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated ranking query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed ranking HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("ranking windows emit from closed HIR");
+    program
+        .resolve_labels()
+        .expect("all ranking-window branches are closed");
+
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| {
+                matches!(
+                    instruction,
+                    Insn::OpenRead {
+                        root_page: 53,
+                        db: 0,
+                        ..
+                    }
+                )
+            })
+            .count(),
+        4,
+        "one output scan and one independent rescan per window call"
+    );
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::Add { .. }))
+            .count(),
+        3,
+        "each ranking function owns one counter"
+    );
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::HashDistinct { .. }))
+            .count(),
+        1,
+        "only dense_rank counts distinct earlier order keys"
+    );
+    let first_compare = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::Compare { .. }))
+        .expect("partition and order keys are compared during rescans");
+    let result = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { .. }))
+        .expect("the ranked row is emitted");
+    assert!(first_compare < result);
+}
+
 // Example: `SELECT c3, sum(c5), count(*) FROM items GROUP BY c3`, where
 // `c3 TEXT COLLATE NOCASE`, sorts with the collation frozen in HIR, reloads
 // each sorted source row under the same SourceId, steps one accumulator per

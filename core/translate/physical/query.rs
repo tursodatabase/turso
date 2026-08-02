@@ -11,7 +11,7 @@ use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{CompoundOperator, Distinctness, Literal, NullsOrder, SortOrder};
 
 use crate::{
-    function::{AccumulatorFunc, AggFunc, Func},
+    function::{AccumulatorFunc, AggFunc, Func, WindowFunc},
     schema::{
         BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, PseudoCursorType, Table,
     },
@@ -116,6 +116,14 @@ enum ScanRowAction<'hir, 'destination> {
         cursor: usize,
         table: &'destination BTreeTable,
     },
+    WindowProject {
+        block: &'destination super::PhysicalQueryBlock<'hir>,
+        filter: Option<&'hir Expr>,
+        result: RegisterRange,
+        destination: QueryDestination<'destination>,
+        limit: Option<LimitRuntime>,
+        distinct: Option<&'destination DistinctRuntime>,
+    },
 }
 
 impl ScanRowAction<'_, '_> {
@@ -126,7 +134,8 @@ impl ScanRowAction<'_, '_> {
             } => row_cleanup_label(destination, limit),
             Self::Aggregate { .. }
             | Self::GroupSortInsert { .. }
-            | Self::UpdateCandidate { .. } => None,
+            | Self::UpdateCandidate { .. }
+            | Self::WindowProject { .. } => None,
         }
     }
 }
@@ -1603,9 +1612,19 @@ fn emit_query_block<'document>(
             windows,
         } => {
             if !windows.is_empty() || !block.window_functions.is_empty() {
-                return Err(PhysicalQueryError::Unsupported("window query"));
-            }
-            if let Some(grouping) = grouping
+                emit_ranking_window_query(
+                    plan,
+                    program,
+                    bindings,
+                    ctes,
+                    block,
+                    filter.as_ref(),
+                    result,
+                    destination,
+                    limit,
+                    distinct.as_ref(),
+                )
+            } else if let Some(grouping) = grouping
                 .as_ref()
                 .filter(|grouping| !grouping.keys.is_empty())
             {
@@ -2211,6 +2230,360 @@ fn emit_ungrouped_aggregate<'document>(
     program.preassign_label_to_next_insn(skip);
     close_aggregate_distinct_sets(program, bindings, &block.aggregates)?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_ranking_window_query<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    ctes: &mut MaterializedCtes,
+    block: &super::PhysicalQueryBlock<'document>,
+    filter: Option<&'document Expr>,
+    result: RegisterRange,
+    destination: QueryDestination<'_>,
+    limit: Option<LimitRuntime>,
+    distinct: Option<&DistinctRuntime>,
+) -> QueryResult<()> {
+    if block.aggregates.len() > 0 {
+        return Err(PhysicalQueryError::Unsupported(
+            "aggregate and window functions in one query block",
+        ));
+    }
+    let [source] = block.source_order.as_slice() else {
+        return Err(PhysicalQueryError::Unsupported(
+            "ranking window over a non-table or joined source",
+        ));
+    };
+    for function in &block.window_functions {
+        let Func::Window(WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank) =
+            function.call.function.value()
+        else {
+            return Err(PhysicalQueryError::Unsupported(
+                "window function outside the ranking subset",
+            ));
+        };
+        bindings.bind_window_function(
+            function.id,
+            super::WindowFunctionRuntime {
+                register: RegisterId(program.alloc_register()),
+            },
+        )?;
+    }
+    emit_table_scans(
+        plan,
+        program,
+        bindings,
+        ctes,
+        std::slice::from_ref(source),
+        filter,
+        block.hir.from.as_ref(),
+        ScanRowAction::WindowProject {
+            block,
+            filter,
+            result,
+            destination,
+            limit,
+            distinct,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_ranking_window_row<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    ctes: &mut MaterializedCtes,
+    block: &super::PhysicalQueryBlock<'document>,
+    filter: Option<&'document Expr>,
+    result: RegisterRange,
+    destination: QueryDestination<'_>,
+    limit: Option<LimitRuntime>,
+    distinct: Option<&DistinctRuntime>,
+) -> QueryResult<()> {
+    let [source_id] = block.source_order.as_slice() else {
+        return Err(PhysicalQueryError::Invalid(
+            "ranking window source shape changed during emission",
+        ));
+    };
+    let source = plan
+        .source(*source_id)
+        .ok_or(PhysicalQueryError::Invalid("window source is missing"))?;
+    let SourceRuntime::Cursor(outer_cursor) = bindings.source(*source_id)? else {
+        return Err(PhysicalQueryError::Invalid(
+            "window outer source is not cursor-backed",
+        ));
+    };
+    let outer_columns = RegisterRange::new(program.alloc_registers(source.width), source.width);
+    for position in 0..source.width {
+        program.emit_insn(Insn::Column {
+            cursor_id: outer_cursor.0,
+            column: position,
+            dest: outer_columns.first.0 + position,
+            default: None,
+        });
+    }
+    let outer_rowid = RegisterId(program.alloc_register());
+    program.emit_insn(Insn::RowId {
+        cursor_id: outer_cursor.0,
+        dest: outer_rowid.0,
+    });
+    let previous_outer = bindings.replace_source(
+        *source_id,
+        SourceRuntime::Registers {
+            columns: outer_columns,
+            rowid: Some(outer_rowid),
+        },
+    )?;
+
+    let emission = (|| -> QueryResult<()> {
+        for function in &block.window_functions {
+            let Func::Window(
+                kind @ (WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank),
+            ) = function.call.function.value()
+            else {
+                return Err(PhysicalQueryError::Unsupported(
+                    "window function outside the ranking subset",
+                ));
+            };
+            let spec = function
+                .call
+                .window
+                .as_ref()
+                .ok_or(PhysicalQueryError::Invalid(
+                    "window call has no specification",
+                ))?;
+            let outer_partition = program.alloc_registers(spec.partition_by.len());
+            for (position, expression) in spec.partition_by.iter().enumerate() {
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries).emit_into(
+                    expression,
+                    RegisterRange::new(outer_partition + position, 1),
+                )?;
+            }
+            let outer_order = program.alloc_registers(spec.order_by.len());
+            for (position, term) in spec.order_by.iter().enumerate() {
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                    .emit_into(&term.expr, RegisterRange::new(outer_order + position, 1))?;
+            }
+            let inner = open_source(plan, program, bindings, ctes, source)?;
+            let ScanCursor::BTree(inner_cursor) = inner.cursor else {
+                return Err(PhysicalQueryError::Unsupported(
+                    "ranking window over a non-B-tree source",
+                ));
+            };
+            let outer_runtime = bindings.replace_source(
+                *source_id,
+                SourceRuntime::Cursor(super::CursorId(inner.runtime_cursor)),
+            )?;
+            let value = bindings.window_function(function.id)?.register;
+            program.emit_insn(Insn::Integer {
+                value: i64::from(!matches!(kind, WindowFunc::RowNumber)),
+                dest: value.0,
+            });
+            let one = program.alloc_register();
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: one,
+            });
+            let distinct_orders =
+                matches!(kind, WindowFunc::DenseRank).then(|| program.alloc_hash_table_id());
+            if let Some(hash_table_id) = distinct_orders {
+                program.emit_insn(Insn::HashClear { hash_table_id });
+            }
+            let loop_start = program.allocate_label();
+            let loop_next = program.allocate_label();
+            let less = program.allocate_label();
+            let equal = program.allocate_label();
+            let increment = program.allocate_label();
+            let done = program.allocate_label();
+            program.emit_insn(Insn::Rewind {
+                cursor_id: inner_cursor,
+                pc_if_empty: done,
+            });
+            program.preassign_label_to_next_insn(loop_start);
+            if let Some(filter) = filter {
+                emit_filter(plan, program, bindings, ctes, filter, loop_next)?;
+            }
+            if !spec.partition_by.is_empty() {
+                let inner_partition = program.alloc_registers(spec.partition_by.len());
+                for (position, expression) in spec.partition_by.iter().enumerate() {
+                    let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                    ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                        .emit_into(
+                            expression,
+                            RegisterRange::new(inner_partition + position, 1),
+                        )?;
+                }
+                program.emit_insn(Insn::Compare {
+                    start_reg_a: outer_partition,
+                    start_reg_b: inner_partition,
+                    count: spec.partition_by.len(),
+                    key_info: spec
+                        .partition_by
+                        .iter()
+                        .map(|expression| KeyInfo {
+                            sort_order: SortOrder::Asc,
+                            collation: expression_collation(plan, expression),
+                            nulls_order: None,
+                        })
+                        .collect(),
+                });
+                let same_partition = program.allocate_label();
+                program.emit_insn(Insn::Jump {
+                    target_pc_lt: loop_next,
+                    target_pc_eq: same_partition,
+                    target_pc_gt: loop_next,
+                });
+                program.preassign_label_to_next_insn(same_partition);
+            }
+            if spec.order_by.is_empty() {
+                if matches!(kind, WindowFunc::RowNumber) {
+                    let inner_rowid = program.alloc_register();
+                    program.emit_insn(Insn::RowId {
+                        cursor_id: inner_cursor,
+                        dest: inner_rowid,
+                    });
+                    program.emit_insn(Insn::Compare {
+                        start_reg_a: outer_rowid.0,
+                        start_reg_b: inner_rowid,
+                        count: 1,
+                        key_info: vec![KeyInfo {
+                            sort_order: SortOrder::Asc,
+                            collation: CollationSeq::Binary,
+                            nulls_order: None,
+                        }],
+                    });
+                    program.emit_insn(Insn::Jump {
+                        target_pc_lt: loop_next,
+                        target_pc_eq: increment,
+                        target_pc_gt: increment,
+                    });
+                } else {
+                    program.emit_insn(Insn::Goto {
+                        target_pc: loop_next,
+                    });
+                }
+            } else {
+                let inner_order = program.alloc_registers(spec.order_by.len());
+                for (position, term) in spec.order_by.iter().enumerate() {
+                    let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                    ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                        .emit_into(&term.expr, RegisterRange::new(inner_order + position, 1))?;
+                }
+                program.emit_insn(Insn::Compare {
+                    start_reg_a: outer_order,
+                    start_reg_b: inner_order,
+                    count: spec.order_by.len(),
+                    key_info: spec
+                        .order_by
+                        .iter()
+                        .map(|term| KeyInfo {
+                            sort_order: term.order,
+                            collation: term
+                                .collation
+                                .as_ref()
+                                .map_or(CollationSeq::Binary, |collation| *collation.value()),
+                            nulls_order: term.nulls,
+                        })
+                        .collect(),
+                });
+                program.emit_insn(Insn::Jump {
+                    target_pc_lt: loop_next,
+                    target_pc_eq: equal,
+                    target_pc_gt: less,
+                });
+                program.preassign_label_to_next_insn(less);
+                if let Some(hash_table_id) = distinct_orders {
+                    program.emit_insn(Insn::HashDistinct {
+                        data: Box::new(HashDistinctData {
+                            hash_table_id,
+                            key_start_reg: inner_order,
+                            num_keys: spec.order_by.len(),
+                            collations: spec
+                                .order_by
+                                .iter()
+                                .map(|term| {
+                                    term.collation
+                                        .as_ref()
+                                        .map_or(CollationSeq::Binary, |collation| {
+                                            *collation.value()
+                                        })
+                                })
+                                .collect(),
+                            target_pc: loop_next,
+                        }),
+                    });
+                }
+                program.emit_insn(Insn::Goto {
+                    target_pc: increment,
+                });
+                program.preassign_label_to_next_insn(equal);
+                if matches!(kind, WindowFunc::RowNumber) {
+                    let inner_rowid = program.alloc_register();
+                    program.emit_insn(Insn::RowId {
+                        cursor_id: inner_cursor,
+                        dest: inner_rowid,
+                    });
+                    program.emit_insn(Insn::Compare {
+                        start_reg_a: outer_rowid.0,
+                        start_reg_b: inner_rowid,
+                        count: 1,
+                        key_info: vec![KeyInfo {
+                            sort_order: SortOrder::Asc,
+                            collation: CollationSeq::Binary,
+                            nulls_order: None,
+                        }],
+                    });
+                    program.emit_insn(Insn::Jump {
+                        target_pc_lt: loop_next,
+                        target_pc_eq: increment,
+                        target_pc_gt: increment,
+                    });
+                } else {
+                    program.emit_insn(Insn::Goto {
+                        target_pc: loop_next,
+                    });
+                }
+            }
+            program.preassign_label_to_next_insn(increment);
+            program.emit_insn(Insn::Add {
+                lhs: value.0,
+                rhs: one,
+                dest: value.0,
+            });
+            program.preassign_label_to_next_insn(loop_next);
+            program.emit_insn(Insn::Next {
+                cursor_id: inner_cursor,
+                pc_if_next: loop_start,
+            });
+            program.preassign_label_to_next_insn(done);
+            if let Some(hash_table_id) = distinct_orders {
+                program.emit_insn(Insn::HashClose { hash_table_id });
+            }
+            if inner.owned {
+                program.emit_insn(Insn::Close {
+                    cursor_id: inner.cursor.id(),
+                });
+            }
+            bindings.replace_source(*source_id, outer_runtime)?;
+        }
+        emit_output_row(
+            plan,
+            program,
+            bindings,
+            ctes,
+            block.outputs,
+            result,
+            destination,
+            limit,
+            distinct,
+        )
+    })();
+    bindings.replace_source(*source_id, previous_outer)?;
+    emission
 }
 
 fn open_ordered_aggregate_sorters<'document>(
@@ -3289,6 +3662,25 @@ fn emit_scan_action<'document>(
             });
             Ok(())
         }
+        ScanRowAction::WindowProject {
+            block,
+            filter,
+            result,
+            destination,
+            limit,
+            distinct,
+        } => emit_ranking_window_row(
+            plan,
+            program,
+            bindings,
+            ctes,
+            block,
+            filter,
+            result,
+            destination,
+            limit,
+            distinct,
+        ),
     }
 }
 

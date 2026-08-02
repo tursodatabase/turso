@@ -92,6 +92,9 @@ operations are not SQL binding.
         read exactly the first row or existence bit after every arm is closed.
   - [x] LEFT JOIN preserves the separate HIR join constraint and WHERE phases
         and null-extends the right SourceId only when no join match exists.
+  - [x] `row_number`, `rank`, and `dense_rank` execute over one resolved B-tree
+        source using stable WindowFunctionId bindings. The correctness-first
+        implementation rescans the frozen HIR source for each output row.
   - [ ] Window execution, RIGHT/FULL OUTER JOIN, and the remaining compound
         combinations.
   - [x] Recursive CTE seeds and arms feed a frozen-HIR priority queue, bind
