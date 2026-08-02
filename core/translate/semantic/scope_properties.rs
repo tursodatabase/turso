@@ -1,32 +1,12 @@
 //! Property tests for the SQL name and position rules implemented by `Scope`.
 
-#[allow(dead_code, clippy::large_enum_variant)]
-#[path = "hir/mod.rs"]
-mod hir;
-
-#[allow(dead_code)]
-#[path = "cte_bindings.rs"]
-mod cte_bindings;
-
-#[path = "cte_rules.rs"]
-mod cte_rules;
+use super::{cte_bindings, cte_rules, dml_rules, hir, scope, trigger_rules};
 
 #[path = "cte_properties.rs"]
 mod cte_properties;
 
-#[allow(dead_code)]
-#[path = "dml_rules.rs"]
-mod dml_rules;
-
 #[path = "dml_properties.rs"]
 mod dml_properties;
-
-#[allow(dead_code, clippy::type_complexity)]
-#[path = "scope.rs"]
-mod scope;
-
-#[path = "trigger_rules.rs"]
-mod trigger_rules;
 
 #[path = "trigger_properties.rs"]
 mod trigger_properties;
@@ -36,9 +16,10 @@ use turso_parser::ast::Literal;
 
 use self::{
     hir::{
-        ColumnReadExpression, ColumnRef, DatabaseId, Expr, IndexHint, MergedColumnValue, Output,
-        OutputId, OutputNameKind, QueryBlockId, QueryId, Source, SourceColumn, SourceId,
-        SourceKind, SourceOwner, TypeFact, UsingColumn,
+        ColumnReadExpression, ColumnRef, ComparisonComponent, ComparisonSemantics, DatabaseId,
+        Expr, IndexCoverage, IndexHint, MergedColumnValue, Output, OutputId, OutputNameKind,
+        QueryBlockId, QueryId, Source, SourceColumn, SourceId, SourceKind, SourceOwner, TypeFact,
+        UsingColumn,
     },
     scope::{NamePrecedence, Scope},
 };
@@ -96,10 +77,11 @@ fn source(
         generated_expressions: vec![ColumnReadExpression::Absent; width],
         default_expressions: vec![ColumnReadExpression::Absent; width],
         column_type_programs: vec![None; width],
-        check_constraints: Vec::new(),
+        check_constraints: None,
         rowid_available,
         index_hint: IndexHint::None,
         index_expressions: Vec::new(),
+        index_coverage: IndexCoverage::Selective,
         index_method_patterns: Vec::new(),
     }
 }
@@ -118,6 +100,7 @@ fn output_with_kind(position: usize, name: String, name_kind: OutputNameKind) ->
         affinity: Affinity::Integer,
         has_affinity: true,
         collation: None,
+        collation_is_explicit: false,
         name_kind,
     }
 }
@@ -697,6 +680,13 @@ fn using_keeps_one_value_with_both_source_positions(tc: hegel::TestCase) {
         affinity: Affinity::Integer,
         has_affinity: true,
         collation: None,
+        comparison: ComparisonSemantics {
+            components: vec![ComparisonComponent {
+                affinity: Affinity::Integer,
+                collation: None,
+                array: false,
+            }],
+        },
     };
     let mut scope = Scope::default();
     scope.add_source(&left, true);

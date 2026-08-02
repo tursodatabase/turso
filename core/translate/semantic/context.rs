@@ -20,7 +20,7 @@ use crate::{
     DatabaseCatalog, LimboError, Result, SymbolTable, MAIN_DB_ID, TEMP_DB_ID,
 };
 
-use super::hir::CatalogSnapshot;
+use super::hir::{CatalogSnapshot, DatabaseId, DatabaseSnapshot};
 
 static NEXT_CATALOG_SNAPSHOT: AtomicU64 = AtomicU64::new(1);
 
@@ -208,12 +208,8 @@ impl<'a> SemanticContext<'a> {
             .map(|temp| temp.db.schema.lock().clone())
             .unwrap_or_else(|| {
                 Arc::new(
-                    Schema::with_options_and_symbols(
-                        custom_types_enabled,
-                        dialect.as_ref(),
-                        symbol_table,
-                    )
-                    .expect("built-in type definitions are malformed"),
+                    Schema::with_options(custom_types_enabled, dialect.as_ref())
+                        .expect("built-in type definitions are malformed"),
                 )
             });
         schemas.insert(TEMP_DB_ID, SchemaSnapshot::Shared(temp_schema));
@@ -258,6 +254,19 @@ impl<'a> SemanticContext<'a> {
 
     pub(crate) fn snapshot(&self) -> CatalogSnapshot {
         CatalogSnapshot::from_id(self.snapshot_serial)
+    }
+
+    pub(crate) fn database_snapshots(&self) -> Vec<DatabaseSnapshot> {
+        let mut snapshots = self
+            .schemas
+            .iter()
+            .map(|(database_id, schema)| DatabaseSnapshot {
+                database: DatabaseId::new(*database_id),
+                schema_version: schema.schema().schema_version,
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_unstable_by_key(|snapshot| snapshot.database.index());
+        snapshots
     }
 
     pub(crate) fn main_schema(&self) -> &Schema {

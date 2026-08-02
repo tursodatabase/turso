@@ -64,6 +64,8 @@ impl PseudoSources {
 /// Inputs inherited by a query from its containing statement or query.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct QueryEnvironment {
+    /// Query whose namespace is inherited by the query being analyzed.
+    pub(crate) query: Option<hir::QueryId>,
     pub(crate) outer: Option<Scope>,
     pub(crate) pseudo_sources: PseudoSources,
     pub(crate) ctes: CteBindings,
@@ -83,6 +85,7 @@ impl QueryEnvironment {
 
     pub(crate) fn for_subquery(scope: &Scope) -> Self {
         Self {
+            query: scope.query(),
             outer: Some(scope.clone()),
             pseudo_sources: scope.pseudo_sources().clone(),
             ctes: scope.ctes().clone(),
@@ -210,11 +213,13 @@ struct ScopeOutput {
     affinity: Affinity,
     has_affinity: bool,
     collation: Option<hir::ResolvedCollation>,
+    collation_is_explicit: bool,
 }
 
 /// One query block's source and output namespaces, plus enclosing blocks.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Scope {
+    query: Option<hir::QueryId>,
     sources: Vec<ScopeSource>,
     visible_columns: Vec<ScopeColumn>,
     outputs: Vec<ScopeOutput>,
@@ -238,6 +243,14 @@ impl Scope {
 
     pub(crate) fn outer(&self) -> Option<&Scope> {
         self.outer.as_deref()
+    }
+
+    pub(crate) const fn query(&self) -> Option<hir::QueryId> {
+        self.query
+    }
+
+    pub(crate) fn set_query(&mut self, query: hir::QueryId) {
+        self.query = Some(query);
     }
 
     /// Clone this query block's namespace without any enclosing query blocks.
@@ -416,6 +429,7 @@ impl Scope {
                 affinity: output.affinity,
                 has_affinity: output.has_affinity,
                 collation: output.collation.clone(),
+                collation_is_explicit: output.collation_is_explicit,
             })
             .collect();
     }
@@ -620,12 +634,24 @@ impl Scope {
             .or_else(|| self.outer.as_deref()?.output_has_affinity(id))
     }
 
-    pub(crate) fn output_collation(&self, id: OutputId) -> Option<Option<&hir::ResolvedCollation>> {
+    pub(crate) fn output_collation_parts(
+        &self,
+        id: OutputId,
+    ) -> Option<(
+        Option<&hir::ResolvedCollation>,
+        Option<&hir::ResolvedCollation>,
+    )> {
         self.outputs
             .iter()
             .find(|output| output.id == id)
-            .map(|output| output.collation.as_ref())
-            .or_else(|| self.outer.as_deref()?.output_collation(id))
+            .map(|output| {
+                if output.collation_is_explicit {
+                    (output.collation.as_ref(), None)
+                } else {
+                    (None, output.collation.as_ref())
+                }
+            })
+            .or_else(|| self.outer.as_deref()?.output_collation_parts(id))
     }
 
     pub(crate) fn output_expr(&self, id: OutputId) -> Option<&hir::Expr> {

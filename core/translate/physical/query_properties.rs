@@ -1,0 +1,2624 @@
+//! Properties for the catalog-free physical query boundary.
+
+use hegel::generators;
+use turso_parser::{
+    ast::{self, CompoundOperator},
+    parser::Parser,
+};
+
+use super::*;
+use crate::{
+    dialect::{Dialect, SqliteDialect},
+    schema::{BTreeTable, Index, Schema},
+    sync::Arc,
+    translate::{
+        collate::CollationSeq,
+        semantic::{
+            analyze,
+            context::SemanticContext,
+            hir::{Expr, FunctionEvaluation, HirRoot, QueryBlockBody},
+            AnalyzeInput,
+        },
+    },
+    vdbe::{
+        affinity::Affinity,
+        builder::{CursorType, ProgramBuilder, ProgramBuilderOpts},
+        insn::Insn,
+        BranchOffset,
+    },
+    QueryMode, SymbolTable,
+};
+
+fn parse_statement(sql: &str) -> ast::Stmt {
+    let command = Parser::new(sql.as_bytes())
+        .next_cmd()
+        .expect("generated SQL parses")
+        .expect("generated SQL contains a statement");
+    let ast::Cmd::Stmt(statement) = command else {
+        panic!("generated SQL contains a statement");
+    };
+    statement
+}
+
+fn program() -> ProgramBuilder {
+    ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 32, 8))
+}
+
+// Example: after binding
+// `SELECT c7, c7 + 1 FROM items WHERE c2 >= ?1`, physical emission must open
+// the resolved `items` table, read positions `[2, 7, 7]`, reject false or
+// NULL filters, and loop that exact cursor. Dropping `Schema` first proves
+// that no table, column, type, collation, or parameter name is resolved again.
+#[hegel::test]
+fn a_root_table_scan_emits_only_from_closed_hir(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(15))) + 1;
+    let filter_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let output_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let columns = (0..width)
+        .map(|position| format!("c{position} INTEGER"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = BTreeTable::from_sql(&format!("CREATE TABLE items({columns})"), 7)
+        .expect("generated table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(table))
+        .expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT c{output_position}, c{output_position} + 1 \
+         FROM items WHERE c{filter_position} >= ?1"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("scan-first query lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("all direct-emission branches are closed");
+
+    let opened = program
+        .insns
+        .iter()
+        .find_map(|(instruction, _)| match instruction {
+            Insn::OpenRead {
+                cursor_id,
+                root_page: 7,
+                db: 0,
+            } => Some(*cursor_id),
+            _ => None,
+        })
+        .expect("resolved items table is opened directly");
+    let column_positions = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::Column {
+                cursor_id, column, ..
+            } if *cursor_id == opened => Some(*column),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        column_positions,
+        [filter_position, output_position, output_position]
+    );
+
+    let rewind = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(instruction, Insn::Rewind { cursor_id, .. } if *cursor_id == opened)
+        })
+        .expect("B-tree scan starts with Rewind");
+    let next = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(instruction, Insn::Next { cursor_id, .. } if *cursor_id == opened)
+        })
+        .expect("B-tree scan advances with Next");
+    let close = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(instruction, Insn::Close { cursor_id } if *cursor_id == opened)
+        })
+        .expect("resolved cursor is closed");
+
+    assert!(matches!(
+        &program.insns[rewind].0,
+        Insn::Rewind {
+            pc_if_empty: BranchOffset::Offset(target),
+            ..
+        } if *target as usize == close
+    ));
+    assert!(matches!(
+        &program.insns[next].0,
+        Insn::Next {
+            pc_if_next: BranchOffset::Offset(target),
+            ..
+        } if *target as usize == rewind + 1
+    ));
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::IfNot {
+            target_pc: BranchOffset::Offset(target),
+            jump_if_null: true,
+            ..
+        } if *target as usize == next
+    )));
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Ge { flags, .. } if flags.get_affinity() == Affinity::Integer
+    )));
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 2, .. })));
+}
+
+// Example: `SELECT c7 FROM items INDEXED BY items_idx WHERE c2 >= ?1` must
+// iterate the exact resolved `items_idx`, seek the matching table row, and
+// still read table positions `c2` and `c7` from the table cursor. Index-key
+// positions are not table-column positions. Dropping `Schema` first proves
+// that the index name and its table relationship are never resolved again.
+#[hegel::test]
+fn forced_indexes_iterate_the_index_but_bind_columns_to_the_table(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(15))) + 1;
+    let index_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let filter_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let output_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let columns = (0..width)
+        .map(|position| format!("c{position} INTEGER"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = Arc::new(
+        BTreeTable::from_sql(&format!("CREATE TABLE items({columns})"), 7)
+            .expect("generated table SQL is valid"),
+    );
+    let symbols = SymbolTable::new();
+    let index = Index::from_sql(
+        &symbols,
+        &format!("CREATE INDEX items_idx ON items(c{index_position})"),
+        13,
+        &table,
+    )
+    .expect("generated index SQL is valid");
+    let mut schema = Schema::new();
+    schema.add_btree_table(table).expect("items is unique");
+    schema
+        .add_index(Arc::new(index))
+        .expect("items_idx is unique");
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT c{output_position} FROM items INDEXED BY items_idx \
+         WHERE c{filter_position} >= ?1"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated forced-index query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed forced-index HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("forced index lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("forced-index branches are all closed");
+
+    let cursor_for_root = |root_page| {
+        program
+            .insns
+            .iter()
+            .find_map(|(instruction, _)| match instruction {
+                Insn::OpenRead {
+                    cursor_id,
+                    root_page: actual,
+                    db: 0,
+                } if *actual == root_page => Some(*cursor_id),
+                _ => None,
+            })
+            .expect("resolved B-tree is opened")
+    };
+    let table_cursor = cursor_for_root(7);
+    let index_cursor = cursor_for_root(13);
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::DeferredSeek {
+            index_cursor_id,
+            table_cursor_id,
+        } if *index_cursor_id == index_cursor && *table_cursor_id == table_cursor
+    )));
+
+    let reads = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::Column {
+                cursor_id, column, ..
+            } => Some((*cursor_id, *column)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reads,
+        [
+            (table_cursor, filter_position),
+            (table_cursor, output_position),
+        ]
+    );
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Rewind { cursor_id, .. } if *cursor_id == index_cursor
+    )));
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Next { cursor_id, .. } if *cursor_id == index_cursor
+    )));
+    assert!(!program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Rewind { cursor_id, .. } | Insn::Next { cursor_id, .. }
+            if *cursor_id == table_cursor
+    )));
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Close { cursor_id } if *cursor_id == index_cursor
+    )));
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Close { cursor_id } if *cursor_id == table_cursor
+    )));
+}
+
+// Example: `SELECT d.value FROM (SELECT c7 AS value FROM items WHERE c2 >= ?1)
+// AS d` must materialize the child query through its resolved QueryId, then
+// bind the outer source to column zero of that materialization. The child
+// still reads table positions `c2` and `c7`; the outer position is `d[0]`.
+// These two position spaces must never be mixed or reconstructed by name.
+#[hegel::test]
+fn derived_sources_materialize_query_outputs_in_their_own_position_space(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(15))) + 1;
+    let filter_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let output_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let columns = (0..width)
+        .map(|position| format!("c{position} INTEGER"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = BTreeTable::from_sql(&format!("CREATE TABLE items({columns})"), 7)
+        .expect("generated table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(table))
+        .expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT d.value FROM (\
+             SELECT c{output_position} AS value \
+             FROM items WHERE c{filter_position} >= ?1\
+         ) AS d"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated derived-table query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed derived-table HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("derived table lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("derived-table branches are all closed");
+
+    let table_cursor = program
+        .insns
+        .iter()
+        .find_map(|(instruction, _)| match instruction {
+            Insn::OpenRead {
+                cursor_id,
+                root_page: 7,
+                db: 0,
+            } => Some(*cursor_id),
+            _ => None,
+        })
+        .expect("the child opens the resolved items table");
+    let derived_cursor = program
+        .insns
+        .iter()
+        .find_map(|(instruction, _)| match instruction {
+            Insn::OpenEphemeral {
+                cursor_id,
+                is_table: true,
+            } => Some(*cursor_id),
+            _ => None,
+        })
+        .expect("the child output has one materialized source");
+    let reads = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::Column {
+                cursor_id, column, ..
+            } => Some((*cursor_id, *column)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reads,
+        [
+            (table_cursor, filter_position),
+            (table_cursor, output_position),
+            (derived_cursor, 0),
+        ]
+    );
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::MakeRecord { count: 1, .. })));
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::NewRowid { cursor, .. } if *cursor == derived_cursor
+    )));
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Insert { cursor, .. } if *cursor == derived_cursor
+    )));
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. }))
+            .count(),
+        1
+    );
+}
+
+// Example: `WITH chosen(value) AS (SELECT c7 FROM items WHERE c2 >= ?1)
+// SELECT l.value, r.value FROM chosen AS l JOIN chosen AS r
+// ON l.value = r.value` must evaluate `chosen` once, then open two independent
+// cursors over the same ephemeral rows. Each CTE occurrence keeps its own
+// SourceId and cursor position; neither reference may rerun or steal the
+// other reference's cursor.
+#[hegel::test]
+fn repeated_cte_sources_share_rows_but_keep_independent_source_cursors(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(15))) + 1;
+    let filter_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let output_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let columns = (0..width)
+        .map(|position| format!("c{position} INTEGER"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = BTreeTable::from_sql(&format!("CREATE TABLE items({columns})"), 7)
+        .expect("generated table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(table))
+        .expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "WITH chosen(value) AS (\
+             SELECT c{output_position} FROM items WHERE c{filter_position} >= ?1\
+         ) \
+         SELECT l.value, r.value \
+         FROM chosen AS l JOIN chosen AS r ON l.value = r.value"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated repeated-CTE query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed repeated-CTE HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("repeated CTE lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("repeated-CTE branches are all closed");
+
+    let backing_cursor = program
+        .insns
+        .iter()
+        .find_map(|(instruction, _)| match instruction {
+            Insn::OpenEphemeral {
+                cursor_id,
+                is_table: true,
+            } => Some(*cursor_id),
+            _ => None,
+        })
+        .expect("the CTE is materialized once");
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::OpenEphemeral { .. }))
+            .count(),
+        1
+    );
+    let duplicate_cursors = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::OpenDup {
+                new_cursor_id,
+                original_cursor_id,
+            } if *original_cursor_id == backing_cursor => Some(*new_cursor_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(duplicate_cursors.len(), 2);
+    assert_ne!(duplicate_cursors[0], duplicate_cursors[1]);
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Insert { cursor, .. } if *cursor == backing_cursor
+    )));
+    assert!(!program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Rewind { cursor_id, .. } if *cursor_id == backing_cursor
+    )));
+    assert!(duplicate_cursors
+        .iter()
+        .all(
+            |cursor| program.insns.iter().any(|(instruction, _)| matches!(
+                instruction,
+                Insn::Rewind { cursor_id, .. } if cursor_id == cursor
+            ))
+        ));
+
+    let table_cursor = program
+        .insns
+        .iter()
+        .find_map(|(instruction, _)| match instruction {
+            Insn::OpenRead {
+                cursor_id,
+                root_page: 7,
+                db: 0,
+            } => Some(*cursor_id),
+            _ => None,
+        })
+        .expect("the CTE body opens the resolved items table once");
+    let table_reads = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::Column {
+                cursor_id, column, ..
+            } if *cursor_id == table_cursor => Some(*column),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(table_reads, [filter_position, output_position]);
+    assert!(duplicate_cursors
+        .iter()
+        .all(
+            |cursor| program.insns.iter().any(|(instruction, _)| matches!(
+                instruction,
+                Insn::Column { cursor_id, column: 0, .. } if cursor_id == cursor
+            ))
+        ));
+}
+
+// Example: `SELECT o.c7,
+// (SELECT i.c4 + 1 FROM inner_items AS i WHERE i.c2 = o.c3),
+// EXISTS(SELECT e.c4 + 99 FROM inner_items AS e WHERE e.c2 = o.c3)
+// FROM outer_items AS o` gives both child queries the exact captured outer
+// SourceId. Scalar evaluation keeps only the first row (or NULL when empty),
+// while EXISTS stops at the first match without evaluating its SELECT output.
+#[hegel::test]
+fn correlated_scalar_and_exists_subqueries_use_exact_captures_and_stop_cleanly(
+    tc: hegel::TestCase,
+) {
+    let outer_width = usize::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
+    let inner_width = usize::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
+    let outer_key = tc.draw(generators::integers::<usize>().max_value(outer_width - 1));
+    let outer_output = tc.draw(generators::integers::<usize>().max_value(outer_width - 1));
+    let inner_key = tc.draw(generators::integers::<usize>().max_value(inner_width - 1));
+    let inner_value = tc.draw(generators::integers::<usize>().max_value(inner_width - 1));
+    let table_sql = |name: &str, width: usize| {
+        let columns = (0..width)
+            .map(|position| format!("c{position} INTEGER"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("CREATE TABLE {name}({columns})")
+    };
+    let outer_table = BTreeTable::from_sql(&table_sql("outer_items", outer_width), 7)
+        .expect("generated outer table is valid");
+    let inner_table = BTreeTable::from_sql(&table_sql("inner_items", inner_width), 11)
+        .expect("generated inner table is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(outer_table))
+        .expect("outer_items is unique");
+    schema
+        .add_btree_table(Arc::new(inner_table))
+        .expect("inner_items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT o.c{outer_output}, \
+             (SELECT i.c{inner_value} + 1 FROM inner_items AS i \
+              WHERE i.c{inner_key} = o.c{outer_key}), \
+             EXISTS(SELECT e.c{inner_value} + 99 FROM inner_items AS e \
+                    WHERE e.c{inner_key} = o.c{outer_key}) \
+         FROM outer_items AS o"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated correlated subqueries have valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed correlated HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("correlated subqueries lower without a catalog");
+    program
+        .resolve_labels()
+        .expect("correlated-subquery branches are all closed");
+
+    let outer_cursor = program
+        .insns
+        .iter()
+        .find_map(|(instruction, _)| match instruction {
+            Insn::OpenRead {
+                cursor_id,
+                root_page: 7,
+                db: 0,
+            } => Some(*cursor_id),
+            _ => None,
+        })
+        .expect("the resolved outer table is opened");
+    let inner_cursors = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::OpenRead {
+                cursor_id,
+                root_page: 11,
+                db: 0,
+            } => Some(*cursor_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(inner_cursors.len(), 2);
+    assert_ne!(inner_cursors[0], inner_cursors[1]);
+
+    let reads = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::Column {
+                cursor_id, column, ..
+            } => Some((*cursor_id, *column)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reads,
+        [
+            (outer_cursor, outer_output),
+            (inner_cursors[0], inner_key),
+            (outer_cursor, outer_key),
+            (inner_cursors[0], inner_value),
+            (inner_cursors[1], inner_key),
+            (outer_cursor, outer_key),
+        ]
+    );
+    for inner in &inner_cursors {
+        assert!(program.insns.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::Close { cursor_id } if cursor_id == inner
+        )));
+        assert!(program.insns.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::Goto { target_pc: BranchOffset::Offset(target) }
+                if matches!(program.insns[*target as usize].0, Insn::Close { cursor_id } if cursor_id == *inner)
+        )));
+    }
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::Null { .. })));
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::Integer { value: 0, .. })));
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::Integer { value: 1, .. })));
+}
+
+// Example: `WITH unused(x) AS (VALUES (99)), chosen(x) AS
+// (SELECT c7 FROM items WHERE c2 >= ?1) SELECT (SELECT x FROM chosen)` uses a
+// CTE only inside a scalar child query. `chosen` must be materialized before
+// the root runtime frame is entered, while `unused` must not execute merely
+// because it was declared in the same WITH clause.
+#[hegel::test]
+fn cte_reachability_follows_nested_queries_without_executing_unused_ctes(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(15))) + 1;
+    let filter_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let output_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let columns = (0..width)
+        .map(|position| format!("c{position} INTEGER"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = BTreeTable::from_sql(&format!("CREATE TABLE items({columns})"), 7)
+        .expect("generated table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(table))
+        .expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "WITH unused(x) AS (VALUES (99)), \
+              chosen(x) AS (\
+                  SELECT c{output_position} FROM items WHERE c{filter_position} >= ?1\
+              ) \
+         SELECT (SELECT x FROM chosen)"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated nested CTE query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed nested-CTE HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("nested CTE lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("nested-CTE branches are all closed");
+
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::OpenEphemeral { .. }))
+            .count(),
+        1,
+        "only chosen is reachable"
+    );
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::OpenDup { .. }))
+            .count(),
+        1
+    );
+    assert!(!program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::Integer { value: 99, .. })));
+    let table_cursor = program
+        .insns
+        .iter()
+        .find_map(|(instruction, _)| match instruction {
+            Insn::OpenRead {
+                cursor_id,
+                root_page: 7,
+                db: 0,
+            } => Some(*cursor_id),
+            _ => None,
+        })
+        .expect("the reachable CTE opens items");
+    let table_reads = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::Column {
+                cursor_id, column, ..
+            } if *cursor_id == table_cursor => Some(*column),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(table_reads, [filter_position, output_position]);
+}
+
+// Example: `SELECT l.c4, r.c6 FROM left_items AS l JOIN right_items AS r
+// ON l.c2 = r.c3 WHERE r.c5 >= ?1` must form a nested loop over the two
+// resolved source identities. Both ON and WHERE failures advance the inner
+// cursor, and every column read uses the position bound for its own source.
+#[hegel::test]
+fn inner_joins_keep_source_identity_position_and_loop_scope(tc: hegel::TestCase) {
+    let left_width = usize::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
+    let right_width = usize::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
+    let left_join = tc.draw(generators::integers::<usize>().max_value(left_width - 1));
+    let left_output = tc.draw(generators::integers::<usize>().max_value(left_width - 1));
+    let right_join = tc.draw(generators::integers::<usize>().max_value(right_width - 1));
+    let right_filter = tc.draw(generators::integers::<usize>().max_value(right_width - 1));
+    let right_output = tc.draw(generators::integers::<usize>().max_value(right_width - 1));
+    let table_sql = |name: &str, width: usize| {
+        let columns = (0..width)
+            .map(|position| format!("c{position} INTEGER"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("CREATE TABLE {name}({columns})")
+    };
+    let left_table = BTreeTable::from_sql(&table_sql("left_items", left_width), 7)
+        .expect("generated left table is valid");
+    let right_table = BTreeTable::from_sql(&table_sql("right_items", right_width), 11)
+        .expect("generated right table is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(left_table))
+        .expect("left_items is unique");
+    schema
+        .add_btree_table(Arc::new(right_table))
+        .expect("right_items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT l.c{left_output}, r.c{right_output} \
+         FROM left_items AS l JOIN right_items AS r \
+         ON l.c{left_join} = r.c{right_join} \
+         WHERE r.c{right_filter} >= ?1"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated inner join has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed join HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("inner join lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("nested loop branches are all closed");
+
+    let cursor_for_root = |root_page| {
+        program
+            .insns
+            .iter()
+            .find_map(|(instruction, _)| match instruction {
+                Insn::OpenRead {
+                    cursor_id,
+                    root_page: actual,
+                    db: 0,
+                } if *actual == root_page => Some(*cursor_id),
+                _ => None,
+            })
+            .expect("resolved join table is opened")
+    };
+    let left_cursor = cursor_for_root(7);
+    let right_cursor = cursor_for_root(11);
+    let reads = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::Column {
+                cursor_id, column, ..
+            } => Some((*cursor_id, *column)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reads,
+        [
+            (left_cursor, left_join),
+            (right_cursor, right_join),
+            (right_cursor, right_filter),
+            (left_cursor, left_output),
+            (right_cursor, right_output),
+        ]
+    );
+
+    let inner_next = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(
+                instruction,
+                Insn::Next { cursor_id, .. } if *cursor_id == right_cursor
+            )
+        })
+        .expect("right source is the inner loop");
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(
+                instruction,
+                Insn::IfNot {
+                    target_pc: BranchOffset::Offset(target),
+                    jump_if_null: true,
+                    ..
+                } if *target as usize == inner_next
+            ))
+            .count(),
+        2
+    );
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Next { cursor_id, .. } if *cursor_id == left_cursor
+    )));
+}
+
+// Example: `SELECT key FROM left_items JOIN right_items USING(key)` (and its
+// NATURAL JOIN spelling) compares the exact two resolved key positions using
+// SQLite's no-coercion BLOB comparison affinity and NOCASE, then reads the
+// already-resolved merged value.
+// Physical emission must not reconstruct `l.key = r.key` from column names.
+#[hegel::test]
+fn using_and_natural_joins_emit_their_stored_comparison(tc: hegel::TestCase) {
+    let left_width = usize::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
+    let right_width = usize::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
+    let left_key = tc.draw(generators::integers::<usize>().max_value(left_width - 1));
+    let right_key = tc.draw(generators::integers::<usize>().max_value(right_width - 1));
+    let natural = tc.draw(generators::booleans());
+    let columns = |width: usize, key: usize, prefix: &str| {
+        (0..width)
+            .map(|position| {
+                if position == key {
+                    "key TEXT COLLATE NOCASE".to_string()
+                } else {
+                    format!("{prefix}{position} INTEGER")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let left_table = BTreeTable::from_sql(
+        &format!(
+            "CREATE TABLE left_items({})",
+            columns(left_width, left_key, "l")
+        ),
+        7,
+    )
+    .expect("generated left table is valid");
+    let right_table = BTreeTable::from_sql(
+        &format!(
+            "CREATE TABLE right_items({})",
+            columns(right_width, right_key, "r")
+        ),
+        11,
+    )
+    .expect("generated right table is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(left_table))
+        .expect("left_items is unique");
+    schema
+        .add_btree_table(Arc::new(right_table))
+        .expect("right_items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let join = if natural {
+        "left_items NATURAL JOIN right_items"
+    } else {
+        "left_items JOIN right_items USING(key)"
+    };
+    let statement = parse_statement(&format!("SELECT key FROM {join}"));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated merged-column join has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed join HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("merged-column join lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("merged-column branches are all closed");
+
+    let cursor_for_root = |root_page| {
+        program
+            .insns
+            .iter()
+            .find_map(|(instruction, _)| match instruction {
+                Insn::OpenRead {
+                    cursor_id,
+                    root_page: actual,
+                    ..
+                } if *actual == root_page => Some(*cursor_id),
+                _ => None,
+            })
+            .expect("resolved join table is opened")
+    };
+    let left_cursor = cursor_for_root(7);
+    let right_cursor = cursor_for_root(11);
+    let reads = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::Column {
+                cursor_id, column, ..
+            } => Some((*cursor_id, *column)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reads[0], (left_cursor, left_key));
+    assert_eq!(reads[1], (right_cursor, right_key));
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Eq {
+            flags,
+            collation: Some(CollationSeq::NoCase),
+            ..
+        } if flags.get_affinity() == Affinity::Blob
+    )));
+}
+
+// Example: `VALUES (10, 11), (20, 21)` has no runtime source. Every generated
+// row must reuse one exact result register range of width two and emit one
+// `ResultRow`; physical emission must not invent or resolve a table cursor.
+#[hegel::test]
+fn values_rows_use_one_exact_source_free_result_range(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
+    let row_count = usize::from(tc.draw(generators::integers::<u8>().max_value(4))) + 1;
+    let rows = (0..row_count)
+        .map(|row| {
+            let values = (0..width)
+                .map(|column| (row * 100 + column).to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({values})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let schema = Schema::new();
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!("VALUES {rows}"));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated VALUES has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed VALUES HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("VALUES lowers without a catalog");
+
+    assert!(!program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::OpenRead { .. } | Insn::VOpen { .. })));
+    let result_rows = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::ResultRow { start_reg, count } => Some((*start_reg, *count)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(result_rows.len(), row_count);
+    assert!(result_rows
+        .iter()
+        .all(|(start, count)| *start == result_rows[0].0 && *count == width));
+}
+
+// Example: `WITH rows(a, b) AS (
+// VALUES (?1, ?2), (?3, ?4) UNION ALL VALUES (?5, ?6)
+// ) SELECT a, b FROM rows` must materialize the first arm before the second,
+// keep every arm at the resolved width two, and scan the combined rows through
+// one CTE source. The parameter order proves emission follows HIR block order;
+// no parser compound tree or catalog is available after semantic analysis.
+#[hegel::test]
+fn union_all_materializes_hir_arms_in_order_at_one_exact_width(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(3))) + 1;
+    let first_rows = usize::from(tc.draw(generators::integers::<u8>().max_value(2))) + 1;
+    let second_rows = usize::from(tc.draw(generators::integers::<u8>().max_value(2))) + 1;
+    let mut next_parameter = 1;
+    let mut arm = |row_count: usize| {
+        (0..row_count)
+            .map(|_| {
+                let row = (0..width)
+                    .map(|_| {
+                        let parameter = next_parameter;
+                        next_parameter += 1;
+                        format!("?{parameter}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({row})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let first = arm(first_rows);
+    let second = arm(second_rows);
+    let total_parameters = next_parameter - 1;
+    let names = (0..width)
+        .map(|position| format!("c{position}"))
+        .collect::<Vec<_>>();
+    let schema = Schema::new();
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "WITH rows({}) AS (VALUES {first} UNION ALL VALUES {second}) SELECT {} FROM rows",
+        names.join(", "),
+        names.join(", ")
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated UNION ALL CTE has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed UNION ALL HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("UNION ALL lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("UNION ALL branches are all closed");
+
+    let parameters = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::Variable { index, .. } => Some(index.get()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(parameters, (1..=total_parameters).collect::<Vec<_>>());
+
+    let backing_cursor = program
+        .insns
+        .iter()
+        .find_map(|(instruction, _)| match instruction {
+            Insn::OpenEphemeral {
+                cursor_id,
+                is_table: true,
+            } => Some(*cursor_id),
+            _ => None,
+        })
+        .expect("the compound CTE has one backing table");
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(
+                instruction,
+                Insn::Insert { cursor, .. } if *cursor == backing_cursor
+            ))
+            .count(),
+        first_rows + second_rows
+    );
+    let record_width = u32::try_from(width).expect("generated width fits in a VDBE operand");
+    assert!(program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::MakeRecord { count, .. } => Some(*count),
+            _ => None,
+        })
+        .all(|count| count == record_width));
+
+    let scan_cursor = program
+        .insns
+        .iter()
+        .find_map(|(instruction, _)| match instruction {
+            Insn::OpenDup {
+                new_cursor_id,
+                original_cursor_id,
+            } if *original_cursor_id == backing_cursor => Some(*new_cursor_id),
+            _ => None,
+        })
+        .expect("the root scans one independent CTE cursor");
+    let positions = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::Column {
+                cursor_id, column, ..
+            } if *cursor_id == scan_cursor => Some(*column),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(positions, (0..width).collect::<Vec<_>>());
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::ResultRow { count, .. } if *count == width
+    )));
+}
+
+// Example: `SELECT ?1 AS a, ?2 AS b UNION ALL SELECT ?3, ?4
+// ORDER BY b COLLATE NOCASE DESC NULLS LAST` binds the ORDER BY output to
+// position one, not permanently to the first arm's `?2` register. Each arm
+// must copy its own position-one value into the sorter key, while the frozen
+// NOCASE/direction/NULL facts configure the sorter without a resolver.
+#[hegel::test]
+fn compound_order_by_remaps_each_hir_arm_and_keeps_frozen_sort_facts(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(3))) + 1;
+    let order_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let aliases = (0..width)
+        .map(|position| format!("c{position}"))
+        .collect::<Vec<_>>();
+    let first = aliases
+        .iter()
+        .enumerate()
+        .map(|(position, alias)| format!("?{} AS {alias}", position + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let second = (0..width)
+        .map(|position| format!("?{}", width + position + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let schema = Schema::new();
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT {first} UNION ALL SELECT {second} ORDER BY {} COLLATE NOCASE DESC NULLS LAST",
+        aliases[order_position]
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated ordered compound query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("ordered compound HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("ordered compound lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("ordered compound branches are all closed");
+
+    let (sorter, sort_facts, comparators) = program
+        .insns
+        .iter()
+        .find_map(|(instruction, _)| match instruction {
+            Insn::SorterOpen {
+                cursor_id,
+                order_collations_nulls,
+                comparators,
+                ..
+            } => Some((*cursor_id, order_collations_nulls, comparators)),
+            _ => None,
+        })
+        .expect("ORDER BY opens one HIR-configured sorter");
+    assert_eq!(
+        sort_facts,
+        &[(
+            ast::SortOrder::Desc,
+            Some(CollationSeq::NoCase),
+            Some(ast::NullsOrder::Last),
+        )]
+    );
+    assert_eq!(comparators, &[None]);
+
+    let variables = program
+        .insns
+        .iter()
+        .enumerate()
+        .filter_map(
+            |(instruction_position, (instruction, _))| match instruction {
+                Insn::Variable { index, dest } => Some((instruction_position, index.get(), *dest)),
+                _ => None,
+            },
+        )
+        .collect::<Vec<_>>();
+    assert_eq!(
+        variables
+            .iter()
+            .map(|(_, index, _)| *index)
+            .collect::<Vec<_>>(),
+        (1..=width * 2).collect::<Vec<_>>()
+    );
+    for parameter in [order_position + 1, width + order_position + 1] {
+        let (variable_position, _, variable_register) = variables
+            .iter()
+            .copied()
+            .find(|(_, index, _)| *index == parameter)
+            .expect("the selected arm output has a parameter register");
+        let insert_position = program
+            .insns
+            .iter()
+            .enumerate()
+            .skip(variable_position + 1)
+            .find_map(|(position, (instruction, _))| match instruction {
+                Insn::SorterInsert { cursor_id, .. } if *cursor_id == sorter => Some(position),
+                _ => None,
+            })
+            .expect("the selected arm is inserted into the sorter");
+        assert!(program.insns[variable_position + 1..insert_position]
+            .iter()
+            .any(|(instruction, _)| matches!(
+                instruction,
+                Insn::Copy { src_reg, .. } if *src_reg == variable_register
+            )));
+    }
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(
+                instruction,
+                Insn::SorterInsert { cursor_id, .. } if *cursor_id == sorter
+            ))
+            .count(),
+        2
+    );
+
+    let pseudo = program
+        .insns
+        .iter()
+        .find_map(|(instruction, _)| match instruction {
+            Insn::OpenPseudo { cursor_id, .. } => Some(*cursor_id),
+            _ => None,
+        })
+        .expect("sorted result rows use one pseudo cursor");
+    let output_positions = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::Column {
+                cursor_id, column, ..
+            } if *cursor_id == pseudo => Some(*column),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(output_positions, (1..=width).collect::<Vec<_>>());
+}
+
+// Example: `SELECT c7 FROM items ORDER BY c2 DESC LIMIT ?1 OFFSET ?2`
+// must fill the sorter with every input row, then apply OFFSET and LIMIT while
+// draining sorted rows. Both counters are bound and integer-checked once; an
+// exhausted LIMIT must jump to sorter cleanup, never out past open cursors.
+#[hegel::test]
+fn sorted_limit_and_offset_control_final_hir_rows_and_reach_cleanup(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(15))) + 1;
+    let output_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let order_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let columns = (0..width)
+        .map(|position| format!("c{position} INTEGER"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = BTreeTable::from_sql(&format!("CREATE TABLE items({columns})"), 7)
+        .expect("generated table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(table))
+        .expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT c{output_position} FROM items ORDER BY c{order_position} DESC LIMIT ?1 OFFSET ?2"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated sorted LIMIT query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed LIMIT HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("sorted LIMIT lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("sorted LIMIT branches are all closed");
+
+    let variables = program
+        .insns
+        .iter()
+        .enumerate()
+        .filter_map(|(position, (instruction, _))| match instruction {
+            Insn::Variable { index, dest } => Some((position, index.get(), *dest)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        variables
+            .iter()
+            .map(|(_, index, _)| *index)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+    let (_, _, limit_register) = variables[0];
+    let (_, _, offset_register) = variables[1];
+    assert!(variables.iter().all(|(variable_position, _, register)| {
+        program.insns[variable_position + 1..]
+            .iter()
+            .any(|(instruction, _)| {
+                matches!(
+                    instruction,
+                    Insn::MustBeInt { reg, .. } if reg == register
+                )
+            })
+    }));
+
+    let table_open = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::OpenRead { root_page: 7, .. }))
+        .expect("the resolved table opens after counter setup");
+    assert!(variables
+        .iter()
+        .all(|(position, _, _)| *position < table_open));
+
+    let sorter_data = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::SorterData { .. }))
+        .expect("sorted rows are drained");
+    let offset = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(
+                instruction,
+                Insn::IfPos { reg, .. } if *reg == offset_register
+            )
+        })
+        .expect("OFFSET controls sorted output");
+    let result = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. }))
+        .expect("one selected column is returned");
+    let decrement = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(
+                instruction,
+                Insn::DecrJumpZero { reg, .. } if *reg == limit_register
+            )
+        })
+        .expect("LIMIT controls sorted output");
+    let sorter_next = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::SorterNext { .. }))
+        .expect("sorter advances after final-row control");
+    assert!(
+        sorter_data < offset && offset < result && result < decrement && decrement < sorter_next
+    );
+    assert!(matches!(
+        &program.insns[offset].0,
+        Insn::IfPos {
+            target_pc: BranchOffset::Offset(target),
+            ..
+        } if *target as usize == sorter_next
+    ));
+
+    let cleanup = program
+        .insns
+        .iter()
+        .enumerate()
+        .skip(sorter_next + 1)
+        .find_map(|(position, (instruction, _))| {
+            matches!(instruction, Insn::Close { .. }).then_some(position)
+        })
+        .expect("sorter output has a cleanup path");
+    assert!(matches!(
+        &program.insns[decrement].0,
+        Insn::DecrJumpZero {
+            target_pc: BranchOffset::Offset(target),
+            ..
+        } if *target as usize == cleanup
+    ));
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::IfNot {
+            reg,
+            target_pc: BranchOffset::Offset(target),
+            jump_if_null: false,
+        } if *reg == limit_register && *target as usize == cleanup
+    )));
+}
+
+// Example: `SELECT ?1 UNION ALL SELECT ?2 LIMIT ?3 OFFSET ?4` must use one
+// OFFSET and one LIMIT counter across both HIR arms. If the first arm exhausts
+// LIMIT, it must leave that arm through its cleanup path and jump over the
+// second arm; normal completion must keep going to the next arm.
+#[hegel::test]
+fn union_all_limit_uses_one_counter_and_stops_before_later_hir_arms(tc: hegel::TestCase) {
+    let arm_count = usize::from(tc.draw(generators::integers::<u8>().max_value(3))) + 2;
+    let mut sql = String::new();
+    for arm in 1..=arm_count {
+        if arm == 1 {
+            sql.push_str("SELECT ");
+        } else {
+            sql.push_str(" UNION ALL SELECT ");
+        }
+        sql.push('?');
+        sql.push_str(&arm.to_string());
+    }
+    let limit_parameter = arm_count + 1;
+    let offset_parameter = arm_count + 2;
+    sql.push_str(&format!(
+        " LIMIT ?{limit_parameter} OFFSET ?{offset_parameter}"
+    ));
+
+    let schema = Schema::new();
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&sql);
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated limited UNION ALL has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("limited compound HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("limited UNION ALL lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("limited UNION ALL branches are all closed");
+
+    let variables = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::Variable { index, dest } => Some((index.get(), *dest)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(variables.len(), arm_count + 2);
+    for parameter in 1..=arm_count + 2 {
+        assert_eq!(
+            variables
+                .iter()
+                .filter(|(index, _)| *index == parameter)
+                .count(),
+            1,
+            "every SQL parameter is bound once"
+        );
+    }
+    let register_for = |parameter| {
+        variables
+            .iter()
+            .find_map(|(index, register)| (*index == parameter).then_some(*register))
+            .expect("parameter has one runtime register")
+    };
+    let limit_register = register_for(limit_parameter);
+    let offset_register = register_for(offset_parameter);
+    let stopped_register = program
+        .insns
+        .iter()
+        .find_map(|(instruction, _)| match instruction {
+            Insn::Integer { value: 0, dest } => Some(*dest),
+            _ => None,
+        })
+        .expect("streaming compound LIMIT has one stop register");
+
+    let results = program
+        .insns
+        .iter()
+        .enumerate()
+        .filter_map(|(position, (instruction, _))| {
+            matches!(instruction, Insn::ResultRow { count: 1, .. }).then_some(position)
+        })
+        .collect::<Vec<_>>();
+    let decrements = program
+        .insns
+        .iter()
+        .enumerate()
+        .filter_map(|(position, (instruction, _))| match instruction {
+            Insn::DecrJumpZero { reg, target_pc } if *reg == limit_register => {
+                Some((position, *target_pc))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let offsets = program
+        .insns
+        .iter()
+        .enumerate()
+        .filter_map(|(position, (instruction, _))| match instruction {
+            Insn::IfPos { reg, target_pc, .. } if *reg == offset_register => {
+                Some((position, *target_pc))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let arm_exits = program
+        .insns
+        .iter()
+        .enumerate()
+        .filter_map(|(position, (instruction, _))| match instruction {
+            Insn::If {
+                reg,
+                target_pc,
+                jump_if_null: false,
+            } if *reg == stopped_register => Some((position, *target_pc)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), arm_count);
+    assert_eq!(decrements.len(), arm_count);
+    assert_eq!(offsets.len(), arm_count);
+    assert_eq!(arm_exits.len(), arm_count);
+
+    let query_done = arm_exits[0].1;
+    assert!(arm_exits.iter().all(|(_, target)| *target == query_done));
+    let BranchOffset::Offset(query_done) = query_done else {
+        panic!("query-wide compound exit is resolved");
+    };
+    assert!(query_done as usize > arm_exits.last().expect("at least two arms").0);
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::IfNot {
+            reg,
+            target_pc: BranchOffset::Offset(target),
+            jump_if_null: false,
+        } if *reg == limit_register && *target == query_done
+    )));
+
+    for arm in 0..arm_count {
+        let (decrement, BranchOffset::Offset(exhausted)) = decrements[arm] else {
+            panic!("arm LIMIT exit is resolved");
+        };
+        let (offset, BranchOffset::Offset(after_offset)) = offsets[arm] else {
+            panic!("arm OFFSET exit is resolved");
+        };
+        let (arm_exit, _) = arm_exits[arm];
+        assert!(offset < results[arm] && results[arm] < decrement && decrement < arm_exit);
+        assert_eq!(after_offset as usize, arm_exit);
+        assert!(matches!(
+            &program.insns[exhausted as usize].0,
+            Insn::Integer { value: 1, dest } if *dest == stopped_register
+        ));
+        if arm + 1 < arm_count {
+            assert!(arm_exit < results[arm + 1]);
+            assert!(query_done as usize > results[arm + 1]);
+        }
+    }
+}
+
+// Example: `SELECT DISTINCT c0 COLLATE NOCASE, c1 COLLATE RTRIM FROM items
+// LIMIT ?1 OFFSET ?2` must deduplicate the fully produced HIR row with those
+// exact frozen collations before OFFSET and LIMIT. A duplicate must jump to
+// the scan's Next instruction, while LIMIT exits through both scan and hash
+// cleanup.
+#[hegel::test]
+fn distinct_uses_frozen_output_collations_before_offset_and_limit(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(3))) + 1;
+    let columns = (0..width)
+        .map(|position| format!("c{position} TEXT"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let outputs = (0..width)
+        .map(|position| {
+            let collation = if position % 2 == 0 { "NOCASE" } else { "RTRIM" };
+            format!("c{position} COLLATE {collation} AS out_{position}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let expected_collations = (0..width)
+        .map(|position| {
+            if position % 2 == 0 {
+                CollationSeq::NoCase
+            } else {
+                CollationSeq::Rtrim
+            }
+        })
+        .collect::<Vec<_>>();
+    let table = BTreeTable::from_sql(&format!("CREATE TABLE items({columns})"), 7)
+        .expect("generated table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(table))
+        .expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT DISTINCT {outputs} FROM items LIMIT ?1 OFFSET ?2"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated DISTINCT query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("DISTINCT HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("DISTINCT lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("DISTINCT branches are all closed");
+
+    let variables = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::Variable { index, dest } => Some((index.get(), *dest)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let limit_register = variables
+        .iter()
+        .find_map(|(index, register)| (*index == 1).then_some(*register))
+        .expect("LIMIT has one register");
+    let offset_register = variables
+        .iter()
+        .find_map(|(index, register)| (*index == 2).then_some(*register))
+        .expect("OFFSET has one register");
+
+    let (hash_clear, hash_table_id) = program
+        .insns
+        .iter()
+        .enumerate()
+        .find_map(|(position, (instruction, _))| match instruction {
+            Insn::HashClear { hash_table_id } => Some((position, *hash_table_id)),
+            _ => None,
+        })
+        .expect("DISTINCT initializes one block-local hash table");
+    let (distinct, key_start, duplicate_target) = program
+        .insns
+        .iter()
+        .enumerate()
+        .find_map(|(position, (instruction, _))| match instruction {
+            Insn::HashDistinct { data } if data.hash_table_id == hash_table_id => {
+                assert_eq!(data.num_keys, width);
+                assert_eq!(data.collations, expected_collations);
+                Some((position, data.key_start_reg, data.target_pc))
+            }
+            _ => None,
+        })
+        .expect("DISTINCT probes the initialized hash table");
+    let table_open = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::OpenRead { root_page: 7, .. }))
+        .expect("resolved table is opened");
+    let offset = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(instruction, Insn::IfPos { reg, .. } if *reg == offset_register)
+        })
+        .expect("OFFSET follows DISTINCT");
+    let result = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(
+                instruction,
+                Insn::ResultRow { start_reg, count }
+                    if *start_reg == key_start && *count == width
+            )
+        })
+        .expect("the distinct key is the final output row");
+    let decrement = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(instruction, Insn::DecrJumpZero { reg, .. } if *reg == limit_register)
+        })
+        .expect("LIMIT follows DISTINCT output");
+    let next = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::Next { .. }))
+        .expect("duplicates continue the table scan");
+    assert!(hash_clear < table_open && table_open < distinct);
+    assert!(distinct < offset && offset < result && result < decrement && decrement < next);
+    assert!(matches!(
+        duplicate_target,
+        BranchOffset::Offset(target) if target as usize == next
+    ));
+
+    let scan_close = program
+        .insns
+        .iter()
+        .enumerate()
+        .skip(next + 1)
+        .find_map(|(position, (instruction, _))| {
+            matches!(instruction, Insn::Close { .. }).then_some(position)
+        })
+        .expect("scan cursor is closed");
+    let hash_close = program
+        .insns
+        .iter()
+        .enumerate()
+        .skip(scan_close + 1)
+        .find_map(|(position, (instruction, _))| match instruction {
+            Insn::HashClose {
+                hash_table_id: actual,
+            } if *actual == hash_table_id => Some(position),
+            _ => None,
+        })
+        .expect("DISTINCT hash state is closed after the scan");
+    assert!(matches!(
+        &program.insns[decrement].0,
+        Insn::DecrJumpZero {
+            target_pc: BranchOffset::Offset(target),
+            ..
+        } if *target as usize == scan_close
+    ));
+    assert!(scan_close < hash_close);
+}
+
+// Example: `SELECT outer_items.c0 COLLATE NOCASE IN
+// (SELECT inner_items.c1 FROM inner_items
+//  WHERE inner_items.c2 = outer_items.c3) FROM outer_items` must rebuild the
+// correlated row set inside the outer loop, read the exact captured outer
+// column, and compare membership with the HIR-frozen NOCASE/Text rule. The
+// row-set scan must retain SQL's FALSE/TRUE/NULL outcomes.
+#[hegel::test]
+fn correlated_in_subqueries_use_captures_and_frozen_comparison_facts(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
+    let lhs_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let rhs_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let inner_filter = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let outer_capture = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let columns = (0..width)
+        .map(|position| format!("c{position} TEXT"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let outer = BTreeTable::from_sql(&format!("CREATE TABLE outer_items({columns})"), 7)
+        .expect("generated outer table SQL is valid");
+    let inner = BTreeTable::from_sql(&format!("CREATE TABLE inner_items({columns})"), 13)
+        .expect("generated inner table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(outer))
+        .expect("outer_items is unique");
+    schema
+        .add_btree_table(Arc::new(inner))
+        .expect("inner_items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT outer_items.c{lhs_position} COLLATE NOCASE IN (\
+         SELECT inner_items.c{rhs_position} FROM inner_items \
+         WHERE inner_items.c{inner_filter} = outer_items.c{outer_capture}\
+         ) FROM outer_items"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated correlated IN query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("correlated IN HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("correlated IN lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("correlated IN branches are all closed");
+
+    let cursor_for_root = |root_page| {
+        program
+            .insns
+            .iter()
+            .find_map(|(instruction, _)| match instruction {
+                Insn::OpenRead {
+                    cursor_id,
+                    root_page: actual,
+                    ..
+                } if *actual == root_page => Some(*cursor_id),
+                _ => None,
+            })
+            .expect("resolved table cursor is opened")
+    };
+    let outer_cursor = cursor_for_root(7);
+    let inner_cursor = cursor_for_root(13);
+    let (row_set_open, row_set_cursor) = program
+        .insns
+        .iter()
+        .enumerate()
+        .find_map(|(position, (instruction, _))| match instruction {
+            Insn::OpenEphemeral {
+                cursor_id,
+                is_table: true,
+            } => Some((position, *cursor_id)),
+            _ => None,
+        })
+        .expect("IN subquery opens one ephemeral row set");
+    let outer_rewind = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(instruction, Insn::Rewind { cursor_id, .. } if *cursor_id == outer_cursor)
+        })
+        .expect("outer scan starts");
+    let outer_next = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(instruction, Insn::Next { cursor_id, .. } if *cursor_id == outer_cursor)
+        })
+        .expect("outer scan advances");
+    assert!(outer_rewind < row_set_open && row_set_open < outer_next);
+
+    let inner_reads = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::Column {
+                cursor_id, column, ..
+            } if *cursor_id == inner_cursor => Some(*column),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(inner_reads, [inner_filter, rhs_position]);
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Column {
+            cursor_id,
+            column,
+            ..
+        } if *cursor_id == outer_cursor && *column == outer_capture
+    )));
+
+    let (row_set_read, row_set_value) = program
+        .insns
+        .iter()
+        .enumerate()
+        .find_map(|(position, (instruction, _))| match instruction {
+            Insn::Column {
+                cursor_id,
+                column: 0,
+                dest,
+                ..
+            } if *cursor_id == row_set_cursor => Some((position, *dest)),
+            _ => None,
+        })
+        .expect("membership scans the materialized HIR output");
+    let comparison = program
+        .insns
+        .iter()
+        .enumerate()
+        .skip(row_set_read + 1)
+        .find_map(|(position, (instruction, _))| match instruction {
+            Insn::Eq {
+                lhs,
+                rhs,
+                flags,
+                collation: Some(CollationSeq::NoCase),
+                ..
+            } if *lhs == row_set_value || *rhs == row_set_value => Some((position, *flags)),
+            _ => None,
+        })
+        .expect("membership uses the frozen explicit collation");
+    assert_eq!(comparison.1.get_affinity(), Affinity::Text);
+    let row_set_next = program
+        .insns
+        .iter()
+        .enumerate()
+        .skip(comparison.0 + 1)
+        .find_map(|(position, (instruction, _))| {
+            matches!(instruction, Insn::Next { cursor_id, .. } if *cursor_id == row_set_cursor)
+                .then_some(position)
+        })
+        .expect("membership checks every candidate row");
+    let result = program
+        .insns
+        .iter()
+        .enumerate()
+        .skip(row_set_next + 1)
+        .find_map(|(position, (instruction, _))| match instruction {
+            Insn::ResultRow {
+                start_reg,
+                count: 1,
+            } => Some((position, *start_reg)),
+            _ => None,
+        })
+        .expect("membership produces one SQL value");
+    assert!(program.insns[comparison.0..result.0]
+        .iter()
+        .any(|(instruction, _)| matches!(
+            instruction,
+            Insn::Null { dest, .. } if *dest == result.1
+        )));
+    assert!(program.insns[comparison.0..result.0]
+        .iter()
+        .any(|(instruction, _)| matches!(
+            instruction,
+            Insn::Integer { value: 1, dest } if *dest == result.1
+        )));
+
+    let row_set_close = program
+        .insns
+        .iter()
+        .enumerate()
+        .skip(outer_next + 1)
+        .find_map(|(position, (instruction, _))| {
+            matches!(instruction, Insn::Close { cursor_id } if *cursor_id == row_set_cursor)
+                .then_some(position)
+        })
+        .expect("root cleanup closes the IN row set");
+    assert!(outer_next < row_set_close);
+}
+
+// Example: `SELECT sum(c4), count(*), avg(c1) FROM items WHERE c2 >= 0`
+// gives each aggregate a stable identity owned by this SELECT block. Physical
+// planning must borrow those exact HIR calls, step each identity once per
+// accepted row, finalize it once, and read its bound register for the output.
+#[hegel::test]
+fn ungrouped_aggregates_keep_hir_identity_through_physical_emission(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(11))) + 1;
+    let aggregate_count = usize::from(tc.draw(generators::integers::<u8>().max_value(5))) + 1;
+    let filter_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let columns = (0..width)
+        .map(|position| format!("c{position} INTEGER"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = BTreeTable::from_sql(&format!("CREATE TABLE items({columns})"), 17)
+        .expect("generated table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(table))
+        .expect("items is unique");
+    let functions = (0..aggregate_count)
+        .map(|position| {
+            let column = tc.draw(generators::integers::<usize>().max_value(width - 1));
+            match position % 5 {
+                0 => format!("sum(c{column})"),
+                1 => "count(*)".to_string(),
+                2 => format!("avg(c{column})"),
+                3 => format!("count(c{column})"),
+                _ => format!("total(c{column})"),
+            }
+        })
+        .collect::<Vec<_>>();
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT {} FROM items WHERE c{filter_position} >= 0",
+        functions.join(", ")
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated aggregate query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let HirRoot::Query(root) = &document.root else {
+        panic!("the fixture is a SELECT");
+    };
+    let query = &document.queries[root.query.index()];
+    let block = &query.blocks[query.first.index];
+    assert_eq!(block.aggregate_count, aggregate_count);
+    assert_eq!(block.window_function_count, 0);
+    let mut hir_calls = vec![None; aggregate_count];
+    for output in &block.outputs {
+        output.expr.walk(&mut |expression| {
+            let Expr::Function(call) = expression else {
+                return;
+            };
+            if let FunctionEvaluation::Aggregate(id) = call.evaluation {
+                assert_eq!(id.block, block.id);
+                assert!(hir_calls[id.index].replace(call).is_none());
+            }
+        });
+    }
+    assert!(hir_calls.iter().all(Option::is_some));
+
+    let plan = PhysicalPlan::new(&document).expect("closed aggregate HIR has a physical plan");
+    let planned = &plan.queries[root.query.index()].blocks[query.first.index];
+    assert_eq!(planned.aggregates.len(), aggregate_count);
+    for (position, aggregate) in planned.aggregates.iter().enumerate() {
+        assert_eq!(aggregate.id.index, position);
+        assert!(std::ptr::eq(
+            aggregate.call,
+            hir_calls[position].expect("every HIR aggregate has a definition")
+        ));
+    }
+
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("core ungrouped aggregates emit from HIR");
+    program
+        .resolve_labels()
+        .expect("all aggregate-emission branches are closed");
+    let steps = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::AggStep { acc_reg, .. } => Some(*acc_reg),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let finals = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::AggFinal { register, .. } => Some(*register),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(steps.len(), aggregate_count);
+    assert_eq!(finals.len(), aggregate_count);
+    assert_eq!(steps, finals);
+    let first_step = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::AggStep { .. }))
+        .expect("aggregate rows are stepped");
+    let next = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::Next { .. }))
+        .expect("the input table is scanned");
+    let first_final = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::AggFinal { .. }))
+        .expect("aggregate state is finalized");
+    let result = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { .. }))
+        .expect("the aggregate query emits one result row");
+    assert!(first_step < next && next < first_final && first_final < result);
+}
+
+// Example: `SELECT row_number() OVER (PARTITION BY c3 ORDER BY c1),
+// sum(c4) OVER (ORDER BY c2) FROM items` assigns window identities 0 and 1
+// to the calls, including the aggregate used in window mode. They must not be
+// mixed with the ordinary aggregate slots for the same SELECT block.
+#[hegel::test]
+fn window_calls_have_separate_stable_hir_identity(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(11))) + 1;
+    let window_count = usize::from(tc.draw(generators::integers::<u8>().max_value(5))) + 1;
+    let columns = (0..width)
+        .map(|position| format!("c{position} INTEGER"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = BTreeTable::from_sql(&format!("CREATE TABLE items({columns})"), 19)
+        .expect("generated table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(table))
+        .expect("items is unique");
+    let functions = (0..window_count)
+        .map(|position| {
+            let partition = tc.draw(generators::integers::<usize>().max_value(width - 1));
+            let order = tc.draw(generators::integers::<usize>().max_value(width - 1));
+            if position % 2 == 0 {
+                format!("row_number() OVER (PARTITION BY c{partition} ORDER BY c{order})")
+            } else {
+                let value = tc.draw(generators::integers::<usize>().max_value(width - 1));
+                format!("sum(c{value}) OVER (PARTITION BY c{partition} ORDER BY c{order})")
+            }
+        })
+        .collect::<Vec<_>>();
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!("SELECT {} FROM items", functions.join(", ")));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated window query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let HirRoot::Query(root) = &document.root else {
+        panic!("the fixture is a SELECT");
+    };
+    let query = &document.queries[root.query.index()];
+    let block = &query.blocks[query.first.index];
+    assert_eq!(block.aggregate_count, 0);
+    assert_eq!(block.window_function_count, window_count);
+    let mut hir_calls = vec![None; window_count];
+    for output in &block.outputs {
+        output.expr.walk(&mut |expression| {
+            let Expr::Function(call) = expression else {
+                return;
+            };
+            if let FunctionEvaluation::Window(id) = call.evaluation {
+                assert_eq!(id.block, block.id);
+                assert!(hir_calls[id.index].replace(call).is_none());
+            }
+        });
+    }
+    assert!(hir_calls.iter().all(Option::is_some));
+
+    let plan = PhysicalPlan::new(&document).expect("closed window HIR has a physical plan");
+    let planned = &plan.queries[root.query.index()].blocks[query.first.index];
+    assert!(planned.aggregates.is_empty());
+    assert_eq!(planned.window_functions.len(), window_count);
+    for (position, function) in planned.window_functions.iter().enumerate() {
+        assert_eq!(function.id.index, position);
+        assert!(std::ptr::eq(
+            function.call,
+            hir_calls[position].expect("every HIR window function has a definition")
+        ));
+    }
+}
+
+// Example: `SELECT c3, sum(c5), count(*) FROM items GROUP BY c3`, where
+// `c3 TEXT COLLATE NOCASE`, sorts with the collation frozen in HIR, reloads
+// each sorted source row under the same SourceId, steps one accumulator per
+// group row, and emits only after that group's accumulators are finalized.
+#[hegel::test]
+fn grouped_aggregates_sort_and_rebind_from_frozen_hir(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(11))) + 2;
+    let key_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let value_offset = tc.draw(generators::integers::<usize>().max_value(width - 2)) + 1;
+    let value_position = (key_position + value_offset) % width;
+    let aggregate_count = usize::from(tc.draw(generators::integers::<u8>().max_value(4))) + 1;
+    let columns = (0..width)
+        .map(|position| {
+            if position == key_position {
+                format!("c{position} TEXT COLLATE NOCASE")
+            } else {
+                format!("c{position} INTEGER")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = BTreeTable::from_sql(&format!("CREATE TABLE items({columns})"), 23)
+        .expect("generated table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(table))
+        .expect("items is unique");
+    let aggregates = (0..aggregate_count)
+        .map(|position| match position % 5 {
+            0 => format!("sum(c{value_position})"),
+            1 => "count(*)".to_string(),
+            2 => format!("avg(c{value_position})"),
+            3 => format!("count(c{value_position})"),
+            _ => format!("total(c{value_position})"),
+        })
+        .collect::<Vec<_>>();
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT c{key_position}, {} FROM items GROUP BY c{key_position}",
+        aggregates.join(", ")
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated grouped query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let HirRoot::Query(root) = &document.root else {
+        panic!("the fixture is a SELECT");
+    };
+    let query = &document.queries[root.query.index()];
+    let block = &query.blocks[query.first.index];
+    let QueryBlockBody::Select {
+        grouping: Some(grouping),
+        ..
+    } = &block.body
+    else {
+        panic!("the fixture has GROUP BY");
+    };
+    assert_eq!(block.aggregate_count, aggregate_count);
+    assert_eq!(grouping.keys.len(), 1);
+    assert_eq!(grouping.key_type_facts.len(), 1);
+    assert_eq!(grouping.key_collations.len(), 1);
+    assert_eq!(
+        grouping.key_collations[0]
+            .as_ref()
+            .map(|collation| *collation.value()),
+        Some(CollationSeq::NoCase)
+    );
+
+    let plan = PhysicalPlan::new(&document).expect("closed grouped HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("grouped aggregates emit from HIR");
+    program
+        .resolve_labels()
+        .expect("all grouped-emission branches are closed");
+
+    let (sorter_cursor, sorter_open) = program
+        .insns
+        .iter()
+        .enumerate()
+        .find_map(|(position, (instruction, _))| match instruction {
+            Insn::SorterOpen {
+                cursor_id,
+                columns: 1,
+                order_collations_nulls,
+                ..
+            } if order_collations_nulls
+                == &[(ast::SortOrder::Asc, Some(CollationSeq::NoCase), None)] =>
+            {
+                Some((*cursor_id, position))
+            }
+            _ => None,
+        })
+        .expect("GROUP BY opens a sorter with the frozen HIR collation");
+    let sorter_insert = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(
+                instruction,
+                Insn::SorterInsert { cursor_id, .. } if *cursor_id == sorter_cursor
+            )
+        })
+        .expect("source rows enter the group sorter");
+    let sorter_sort = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(
+                instruction,
+                Insn::SorterSort { cursor_id, .. } if *cursor_id == sorter_cursor
+            )
+        })
+        .expect("group rows are sorted");
+    let pseudo_cursor = program
+        .insns
+        .iter()
+        .find_map(|(instruction, _)| match instruction {
+            Insn::OpenPseudo { cursor_id, .. } => Some(*cursor_id),
+            _ => None,
+        })
+        .expect("sorted rows are exposed through a pseudo cursor");
+    let steps = program
+        .insns
+        .iter()
+        .enumerate()
+        .filter_map(|(position, (instruction, _))| match instruction {
+            Insn::AggStep { acc_reg, col, .. } => Some((position, *acc_reg, *col)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let finals = program
+        .insns
+        .iter()
+        .enumerate()
+        .filter_map(|(position, (instruction, _))| match instruction {
+            Insn::AggFinal { register, .. } => Some((position, *register)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(steps.len(), aggregate_count);
+    assert_eq!(finals.len(), aggregate_count);
+    assert_eq!(
+        steps
+            .iter()
+            .map(|(_, register, _)| *register)
+            .collect::<Vec<_>>(),
+        finals
+            .iter()
+            .map(|(_, register)| *register)
+            .collect::<Vec<_>>()
+    );
+    let rebound_source_registers = program.insns[..steps[0].0]
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::Column {
+                cursor_id,
+                column,
+                dest,
+                ..
+            } if *cursor_id == pseudo_cursor && *column >= grouping.keys.len() => Some(*dest),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(rebound_source_registers.len() >= width);
+    for (step, _, argument) in &steps {
+        let argument_comes_from_sorted_source =
+            program.insns[..*step]
+                .iter()
+                .any(|(instruction, _)| match instruction {
+                    Insn::Copy {
+                        src_reg,
+                        dst_reg,
+                        extra_amount: 0,
+                    } => *dst_reg == *argument && rebound_source_registers.contains(src_reg),
+                    _ => false,
+                });
+        let argument_is_count_star_one = program.insns[..*step].iter().any(|(instruction, _)| {
+            matches!(
+                instruction,
+                Insn::Integer { value: 1, dest } if *dest == *argument
+            )
+        });
+        assert!(argument_comes_from_sorted_source || argument_is_count_star_one);
+    }
+    let result = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { .. }))
+        .expect("each finished group can emit one row");
+    assert!(sorter_open < sorter_insert && sorter_insert < sorter_sort);
+    assert!(sorter_sort < steps[0].0 && steps[0].0 < finals[0].0 && finals[0].0 < result);
+}
+
+// Examples: `SELECT 'A' COLLATE NOCASE, 1 UNION SELECT 'a', 1`, and the
+// corresponding INTERSECT/EXCEPT forms. The left HIR output freezes NOCASE
+// equality for the temporary set, UNION inserts both arms into one set,
+// EXCEPT deletes the right arm from the left set, and INTERSECT probes a
+// separately materialized right set before producing a row.
+#[hegel::test]
+fn binary_set_compounds_use_hir_output_equality(tc: hegel::TestCase) {
+    let operator = match tc.draw(generators::integers::<u8>().max_value(2)) {
+        0 => ("UNION", CompoundOperator::Union),
+        1 => ("INTERSECT", CompoundOperator::Intersect),
+        _ => ("EXCEPT", CompoundOperator::Except),
+    };
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(5))) + 1;
+    let left = std::iter::once("'A' COLLATE NOCASE".to_string())
+        .chain((1..width).map(|position| position.to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let right = std::iter::once("'a'".to_string())
+        .chain((1..width).map(|position| position.to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let schema = Schema::new();
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!("SELECT {left} {} SELECT {right}", operator.0));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated binary compound has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let HirRoot::Query(root) = &document.root else {
+        panic!("the fixture is a query");
+    };
+    let query = &document.queries[root.query.index()];
+    assert_eq!(query.compounds.len(), 1);
+    assert_eq!(query.compounds[0].operator, operator.1);
+    assert_eq!(query.blocks[0].outputs.len(), width);
+    assert_eq!(
+        query.blocks[0].outputs[0]
+            .collation
+            .as_ref()
+            .map(|collation| *collation.value()),
+        Some(CollationSeq::NoCase)
+    );
+
+    let plan = PhysicalPlan::new(&document).expect("closed compound HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("binary set compound emits from HIR");
+    program
+        .resolve_labels()
+        .expect("all compound set branches are closed");
+
+    let set_cursors = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::OpenEphemeral {
+                cursor_id,
+                is_table: false,
+            } => Some(*cursor_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let expected_sets = if operator.1 == CompoundOperator::Intersect {
+        2
+    } else {
+        1
+    };
+    assert_eq!(set_cursors.len(), expected_sets);
+    for cursor in &set_cursors {
+        let CursorType::BTreeIndex(index) = program
+            .get_cursor_type(*cursor)
+            .expect("set cursor has a physical type")
+        else {
+            panic!("set storage is an ephemeral index");
+        };
+        assert_eq!(index.columns.len(), width);
+        assert_eq!(index.columns[0].collation, Some(CollationSeq::NoCase));
+        assert!(!index.has_rowid);
+    }
+
+    let inserts = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::IdxInsert { cursor_id, .. } if set_cursors.contains(cursor_id) => {
+                Some(*cursor_id)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    match operator.1 {
+        CompoundOperator::Union => {
+            assert_eq!(inserts, vec![set_cursors[0], set_cursors[0]]);
+        }
+        CompoundOperator::Except => {
+            assert_eq!(inserts, vec![set_cursors[0]]);
+            assert!(program.insns.iter().any(|(instruction, _)| matches!(
+                instruction,
+                Insn::IdxDelete { cursor_id, .. } if *cursor_id == set_cursors[0]
+            )));
+        }
+        CompoundOperator::Intersect => {
+            assert_eq!(inserts, set_cursors);
+            assert!(program.insns.iter().any(|(instruction, _)| matches!(
+                instruction,
+                Insn::NotFound { cursor_id, .. } if *cursor_id == set_cursors[1]
+            )));
+        }
+        CompoundOperator::UnionAll => unreachable!(),
+    }
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Rewind { cursor_id, .. } if *cursor_id == set_cursors[0]
+    )));
+    assert!(program.insns.iter().any(
+        |(instruction, _)| matches!(instruction, Insn::ResultRow { count, .. } if *count == width)
+    ));
+}
+
+// Examples: `l LEFT JOIN r ON l.k = r.k`, `LEFT JOIN r USING(k)`, and
+// `NATURAL LEFT JOIN r`, all followed by `WHERE r.rv IS NULL`. A right row
+// marks the join as matched only after its ON/USING rule passes. If no row
+// matches, the right SourceId reads through NullRow and the separate WHERE
+// rule is evaluated again against that NULL-extended row.
+#[hegel::test]
+fn left_join_keeps_join_matching_separate_from_where(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(8))) + 2;
+    let key_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let value_offset = tc.draw(generators::integers::<usize>().max_value(width - 2)) + 1;
+    let value_position = (key_position + value_offset) % width;
+    let join_syntax = match tc.draw(generators::integers::<u8>().max_value(2)) {
+        0 => "LEFT JOIN r ON l.k = r.k",
+        1 => "LEFT JOIN r USING(k)",
+        _ => "NATURAL LEFT JOIN r",
+    };
+    let left_columns = (0..width)
+        .map(|position| {
+            if position == key_position {
+                "k INTEGER".to_string()
+            } else {
+                format!("l{position} INTEGER")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let right_columns = (0..width)
+        .map(|position| {
+            if position == key_position {
+                "k INTEGER".to_string()
+            } else {
+                format!("r{position} INTEGER")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let left_table = BTreeTable::from_sql(&format!("CREATE TABLE l({left_columns})"), 31)
+        .expect("generated left table SQL is valid");
+    let right_table = BTreeTable::from_sql(&format!("CREATE TABLE r({right_columns})"), 37)
+        .expect("generated right table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(left_table))
+        .expect("l is unique");
+    schema
+        .add_btree_table(Arc::new(right_table))
+        .expect("r is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT l.l{value_position}, r.r{value_position} FROM l {join_syntax} WHERE r.r{value_position} IS NULL"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated LEFT JOIN has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let HirRoot::Query(root) = &document.root else {
+        panic!("the fixture is a query");
+    };
+    let query = &document.queries[root.query.index()];
+    let block = &query.blocks[query.first.index];
+    let from = block.from.as_ref().expect("the query has FROM");
+    assert_eq!(from.joins.len(), 1);
+    assert_eq!(
+        from.joins[0].kind,
+        crate::translate::semantic::hir::JoinKind::Left
+    );
+    let QueryBlockBody::Select {
+        filter: Some(_), ..
+    } = &block.body
+    else {
+        panic!("WHERE remains a separate HIR expression");
+    };
+
+    let plan = PhysicalPlan::new(&document).expect("closed LEFT JOIN HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("LEFT JOIN emits from HIR");
+    program
+        .resolve_labels()
+        .expect("all LEFT JOIN branches are closed");
+
+    let cursor_for_root = |root_page| {
+        program
+            .insns
+            .iter()
+            .find_map(|(instruction, _)| match instruction {
+                Insn::OpenRead {
+                    cursor_id,
+                    root_page: actual,
+                    ..
+                } if *actual == root_page => Some(*cursor_id),
+                _ => None,
+            })
+            .expect("resolved table cursor is opened")
+    };
+    let right_cursor = cursor_for_root(37);
+    let right_rewind = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(
+                instruction,
+                Insn::Rewind { cursor_id, .. } if *cursor_id == right_cursor
+            )
+        })
+        .expect("right side is scanned for each left row");
+    let (match_zero, match_register) = program.insns[..right_rewind]
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(position, (instruction, _))| match instruction {
+            Insn::Integer { value: 0, dest } => Some((position, *dest)),
+            _ => None,
+        })
+        .expect("LEFT JOIN clears one match flag before its right scan");
+    let match_one = program.insns[right_rewind + 1..]
+        .iter()
+        .enumerate()
+        .find_map(|(offset, (instruction, _))| match instruction {
+            Insn::Integer { value: 1, dest } if *dest == match_register => {
+                Some(right_rewind + 1 + offset)
+            }
+            _ => None,
+        })
+        .expect("a right row marks the LEFT JOIN only after its join rule passes");
+    let null_row = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(
+                instruction,
+                Insn::NullRow { cursor_id } if *cursor_id == right_cursor
+            )
+        })
+        .expect("an unmatched left row null-extends the right SourceId");
+    assert!(match_zero < right_rewind && right_rewind < match_one && match_one < null_row);
+    assert!(program.insns[right_rewind..match_one]
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::IfNot { .. })));
+    assert!(program.insns[match_one..null_row]
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::IfNot { .. })));
+    assert!(program.insns[..null_row]
+        .iter()
+        .any(|(instruction, _)| matches!(
+            instruction,
+            Insn::IfPos { reg, .. } if *reg == match_register
+        )));
+    assert!(program.insns[null_row + 1..]
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::IfNot { .. })));
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 2, .. }))
+            .count(),
+        2
+    );
+}

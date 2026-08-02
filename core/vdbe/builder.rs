@@ -1,6 +1,7 @@
 use crate::{alloc, turso_assert, turso_assert_eq, turso_debug_assert, Result, Value, ValueRef};
 
 use rustc_hash::FxHashMap as HashMap;
+use std::num::NonZeroU32;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
@@ -590,11 +591,22 @@ impl ProgramBuilder {
     /// Register an `ast::Variable` in the parameter list. Returns the
     /// `NonZeroUsize` index for use in `Insn::Variable`.
     pub fn register_variable(&mut self, variable: &ast::Variable) -> NonZeroUsize {
-        let index = usize::try_from(variable.index.get())
+        self.register_resolved_parameter(variable.index, variable.name.as_deref())
+    }
+
+    /// Register a parameter whose SQL identity was already resolved before
+    /// bytecode emission. This keeps HIR lowering from reconstructing a parser
+    /// `Variable` merely to populate the prepared statement's parameter map.
+    pub fn register_resolved_parameter(
+        &mut self,
+        parameter: NonZeroU32,
+        name: Option<&str>,
+    ) -> NonZeroUsize {
+        let index = usize::try_from(parameter.get())
             .expect("u32 variable index must fit into usize")
             .try_into()
             .expect("variable index must be non-zero");
-        if let Some(name) = variable.name.as_deref() {
+        if let Some(name) = name {
             self.parameters.push_named_at(name, index);
         } else {
             self.parameters.push_index(index);

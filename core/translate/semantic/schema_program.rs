@@ -257,8 +257,19 @@ impl Analyzer<'_, '_> {
         let mut checks = Vec::new();
         for definition in chain {
             for (index, constraint) in definition.value().domain_checks.iter().enumerate() {
-                let expression = constraint
-                    .check
+                let database = definition
+                    .database()
+                    .map_or(MAIN_DB_ID, |database| database.index());
+                let visible_types = [definition.handle()];
+                let stored = self.resolve_standalone_schema_syntax(
+                    &constraint.check,
+                    SchemaExprProfile::DomainCheck,
+                    database,
+                    Some(&definition.value().name),
+                    &[],
+                    &visible_types,
+                )?;
+                let expression = stored
                     .as_valid()?
                     .specialize_domain_value(SelfColumn::new(0, false))?;
                 let input = SchemaExprInput {
@@ -342,7 +353,15 @@ impl Analyzer<'_, '_> {
             .ty_params
             .iter()
             .map(|argument| {
-                let expression = self.instantiate_schema_expr(argument.as_valid()?, source)?;
+                let stored = self.resolve_standalone_schema_syntax(
+                    argument,
+                    SchemaExprProfile::Default,
+                    database,
+                    Some(&column.ty_str),
+                    &[],
+                    &[],
+                )?;
+                let expression = self.instantiate_schema_expr(stored.as_valid()?, source)?;
                 let type_fact = self.expression_type_fact(&expression, &scope);
                 Ok(SchemaProgramArgument {
                     expression,
@@ -371,10 +390,19 @@ impl Analyzer<'_, '_> {
             return Ok(None);
         };
         let arguments = Self::arguments_for_definition(definition, arguments)?;
-        let expression = stored.as_valid()?.specialize_type_parameters()?;
         let database = definition
             .database()
             .map_or(MAIN_DB_ID, |database| database.index());
+        let visible_types = [definition.handle()];
+        let stored = self.resolve_standalone_schema_syntax(
+            stored,
+            SchemaExprProfile::TypeTransform,
+            database,
+            Some(&definition.value().name),
+            definition.value().params(),
+            &visible_types,
+        )?;
+        let expression = stored.as_valid()?.specialize_type_parameters()?;
         let value_fact = self.resolve_declared_type_fact_in_database(
             definition.value().value_input_type(),
             0,

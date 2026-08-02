@@ -29,6 +29,7 @@ pub(crate) struct ExprPolicy {
     allow_window: bool,
     allow_dqs_fallback: bool,
     expected_type: Option<hir::ResolvedType>,
+    query_block: Option<hir::QueryBlockId>,
 }
 
 impl ExprPolicy {
@@ -41,6 +42,7 @@ impl ExprPolicy {
             allow_window: true,
             allow_dqs_fallback: true,
             expected_type: None,
+            query_block: None,
         }
     }
 
@@ -99,6 +101,11 @@ impl ExprPolicy {
         self.allow_raise = allow;
         self
     }
+
+    pub(crate) fn in_query_block(mut self, block: hir::QueryBlockId) -> Self {
+        self.query_block = Some(block);
+        self
+    }
 }
 
 impl Analyzer<'_, '_> {
@@ -125,21 +132,35 @@ impl Analyzer<'_, '_> {
                 not,
                 start,
                 end,
-            } => Ok(hir::Expr::Between {
-                expr: Box::new(self.analyze_expr(lhs, scope, policy.clone())?),
-                negated: *not,
-                start: Box::new(self.analyze_expr(start, scope, policy.clone())?),
-                end: Box::new(self.analyze_expr(end, scope, policy)?),
-            }),
+            } => {
+                let expr = self.analyze_expr(lhs, scope, policy.clone())?;
+                let start = self.analyze_expr(start, scope, policy.clone())?;
+                let end = self.analyze_expr(end, scope, policy)?;
+                let start_comparison = self.comparison_semantics(&expr, &start, scope, false)?;
+                let end_comparison = self.comparison_semantics(&expr, &end, scope, false)?;
+                Ok(hir::Expr::Between {
+                    expr: Box::new(expr),
+                    negated: *not,
+                    start: Box::new(start),
+                    end: Box::new(end),
+                    start_comparison,
+                    end_comparison,
+                })
+            }
             ast::Expr::Binary(lhs, operator, rhs) => {
                 let lhs = self.analyze_expr(lhs, scope, policy.clone())?;
                 let rhs = self.analyze_expr(rhs, scope, policy)?;
                 let custom = self.resolve_custom_binary_operator(&lhs, *operator, &rhs, scope)?;
+                let comparison = operator
+                    .is_comparison()
+                    .then(|| self.comparison_semantics(&lhs, &rhs, scope, false))
+                    .transpose()?;
                 Ok(hir::Expr::Binary {
                     lhs: Box::new(lhs),
                     operator: *operator,
                     rhs: Box::new(rhs),
                     custom,
+                    comparison,
                 })
             }
             ast::Expr::Case {
@@ -164,10 +185,20 @@ impl Analyzer<'_, '_> {
                     .map(|expr| self.analyze_expr(expr, scope, policy))
                     .transpose()?
                     .map(Box::new);
+                let base_comparisons = base.as_deref().map_or_else(
+                    || Ok(Vec::new()),
+                    |base| {
+                        when_then
+                            .iter()
+                            .map(|(when, _)| self.comparison_semantics(base, when, scope, false))
+                            .collect::<Result<Vec<_>>>()
+                    },
+                )?;
                 Ok(hir::Expr::Case {
                     base,
                     when_then,
                     else_expr,
+                    base_comparisons,
                 })
             }
             ast::Expr::Cast { expr, type_name } => {
@@ -290,25 +321,32 @@ impl Analyzer<'_, '_> {
                 );
             }
             ast::Expr::InList { lhs, not, rhs } => {
-                let lhs = Box::new(self.analyze_expr(lhs, scope, policy.clone())?);
+                let lhs = self.analyze_expr(lhs, scope, policy.clone())?;
                 let mut values = Vec::with_capacity(rhs.len());
                 for value in rhs {
                     values.push(self.analyze_expr(value, scope, policy.clone())?);
                 }
+                let comparisons = values
+                    .iter()
+                    .map(|value| self.comparison_semantics(&lhs, value, scope, true))
+                    .collect::<Result<Vec<_>>>()?;
                 Ok(hir::Expr::InList {
-                    lhs,
+                    lhs: Box::new(lhs),
                     negated: *not,
                     values,
+                    comparisons,
                 })
             }
             ast::Expr::InSelect { lhs, not, rhs } => {
                 self.require_subqueries(&policy)?;
-                let lhs = Box::new(self.analyze_expr(lhs, scope, policy)?);
+                let lhs = self.analyze_expr(lhs, scope, policy)?;
                 let query = self.analyze_query(rhs, self.subquery_environment(scope))?;
+                let comparison = self.subquery_in_comparison_semantics(&lhs, query, scope)?;
                 Ok(hir::Expr::Subquery(hir::SubqueryExpr::In {
-                    lhs,
+                    lhs: Box::new(lhs),
                     query,
                     negated: *not,
+                    comparison,
                 }))
             }
             ast::Expr::InTable {
@@ -318,7 +356,7 @@ impl Analyzer<'_, '_> {
                 args,
             } => {
                 self.require_subqueries(&policy)?;
-                let lhs = Box::new(self.analyze_expr(lhs, scope, policy)?);
+                let lhs = self.analyze_expr(lhs, scope, policy)?;
                 let table = if args.is_empty() {
                     ast::SelectTable::Table(rhs.clone(), None, None)
                 } else {
@@ -344,10 +382,12 @@ impl Analyzer<'_, '_> {
                     limit: None,
                 };
                 let query = self.analyze_query(&select, self.subquery_environment(scope))?;
+                let comparison = self.subquery_in_comparison_semantics(&lhs, query, scope)?;
                 Ok(hir::Expr::Subquery(hir::SubqueryExpr::In {
-                    lhs,
+                    lhs: Box::new(lhs),
                     query,
                     negated: *not,
+                    comparison,
                 }))
             }
             ast::Expr::IsNull(expr) => Ok(hir::Expr::IsNull(Box::new(
@@ -431,7 +471,7 @@ impl Analyzer<'_, '_> {
                 base: Box::new(self.analyze_expr(base, scope, policy.clone())?),
                 index: Box::new(self.analyze_expr(index, scope, policy)?),
             }),
-            ast::Expr::FieldAccess { base, field } => {
+            ast::Expr::FieldAccess { base, field, .. } => {
                 let base = self.analyze_expr(base, scope, policy)?;
                 let type_fact = self.expression_type_fact(&base, scope);
                 self.analyze_field_access(
@@ -445,6 +485,12 @@ impl Analyzer<'_, '_> {
                     field.as_str(),
                 )
             }
+            ast::Expr::Register(_)
+            | ast::Expr::Column { .. }
+            | ast::Expr::RowId { .. }
+            | ast::Expr::SubqueryResult { .. } => Err(LimboError::InternalError(
+                "semantic analysis received a bound or runtime parser expression".to_string(),
+            )),
             ast::Expr::Default => {
                 crate::bail_parse_error!("DEFAULT is only valid in an INSERT value");
             }
@@ -509,6 +555,7 @@ impl Analyzer<'_, '_> {
                 base,
                 when_then,
                 else_expr,
+                ..
             } => {
                 if let Some(base) = base {
                     self.require_source_columns_in_expr(base);
@@ -822,35 +869,57 @@ impl Analyzer<'_, '_> {
                 operator,
                 rhs,
                 custom,
+                comparison,
             } => {
                 self.refresh_expression_semantics(lhs, scope, finalize_custom_operators)?;
                 self.refresh_expression_semantics(rhs, scope, finalize_custom_operators)?;
                 if finalize_custom_operators {
                     *custom = self.resolve_custom_binary_operator(lhs, *operator, rhs, scope)?;
                 }
+                *comparison = operator
+                    .is_comparison()
+                    .then(|| self.comparison_semantics(lhs, rhs, scope, false))
+                    .transpose()?;
             }
             hir::Expr::Between {
-                expr, start, end, ..
+                expr,
+                start,
+                end,
+                start_comparison,
+                end_comparison,
+                ..
             } => {
                 self.refresh_expression_semantics(expr, scope, finalize_custom_operators)?;
                 self.refresh_expression_semantics(start, scope, finalize_custom_operators)?;
                 self.refresh_expression_semantics(end, scope, finalize_custom_operators)?;
+                *start_comparison = self.comparison_semantics(expr, start, scope, false)?;
+                *end_comparison = self.comparison_semantics(expr, end, scope, false)?;
             }
             hir::Expr::Case {
                 base,
                 when_then,
                 else_expr,
+                base_comparisons,
             } => {
                 if let Some(base) = base {
                     self.refresh_expression_semantics(base, scope, finalize_custom_operators)?;
                 }
-                for (when, then) in when_then {
+                for (when, then) in &mut *when_then {
                     self.refresh_expression_semantics(when, scope, finalize_custom_operators)?;
                     self.refresh_expression_semantics(then, scope, finalize_custom_operators)?;
                 }
                 if let Some(else_expr) = else_expr {
                     self.refresh_expression_semantics(else_expr, scope, finalize_custom_operators)?;
                 }
+                *base_comparisons = base.as_deref().map_or_else(
+                    || Ok(Vec::new()),
+                    |base| {
+                        when_then
+                            .iter()
+                            .map(|(when, _)| self.comparison_semantics(base, when, scope, false))
+                            .collect()
+                    },
+                )?;
             }
             hir::Expr::Cast { expr, target } => {
                 self.refresh_expression_semantics(expr, scope, finalize_custom_operators)?;
@@ -931,14 +1000,29 @@ impl Analyzer<'_, '_> {
                         )
                     });
             }
-            hir::Expr::InList { lhs, values, .. } => {
+            hir::Expr::InList {
+                lhs,
+                values,
+                comparisons,
+                ..
+            } => {
                 self.refresh_expression_semantics(lhs, scope, finalize_custom_operators)?;
-                for value in values {
+                for value in &mut *values {
                     self.refresh_expression_semantics(value, scope, finalize_custom_operators)?;
                 }
+                *comparisons = values
+                    .iter()
+                    .map(|value| self.comparison_semantics(lhs, value, scope, true))
+                    .collect::<Result<_>>()?;
             }
-            hir::Expr::Subquery(hir::SubqueryExpr::In { lhs, .. }) => {
+            hir::Expr::Subquery(hir::SubqueryExpr::In {
+                lhs,
+                query,
+                comparison,
+                ..
+            }) => {
                 self.refresh_expression_semantics(lhs, scope, finalize_custom_operators)?;
+                *comparison = self.subquery_in_comparison_semantics(lhs, *query, scope)?;
             }
             hir::Expr::Like {
                 lhs, rhs, escape, ..
@@ -1024,13 +1108,113 @@ impl Analyzer<'_, '_> {
         }
     }
 
-    pub(crate) fn expression_collation(
+    pub(crate) fn comparison_semantics(
+        &self,
+        lhs: &hir::Expr,
+        rhs: &hir::Expr,
+        scope: &Scope,
+        in_lhs_affinity: bool,
+    ) -> Result<hir::ComparisonSemantics> {
+        let lhs_components = expression_components(lhs);
+        let rhs_components = expression_components(rhs);
+        if lhs_components.len() != rhs_components.len() {
+            crate::bail_parse_error!("row value misused");
+        }
+        let components = lhs_components
+            .into_iter()
+            .zip(rhs_components)
+            .map(|(lhs, rhs)| self.comparison_component(lhs, rhs, scope, in_lhs_affinity))
+            .collect();
+        Ok(hir::ComparisonSemantics { components })
+    }
+
+    fn subquery_in_comparison_semantics(
+        &self,
+        lhs: &hir::Expr,
+        query: hir::QueryId,
+        scope: &Scope,
+    ) -> Result<hir::ComparisonSemantics> {
+        let lhs_components = expression_components(lhs);
+        let outputs = self.query_outputs(query)?;
+        if lhs_components.len() != outputs.len() {
+            crate::bail_parse_error!(
+                "sub-select returns {} columns - expected {}",
+                outputs.len(),
+                lhs_components.len()
+            );
+        }
+        let components = lhs_components
+            .into_iter()
+            .zip(outputs)
+            .map(|(lhs, rhs)| {
+                let (lhs_explicit, lhs_implicit) = self.expression_collation_parts(lhs, scope);
+                let (rhs_explicit, rhs_implicit) = if rhs.collation_is_explicit {
+                    (rhs.collation.clone(), None)
+                } else {
+                    (None, rhs.collation.clone())
+                };
+                hir::ComparisonComponent {
+                    // SQLite's IN affinity is set by the left-hand expression.
+                    affinity: self.expression_affinity(lhs, scope),
+                    collation: lhs_explicit
+                        .or(rhs_explicit)
+                        .or(lhs_implicit)
+                        .or(rhs_implicit),
+                    array: self.expression_type_fact(lhs, scope).is_array()
+                        && rhs.type_fact.is_array(),
+                }
+            })
+            .collect();
+        Ok(hir::ComparisonSemantics { components })
+    }
+
+    fn comparison_component(
+        &self,
+        lhs: &hir::Expr,
+        rhs: &hir::Expr,
+        scope: &Scope,
+        in_lhs_affinity: bool,
+    ) -> hir::ComparisonComponent {
+        let lhs_affinity = self.expression_affinity(lhs, scope);
+        let rhs_affinity = self.expression_affinity(rhs, scope);
+        let lhs_has_affinity = self.expression_has_affinity(lhs, scope);
+        let rhs_has_affinity = self.expression_has_affinity(rhs, scope);
+        let affinity = if in_lhs_affinity {
+            lhs_affinity
+        } else if lhs_has_affinity && rhs_has_affinity {
+            if lhs_affinity.is_numeric() || rhs_affinity.is_numeric() {
+                Affinity::Numeric
+            } else {
+                Affinity::Blob
+            }
+        } else if lhs_has_affinity {
+            lhs_affinity
+        } else if rhs_has_affinity {
+            rhs_affinity
+        } else {
+            Affinity::Blob
+        };
+        let (lhs_explicit, lhs_implicit) = self.expression_collation_parts(lhs, scope);
+        let (rhs_explicit, rhs_implicit) = self.expression_collation_parts(rhs, scope);
+        hir::ComparisonComponent {
+            affinity,
+            collation: lhs_explicit
+                .or(rhs_explicit)
+                .or(lhs_implicit)
+                .or(rhs_implicit),
+            array: self.expression_type_fact(lhs, scope).is_array()
+                && self.expression_type_fact(rhs, scope).is_array(),
+        }
+    }
+
+    pub(crate) fn expression_collation_with_origin(
         &self,
         expr: &hir::Expr,
         scope: &Scope,
-    ) -> Option<hir::ResolvedCollation> {
+    ) -> (Option<hir::ResolvedCollation>, bool) {
         let (explicit, implicit) = self.expression_collation_parts(expr, scope);
-        explicit.or(implicit)
+        let is_explicit = explicit.is_some();
+        (explicit.or(implicit), is_explicit)
     }
 
     pub(crate) fn expression_explicit_collation(
@@ -1039,6 +1223,24 @@ impl Analyzer<'_, '_> {
         scope: &Scope,
     ) -> Option<hir::ResolvedCollation> {
         self.expression_collation_parts(expr, scope).0
+    }
+
+    pub(crate) fn resolved_order_term(
+        &self,
+        expr: hir::Expr,
+        order: ast::SortOrder,
+        nulls: Option<ast::NullsOrder>,
+        scope: &Scope,
+    ) -> hir::OrderTerm {
+        let type_fact = self.expression_type_fact(&expr, scope);
+        let (collation, _) = self.expression_collation_with_origin(&expr, scope);
+        hir::OrderTerm {
+            expr,
+            order,
+            nulls,
+            type_fact,
+            collation,
+        }
     }
 
     fn expression_collation_parts(
@@ -1111,7 +1313,10 @@ impl Analyzer<'_, '_> {
             hir::Expr::RowId(_) => {}
             hir::Expr::Output(output) => {
                 if inherit_column_collation {
-                    parts.1 = scope.output_collation(*output).flatten().cloned();
+                    if let Some((explicit, implicit)) = scope.output_collation_parts(*output) {
+                        parts.0 = explicit.cloned();
+                        parts.1 = implicit.cloned();
+                    }
                 }
             }
             hir::Expr::Unary {
@@ -1142,6 +1347,7 @@ impl Analyzer<'_, '_> {
                 base,
                 when_then,
                 else_expr,
+                ..
             } => {
                 if let Some(base) = base {
                     collect!(base);
@@ -1425,6 +1631,19 @@ impl Analyzer<'_, '_> {
         let result_type = custom_operation_result(&custom_type_operation).unwrap_or_else(|| {
             self.resolved_function_result_type(&function, &arguments, &within_group, scope)
         });
+        let evaluation = if window_only || tail.over_clause.is_some() {
+            let block = policy.query_block.ok_or_else(|| {
+                LimboError::ParseError(format!("misuse of window function {}()", function_name))
+            })?;
+            hir::FunctionEvaluation::Window(self.allocate_window_function_id(block))
+        } else if aggregate {
+            let block = policy.query_block.ok_or_else(|| {
+                LimboError::ParseError(format!("misuse of aggregate function {}()", function_name))
+            })?;
+            hir::FunctionEvaluation::Aggregate(self.allocate_aggregate_id(block))
+        } else {
+            hir::FunctionEvaluation::Scalar
+        };
         let id = self.catalog_object_id(
             None,
             CatalogObjectKind::Function {
@@ -1435,6 +1654,7 @@ impl Analyzer<'_, '_> {
         let function = CatalogObject::new(id, self.context().snapshot(), None, Arc::new(function));
         Ok(hir::Expr::Function(hir::FunctionCall {
             function,
+            evaluation,
             star,
             arguments,
             distinctness,
@@ -1492,11 +1712,13 @@ impl Analyzer<'_, '_> {
     ) -> Result<Vec<hir::OrderTerm>> {
         let mut resolved = Vec::with_capacity(terms.len());
         for term in terms {
-            resolved.push(hir::OrderTerm {
-                expr: self.analyze_expr(&term.expr, scope, policy.clone())?,
-                order: term.order.unwrap_or(ast::SortOrder::Asc),
-                nulls: term.nulls,
-            });
+            let expr = self.analyze_expr(&term.expr, scope, policy.clone())?;
+            resolved.push(self.resolved_order_term(
+                expr,
+                term.order.unwrap_or(ast::SortOrder::Asc),
+                term.nulls,
+                scope,
+            ));
         }
         Ok(resolved)
     }
@@ -1602,6 +1824,7 @@ impl Analyzer<'_, '_> {
                 parameters: Vec::new(),
                 array_dimensions: 0,
                 type_fact,
+                affinity: Affinity::Numeric,
                 programs,
             });
         };
@@ -1618,11 +1841,17 @@ impl Analyzer<'_, '_> {
         }
         let type_fact = self.resolve_declared_type_fact(&syntax.name, syntax.array_dimensions)?;
         let programs = self.bind_cast_programs(&type_fact, &parameters, scope)?;
+        let affinity = if programs.apply_builtin_affinity {
+            Affinity::affinity(&syntax.name)
+        } else {
+            type_fact_affinity(&type_fact)
+        };
         Ok(hir::TypeName {
             name: syntax.name.clone(),
             parameters,
             array_dimensions: syntax.array_dimensions,
             type_fact,
+            affinity,
             programs,
         })
     }
@@ -2309,6 +2538,7 @@ impl Analyzer<'_, '_> {
                 base,
                 when_then,
                 else_expr,
+                ..
             } => {
                 if let Some(base) = base {
                     self.collect_expression_features(base, scope, features);
@@ -2443,6 +2673,13 @@ fn hir_literal_type_name(expr: &hir::Expr) -> Option<&'static str> {
     }
 }
 
+fn expression_components(expression: &hir::Expr) -> Vec<&hir::Expr> {
+    match expression {
+        hir::Expr::Row(components) => components.iter().collect(),
+        expression => vec![expression],
+    }
+}
+
 fn custom_literal_is_compatible(literal_type: &str, value_input_type: &str) -> bool {
     value_input_type.eq_ignore_ascii_case("any")
         || literal_type.eq_ignore_ascii_case(value_input_type)
@@ -2482,18 +2719,10 @@ fn storage_type(name: &str) -> Type {
 }
 
 fn cast_affinity(target: &hir::TypeName) -> Affinity {
-    if target.programs.apply_builtin_affinity {
-        if target.name.is_empty() {
-            Affinity::Numeric
-        } else {
-            Affinity::affinity(&target.name)
-        }
-    } else {
-        type_fact_affinity(&target.type_fact)
-    }
+    target.affinity
 }
 
-fn type_fact_affinity(fact: &TypeFact) -> Affinity {
+pub(super) fn type_fact_affinity(fact: &TypeFact) -> Affinity {
     if fact.is_array() {
         return Affinity::Blob;
     }

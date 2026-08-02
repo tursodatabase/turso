@@ -7,9 +7,11 @@ use crate::schema::{Column, Table, Type, TypeDef};
 use crate::schema_expr::{
     BuiltinSchemaExprResolver, ResolutionMode, SchemaColumn, SchemaCustomTypeFunction, SchemaExpr,
     SchemaExprContext, SchemaExprNode, SchemaExprResolver, SchemaFieldAccess, SchemaTable,
-    SchemaTypeName, SchemaTypeSize, SchemaValueType, SelfColumn, ValidSchemaExpr,
+    SchemaTypeName, SchemaTypeParameter, SchemaTypeSize, SchemaValueType, SelfColumn,
+    ValidSchemaExpr,
 };
 use crate::sync::Arc;
+use crate::translate::expr::{walk_expr_mut, WalkControl};
 use crate::util::{check_literal_equivalency, normalize_ident, type_from_name};
 use crate::vdbe::affinity::Affinity;
 use crate::{LimboError, Result};
@@ -182,11 +184,12 @@ pub(crate) fn analyze_schema_exprs(
             generated_expressions: vec![hir::ColumnReadExpression::Absent; columns.len()],
             default_expressions: vec![hir::ColumnReadExpression::Absent; columns.len()],
             column_type_programs: vec![None; columns.len()],
-            check_constraints: Vec::new(),
+            check_constraints: None,
             columns,
             rowid_available: matches!(table.as_ref(), Table::BTree(table) if table.has_rowid),
             index_hint: hir::IndexHint::None,
             index_expressions: Vec::new(),
+            index_coverage: hir::IndexCoverage::Selective,
             index_method_patterns: Vec::new(),
         },
     )?;
@@ -278,6 +281,37 @@ fn schema_expr_input_affinity(type_fact: &TypeFact) -> Affinity {
 }
 
 impl Analyzer<'_, '_> {
+    /// Resolve catalog syntax that has no table columns. Type transforms,
+    /// domain checks, and type arguments use this path until the catalog owns
+    /// `SchemaExpr` directly.
+    pub(crate) fn resolve_standalone_schema_syntax(
+        &self,
+        syntax: &ast::Expr,
+        profile: crate::schema_expr::SchemaExprProfile,
+        database_id: usize,
+        expected_type: Option<&str>,
+        type_parameters: &[ast::TypeParam],
+        visible_types: &[Arc<TypeDef>],
+    ) -> Result<SchemaExpr> {
+        let parameters = type_parameters
+            .iter()
+            .map(|parameter| SchemaTypeParameter::new(parameter.name.clone(), parameter.ty.clone()))
+            .collect::<Vec<_>>();
+        let source_types = visible_types
+            .iter()
+            .map(|definition| (normalize_ident(&definition.name), Arc::clone(definition)))
+            .collect();
+        let resolver = SemanticSchemaExprResolver {
+            context: self.context(),
+            database_id,
+            source_types,
+        };
+        let context = SchemaExprContext::without_table()
+            .with_expected_type(expected_type)
+            .with_type_parameters(&parameters);
+        SchemaExpr::resolve(syntax, profile, context, &resolver, ResolutionMode::Strict)
+    }
+
     /// Resolve a catalog column without letting connection-wide custom types
     /// change SQLite's declared-type rules for a non-STRICT table.
     pub(crate) fn table_column_type_fact(
@@ -357,11 +391,12 @@ impl Analyzer<'_, '_> {
                 generated_expressions: vec![hir::ColumnReadExpression::Absent; columns.len()],
                 default_expressions: vec![hir::ColumnReadExpression::Absent; columns.len()],
                 column_type_programs: vec![None; columns.len()],
-                check_constraints: Vec::new(),
+                check_constraints: None,
                 columns,
                 rowid_available: false,
                 index_hint: hir::IndexHint::None,
                 index_expressions: Vec::new(),
+                index_coverage: hir::IndexCoverage::Selective,
                 index_method_patterns: Vec::new(),
             },
         )?;
@@ -400,6 +435,76 @@ impl Analyzer<'_, '_> {
         source: SourceId,
     ) -> Result<hir::Expr> {
         self.instantiate_source_schema_expr(expression, source, None)
+    }
+
+    /// Resolve parser syntax still held by the legacy catalog, then bind its
+    /// positional meaning to one concrete source occurrence.
+    ///
+    /// This adapter belongs at the schema-expression boundary: query and DML
+    /// analysis never call the old statement binder. Once the catalog stores
+    /// `SchemaExpr` directly, callers move to `instantiate_*_schema_expr` and
+    /// this compatibility entry point disappears.
+    pub(crate) fn instantiate_column_schema_syntax(
+        &mut self,
+        syntax: &ast::Expr,
+        profile: crate::schema_expr::SchemaExprProfile,
+        source: SourceId,
+        owner_column: usize,
+    ) -> Result<hir::Expr> {
+        self.instantiate_source_schema_syntax(syntax, profile, source, Some(owner_column))
+    }
+
+    pub(crate) fn instantiate_table_schema_syntax(
+        &mut self,
+        syntax: &ast::Expr,
+        profile: crate::schema_expr::SchemaExprProfile,
+        source: SourceId,
+    ) -> Result<hir::Expr> {
+        self.instantiate_source_schema_syntax(syntax, profile, source, None)
+    }
+
+    fn instantiate_source_schema_syntax(
+        &mut self,
+        syntax: &ast::Expr,
+        profile: crate::schema_expr::SchemaExprProfile,
+        source: SourceId,
+        owner_column: Option<usize>,
+    ) -> Result<hir::Expr> {
+        let columns = self
+            .source(source)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!("stored expression source {source} is missing"))
+            })?
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+
+        // Generated-column expressions in the current catalog may already
+        // contain the old SELF_TABLE marker. Convert only that catalog-local
+        // marker back to schema syntax. Any statement-bound or runtime AST
+        // node remains untouched and is rejected by SchemaExpr resolution.
+        let mut syntax = syntax.clone();
+        walk_expr_mut(&mut syntax, &mut |node| {
+            match node {
+                ast::Expr::Column { table, column, .. } if table.is_self_table() => {
+                    let name = columns.get(*column).ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "stored expression references missing source column {column}"
+                        ))
+                    })?;
+                    *node = ast::Expr::Id(ast::Name::exact(name.clone()));
+                }
+                ast::Expr::RowId { table, .. } if table.is_self_table() => {
+                    *node = ast::Expr::Id(ast::Name::exact("rowid".to_string()));
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        })?;
+
+        let expression = SchemaExpr::preserve_unresolved(syntax, profile);
+        self.instantiate_source_schema_expr(&expression, source, owner_column)
     }
 
     /// Schema loading may preserve parser syntax before user-defined types are
@@ -522,34 +627,49 @@ impl Analyzer<'_, '_> {
                 not,
                 start,
                 end,
-            } => Ok(hir::Expr::Between {
-                expr: Box::new(self.instantiate_schema_node(lhs, source)?),
-                negated: *not,
-                start: Box::new(self.instantiate_schema_node(start, source)?),
-                end: Box::new(self.instantiate_schema_node(end, source)?),
-            }),
+            } => {
+                let expr = self.instantiate_schema_node(lhs, source)?;
+                let start = self.instantiate_schema_node(start, source)?;
+                let end = self.instantiate_schema_node(end, source)?;
+                let scope = Scope::default();
+                let start_comparison = self.comparison_semantics(&expr, &start, &scope, false)?;
+                let end_comparison = self.comparison_semantics(&expr, &end, &scope, false)?;
+                Ok(hir::Expr::Between {
+                    expr: Box::new(expr),
+                    negated: *not,
+                    start: Box::new(start),
+                    end: Box::new(end),
+                    start_comparison,
+                    end_comparison,
+                })
+            }
             SchemaExprNode::Binary(lhs, operator, rhs) => {
                 let lhs = self.instantiate_schema_node(lhs, source)?;
                 let rhs = self.instantiate_schema_node(rhs, source)?;
                 let custom =
                     self.resolve_custom_binary_operator(&lhs, *operator, &rhs, &Scope::default())?;
+                let comparison = operator
+                    .is_comparison()
+                    .then(|| self.comparison_semantics(&lhs, &rhs, &Scope::default(), false))
+                    .transpose()?;
                 Ok(hir::Expr::Binary {
                     lhs: Box::new(lhs),
                     operator: *operator,
                     rhs: Box::new(rhs),
                     custom,
+                    comparison,
                 })
             }
             SchemaExprNode::Case {
                 base,
                 when_then_pairs,
                 else_expr,
-            } => Ok(hir::Expr::Case {
-                base: base
+            } => {
+                let base = base
                     .as_deref()
                     .map(|expr| self.instantiate_schema_node(expr, source).map(Box::new))
-                    .transpose()?,
-                when_then: when_then_pairs
+                    .transpose()?;
+                let when_then = when_then_pairs
                     .iter()
                     .map(|(when, then)| {
                         Ok((
@@ -557,12 +677,29 @@ impl Analyzer<'_, '_> {
                             self.instantiate_schema_node(then, source)?,
                         ))
                     })
-                    .collect::<Result<_>>()?,
-                else_expr: else_expr
+                    .collect::<Result<Vec<_>>>()?;
+                let else_expr = else_expr
                     .as_deref()
                     .map(|expr| self.instantiate_schema_node(expr, source).map(Box::new))
-                    .transpose()?,
-            }),
+                    .transpose()?;
+                let base_comparisons = base.as_deref().map_or_else(
+                    || Ok(Vec::new()),
+                    |base| {
+                        when_then
+                            .iter()
+                            .map(|(when, _)| {
+                                self.comparison_semantics(base, when, &Scope::default(), false)
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    },
+                )?;
+                Ok(hir::Expr::Case {
+                    base,
+                    when_then,
+                    else_expr,
+                    base_comparisons,
+                })
+            }
             SchemaExprNode::Cast {
                 expr,
                 type_name,
@@ -578,6 +715,15 @@ impl Analyzer<'_, '_> {
                 let parameters = self.schema_type_parameters(type_name, source)?;
                 let programs =
                     self.bind_cast_programs(&type_fact, &parameters, &Scope::default())?;
+                let affinity = if programs.apply_builtin_affinity {
+                    if type_name.name().is_empty() {
+                        Affinity::Numeric
+                    } else {
+                        Affinity::affinity(type_name.name())
+                    }
+                } else {
+                    super::expr::type_fact_affinity(&type_fact)
+                };
                 Ok(hir::Expr::Cast {
                     expr: Box::new(self.instantiate_schema_node(expr, source)?),
                     target: hir::TypeName {
@@ -585,6 +731,7 @@ impl Analyzer<'_, '_> {
                         parameters,
                         array_dimensions: type_name.array_dimensions(),
                         type_fact,
+                        affinity,
                         programs,
                     },
                 })
@@ -723,6 +870,7 @@ impl Analyzer<'_, '_> {
                         None,
                         Arc::new(function.clone()),
                     ),
+                    evaluation: hir::FunctionEvaluation::Scalar,
                     star: *star,
                     arguments,
                     distinctness: *distinctness,
@@ -766,14 +914,23 @@ impl Analyzer<'_, '_> {
             SchemaExprNode::TypeParameter { .. } => Err(LimboError::InternalError(
                 "type transform parameter must be specialized before HIR instantiation".to_string(),
             )),
-            SchemaExprNode::InList { lhs, not, rhs } => Ok(hir::Expr::InList {
-                lhs: Box::new(self.instantiate_schema_node(lhs, source)?),
-                negated: *not,
-                values: rhs
+            SchemaExprNode::InList { lhs, not, rhs } => {
+                let lhs = self.instantiate_schema_node(lhs, source)?;
+                let values = rhs
                     .iter()
                     .map(|expr| self.instantiate_schema_node(expr, source))
-                    .collect::<Result<_>>()?,
-            }),
+                    .collect::<Result<Vec<_>>>()?;
+                let comparisons = values
+                    .iter()
+                    .map(|value| self.comparison_semantics(&lhs, value, &Scope::default(), true))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(hir::Expr::InList {
+                    lhs: Box::new(lhs),
+                    negated: *not,
+                    values,
+                    comparisons,
+                })
+            }
             SchemaExprNode::IsNull(expr) => Ok(hir::Expr::IsNull(Box::new(
                 self.instantiate_schema_node(expr, source)?,
             ))),
@@ -1157,15 +1314,18 @@ pub(crate) fn equivalent(lhs: &hir::Expr, rhs: &hir::Expr) -> bool {
                 operator: lhs_operator,
                 rhs: lhs_right,
                 custom: lhs_custom,
+                comparison: lhs_comparison,
             },
             hir::Expr::Binary {
                 lhs: rhs_left,
                 operator: rhs_operator,
                 rhs: rhs_right,
                 custom: rhs_custom,
+                comparison: rhs_comparison,
             },
         ) => {
             lhs_operator == rhs_operator
+                && lhs_comparison == rhs_comparison
                 && ((equivalent(lhs_left, rhs_left)
                     && equivalent(lhs_right, rhs_right)
                     && custom_binary_operator_equivalent(
@@ -1188,15 +1348,21 @@ pub(crate) fn equivalent(lhs: &hir::Expr, rhs: &hir::Expr) -> bool {
                 negated: lhs_negated,
                 start: lhs_start,
                 end: lhs_end,
+                start_comparison: lhs_start_comparison,
+                end_comparison: lhs_end_comparison,
             },
             hir::Expr::Between {
                 expr: rhs,
                 negated: rhs_negated,
                 start: rhs_start,
                 end: rhs_end,
+                start_comparison: rhs_start_comparison,
+                end_comparison: rhs_end_comparison,
             },
         ) => {
             lhs_negated == rhs_negated
+                && lhs_start_comparison == rhs_start_comparison
+                && lhs_end_comparison == rhs_end_comparison
                 && equivalent(lhs, rhs)
                 && equivalent(lhs_start, rhs_start)
                 && equivalent(lhs_end, rhs_end)
@@ -1206,14 +1372,17 @@ pub(crate) fn equivalent(lhs: &hir::Expr, rhs: &hir::Expr) -> bool {
                 base: lhs_base,
                 when_then: lhs_pairs,
                 else_expr: lhs_else,
+                base_comparisons: lhs_comparisons,
             },
             hir::Expr::Case {
                 base: rhs_base,
                 when_then: rhs_pairs,
                 else_expr: rhs_else,
+                base_comparisons: rhs_comparisons,
             },
         ) => {
-            optional_expr_equivalent(lhs_base.as_deref(), rhs_base.as_deref())
+            lhs_comparisons == rhs_comparisons
+                && optional_expr_equivalent(lhs_base.as_deref(), rhs_base.as_deref())
                 && expr_pair_slices_equivalent(lhs_pairs, rhs_pairs)
                 && optional_expr_equivalent(lhs_else.as_deref(), rhs_else.as_deref())
         }
@@ -1245,14 +1414,17 @@ pub(crate) fn equivalent(lhs: &hir::Expr, rhs: &hir::Expr) -> bool {
                 lhs,
                 negated: lhs_negated,
                 values: lhs_values,
+                comparisons: lhs_comparisons,
             },
             hir::Expr::InList {
                 lhs: rhs,
                 negated: rhs_negated,
                 values: rhs_values,
+                comparisons: rhs_comparisons,
             },
         ) => {
             lhs_negated == rhs_negated
+                && lhs_comparisons == rhs_comparisons
                 && equivalent(lhs, rhs)
                 && expr_slices_equivalent(lhs_values, rhs_values)
         }
@@ -1436,13 +1608,20 @@ fn subquery_equivalent(lhs: &hir::SubqueryExpr, rhs: &hir::SubqueryExpr) -> bool
                 lhs,
                 query: lhs_query,
                 negated: lhs_negated,
+                comparison: lhs_comparison,
             },
             hir::SubqueryExpr::In {
                 lhs: rhs,
                 query: rhs_query,
                 negated: rhs_negated,
+                comparison: rhs_comparison,
             },
-        ) => lhs_query == rhs_query && lhs_negated == rhs_negated && equivalent(lhs, rhs),
+        ) => {
+            lhs_query == rhs_query
+                && lhs_negated == rhs_negated
+                && lhs_comparison == rhs_comparison
+                && equivalent(lhs, rhs)
+        }
         _ => false,
     }
 }
@@ -1450,6 +1629,7 @@ fn subquery_equivalent(lhs: &hir::SubqueryExpr, rhs: &hir::SubqueryExpr) -> bool
 fn type_name_equivalent(lhs: &hir::TypeName, rhs: &hir::TypeName) -> bool {
     lhs.name.eq_ignore_ascii_case(&rhs.name)
         && lhs.array_dimensions == rhs.array_dimensions
+        && lhs.affinity == rhs.affinity
         && expr_slices_equivalent(&lhs.parameters, &rhs.parameters)
         && type_fact_equivalent(&lhs.type_fact, &rhs.type_fact)
 }
@@ -1516,7 +1696,11 @@ fn window_bound_equivalent(lhs: &hir::WindowFrameBound, rhs: &hir::WindowFrameBo
 fn order_slices_equivalent(lhs: &[hir::OrderTerm], rhs: &[hir::OrderTerm]) -> bool {
     lhs.len() == rhs.len()
         && lhs.iter().zip(rhs).all(|(lhs, rhs)| {
-            lhs.order == rhs.order && lhs.nulls == rhs.nulls && equivalent(&lhs.expr, &rhs.expr)
+            lhs.order == rhs.order
+                && lhs.nulls == rhs.nulls
+                && lhs.type_fact == rhs.type_fact
+                && lhs.collation == rhs.collation
+                && equivalent(&lhs.expr, &rhs.expr)
         })
 }
 

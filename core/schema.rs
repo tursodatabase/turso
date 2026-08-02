@@ -228,6 +228,7 @@ pub struct StructFieldDef {
     pub name: String,
     pub base_affinity: Affinity,
     pub type_name: String,
+    pub array_dimensions: u32,
 }
 
 /// Definition for a STRUCT composite type.
@@ -243,6 +244,7 @@ pub struct UnionVariantDef {
     pub tag_index: u8,
     pub base_affinity: Affinity,
     pub type_name: String,
+    pub array_dimensions: u32,
 }
 
 /// Definition for a UNION discriminated union type.
@@ -453,6 +455,7 @@ impl TypeDef {
                         name: f.name.to_string(),
                         base_affinity: Affinity::affinity(&f.field_type.name),
                         type_name: f.field_type.name.clone(),
+                        array_dimensions: f.field_type.array_dimensions,
                     })
                     .try_collect()?;
                 Self {
@@ -482,6 +485,7 @@ impl TypeDef {
                         tag_index: i as u8,
                         base_affinity: Affinity::affinity(&f.field_type.name),
                         type_name: f.field_type.name.clone(),
+                        array_dimensions: f.field_type.array_dimensions,
                     })
                     .try_collect()?;
                 Self {

@@ -11,6 +11,12 @@ use crate::vdbe::affinity::Affinity;
 #[derive(Clone, Debug)]
 pub struct Query {
     pub id: QueryId,
+    /// Lexical query whose scope this query may capture. Root statement and
+    /// uncorrelated CTE queries have no parent.
+    pub parent: Option<QueryId>,
+    /// Exact source identities read from outside this query's own blocks.
+    /// Kept sorted by document-local identity for stable planning and tests.
+    pub captures: Vec<SourceId>,
     pub reachable_ctes: Vec<CteId>,
     pub blocks: Vec<QueryBlock>,
     pub first: QueryBlockId,
@@ -31,6 +37,10 @@ pub struct QueryBlock {
     pub id: QueryBlockId,
     pub from: Option<From>,
     pub outputs: Vec<Output>,
+    /// Number of stable aggregate identities owned by this block.
+    pub aggregate_count: usize,
+    /// Number of stable window-function identities owned by this block.
+    pub window_function_count: usize,
     pub body: QueryBlockBody,
 }
 
@@ -59,6 +69,10 @@ pub struct Output {
     /// storage type is known; a real BLOB column does have BLOB affinity.
     pub has_affinity: bool,
     pub collation: Option<super::ResolvedCollation>,
+    /// Whether `collation` came from an explicit COLLATE inside this output.
+    /// This is needed when an output participates in a later comparison:
+    /// explicit collations outrank declared column collations on either side.
+    pub collation_is_explicit: bool,
     pub name_kind: OutputNameKind,
 }
 
@@ -72,6 +86,10 @@ pub enum OutputNameKind {
 #[derive(Clone, Debug)]
 pub struct Grouping {
     pub keys: Vec<Expr>,
+    /// Type and custom-comparison facts aligned with `keys`.
+    pub key_type_facts: Vec<TypeFact>,
+    /// Resolved SQL collations aligned with `keys`.
+    pub key_collations: Vec<Option<super::ResolvedCollation>>,
     pub having: Option<Expr>,
 }
 
@@ -132,6 +150,7 @@ pub struct UsingColumn {
     pub affinity: Affinity,
     pub has_affinity: bool,
     pub collation: Option<super::ResolvedCollation>,
+    pub comparison: super::ComparisonSemantics,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,14 +207,18 @@ pub struct Source {
     /// Custom-type encode/decode programs aligned with `columns`. Plain and
     /// built-in typed columns contain `None`.
     pub column_type_programs: Vec<Option<BoundColumnTypePrograms>>,
-    /// CHECK constraints instantiated for this exact DML target. Query-only
-    /// and synthetic sources keep this empty.
-    pub check_constraints: Vec<CheckConstraint>,
+    /// CHECK constraints instantiated for this exact DML target. `None`
+    /// means this source does not enforce CHECKs for the current statement;
+    /// `Some([])` means enforcement is active and the table has no checks.
+    pub check_constraints: Option<Vec<CheckConstraint>>,
     pub rowid_available: bool,
     pub index_hint: IndexHint,
     /// Expression-index keys and partial predicates instantiated for this
     /// exact source occurrence.
     pub index_expressions: Vec<IndexExpressions>,
+    /// Whether `index_expressions` covers every index in the frozen catalog or
+    /// only the candidates usable by this read.
+    pub index_coverage: IndexCoverage,
     /// Custom index-method match patterns resolved against this source.
     pub index_method_patterns: Vec<IndexMethodPattern>,
 }
@@ -243,6 +266,14 @@ pub enum IndexHint {
     None,
     NotIndexed,
     Indexed(ResolvedIndex),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IndexCoverage {
+    Selective,
+    Complete {
+        indexes: Vec<super::CatalogObjectId>,
+    },
 }
 
 #[derive(Clone, Debug)]

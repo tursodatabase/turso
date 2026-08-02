@@ -21,6 +21,11 @@ mod sequence;
 mod trigger;
 mod trigger_rules;
 
+#[cfg(test)]
+mod analysis_properties;
+#[cfg(test)]
+mod scope_properties;
+
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use turso_parser::ast;
 
@@ -85,7 +90,11 @@ pub(crate) fn analyze(
             analyzer.analyze_trigger_predicate(syntax, trigger)?
         }
     };
-    analyzer.finish(root)
+    let document = analyzer.finish(root)?;
+    document.validate().map_err(|error| {
+        LimboError::InternalError(format!("semantic analysis produced invalid HIR: {error}"))
+    })?;
+    Ok(document)
 }
 
 /// Target row images visible to a trigger command or `WHEN` predicate.
@@ -111,6 +120,7 @@ pub(crate) enum CatalogObjectKind {
     Function { argument_count: usize },
     Collation,
     Type,
+    Trigger,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -141,6 +151,8 @@ pub(crate) struct Analyzer<'context, 'catalog> {
     schema_programs: Vec<Option<BoundSchemaProgram>>,
     schema_program_bindings: HashMap<SchemaProgramKey, SchemaProgramBindingState>,
     catalog_ids: HashMap<CatalogIdentityKey, CatalogObjectId>,
+    next_aggregate_ids: HashMap<hir::QueryBlockId, usize>,
+    next_window_function_ids: HashMap<hir::QueryBlockId, usize>,
 }
 
 impl<'context, 'catalog> Analyzer<'context, 'catalog> {
@@ -155,7 +167,36 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
             schema_programs: Vec::new(),
             schema_program_bindings: HashMap::default(),
             catalog_ids: HashMap::default(),
+            next_aggregate_ids: HashMap::default(),
+            next_window_function_ids: HashMap::default(),
         }
+    }
+
+    pub(crate) fn allocate_aggregate_id(&mut self, block: hir::QueryBlockId) -> hir::AggregateId {
+        let next = self.next_aggregate_ids.entry(block).or_default();
+        let id = hir::AggregateId::new(block, *next);
+        *next += 1;
+        id
+    }
+
+    pub(crate) fn allocate_window_function_id(
+        &mut self,
+        block: hir::QueryBlockId,
+    ) -> hir::WindowFunctionId {
+        let next = self.next_window_function_ids.entry(block).or_default();
+        let id = hir::WindowFunctionId::new(block, *next);
+        *next += 1;
+        id
+    }
+
+    pub(crate) fn query_block_function_counts(&self, block: hir::QueryBlockId) -> (usize, usize) {
+        (
+            self.next_aggregate_ids.get(&block).copied().unwrap_or(0),
+            self.next_window_function_ids
+                .get(&block)
+                .copied()
+                .unwrap_or(0),
+        )
     }
 
     pub(crate) fn context(&self) -> &'context SemanticContext<'catalog> {
@@ -293,14 +334,21 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
 
     pub(crate) fn finish(mut self, root: HirRoot) -> Result<HirDocument> {
         self.materialize_required_source_expressions(&root)?;
-        Ok(HirDocument {
+        let mut document = HirDocument {
             snapshot: self.context.snapshot(),
+            databases: self.context.database_snapshots(),
             root,
             queries: Self::finish_arena(self.queries, "query")?,
             sources: Self::finish_arena(self.sources, "source")?,
             ctes: Self::finish_arena(self.ctes, "CTE")?,
             schema_programs: Self::finish_arena(self.schema_programs, "schema program")?,
-        })
+        };
+        for index in 0..document.queries.len() {
+            let id = QueryId::new(index);
+            let captures = document.direct_query_captures(id);
+            document.queries[index].captures = captures;
+        }
+        Ok(document)
     }
 
     fn insert_reserved<T>(

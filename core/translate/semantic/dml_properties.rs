@@ -344,7 +344,7 @@ fn dml_hir_closes_over_target_and_expression_positions(tc: hegel::TestCase) {
         1 => GeneratedDml::Update,
         _ => GeneratedDml::Delete,
     };
-    let target = source(
+    let mut target = source(
         0,
         "items",
         None,
@@ -352,6 +352,9 @@ fn dml_hir_closes_over_target_and_expression_positions(tc: hegel::TestCase) {
         source_columns(width, None, None),
         true,
     );
+    target.index_coverage = hir::IndexCoverage::Complete {
+        indexes: Vec::new(),
+    };
     let target_id = target.id;
     let root = match operation {
         GeneratedDml::Insert => hir::HirRoot::Insert(hir::Insert {
@@ -364,6 +367,8 @@ fn dml_hir_closes_over_target_and_expression_positions(tc: hegel::TestCase) {
             excluded_source: None,
             returning: None,
             trigger: None,
+            triggers: Vec::new(),
+            foreign_keys: hir::DmlForeignKeys::default(),
         }),
         GeneratedDml::Update => hir::HirRoot::Update(hir::Update {
             target: target_id,
@@ -379,6 +384,8 @@ fn dml_hir_closes_over_target_and_expression_positions(tc: hegel::TestCase) {
             conflict: None,
             returning: None,
             trigger: None,
+            triggers: Vec::new(),
+            foreign_keys: hir::DmlForeignKeys::default(),
         }),
         GeneratedDml::Delete => hir::HirRoot::Delete(hir::Delete {
             target: target_id,
@@ -387,10 +394,16 @@ fn dml_hir_closes_over_target_and_expression_positions(tc: hegel::TestCase) {
             limit: None,
             returning: None,
             trigger: None,
+            triggers: Vec::new(),
+            foreign_keys: hir::DmlForeignKeys::default(),
         }),
     };
     let mut document = hir::HirDocument {
         snapshot: hir::CatalogSnapshot::from_id(1),
+        databases: vec![hir::DatabaseSnapshot {
+            database: hir::DatabaseId::new(0),
+            schema_version: 0,
+        }],
         root,
         queries: Vec::new(),
         sources: vec![target],

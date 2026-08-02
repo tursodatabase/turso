@@ -38,10 +38,11 @@ fn source(id: SourceId, owner: SourceOwner, width: usize, kind: SourceKind) -> S
         generated_expressions: vec![ColumnReadExpression::Absent; width],
         default_expressions: vec![ColumnReadExpression::Absent; width],
         column_type_programs: vec![None; width],
-        check_constraints: Vec::new(),
+        check_constraints: None,
         rowid_available: false,
         index_hint: IndexHint::None,
         index_expressions: Vec::new(),
+        index_coverage: IndexCoverage::Selective,
         index_method_patterns: Vec::new(),
     }
 }
@@ -55,6 +56,7 @@ fn output(block: QueryBlockId, index: usize, expression: Expr) -> Output {
         affinity: Affinity::Integer,
         has_affinity: true,
         collation: None,
+        collation_is_explicit: false,
         name_kind: OutputNameKind::Inferred,
     }
 }
@@ -82,6 +84,8 @@ fn generated_query_document(tc: &hegel::TestCase) -> HirDocument {
             joins: Vec::new(),
         }),
         outputs,
+        aggregate_count: 0,
+        window_function_count: 0,
         body: QueryBlockBody::Select {
             distinctness: None,
             filter: None,
@@ -92,12 +96,15 @@ fn generated_query_document(tc: &hegel::TestCase) -> HirDocument {
 
     HirDocument {
         snapshot: CatalogSnapshot::from_id(1),
+        databases: Vec::new(),
         root: HirRoot::Query(QueryRoot {
             query: query_id,
             trigger: None,
         }),
         queries: vec![Query {
             id: query_id,
+            parent: None,
+            captures: Vec::new(),
             reachable_ctes: Vec::new(),
             blocks: vec![block],
             first: block_id,
@@ -132,6 +139,7 @@ fn expression_with_schema_call(program: SchemaProgramId) -> Expr {
             parameters: Vec::new(),
             array_dimensions: 0,
             type_fact: TypeFact::known(Type::Integer),
+            affinity: Affinity::Integer,
             programs: BoundCastPrograms {
                 encode: vec![schema_call(program)],
                 domain: None,
@@ -186,6 +194,7 @@ fn generated_cte_document(tc: &hegel::TestCase) -> HirDocument {
 
     HirDocument {
         snapshot: CatalogSnapshot::from_id(1),
+        databases: Vec::new(),
         root: HirRoot::Query(QueryRoot {
             query: root_query,
             trigger: None,
@@ -193,6 +202,8 @@ fn generated_cte_document(tc: &hegel::TestCase) -> HirDocument {
         queries: vec![
             Query {
                 id: root_query,
+                parent: None,
+                captures: Vec::new(),
                 reachable_ctes: vec![cte_id],
                 blocks: vec![QueryBlock {
                     id: root_block,
@@ -201,6 +212,8 @@ fn generated_cte_document(tc: &hegel::TestCase) -> HirDocument {
                         joins: Vec::new(),
                     }),
                     outputs: root_outputs,
+                    aggregate_count: 0,
+                    window_function_count: 0,
                     body: QueryBlockBody::Select {
                         distinctness: None,
                         filter: None,
@@ -216,11 +229,15 @@ fn generated_cte_document(tc: &hegel::TestCase) -> HirDocument {
             },
             Query {
                 id: body_query,
+                parent: None,
+                captures: Vec::new(),
                 reachable_ctes: Vec::new(),
                 blocks: vec![QueryBlock {
                     id: body_block,
                     from: None,
                     outputs: body_outputs,
+                    aggregate_count: 0,
+                    window_function_count: 0,
                     body: QueryBlockBody::Select {
                         distinctness: None,
                         filter: None,
@@ -398,6 +415,59 @@ fn source_column_state_widths_must_stay_aligned(tc: hegel::TestCase) {
         }
     }
 
+    assert!(document.validate().is_err());
+}
+
+// Example: `SELECT generated_c2 FROM items` cannot leave c2's generated or
+// short-record default expression in `NotRequired`; reading that position
+// makes each stored expression attached to it part of the closed document.
+#[hegel::test]
+fn referenced_columns_require_their_stored_read_programs(tc: hegel::TestCase) {
+    let mut document = generated_query_document(&tc);
+    let Expr::Column(reference) = &first_output_mut(&mut document).expr else {
+        unreachable!("the generator emits a column output");
+    };
+    let reference = *reference;
+    if tc.draw(generators::booleans()) {
+        document.sources[reference.source.index()].generated_expressions[reference.column] =
+            ColumnReadExpression::NotRequired;
+    } else {
+        document.sources[reference.source.index()].default_expressions[reference.column] =
+            ColumnReadExpression::NotRequired;
+    }
+
+    assert!(document.validate().is_err());
+}
+
+// Example: `SELECT array_value FROM items` must carry the array storage bundle
+// for that referenced column even when it has no custom ENCODE/DECODE calls.
+// Clearing the aligned type-program slot makes the document incomplete.
+#[hegel::test]
+fn referenced_array_columns_require_their_type_programs(tc: hegel::TestCase) {
+    let mut document = generated_query_document(&tc);
+    let Expr::Column(reference) = &first_output_mut(&mut document).expr else {
+        unreachable!("the generator emits a column output");
+    };
+    let reference = *reference;
+    let source = &mut document.sources[reference.source.index()];
+    source.columns[reference.column].type_fact = TypeFact::known_array(1);
+    source.column_type_programs[reference.column] = Some(BoundColumnTypePrograms {
+        encode: Vec::new(),
+        decode: Vec::new(),
+        array: Some(BoundArrayStorage {
+            element_affinity: Affinity::Integer,
+            element_type: "INTEGER".to_string(),
+            table_name: "items".to_string(),
+            column_name: "array_value".to_string(),
+            dimensions: 1,
+        }),
+        encode_nulls: false,
+    });
+    document
+        .validate()
+        .expect("the referenced array column carries its storage program");
+
+    document.sources[reference.source.index()].column_type_programs[reference.column] = None;
     assert!(document.validate().is_err());
 }
 

@@ -27,6 +27,7 @@ pub(crate) mod logical;
 pub(crate) mod main_loop;
 pub(crate) mod optimizer;
 pub(crate) mod order_by;
+pub(crate) mod physical;
 pub(crate) mod plan;
 pub(crate) mod planner;
 pub(crate) mod pragma;
@@ -35,9 +36,7 @@ pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;
 pub(crate) mod select;
-#[cfg(test)]
-#[path = "semantic/scope_properties.rs"]
-mod semantic_scope_properties;
+pub(crate) mod semantic;
 pub(crate) mod sequence;
 pub(crate) mod stmt_journal;
 pub(crate) mod subquery;

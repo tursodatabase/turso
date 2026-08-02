@@ -1,5 +1,6 @@
 //! Semantic analysis for INSERT, UPDATE, and DELETE.
 
+use rustc_hash::FxHashSet as HashSet;
 use turso_parser::ast;
 
 use super::{
@@ -15,7 +16,8 @@ use super::{
     Analyzer, CatalogObjectKind, TriggerAnalysisInput,
 };
 use crate::{
-    schema::{Index, IndexColumn, Table},
+    schema::{BTreeTable, Index, IndexColumn, ResolvedFkRef, Table, Trigger},
+    schema_expr::SchemaExprProfile,
     sync::Arc,
     translate::expr::{walk_expr, WalkControl},
     LimboError, Result,
@@ -118,6 +120,33 @@ fn target_type_fact(target: TargetColumn, source: &hir::Source) -> hir::TypeFact
             .type_fact
             .clone(),
         TargetColumn::RowId => hir::TypeFact::known(crate::schema::Type::Integer),
+    }
+}
+
+fn trigger_targets_database(trigger: &Trigger, database_id: usize) -> bool {
+    trigger
+        .target_database_id
+        .map_or(true, |target| target == database_id)
+}
+
+fn trigger_matches_event(
+    trigger: &Trigger,
+    event: &ast::TriggerEvent,
+    table: &Table,
+    updated_columns: &HashSet<usize>,
+) -> bool {
+    match (&trigger.event, event) {
+        (ast::TriggerEvent::Insert, ast::TriggerEvent::Insert)
+        | (ast::TriggerEvent::Delete, ast::TriggerEvent::Delete)
+        | (ast::TriggerEvent::Update, ast::TriggerEvent::Update) => true,
+        (ast::TriggerEvent::UpdateOf(names), ast::TriggerEvent::Update) => {
+            names.iter().any(|name| {
+                table
+                    .get_column_by_name(&crate::util::normalize_ident(name.as_str()))
+                    .is_some_and(|(position, _)| updated_columns.contains(&position))
+            })
+        }
+        _ => false,
     }
 }
 
@@ -268,6 +297,9 @@ impl Analyzer<'_, '_> {
 
         let returning =
             self.analyze_dml_returning(returning_syntax, &environment, target, trigger.is_some())?;
+        let triggers =
+            self.resolve_dml_triggers(database_id, &table, ast::TriggerEvent::Insert, &[])?;
+        let foreign_keys = self.resolve_dml_foreign_keys(database_id, table.get_name())?;
         Ok(hir::HirRoot::Insert(hir::Insert {
             target,
             columns,
@@ -278,6 +310,8 @@ impl Analyzer<'_, '_> {
             excluded_source,
             returning,
             trigger,
+            triggers,
+            foreign_keys,
         }))
     }
 
@@ -338,6 +372,13 @@ impl Analyzer<'_, '_> {
         let limit = self.analyze_dml_limit(limit_syntax, &environment, trigger.is_some())?;
         let returning =
             self.analyze_dml_returning(returning_syntax, &environment, target, trigger.is_some())?;
+        let triggers = self.resolve_dml_triggers(
+            database_id,
+            &table,
+            ast::TriggerEvent::Update,
+            &assignments,
+        )?;
+        let foreign_keys = self.resolve_dml_foreign_keys(database_id, table.get_name())?;
 
         Ok(hir::HirRoot::Update(hir::Update {
             target,
@@ -350,6 +391,8 @@ impl Analyzer<'_, '_> {
             conflict,
             returning,
             trigger,
+            triggers,
+            foreign_keys,
         }))
     }
 
@@ -390,6 +433,9 @@ impl Analyzer<'_, '_> {
         let limit = self.analyze_dml_limit(limit_syntax, &environment, trigger.is_some())?;
         let returning =
             self.analyze_dml_returning(returning_syntax, &environment, target, trigger.is_some())?;
+        let triggers =
+            self.resolve_dml_triggers(database_id, &table, ast::TriggerEvent::Delete, &[])?;
+        let foreign_keys = self.resolve_dml_foreign_keys(database_id, table.get_name())?;
 
         Ok(hir::HirRoot::Delete(hir::Delete {
             target,
@@ -398,7 +444,183 @@ impl Analyzer<'_, '_> {
             limit,
             returning,
             trigger,
+            triggers,
+            foreign_keys,
         }))
+    }
+
+    fn resolve_dml_triggers(
+        &mut self,
+        database_id: usize,
+        table: &Table,
+        event: ast::TriggerEvent,
+        assignments: &[hir::Assignment],
+    ) -> Result<Vec<hir::ResolvedTrigger>> {
+        let updated_columns = assignments
+            .iter()
+            .flat_map(|assignment| assignment.columns.iter())
+            .filter_map(|column| match column {
+                TargetColumn::Column(position) => Some(*position),
+                TargetColumn::RowId => None,
+            })
+            .collect::<HashSet<_>>();
+        let table_name = table.get_name();
+        let schema = self.context().schema(database_id).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "database {database_id} disappeared while resolving DML triggers"
+            ))
+        })?;
+        let mut matches = schema
+            .get_triggers_for_table(table_name)
+            .filter(|trigger| {
+                trigger_targets_database(trigger, database_id)
+                    && trigger_matches_event(trigger, &event, table, &updated_columns)
+            })
+            .cloned()
+            .map(|trigger| (database_id, trigger))
+            .collect::<Vec<_>>();
+
+        if database_id != crate::TEMP_DB_ID {
+            if let Some(temp_schema) = self.context().schema(crate::TEMP_DB_ID) {
+                let temp_shadows_target = temp_schema.get_table(table_name).is_some();
+                matches.extend(
+                    temp_schema
+                        .get_triggers_for_table(table_name)
+                        .filter(|trigger| {
+                            let target_matches = match trigger.target_database_id {
+                                Some(target) => target == database_id,
+                                None => !temp_shadows_target,
+                            };
+                            target_matches
+                                && trigger_matches_event(trigger, &event, table, &updated_columns)
+                        })
+                        .cloned()
+                        .map(|trigger| (crate::TEMP_DB_ID, trigger)),
+                );
+            }
+        }
+
+        matches
+            .into_iter()
+            .map(|(owner_database, trigger)| {
+                let name = crate::util::normalize_ident(&trigger.name);
+                let object_id =
+                    self.catalog_object_id(Some(owner_database), CatalogObjectKind::Trigger, name);
+                Ok(CatalogObject::new(
+                    object_id,
+                    self.context().snapshot(),
+                    Some(DatabaseId::new(owner_database)),
+                    trigger,
+                ))
+            })
+            .collect()
+    }
+
+    fn resolve_dml_foreign_keys(
+        &mut self,
+        database_id: usize,
+        table_name: &str,
+    ) -> Result<hir::DmlForeignKeys> {
+        let schema = self.context().schema(database_id).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "database {database_id} disappeared while resolving foreign keys"
+            ))
+        })?;
+        if schema.get_btree_table(table_name).is_none() {
+            return Ok(hir::DmlForeignKeys::default());
+        }
+
+        let outgoing = schema
+            .resolved_fks_for_child(table_name)?
+            .into_iter()
+            .map(|foreign_key| {
+                let parent = schema
+                    .get_btree_table(&foreign_key.fk.parent_table)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "resolved foreign-key parent {} disappeared",
+                            foreign_key.fk.parent_table
+                        ))
+                    })?;
+                Ok((foreign_key, parent))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let parent = schema.get_btree_table(table_name).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "resolved foreign-key parent {table_name} disappeared"
+            ))
+        })?;
+        let incoming = schema
+            .resolved_fks_referencing(table_name)?
+            .into_iter()
+            .map(|foreign_key| (foreign_key, parent.clone()))
+            .collect::<Vec<_>>();
+
+        Ok(hir::DmlForeignKeys {
+            outgoing: outgoing
+                .into_iter()
+                .map(|(foreign_key, parent)| {
+                    self.freeze_foreign_key(database_id, foreign_key, parent)
+                })
+                .collect::<Result<Vec<_>>>()?,
+            incoming: incoming
+                .into_iter()
+                .map(|(foreign_key, parent)| {
+                    self.freeze_foreign_key(database_id, foreign_key, parent)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+
+    fn freeze_foreign_key(
+        &mut self,
+        database_id: usize,
+        foreign_key: ResolvedFkRef,
+        parent: Arc<BTreeTable>,
+    ) -> Result<hir::ResolvedForeignKey> {
+        let child_id = self.catalog_object_id(
+            Some(database_id),
+            CatalogObjectKind::Table,
+            crate::util::normalize_ident(&foreign_key.child_table.name),
+        );
+        let parent_id = self.catalog_object_id(
+            Some(database_id),
+            CatalogObjectKind::Table,
+            crate::util::normalize_ident(&parent.name),
+        );
+        let parent_unique_index = foreign_key.parent_unique_index.map(|index| {
+            let id = self.catalog_object_id(
+                Some(database_id),
+                CatalogObjectKind::Index,
+                crate::util::normalize_ident(&index.name),
+            );
+            CatalogObject::new(
+                id,
+                self.context().snapshot(),
+                Some(DatabaseId::new(database_id)),
+                index,
+            )
+        });
+        Ok(hir::ResolvedForeignKey {
+            child_table: CatalogObject::new(
+                child_id,
+                self.context().snapshot(),
+                Some(DatabaseId::new(database_id)),
+                Arc::new(Table::BTree(foreign_key.child_table)),
+            ),
+            parent_table: CatalogObject::new(
+                parent_id,
+                self.context().snapshot(),
+                Some(DatabaseId::new(database_id)),
+                Arc::new(Table::BTree(parent)),
+            ),
+            declaration: foreign_key.fk,
+            parent_columns: foreign_key.parent_cols,
+            child_positions: foreign_key.child_pos,
+            parent_positions: foreign_key.parent_pos,
+            parent_uses_rowid: foreign_key.parent_uses_rowid,
+            parent_unique_index,
+        })
     }
 
     fn prepare_dml_environment(
@@ -538,7 +760,12 @@ impl Analyzer<'_, '_> {
                     .and_then(|resolved| resolved.default_expr().cloned())
             };
             let value = match stored {
-                Some(stored) => self.instantiate_schema_expr(stored.as_valid()?, target)?,
+                Some(stored) => self.instantiate_column_schema_syntax(
+                    &stored,
+                    SchemaExprProfile::Default,
+                    target,
+                    column_index,
+                )?,
                 None => hir::Expr::Literal(ast::Literal::Null),
             };
             defaults.push(hir::ResolvedDefault {
@@ -589,11 +816,13 @@ impl Analyzer<'_, '_> {
     ) -> Result<Vec<hir::OrderTerm>> {
         let mut terms = Vec::with_capacity(syntax.len());
         for term in syntax {
-            terms.push(hir::OrderTerm {
-                expr: self.analyze_expr(&term.expr, scope, scalar_expr_policy(in_trigger))?,
-                order: term.order.unwrap_or(ast::SortOrder::Asc),
-                nulls: term.nulls,
-            });
+            let expr = self.analyze_expr(&term.expr, scope, scalar_expr_policy(in_trigger))?;
+            terms.push(self.resolved_order_term(
+                expr,
+                term.order.unwrap_or(ast::SortOrder::Asc),
+                term.nulls,
+                scope,
+            ));
         }
         Ok(terms)
     }
@@ -674,9 +903,7 @@ impl Analyzer<'_, '_> {
                 ast::UpsertDo::Set { sets, where_clause } => {
                     let mut scope = self.scope_for_environment(environment)?;
                     let target_definition = self.source(target).ok_or_else(|| {
-                        LimboError::InternalError(format!(
-                            "missing UPSERT target source {target}"
-                        ))
+                        LimboError::InternalError(format!("missing UPSERT target source {target}"))
                     })?;
                     let excluded_definition = self.source(excluded).ok_or_else(|| {
                         LimboError::InternalError(format!(
@@ -820,7 +1047,11 @@ impl Analyzer<'_, '_> {
         }
         match (&index.where_clause, predicate) {
             (Some(stored), Some(predicate)) => {
-                let stored = self.instantiate_schema_expr(stored.as_valid()?, target)?;
+                let stored = self.instantiate_table_schema_syntax(
+                    stored,
+                    SchemaExprProfile::PartialIndexPredicate,
+                    target,
+                )?;
                 if !super::schema_expr::equivalent(predicate, &stored) {
                     return Ok(false);
                 }
@@ -855,7 +1086,11 @@ impl Analyzer<'_, '_> {
                     let Some(stored) = &index_column.expr else {
                         continue;
                     };
-                    let stored = self.instantiate_schema_expr(stored.as_valid()?, target)?;
+                    let stored = self.instantiate_table_schema_syntax(
+                        stored,
+                        SchemaExprProfile::IndexKey,
+                        target,
+                    )?;
                     if super::schema_expr::equivalent(expression, &stored) {
                         found = Some(position);
                         break;

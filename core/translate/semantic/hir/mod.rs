@@ -4,6 +4,7 @@
 //! are local to one [`HirDocument`], and all catalog objects are tied to the
 //! snapshot against which the document was analyzed.
 
+mod dependencies;
 mod expr;
 mod query;
 mod root;
@@ -17,7 +18,7 @@ use std::fmt;
 
 use crate::{
     function::Func,
-    schema::{Index, Table, Type, TypeDef},
+    schema::{Index, Table, Trigger, Type, TypeDef},
     sync::Arc,
     translate::collate::CollationSeq,
 };
@@ -226,6 +227,7 @@ pub type ResolvedIndex = CatalogObject<Index>;
 pub type ResolvedFunction = CatalogObject<Func>;
 pub type ResolvedCollation = CatalogObject<CollationSeq>;
 pub type ResolvedType = CatalogObject<TypeDef>;
+pub type ResolvedTrigger = CatalogObject<Trigger>;
 
 /// A declared SQL type whose meaning was resolved during analysis.
 #[derive(Clone, Debug, PartialEq)]
@@ -545,11 +547,19 @@ impl Default for TypeFact {
 #[derive(Clone, Debug)]
 pub struct HirDocument {
     pub snapshot: CatalogSnapshot,
+    pub databases: Vec<DatabaseSnapshot>,
     pub root: HirRoot,
     pub queries: Vec<Query>,
     pub sources: Vec<Source>,
     pub ctes: Vec<Cte>,
     pub schema_programs: Vec<BoundSchemaProgram>,
+}
+
+/// One database schema frozen into the semantic-analysis snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DatabaseSnapshot {
+    pub database: DatabaseId,
+    pub schema_version: u32,
 }
 
 impl HirDocument {

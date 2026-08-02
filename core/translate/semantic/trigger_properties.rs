@@ -32,15 +32,19 @@ fn generated_position(tc: &hegel::TestCase, len: usize) -> usize {
 }
 
 fn resolved_table() -> super::hir::ResolvedTable {
-    resolved_table_with_id(41)
+    resolved_table_with_id_and_snapshot(41, 9)
 }
 
 fn resolved_table_with_id(object_id: u64) -> super::hir::ResolvedTable {
+    resolved_table_with_id_and_snapshot(object_id, 9)
+}
+
+fn resolved_table_with_id_and_snapshot(object_id: u64, snapshot: u64) -> super::hir::ResolvedTable {
     let table = BTreeTable::from_sql("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)", 2)
         .expect("fixed trigger table is valid");
     CatalogObject::new(
         CatalogObjectId::new(object_id),
-        CatalogSnapshot::from_id(9),
+        CatalogSnapshot::from_id(snapshot),
         Some(DatabaseId::new(MAIN_DB_ID)),
         Arc::new(Table::BTree(Arc::new(table))),
     )
@@ -89,6 +93,10 @@ fn trigger_document(new_visible: bool, old_visible: bool) -> hir::HirDocument {
     });
     hir::HirDocument {
         snapshot: CatalogSnapshot::from_id(9),
+        databases: vec![hir::DatabaseSnapshot {
+            database: DatabaseId::new(MAIN_DB_ID),
+            schema_version: 0,
+        }],
         root: hir::HirRoot::TriggerPredicate(hir::TriggerPredicate {
             expression: hir::Expr::Literal(turso_parser::ast::Literal::Null),
             environment: TriggerEnvironment {
@@ -335,6 +343,24 @@ fn trigger_hir_rejects_wrong_pseudo_kind_or_target_table(tc: hegel::TestCase) {
     } else {
         *table = resolved_table_with_id(99);
     }
+
+    assert!(document.validate().is_err());
+}
+
+// Example: a trigger analyzed against catalog snapshot 9 cannot carry a NEW
+// table handle from snapshot 10, even when database, table, and columns match.
+#[hegel::test]
+fn trigger_hir_rejects_catalog_objects_from_another_snapshot(tc: hegel::TestCase) {
+    let mut document = trigger_document(true, tc.draw(generators::booleans()));
+    let wrong_snapshot = resolved_table_with_id_and_snapshot(41, 10);
+    let hir::HirRoot::TriggerPredicate(predicate) = &mut document.root else {
+        unreachable!("the fixture is a trigger predicate");
+    };
+    predicate.environment.table = wrong_snapshot.clone();
+    let SourceKind::Pseudo { table, .. } = &mut document.sources[0].kind else {
+        unreachable!("the first generated source is NEW");
+    };
+    *table = wrong_snapshot;
 
     assert!(document.validate().is_err());
 }

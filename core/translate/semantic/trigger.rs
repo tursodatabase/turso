@@ -6,10 +6,8 @@ use super::{
     dml::InsertSourceSyntax,
     expr::ExprPolicy,
     hir::{self, CatalogObject, DatabaseId, PseudoSource},
-    scope::{QueryEnvironment, Scope},
-    trigger_rules::{
-        apply_pseudo_column_affinity, effective_conflict_policy, query_environment,
-    },
+    scope::Scope,
+    trigger_rules::{apply_pseudo_column_affinity, effective_conflict_policy, query_environment},
     Analyzer, CatalogObjectKind, TriggerAnalysisInput,
 };
 use crate::{LimboError, Result};

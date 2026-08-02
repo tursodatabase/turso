@@ -146,11 +146,11 @@ impl CteBinding {
         self.definition.syntax.as_ref()
     }
 
-    pub(crate) fn state(&self) -> CteState {
+    pub(super) fn state(&self) -> CteState {
         self.definition.state.borrow().clone()
     }
 
-    pub(crate) fn set_state(&self, state: CteState) {
+    pub(super) fn set_state(&self, state: CteState) {
         *self.definition.state.borrow_mut() = state;
     }
 
@@ -171,6 +171,7 @@ impl CteBinding {
         let mut environment = cte_query_environment(reference_environment);
         environment.ctes = self.definition_ctes.clone();
         environment.outer = self.enclosing_scope.clone();
+        environment.query = self.enclosing_scope.as_ref().and_then(Scope::query);
         environment
     }
 }

@@ -11,6 +11,7 @@ use super::{
 };
 use crate::{
     schema::{Index, Table, Type},
+    schema_expr::SchemaExprProfile,
     sync::Arc,
     vdbe::affinity::Affinity,
     LimboError, Result,
@@ -110,6 +111,9 @@ impl Analyzer<'_, '_> {
     /// trigger/DML pseudo-tables.
     pub(crate) fn scope_for_environment(&self, environment: &QueryEnvironment) -> Result<Scope> {
         let mut scope = Scope::new(environment.outer.clone());
+        if let Some(query) = environment.query {
+            scope.set_query(query);
+        }
         scope.set_ctes(environment.ctes.clone());
         scope.add_environment_pseudo_sources(environment, |source| self.source(source))?;
         Ok(scope)
@@ -131,7 +135,7 @@ impl Analyzer<'_, '_> {
 
     /// Resolve and register a real schema table. CTEs, views, and derived
     /// sources use separate query-only paths.
-    pub(crate) fn analyze_base_table_source(
+    pub(super) fn analyze_base_table_source(
         &mut self,
         name: &ast::QualifiedName,
         alias: Option<&ast::Name>,
@@ -197,11 +201,12 @@ impl Analyzer<'_, '_> {
                 generated_expressions: vec![hir::ColumnReadExpression::Absent; columns.len()],
                 default_expressions: vec![hir::ColumnReadExpression::Absent; columns.len()],
                 column_type_programs: vec![None; columns.len()],
-                check_constraints: Vec::new(),
+                check_constraints: None,
                 columns,
                 rowid_available: table_has_rowid(table.value()),
                 index_hint,
                 index_expressions: Vec::new(),
+                index_coverage: hir::IndexCoverage::Selective,
                 index_method_patterns: Vec::new(),
             },
         )?;
@@ -235,11 +240,12 @@ impl Analyzer<'_, '_> {
                 generated_expressions: vec![hir::ColumnReadExpression::Absent; columns.len()],
                 default_expressions: vec![hir::ColumnReadExpression::Absent; columns.len()],
                 column_type_programs: vec![None; columns.len()],
-                check_constraints: Vec::new(),
+                check_constraints: None,
                 columns,
                 rowid_available: table_has_rowid(table.value()),
                 index_hint: hir::IndexHint::None,
                 index_expressions: Vec::new(),
+                index_coverage: hir::IndexCoverage::Selective,
                 index_method_patterns: Vec::new(),
             },
         )?;
@@ -471,6 +477,7 @@ impl Analyzer<'_, '_> {
             column,
             "generated",
             schema_column.generated_expr(),
+            SchemaExprProfile::GeneratedColumn,
             generated_state,
         )?;
         let default = self.instantiate_required_column_read_expression(
@@ -478,6 +485,7 @@ impl Analyzer<'_, '_> {
             column,
             "default",
             schema_column.default.as_deref(),
+            SchemaExprProfile::Default,
             default_state,
         )?;
 
@@ -505,14 +513,15 @@ impl Analyzer<'_, '_> {
         source: hir::SourceId,
         column: usize,
         kind: &str,
-        stored: Option<&crate::schema_expr::SchemaExpr>,
+        stored: Option<&ast::Expr>,
+        profile: SchemaExprProfile,
         state: hir::ColumnReadExpression,
     ) -> Result<Option<hir::Expr>> {
         match (stored, state) {
             (None, hir::ColumnReadExpression::Absent)
             | (Some(_), hir::ColumnReadExpression::Planned(_)) => Ok(None),
             (Some(stored), hir::ColumnReadExpression::NotRequired) => {
-                self.instantiate_column_schema_expr(stored, source, column)
+                self.instantiate_column_schema_syntax(stored, profile, source, column)
                     .map(Some)
             }
             (None, hir::ColumnReadExpression::NotRequired)
@@ -539,25 +548,19 @@ impl Analyzer<'_, '_> {
         let Table::BTree(table) = table else {
             return Ok(());
         };
-        let column_names = table
-            .columns()
-            .iter()
-            .map(|column| {
-                column.name.as_deref().ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "table '{}' has an unnamed column in CHECK constraint analysis",
-                        table.name
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
         let mut check_constraints = Vec::with_capacity(table.check_constraints.len());
         for check in &table.check_constraints {
             let description = match &check.name {
                 Some(name) => name.clone(),
-                None => check.expr.render(&column_names)?,
+                None => check.expr.to_string(),
             };
-            let expression = self.instantiate_table_schema_expr(&check.expr, source)?;
+            let expression = self.instantiate_table_schema_syntax(
+                &check.expr,
+                SchemaExprProfile::Check {
+                    strict_types: table.is_strict,
+                },
+                source,
+            )?;
             check_constraints.push(hir::CheckConstraint {
                 expression,
                 description,
@@ -566,7 +569,7 @@ impl Analyzer<'_, '_> {
         let definition = self.source_mut(source).ok_or_else(|| {
             LimboError::InternalError(format!("missing semantic source {source}"))
         })?;
-        definition.check_constraints = check_constraints;
+        definition.check_constraints = Some(check_constraints);
         Ok(())
     }
 
@@ -612,19 +615,6 @@ impl Analyzer<'_, '_> {
                         continue;
                     }
                 }
-                if matches!(&index_hint, hir::IndexHint::None)
-                    && (index.columns.iter().any(|column| {
-                        column
-                            .expr
-                            .as_deref()
-                            .is_some_and(|expression| expression.as_unresolved().is_some())
-                    }) || index
-                        .where_clause
-                        .as_deref()
-                        .is_some_and(|predicate| predicate.as_unresolved().is_some()))
-                {
-                    continue;
-                }
             }
 
             // Validate the complete index before instantiating any part. An
@@ -632,19 +622,9 @@ impl Analyzer<'_, '_> {
             let stored_columns = index
                 .columns
                 .iter()
-                .map(|column| {
-                    column
-                        .expr
-                        .as_deref()
-                        .map(|expr| expr.as_valid())
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let stored_predicate = index
-                .where_clause
-                .as_deref()
-                .map(|expr| expr.as_valid())
-                .transpose()?;
+                .map(|column| column.expr.as_deref())
+                .collect::<Vec<_>>();
+            let stored_predicate = index.where_clause.as_deref();
             let may_omit_invalid_pattern =
                 mode == IndexMetadataMode::Read && matches!(&index_hint, hir::IndexHint::None);
             let mut prior_requirements =
@@ -661,12 +641,24 @@ impl Analyzer<'_, '_> {
                 .into_iter()
                 .map(|expression| {
                     expression
-                        .map(|expression| self.instantiate_schema_expr(expression, source))
+                        .map(|expression| {
+                            self.instantiate_table_schema_syntax(
+                                expression,
+                                SchemaExprProfile::IndexKey,
+                                source,
+                            )
+                        })
                         .transpose()
                 })
                 .collect::<Result<Vec<_>>>()?;
             let predicate = stored_predicate
-                .map(|predicate| self.instantiate_schema_expr(predicate, source))
+                .map(|predicate| {
+                    self.instantiate_table_schema_syntax(
+                        predicate,
+                        SchemaExprProfile::PartialIndexPredicate,
+                        source,
+                    )
+                })
                 .transpose()?;
             let pattern_result = if let Some(index_method) = &index.index_method {
                 if !index.is_backing_btree_index() {
@@ -720,6 +712,15 @@ impl Analyzer<'_, '_> {
         })?;
         definition.index_expressions = index_expressions;
         definition.index_method_patterns = index_method_patterns;
+        if mode == IndexMetadataMode::Dml {
+            definition.index_coverage = hir::IndexCoverage::Complete {
+                indexes: definition
+                    .index_expressions
+                    .iter()
+                    .map(|expressions| expressions.index.id())
+                    .collect(),
+            };
+        }
         Ok(())
     }
 
@@ -894,7 +895,9 @@ impl Analyzer<'_, '_> {
         environment: QueryEnvironment,
     ) -> Result<hir::QueryId> {
         let query_id = self.reserve_query();
-        let environment = self.prepare_query_environment(environment, syntax.with.as_ref())?;
+        let parent = environment.query;
+        let mut environment = self.prepare_query_environment(environment, syntax.with.as_ref())?;
+        environment.query = Some(query_id);
 
         let first_id = hir::QueryBlockId::new(query_id, 0);
         // Lazy CTE resolution can recurse through many query blocks. Finish
@@ -909,6 +912,7 @@ impl Analyzer<'_, '_> {
             first,
             result_scope,
             environment,
+            parent,
         )
     }
 
@@ -920,6 +924,7 @@ impl Analyzer<'_, '_> {
         first: hir::QueryBlock,
         mut result_scope: Scope,
         environment: QueryEnvironment,
+        parent: Option<hir::QueryId>,
     ) -> Result<hir::QueryId> {
         let output_count = first.outputs.len();
         let output = first.outputs.iter().map(|output| output.id).collect();
@@ -974,11 +979,19 @@ impl Analyzer<'_, '_> {
             Some(&blocks[0]),
         )?;
         let limit = self.analyze_query_limit(syntax.limit.as_ref(), &environment)?;
+        for block in &mut blocks {
+            let (aggregate_count, window_function_count) =
+                self.query_block_function_counts(block.id);
+            block.aggregate_count = aggregate_count;
+            block.window_function_count = window_function_count;
+        }
         let reachable_ctes = self.collect_reachable_ctes(&blocks);
         self.insert_query(
             query_id,
             hir::Query {
                 id: query_id,
+                parent,
+                captures: Vec::new(),
                 reachable_ctes,
                 blocks,
                 first: first_id,
@@ -1053,8 +1066,11 @@ impl Analyzer<'_, '_> {
             if scope.window(definition.name.as_str()).is_some() {
                 continue;
             }
-            let spec =
-                self.analyze_window(&definition.window, &scope, query_policy(environment))?;
+            let spec = self.analyze_window(
+                &definition.window,
+                &scope,
+                query_block_policy(environment, block_id),
+            )?;
             scope.insert_window(definition.name.as_str(), spec.clone());
             windows.push(hir::NamedWindow {
                 name: crate::util::normalize_ident(definition.name.as_str()),
@@ -1066,7 +1082,7 @@ impl Analyzer<'_, '_> {
             columns,
             &scope,
             hir::OutputOwner::QueryBlock(block_id),
-            query_policy(environment),
+            query_block_policy(environment, block_id),
             environment.expected_output_types(),
         )?;
         scope.set_outputs(&outputs);
@@ -1078,13 +1094,14 @@ impl Analyzer<'_, '_> {
                     &scope,
                     ExprPolicy::source_then_output()
                         .with_raise(scope.allow_raise())
+                        .in_query_block(block_id)
                         .without_aggregate(),
                 )
             })
             .transpose()?;
         let grouping = group_by
             .as_ref()
-            .map(|grouping| self.analyze_grouping(grouping, &scope))
+            .map(|grouping| self.analyze_grouping(grouping, &scope, block_id))
             .transpose()?;
 
         Ok((
@@ -1092,6 +1109,8 @@ impl Analyzer<'_, '_> {
                 id: block_id,
                 from,
                 outputs,
+                aggregate_count: 0,
+                window_function_count: 0,
                 body: hir::QueryBlockBody::Select {
                     distinctness: *distinctness,
                     filter,
@@ -1143,7 +1162,7 @@ impl Analyzer<'_, '_> {
                 let expression = self.analyze_expr(
                     expression,
                     &scope,
-                    query_policy(environment).with_expected_type(expected),
+                    query_block_policy(environment, block_id).with_expected_type(expected),
                 )?;
                 if matches!(&expression, hir::Expr::Row(_)) {
                     crate::bail_parse_error!("row value misused");
@@ -1166,7 +1185,8 @@ impl Analyzer<'_, '_> {
                 let type_fact = hir::TypeFact::selected_value_result(&row_type_facts);
                 let affinity = self.expression_affinity(&expression, &scope);
                 let has_affinity = self.expression_has_affinity(&expression, &scope);
-                let collation = self.expression_collation(&expression, &scope);
+                let (collation, collation_is_explicit) =
+                    self.expression_collation_with_origin(&expression, &scope);
                 hir::Output {
                     id: hir::OutputId::query(block_id, index),
                     name: format!("column{}", index + 1),
@@ -1175,6 +1195,7 @@ impl Analyzer<'_, '_> {
                     affinity,
                     has_affinity,
                     collation,
+                    collation_is_explicit,
                     name_kind: hir::OutputNameKind::Inferred,
                 }
             })
@@ -1185,17 +1206,25 @@ impl Analyzer<'_, '_> {
                 id: block_id,
                 from: None,
                 outputs,
+                aggregate_count: 0,
+                window_function_count: 0,
                 body: hir::QueryBlockBody::Values { rows },
             },
             scope,
         ))
     }
 
-    fn analyze_grouping(&mut self, syntax: &ast::GroupBy, scope: &Scope) -> Result<hir::Grouping> {
+    fn analyze_grouping(
+        &mut self,
+        syntax: &ast::GroupBy,
+        scope: &Scope,
+        block_id: hir::QueryBlockId,
+    ) -> Result<hir::Grouping> {
         let key_scope = scope.without_outer();
         let mut keys = Vec::with_capacity(syntax.exprs.len());
         let key_policy = ExprPolicy::source_then_output()
             .with_raise(key_scope.allow_raise())
+            .in_query_block(block_id)
             .without_aggregate();
         for (index, expression) in syntax.exprs.iter().enumerate() {
             let clause = format!("{} GROUP BY", ordinal_name(index));
@@ -1206,6 +1235,14 @@ impl Analyzer<'_, '_> {
                 keys.push(self.analyze_expr(expression, &key_scope, key_policy.clone())?);
             }
         }
+        let key_type_facts = keys
+            .iter()
+            .map(|key| self.expression_type_fact(key, &key_scope))
+            .collect();
+        let key_collations = keys
+            .iter()
+            .map(|key| self.expression_collation_with_origin(key, &key_scope).0)
+            .collect();
         let having = syntax
             .having
             .as_deref()
@@ -1215,11 +1252,17 @@ impl Analyzer<'_, '_> {
                     scope,
                     ExprPolicy::output_then_source()
                         .with_raise(scope.allow_raise())
+                        .in_query_block(block_id)
                         .without_window(),
                 )
             })
             .transpose()?;
-        Ok(hir::Grouping { keys, having })
+        Ok(hir::Grouping {
+            keys,
+            key_type_facts,
+            key_collations,
+            having,
+        })
     }
 
     pub(super) fn analyze_query_order_by(
@@ -1249,21 +1292,21 @@ impl Analyzer<'_, '_> {
             {
                 expression
             } else {
-                self.analyze_expr(
-                    &term.expr,
-                    scope,
-                    ExprPolicy::output_then_source().with_raise(scope.allow_raise()),
-                )?
+                let policy = ExprPolicy::output_then_source().with_raise(scope.allow_raise());
+                let policy =
+                    query_block.map_or(policy.clone(), |block| policy.in_query_block(block.id));
+                self.analyze_expr(&term.expr, scope, policy)?
             };
             let ends_order = query_block
                 .map(|query_block| self.order_term_is_unique_rowid(&expression, query_block))
                 .transpose()?
                 .unwrap_or(false);
-            order.push(hir::OrderTerm {
-                expr: expression,
-                order: term.order.unwrap_or(ast::SortOrder::Asc),
-                nulls: term.nulls,
-            });
+            order.push(self.resolved_order_term(
+                expression,
+                term.order.unwrap_or(ast::SortOrder::Asc),
+                term.nulls,
+                scope,
+            ));
             if ends_order {
                 break;
             }
@@ -1360,10 +1403,47 @@ impl Analyzer<'_, '_> {
         for (index, term) in syntax.iter().enumerate() {
             let expression =
                 self.resolve_compound_order_by_expr(&term.expr, output_arms, first, index + 1)?;
+            let output = match &expression {
+                hir::Expr::Output(output) => first
+                    .iter()
+                    .find(|candidate| candidate.id == *output)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(
+                            "compound ORDER BY output is missing from the first arm".to_string(),
+                        )
+                    })?,
+                hir::Expr::Collate { expr, .. } => {
+                    let hir::Expr::Output(output) = expr.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "compound ORDER BY COLLATE does not wrap an output".to_string(),
+                        ));
+                    };
+                    first
+                        .iter()
+                        .find(|candidate| candidate.id == *output)
+                        .ok_or_else(|| {
+                            LimboError::InternalError(
+                                "compound ORDER BY output is missing from the first arm"
+                                    .to_string(),
+                            )
+                        })?
+                }
+                _ => {
+                    return Err(LimboError::InternalError(
+                        "compound ORDER BY did not resolve to an output".to_string(),
+                    ));
+                }
+            };
+            let collation = match &expression {
+                hir::Expr::Collate { collation, .. } => Some(collation.clone()),
+                _ => output.collation.clone(),
+            };
             order.push(hir::OrderTerm {
                 expr: expression,
                 order: term.order.unwrap_or(ast::SortOrder::Asc),
                 nulls: term.nulls,
+                type_fact: output.type_fact.clone(),
+                collation,
             });
         }
         Ok(order)
@@ -1463,11 +1543,13 @@ impl Analyzer<'_, '_> {
         syntax
             .iter()
             .map(|term| {
-                Ok(hir::OrderTerm {
-                    expr: self.analyze_expr(&term.expr, scope, policy.clone())?,
-                    order: term.order.unwrap_or(ast::SortOrder::Asc),
-                    nulls: term.nulls,
-                })
+                let expr = self.analyze_expr(&term.expr, scope, policy.clone())?;
+                Ok(self.resolved_order_term(
+                    expr,
+                    term.order.unwrap_or(ast::SortOrder::Asc),
+                    term.nulls,
+                    scope,
+                ))
             })
             .collect()
     }
@@ -1647,6 +1729,9 @@ impl Analyzer<'_, '_> {
                 };
                 self.require_source_columns_in_expr(&left.expr);
                 self.require_source_column(right, right_index);
+                let right_expr = hir::Expr::column(right, right_index);
+                let comparison =
+                    self.comparison_semantics(&left.expr, &right_expr, &complete_scope, false)?;
                 using_columns.push(hir::UsingColumn {
                     name,
                     left: Box::new(left.expr),
@@ -1659,6 +1744,7 @@ impl Analyzer<'_, '_> {
                     affinity,
                     has_affinity,
                     collation,
+                    comparison,
                 });
             }
 
@@ -1922,11 +2008,12 @@ impl Analyzer<'_, '_> {
                 generated_expressions: vec![hir::ColumnReadExpression::Absent; columns.len()],
                 default_expressions: vec![hir::ColumnReadExpression::Absent; columns.len()],
                 column_type_programs: vec![None; columns.len()],
-                check_constraints: Vec::new(),
+                check_constraints: None,
                 columns,
                 rowid_available: false,
                 index_hint: hir::IndexHint::None,
                 index_expressions: Vec::new(),
+                index_coverage: hir::IndexCoverage::Selective,
                 index_method_patterns: Vec::new(),
             },
         )?;
@@ -2019,7 +2106,8 @@ impl Analyzer<'_, '_> {
                     let type_fact = self.expression_type_fact(&expression, scope);
                     let affinity = self.expression_affinity(&expression, scope);
                     let has_affinity = self.expression_has_affinity(&expression, scope);
-                    let collation = self.expression_collation(&expression, scope);
+                    let (collation, collation_is_explicit) =
+                        self.expression_collation_with_origin(&expression, scope);
                     outputs.push(hir::Output {
                         id: hir::OutputId {
                             owner,
@@ -2031,6 +2119,7 @@ impl Analyzer<'_, '_> {
                         affinity,
                         has_affinity,
                         collation,
+                        collation_is_explicit,
                         name_kind: if alias.as_ref().is_some_and(ast::As::is_explicit) {
                             hir::OutputNameKind::ExplicitAlias
                         } else {
@@ -2056,6 +2145,7 @@ impl Analyzer<'_, '_> {
                             affinity,
                             has_affinity,
                             collation,
+                            collation_is_explicit: false,
                             name_kind: hir::OutputNameKind::StarExpansion,
                         });
                     }
@@ -2076,6 +2166,7 @@ impl Analyzer<'_, '_> {
                             affinity,
                             has_affinity,
                             collation,
+                            collation_is_explicit: false,
                             name_kind: hir::OutputNameKind::StarExpansion,
                         });
                     }
@@ -2198,6 +2289,10 @@ fn nested_query_environment(environment: &QueryEnvironment) -> QueryEnvironment 
 
 fn query_policy(environment: &QueryEnvironment) -> ExprPolicy {
     ExprPolicy::select().with_raise(environment.allow_raise)
+}
+
+fn query_block_policy(environment: &QueryEnvironment, block: hir::QueryBlockId) -> ExprPolicy {
+    query_policy(environment).in_query_block(block)
 }
 
 fn resolved_join_kind(operator: ast::JoinOperator) -> (hir::JoinKind, bool) {

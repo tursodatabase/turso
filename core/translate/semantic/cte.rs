@@ -687,6 +687,16 @@ impl Analyzer<'_, '_> {
                                 finalize_custom_operators,
                             )?;
                         }
+                        grouping.key_type_facts = grouping
+                            .keys
+                            .iter()
+                            .map(|key| self.expression_type_fact(key, &scope))
+                            .collect();
+                        grouping.key_collations = grouping
+                            .keys
+                            .iter()
+                            .map(|key| self.expression_collation_with_origin(key, &scope).0)
+                            .collect();
                         if let Some(having) = &mut grouping.having {
                             self.refresh_widened_expression(
                                 having,
@@ -1033,11 +1043,12 @@ impl Analyzer<'_, '_> {
                 generated_expressions: vec![hir::ColumnReadExpression::Absent; columns.len()],
                 default_expressions: vec![hir::ColumnReadExpression::Absent; columns.len()],
                 column_type_programs: vec![None; columns.len()],
-                check_constraints: Vec::new(),
+                check_constraints: None,
                 columns,
                 rowid_available: false,
                 index_hint: hir::IndexHint::None,
                 index_expressions: Vec::new(),
+                index_coverage: hir::IndexCoverage::Selective,
                 index_method_patterns: Vec::new(),
             },
         )?;
@@ -1084,11 +1095,12 @@ impl Analyzer<'_, '_> {
                 ],
                 default_expressions: vec![hir::ColumnReadExpression::Absent; source_columns.len()],
                 column_type_programs: vec![None; source_columns.len()],
-                check_constraints: Vec::new(),
+                check_constraints: None,
                 columns: source_columns,
                 rowid_available: false,
                 index_hint: hir::IndexHint::None,
                 index_expressions: Vec::new(),
+                index_coverage: hir::IndexCoverage::Selective,
                 index_method_patterns: Vec::new(),
             },
         )?;
@@ -1250,6 +1262,7 @@ fn collect_expression_subqueries(expression: &hir::Expr, queries: &mut Vec<hir::
             base,
             when_then,
             else_expr,
+            ..
         } => {
             if let Some(base) = base {
                 collect_expression_subqueries(base, queries);

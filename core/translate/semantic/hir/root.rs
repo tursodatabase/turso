@@ -1,10 +1,11 @@
 //! Resolved statement and trigger roots.
 
+use crate::{schema::ForeignKey, sync::Arc};
 use turso_parser::ast::{ResolveType, SortOrder};
 
 use super::{
     Expr, From, Limit, OrderTerm, Output, QueryId, ResolvedCollation, ResolvedIndex, ResolvedTable,
-    SourceId,
+    ResolvedTrigger, SourceId,
 };
 
 #[derive(Clone, Debug)]
@@ -47,6 +48,9 @@ pub struct Insert {
     pub excluded_source: Option<SourceId>,
     pub returning: Option<Returning>,
     pub trigger: Option<TriggerEnvironment>,
+    /// Exact schema and temp triggers that can fire for this write.
+    pub triggers: Vec<ResolvedTrigger>,
+    pub foreign_keys: DmlForeignKeys,
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +121,8 @@ pub struct Update {
     pub conflict: Option<ResolveType>,
     pub returning: Option<Returning>,
     pub trigger: Option<TriggerEnvironment>,
+    pub triggers: Vec<ResolvedTrigger>,
+    pub foreign_keys: DmlForeignKeys,
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +133,29 @@ pub struct Delete {
     pub limit: Option<Limit>,
     pub returning: Option<Returning>,
     pub trigger: Option<TriggerEnvironment>,
+    pub triggers: Vec<ResolvedTrigger>,
+    pub foreign_keys: DmlForeignKeys,
+}
+
+/// Foreign-key identities and positions frozen for one DML target.
+#[derive(Clone, Debug, Default)]
+pub struct DmlForeignKeys {
+    /// Constraints declared by the target, where it is the child table.
+    pub outgoing: Vec<ResolvedForeignKey>,
+    /// Constraints declared by other tables, where the target is the parent.
+    pub incoming: Vec<ResolvedForeignKey>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedForeignKey {
+    pub child_table: ResolvedTable,
+    pub parent_table: ResolvedTable,
+    pub declaration: Arc<ForeignKey>,
+    pub parent_columns: Box<[String]>,
+    pub child_positions: Box<[usize]>,
+    pub parent_positions: Box<[usize]>,
+    pub parent_uses_rowid: bool,
+    pub parent_unique_index: Option<ResolvedIndex>,
 }
 
 #[derive(Clone, Debug)]
