@@ -158,6 +158,9 @@ pub(crate) fn emit_root_insert_with_context(
         PhysicalRoot::Insert(insert) => *insert,
         _ => return Err(PhysicalInsertError::Unsupported("non-INSERT HIR root")),
     };
+    if let Table::Virtual(table) = target_table(plan, insert)?.value() {
+        return emit_virtual_insert(plan, program, inputs, insert, table.clone());
+    }
     let (source, table, database) = preflight_insert(plan, insert, triggers)?;
     let cdc = PreparedCdc::open(program, plan.document)?;
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
@@ -308,6 +311,115 @@ pub(crate) fn emit_root_insert_with_context(
         cdc.emit_autocommit_commit(program)?;
         cdc.close(program);
     }
+    Ok(())
+}
+
+fn target_table<'document>(
+    plan: &'document PhysicalPlan<'document>,
+    insert: &hir::Insert,
+) -> InsertResult<&'document hir::ResolvedTable> {
+    let physical = plan
+        .source(insert.target)
+        .ok_or(PhysicalInsertError::Invalid(
+            "physical target source is missing",
+        ))?;
+    let PhysicalSourceKind::CatalogTable { table, access } = &physical.kind else {
+        return Err(PhysicalInsertError::Invalid(
+            "target is not a catalog table",
+        ));
+    };
+    if !matches!(access, TableAccess::Scan) {
+        return Err(PhysicalInsertError::Unsupported("indexed target access"));
+    }
+    Ok(table)
+}
+
+fn emit_virtual_insert<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    inputs: &RootRuntimeInputs,
+    insert: &hir::Insert,
+    table: crate::sync::Arc<crate::VirtualTable>,
+) -> InsertResult<()> {
+    let source = plan
+        .document
+        .source(insert.target)
+        .ok_or(PhysicalInsertError::Invalid("target source is missing"))?;
+    let values = match &insert.source {
+        InsertSource::DefaultValues => &[][..],
+        // Match the old virtual-table path: VALUES is a single VUpdate call.
+        InsertSource::Values(rows) => rows
+            .last()
+            .map(Vec::as_slice)
+            .ok_or(PhysicalInsertError::Invalid("VALUES has no rows"))?,
+        InsertSource::Query(_) => {
+            return Err(PhysicalInsertError::Unsupported(
+                "virtual tables only support VALUES in INSERT",
+            ));
+        }
+    };
+    if !matches!(insert.source, InsertSource::DefaultValues) && values.len() != insert.columns.len()
+    {
+        return Err(PhysicalInsertError::Invalid(
+            "VALUES width does not match the target column list",
+        ));
+    }
+
+    #[cfg(feature = "cli_only")]
+    let is_dbpage = table.name == crate::dbpage::DBPAGE_TABLE_NAME;
+    #[cfg(not(feature = "cli_only"))]
+    let is_dbpage = false;
+    if table.readonly() && !is_dbpage {
+        return Err(
+            crate::LimboError::Constraint(format!("Table is read-only: {}", table.name)).into(),
+        );
+    }
+
+    let cursor = program.alloc_cursor_id(CursorType::VirtualTable(table));
+    let arguments = program.alloc_registers(source.columns.len() + 2);
+    let rowid = RegisterId(arguments + 1);
+    let logical = RegisterRange::new(arguments + 2, source.columns.len());
+    program.emit_insn(Insn::VOpen { cursor_id: cursor });
+    if !is_dbpage {
+        program.emit_insn(Insn::VBegin { cursor_id: cursor });
+    }
+    program.emit_insn(Insn::Null {
+        dest: arguments,
+        dest_end: Some(arguments + source.columns.len() + 1),
+    });
+
+    let mut bindings = RuntimeBindings::new(plan.document, plan.document.snapshot)?;
+    inputs.apply(&mut bindings)?;
+    bindings.bind_source(
+        insert.target,
+        SourceRuntime::Registers {
+            columns: logical,
+            rowid: Some(rowid),
+        },
+    )?;
+    for (target, value) in insert.columns.iter().zip(values) {
+        let result = emit_expression_for_dml(plan, program, &mut bindings, value)?;
+        if result.width != 1 {
+            return Err(PhysicalInsertError::Invalid("INSERT value is not scalar"));
+        }
+        if target.uses_value {
+            let destination = target_register(target.column, logical, rowid)?;
+            program.emit_insn(Insn::Copy {
+                src_reg: result.first.0,
+                dst_reg: destination.0,
+                extra_amount: 0,
+            });
+        }
+    }
+    emit_insert_defaults(plan, program, &mut bindings, insert, logical)?;
+
+    program.emit_insn(Insn::VUpdate {
+        cursor_id: cursor,
+        arg_count: source.columns.len() + 2,
+        start_reg: arguments,
+        conflict_action: insert.conflict.map_or(0, |conflict| conflict.bit_value()) as u16,
+    });
+    program.emit_insn(Insn::Close { cursor_id: cursor });
     Ok(())
 }
 
