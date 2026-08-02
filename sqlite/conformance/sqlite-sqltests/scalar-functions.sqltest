@@ -889,6 +889,9 @@ test round-subnormal-no-panic {
 expect {
     0.0
 }
+expect @js {
+    0
+}
 
 test length-text {
     SELECT length('limbo');
