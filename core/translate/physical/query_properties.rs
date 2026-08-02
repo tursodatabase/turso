@@ -3860,6 +3860,113 @@ fn a_first_outer_join_feeds_every_row_into_the_remaining_join_chain(tc: hegel::T
 }
 
 // Examples:
+// - `l JOIN p ON l.k = p.k FULL JOIN r ON p.k = r.k` null-extends both `l`
+//   and `p` when an `r` row has no match in the completed inner-join prefix.
+// - `l JOIN p JOIN q FULL JOIN r LEFT JOIN t` sends that unmatched `r` row
+//   through the later `t` join only after null-extending all three prefix tables.
+#[hegel::test]
+fn a_full_join_after_an_inner_prefix_preserves_the_prefix_as_one_left_side(tc: hegel::TestCase) {
+    let extra_prefix_table = tc.draw(generators::booleans());
+    let tail_is_left = tc.draw(generators::booleans());
+    let extra_output = if extra_prefix_table { ", q.k" } else { "" };
+    let extra_join = if extra_prefix_table {
+        "JOIN q ON p.k = q.k"
+    } else {
+        ""
+    };
+    let prefix_last = if extra_prefix_table { "q" } else { "p" };
+    let tail_keyword = if tail_is_left { "LEFT JOIN" } else { "JOIN" };
+    let mut schema = Schema::new();
+    for (sql, root_page) in [
+        ("CREATE TABLE l(k INTEGER)", 61),
+        ("CREATE TABLE p(k INTEGER)", 67),
+        ("CREATE TABLE q(k INTEGER)", 71),
+        ("CREATE TABLE r(k INTEGER)", 73),
+        ("CREATE TABLE t(k INTEGER)", 79),
+    ] {
+        let table = BTreeTable::from_sql(sql, root_page).expect("fixture table SQL is valid");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("fixture table name is unique");
+    }
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT l.k, p.k{extra_output}, r.k, t.k \
+         FROM l JOIN p ON l.k = p.k {extra_join} \
+         FULL JOIN r ON {prefix_last}.k = r.k \
+         {tail_keyword} t ON coalesce({prefix_last}.k, r.k) = t.k"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated inner-prefix FULL join has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let HirRoot::Query(root) = &document.root else {
+        panic!("the fixture is a query");
+    };
+    let query = &document.queries[root.query.index()];
+    let from = query.blocks[query.first.index]
+        .from
+        .as_ref()
+        .expect("join chain has FROM");
+    let mut expected_kinds = vec![crate::translate::semantic::hir::JoinKind::Inner];
+    if extra_prefix_table {
+        expected_kinds.push(crate::translate::semantic::hir::JoinKind::Inner);
+    }
+    expected_kinds.push(crate::translate::semantic::hir::JoinKind::Full);
+    expected_kinds.push(if tail_is_left {
+        crate::translate::semantic::hir::JoinKind::Left
+    } else {
+        crate::translate::semantic::hir::JoinKind::Inner
+    });
+    assert_eq!(
+        from.joins.iter().map(|join| join.kind).collect::<Vec<_>>(),
+        expected_kinds
+    );
+
+    let plan = PhysicalPlan::new(&document).expect("closed join HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("inner-prefix FULL join emits from HIR");
+    program
+        .resolve_labels()
+        .expect("all inner-prefix FULL join branches are closed");
+
+    let cursor_for_root = |root_page| {
+        program
+            .insns
+            .iter()
+            .find_map(|(instruction, _)| match instruction {
+                Insn::OpenRead {
+                    cursor_id,
+                    root_page: actual,
+                    ..
+                } if *actual == root_page => Some(*cursor_id),
+                _ => None,
+            })
+            .expect("participating table cursor is opened")
+    };
+    let is_nulled = |cursor| {
+        program.insns.iter().any(|(instruction, _)| {
+            matches!(instruction, Insn::NullRow { cursor_id } if *cursor_id == cursor)
+        })
+    };
+    assert!(is_nulled(cursor_for_root(61)));
+    assert!(is_nulled(cursor_for_root(67)));
+    if extra_prefix_table {
+        assert!(is_nulled(cursor_for_root(71)));
+    }
+    assert!(is_nulled(cursor_for_root(73)));
+    assert_eq!(is_nulled(cursor_for_root(79)), tail_is_left);
+    let output_width = if extra_prefix_table { 5 } else { 4 };
+    assert!(program.insns.iter().any(
+        |(instruction, _)| matches!(instruction, Insn::ResultRow { count, .. } if *count == output_width)
+    ));
+}
+
+// Examples:
 // - `SELECT (SELECT 7 UNION ALL SELECT 9)` returns the first compound row, so
 //   later arms must not overwrite the scalar result after an early jump.
 // - `SELECT EXISTS(SELECT 1 WHERE 0 UNION ALL SELECT 2 WHERE 1)` is true even
