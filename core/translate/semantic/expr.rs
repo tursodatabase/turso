@@ -1560,7 +1560,7 @@ impl Analyzer<'_, '_> {
             crate::bail_parse_error!("misuse of window function {}()", function_name);
         }
         if aggregate && !policy.allow_aggregate {
-            crate::bail_parse_error!("misuse of aggregate: {}()", function_name);
+            crate::bail_parse_error!("misuse of aggregate function {}()", function_name);
         }
         if window_only && tail.over_clause.is_none() {
             crate::bail_parse_error!("misuse of window function {}()", function_name);
@@ -1673,7 +1673,10 @@ impl Analyzer<'_, '_> {
             hir::FunctionEvaluation::Window(self.allocate_window_function_id(block))
         } else if aggregate {
             let block = policy.query_block.ok_or_else(|| {
-                LimboError::ParseError(format!("misuse of aggregate: {}()", function_name))
+                LimboError::ParseError(format!(
+                    "misuse of aggregate function {}()",
+                    function_name
+                ))
             })?;
             hir::FunctionEvaluation::Aggregate(self.allocate_aggregate_id(block))
         } else {
@@ -2494,7 +2497,7 @@ impl Analyzer<'_, '_> {
         }
         if !policy.allow_aggregate {
             if let Some(function) = features.aggregate {
-                crate::bail_parse_error!("misuse of aggregate: {}()", function);
+                crate::bail_parse_error!("misuse of aggregate function {}()", function);
             }
         }
         Ok(())
