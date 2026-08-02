@@ -13,7 +13,7 @@ use crate::{
     translate::semantic::hir::{self, ColumnReadExpression},
     vdbe::{
         builder::ProgramBuilder,
-        insn::{to_u32, Insn},
+        insn::{Insn, to_u32},
     },
 };
 
@@ -192,11 +192,21 @@ pub(crate) fn emit_new_row_constraints(
     source: hir::SourceId,
     table: &crate::sync::Arc<BTreeTable>,
     logical: RegisterRange,
-    conflict: ResolveType,
+    statement_conflict: Option<ResolveType>,
     skip_row: crate::vdbe::BranchOffset,
 ) -> RowResult<()> {
     for (position, column) in table.columns().iter().enumerate() {
         if column.notnull() && !column.is_rowid_alias() {
+            let conflict = statement_conflict
+                .or(column.notnull_conflict_clause)
+                .unwrap_or(ResolveType::Abort);
+            // REPLACE has already tried the frozen default. A NULL default
+            // falls back to ABORT, matching SQLite's constraint rule.
+            let conflict = if conflict == ResolveType::Replace {
+                ResolveType::Abort
+            } else {
+                conflict
+            };
             if conflict == ResolveType::Ignore {
                 program.emit_insn(Insn::IsNull {
                     reg: logical.first.0 + position,
@@ -226,7 +236,13 @@ pub(crate) fn emit_new_row_constraints(
             table_reference: table.clone(),
         });
     }
-    emit_check_constraints(program, bindings, source, conflict, skip_row)
+    emit_check_constraints(
+        program,
+        bindings,
+        source,
+        statement_conflict.unwrap_or(ResolveType::Abort),
+        skip_row,
+    )
 }
 
 /// Apply SQLite's REPLACE rule for NOT NULL columns before the ordinary row
@@ -238,9 +254,13 @@ pub(crate) fn emit_replace_not_null_defaults(
     defaults: &[hir::ResolvedDefault],
     table: &BTreeTable,
     logical: RegisterRange,
+    statement_conflict: Option<ResolveType>,
 ) -> RowResult<()> {
     for (position, column) in table.columns().iter().enumerate() {
-        if !column.notnull() || column.is_rowid_alias() {
+        let conflict = statement_conflict
+            .or(column.notnull_conflict_clause)
+            .unwrap_or(ResolveType::Abort);
+        if !column.notnull() || column.is_rowid_alias() || conflict != ResolveType::Replace {
             continue;
         }
         let present = program.allocate_label();

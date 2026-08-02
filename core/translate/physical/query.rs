@@ -25,7 +25,7 @@ use crate::{
     types::KeyInfo,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{HashDistinctData, IdxInsertFlags, InsertFlags, Insn, SortComparatorType, to_u32},
+        insn::{to_u32, HashDistinctData, IdxInsertFlags, InsertFlags, Insn, SortComparatorType},
     },
 };
 

@@ -6,7 +6,7 @@ use turso_parser::ast::{ResolveType, TriggerTime};
 
 use crate::{
     error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_FULL},
-    schema::{Table, SQLITE_SEQUENCE_TABLE_NAME},
+    schema::{SQLITE_SEQUENCE_TABLE_NAME, Table},
     translate::semantic::hir::{self, IndexCoverage, InsertSource, UpsertAction},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -15,15 +15,15 @@ use crate::{
 };
 
 use super::{
-    close_indexes, emit_complete_logical_row, emit_index_insert, emit_index_key,
-    emit_new_row_constraints, emit_query_for_dml, emit_replace_conflicting_row,
-    emit_replace_not_null_defaults, emit_replace_unique_check, emit_returning_result,
-    emit_returning_values, emit_stored_record, emit_trigger_programs, emit_unique_check,
-    open_indexes, record_from_registers, CdcChange, CursorId, ExpressionEmitter, OpenedIndex,
-    PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError, PhysicalPlan,
-    PhysicalQueryError, PhysicalRoot, PhysicalRowError, PhysicalSourceKind, PhysicalTriggerError,
-    PreparedCdc, PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs,
-    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess, TriggerRow, TriggerRows,
+    CdcChange, CursorId, ExpressionEmitter, OpenedIndex, PhysicalExpressionError,
+    PhysicalForeignKeyError, PhysicalIndexError, PhysicalPlan, PhysicalQueryError, PhysicalRoot,
+    PhysicalRowError, PhysicalSourceKind, PhysicalTriggerError, PreparedCdc, PreparedTriggers,
+    RegisterId, RegisterRange, RootRuntimeInputs, RuntimeBindingError, RuntimeBindings,
+    SourceRuntime, TableAccess, TriggerRow, TriggerRows, close_indexes, emit_complete_logical_row,
+    emit_index_insert, emit_index_key, emit_new_row_constraints, emit_query_for_dml,
+    emit_replace_conflicting_row, emit_replace_not_null_defaults, emit_replace_unique_check,
+    emit_returning_result, emit_returning_values, emit_stored_record, emit_trigger_programs,
+    emit_unique_check, open_indexes, record_from_registers,
 };
 
 #[derive(Debug)]
@@ -450,7 +450,6 @@ fn finish_insert_row(
     mut autoincrement: Option<&mut AutoincrementRuntime>,
     cdc: Option<PreparedCdc<'_>>,
 ) -> InsertResult<()> {
-    let statement_conflict = insert.conflict.unwrap_or(ResolveType::Abort);
     if let Some((position, _)) = table.get_rowid_alias_column().filter(|(position, _)| {
         insert
             .columns
@@ -518,21 +517,21 @@ fn finish_insert_row(
         trigger_rows,
         skip_row,
     )?;
-    if statement_conflict == ResolveType::Replace {
-        emit_replace_not_null_defaults(program, bindings, &insert.defaults, table, logical)?;
-    }
-    let row_conflict = if statement_conflict == ResolveType::Replace {
-        ResolveType::Abort
-    } else {
-        statement_conflict
-    };
+    emit_replace_not_null_defaults(
+        program,
+        bindings,
+        &insert.defaults,
+        table,
+        logical,
+        insert.conflict,
+    )?;
     emit_new_row_constraints(
         program,
         bindings,
         insert.target,
         table,
         logical,
-        row_conflict,
+        insert.conflict,
         skip_row,
     )?;
     let rowid_is_unique = program.allocate_label();
@@ -550,7 +549,12 @@ fn finish_insert_row(
             program, bindings, insert, upsert, table, cursor, logical, record, indexes, rowid,
             skip_row,
         )?;
-    } else if statement_conflict == ResolveType::Replace {
+    } else if insert
+        .conflict
+        .or(table.rowid_alias_conflict_clause)
+        .unwrap_or(ResolveType::Abort)
+        == ResolveType::Replace
+    {
         emit_replace_conflicting_row(
             program,
             bindings,
@@ -562,7 +566,12 @@ fn finish_insert_row(
             None,
             skip_row,
         )?;
-    } else if statement_conflict == ResolveType::Ignore {
+    } else if insert
+        .conflict
+        .or(table.rowid_alias_conflict_clause)
+        .unwrap_or(ResolveType::Abort)
+        == ResolveType::Ignore
+    {
         program.emit_insn(Insn::Goto {
             target_pc: skip_row,
         });
@@ -571,7 +580,10 @@ fn finish_insert_row(
             program,
             SQLITE_CONSTRAINT_PRIMARYKEY,
             format!("{}.{}", table.name, rowid_name),
-            statement_conflict,
+            insert
+                .conflict
+                .or(table.rowid_alias_conflict_clause)
+                .unwrap_or(ResolveType::Abort),
         );
     }
     program.preassign_label_to_next_insn(rowid_is_unique);
@@ -1047,20 +1059,6 @@ fn preflight_insert<'plan>(
     if !table.has_rowid {
         return Err(PhysicalInsertError::Unsupported("WITHOUT ROWID target"));
     }
-    if table
-        .columns()
-        .iter()
-        .any(|column| column.notnull_conflict_clause.is_some())
-    {
-        return Err(PhysicalInsertError::Unsupported(
-            "column NOT NULL conflict policy",
-        ));
-    }
-    if table.rowid_alias_conflict_clause.is_some() {
-        return Err(PhysicalInsertError::Unsupported(
-            "INTEGER PRIMARY KEY conflict policy",
-        ));
-    }
     Ok((source, table.clone(), database))
 }
 
@@ -1245,7 +1243,7 @@ fn emit_upsert_action(
         insert.target,
         table,
         updated,
-        ResolveType::Abort,
+        Some(ResolveType::Abort),
         skip_row,
     )?;
     let mut new_keys = Vec::with_capacity(indexes.len());

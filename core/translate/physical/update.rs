@@ -14,14 +14,14 @@ use crate::{
 };
 
 use super::{
-    close_indexes, emit_complete_logical_row, emit_index_delete, emit_index_insert, emit_index_key,
-    emit_new_row_constraints, emit_replace_not_null_defaults, emit_replace_unique_check,
-    emit_returning_result, emit_returning_values, emit_stored_record, emit_trigger_programs,
-    emit_unique_check, open_indexes, record_from_registers, update_record, CdcChange, CursorId,
-    ExpressionEmitter, PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError,
-    PhysicalPlan, PhysicalRoot, PhysicalRowError, PhysicalSourceKind, PhysicalTriggerError,
-    PreparedCdc, PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs,
-    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess, TriggerRow, TriggerRows,
+    CdcChange, CursorId, ExpressionEmitter, PhysicalExpressionError, PhysicalForeignKeyError,
+    PhysicalIndexError, PhysicalPlan, PhysicalRoot, PhysicalRowError, PhysicalSourceKind,
+    PhysicalTriggerError, PreparedCdc, PreparedTriggers, RegisterId, RegisterRange,
+    RootRuntimeInputs, RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
+    TriggerRow, TriggerRows, close_indexes, emit_complete_logical_row, emit_index_delete,
+    emit_index_insert, emit_index_key, emit_new_row_constraints, emit_replace_not_null_defaults,
+    emit_replace_unique_check, emit_returning_result, emit_returning_values, emit_stored_record,
+    emit_trigger_programs, emit_unique_check, open_indexes, record_from_registers, update_record,
 };
 
 #[derive(Debug)]
@@ -377,16 +377,21 @@ pub(crate) fn emit_root_update_with_context(
             rowid: Some(rowid),
         },
     )?;
-    if update.conflict == Some(ResolveType::Replace) {
-        emit_replace_not_null_defaults(program, &mut bindings, &update.defaults, &table, logical)?;
-    }
+    emit_replace_not_null_defaults(
+        program,
+        &mut bindings,
+        &update.defaults,
+        &table,
+        logical,
+        update.conflict,
+    )?;
     emit_new_row_constraints(
         program,
         &mut bindings,
         update.target,
         &table,
         logical,
-        update.conflict.unwrap_or(ResolveType::Abort),
+        update.conflict,
         write_next,
     )?;
     if !update.foreign_keys.outgoing.is_empty() {
@@ -645,15 +650,6 @@ fn preflight_update<'plan>(
     };
     if !table.has_rowid {
         return Err(PhysicalUpdateError::Unsupported("WITHOUT ROWID target"));
-    }
-    if table
-        .columns()
-        .iter()
-        .any(|column| column.notnull_conflict_clause.is_some())
-    {
-        return Err(PhysicalUpdateError::Unsupported(
-            "column NOT NULL conflict policy",
-        ));
     }
     Ok((source, table.clone(), database))
 }
