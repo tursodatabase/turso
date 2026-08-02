@@ -6,7 +6,7 @@ use turso_parser::ast::{ResolveType, TriggerTime};
 
 use crate::{
     error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_FULL},
-    schema::{SQLITE_SEQUENCE_TABLE_NAME, Table},
+    schema::{Table, SQLITE_SEQUENCE_TABLE_NAME},
     translate::semantic::hir::{self, IndexCoverage, InsertSource, UpsertAction},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -15,15 +15,15 @@ use crate::{
 };
 
 use super::{
-    CdcChange, CursorId, ExpressionEmitter, OpenedIndex, PhysicalExpressionError,
-    PhysicalForeignKeyError, PhysicalIndexError, PhysicalPlan, PhysicalQueryError, PhysicalRoot,
-    PhysicalRowError, PhysicalSourceKind, PhysicalTriggerError, PreparedCdc, PreparedTriggers,
-    RegisterId, RegisterRange, RootRuntimeInputs, RuntimeBindingError, RuntimeBindings,
-    SourceRuntime, TableAccess, TriggerRow, TriggerRows, close_indexes, emit_complete_logical_row,
-    emit_index_insert, emit_index_key, emit_new_row_constraints, emit_query_for_dml,
-    emit_replace_conflicting_row, emit_replace_not_null_defaults, emit_replace_unique_check,
-    emit_returning_result, emit_returning_values, emit_stored_record, emit_trigger_programs,
-    emit_unique_check, open_indexes, record_from_registers,
+    close_indexes, emit_complete_logical_row, emit_index_insert, emit_index_key,
+    emit_new_row_constraints, emit_query_for_dml, emit_replace_conflicting_row,
+    emit_replace_not_null_defaults, emit_replace_unique_check, emit_returning_result,
+    emit_returning_values, emit_stored_record, emit_trigger_programs, emit_unique_check,
+    open_indexes, record_from_registers, CdcChange, CursorId, ExpressionEmitter, OpenedIndex,
+    PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError, PhysicalPlan,
+    PhysicalQueryError, PhysicalRoot, PhysicalRowError, PhysicalSourceKind, PhysicalTriggerError,
+    PreparedCdc, PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs,
+    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess, TriggerRow, TriggerRows,
 };
 
 #[derive(Debug)]

@@ -64,6 +64,119 @@ pub(crate) fn emit_insert_parent_repairs(
     Ok(())
 }
 
+pub(crate) fn emit_update_child_checks(
+    program: &mut ProgramBuilder,
+    foreign_keys: &[ResolvedForeignKey],
+    child_table: &BTreeTable,
+    old_columns: RegisterRange,
+    new_columns: RegisterRange,
+    rowid: RegisterId,
+) -> ForeignKeyResult<()> {
+    for foreign_key in foreign_keys {
+        if foreign_key.declaration.deferred {
+            emit_old_child_repair(program, foreign_key, child_table, old_columns, rowid)?;
+        }
+        emit_new_child_check(program, foreign_key, child_table, new_columns, rowid)?;
+    }
+    Ok(())
+}
+
+fn emit_old_child_repair(
+    program: &mut ProgramBuilder,
+    foreign_key: &ResolvedForeignKey,
+    child_table: &BTreeTable,
+    columns: RegisterRange,
+    rowid: RegisterId,
+) -> ForeignKeyResult<()> {
+    let Table::BTree(parent_table) = foreign_key.parent_table.value() else {
+        return Err(PhysicalForeignKeyError::Unsupported(
+            "non-B-tree parent table",
+        ));
+    };
+    let database = foreign_key
+        .parent_table
+        .database()
+        .ok_or(PhysicalForeignKeyError::Invalid(
+            "parent table has no database identity",
+        ))?
+        .index();
+    let complete = program.allocate_label();
+    let missing = program.allocate_label();
+    let key = program.alloc_registers(foreign_key.child_positions.len());
+    for (offset, position) in foreign_key.child_positions.iter().copied().enumerate() {
+        let source = child_register(child_table, columns, rowid, position)?;
+        program.emit_insn(Insn::Copy {
+            src_reg: source,
+            dst_reg: key + offset,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::IsNull {
+            reg: key + offset,
+            target_pc: complete,
+        });
+    }
+    if foreign_key.parent_uses_rowid {
+        let cursor = open_parent_table(program, parent_table, database);
+        program.emit_insn(Insn::MustBeInt {
+            reg: key,
+            target_pc: Some(missing),
+        });
+        program.emit_insn(Insn::NotExists {
+            cursor,
+            rowid_reg: key,
+            target_pc: missing,
+        });
+        program.emit_insn(Insn::Close { cursor_id: cursor });
+        program.emit_insn(Insn::Goto {
+            target_pc: complete,
+        });
+        program.preassign_label_to_next_insn(missing);
+        program.emit_insn(Insn::Close { cursor_id: cursor });
+    } else {
+        let resolved_index =
+            foreign_key
+                .parent_unique_index
+                .as_ref()
+                .ok_or(PhysicalForeignKeyError::Invalid(
+                    "parent unique index is missing",
+                ))?;
+        let index = resolved_index.handle();
+        if let Some(count) = NonZeroUsize::new(index.columns.len()) {
+            program.emit_insn(Insn::Affinity {
+                start_reg: key,
+                count,
+                affinities: index_affinities(&index, parent_table),
+            });
+        }
+        let cursor = open_parent_index(program, index, database);
+        let found = program.allocate_label();
+        program.emit_insn(Insn::Found {
+            cursor_id: cursor,
+            target_pc: found,
+            record_reg: key,
+            num_regs: foreign_key.child_positions.len(),
+        });
+        program.emit_insn(Insn::Close { cursor_id: cursor });
+        program.emit_insn(Insn::Goto { target_pc: missing });
+        program.preassign_label_to_next_insn(found);
+        program.emit_insn(Insn::Close { cursor_id: cursor });
+        program.emit_insn(Insn::Goto {
+            target_pc: complete,
+        });
+        program.preassign_label_to_next_insn(missing);
+    }
+    program.emit_insn(Insn::FkIfZero {
+        deferred: true,
+        target_pc: complete,
+    });
+    program.emit_insn(Insn::FkCounter {
+        increment_value: -1,
+        deferred: true,
+    });
+    program.preassign_label_to_next_insn(complete);
+    Ok(())
+}
+
 fn emit_new_parent_repair(
     program: &mut ProgramBuilder,
     foreign_key: &ResolvedForeignKey,

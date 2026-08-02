@@ -109,6 +109,8 @@ operations are not SQL binding.
   - [x] UPDATE FROM evaluates predicates and assignments while target and FROM
         SourceIds are live, then materializes one stable value row per target
         rowid before the write phase.
+  - [x] UPDATE child-key changes remove deferred OLD violations and validate
+        the complete NEW row through frozen parent table/index identities.
   - [ ] Triggers and foreign keys.
 - [ ] INSERT, VALUES, INSERT SELECT, UPSERT, excluded, defaults, and RETURNING.
   - [x] VALUES and DEFAULT VALUES build supplied fields, frozen defaults, and

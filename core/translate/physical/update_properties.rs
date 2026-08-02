@@ -5,20 +5,19 @@ use turso_parser::{ast, parser::Parser};
 
 use super::*;
 use crate::{
+    QueryMode, SymbolTable,
     dialect::{Dialect, SqliteDialect},
     schema::{BTreeTable, Schema},
     sync::Arc,
     translate::semantic::{
-        analyze,
-        context::SemanticContext,
+        AnalyzeInput, analyze,
+        context::{DmlPolicy, SemanticContext},
         hir::{Expr, HirRoot, TargetColumn},
-        AnalyzeInput,
     },
     vdbe::{
         builder::{ProgramBuilder, ProgramBuilderOpts},
         insn::Insn,
     },
-    QueryMode, SymbolTable,
 };
 
 fn parse_statement(sql: &str) -> ast::Stmt {
@@ -34,6 +33,87 @@ fn parse_statement(sql: &str) -> ast::Stmt {
 
 fn program() -> ProgramBuilder {
     ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 32, 8))
+}
+
+// Examples: `UPDATE children SET c3 = 8` removes any deferred violation for
+// OLD c3, then checks NEW c3 against the frozen parent rowid; the immediate
+// form performs only the NEW probe. Varying both positions proves that OLD and
+// NEW row images use HIR offsets rather than rebinding the column names.
+#[hegel::test]
+fn update_child_foreign_keys_replace_old_counters_before_checking_new(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(10)));
+    let child_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let parent_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let deferred = tc.draw(generators::integers::<u8>().max_value(1)) == 1;
+    let parent_columns = (0..width)
+        .map(|position| {
+            if position == parent_position {
+                format!("p{position} INTEGER PRIMARY KEY")
+            } else {
+                format!("p{position} INTEGER")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let child_columns = (0..width)
+        .map(|position| {
+            if position == child_position {
+                format!(
+                    "c{position} INTEGER REFERENCES parents(p{parent_position}){}",
+                    if deferred {
+                        " DEFERRABLE INITIALLY DEFERRED"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                format!("c{position} INTEGER")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let parent = BTreeTable::from_sql(&format!("CREATE TABLE parents({parent_columns})"), 23)
+        .expect("parent table SQL is valid");
+    let child = BTreeTable::from_sql(&format!("CREATE TABLE children({child_columns})"), 29)
+        .expect("child table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(parent))
+        .expect("parents is unique");
+    schema
+        .add_btree_table(Arc::new(child))
+        .expect("children is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect)
+        .with_dml_policy(DmlPolicy::new(false, false, false, false, true));
+    let statement = parse_statement(&format!("UPDATE children SET c{child_position} = 8"));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated FK update has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed FK UPDATE has a physical plan");
+    let mut program = program();
+    emit_root_update(&plan, &mut program).expect("child FK UPDATE emits without a resolver");
+    program
+        .resolve_labels()
+        .expect("all FK UPDATE branches are closed");
+
+    let counters = program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::FkCounter {
+                increment_value,
+                deferred: actual,
+            } => Some((*increment_value, *actual)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(counters.contains(&(1, deferred)));
+    assert_eq!(counters.contains(&(-1, true)), deferred);
 }
 
 // Example: for `items(c0, c1, c2 AS (c0 + c1) VIRTUAL)`,
@@ -121,10 +201,12 @@ fn update_uses_a_stable_rowset_and_recomputes_the_hir_row(tc: hegel::TestCase) {
         2,
         "one addition evaluates the assignment and one recomputes c2"
     );
-    assert!(program
-        .insns
-        .iter()
-        .any(|(instruction, _)| matches!(instruction, Insn::MakeRecord { count: 2, .. })));
+    assert!(
+        program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::MakeRecord { count: 2, .. }))
+    );
 }
 
 // Examples:
@@ -229,8 +311,10 @@ fn update_from_materializes_hir_assignment_values_before_writing(tc: hegel::Test
         .expect("SET expression is evaluated");
     assert!(assignment < candidate_insert && candidate_insert < delete);
     assert!(delete < target_insert && target_insert < returning);
-    assert!(!program
-        .insns
-        .iter()
-        .any(|(instruction, _)| matches!(instruction, Insn::RowSetAdd { .. })));
+    assert!(
+        !program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::RowSetAdd { .. }))
+    );
 }

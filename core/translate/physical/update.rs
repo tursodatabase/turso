@@ -18,10 +18,10 @@ use super::{
     emit_new_row_constraints, emit_replace_not_null_defaults, emit_replace_unique_check,
     emit_returning_result, emit_returning_values, emit_stored_record, emit_trigger_programs,
     emit_unique_check, open_indexes, record_from_registers, update_record, CdcChange, CursorId,
-    ExpressionEmitter, PhysicalExpressionError, PhysicalIndexError, PhysicalPlan, PhysicalRoot,
-    PhysicalRowError, PhysicalSourceKind, PhysicalTriggerError, PreparedCdc, PreparedTriggers,
-    RegisterId, RegisterRange, RootRuntimeInputs, RuntimeBindingError, RuntimeBindings,
-    SourceRuntime, TableAccess, TriggerRow, TriggerRows,
+    ExpressionEmitter, PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError,
+    PhysicalPlan, PhysicalRoot, PhysicalRowError, PhysicalSourceKind, PhysicalTriggerError,
+    PreparedCdc, PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs,
+    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess, TriggerRow, TriggerRows,
 };
 
 #[derive(Debug)]
@@ -32,6 +32,7 @@ pub(crate) enum PhysicalUpdateError {
     Index(PhysicalIndexError),
     Query(super::PhysicalQueryError),
     Trigger(PhysicalTriggerError),
+    ForeignKey(PhysicalForeignKeyError),
     Cdc(crate::LimboError),
     Invalid(&'static str),
     Unsupported(&'static str),
@@ -46,6 +47,7 @@ impl fmt::Display for PhysicalUpdateError {
             Self::Index(error) => error.fmt(formatter),
             Self::Query(error) => error.fmt(formatter),
             Self::Trigger(error) => error.fmt(formatter),
+            Self::ForeignKey(error) => error.fmt(formatter),
             Self::Cdc(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical UPDATE: {message}"),
             Self::Unsupported(message) => {
@@ -90,6 +92,12 @@ impl From<super::PhysicalQueryError> for PhysicalUpdateError {
 impl From<PhysicalTriggerError> for PhysicalUpdateError {
     fn from(error: PhysicalTriggerError) -> Self {
         Self::Trigger(error)
+    }
+}
+
+impl From<PhysicalForeignKeyError> for PhysicalUpdateError {
+    fn from(error: PhysicalForeignKeyError) -> Self {
+        Self::ForeignKey(error)
     }
 }
 
@@ -145,6 +153,7 @@ pub(crate) fn emit_root_update_with_context(
         source.columns.len(),
     );
     let old_columns = (!update.triggers.is_empty()
+        || !update.foreign_keys.outgoing.is_empty()
         || cdc.is_some_and(|cdc| cdc.has_before() || cdc.has_updates()))
     .then(|| {
         RegisterRange::new(
@@ -379,6 +388,16 @@ pub(crate) fn emit_root_update_with_context(
         update.conflict.unwrap_or(ResolveType::Abort),
         write_next,
     )?;
+    if !update.foreign_keys.outgoing.is_empty() {
+        super::emit_update_child_checks(
+            program,
+            &update.foreign_keys.outgoing,
+            &table,
+            old_columns.expect("outgoing foreign keys require the frozen OLD row"),
+            logical,
+            rowid,
+        )?;
+    }
     let mut new_keys = Vec::with_capacity(indexes.len());
     for index in &indexes {
         let key = emit_index_key(program, &mut bindings, update.target, rowid, index, true)?;
@@ -533,8 +552,10 @@ fn preflight_update<'plan>(
             "resolved trigger has no prepared program",
         ));
     }
-    if !update.foreign_keys.outgoing.is_empty() || !update.foreign_keys.incoming.is_empty() {
-        return Err(PhysicalUpdateError::Unsupported("foreign-key checks"));
+    if !update.foreign_keys.incoming.is_empty() {
+        return Err(PhysicalUpdateError::Unsupported(
+            "parent-side foreign-key update checks and actions",
+        ));
     }
     if update
         .assignments
