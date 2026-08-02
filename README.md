@@ -4,7 +4,7 @@
 </p>
 
 <p align="center">
-  An in-process SQL database, compatible with SQLite.
+  An in-process SQL database, compatible with SQLite, and now with a Postgres frontend too.
 </p>
 
 <p align="center">
@@ -31,7 +31,13 @@
 
 ## About
 
-Turso Database is an in-process SQL database written in Rust, compatible with SQLite. It runs in production today at multiple organizations — see the [FAQ](#faq) for where the project stands on its way to 1.0.
+Turso is an in-process SQL database written in Rust, compatible with SQLite. It runs in production today at multiple organizations.
+
+Turso is also a virtual machine. Like SQLite, it compiles SQL into bytecode for that machine, the VDBE, and then runs the bytecode. That design is what lets one engine host more than one SQL dialect. SQLite is the first and primary frontend that compiles to it, and Postgres is now a frontend of its own, with its own dialect and wire protocol. More will follow. Our goal is to be for databases what LLVM is to compilers, with one modern and reliable core, and many frontends compiled down onto it.
+
+How general is that core? General enough to [run Doom](https://github.com/tursodatabase/turso-vdbe-doom-example) on it.
+
+See the [FAQ](#faq) for where the project stands on its way to 1.0.
 
 ## Features and Roadmap
 
@@ -53,6 +59,7 @@ Turso Database is an in-process SQL database written in Rust, compatible with SQ
 
 The database has the following experimental features:
 
+* **Postgres compatibility** for SQL dialect and wire protocol, see the see [compatibility reference](postgres/COMPAT.md) for details.
 * **Encryption at rest** for protecting the data locally.
 * **Incremental computation** using DBSP for incremental view maintenance and query subscriptions.
 * **Full-Text-Search** powered by the awesome [tantivy](https://github.com/quickwit-oss/tantivy) library
@@ -431,6 +438,14 @@ That said, we have not yet reached 1.0. The project is under active development,
 ### How compatible is Turso Database with SQLite?
 
 Turso is compatible with SQLite at the SQL dialect, file format, and C API levels, and existing SQLite database files work as-is. We are not at 100% yet, so some differences are still expected — [COMPAT.md](COMPAT.md) tracks the details — but the gap is closing quickly, and full compatibility is a requirement for 1.0.
+
+### Is Turso a SQLite database or a Postgres database?
+
+It is one engine with more than one SQL frontend. SQLite is the original and primary frontend, with its dialect, its file format, and its C API, and if that is what you use, nothing changes for you. Postgres is a newer and still experimental frontend that speaks the Postgres dialect and wire protocol. They share everything below the SQL: the storage, the concurrency, the query compiler, and the VM. Postgres is additive.
+
+### What do you mean by "the LLVM of databases"?
+
+Like SQLite, Turso compiles a query into bytecode for a virtual machine called the VDBE, and runs that bytecode. SQL is just one language that compiles to it. Our goal is to make that VM a general target, with one modern and rigorously tested core, and many database frontends compiled onto it: SQLite, Postgres, and others over time. LLVM did this for compilers, where a stable intermediate representation let many languages share one backend, and we think databases deserve the same. The bytecode is general enough to [run Doom](https://github.com/tursodatabase/turso-vdbe-doom-example), if you want proof.
 
 ### How is Turso Database different from Turso's libSQL?
 

@@ -126,7 +126,7 @@ pub struct PageInner {
     /// The actual page data buffer. None if not loaded.
     pub buffer: Option<Arc<Buffer>>,
     /// Overflow cells during btree operations
-    pub overflow_cells: Vec<OverflowCell>,
+    pub overflow_cells: crate::alloc::Vec<OverflowCell>,
 }
 
 // Methods moved from PageContent - these provide btree page access
@@ -139,7 +139,7 @@ impl PageInner {
             pin_count: AtomicUsize::new(0),
             wal_tag: AtomicU64::new(TAG_UNSET),
             buffer: Some(buffer),
-            overflow_cells: Vec::new(),
+            overflow_cells: crate::alloc::vec![],
         }
     }
 
@@ -151,7 +151,7 @@ impl PageInner {
             pin_count: AtomicUsize::new(0),
             wal_tag: AtomicU64::new(TAG_UNSET),
             buffer: Some(Arc::new(buffer)),
-            overflow_cells: Vec::new(),
+            overflow_cells: crate::alloc::vec![],
         }
     }
     /// Get the page buffer as a mutable slice. Panics if buffer not loaded.
@@ -443,14 +443,16 @@ impl PageInner {
         Ok(rowid as i64)
     }
 
-    /// Fast path for index cells: returns payload slice and overflow info without constructing BTreeCell.
+    /// Returns a cell's record payload and overflow info without constructing
+    /// a `BTreeCell`.
     ///
-    /// This bypasses the full `cell_get()` to `read_btree_cell()` path for binary search hot loops.
+    /// This bypasses the full `cell_get()` to `read_btree_cell()` path for
+    /// record reads and index binary-search hot loops.
     /// The returned slice is valid as long as the page is alive.
     ///
     /// Returns: (payload_slice, payload_size, first_overflow_page)
     #[inline(always)]
-    pub fn cell_index_read_payload_ptr(
+    pub fn cell_read_payload_ptr(
         &self,
         idx: usize,
         usable_size: usize,
@@ -461,21 +463,29 @@ impl PageInner {
         let cell_offset = self.read_u16(cell_pointer) as usize;
 
         let page_type = self.page_type()?;
-        let (payload_size, varint_len, header_skip) = match page_type {
+        let (payload_size, payload_start) = match page_type {
             PageType::IndexInterior => {
                 let (size, len) =
                     read_varint(crate::slice_in_bounds_or_corrupt!(buf, cell_offset + 4..))?;
-                (size, len, 4usize)
+                (size, cell_offset + 4 + len)
             }
             PageType::IndexLeaf => {
                 let (size, len) =
                     read_varint(crate::slice_in_bounds_or_corrupt!(buf, cell_offset..))?;
-                (size, len, 0usize)
+                (size, cell_offset + len)
             }
-            _ => unreachable!("cell_index_read_payload_ptr called on non-index page"),
+            PageType::TableLeaf => {
+                let (size, payload_size_len) =
+                    read_varint(crate::slice_in_bounds_or_corrupt!(buf, cell_offset..))?;
+                let rowid_start = cell_offset + payload_size_len;
+                let (_, rowid_len) =
+                    read_varint(crate::slice_in_bounds_or_corrupt!(buf, rowid_start..))?;
+                (size, rowid_start + rowid_len)
+            }
+            PageType::TableInterior => {
+                unreachable!("table interior cells do not contain record payloads")
+            }
         };
-
-        let payload_start = cell_offset + header_skip + varint_len;
 
         let max_local = payload_overflow_threshold_max(page_type, usable_size);
         let min_local = payload_overflow_threshold_min(page_type, usable_size);
@@ -750,7 +760,7 @@ impl Page {
                 pin_count: AtomicUsize::new(0),
                 wal_tag: AtomicU64::new(TAG_UNSET),
                 buffer: None,
-                overflow_cells: Vec::new(),
+                overflow_cells: crate::alloc::vec![],
             }),
         }
     }
@@ -2795,7 +2805,25 @@ impl Pager {
         // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
         // Rebuilding init_page_1 must not leak any stale 4 KiB page-1 image into the first write.
         self.dirty_pages.write().clear();
+
+        // Encryption can be configured before a fresh database chooses its page
+        // size, so keep the IO context aligned with the pager before the first
+        // page write.
+        self.reset_page_size_in_encryption_ctx(size);
         Ok(())
+    }
+
+    /// Update the encryption page size in the pager IO context and its WAL copy.
+    ///
+    /// This is a no-op when encryption is not configured.
+    fn reset_page_size_in_encryption_ctx(&self, size: PageSize) {
+        self.io_ctx.write().reset_page_size_in_encryption_ctx(size);
+        if !self.is_encryption_ctx_set() {
+            return;
+        }
+        if let Some(wal) = self.wal.as_ref() {
+            wal.set_io_context(self.io_ctx.read().clone());
+        }
     }
 
     /// Set the initial journal version in page 1 before the database is initialized.
@@ -3322,7 +3350,7 @@ impl Pager {
                 self.pending_reads.write().remove(&page_idx);
                 Ok(IOResult::Done((page, c_disk)))
             }
-            IOResult::IO(IOCompletions::Single(spill_c)) => {
+            IOResult::IO(IOCompletions(spill_c)) => {
                 // Leave the pending entry in place; the next call to
                 // `read_page_nonblock(page_idx)` will recover it and retry
                 // `cache_insert` without re-issuing the disk read.
@@ -3542,7 +3570,7 @@ impl Pager {
                     dirty_ids,
                     completion: completion.clone(),
                 },
-                IOCompletions::Single(completion),
+                IOCompletions(completion),
             )),
             None => {
                 // No async prep needed, go straight to finish
@@ -3552,7 +3580,7 @@ impl Pager {
                         dirty_ids,
                         completion: completion.clone(),
                     },
-                    IOCompletions::Single(completion),
+                    IOCompletions(completion),
                 ))
             }
         }
@@ -3572,7 +3600,7 @@ impl Pager {
                     dirty_ids,
                     completion: completion.clone(),
                 },
-                IOCompletions::Single(completion),
+                IOCompletions(completion),
             ));
         }
 
@@ -3582,7 +3610,7 @@ impl Pager {
                 dirty_ids,
                 completion: finish_completion.clone(),
             },
-            IOCompletions::Single(finish_completion),
+            IOCompletions(finish_completion),
         ))
     }
 
@@ -3599,7 +3627,7 @@ impl Pager {
                     dirty_ids,
                     completion: completion.clone(),
                 },
-                IOCompletions::Single(completion),
+                IOCompletions(completion),
             ));
         }
 
@@ -3649,7 +3677,7 @@ impl Pager {
                                 page,
                                 completion: completion.clone(),
                             },
-                            IOCompletions::Single(completion),
+                            IOCompletions(completion),
                         ));
                     }
 
@@ -3689,7 +3717,7 @@ impl Pager {
                     page,
                     completion: completion.clone(),
                 },
-                IOCompletions::Single(completion),
+                IOCompletions(completion),
             ));
         }
         trace!(
@@ -4952,6 +4980,14 @@ impl Pager {
     /// Invalidates entire page cache by removing all dirty and clean pages. Usually used in case
     /// of a rollback or in case we want to invalidate page cache after starting a read transaction
     /// right after new writes happened which would invalidate current page cache.
+    /// Test-only: evict clean, unpinned pages WITHOUT invalidating cursors, so we
+    /// can exercise what happens to a cursor that still holds a `PageRef` to an
+    /// evicted (buffer-taken) page — the exact hazard normal LRU eviction creates.
+    #[cfg(test)]
+    pub fn test_evict_all_unpinned_clean(&self) {
+        self.page_cache.write().test_evict_all_unpinned_clean();
+    }
+
     pub fn clear_page_cache(&self, clear_dirty: bool) {
         self.invalidate_all_cursors();
         let dirty_pages = self.dirty_pages.write();
@@ -6502,6 +6538,7 @@ mod checkpoint_phase_tests {
     use crate::sync::atomic::Ordering;
     use crate::types::IOResult;
     use crate::Database;
+    use crate::SqliteDialect;
 
     /// Returns an IO backend that supports shared WAL coordination on the host.
     /// On Windows the default `PlatformIO` (`WindowsIO`) lacks the byte-locking
@@ -6534,6 +6571,7 @@ mod checkpoint_phase_tests {
             crate::OpenFlags::default(),
             crate::DatabaseOpts::new().with_multiprocess_wal(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         (db, dir)

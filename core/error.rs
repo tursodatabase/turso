@@ -103,6 +103,12 @@ pub enum LimboError {
     InvalidColumnType,
     #[error("Invalid blob size, expected {0}")]
     InvalidBlobSize(usize),
+    /// An incremental-blob handle was invalidated because the row it points to
+    /// (or its table) was modified after the handle was opened. Mirrors SQLite's
+    /// expired blob handles: every subsequent read/write must fail with
+    /// SQLITE_ABORT until the handle is closed.
+    #[error("Runtime error: blob handle expired")]
+    BlobHandleExpired,
     #[error("Planning error: {0}")]
     PlanningError(String),
     #[error("Checkpoint failed: {0}")]

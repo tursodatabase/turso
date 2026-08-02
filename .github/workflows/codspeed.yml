@@ -38,7 +38,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: ./.github/actions/setup-rust-toolchain
+        with:
+          toolchain: "1.88.0"
 
       - name: Resolve benchmark shards
         id: benchmarks
@@ -75,7 +77,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: ./.github/actions/setup-rust-toolchain
         with:
           toolchain: ${{ env.TOOLCHAIN_VERSION }}
 
@@ -143,7 +145,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: ./.github/actions/setup-rust-toolchain
         with:
           toolchain: ${{ env.TOOLCHAIN_VERSION }}
 
@@ -216,7 +218,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: ./.github/actions/setup-rust-toolchain
         with:
           toolchain: ${{ env.TOOLCHAIN_VERSION }}
 
@@ -271,7 +273,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: ./.github/actions/setup-rust-toolchain
         with:
           toolchain: ${{ env.TOOLCHAIN_VERSION }}
 

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use turso_core::SqliteDialect;
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
@@ -39,7 +40,7 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, TPC_H_PATH).unwrap();
+    let db = Database::open_file(io, TPC_H_PATH, Arc::new(SqliteDialect)).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let queries = [

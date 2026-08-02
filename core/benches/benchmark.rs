@@ -2,6 +2,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 #[cfg(not(feature = "codspeed"))]
 use pprof::criterion::{Output, PProfProfiler};
+use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{
@@ -83,7 +84,12 @@ fn bench_open(criterion: &mut Criterion) {
     if !std::fs::exists("../testing/system/schema_5k.db").unwrap() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
+        let db = Database::open_file(
+            io,
+            "../testing/system/schema_5k.db",
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
 
         for i in 0..5000 {
@@ -99,7 +105,12 @@ fn bench_open(criterion: &mut Criterion) {
         b.iter(|| {
             #[allow(clippy::arc_with_non_send_sync)]
             let io = Arc::new(PlatformIO::new().unwrap());
-            let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
+            let db = Database::open_file(
+                io,
+                "../testing/system/schema_5k.db",
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
             let conn = db.connect().unwrap();
             conn.execute("SELECT * FROM table_0").unwrap();
         });
@@ -126,7 +137,12 @@ fn bench_alter(criterion: &mut Criterion) {
     if !std::fs::exists("../testing/system/schema_5k.db").unwrap() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
+        let db = Database::open_file(
+            io,
+            "../testing/system/schema_5k.db",
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
 
         for i in 0..5000 {
@@ -141,7 +157,12 @@ fn bench_alter(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo_rename_table", ""), |b| {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
+        let db = Database::open_file(
+            io,
+            "../testing/system/schema_5k.db",
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
         iter_custom_or_iter!(b, |iters| {
             (0..iters)
@@ -186,7 +207,12 @@ fn bench_alter(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo_rename_column", ""), |b| {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
+        let db = Database::open_file(
+            io,
+            "../testing/system/schema_5k.db",
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
         iter_custom_or_iter!(b, |iters| {
             (0..iters)
@@ -232,7 +258,12 @@ fn bench_alter(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo_add_column", ""), |b| {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
+        let db = Database::open_file(
+            io,
+            "../testing/system/schema_5k.db",
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
         iter_custom_or_iter!(b, |iters| {
             (0..iters)
@@ -277,7 +308,12 @@ fn bench_alter(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo_drop_column", ""), |b| {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
+        let db = Database::open_file(
+            io,
+            "../testing/system/schema_5k.db",
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
         iter_custom_or_iter!(b, |iters| {
             (0..iters)
@@ -326,7 +362,8 @@ fn bench_prepare_query(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, "../testing/system/testing.db").unwrap();
+    let db =
+        Database::open_file(io, "../testing/system/testing.db", Arc::new(SqliteDialect)).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let queries = [
@@ -409,7 +446,8 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, "../testing/system/testing.db").unwrap();
+    let db =
+        Database::open_file(io, "../testing/system/testing.db", Arc::new(SqliteDialect)).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT * FROM users LIMIT ?`");
@@ -478,7 +516,8 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, "../testing/system/testing.db").unwrap();
+    let db =
+        Database::open_file(io, "../testing/system/testing.db", Arc::new(SqliteDialect)).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT 1`");
@@ -531,7 +570,8 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, "../testing/system/testing.db").unwrap();
+    let db =
+        Database::open_file(io, "../testing/system/testing.db", Arc::new(SqliteDialect)).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT count() FROM users`");
@@ -577,6 +617,71 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
 }
 
 #[turso_macros::codspeed_criterion_benchmark]
+fn bench_execute_group_by(criterion: &mut Criterion) {
+    // https://github.com/tursodatabase/turso/issues/174
+    // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
+    let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
+
+    // Low-cardinality GROUP BY over an unindexed column: the sort is NOT elided,
+    // so this exercises the full sorter path (SorterInsert / SorterSort /
+    // SorterData) and reads every grouped row's columns back through the pseudo
+    // cursor -- the code path the other execute benchmarks (point scans, indexed
+    // COUNT) never touch. `state` is unindexed and `age`/`last_name` feed the
+    // aggregates, so all three aggregate arguments come from the sorter output.
+    const QUERY: &str =
+        "SELECT state, COUNT(*), MAX(last_name), SUM(age) FROM users GROUP BY state";
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db =
+        Database::open_file(io, "../testing/system/testing.db", Arc::new(SqliteDialect)).unwrap();
+    let limbo_conn = db.connect().unwrap();
+
+    let mut group = criterion.benchmark_group(
+        "Execute `SELECT state, COUNT(*), MAX(last_name), SUM(age) GROUP BY state`",
+    );
+
+    group.bench_function("limbo_execute_group_by", |b| {
+        let mut stmt = limbo_conn.prepare(QUERY).unwrap();
+        b.iter(|| {
+            loop {
+                match stmt.step().unwrap() {
+                    turso_core::StepResult::Row => {
+                        black_box(stmt.row());
+                    }
+                    turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                        db.io.step().unwrap();
+                    }
+                    turso_core::StepResult::Done => {
+                        break;
+                    }
+                    turso_core::StepResult::Interrupt | turso_core::StepResult::Busy => {
+                        unreachable!();
+                    }
+                }
+            }
+            stmt.reset().unwrap();
+        });
+    });
+
+    if enable_rusqlite {
+        let sqlite_conn = rusqlite_open();
+
+        group.bench_function("sqlite_execute_group_by", |b| {
+            let mut stmt = sqlite_conn.prepare(QUERY).unwrap();
+            b.iter(|| {
+                let mut rows = stmt.raw_query();
+                while let Some(row) = rows.next().unwrap() {
+                    black_box(row);
+                }
+            });
+        });
+    }
+
+    group.finish();
+}
+
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_insert_rows(criterion: &mut Criterion) {
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
@@ -593,7 +698,12 @@ fn bench_insert_rows(criterion: &mut Criterion) {
 
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), db_path.to_str().unwrap()).unwrap();
+        let db = Database::open_file(
+            io.clone(),
+            db_path.to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let limbo_conn = db.connect().unwrap();
         if disable_checkpoint {
             limbo_conn.wal_auto_actions_disable();
@@ -657,7 +767,12 @@ fn bench_insert_rows(criterion: &mut Criterion) {
 
         #[allow(clippy::arc_with_non_send_sync)]
         let mvcc_io = Arc::new(PlatformIO::new().unwrap());
-        let mvcc_db = Database::open_file(mvcc_io.clone(), mvcc_db_path.to_str().unwrap()).unwrap();
+        let mvcc_db = Database::open_file(
+            mvcc_io.clone(),
+            mvcc_db_path.to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let mvcc_conn = mvcc_db.connect().unwrap();
         mvcc_conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         if disable_checkpoint {
@@ -792,7 +907,7 @@ fn bench_limbo(
     let io = Arc::new(PlatformIO::new().unwrap());
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("bench.db");
-    let db = Database::open_file(io, path.to_str().unwrap()).unwrap();
+    let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
     let mut connecitons = Vec::new();
     {
         let conn = db.connect().unwrap();
@@ -878,7 +993,7 @@ fn bench_limbo_mvcc(
     let io = Arc::new(PlatformIO::new().unwrap());
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("bench.db");
-    let db = Database::open_file(io, path.to_str().unwrap()).unwrap();
+    let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
     let mut connecitons = Vec::new();
     let conn0 = db.connect().unwrap();
     if mvcc {
@@ -1064,7 +1179,12 @@ fn bench_insert_randomblob(criterion: &mut Criterion) {
 
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), db_path.to_str().unwrap()).unwrap();
+        let db = Database::open_file(
+            io.clone(),
+            db_path.to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let limbo_conn = db.connect().unwrap();
 
         let mut stmt = limbo_conn.query("CREATE TABLE test(x)").unwrap().unwrap();
@@ -1136,14 +1256,14 @@ fn bench_insert_randomblob(criterion: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_insert_rows, bench_concurrent_writes, bench_insert_randomblob
+    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_execute_group_by, bench_insert_rows, bench_concurrent_writes, bench_insert_randomblob
 }
 
 #[cfg(feature = "codspeed")]
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_insert_rows, bench_concurrent_writes, bench_insert_randomblob
+    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_execute_group_by, bench_insert_rows, bench_concurrent_writes, bench_insert_randomblob
 }
 
 criterion_main!(benches);

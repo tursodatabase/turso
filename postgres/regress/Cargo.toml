@@ -1,0 +1,20 @@
+[package]
+name = "turso_pg_regress"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Runner for upstream PostgreSQL regression tests against a PostgreSQL wire-protocol endpoint"
+
+[[bin]]
+name = "pgregress"
+path = "main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+similar.workspace = true
+
+[lints]
+workspace = true

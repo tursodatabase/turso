@@ -1,8 +1,10 @@
 use crate::{
+    alloc::TursoTryWithCapacityExt,
     vector::vector_types::{Vector, VectorType},
-    LimboError, Result,
+    LimboError, Result, ValueBlob,
 };
 
+#[turso_macros::allocation_site(crate::alloc::VectorAllocationSite::Concat)]
 pub fn vector_concat(v1: &Vector, v2: &Vector) -> Result<Vector<'static>> {
     if v1.vector_type != v2.vector_type {
         return Err(LimboError::ConversionError(
@@ -12,13 +14,17 @@ pub fn vector_concat(v1: &Vector, v2: &Vector) -> Result<Vector<'static>> {
 
     let data = match v1.vector_type {
         VectorType::Float32Dense | VectorType::Float64Dense => {
-            let mut data = Vec::with_capacity(v1.bin_len() + v2.bin_len());
+            let mut data = <ValueBlob as TursoTryWithCapacityExt>::try_with_capacity_ext(
+                v1.bin_len() + v2.bin_len(),
+            )?;
             data.extend_from_slice(v1.bin_data());
             data.extend_from_slice(v2.bin_data());
             data
         }
         VectorType::Float32Sparse => {
-            let mut data = Vec::with_capacity(v1.bin_len() + v2.bin_len());
+            let mut data = <ValueBlob as TursoTryWithCapacityExt>::try_with_capacity_ext(
+                v1.bin_len() + v2.bin_len(),
+            )?;
             data.extend_from_slice(&v1.bin_data()[..v1.bin_len() / 2]);
             data.extend_from_slice(&v2.bin_data()[..v2.bin_len() / 2]);
             data.extend_from_slice(&v1.bin_data()[v1.bin_len() / 2..]);
@@ -48,7 +54,7 @@ mod tests {
     };
 
     fn float32_vec_from(slice: &[f32]) -> Vector<'static> {
-        let mut data = Vec::new();
+        let mut data = crate::alloc::vec![];
         for &v in slice {
             data.extend_from_slice(&v.to_le_bytes());
         }

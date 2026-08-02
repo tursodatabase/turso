@@ -790,6 +790,13 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                                 sql_logger.log(&thread, "PRAGMA integrity_check", "ERROR: no rows");
                                 turso_macros::turso_assert_unreachable!("integrity check returned no rows", { "thread": thread });
                             }
+                            Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => {
+                                sql_logger.log(
+                                    &thread,
+                                    "PRAGMA integrity_check",
+                                    "SKIPPED: database busy",
+                                );
+                            }
                             Err(e) => {
                                 sql_logger.log(
                                     &thread,

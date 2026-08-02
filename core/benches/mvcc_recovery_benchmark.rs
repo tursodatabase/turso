@@ -5,6 +5,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 #[cfg(not(feature = "codspeed"))]
 use std::time::Duration;
+use turso_core::SqliteDialect;
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -35,6 +36,7 @@ impl RecoveryFixture {
             OpenFlags::default(),
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         black_box(&db);
@@ -57,6 +59,7 @@ fn build_mvcc_db_with_log(populate: impl FnOnce(&Arc<turso_core::Connection>)) -
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db.connect().unwrap();

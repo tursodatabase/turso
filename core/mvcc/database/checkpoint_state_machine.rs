@@ -115,6 +115,7 @@ pub(crate) enum CheckpointYieldPoint {
     BeforeAcquireLock,
     AfterDurableBoundaryAdvanced,
     AfterCollectTableRows,
+    BeforePagerCommit,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -161,7 +162,7 @@ pub struct LockStates {
 /// 6. Immediately does a TRUNCATE checkpoint from the WAL to the DB
 /// 7. Fsync the DB file
 /// 8. Truncate logical log to 0 (salt regenerated in memory), fsync, then truncate WAL
-/// 9. Releases the blocking_checkpoint_lock
+/// 9. Calls `on_checkpoint_end`, then releases checkpoint locks
 ///
 /// Passive mode defers step 1 until publish and runs collection/write concurrently; the durable
 /// outcome (WAL backfill, log truncate, metadata) is the same.
@@ -251,6 +252,13 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     owns_checkpoint_in_progress: bool,
     /// Roots allocated this checkpoint; published with `visible_from = durable_txid_max_new`.
     staged_roots: Vec<MVTableId>,
+    /// Positive roots materialized this pass whose schema version was already ended
+    /// (e.g. DROP after our snapshot). Tracked in `dropped_root_pages` until a later
+    /// checkpoint frees the btree.
+    ended_created_roots: HashSet<i64>,
+    /// Positive roots whose btrees were destroyed in this checkpoint's pager write.
+    /// Only these may be removed from `dropped_root_pages` at publish.
+    freed_root_pages: HashSet<i64>,
 }
 
 /// One pending compaction job in the per-checkpoint sequence sweep.
@@ -399,6 +407,11 @@ pub struct SqliteSchemaBtreeIdentity {
 /// Identity of a sqlite_schema row version that refers to a B-tree-backed object.
 /// Schema rewrites that preserve this identity are metadata-only and should not be
 /// treated as create/drop lifecycle changes.
+#[aristo::intent(
+    "Recovery never replays a sqlite_schema delete as an empty payload; it keeps the row's pre-delete record, so every recovered schema row still has a decodable (type, rootpage)",
+    id = "mvcc_recovered_schema_record_wellformed",
+    verify = "full"
+)]
 pub fn sqlite_schema_btree_identity(version: &RowVersion) -> Option<SqliteSchemaBtreeIdentity> {
     if version.row.id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
         return None;
@@ -822,6 +835,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             local_schema: None,
             owns_checkpoint_in_progress: false,
             staged_roots: crate::alloc::vec![],
+            ended_created_roots: HashSet::default(),
+            freed_root_pages: HashSet::default(),
         }
     }
 
@@ -836,6 +851,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             self.durable_txid_max_old.map(u64::from),
             self.durable_txid_max_new,
         )
+    }
+
+    /// Drop checkpoint locks. Call only after `on_checkpoint_end`.
+    fn release_checkpoint_locks_if_needed(&mut self) {
+        if self.lock_states.blocking_checkpoint_lock_held {
+            tracing::debug!("Releasing blocking checkpoint lock");
+            self.checkpoint_lock.unlock();
+            self.lock_states.blocking_checkpoint_lock_held = false;
+        }
+        if self.owns_checkpoint_in_progress {
+            self.mvstore
+                .checkpoint_in_progress
+                .store(false, Ordering::Release);
+            self.owns_checkpoint_in_progress = false;
+        }
     }
 
     /// Cleanup path for I/O errors that happen while waiting on completions outside
@@ -874,18 +904,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             wal.abort_checkpoint();
         }
 
-        // Release the checkpoint lock only after checkpoint state has been reset.
-        if self.lock_states.blocking_checkpoint_lock_held {
-            self.checkpoint_lock.unlock();
-            self.lock_states.blocking_checkpoint_lock_held = false;
-        }
-        // Release the single-orchestrator gate so a future checkpoint can run.
-        if self.owns_checkpoint_in_progress {
-            self.mvstore
-                .checkpoint_in_progress
-                .store(false, Ordering::Release);
-            self.owns_checkpoint_in_progress = false;
-        }
+        self.release_checkpoint_locks_if_needed();
 
         result
     }
@@ -1270,7 +1289,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
             processed += 1;
             if processed >= COLLECT_PREEMPTION_THRESHOLD {
-                return Ok(Some(IOCompletions::Single(Completion::new_yield())));
+                return Ok(Some(IOCompletions(Completion::new_yield())));
             }
         }
         // Writing in ascending order of rowid gives us a better chance of using balance-quick algorithm
@@ -1339,7 +1358,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
                 processed += 1;
                 if processed >= COLLECT_PREEMPTION_THRESHOLD {
-                    return Ok(Some(IOCompletions::Single(Completion::new_yield())));
+                    return Ok(Some(IOCompletions(Completion::new_yield())));
                 }
             }
             self.collect_index_tableid_cursor = Some(index_id);
@@ -1430,12 +1449,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     }
 
     fn truncate_logical_log(&self) -> Result<Completion> {
+        use crate::mvcc::persistent_storage::LogicalLogTruncateOutcome;
         let boundary = if self.mode.should_restart_log() {
             u64::MAX
         } else {
             self.durable_txid_max_new
         };
-        self.mvstore.storage.truncate(boundary)
+        let (c, outcome) = self.mvstore.storage.truncate(boundary)?;
+        if self.mode.should_restart_log() {
+            turso_assert!(
+                matches!(outcome, LogicalLogTruncateOutcome::Truncated),
+                "TRUNCATE checkpoint must clear the logical log"
+            );
+        }
+        Ok(c)
     }
 
     /// Perform a TRUNCATE checkpoint on the WAL
@@ -1501,19 +1528,34 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 .get(&key)
                 .expect("sqlite_schema row not found");
             let mut row_versions = sqlite_schema_row.value().write();
-            // Replace in place (same version id), don't append: a duplicate (id, begin, end)
-            // would leave a phantom current version after a later DELETE (which ends only the
-            // first match), causing spurious write-write conflicts at commit time.
+            // Patch payload in place (same version id), don't append: a duplicate
+            // (id, begin, end) would leave a phantom current version after a later
+            // DELETE (which ends only the first match), causing spurious write-write
+            // conflicts at commit time.
+            //
+            // Only replace the row payload (positive rootpage). Preserve begin/end so a
+            // DROP that committed after our snapshot keeps its end stamp — wholesale
+            // replace of the collected clone would resurrect the table (#7956).
             let vid = row_version.id;
             if let Some(existing) = row_versions.iter_mut().find(|rv| rv.id == vid) {
-                *existing = row_version;
+                existing.row.data = row_version.row.data;
+                if existing.end().is_some() {
+                    if let Some(identity) = sqlite_schema_btree_identity(existing) {
+                        if identity.root_page > 0 {
+                            self.ended_created_roots.insert(identity.root_page);
+                        }
+                    }
+                }
             } else {
                 self.mvstore
                     .insert_version_raw(&mut row_versions, row_version)?;
             }
         }
 
-        if !self.has_unpublished_schema_changes() {
+        if !self.has_unpublished_schema_changes()
+            && self.ended_created_roots.is_empty()
+            && self.freed_root_pages.is_empty()
+        {
             return Ok(());
         }
 
@@ -1571,9 +1613,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
         }
 
-        // Clear dropped root pages now that the pager commit contains the btree frees.
-        // integrity_check should now follow the committed freelist state instead.
-        schema.dropped_root_pages.clear();
+        // Only forget roots whose btrees this checkpoint actually freed. A concurrent
+        // DROP after our snapshot may have added roots we did not destroy (#7957).
+        for root in std::mem::take(&mut self.freed_root_pages) {
+            schema.dropped_root_pages.remove(&root);
+        }
+        // Roots we materialized whose schema versions were already ended are still
+        // allocated and must stay accounted for until a later destroy (#7956).
+        schema
+            .dropped_root_pages
+            .extend(std::mem::take(&mut self.ended_created_roots));
         drop(schema_ref);
         *self.connection.schema.write() = self.connection.db.clone_schema();
         self.connection.bump_prepare_context_generation();
@@ -1755,7 +1804,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             };
             *next_index = index;
 
-            Some(IOCompletions::Single(Completion::new_yield()))
+            Some(IOCompletions(Completion::new_yield()))
         } else {
             None
         }
@@ -1822,7 +1871,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 unreachable!("gc_checkpointed_index_versions runs only in GcIndexRows");
             };
             *next_index = index;
-            Some(IOCompletions::Single(Completion::new_yield()))
+            Some(IOCompletions(Completion::new_yield()))
         } else {
             None
         }
@@ -2189,6 +2238,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             // Evict stale cursor.
                             self.cursors.remove(&root_page);
                             self.destroyed_tables.insert(table_id);
+                            self.freed_root_pages.insert(root_page as i64);
                             // Deferred destroy: retire the binding (set its `end` to the drop ts)
                             // but keep it, so a transaction still scanning this table at an older
                             // snapshot resolves the (read-mark-protected) root page. GC'd once
@@ -2255,6 +2305,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             // Evict stale cursor.
                             self.cursors.remove(&root_page);
                             self.destroyed_indexes.insert(index_id);
+                            self.freed_root_pages.insert(root_page as i64);
                             // Deferred destroy: retire the binding (set its `end`) but keep it so
                             // a transaction still scanning this index at an older snapshot resolves
                             // the (read-mark-protected) root page. GC'd once `lwm` passes the drop.
@@ -2648,6 +2699,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
             }
             CheckpointState::CommitPagerTxn => {
+                inject_transition_yield!(self, CheckpointYieldPoint::BeforePagerCommit);
                 let passive = matches!(self.mode, CheckpointMode::Passive { .. });
                 let passive_auto_publish_retry = passive && !self.update_transaction_state;
                 // Passive: btree commit and publish run off the RW lock (drain bit only).
@@ -2705,9 +2757,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             tracing::debug!(
                                 "passive checkpoint publish contended; yielding for retry"
                             );
-                            return Ok(TransitionResult::Io(IOCompletions::Single(
-                                Completion::new_yield(),
-                            )));
+                            return Ok(TransitionResult::Io(
+                                IOCompletions(Completion::new_yield()),
+                            ));
                         }
                         return Err(crate::LimboError::Busy);
                     }
@@ -2756,7 +2808,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     }
                     Ok(TransitionResult::Continue)
                 } else {
-                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                    Ok(TransitionResult::Io(IOCompletions(c)))
                 }
             }
 
@@ -2774,7 +2826,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
-                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                    Ok(TransitionResult::Io(IOCompletions(c)))
                 }
             }
 
@@ -2823,7 +2875,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     .db_file
                     .sync(Completion::new_sync(|_| {}), self.pager.get_sync_type())?;
                 checkpoint_result.db_sync_sent = true;
-                Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                Ok(TransitionResult::Io(IOCompletions(c)))
             }
 
             CheckpointState::TruncateWal => {
@@ -2901,23 +2953,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
             CheckpointState::Finalize => {
                 if self.lock_states.blocking_checkpoint_lock_held {
-                    // Blocking lock held: the slot-removing GC variant is safe (no writer races
-                    // the empty-slot removal). Then release.
-                    tracing::debug!("Releasing blocking checkpoint lock");
+                    // Slot-removing GC is safe while the blocking lock is held.
                     self.mvstore.drop_unused_row_versions_and_slots();
-                    self.checkpoint_lock.unlock();
-                    self.lock_states.blocking_checkpoint_lock_held = false;
                 } else {
-                    // Passive: GC chains in place only; empty slots reclaimed on next insert.
+                    // Passive: GC chains in place; empty slots reclaimed on next insert.
                     self.mvstore.drop_unused_row_versions();
                 }
-                // Release the single-orchestrator gate so the next checkpoint can run.
-                if self.owns_checkpoint_in_progress {
-                    self.mvstore
-                        .checkpoint_in_progress
-                        .store(false, Ordering::Release);
-                    self.owns_checkpoint_in_progress = false;
-                }
+                // Locks stay held until `step()` runs `on_checkpoint_end`.
                 self.finalize(&())?;
                 Ok(TransitionResult::Done(
                     self.checkpoint_result.take().ok_or_else(|| {
@@ -2940,14 +2982,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
         match res {
             Err(ref err) => {
                 tracing::debug!("Error in checkpoint state machine: {err}");
-                // `cleanup_after_external_io_error` already emits the paired
-                // `on_checkpoint_end(Err(..))`, so don't call it here too — doing both
-                // double-fires the hook for a single failure.
+                // cleanup already calls on_checkpoint_end + unlock
                 self.cleanup_after_external_io_error(err.clone())?;
                 res
             }
             Ok(TransitionResult::Done(ref result)) => {
-                self.mvstore.storage.on_checkpoint_end(Ok(result))?;
+                // End hook before unlock so storage cannot race the next writer/checkpoint.
+                let end = self.mvstore.storage.on_checkpoint_end(Ok(result));
+                self.release_checkpoint_locks_if_needed();
+                end?;
                 res
             }
             Ok(result) => Ok(result),
@@ -2985,7 +3028,7 @@ pub struct BuildLocalSchemaViewStateMachine<
     connection: Arc<Connection>,
     snapshot_ts: u64,
     state: BuildLocalSchemaViewState,
-    rows: HashMap<i64, ImmutableRecord>,
+    rows: HashMap<i64, ImmutableRecordRef<'static>>,
     finalized: bool,
 }
 
@@ -3041,7 +3084,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> BuildLocalSchemaViewStateMachi
                         .as_ref()
                         .expect("present schema version must carry row data at snapshot_ts");
                     self.rows
-                        .insert(rowid, ImmutableRecord::from_bin_record(data.to_vec()));
+                        .insert(rowid, ImmutableRecordRef::from_shared_record(data.clone()));
                 }
                 None => {
                     let existed_and_gone = versions.iter().any(|version| {
@@ -3101,7 +3144,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
                     IOResult::Done(None) => None,
                 };
                 if let Some(record) = record {
-                    self.rows.insert(rowid, record);
+                    self.rows
+                        .insert(rowid, ImmutableRecordRef::from_owned_record(record));
                 }
                 self.state = BuildLocalSchemaViewState::Advance;
                 Ok(TransitionResult::Continue)
@@ -3181,6 +3225,18 @@ mod tests {
             btree_resident: false,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
+    }
+
+    #[test]
+    fn local_schema_record_shares_mvcc_payload() {
+        let version = sqlite_schema_row_version(2, "table", "t", "t", -2, Some(1), None);
+        let payload = version.row.data.as_ref().unwrap();
+        let payload_ptr = payload.as_ptr();
+
+        let record = ImmutableRecordRef::from_shared_record(payload.clone());
+
+        assert_eq!(record.get_payload().as_ptr(), payload_ptr);
+        assert_eq!(record.column_count(), SQLITE_SCHEMA_COLUMN_COUNT);
     }
 
     #[test]
@@ -3298,7 +3354,8 @@ mod tests {
             2,
         )
         .unwrap();
-        let sortable_key = SortableIndexKey::new_from_record(key_record, index_info);
+        let sortable_key =
+            SortableIndexKey::new_from_payload_in(&key_record, index_info, TursoAllocator).unwrap();
         let key_arc = Arc::new(sortable_key.clone());
         let row = Row::new_index_row(
             RowID::new(index_id, RowKey::Record(Arc::new(sortable_key))),

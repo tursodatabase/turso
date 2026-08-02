@@ -8,12 +8,12 @@ description: Test types, when to use each, how to write and run tests
 
 | Type | Location | Use Case |
 |------|----------|----------|
-| `.sqltest` | `testing/sqltests/tests/` | SQL compatibility. **Preferred for new tests** |
+| `.sqltest` | `sqlite/conformance/sqlite-sqltests/` | SQL compatibility. **Preferred for new tests** |
 | TCL `.test` | `testing/` | Legacy SQL compat (being phased out) |
 | Rust integration | `tests/integration/` | Regression tests, complex scenarios |
 | Fuzz | `tests/fuzz/` | Complex features, edge case discovery |
 
-**Note:** TCL tests are being phased out in favor of testing/sqltests. The `.sqltest` format allows the same test cases to run against multiple backends (CLI, Rust bindings, etc.).
+**Note:** TCL tests are being phased out in favor of the `.sqltest` suites in `sqlite/conformance/`. The `.sqltest` format allows the same test cases to run against multiple backends (CLI, Rust bindings, etc.).
 
 ## Running Tests
 
@@ -25,7 +25,7 @@ make test
 make test-single TEST=select.test
 
 # SQL test runner
-make -C testing/sqltests run-cli
+make -C sqlite/conformance run-cli
 
 # Rust unit/integration tests (full workspace)
 cargo test
@@ -42,7 +42,7 @@ SELECT 1 + 1;
 @expected
 2
 ```
-Location: `testing/sqltests/tests/*.sqltest`
+Location: `sqlite/conformance/sqlite-sqltests/*.sqltest`
 
 ### TCL
 ```tcl
@@ -69,6 +69,9 @@ fn test_something() {
 - Prefer in-memory DBs: `:memory:` (sqltest) or `{:memory:}` (TCL)
 - Don't invent new test formats. Follow existing patterns
 - Write tests first when possible
+- If tasked with identifying a reproducer for a bug, strongly prefer using only user-facing APIs. Manipulating DB internals to artificially trigger a condition, or asserting internal state, is a bad reproducer.
+- A reproducer must serve as a regression test once the bug is fixed.
+
 
 ## Test Database Schema
 

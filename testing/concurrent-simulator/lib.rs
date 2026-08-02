@@ -16,6 +16,7 @@ use std::fmt::Write;
 use std::ops::Bound;
 use std::sync::Arc;
 use tracing::{debug, error, trace};
+use turso_core::SqliteDialect;
 #[cfg(target_os = "windows")]
 use turso_core::WindowsIOCP;
 use turso_core::schema::SEQ_BACKING_TABLE_PREFIX;
@@ -711,6 +712,7 @@ impl Whopper {
                 OpenFlags::default(),
                 db_opts,
                 encryption_opts.clone(),
+                Arc::new(SqliteDialect),
             ) {
                 Ok(db) => db,
                 Err(e) => {
@@ -1527,6 +1529,7 @@ impl Whopper {
             OpenFlags::default(),
             db_opts,
             self.encryption_opts.clone(),
+            Arc::new(SqliteDialect),
         )
         .map_err(|e| anyhow::anyhow!("Database open failed: {}", e))?;
 

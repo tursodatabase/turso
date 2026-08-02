@@ -7,6 +7,7 @@
 mod encoder;
 
 use std::sync::Arc;
+use turso_core::SqliteDialect;
 
 use sha1::{Digest, Sha1};
 use std::num::NonZero;
@@ -66,6 +67,7 @@ pub fn hash_database_with_database_opts(
         OpenFlags::default(),
         database_opts,
         None,
+        Arc::new(SqliteDialect),
     )?;
     let conn = db.connect()?;
 

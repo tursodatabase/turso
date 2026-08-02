@@ -442,6 +442,7 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             (10, Box::new(CreateSimpleTableWorkload)),
             (20, Box::new(SimpleSelectWorkload)),
             (20, Box::new(SimpleInsertWorkload)),
+            (20, Box::new(JsonWorkload)),
             (15, Box::new(UpdateWorkload)),
             (15, Box::new(DeleteWorkload)),
             (2, Box::new(CreateIndexWorkload)),

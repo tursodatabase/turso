@@ -7,13 +7,20 @@ use crate::sync::RwLock;
 use crate::turso_assert;
 use std::fmt::Debug;
 
+#[cfg(test)]
+mod discard_pending_tests;
 pub mod logical_log;
 use crate::mvcc::database::{LogRecord, RowVersion};
 use crate::mvcc::persistent_storage::logical_log::{
-    serialize_header_entry, serialize_op_entry, LogicalLog, OnSerializationComplete,
-    DEFAULT_LOG_CHECKPOINT_THRESHOLD,
+    LogSerializer, LogicalLog, OnSerializationComplete, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
 };
 use crate::{CheckpointResult, Completion, File, LimboError, Result};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogicalLogTruncateOutcome {
+    Truncated,
+    Retained,
+}
 
 pub trait DurableStorage: Send + Sync + Debug {
     /// Append one row-version op to `log_record`'s payload buffer, in the
@@ -35,9 +42,11 @@ pub trait DurableStorage: Send + Sync + Debug {
     /// Write a transaction to the logical log without advancing the writer offset.
     ///
     /// If `on_serialization_complete` is provided, it is called with shared
-    /// ownership of the framed bytes and the running CRC after framing but
-    /// before the disk write. The callback runs while the internal write lock
-    /// is held, so it should be fast.
+    /// ownership of the framed bytes and the frame's
+    /// [`logical_log::LogTxFrameInfo`] chain state (start offset, pre-frame
+    /// committed CRC, post-frame CRC) after framing but before the disk write.
+    /// The callback runs while the internal write lock is held, so it should
+    /// be fast.
     fn log_tx(
         &self,
         m: LogRecord,
@@ -69,7 +78,13 @@ pub trait DurableStorage: Send + Sync + Debug {
     /// Truncate the logical log, discarding frames at or below
     /// `checkpointed_through_ts` (the checkpoint's published boundary). Frames
     /// above the boundary (uncheckpointed concurrent commits) are preserved.
-    fn truncate(&self, checkpointed_through_ts: u64) -> Result<Completion>;
+    ///
+    /// Returns whether the log was actually truncated ([`LogicalLogTruncateOutcome::Truncated`])
+    /// or left intact ([`LogicalLogTruncateOutcome::Retained`]).
+    fn truncate(
+        &self,
+        checkpointed_through_ts: u64,
+    ) -> Result<(Completion, LogicalLogTruncateOutcome)>;
 
     /// Reset the logical log to a fresh header-only file.
     ///
@@ -84,9 +99,12 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn set_checkpoint_threshold(&self, threshold: i64);
     fn checkpoint_threshold(&self) -> i64;
     fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()>;
-    fn discard_pending_log_write(&self) -> Result<()> {
-        Ok(())
-    }
+    #[aristo::intent(
+        "the pending running-CRC slot is cleared by the storage abort path after an abandoned deferred-offset write",
+        id = "logical_log_pending_crc_cleared_on_abort",
+        verify = "full"
+    )]
+    fn discard_pending_log_write(&self) -> Result<()>;
     fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32);
 
     /// Set the in-memory log header from a previously-read on-disk header.
@@ -101,6 +119,8 @@ pub trait DurableStorage: Send + Sync + Debug {
 
     /// Called after the checkpoint has fully completed: rows are flushed, WAL is
     /// truncated, and the logical log is reset.
+    ///
+    /// Runs while checkpoint locks are still held.
     fn on_checkpoint_end(&self, _result: Result<&CheckpointResult>) -> Result<()> {
         Ok(())
     }
@@ -150,7 +170,8 @@ impl DurableStorage for Storage {
         row_version: &RowVersion,
         portable_extension: Option<&[u8]>,
     ) -> Result<()> {
-        serialize_op_entry(&mut log_record.buf, row_version, portable_extension)?;
+        LogSerializer::new(&mut log_record.buf)
+            .serialize_op_entry(row_version, portable_extension)?;
         log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
             LimboError::InternalError("logical log op_count exceeds u32".to_string())
         })?;
@@ -166,7 +187,7 @@ impl DurableStorage for Storage {
             !log_record.has_header,
             "DatabaseHeader op appended more than once to a single LogRecord"
         );
-        serialize_header_entry(&mut log_record.buf, header);
+        LogSerializer::new(&mut log_record.buf).serialize_header_entry(header)?;
         log_record.has_header = true;
         log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
             LimboError::InternalError("logical log op_count exceeds u32".to_string())
@@ -196,16 +217,20 @@ impl DurableStorage for Storage {
         self.logical_log.write().update_header()
     }
 
-    fn truncate(&self, checkpointed_through_ts: u64) -> Result<Completion> {
+    #[aristo::intent("after a truncate, once no write is in flight, the in-memory shadow_offset equals the on-disk durable_offset (the tracked end-of-log matches what's been fsync'd)", id = "aristos:logical_log_shadow_offset_matches_durable", verify = "full")]
+    fn truncate(
+        &self,
+        checkpointed_through_ts: u64,
+    ) -> Result<(Completion, LogicalLogTruncateOutcome)> {
         let mut log = self.logical_log.write();
-        let c = log.truncate(checkpointed_through_ts)?;
+        let (c, outcome) = log.truncate(checkpointed_through_ts)?;
         // Shadow the log's actual offset: 0 if it truncated, unchanged if it
         // skipped (uncheckpointed frames remain), so should_checkpoint() stays
         // accurate.
         let new_offset = log.offset;
         drop(log);
         self.shadow_offset_store(new_offset);
-        Ok(c)
+        Ok((c, outcome))
     }
 
     fn reset_to_fresh_header(&self) -> Result<Completion> {
@@ -247,6 +272,11 @@ impl DurableStorage for Storage {
     fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()> {
         self.logical_log.write().advance_offset_after_success(bytes);
         self.shadow_offset_advance(bytes);
+        Ok(())
+    }
+
+    fn discard_pending_log_write(&self) -> Result<()> {
+        self.logical_log.write().discard_pending_write();
         Ok(())
     }
 

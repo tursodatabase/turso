@@ -1,4 +1,5 @@
 use rand::Rng;
+use turso_core::alloc::{TursoSliceExt, ALLOC_ERR_MSG};
 use turso_core::Value;
 
 use crate::{
@@ -53,7 +54,12 @@ impl ArbitraryFrom<&ColumnType> for SimValue {
             ColumnType::Integer => Value::from_i64(rng.random_range(-(1i64 << 53)..(1i64 << 53))),
             ColumnType::Float => Value::from_f64(rng.random_range(-1e10..1e10)),
             ColumnType::Text => Value::build_text(gen_random_text(rng)),
-            ColumnType::Blob => Value::Blob(gen_random_text(rng).into_bytes()),
+            ColumnType::Blob => Value::Blob(
+                gen_random_text(rng)
+                    .as_bytes()
+                    .try_to_vec()
+                    .expect(ALLOC_ERR_MSG),
+            ),
         };
         SimValue(value)
     }

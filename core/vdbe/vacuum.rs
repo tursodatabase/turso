@@ -298,6 +298,7 @@ pub(crate) fn open_vacuum_temp_db(
         OpenFlags::Create,
         vacuum_target_opts_from_source(source_db),
         encryption_opts,
+        source_db.dialect(),
     )?;
     let conn = db.connect_with_encryption(encryption_key)?;
     conn.reset_page_size(page_size)?;
@@ -647,7 +648,7 @@ pub(crate) fn vacuum_target_build_step(
                     crate::StepResult::IO | crate::StepResult::Yield => {
                         let io = schema_stmt
                             .take_io_completions()
-                            .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
+                            .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
                         state.phase = VacuumTargetBuildPhase::CollectSchemaRows { schema_stmt };
                         return Ok(crate::IOResult::IO(io));
                     }
@@ -669,7 +670,7 @@ pub(crate) fn vacuum_target_build_step(
 
                 let entry_ordinal = state.tables_to_create[idx];
                 let entry = &state.schema_entries[entry_ordinal];
-                let sql_str = &entry.sql;
+                let sql = table_sql_for_vacuum_replay(&state.target_conn, &entry.sql)?;
 
                 // System tables (sqlite_stat1, __turso_internal_types, etc.) have
                 // reserved name prefixes that translate_create_table rejects for
@@ -682,7 +683,7 @@ pub(crate) fn vacuum_target_build_step(
                 if is_system {
                     state.target_conn.start_nested();
                 }
-                let target_stmt = state.target_conn.prepare(sql_str);
+                let target_stmt = state.target_conn.prepare(&sql);
                 if is_system {
                     state.target_conn.end_nested();
                 }
@@ -708,7 +709,7 @@ pub(crate) fn vacuum_target_build_step(
                 crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_schema_stmt
                         .take_io_completions()
-                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
+                        .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::StepCreateTable {
                         target_schema_stmt,
                         idx,
@@ -842,7 +843,7 @@ pub(crate) fn vacuum_target_build_step(
                 crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = select_stmt
                         .take_io_completions()
-                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
+                        .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::CopyRows {
                         select_stmt,
                         target_insert_stmt,
@@ -875,7 +876,7 @@ pub(crate) fn vacuum_target_build_step(
                 crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_insert_stmt
                         .take_io_completions()
-                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
+                        .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::StepTargetInsert {
                         select_stmt,
                         target_insert_stmt,
@@ -924,7 +925,7 @@ pub(crate) fn vacuum_target_build_step(
                 crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_schema_stmt
                         .take_io_completions()
-                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
+                        .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::StepCreateIndex {
                         target_schema_stmt,
                         idx,
@@ -968,7 +969,7 @@ pub(crate) fn vacuum_target_build_step(
                 crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_schema_stmt
                         .take_io_completions()
-                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
+                        .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::StepPostData {
                         target_schema_stmt,
                         idx,
@@ -1000,6 +1001,10 @@ pub(crate) fn vacuum_target_build_step(
             }
         }
     }
+}
+
+fn table_sql_for_vacuum_replay(target_conn: &Arc<Connection>, sql: &str) -> Result<String> {
+    target_conn.dialect().table_sql_for_replay(sql)
 }
 
 // Build the SELECT and INSERT SQL strings for copying a table's data.
@@ -1942,7 +1947,7 @@ fn vacuum_in_place_step(
                 fsync_phase,
             } => {
                 if !completion.finished() {
-                    return Ok(IOResult::IO(IOCompletions::Single(completion.clone())));
+                    return Ok(IOResult::IO(IOCompletions(completion.clone())));
                 }
                 if !completion.succeeded() {
                     return Err(vacuum_completion_error(completion, "WAL header init"));
@@ -2009,7 +2014,7 @@ fn vacuum_in_place_step(
                 );
                 // Wait for every run in this batch to finish.
                 if !read_completion.finished() {
-                    return Ok(IOResult::IO(IOCompletions::Single(read_completion.clone())));
+                    return Ok(IOResult::IO(IOCompletions(read_completion.clone())));
                 }
                 if !read_completion.succeeded() {
                     return Err(vacuum_completion_error(read_completion, "temp batch read"));
@@ -2085,7 +2090,7 @@ fn vacuum_in_place_step(
                 // unfinished completion; re-entry will re-check them all.
                 let pending = completions.iter().find(|c| !c.finished()).cloned();
                 if let Some(pending) = pending {
-                    return Ok(IOResult::IO(IOCompletions::Single(pending)));
+                    return Ok(IOResult::IO(IOCompletions(pending)));
                 }
 
                 // Check for write errors.
@@ -2161,7 +2166,7 @@ fn vacuum_in_place_step(
 
             VacuumInPlacePhase::SyncSourceWal { sync_completion } => {
                 if !sync_completion.finished() {
-                    return Ok(IOResult::IO(IOCompletions::Single(sync_completion.clone())));
+                    return Ok(IOResult::IO(IOCompletions(sync_completion.clone())));
                 }
                 if !sync_completion.succeeded() {
                     return Err(vacuum_completion_error(sync_completion, "WAL fsync"));
@@ -2381,6 +2386,7 @@ mod tests {
     use crate::storage::pager::Page;
     use crate::util::IOExt;
     use crate::vdbe::execute::TransactionYieldPoint;
+    use crate::SqliteDialect;
     use crate::{
         Buffer, Clock, Completion, DatabaseOpts, File, MemoryIO, MonotonicInstant, OpenFlags,
         WallClockInstant, IO,
@@ -2697,7 +2703,7 @@ mod tests {
     #[test]
     fn replace_shared_schema_after_vacuum_replaces_wrapped_schema_cookie() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file(io, ":memory:")?;
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
 
         db.with_schema_mut(|schema| {
             schema.schema_version = u32::MAX;
@@ -2721,7 +2727,7 @@ mod tests {
     #[test]
     fn install_committed_vacuum_image_updates_connection_and_shared_schema() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file(io, ":memory:")?;
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
         let conn = db.connect()?;
 
         conn.with_schema_mut(|schema| {
@@ -2757,7 +2763,7 @@ mod tests {
     #[test]
     fn cleanup_after_published_vacuum_installs_committed_image() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file(io, ":memory:")?;
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
         let conn = db.connect()?;
 
         conn.with_schema_mut(|schema| {
@@ -2810,6 +2816,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )?;
         let source_conn = source_db.connect()?;
         // Source is uninitialized so its header reserved_space isn't usable.
@@ -2880,6 +2887,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )?;
         let conn = db.connect()?;
         conn.set_sync_mode(crate::SyncMode::Off);
@@ -2923,6 +2931,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
+            Arc::new(SqliteDialect),
         )?;
         let source_conn = source_db.connect()?;
         source_conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
@@ -2944,6 +2953,7 @@ mod tests {
             OpenFlags::Create,
             vacuum_target_opts_from_source(&source_db),
             None,
+            Arc::new(SqliteDialect),
         )?;
         let target_conn = target_db.connect()?;
         mirror_symbols(&source_conn, &target_conn);
@@ -3006,6 +3016,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
+            Arc::new(SqliteDialect),
         )?;
         let conn = db.connect()?;
         conn.set_sync_mode(crate::SyncMode::Off);
@@ -3047,6 +3058,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
+            Arc::new(SqliteDialect),
         )?;
         let conn = db.connect()?;
         conn.set_sync_mode(crate::SyncMode::Off);
@@ -3087,6 +3099,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )?;
         let source_conn = source_db.connect()?;
         let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, 0)?;
@@ -3140,6 +3153,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )?;
         let source_conn = source_db.connect()?;
 
@@ -3175,6 +3189,7 @@ mod tests {
                 cipher: CipherMode::Aes256Gcm.to_string(),
                 hexkey: key_hex.to_string(),
             }),
+            Arc::new(SqliteDialect),
         )?;
         let source_conn = source_db.connect_with_encryption(Some(key))?;
         let reserved_space = source_conn
@@ -3207,6 +3222,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )?;
         let target_conn = target_db.connect()?;
         target_conn.execute("CREATE TABLE seed(x)")?;

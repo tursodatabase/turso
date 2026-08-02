@@ -1,33 +1,19 @@
-use crate::{types::ImmutableRecord, Result, Value};
-
+/// A pseudo cursor exposes the record stored in its content register as a
+/// one-row table, mirroring SQLite's OpenPseudo. It holds no data itself:
+/// SorterData moves each record into the content register and Column ops
+/// decode straight out of it.
 pub struct PseudoCursor {
-    current: Option<ImmutableRecord>,
-}
-
-impl Default for PseudoCursor {
-    #[inline]
-    fn default() -> Self {
-        Self { current: None }
-    }
+    content_reg: usize,
 }
 
 impl PseudoCursor {
     #[inline]
-    pub fn record(&self) -> Option<&ImmutableRecord> {
-        self.current.as_ref()
+    pub fn new(content_reg: usize) -> Self {
+        Self { content_reg }
     }
 
     #[inline]
-    pub fn insert(&mut self, record: ImmutableRecord) {
-        self.current = Some(record);
-    }
-
-    #[inline]
-    pub fn get_value(&self, column: usize) -> Result<Value> {
-        if let Some(record) = self.current.as_ref() {
-            Ok(record.get_value(column)?.to_owned())
-        } else {
-            Ok(Value::Null)
-        }
+    pub fn content_reg(&self) -> usize {
+        self.content_reg
     }
 }

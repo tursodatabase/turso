@@ -25,9 +25,11 @@ jobs:
         with:
           prefix-key: "v1-rust"
       - name: Build test runner
-        run: make -C testing/sqltests build-runner
+        run: make -C sqlite/conformance build-runner
       - name: Check test syntax
-        run: make -C testing/sqltests check
+        run: make -C sqlite/conformance check
+      - name: Check pg test syntax
+        run: make -C postgres/conformance check
 
   sqltest-run-cli:
     name: Run SQL tests (CLI backend)
@@ -40,13 +42,13 @@ jobs:
           prefix-key: "v1-rust"
       - uses: "./.github/shared/install_sqlite"
       - name: Build tursodb
-        run: make -C testing/sqltests build-tursodb
+        run: make -C sqlite/conformance build-tursodb
       - name: Build test runner
-        run: make -C testing/sqltests build-runner
+        run: make -C sqlite/conformance build-runner
       - name: Run tests
-        run: make -C testing/sqltests run-cli CROSS_CHECK_BINARY=sqlite3
+        run: make -C sqlite/conformance run-cli CROSS_CHECK_BINARY=sqlite3
       - name: Run tests (MVCC)
-        run: make -C testing/sqltests run-cli MVCC=1
+        run: make -C sqlite/conformance run-cli MVCC=1
 
   sqltest-run-rust:
     name: Run SQL tests (Rust backend)
@@ -58,11 +60,11 @@ jobs:
         with:
           prefix-key: "v1-rust"
       - name: Build test runner
-        run: make -C testing/sqltests build-runner
+        run: make -C sqlite/conformance build-runner
       - name: Run tests
-        run: make -C testing/sqltests run-rust
+        run: make -C sqlite/conformance run-rust
       - name: Run tests (MVCC)
-        run: make -C testing/sqltests run-rust MVCC=1
+        run: make -C sqlite/conformance run-rust MVCC=1
 
   sqltest-run-js:
     name: Run SQL tests (JS backend)
@@ -79,7 +81,7 @@ jobs:
       - name: Setup node
         uses: useblacksmith/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
       - name: Install JS dependencies
         run: yarn install
       - name: Build common package
@@ -89,14 +91,30 @@ jobs:
       - name: Build TypeScript
         run: yarn workspace @tursodatabase/database tsc-build
       - name: Build test runner
-        working-directory: testing/sqltests
-        run: cargo build --release
+        working-directory: sqlite/conformance
+        run: make build-runner
       - name: Run tests
-        working-directory: testing/sqltests
+        working-directory: sqlite/conformance
         run: make run-js
       - name: Run tests (MVCC)
-        working-directory: testing/sqltests
+        working-directory: sqlite/conformance
         run: make run-js MVCC=1
+
+  sqltest-run-pg:
+    name: Run SQL tests (pg backend)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust"
+      - name: Build tursopg
+        run: make -C postgres/conformance build-tursopg
+      - name: Build test runner
+        run: make -C postgres/conformance build-runner
+      - name: Run tests
+        run: make -C postgres/conformance run
 
   sqltest-sqlite:
     name: Run SQL tests (SQLite)
@@ -109,6 +127,6 @@ jobs:
           prefix-key: "v1-rust"
       - uses: "./.github/shared/install_sqlite"
       - name: Build test runner
-        run: make -C testing/sqltests build-runner
+        run: make -C sqlite/conformance build-runner
       - name: Run tests against SQLite
-        run: make -C testing/sqltests test-sqlite
+        run: make -C sqlite/conformance test-sqlite

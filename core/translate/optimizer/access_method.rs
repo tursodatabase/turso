@@ -109,6 +109,8 @@ pub enum AccessMethodParams {
     /// subqueries may also be scanned backwards when their intrinsic order
     /// matches the requested extremum order.
     Subquery { iter_dir: IterationDirection },
+    /// The single row currently being expanded by a recursive CTE.
+    RecursiveCteInput,
     /// Materialized subquery with an ephemeral index for seeking.
     /// The subquery results are materialized once into an ephemeral index,
     /// which can then be seeked using join conditions.
@@ -676,6 +678,35 @@ fn consider_in_seek_access_method(
     }))
 }
 
+fn residual_literal_in_list_eval_cost(
+    constraints: &[Constraint],
+    where_clause: &[WhereTerm],
+    consumed_where_terms: &[usize],
+    input_cardinality: f64,
+    rows_per_outer_row: f64,
+    params: &CostModelParams,
+) -> Cost {
+    let eval_count = input_cardinality * rows_per_outer_row;
+    let comparison_count: f64 = constraints
+        .iter()
+        .filter(|constraint| !consumed_where_terms.contains(&constraint.where_clause_pos.0))
+        .filter(|constraint| {
+            where_clause
+                .get(constraint.where_clause_pos.0)
+                .is_some_and(|term| matches!(term.expr, ast::Expr::InList { .. }))
+        })
+        .filter_map(|constraint| match constraint.operator {
+            ConstraintOperator::In {
+                not: false,
+                estimated_values,
+            } => Some(estimated_values),
+            _ => None,
+        })
+        .sum();
+
+    Cost(eval_count * comparison_count * params.cpu_cost_per_row)
+}
+
 /// Return the best [AccessMethod] for a given join order.
 #[allow(clippy::too_many_arguments)]
 pub fn find_best_access_method_for_join_order(
@@ -728,6 +759,22 @@ pub fn find_best_access_method_for_join_order(
             base_row_count,
             params,
         ),
+        Table::RecursiveCteInput(_) => Ok(Some(AccessMethod {
+            cost: estimate_cost_for_scan_or_seek(
+                None,
+                &[],
+                &[],
+                input_cardinality,
+                RowCountEstimate::HardcodedFallback(1.0),
+                false,
+                params,
+                None,
+            ),
+            estimated_rows_per_outer_row: 1.0,
+            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+            consumed_where_terms: SmallVec::new(),
+            params: AccessMethodParams::RecursiveCteInput,
+        })),
     }
 }
 
@@ -830,6 +877,15 @@ fn find_best_access_method_for_btree(
     // Skip alternative access methods (in-seek, multi-index) when INDEXED BY or NOT INDEXED
     // is specified — the user explicitly requested a specific index or no index.
     if rhs_table.indexed.is_none() && rhs_table.btree().is_some_and(|b| b.has_rowid) {
+        let in_seek_threshold = best_access_method.cost
+            + residual_literal_in_list_eval_cost(
+                &rhs_constraints.constraints,
+                where_clause,
+                &best_access_method.consumed_where_terms,
+                input_cardinality,
+                best_access_method.estimated_rows_per_outer_row,
+                params,
+            );
         if let Some(in_seek_method) = consider_in_seek_access_method(
             rhs_table,
             rhs_constraints,
@@ -837,7 +893,7 @@ fn find_best_access_method_for_btree(
             input_cardinality,
             base_row_count,
             params,
-            best_access_method.cost,
+            in_seek_threshold,
         )? {
             let mut in_seek_method = in_seek_method;
             if let AccessMethodParams::InSeek { index, .. } = &in_seek_method.params {
@@ -1392,8 +1448,6 @@ fn find_best_access_method_for_subquery(
     use super::constraints::ConstraintRef;
     let maybe_order_target = planning_context.maybe_order_target;
 
-    let table_materialization_required = subquery.requires_table_materialization();
-    let can_direct_materialize_index = subquery.supports_direct_index_materialization();
     let coroutine_scan_cost = estimate_cost_for_scan_or_seek(
         None,
         &[],
@@ -1407,6 +1461,8 @@ fn find_best_access_method_for_subquery(
     let coroutine_reexecution_overhead =
         Cost((input_cardinality - 1.0).max(0.0) * *base_row_count * params.cpu_cost_per_seek);
     let coroutine_cost = coroutine_scan_cost + coroutine_reexecution_overhead;
+    let table_materialization_required = subquery.requires_table_materialization();
+    let can_direct_materialize_index = subquery.supports_direct_index_materialization();
     let scan_cost = if table_materialization_required {
         // Explicit MATERIALIZED hints and shared CTEs already produce a table-backed
         // row source. Scanning them behaves like rescanning cached rows, not rerunning

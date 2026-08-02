@@ -1,0 +1,60 @@
+---
+title: REINDEX
+description: Rebuild indexes from scratch
+sidebarTitle: REINDEX
+---
+
+# REINDEX
+
+The REINDEX statement deletes and recreates indexes from scratch. It is useful when a collation sequence definition has changed, or to rebuild an index that may have become out of date.
+
+## Syntax
+
+```sql
+REINDEX;
+REINDEX collation-name;
+REINDEX [schema-name.]table-name;
+REINDEX [schema-name.]index-name;
+```
+
+## Description
+
+| Form | Description |
+|------|-------------|
+| `REINDEX` | Rebuild all indexes in all attached databases |
+| `REINDEX collation-name` | Rebuild every index that uses the named collation sequence |
+| `REINDEX table-name` | Rebuild all indexes associated with the named table |
+| `REINDEX index-name` | Rebuild the named index |
+
+When a single unqualified name is given, Turso resolves it in the order **collation → table → index**: if the name matches a collation sequence, all indexes using that collation are rebuilt; otherwise it is treated as a table or index name.
+
+## Examples
+
+```sql
+-- Rebuild every index in the database
+REINDEX;
+
+-- Rebuild all indexes on a table
+REINDEX orders;
+
+-- Rebuild a single index
+REINDEX idx_customer;
+
+-- Rebuild all indexes that use a collation
+REINDEX NOCASE;
+```
+
+## Limitations
+
+REINDEX returns an error in the following cases:
+
+- When the connection is in MVCC mode (`journal_mode=mvcc`).
+- On `WITHOUT ROWID` tables.
+- For custom index methods that have no backing B-tree, such as FTS and vector indexes.
+- When `PRAGMA query_only` is enabled.
+
+## See Also
+
+- [CREATE INDEX](/docs/sql-reference/statements/create-index) for creating indexes
+- [DROP INDEX](/docs/sql-reference/statements/drop-index) for removing indexes
+- [ANALYZE](/docs/sql-reference/statements/analyze) for collecting index statistics

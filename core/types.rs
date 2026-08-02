@@ -14,7 +14,9 @@ use crate::numeric::Numeric;
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
 use crate::storage::btree::CursorTrait;
-use crate::storage::sqlite3_ondisk::{read_integer, read_value, read_varint, write_varint};
+use crate::storage::sqlite3_ondisk::{
+    read_integer, read_value, read_varint, varint_len, write_varint,
+};
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
@@ -23,6 +25,7 @@ use crate::vtab::VirtualTableCursor;
 use crate::{Completion, CompletionError, Result, IO};
 use std::borrow::{Borrow, Cow};
 use std::cell::Cell;
+use std::cmp::Ordering;
 use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::iter::{FusedIterator, Peekable};
@@ -136,6 +139,39 @@ pub trait Extendable<T> {
     fn do_extend(&mut self, other: &T) -> Result<()>;
 }
 
+/// Copies non-overlapping bytes while keeping common small lengths visible to the optimizer.
+///
+/// # Safety
+///
+/// `src` and `dst` must be valid for `len` bytes and must not overlap.
+#[inline(always)]
+unsafe fn copy_nonoverlapping_inline(src: *const u8, dst: *mut u8, len: usize) {
+    // Record decoding frequently reuses registers for short values. Fixed-size
+    // copies compile inline instead of calling the platform memcpy routine.
+    unsafe {
+        match len {
+            0 => {}
+            1 => std::ptr::copy_nonoverlapping(src, dst, 1),
+            2 => std::ptr::copy_nonoverlapping(src, dst, 2),
+            3 => std::ptr::copy_nonoverlapping(src, dst, 3),
+            4 => std::ptr::copy_nonoverlapping(src, dst, 4),
+            5 => std::ptr::copy_nonoverlapping(src, dst, 5),
+            6 => std::ptr::copy_nonoverlapping(src, dst, 6),
+            7 => std::ptr::copy_nonoverlapping(src, dst, 7),
+            8 => std::ptr::copy_nonoverlapping(src, dst, 8),
+            9 => std::ptr::copy_nonoverlapping(src, dst, 9),
+            10 => std::ptr::copy_nonoverlapping(src, dst, 10),
+            11 => std::ptr::copy_nonoverlapping(src, dst, 11),
+            12 => std::ptr::copy_nonoverlapping(src, dst, 12),
+            13 => std::ptr::copy_nonoverlapping(src, dst, 13),
+            14 => std::ptr::copy_nonoverlapping(src, dst, 14),
+            15 => std::ptr::copy_nonoverlapping(src, dst, 15),
+            16 => std::ptr::copy_nonoverlapping(src, dst, 16),
+            _ => std::ptr::copy_nonoverlapping(src, dst, len),
+        }
+    }
+}
+
 impl<T: AnyText> Extendable<T> for Text {
     #[inline(always)]
     fn do_extend(&mut self, other: &T) -> Result<()> {
@@ -151,7 +187,7 @@ impl<T: AnyText> Extendable<T> for Text {
                         "source and destination ranges must not overlap"
                     );
                     unsafe {
-                        std::ptr::copy_nonoverlapping(other_str.as_ptr(), s.as_mut_ptr(), needed);
+                        copy_nonoverlapping_inline(other_str.as_ptr(), s.as_mut_ptr(), needed);
                         s.as_mut_vec().set_len(needed);
                     }
                 } else {
@@ -167,7 +203,7 @@ impl<T: AnyText> Extendable<T> for Text {
     }
 }
 
-impl<T: AnyBlob> Extendable<T> for std::vec::Vec<u8> {
+impl<T: AnyBlob> Extendable<T> for ValueBlob {
     #[inline(always)]
     fn do_extend(&mut self, other: &T) -> Result<()> {
         let other_slice = other.as_slice();
@@ -180,13 +216,13 @@ impl<T: AnyBlob> Extendable<T> for std::vec::Vec<u8> {
                 "source and destination ranges must not overlap"
             );
             unsafe {
-                std::ptr::copy_nonoverlapping(other_slice.as_ptr(), self.as_mut_ptr(), needed);
+                copy_nonoverlapping_inline(other_slice.as_ptr(), self.as_mut_ptr(), needed);
                 self.set_len(needed);
             }
         } else {
+            // Reserve before mutation so an allocation failure leaves the old value intact.
+            self.try_reserve(needed - self.len())?;
             self.clear();
-            // Reserve mores space to extend the slice
-            self.try_reserve(self.len().abs_diff(needed))?;
             self.extend_from_slice(other_slice);
         }
         Ok(())
@@ -213,6 +249,13 @@ pub trait AnyBlob {
     fn as_slice(&self) -> &[u8];
 }
 
+impl AnyBlob for ValueBlob {
+    fn as_slice(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+#[cfg(nightly)]
 impl AnyBlob for std::vec::Vec<u8> {
     fn as_slice(&self) -> &[u8] {
         self.as_slice()
@@ -261,13 +304,132 @@ impl From<Text> for String {
 // No intermediate StructValue/UnionValue types are needed — blobs are
 // constructed from registers and extracted directly into registers.
 
+/// Owned bytes stored by [`Value::Blob`].
+///
+/// Stable builds use `std::vec::Vec`; allocator-enabled nightly builds retain
+/// [`TursoAllocator`] in the vector type.
+pub type ValueBlob = crate::alloc::Vec<u8>;
+
+#[inline]
+pub(crate) fn value_blob_from_slice(
+    bytes: &[u8],
+) -> std::result::Result<ValueBlob, crate::alloc::TryReserveError> {
+    bytes.try_to_vec()
+}
+
+#[cfg(feature = "serde")]
+mod value_blob_serde {
+    use super::ValueBlob;
+    use crate::alloc::{TursoAllocExt, TursoTryWithCapacityExt, TursoVecExt};
+    use serde::de::{Error as _, SeqAccess, Visitor};
+    use serde::{Deserializer, Serialize as _, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S>(value: &ValueBlob, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value.as_slice().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<ValueBlob, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ValueBlobVisitor;
+
+        impl<'de> Visitor<'de> for ValueBlobVisitor {
+            type Value = ValueBlob;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a sequence of bytes")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut value = match sequence.size_hint() {
+                    Some(capacity) => {
+                        <ValueBlob as TursoTryWithCapacityExt>::try_with_capacity_ext(capacity)
+                            .map_err(A::Error::custom)?
+                    }
+                    None => <ValueBlob as TursoAllocExt>::new(),
+                };
+                while let Some(byte) = sequence.next_element()? {
+                    value.try_push(byte).map_err(A::Error::custom)?;
+                }
+                Ok(value)
+            }
+        }
+
+        deserializer.deserialize_seq(ValueBlobVisitor)
+    }
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Value {
     Null,
     Numeric(Numeric),
     Text(Text),
-    Blob(std::vec::Vec<u8>),
+    Blob(#[cfg_attr(feature = "serde", serde(with = "value_blob_serde"))] ValueBlob),
+}
+
+impl TryClone for Value {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        match self {
+            Self::Null => Ok(Self::Null),
+            Self::Numeric(numeric) => Ok(Self::Numeric(*numeric)),
+            Self::Text(text) => {
+                let mut value = String::new();
+                value.try_reserve(text.as_str().len())?;
+                value.push_str(text.as_str());
+                Ok(Self::Text(Text {
+                    value: Cow::Owned(value),
+                    subtype: text.subtype,
+                }))
+            }
+            Self::Blob(blob) => Self::from_slice(blob),
+        }
+    }
+
+    /// Fallibly copies `source` into `self`, reusing the existing Text/Blob
+    /// allocation when the variants match, so hot per-row copies are
+    /// allocation-free once buffers have grown to the row size. On allocation
+    /// failure `self` is left valid but unspecified (an empty Text/Blob).
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::CloneFrom)]
+    fn try_clone_from(&mut self, source: &Self) -> Result<(), Self::Error> {
+        match (self, source) {
+            (Self::Text(dst), Self::Text(src)) => {
+                let src_str = src.as_str();
+                match &mut dst.value {
+                    Cow::Owned(s) => {
+                        s.clear();
+                        s.try_reserve(src_str.len())?;
+                        s.push_str(src_str);
+                    }
+                    borrowed => {
+                        let mut s = String::new();
+                        s.try_reserve(src_str.len())?;
+                        s.push_str(src_str);
+                        *borrowed = Cow::Owned(s);
+                    }
+                }
+                dst.subtype = src.subtype;
+            }
+            (Self::Blob(dst), Self::Blob(src)) => {
+                dst.clear();
+                dst.try_extend(src.iter().copied())?;
+            }
+            (dst, src) => {
+                *dst = src.try_clone()?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -311,26 +473,26 @@ impl Debug for ValueRef<'_> {
 }
 
 pub trait AsValueRef {
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a>;
+    fn as_value_ref(&'_ self) -> ValueRef<'_>;
 }
 
 impl<'b> AsValueRef for ValueRef<'b> {
     #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         *self
     }
 }
 
 impl AsValueRef for Value {
     #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         self.as_ref()
     }
 }
 
 impl AsValueRef for &mut Value {
     #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         self.as_ref()
     }
 }
@@ -341,7 +503,7 @@ where
     V2: AsValueRef,
 {
     #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         match self {
             Either::Left(left) => left.as_value_ref(),
             Either::Right(right) => right.as_value_ref(),
@@ -350,7 +512,7 @@ where
 }
 
 impl<V: AsValueRef> AsValueRef for &V {
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         (*self).as_value_ref()
     }
 }
@@ -367,7 +529,7 @@ impl Value {
         Self::Numeric(Numeric::Integer(i))
     }
 
-    pub fn as_ref<'a>(&'a self) -> ValueRef<'a> {
+    pub fn as_ref(&'_ self) -> ValueRef<'_> {
         match self {
             Value::Null => ValueRef::Null,
             Value::Numeric(n) => ValueRef::Numeric(*n),
@@ -391,8 +553,14 @@ impl Value {
         }
     }
 
-    pub fn from_blob(data: std::vec::Vec<u8>) -> Self {
+    pub const fn from_blob(data: ValueBlob) -> Self {
         Value::Blob(data)
+    }
+
+    #[inline]
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::FromSlice)]
+    pub fn from_slice(data: &[u8]) -> std::result::Result<Self, TryReserveError> {
+        Ok(Value::Blob(value_blob_from_slice(data)?))
     }
 
     pub fn to_text(&self) -> Option<&str> {
@@ -402,14 +570,14 @@ impl Value {
         }
     }
 
-    pub const fn as_blob(&self) -> &std::vec::Vec<u8> {
+    pub const fn as_blob(&self) -> &ValueBlob {
         match self {
             Value::Blob(b) => b,
             _ => panic!("as_blob must be called only for Value::Blob"),
         }
     }
 
-    pub const fn as_blob_mut(&mut self) -> &mut std::vec::Vec<u8> {
+    pub const fn as_blob_mut(&mut self) -> &mut ValueBlob {
         match self {
             Value::Blob(b) => b,
             _ => panic!("as_blob must be called only for Value::Blob"),
@@ -564,7 +732,7 @@ impl Value {
                 let Some(blob) = v.to_blob() else {
                     return Ok(Value::Null);
                 };
-                Ok(Value::Blob(blob))
+                Ok(Value::from_slice(&blob)?)
             }
             ExtValueType::Error => {
                 let Some(err) = v.to_error_details() else {
@@ -600,12 +768,14 @@ impl FromValue for Value {
 impl Sealed for crate::Value {}
 
 macro_rules! impl_int_from_value {
-    ($ty:ty, $cast:expr) => {
+    ($ty:ty) => {
         impl FromValue for $ty {
             fn from_sql(val: Value) -> Result<Self> {
                 match val {
                     Value::Null => Err(LimboError::NullValue),
-                    Value::Numeric(Numeric::Integer(i)) => Ok($cast(i)),
+                    Value::Numeric(Numeric::Integer(i)) => {
+                        <$ty>::try_from(i).map_err(|_| LimboError::IntegerOverflow)
+                    }
                     _ => Err(LimboError::InvalidColumnType),
                 }
             }
@@ -615,23 +785,24 @@ macro_rules! impl_int_from_value {
     };
 }
 
-impl_int_from_value!(i32, |i| i as i32);
-impl_int_from_value!(u32, |i| i as u32);
-impl_int_from_value!(i64, |i| i);
-impl_int_from_value!(u64, |i| i as u64);
+impl_int_from_value!(i32);
+impl_int_from_value!(u32);
+impl_int_from_value!(i64);
+impl_int_from_value!(u64);
 
 impl FromValue for f64 {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
             Value::Null => Err(LimboError::NullValue),
             Value::Numeric(Numeric::Float(f)) => Ok(f64::from(f)),
+            Value::Numeric(Numeric::Integer(i)) => Ok(i as f64),
             _ => Err(LimboError::InvalidColumnType),
         }
     }
 }
 impl Sealed for f64 {}
 
-impl FromValue for std::vec::Vec<u8> {
+impl FromValue for ValueBlob {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
             Value::Null => Err(LimboError::NullValue),
@@ -640,13 +811,16 @@ impl FromValue for std::vec::Vec<u8> {
         }
     }
 }
-impl Sealed for std::vec::Vec<u8> {}
+impl Sealed for ValueBlob {}
 
 impl<const N: usize> FromValue for [u8; N] {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
             Value::Null => Err(LimboError::NullValue),
-            Value::Blob(blob) => blob.try_into().map_err(|_| LimboError::InvalidBlobSize(N)),
+            Value::Blob(blob) => blob
+                .as_slice()
+                .try_into()
+                .map_err(|_| LimboError::InvalidBlobSize(N)),
             _ => Err(LimboError::InvalidColumnType),
         }
     }
@@ -725,6 +899,29 @@ pub enum AggContext {
     Builtin(Vec<Value>),
     /// External (extension) aggregates need FFI state that can't be serialized.
     External(ExternalAggState),
+}
+
+impl TryClone for AggContext {
+    type Error = TryReserveError;
+
+    /// Fallible clone: the builtin payload's Vec and each contained Text/Blob
+    /// go through fallible reservation. External state holds only FFI
+    /// pointers and copies without allocating.
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::CloneFrom)]
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        match self {
+            Self::Builtin(payload) => {
+                let mut values = Vec::try_with_capacity_ext(payload.len())?;
+                for value in payload {
+                    let mut copy = Value::Null;
+                    copy.try_clone_from(value)?;
+                    values.push(copy);
+                }
+                Ok(Self::Builtin(values))
+            }
+            Self::External(_) => Ok(self.clone()),
+        }
+    }
 }
 
 impl AggContext {
@@ -919,8 +1116,10 @@ impl std::ops::DivAssign<Value> for Value {
     }
 }
 
-impl From<ValueRef<'_>> for Value {
-    fn from(value: ValueRef<'_>) -> Self {
+impl TryFrom<ValueRef<'_>> for Value {
+    type Error = TryReserveError;
+
+    fn try_from(value: ValueRef<'_>) -> std::result::Result<Self, Self::Error> {
         value.to_owned()
     }
 }
@@ -1031,14 +1230,21 @@ mod immutable_record {
         }
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     pub struct ImmutableRecordRef<'a> {
-        payload: &'a [u8],
+        payload: ImmutableRecordRefPayload<'a>,
+    }
+
+    #[derive(Clone)]
+    enum ImmutableRecordRefPayload<'a> {
+        Borrowed(&'a [u8]),
+        Owned(ValueBlob),
+        Shared(crate::alloc::ArcSlice<u8>),
     }
 
     impl std::fmt::Debug for ImmutableRecordRef<'_> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            let bytes = self.payload;
+            let bytes = self.get_payload();
             let preview = if bytes.len() > 20 {
                 format!("{:?} ... ({} bytes total)", &bytes[..20], bytes.len())
             } else {
@@ -1048,15 +1254,35 @@ mod immutable_record {
         }
     }
 
+    impl PartialEq for ImmutableRecordRef<'_> {
+        fn eq(&self, other: &Self) -> bool {
+            self.get_payload() == other.get_payload()
+        }
+    }
+
+    impl Eq for ImmutableRecordRef<'_> {}
+
+    impl AsRef<[u8]> for ImmutableRecordRef<'_> {
+        fn as_ref(&self) -> &[u8] {
+            self.get_payload()
+        }
+    }
+
+    impl AsRef<[u8]> for ImmutableRecord {
+        fn as_ref(&self) -> &[u8] {
+            self.get_payload()
+        }
+    }
+
     struct AppendWriter<'a> {
-        buf: &'a mut std::vec::Vec<u8>,
+        buf: &'a mut ValueBlob,
         pos: usize,
         buf_capacity_start: usize,
         buf_ptr_start: *const u8,
     }
 
     impl<'a> AppendWriter<'a> {
-        fn new(buf: &'a mut std::vec::Vec<u8>, pos: usize) -> Self {
+        fn new(buf: &'a mut ValueBlob, pos: usize) -> Self {
             let buf_ptr_start = buf.as_ptr();
             let buf_capacity_start = buf.capacity();
             Self {
@@ -1160,7 +1386,7 @@ mod immutable_record {
     fn values_owned(payload: &[u8]) -> Result<Vec<Value>> {
         let iter = iter(payload).expect("Failed to create payload iterator");
         let values = iter
-            .map(|v| Ok::<_, LimboError>(v?.to_owned()))
+            .map(|v| Ok::<_, LimboError>(v?.to_owned()?))
             .try_collect::<Result<_>>()??;
         Ok(values)
     }
@@ -1169,13 +1395,13 @@ mod immutable_record {
         let mut iter = iter(payload).expect("Failed to create payload iterator");
         let mut values = Vec::try_with_capacity_ext(range.end - range.start)?;
         if let Some(value) = iter.nth(range.start) {
-            values.push(value?.to_owned());
+            values.push(value?.to_owned()?);
         } else {
             return Ok(values);
         }
         for _ in range.start + 1..range.end {
             if let Some(value) = iter.next() {
-                values.push(value?.to_owned());
+                values.push(value?.to_owned()?);
             } else {
                 break;
             }
@@ -1258,6 +1484,20 @@ mod immutable_record {
 
     fn column_count(payload: &[u8]) -> usize {
         iter(payload).map(|it| it.count()).unwrap_or_default()
+    }
+
+    /// A spent record buffer, obtained by retiring a record ([ImmutableRecord::retire]).
+    /// Hot-path record construction requires one, so per-row callers either recycle a
+    /// previous record's allocation or go through the single explicit entry point,
+    /// [RecordBuf::alloc]. The wrapped buffer is always empty; only its capacity carries
+    /// over.
+    #[must_use = "dropping a RecordBuf discards a reusable allocation"]
+    pub struct RecordBuf(ValueBlob);
+
+    impl RecordBuf {
+        pub fn alloc() -> Self {
+            Self(crate::alloc::vec![])
+        }
     }
 
     impl ImmutableRecord {
@@ -1351,20 +1591,20 @@ mod immutable_record {
 
     impl<'a> ImmutableRecordRef<'a> {
         #[inline(always)]
-        pub fn iter(&self) -> Result<ValueIterator<'a>, LimboError> {
-            iter(self.payload)
+        pub fn iter(&self) -> Result<ValueIterator<'_>, LimboError> {
+            iter(self.get_payload())
         }
 
-        pub fn get_values(&self) -> Result<Vec<ValueRef<'a>>> {
-            values(self.payload)
+        pub fn get_values(&self) -> Result<Vec<ValueRef<'_>>> {
+            values(self.get_payload())
         }
 
         pub fn get_two_values(
             &self,
             idx1: usize,
             idx2: usize,
-        ) -> Result<(ValueRef<'a>, ValueRef<'a>)> {
-            two_values(self.payload, idx1, idx2)
+        ) -> Result<(ValueRef<'_>, ValueRef<'_>)> {
+            two_values(self.get_payload(), idx1, idx2)
         }
 
         pub fn get_three_values(
@@ -1377,29 +1617,63 @@ mod immutable_record {
         }
 
         pub fn get_values_owned(&self) -> Result<Vec<Value>> {
-            values_owned(self.payload)
+            values_owned(self.get_payload())
         }
 
         #[inline]
-        pub fn get_value_opt(&self, idx: usize) -> Option<ValueRef<'a>> {
-            value_opt(self.payload, idx)
+        pub fn contains_null(&self) -> Result<bool> {
+            contains_null(self.get_payload())
+        }
+
+        #[inline]
+        pub fn last_value(&self) -> Option<Result<ValueRef<'_>>> {
+            last_value(self.get_payload())
+        }
+
+        #[inline]
+        pub fn get_value_opt(&self, idx: usize) -> Option<ValueRef<'_>> {
+            value_opt(self.get_payload(), idx)
         }
 
         pub fn column_count(&self) -> usize {
-            column_count(self.payload)
+            column_count(self.get_payload())
         }
     }
 
     impl ImmutableRecord {
         pub fn new(payload_capacity: usize) -> Result<Self> {
-            let mut payload = std::vec::Vec::new();
+            let mut payload = crate::alloc::vec![];
             payload.try_reserve_exact(payload_capacity)?;
             Ok(Self {
                 payload: Value::Blob(payload),
             })
         }
 
-        pub const fn from_bin_record(payload: std::vec::Vec<u8>) -> Self {
+        /// Consumes the record, keeping its allocation for reuse.
+        pub fn retire(self) -> RecordBuf {
+            let mut buf = self.into_payload();
+            buf.clear();
+            RecordBuf(buf)
+        }
+
+        /// An invalidated record backed by `buf`'s allocation.
+        pub fn from_buf(buf: RecordBuf) -> Self {
+            Self {
+                payload: Value::Blob(buf.0),
+            }
+        }
+
+        /// A record holding a copy of `payload`, serialized into `buf`.
+        #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::RecordCopy)]
+        pub fn copy_payload(payload: &[u8], buf: RecordBuf) -> Result<Self, TryReserveError> {
+            let RecordBuf(mut buf) = buf;
+            buf.try_extend(payload.iter().copied())?;
+            Ok(Self {
+                payload: Value::Blob(buf),
+            })
+        }
+
+        pub const fn from_bin_record(payload: ValueBlob) -> Self {
             Self {
                 payload: Value::Blob(payload),
             }
@@ -1420,42 +1694,59 @@ mod immutable_record {
             Self::from_values(registers.into_iter().map(|x| x.get_value()), len)
         }
 
+        /// Like [Self::from_registers], but serializes into `buf`; see [Self::build].
+        pub fn build_from_registers<'a, I: Iterator<Item = &'a Register> + Clone>(
+            registers: impl IntoIterator<Item = &'a Register, IntoIter = I>,
+            buf: RecordBuf,
+        ) -> Result<Self> {
+            Self::build(registers.into_iter().map(|x| x.get_value()), buf)
+        }
+
         pub fn from_values<'a>(
             values: impl IntoIterator<Item = impl AsValueRef + 'a> + Clone,
-            len: usize,
+            _len: usize,
         ) -> Result<Self> {
-            let mut serials = Vec::try_with_capacity_ext(len)?;
+            Self::build(values, RecordBuf::alloc())
+        }
+
+        /// Serializes `values` into `buf`, allocating only when the buffer's
+        /// capacity is insufficient. Per-row callers recycle the destination
+        /// register's previous record buffer, making steady-state record
+        /// construction allocation-free.
+        #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::RecordBuild)]
+        pub fn build<'a>(
+            values: impl IntoIterator<Item = impl AsValueRef + 'a> + Clone,
+            buf: RecordBuf,
+        ) -> Result<Self> {
+            let RecordBuf(mut buf) = buf;
             let mut size_header = 0;
             let mut size_values = 0;
 
             let mut serial_type_buf = [0; 9];
-            // write serial types
+            // Sizing pass: the cloneable iterator is re-walked below to write
+            // the serial types, so no scratch buffer is needed.
             for value in values.clone() {
                 let serial_type = SerialType::from(value.as_value_ref());
-                let n = write_varint(&mut serial_type_buf[0..], serial_type.into());
-                serials.push((serial_type_buf, n));
-
-                let value_size = serial_type.size();
-
-                size_header += n;
-                size_values += value_size;
+                size_header += varint_len(serial_type.into());
+                size_values += serial_type.size();
             }
 
             let header_size = Record::calc_header_size(size_header);
 
             // 1. write header size
-            let mut buf = std::vec::Vec::new();
-            buf.try_reserve_exact(header_size + size_values)?;
-            assert_eq!(buf.capacity(), header_size + size_values);
+            let total_size = header_size + size_values;
+            buf.try_reserve_exact(total_size)?;
             let n = write_varint(&mut serial_type_buf, header_size as u64);
 
-            buf.resize(buf.capacity(), 0);
+            buf.resize(total_size, 0);
             let mut writer = AppendWriter::new(&mut buf, 0);
             writer.extend_from_slice(&serial_type_buf[..n]);
 
-            // 2. Write serial
-            for (value, n) in serials {
-                writer.extend_from_slice(&value[..n]);
+            // 2. Write serial types
+            for value in values.clone() {
+                let serial_type = SerialType::from(value.as_value_ref());
+                let n = write_varint(&mut serial_type_buf[0..], serial_type.into());
+                writer.extend_from_slice(&serial_type_buf[..n]);
             }
 
             // write content
@@ -1504,7 +1795,7 @@ mod immutable_record {
         }
 
         #[inline]
-        pub fn into_payload(self) -> std::vec::Vec<u8> {
+        pub fn into_payload(self) -> ValueBlob {
             match self.payload {
                 Value::Blob(b) => b,
                 _ => panic!("payload must be a blob"),
@@ -1512,7 +1803,7 @@ mod immutable_record {
         }
 
         #[inline]
-        pub const fn as_blob(&self) -> &std::vec::Vec<u8> {
+        pub const fn as_blob(&self) -> &ValueBlob {
             match &self.payload {
                 Value::Blob(b) => b,
                 _ => panic!("payload must be a blob"),
@@ -1520,7 +1811,7 @@ mod immutable_record {
         }
 
         #[inline]
-        pub const fn as_blob_mut(&mut self) -> &mut std::vec::Vec<u8> {
+        pub const fn as_blob_mut(&mut self) -> &mut ValueBlob {
             match &mut self.payload {
                 Value::Blob(b) => b,
                 _ => panic!("payload must be a blob"),
@@ -1533,6 +1824,7 @@ mod immutable_record {
         }
 
         #[inline]
+        #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::RecordCopy)]
         pub fn start_serialization(&mut self, payload: &[u8]) -> Result<()> {
             let blob = self.as_blob_mut();
             blob.try_reserve(payload.len())?;
@@ -1558,22 +1850,48 @@ mod immutable_record {
 
     impl<'a> ImmutableRecordRef<'a> {
         pub const fn from_bin_record(payload: &'a [u8]) -> Self {
-            Self { payload }
+            Self {
+                payload: ImmutableRecordRefPayload::Borrowed(payload),
+            }
+        }
+
+        pub(crate) fn from_owned_record(record: ImmutableRecord) -> ImmutableRecordRef<'static> {
+            ImmutableRecordRef {
+                payload: ImmutableRecordRefPayload::Owned(record.into_payload()),
+            }
+        }
+
+        pub(crate) fn from_shared_record(
+            payload: crate::alloc::ArcSlice<u8>,
+        ) -> ImmutableRecordRef<'static> {
+            ImmutableRecordRef {
+                payload: ImmutableRecordRefPayload::Shared(payload),
+            }
         }
 
         #[inline]
-        pub const fn get_payload(&self) -> &'a [u8] {
-            self.payload
+        pub fn get_payload(&self) -> &[u8] {
+            match &self.payload {
+                ImmutableRecordRefPayload::Borrowed(payload) => payload,
+                ImmutableRecordRefPayload::Owned(payload) => payload,
+                ImmutableRecordRefPayload::Shared(payload) => payload,
+            }
         }
 
         #[inline]
-        pub const fn is_invalidated(&self) -> bool {
-            self.payload.is_empty()
+        pub fn is_invalidated(&self) -> bool {
+            self.get_payload().is_empty()
+        }
+
+        pub fn reborrow(&self) -> ImmutableRecordRef<'_> {
+            ImmutableRecordRef {
+                payload: ImmutableRecordRefPayload::Borrowed(self.get_payload()),
+            }
         }
     }
 }
 
-pub use immutable_record::{ImmutableRecord, ImmutableRecordRef};
+pub use immutable_record::{ImmutableRecord, ImmutableRecordRef, RecordBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Record {
@@ -1902,16 +2220,16 @@ impl<'a> ValueRef<'a> {
     }
 
     #[inline]
-    pub fn to_owned(&self) -> Value {
-        match self {
+    pub fn to_owned(&self) -> std::result::Result<Value, TryReserveError> {
+        Ok(match self {
             ValueRef::Null => Value::Null,
             ValueRef::Numeric(n) => Value::from(*n),
             ValueRef::Text(text) => Value::Text(Text {
                 value: text.value.to_string().into(),
                 subtype: text.subtype,
             }),
-            ValueRef::Blob(b) => Value::Blob(b.to_vec()),
-        }
+            ValueRef::Blob(b) => return Value::from_slice(b),
+        })
     }
 
     pub fn value_type(&self) -> ValueType {
@@ -2199,6 +2517,7 @@ where
     Ok(std::cmp::Ordering::Equal)
 }
 
+/// Treats `NULL` as equal to itself and smaller than other values.
 pub fn compare_immutable_single<V1, V2>(l: V1, r: V2, collation: CollationSeq) -> std::cmp::Ordering
 where
     V1: AsValueRef,
@@ -2210,6 +2529,34 @@ where
         (ValueRef::Text(left), ValueRef::Text(right)) => collation.compare_strings(&left, &right),
         _ => l.cmp(&r),
     }
+}
+
+pub fn cmp_in_column(a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
+    cmp_with_sort(compare_immutable_single(a, b, key.collation), a, b, key)
+}
+
+/// Outputs a modified [Ordering] that takes into account the sort order and the NULLS order.
+#[must_use]
+pub fn cmp_with_sort(cmp: Ordering, a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
+    if cmp != Ordering::Equal {
+        let involves_null = matches!(a, ValueRef::Null) || matches!(b, ValueRef::Null);
+        if involves_null {
+            if let Some(nulls_order) = key.nulls_order {
+                // ValueRef ordering: NULL < non-NULL.
+                // NULLS FIRST: keep that natural order regardless of ASC/DESC.
+                // NULLS LAST: reverse it regardless of ASC/DESC.
+                return match nulls_order {
+                    turso_parser::ast::NullsOrder::First => cmp,
+                    turso_parser::ast::NullsOrder::Last => cmp.reverse(),
+                };
+            }
+        }
+        return match key.sort_order {
+            SortOrder::Asc => cmp,
+            SortOrder::Desc => cmp.reverse(),
+        };
+    }
+    Ordering::Equal
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3027,6 +3374,11 @@ impl Cursor {
         match self {
             Self::BTree(cursor) => cursor.set_null_flag(flag),
             Self::Virtual(cursor) => cursor.set_null_flag(flag),
+            // A pseudo cursor always decodes columns from its content
+            // register. SQLite's OP_NullRow likewise leaves pseudo-cursor
+            // column reads untouched: nullRow is the steady state for pseudo
+            // cursors there, and OP_Column keeps routing to the register.
+            Self::Pseudo(_) => {}
             _ => {
                 mark_unlikely();
                 panic!("set_null_flag on unexpected cursor type");
@@ -3037,9 +3389,7 @@ impl Cursor {
 
 #[derive(Debug)]
 #[must_use]
-pub enum IOCompletions {
-    Single(Completion),
-}
+pub struct IOCompletions(pub Completion);
 
 pub struct IOCompletionAsync<'a, I: ?Sized + IO> {
     io: &'a I,
@@ -3067,51 +3417,41 @@ impl<'a, I: ?Sized + IO> Future for IOCompletionAsync<'a, I> {
 impl IOCompletions {
     /// Wais for the Completions to complete
     pub fn wait<I: ?Sized + IO>(self, io: &I) -> Result<()> {
-        match self {
-            IOCompletions::Single(c) => io.wait_for_completion(c),
-        }
+        io.wait_for_completion(self.0)
     }
 
     /// Waits for Completion to complete and `steps` IO. Ideally the user should do the stepping,
     /// but we do not have yet a good api for this
     pub async fn wait_async<I: ?Sized + IO>(self, io: &I) -> Result<()> {
-        match self {
-            IOCompletions::Single(c) => IOCompletionAsync { io, completion: c }.await,
+        IOCompletionAsync {
+            io,
+            completion: self.0,
         }
+        .await
     }
 
     pub fn finished(&self) -> bool {
-        match self {
-            IOCompletions::Single(c) => c.finished(),
-        }
+        self.0.finished()
     }
 
     /// Returns true if this is an explicit yield — a signal to return control
     /// to the cooperative scheduler so other fibers can make progress.
     pub fn is_explicit_yield(&self) -> bool {
-        match self {
-            IOCompletions::Single(c) => c.is_explicit_yield(),
-        }
+        self.0.is_explicit_yield()
     }
 
     /// Send abort signal to completions
     pub fn abort(&self) {
-        match self {
-            IOCompletions::Single(c) => c.abort(),
-        }
+        self.0.abort()
     }
 
     pub fn get_error(&self) -> Option<CompletionError> {
-        match self {
-            IOCompletions::Single(c) => c.get_error(),
-        }
+        self.0.get_error()
     }
 
     pub fn set_waker(&self, waker: Option<&Waker>) {
         if let Some(waker) = waker {
-            match self {
-                IOCompletions::Single(c) => c.set_waker(waker),
-            }
+            self.0.set_waker(waker)
         }
     }
 }
@@ -3250,7 +3590,16 @@ impl SeekOp {
 #[derive(Clone, PartialEq, Debug)]
 pub enum SeekKey<'a> {
     TableRowId(i64),
-    IndexKey(&'a ImmutableRecord),
+    IndexKey(ImmutableRecordRef<'a>),
+}
+
+impl<'a> SeekKey<'a> {
+    pub fn index_record(&self) -> Option<&ImmutableRecordRef<'a>> {
+        match self {
+            Self::TableRowId(_) => None,
+            Self::IndexKey(record) => Some(record),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -3302,6 +3651,101 @@ mod tests {
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
 
+    fn assert_integer_conversions<T>(in_range: &[(i64, T)], out_of_range: &[i64])
+    where
+        T: Copy + std::fmt::Debug + PartialEq + FromValue,
+    {
+        for &(input, expected) in in_range {
+            assert_eq!(T::from_sql(Value::from_i64(input)).unwrap(), expected);
+        }
+        for &input in out_of_range {
+            assert!(
+                matches!(
+                    T::from_sql(Value::from_i64(input)),
+                    Err(LimboError::IntegerOverflow)
+                ),
+                "{input} should overflow {}",
+                std::any::type_name::<T>()
+            );
+        }
+    }
+
+    #[test]
+    fn from_value_checks_integer_ranges() {
+        assert_integer_conversions::<i32>(
+            &[
+                (i32::MIN as i64, i32::MIN),
+                (-1, -1),
+                (0, 0),
+                (1, 1),
+                (i32::MAX as i64, i32::MAX),
+            ],
+            &[i32::MIN as i64 - 1, i32::MAX as i64 + 1],
+        );
+        assert_integer_conversions::<u32>(
+            &[(0, 0), (1, 1), (u32::MAX as i64, u32::MAX)],
+            &[-2, -1, u32::MAX as i64 + 1],
+        );
+        assert_integer_conversions::<i64>(
+            &[
+                (i64::MIN, i64::MIN),
+                (-1, -1),
+                (0, 0),
+                (1, 1),
+                (i64::MAX, i64::MAX),
+            ],
+            &[],
+        );
+        assert_integer_conversions::<u64>(
+            &[(0, 0), (1, 1), (i64::MAX, i64::MAX as u64)],
+            &[-2, -1],
+        );
+    }
+
+    #[test]
+    fn from_value_converts_integers_to_f64() {
+        for input in [i64::MIN, -1, 0, 1, (1_i64 << 53) + 1, i64::MAX] {
+            assert_eq!(f64::from_sql(Value::from_i64(input)).unwrap(), input as f64);
+        }
+        assert_eq!(f64::from_sql(Value::from_f64(1.5)).unwrap(), 1.5);
+    }
+
+    #[cfg(nightly)]
+    #[test]
+    fn moving_blobs_through_value_preserves_allocation() {
+        fn assert_move_preserves_allocation(blob: ValueBlob) {
+            let pointer = blob.as_ptr();
+            let capacity = blob.capacity();
+            let len = blob.len();
+
+            let value = Value::from_blob(blob);
+            let Value::Blob(blob) = value else {
+                unreachable!();
+            };
+
+            assert_eq!(blob.as_ptr(), pointer);
+            assert_eq!(blob.capacity(), capacity);
+            assert_eq!(blob.len(), len);
+        }
+
+        assert_move_preserves_allocation(vec![]);
+        assert_move_preserves_allocation(vec![1, 2, 3, 4]);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn value_blob_serde_preserves_sequence_format() {
+        let value = Value::from_slice(&[1, 2, 3, 4]).expect(crate::alloc::ALLOC_ERR_MSG);
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert_eq!(encoded, r#"{"Blob":[1,2,3,4]}"#);
+
+        let decoded: Value = serde_json::from_str(&encoded).unwrap();
+        let Value::Blob(blob) = decoded else {
+            panic!("expected blob value");
+        };
+        assert_eq!(blob.as_slice(), &[1, 2, 3, 4]);
+    }
+
     #[test]
     fn test_value_iterator_simple() {
         let mut buf = std::vec::Vec::new();
@@ -3347,7 +3791,7 @@ mod tests {
             Value::from_i64(100),
             Value::from_f64(std::f64::consts::PI),
             Value::Text(Text::new("test")),
-            Value::Blob(std::vec![1, 2, 3]),
+            Value::from_slice(&[1, 2, 3]).expect(crate::alloc::ALLOC_ERR_MSG),
             Value::from_i64(0),
             Value::from_i64(1),
         ]);
@@ -3868,7 +4312,7 @@ mod tests {
                 "large_field_count",
             ),
             (
-                vec![Value::Blob(std::vec![1, 2, 3])],
+                vec![Value::from_slice(&[1, 2, 3]).expect(crate::alloc::ALLOC_ERR_MSG)],
                 vec![ValueRef::Blob(&[1, 2, 3])],
                 "blob_first_field",
             ),
@@ -4158,7 +4602,9 @@ mod tests {
     #[test]
     fn test_serialize_blob() {
         let blob = std::vec![1, 2, 3, 4, 5];
-        let record = Record::new(vec![Value::Blob(blob.clone())]);
+        let record = Record::new(vec![
+            Value::from_slice(&blob).expect(crate::alloc::ALLOC_ERR_MSG)
+        ]);
         let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 
@@ -4311,6 +4757,105 @@ mod tests {
                 cnt, num_values,
                 "column_count should be {num_values}, not {cnt}"
             );
+        }
+    }
+
+    #[test]
+    fn test_value_try_clone_from_reuses_allocations() {
+        let src = Value::build_text(String::from("short"));
+        let mut dst =
+            Value::build_text(String::from("a destination string with plenty of capacity"));
+        let ptr = match &dst {
+            Value::Text(t) => t.as_str().as_ptr(),
+            _ => unreachable!(),
+        };
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        match &dst {
+            Value::Text(t) => assert_eq!(t.as_str().as_ptr(), ptr),
+            _ => unreachable!(),
+        }
+
+        let mut dst = Value::build_text("static text");
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+
+        let src = Value::Blob(vec![1, 2, 3]);
+        let mut big_blob: ValueBlob = vec![];
+        big_blob.extend(0u8..32);
+        let mut dst = Value::Blob(big_blob);
+        let ptr = match &dst {
+            Value::Blob(b) => b.as_ptr(),
+            _ => unreachable!(),
+        };
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        match &dst {
+            Value::Blob(b) => assert_eq!(b.as_ptr(), ptr),
+            _ => unreachable!(),
+        }
+
+        let src = Value::from_i64(9);
+        let mut dst = Value::build_text("text");
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        let src = Value::build_text("into an integer slot");
+        let mut dst = Value::from_i64(3);
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn test_build_reuses_retired_buffer_and_matches_from_values() {
+        let mut blob: ValueBlob = vec![];
+        blob.extend(0u8..64);
+        let big = vec![
+            Value::build_text("a longer text value that forces a real allocation"),
+            Value::Blob(blob),
+            Value::from_i64(42),
+        ];
+        let small = vec![Value::from_i64(1), Value::Null];
+
+        let expected_big = ImmutableRecord::from_values(&big, big.len()).unwrap();
+        let expected_small = ImmutableRecord::from_values(&small, small.len()).unwrap();
+
+        let record = ImmutableRecord::build(&big, RecordBuf::alloc()).unwrap();
+        assert_eq!(record.get_payload(), expected_big.get_payload());
+
+        let capacity = record.as_blob().capacity();
+        let ptr = record.get_payload().as_ptr();
+        let record = ImmutableRecord::build(&small, record.retire()).unwrap();
+        assert_eq!(record.get_payload(), expected_small.get_payload());
+        assert_eq!(record.as_blob().capacity(), capacity);
+        assert_eq!(record.get_payload().as_ptr(), ptr);
+
+        let record = ImmutableRecord::build(&big, expected_small.retire()).unwrap();
+        assert_eq!(record.get_payload(), expected_big.get_payload());
+    }
+
+    #[test]
+    fn test_copy_payload_reuses_buffer() {
+        let values = vec![Value::build_text("payload to copy"), Value::from_i64(7)];
+        let source = ImmutableRecord::from_values(&values, values.len()).unwrap();
+        let spare = ImmutableRecord::from_values(&values, values.len()).unwrap();
+
+        let ptr = spare.get_payload().as_ptr();
+        let copy = ImmutableRecord::copy_payload(source.get_payload(), spare.retire()).unwrap();
+        assert_eq!(copy.get_payload(), source.get_payload());
+        assert_eq!(copy.get_payload().as_ptr(), ptr);
+    }
+
+    #[test]
+    fn test_value_try_clone() {
+        let values = [
+            Value::Null,
+            Value::from_i64(7),
+            Value::build_text("text"),
+            Value::Blob(vec![1, 2, 3]),
+        ];
+
+        for value in values {
+            assert_eq!(value.try_clone().unwrap(), value);
         }
     }
 }

@@ -211,6 +211,7 @@ impl File for MemoryYieldFile {
 mod tests {
     use super::*;
     use crate::vdbe::StepResult;
+    use crate::SqliteDialect;
     use crate::{Database, IOResult, OpenFlags};
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -356,7 +357,8 @@ mod tests {
     fn engine_yields_and_round_trips() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryYieldIO::new());
-        let db = Database::open_file(io.clone(), "memory_yield_test.db").unwrap();
+        let db = Database::open_file(io.clone(), "memory_yield_test.db", Arc::new(SqliteDialect))
+            .unwrap();
         let conn = db.connect().unwrap();
 
         // Step statements manually so we can observe the cooperative-yield path.
@@ -403,7 +405,12 @@ mod tests {
     fn journal_mode_mvcc_bootstrap_yields_without_internal_step() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(StepGuardedIO::new());
-        let db = Database::open_file(io.clone(), "journal_mode_mvcc_yield.db").unwrap();
+        let db = Database::open_file(
+            io.clone(),
+            "journal_mode_mvcc_yield.db",
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
         let mut stmt = conn.prepare("PRAGMA journal_mode = 'mvcc'").unwrap();
 
@@ -446,6 +453,7 @@ mod tests {
             OpenFlags::Create,
             crate::DatabaseOpts::new().with_attach(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -488,7 +496,8 @@ mod tests {
     fn pager_allocate_and_free_yield_for_header_reads_without_internal_step() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(StepGuardedIO::new());
-        let db = Database::open_file(io.clone(), "pager_header_yield.db").unwrap();
+        let db = Database::open_file(io.clone(), "pager_header_yield.db", Arc::new(SqliteDialect))
+            .unwrap();
         let conn = db.connect().unwrap();
         conn.execute("CREATE TABLE t(x)").unwrap();
 
@@ -516,7 +525,12 @@ mod tests {
     fn overflow_delete_yields_for_header_validation_without_internal_step() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(StepGuardedIO::new());
-        let db = Database::open_file(io.clone(), "overflow_delete_yield.db").unwrap();
+        let db = Database::open_file(
+            io.clone(),
+            "overflow_delete_yield.db",
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
         conn.execute("CREATE TABLE t(x BLOB)").unwrap();
         conn.execute("INSERT INTO t VALUES (zeroblob(20000))")
@@ -572,7 +586,12 @@ mod tests {
     fn wasm_opfs_cache_spill_insert_hang() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(StepGuardedIO::new());
-        let db = Database::open_file(io.clone(), "wasm_opfs_spill_hang.db").unwrap();
+        let db = Database::open_file(
+            io.clone(),
+            "wasm_opfs_spill_hang.db",
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
 
         // Drive one statement to completion exactly like the WASM/OPFS JS

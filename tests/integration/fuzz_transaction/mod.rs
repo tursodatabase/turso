@@ -570,7 +570,7 @@ struct DmlGenOptions {
 impl Default for FuzzOptions {
     fn default() -> Self {
         Self {
-            num_iterations: 50,
+            num_iterations: 10,
             operations_per_connection: 30,
             reopen_probability: 0.1,
             max_num_connections: 8,

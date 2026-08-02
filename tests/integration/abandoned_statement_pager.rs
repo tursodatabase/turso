@@ -14,10 +14,13 @@
 
 use std::sync::Arc;
 
-use turso_core::{Connection, Database, LimboError, MemoryYieldIO, StepResult, IO};
+use turso_core::{Connection, Database, LimboError, MemoryYieldIO, SqliteDialect, StepResult, IO};
 
 fn open_conn(io: Arc<MemoryYieldIO>, path: &str) -> Arc<Connection> {
-    Database::open_file(io, path).unwrap().connect().unwrap()
+    Database::open_file(io, path, Arc::new(SqliteDialect))
+        .unwrap()
+        .connect()
+        .unwrap()
 }
 
 fn integrity_check(conn: &Arc<Connection>) -> Vec<String> {

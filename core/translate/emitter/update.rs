@@ -51,7 +51,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext},
-        insn::{to_u16, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
+        insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset,
     },
     CaptureDataChangesExt, Connection, HashSet, Result, MAIN_DB_ID,
@@ -1887,9 +1887,9 @@ fn emit_update_insns<'a>(
         });
 
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(idx_start_reg),
-            count: to_u16(num_cols + 1),
-            dest_reg: to_u16(*record_reg),
+            start_reg: to_u32(idx_start_reg),
+            count: to_u32(num_cols + 1),
+            dest_reg: to_u32(*record_reg),
             index_name: Some(index.name.clone()),
             affinity_str: None,
         });
@@ -2229,7 +2229,7 @@ fn emit_update_insns<'a>(
             cursor_id: ctx.idx_cursor_id,
             record_reg: ctx.record_reg,
             unpacked_start: Some(ctx.idx_start_reg),
-            unpacked_count: Some((ctx.num_cols + 1) as u16),
+            unpacked_count: Some((ctx.num_cols + 1) as u32),
             flags: IdxInsertFlags::new().nchange(true),
         });
 
@@ -2547,9 +2547,9 @@ fn emit_update_insns<'a>(
             let cdc_updates_record = if let Some(cdc_updates_register) = cdc_updates_register {
                 let record_reg = program.alloc_register();
                 program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u16(cdc_updates_register),
-                    count: to_u16(2 * col_len),
-                    dest_reg: to_u16(record_reg),
+                    start_reg: to_u32(cdc_updates_register),
+                    count: to_u32(2 * col_len),
+                    dest_reg: to_u32(record_reg),
                     index_name: None,
                     affinity_str: None,
                 });

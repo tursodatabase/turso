@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use turso_core::{Connection, Database, DatabaseOpts, IO, LimboError, OpenFlags};
+use turso_core::{Connection, Database, DatabaseOpts, IO, LimboError, OpenFlags, SqliteDialect};
 use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
 use turso_whopper::multiprocess_platform_io;
 
@@ -234,6 +234,7 @@ fn read_simple_kv_length(db_path: &Path, table_name: &str, key: &str) -> Option<
         OpenFlags::ReadOnly,
         multiprocess_wal_db_opts(),
         None,
+        Arc::new(SqliteDialect),
     )
     .expect("open observer database");
     let conn = reopened.connect().expect("connect observer db");
@@ -547,8 +548,12 @@ fn multiprocess_finalize_after_restart_preserves_simple_kv_rows() {
     whopper.finalize().expect("finalize multiprocess whopper");
 
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let reopened = Database::open_file(io, db_path.to_str().expect("db path utf8"))
-        .expect("reopen finalized database");
+    let reopened = Database::open_file(
+        io,
+        db_path.to_str().expect("db path utf8"),
+        Arc::new(SqliteDialect),
+    )
+    .expect("reopen finalized database");
     let conn = reopened.connect().expect("connect reopened db");
     assert_eq!(
         count_rows_in_table(&conn, table_name),

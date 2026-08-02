@@ -8,6 +8,7 @@
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use std::sync::atomic::{AtomicI64, Ordering};
+use turso_core::LimboError;
 
 use crate::chaotic_elle::{ChaoticWorkload, ChaoticWorkloadProfile};
 use crate::operations::{OpResult, Operation, TxMode};
@@ -43,18 +44,49 @@ impl Default for BtreeRebalanceProfile {
 struct BtreeRebalanceWorkload {
     ops: Vec<Operation>,
     index: usize,
+    validating_after_allocation_failure: bool,
 }
 
 impl BtreeRebalanceWorkload {
     fn new(ops: Vec<Operation>) -> Self {
-        Self { ops, index: 0 }
+        Self {
+            ops,
+            index: 0,
+            validating_after_allocation_failure: false,
+        }
     }
 }
 
 impl ChaoticWorkload for BtreeRebalanceWorkload {
     fn next(&mut self, result: Option<OpResult>) -> Option<Operation> {
-        if let Some(Err(e)) = &result {
-            tracing::trace!("btree rebalance workload stopped after operation error: {e}");
+        if self.validating_after_allocation_failure {
+            return match result {
+                Some(Ok(_)) => None,
+                Some(Err(
+                    LimboError::OutOfMemory
+                    | LimboError::Busy
+                    | LimboError::BusySnapshot
+                    | LimboError::WriteWriteConflict
+                    | LimboError::CommitDependencyAborted
+                    | LimboError::SchemaUpdated
+                    | LimboError::SchemaConflict,
+                )) => Some(Operation::IntegrityCheck),
+                Some(Err(error)) => {
+                    tracing::trace!(
+                        "btree rebalance post-allocation-failure integrity check stopped: {error}"
+                    );
+                    None
+                }
+                None => Some(Operation::IntegrityCheck),
+            };
+        }
+
+        if let Some(Err(error)) = result {
+            if matches!(error, LimboError::OutOfMemory) {
+                self.validating_after_allocation_failure = true;
+                return Some(Operation::IntegrityCheck);
+            }
+            tracing::trace!("btree rebalance workload stopped after operation error: {error}");
             return None;
         }
 
@@ -73,6 +105,7 @@ impl ChaoticWorkloadProfile for BtreeRebalanceProfile {
         let mut ops = Vec::new();
 
         push_setup_ops(&mut ops, &self.table_name, &freelist_table_name);
+        push_overflow_probe(&mut ops, &self.table_name, block_base, &mut rng);
         push_seed_freelist_tx(&mut ops, &freelist_table_name, block_base, &mut rng);
         push_warmup_tx(&mut ops, &self.table_name, block_base, &mut rng);
         push_free_freelist_tx(&mut ops, &freelist_table_name, block_base);
@@ -88,6 +121,18 @@ impl ChaoticWorkloadProfile for BtreeRebalanceProfile {
 
         Box::new(BtreeRebalanceWorkload::new(ops))
     }
+}
+
+fn push_overflow_probe(
+    ops: &mut Vec<Operation>,
+    table_name: &str,
+    block_base: i64,
+    rng: &mut ChaCha8Rng,
+) {
+    ops.push(insert_op(table_name, block_base, 16 * 1024, rng));
+    ops.push(Operation::Select {
+        sql: format!("SELECT pad FROM {table_name} WHERE id = {block_base}"),
+    });
 }
 
 fn push_setup_ops(ops: &mut Vec<Operation>, table_name: &str, freelist_table_name: &str) {
@@ -300,6 +345,43 @@ mod tests {
                 > (FREELIST_ROWS + WARMUP_ROWS) as usize
         );
         assert!(ops.iter().any(|op| matches!(op, Operation::Delete { .. })));
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, Operation::Select { sql } if
+            sql.starts_with("SELECT pad FROM btree_rebalance")))
+        );
         assert!(ops.iter().any(|op| matches!(op, Operation::IntegrityCheck)));
+    }
+
+    #[test]
+    fn allocation_failure_is_followed_by_integrity_check() {
+        let mut workload = BtreeRebalanceWorkload::new(vec![Operation::Commit]);
+
+        assert!(matches!(workload.next(None), Some(Operation::Commit)));
+        assert!(matches!(
+            workload.next(Some(Err(LimboError::OutOfMemory))),
+            Some(Operation::IntegrityCheck)
+        ));
+        assert!(workload.next(Some(Ok(Vec::new()))).is_none());
+    }
+
+    #[test]
+    fn allocation_failure_during_integrity_check_is_retried() {
+        let mut workload = BtreeRebalanceWorkload::new(vec![Operation::Commit]);
+
+        assert!(matches!(workload.next(None), Some(Operation::Commit)));
+        assert!(matches!(
+            workload.next(Some(Err(LimboError::OutOfMemory))),
+            Some(Operation::IntegrityCheck)
+        ));
+        assert!(matches!(
+            workload.next(Some(Err(LimboError::OutOfMemory))),
+            Some(Operation::IntegrityCheck)
+        ));
+        assert!(matches!(
+            workload.next(Some(Err(LimboError::Busy))),
+            Some(Operation::IntegrityCheck)
+        ));
+        assert!(workload.next(Some(Ok(Vec::new()))).is_none());
     }
 }

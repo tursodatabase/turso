@@ -46,32 +46,7 @@ pub fn create_dbsp_state_index(root_page: i64) -> Index {
         name: "dbsp_state_pk".to_string(),
         table_name: "dbsp_state".to_string(),
         root_page,
-        columns: crate::alloc::vec![
-            IndexColumn {
-                name: "operator_id".to_string(),
-                order: turso_parser::ast::SortOrder::Asc,
-                collation: None,
-                pos_in_table: 0,
-                default: None,
-                expr: None,
-            },
-            IndexColumn {
-                name: "zset_id".to_string(),
-                order: turso_parser::ast::SortOrder::Asc,
-                collation: None,
-                pos_in_table: 1,
-                default: None,
-                expr: None,
-            },
-            IndexColumn {
-                name: "element_id".to_string(),
-                order: turso_parser::ast::SortOrder::Asc,
-                collation: None,
-                pos_in_table: 2,
-                default: None,
-                expr: None,
-            },
-        ],
+        columns: IndexColumn::new_many(vec!["operator_id", "zset_id", "element_id"]),
         unique: true,
         ephemeral: false,
         has_rowid: true,
@@ -261,6 +236,7 @@ pub trait IncrementalOperator: Debug + Send {
 
 #[cfg(test)]
 mod tests {
+    use crate::SqliteDialect;
     use rustc_hash::FxHashSet as HashSet;
 
     use super::*;
@@ -278,7 +254,7 @@ mod tests {
     /// Create a test pager for operator tests with both table and index
     fn create_test_pager() -> (crate::sync::Arc<crate::Pager>, i64, i64) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:").unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
 
         let pager = conn.pager.load().clone();

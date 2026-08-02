@@ -5,6 +5,7 @@ mod ops;
 pub(crate) mod path;
 pub(crate) mod vtab;
 
+use crate::alloc::TryReserveError;
 use crate::json::error::Error as JsonError;
 pub use crate::json::ops::{
     json_insert, json_patch, json_remove, json_replace, jsonb_insert, jsonb_patch, jsonb_remove,
@@ -21,11 +22,6 @@ use jsonb::{
 };
 use std::borrow::Cow;
 use std::str::FromStr;
-
-// Object/array headers with inline payload size <= 7 are ambiguous with 8-byte scalar blobs:
-// 1-byte header + 7-byte payload == 8 bytes (e.g. INT/FLOAT scalar bytes like `0x7C 12 34 56 78 9A BC DE`
-// It is not JSONB, but it is being recognized as JSONB.
-const JSONB_AMBIGUOUS_PAYLOAD_MAX: usize = 7;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Conv {
@@ -69,22 +65,23 @@ pub fn get_json(json_value: &Value, indent: Option<&str>) -> crate::Result<Value
 pub fn jsonb(json_value: &Value, cache: &JsonCacheCell) -> crate::Result<Value> {
     let json_conv_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
 
-    let jsonbin = cache.get_or_insert_with(json_value, json_conv_fn);
-    match jsonbin {
-        Ok(jsonbin) => Ok(Value::Blob(jsonbin.data())),
-        Err(_) => {
-            bail_parse_error!("malformed JSON")
-        }
-    }
+    let jsonbin =
+        cache
+            .get_or_insert_with(json_value, json_conv_fn)
+            .map_err(|error| match error {
+                LimboError::OutOfMemory => LimboError::OutOfMemory,
+                _ => LimboError::ParseError("malformed JSON".to_string()),
+            })?;
+    Ok(Value::Blob(jsonbin.data()))
 }
 
-pub fn convert_dbtype_to_raw_jsonb(data: &Value, strict: Conv) -> crate::Result<Vec<u8>> {
+pub fn convert_dbtype_to_raw_jsonb(data: &Value, strict: Conv) -> crate::Result<crate::ValueBlob> {
     let json = convert_dbtype_to_jsonb(data, strict)?;
     Ok(json.data())
 }
 
 pub fn json_from_raw_bytes_agg(data: &[u8], raw: bool) -> crate::Result<Value> {
-    let mut json = Jsonb::from_raw_data(data);
+    let mut json = Jsonb::from_raw_data(data)?;
     let el_type = json.element_type()?;
     json.finalize_unsafe(el_type)?;
     if raw {
@@ -107,24 +104,32 @@ fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
     Jsonb::from_str_with_mode(str, mode).map_err(Into::into)
 }
 
-fn is_jsonb_blob(slice: &[u8]) -> bool {
+fn malformed_json_error(error: JsonError) -> LimboError {
+    match error {
+        JsonError::OutOfMemory => LimboError::OutOfMemory,
+        JsonError::Message { .. } => LimboError::ParseError("malformed JSON".to_string()),
+    }
+}
+
+fn is_jsonb_blob(slice: &[u8]) -> Result<bool, TryReserveError> {
     let Ok((header, header_offset)) = JsonbHeader::from_slice(0, slice) else {
-        return false;
+        return Ok(false);
     };
     let payload_size = header.payload_size();
     let Some(total_expected) = header_offset.checked_add(payload_size) else {
-        return false;
+        return Ok(false);
     };
     if total_expected != slice.len() {
-        return false;
+        return Ok(false);
     }
 
-    let jsonb = Jsonb::from_raw_data(slice);
-    if header.is_scalar() || payload_size <= JSONB_AMBIGUOUS_PAYLOAD_MAX {
-        jsonb.is_valid()
-    } else {
-        jsonb.element_type().is_ok()
-    }
+    // A one-byte header cannot identify JSONB: any blob's first byte parses as a
+    // plausible header, and the length check above still admits arbitrary data --
+    // an 8-byte blob starting `0x7C` reads as "OBJECT, 7-byte payload". So the
+    // whole document must validate, because later readers trust its interior
+    // offsets and decode its text payloads as `&str`.
+    let jsonb = Jsonb::from_raw_data(slice)?;
+    Ok(jsonb.is_valid())
 }
 
 pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Result<Jsonb> {
@@ -141,7 +146,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                 str.push('"');
                 Jsonb::from_str(&str)
             };
-            res.map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
+            res.map_err(malformed_json_error)
         }
         ValueRef::Blob(blob) => {
             let bytes = blob;
@@ -167,13 +172,11 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                         if total_expected != slice.len() {
                             parse_as_json_text(slice, strict)?
                         } else {
-                            let jsonb = Jsonb::from_raw_data(slice);
-                            let is_valid_json = if payload_size <= 7 {
-                                jsonb.is_valid()
-                            } else {
-                                jsonb.element_type().is_ok()
-                            };
-                            if is_valid_json {
+                            // Validate the whole document, not just the outer
+                            // header: later readers trust interior offsets and
+                            // the UTF-8 well-formedness of text payloads.
+                            let jsonb = Jsonb::from_raw_data(slice)?;
+                            if jsonb.is_valid() {
                                 jsonb
                             } else {
                                 parse_as_json_text(slice, strict)?
@@ -188,11 +191,10 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
         }
         ValueRef::Null => Ok(Jsonb::from_raw_data(
             JsonbHeader::make_null().into_bytes().as_bytes(),
-        )),
+        )?),
         ValueRef::Numeric(numeric) if matches!(strict, Conv::ToString) => {
             let text = Value::from(numeric).to_string();
-            Jsonb::from_str_with_mode(&text, strict)
-                .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
+            Jsonb::from_str_with_mode(&text, strict).map_err(malformed_json_error)
         }
         ValueRef::Numeric(Numeric::Float(float)) => {
             let float: f64 = float.into();
@@ -203,8 +205,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                 } else {
                     "9.0e+999"
                 };
-                Jsonb::from_str(json_str)
-                    .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
+                Jsonb::from_str(json_str).map_err(malformed_json_error)
             } else {
                 let mut buff = ryu::Buffer::new();
                 let s_ryu = buff.format(float);
@@ -228,12 +229,12 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                     inner.push_str(exponent);
                 }
 
-                Jsonb::from_str(&s)
-                    .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
+                Jsonb::from_str(&s).map_err(malformed_json_error)
             }
         }
-        ValueRef::Numeric(Numeric::Integer(int)) => Jsonb::from_str(&int.to_string())
-            .map_err(|_| LimboError::ParseError("malformed JSON".to_string())),
+        ValueRef::Numeric(Numeric::Integer(int)) => {
+            Jsonb::from_str(&int.to_string()).map_err(malformed_json_error)
+        }
     }
 }
 
@@ -250,7 +251,7 @@ where
     I: IntoIterator<IntoIter = E, Item = V>,
 {
     let values = values.into_iter();
-    let mut json = Jsonb::make_empty_array(values.len());
+    let mut json = Jsonb::make_empty_array(values.len())?;
 
     for value in values {
         let value = value.as_value_ref();
@@ -272,7 +273,7 @@ where
     I: IntoIterator<IntoIter = E, Item = V>,
 {
     let values = values.into_iter();
-    let mut json = Jsonb::make_empty_array(values.len());
+    let mut json = Jsonb::make_empty_array(values.len())?;
 
     for value in values {
         let value = value.as_value_ref();
@@ -307,7 +308,7 @@ pub fn json_array_length(
     let path = json_path_from_db_value(path.expect("We already checked none"), true)?;
 
     if let Some(path) = path {
-        let mut op = SearchOperation::new(json.len() / 2);
+        let mut op = SearchOperation::new(json.len() / 2)?;
         let _ = json.operate_on_path(&path, &mut op);
         if let Ok(len) = op.result().array_len() {
             return Ok(Value::from_i64(len as i64));
@@ -420,7 +421,7 @@ pub fn json_arrow_extract(
     if let Some(path) = json_path_from_db_value(&path, false)? {
         let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
         let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
-        let mut op = SearchOperation::new(json.len());
+        let mut op = SearchOperation::new(json.len())?;
         let res = json.operate_on_path(&path, &mut op);
         let extracted = op.result();
         if res.is_ok() {
@@ -447,7 +448,7 @@ pub fn json_arrow_shift_extract(
     if let Some(path) = json_path_from_db_value(&path, false)? {
         let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
         let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
-        let mut op = SearchOperation::new(json.len());
+        let mut op = SearchOperation::new(json.len())?;
         let res = json.operate_on_path(&path, &mut op);
         let extracted = op.result();
         let element_type = match extracted.element_type() {
@@ -532,7 +533,7 @@ where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
 {
-    let null = Jsonb::from_raw_data(JsonbHeader::make_null().into_bytes().as_bytes());
+    let null = Jsonb::from_raw_data(JsonbHeader::make_null().into_bytes().as_bytes())?;
     if paths.len() == 1 {
         let first_path = paths.next().ok_or_else(|| {
             crate::LimboError::InternalError("paths should have one element".to_string())
@@ -540,7 +541,7 @@ where
         if let Some(path) = json_path_from_db_value(&first_path, true)? {
             let mut json = value;
 
-            let mut op = SearchOperation::new(json.len());
+            let mut op = SearchOperation::new(json.len())?;
             let res = json.operate_on_path(&path, &mut op);
             let extracted = op.result();
             let element_type = match extracted.element_type() {
@@ -558,13 +559,13 @@ where
     }
 
     let mut json = value;
-    let mut result = Jsonb::make_empty_array(json.len());
+    let mut result = Jsonb::make_empty_array(json.len())?;
 
     // TODO: make an op to avoid creating new json for every path element
     for path in paths {
         let path = json_path_from_db_value(&path, true);
         if let Some(path) = path? {
-            let mut op = SearchOperation::new(json.len());
+            let mut op = SearchOperation::new(json.len())?;
             let res = json.operate_on_path(&path, &mut op);
             let extracted = op.result();
             if res.is_ok() {
@@ -744,6 +745,7 @@ pub fn json_error_position(json: impl AsValueRef) -> crate::Result<Value> {
                     ))
                 }
             }
+            Err(JsonError::OutOfMemory) => Err(LimboError::OutOfMemory),
         },
         ValueRef::Blob(_) => {
             bail_parse_error!("Unsupported")
@@ -766,7 +768,7 @@ where
     if values.len() % 2 != 0 {
         bail_constraint_error!("json_object() requires an even number of arguments")
     }
-    let mut json = Jsonb::make_empty_obj(values.len() * 50);
+    let mut json = Jsonb::make_empty_obj(values.len() * 50)?;
 
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
     while values.len() > 1 {
@@ -806,7 +808,7 @@ where
     if values.len() % 2 != 0 {
         bail_constraint_error!("json_object() requires an even number of arguments")
     }
-    let mut json = Jsonb::make_empty_obj(values.len() * 50);
+    let mut json = Jsonb::make_empty_obj(values.len() * 50)?;
 
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
     while values.len() > 1 {
@@ -838,9 +840,9 @@ where
 
 /// Tries to convert the value to jsonb. Returns Value::from_i64(1) if the conversion
 /// succeeded, and Value::from_i64(0) if it didn't.
-pub fn is_json_valid(json_value: impl AsValueRef) -> Value {
+pub fn is_json_valid(json_value: impl AsValueRef) -> Result<Value, TryReserveError> {
     let json_value = json_value.as_value_ref();
-    match json_value {
+    Ok(match json_value {
         ValueRef::Null => Value::Null,
         ValueRef::Blob(blob) => {
             let index = blob
@@ -848,18 +850,22 @@ pub fn is_json_valid(json_value: impl AsValueRef) -> Value {
                 .position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
                 .unwrap_or(blob.len());
             let slice = &blob[index..];
-            if is_jsonb_blob(slice) {
+            if is_jsonb_blob(slice)? {
                 Value::from_i64(0)
             } else {
-                parse_as_json_text(slice, Conv::Strict)
-                    .map(|_| Value::from_i64(1))
-                    .unwrap_or_else(|_| Value::from_i64(0))
+                match parse_as_json_text(slice, Conv::Strict) {
+                    Ok(_) => Value::from_i64(1),
+                    Err(LimboError::OutOfMemory) => return Err(TryReserveError),
+                    Err(_) => Value::from_i64(0),
+                }
             }
         }
-        _ => convert_dbtype_to_jsonb(json_value, Conv::Strict)
-            .map(|_| Value::from_i64(1))
-            .unwrap_or_else(|_| Value::from_i64(0)),
-    }
+        _ => match convert_dbtype_to_jsonb(json_value, Conv::Strict) {
+            Ok(_) => Value::from_i64(1),
+            Err(LimboError::OutOfMemory) => return Err(TryReserveError),
+            Err(_) => Value::from_i64(0),
+        },
+    })
 }
 
 pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
@@ -870,7 +876,7 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
             // then this function is a no-op
             if t.subtype == TextSubtype::Json {
                 // Should just return the json value with no quotes
-                return Ok(value.to_owned());
+                return Ok(value.to_owned()?);
             }
 
             let mut escaped_value = String::with_capacity(t.value.len() + 4);
@@ -907,6 +913,20 @@ mod tests {
     use super::*;
     use crate::numeric::Numeric;
     use crate::types::Value;
+
+    #[test]
+    fn test_jsonb_preserves_malformed_json_error_and_cache_reusability() {
+        let cache = JsonCacheCell::new();
+        let invalid = Value::build_text("{");
+
+        assert!(matches!(
+            jsonb(&invalid, &cache),
+            Err(LimboError::ParseError(message)) if message == "malformed JSON"
+        ));
+
+        let valid = Value::build_text(r#"{"key":"value"}"#);
+        assert!(jsonb(&valid, &cache).is_ok());
+    }
 
     #[test]
     fn test_get_json_valid_json5() {
@@ -990,7 +1010,7 @@ mod tests {
 
     #[test]
     fn test_get_json_blob_valid_jsonb() {
-        let binary_json = vec![124, 55, 104, 101, 121, 39, 121, 111];
+        let binary_json = crate::alloc::vec![124, 55, 104, 101, 121, 39, 121, 111];
         let input = Value::Blob(binary_json);
         let result = get_json(&input, None).unwrap();
         if let Value::Text(result_str) = result {
@@ -1003,7 +1023,7 @@ mod tests {
 
     #[test]
     fn test_get_json_blob_invalid_jsonb() {
-        let binary_json: Vec<u8> = vec![0xA2, 0x62, 0x6B, 0x31, 0x62, 0x76]; // Incomplete binary JSON
+        let binary_json: crate::ValueBlob = crate::alloc::vec![0xA2, 0x62, 0x6B, 0x31, 0x62, 0x76]; // Incomplete binary JSON
         let input = Value::Blob(binary_json);
         let result = get_json(&input, None);
         println!("{result:?}");
@@ -1123,7 +1143,7 @@ mod tests {
 
     #[test]
     fn test_json_array_blob_invalid() {
-        let blob = Value::Blob("1".as_bytes().to_vec());
+        let blob = Value::from_slice(b"1").expect(crate::alloc::ALLOC_ERR_MSG);
 
         let input = [blob];
 
@@ -1875,8 +1895,20 @@ mod tests {
 
     #[test]
     fn test_is_jsonb_blob_rejects_scalar_like_overlap_header() {
+        // `|` is 0x7C: OBJECT with a 7-byte inline payload, so this is exactly at
+        // the length where a scalar blob and a JSONB object are indistinguishable
+        // by header alone.
         let overlapping_scalar = b"|1234567";
-        assert_eq!(overlapping_scalar.len(), JSONB_AMBIGUOUS_PAYLOAD_MAX + 1);
-        assert!(!is_jsonb_blob(overlapping_scalar));
+        assert_eq!(overlapping_scalar.len(), 8);
+        assert!(!is_jsonb_blob(overlapping_scalar).expect(crate::alloc::ALLOC_ERR_MSG));
+    }
+
+    /// Object with a payload larger than a scalar blob, so header inspection
+    /// alone accepts it, but the TEXT5 key holds bytes that are not UTF-8.
+    /// Reading such a key used to reach `str::from_utf8_unchecked`.
+    #[test]
+    fn test_is_jsonb_blob_rejects_invalid_utf8_key() {
+        let invalid_utf8_key = b"\x9C\x79aaaaaa\xF0\x00";
+        assert!(!is_jsonb_blob(invalid_utf8_key).expect(crate::alloc::ALLOC_ERR_MSG));
     }
 }

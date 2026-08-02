@@ -2,6 +2,11 @@
 mod nightly;
 
 #[cfg(not(nightly))]
+pub type DynVec<T> = std::vec::Vec<T>;
+#[cfg(nightly)]
+pub type DynVec<T> = std::vec::Vec<T, crate::alloc::DynAllocator>;
+
+#[cfg(not(nightly))]
 use super::{
     TryClone, TursoAllocExt, TursoFromIterator, TursoSliceExt, TursoTryWithCapacityExt,
     TursoVecExt, TursoVecInExt,

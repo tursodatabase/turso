@@ -14,6 +14,8 @@
 !bindings/dotnet/src/Turso.Data.Sqlite/
 !bindings/dotnet/src/Turso.Data.Sqlite/**
 # Python
+*.egg-info/
+.hypothesis/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
@@ -72,8 +74,8 @@ settings.local.json
 .build-hash
 
 # Track empty wals for read only databases
-!testing/sqltests/database/*
-testing/sqltests/database/integrity_*.db
+!sqlite/conformance/database/*
+sqlite/conformance/database/integrity_*.db
 
 
 # For simulator redo
@@ -103,3 +105,6 @@ dhat-heap.json
 .aristo/critiques/
 .aristo/proofs/*.proof.bak
 .aristo/archive/
+
+# pgregress actual output and diffs
+postgres/regress/results/

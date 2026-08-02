@@ -6,6 +6,7 @@ use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use rusqlite::Connection as SqliteConnection;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
+use turso_core::SqliteDialect;
 use turso_core::{Connection, Database, DatabaseOpts, LimboError, StepResult, Value};
 use turso_parser::{ast::Cmd, parser::Parser};
 
@@ -2589,6 +2590,7 @@ fn test_vacuum_into_from_memory_database() -> anyhow::Result<()> {
         OpenFlags::Create,
         turso_core::DatabaseOpts::new(),
         None,
+        Arc::new(SqliteDialect),
     )?;
     let conn = db.connect()?;
 
@@ -6065,6 +6067,7 @@ fn open_queued_db(io: Arc<QueuedIo>, path: &str) -> anyhow::Result<Arc<Database>
         Default::default(),
         DatabaseOpts::new().with_vacuum(true),
         None,
+        Arc::new(SqliteDialect),
     )?)
 }
 

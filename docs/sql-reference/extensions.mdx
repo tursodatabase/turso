@@ -302,6 +302,83 @@ SELECT percentile_cont(value, 0.25) FROM scores;
 -- 20.0
 ```
 
+## Crypto Extension
+
+The crypto extension provides hashing and encoding functions, compatible with [sqlean-crypto](https://github.com/nalgeon/sqlean/blob/main/docs/crypto.md).
+
+### Functions
+
+| Function | Parameters | Return Type | Description |
+|----------|-----------|-------------|-------------|
+| `crypto_md5(data)` | TEXT/BLOB | BLOB | MD5 hash |
+| `crypto_sha1(data)` | TEXT/BLOB | BLOB | SHA-1 hash |
+| `crypto_sha256(data)` | TEXT/BLOB | BLOB | SHA-256 hash |
+| `crypto_sha384(data)` | TEXT/BLOB | BLOB | SHA-384 hash |
+| `crypto_sha512(data)` | TEXT/BLOB | BLOB | SHA-512 hash |
+| `crypto_blake3(data)` | TEXT/BLOB | BLOB | BLAKE3 hash |
+| `crypto_encode(data, format)` | BLOB, TEXT | TEXT | Encode a blob as text using `format` (e.g. `hex`, `base32`, `base64`, `url`) |
+| `crypto_decode(text, format)` | TEXT, TEXT | BLOB | Decode text in the given `format` back into a blob |
+
+```sql
+-- Hash a value and encode it as hex
+SELECT crypto_encode(crypto_sha256('hello'), 'hex');
+
+-- Base64 round-trip
+SELECT crypto_decode(crypto_encode(x'CAFE', 'base64'), 'base64');
+```
+
+## Fuzzy Extension
+
+The fuzzy extension provides string-similarity, distance, and phonetic functions, compatible with [sqlean-fuzzy](https://github.com/nalgeon/sqlean/blob/main/docs/fuzzy.md).
+
+### Functions
+
+| Function | Parameters | Return Type | Description |
+|----------|-----------|-------------|-------------|
+| `fuzzy_editdist(a, b)` | TEXT, TEXT | INTEGER | Spellcheck-style edit distance |
+| `fuzzy_leven(a, b)` | TEXT, TEXT | INTEGER | Levenshtein distance |
+| `fuzzy_damlev(a, b)` | TEXT, TEXT | INTEGER | Damerau-Levenshtein distance |
+| `fuzzy_osadist(a, b)` | TEXT, TEXT | INTEGER | Optimal string alignment distance |
+| `fuzzy_hamming(a, b)` | TEXT, TEXT | INTEGER | Hamming distance |
+| `fuzzy_jarowin(a, b)` | TEXT, TEXT | REAL | Jaro-Winkler similarity |
+| `fuzzy_soundex(s)` | TEXT | TEXT | Soundex phonetic code |
+| `fuzzy_rsoundex(s)` | TEXT | TEXT | Refined Soundex code |
+| `fuzzy_caver(s)` | TEXT | TEXT | Caverphone phonetic code |
+| `fuzzy_phonetic(s)` | TEXT | TEXT | US Census phonetic code |
+| `fuzzy_translit(s)` | TEXT | TEXT | Transliterate Unicode text to ASCII |
+| `fuzzy_script(s)` | TEXT | INTEGER | Identify the writing script of the text |
+| `phonetics(a, b)` | TEXT, TEXT | INTEGER | 1 if two strings are phonetically equal |
+
+```sql
+-- Distance between two strings
+SELECT fuzzy_leven('awesome', 'aewsime');
+-- 3
+
+-- Phonetic encoding
+SELECT fuzzy_soundex('Robert');
+-- 'R163'
+```
+
+## IP Address Extension
+
+The ipaddr extension provides functions for working with IPv4 and IPv6 addresses and networks.
+
+### Functions
+
+| Function | Parameters | Return Type | Description |
+|----------|-----------|-------------|-------------|
+| `ipfamily(ip)` | TEXT | INTEGER | Returns 4 for IPv4 or 6 for IPv6 |
+| `iphost(ip)` | TEXT | TEXT | The host portion of an address (strips any netmask) |
+| `ipmasklen(cidr)` | TEXT | INTEGER | The prefix (mask) length of a CIDR network |
+| `ipnetwork(cidr)` | TEXT | TEXT | The network address of a CIDR value |
+| `ipcontains(network, ip)` | TEXT, TEXT | INTEGER | 1 if the CIDR network contains the given address |
+
+```sql
+SELECT ipfamily('192.168.1.1');            -- 4
+SELECT ipnetwork('192.168.1.42/24');       -- '192.168.1.0/24'
+SELECT ipcontains('10.0.0.0/8', '10.1.2.3'); -- 1
+```
+
 ## generate_series
 
 The `generate_series` table-valued function generates a sequence of integers.

@@ -1,7 +1,7 @@
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
 use std::sync::Arc;
-use turso_core::{Database, DatabaseOpts, IO, OpenFlags, Statement};
+use turso_core::{Database, DatabaseOpts, IO, OpenFlags, SqliteDialect, Statement};
 use turso_whopper::{IOFaultConfig, SimulatorIO};
 
 fn run_to_done(stmt: &mut Statement, io: &SimulatorIO) {
@@ -38,6 +38,7 @@ fn test_concurrent_commit_no_yield_spin() {
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
+        Arc::new(SqliteDialect),
     )
     .expect("open db");
 

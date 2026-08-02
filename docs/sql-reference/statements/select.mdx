@@ -474,7 +474,7 @@ function_name() OVER (
 Standard aggregate functions (`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`, `TOTAL`, `GROUP_CONCAT`) can all be used as window functions.
 
 <Info>
-Window functions in Turso use the default frame definition (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW). Custom frame specifications (ROWS, RANGE, GROUPS with explicit bounds) are not supported. Built-in ranking functions (row_number, rank, dense_rank) are not yet available.
+Window functions in Turso use the default frame definition (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW). Custom frame specifications (ROWS, RANGE, GROUPS with explicit bounds) are not supported. The `row_number()` ranking function and the `FILTER (WHERE ...)` clause are supported; other ranking and navigation functions (`rank`, `dense_rank`, `lag`, `lead`, and so on) are not yet available.
 </Info>
 
 ## Set Operations

@@ -1,4 +1,4 @@
-use crate::{alloc, turso_assert, turso_assert_eq, turso_debug_assert, Result};
+use crate::{alloc, turso_assert, turso_assert_eq, turso_debug_assert, Result, Value, ValueRef};
 
 use rustc_hash::FxHashMap as HashMap;
 use tracing::{instrument, Level};
@@ -748,6 +748,30 @@ impl ProgramBuilder {
     /// Check whether a name refers to a CTE currently being planned.
     pub fn is_cte_being_defined(&self, name: &str) -> bool {
         self.ctes_being_defined.iter().any(|n| n == name)
+    }
+
+    /// Hide CTEs being defined whose names an inner WITH clause redefines:
+    /// the inner definitions shadow the outer names for that lexical scope,
+    /// so references to them are not circular. Returns the hidden names for
+    /// [Self::unmask_shadowed_ctes_being_defined].
+    pub fn mask_shadowed_ctes_being_defined(&mut self, shadowing_names: &[String]) -> Vec<String> {
+        let mut masked = Vec::new();
+        self.ctes_being_defined.retain(|name| {
+            if shadowing_names.contains(name) {
+                masked.push(name.clone());
+                false
+            } else {
+                true
+            }
+        });
+        masked
+    }
+
+    /// Restore names hidden by [Self::mask_shadowed_ctes_being_defined] when
+    /// their shadowing scope ends. Membership is all that matters for the
+    /// circular-reference check, so restore order is irrelevant.
+    pub fn unmask_shadowed_ctes_being_defined(&mut self, masked: Vec<String>) {
+        self.ctes_being_defined.extend(masked);
     }
 
     /// Temporarily take the CTE-being-defined stack (e.g. during view
@@ -1787,9 +1811,12 @@ impl ProgramBuilder {
         self.table_references.contains_table(table)
     }
 
-    /// Returns true if the cursor is a BTreeTable cursor.
+    /// Returns true if the cursor is backed by a table or index B-tree.
     pub fn cursor_is_btree(&self, cursor_id: CursorID) -> bool {
-        matches!(self.cursor_ref[cursor_id].1, CursorType::BTreeTable(_))
+        matches!(
+            self.cursor_ref[cursor_id].1,
+            CursorType::BTreeTable(_) | CursorType::BTreeIndex(_)
+        )
     }
 
     /// Returns the BTreeTable for the given cursor, if it is a BTreeTable cursor.
@@ -1940,7 +1967,10 @@ impl ProgramBuilder {
             };
             if let Some(converted) = affinity.convert(&value) {
                 value = match converted {
-                    either::Either::Left(val_ref) => val_ref.to_owned(),
+                    either::Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
+                    either::Either::Left(_) => {
+                        unreachable!("affinity conversion returned an unexpected borrowed value")
+                    }
                     either::Either::Right(val) => val,
                 };
             }

@@ -42,7 +42,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # Pinned so upstream nightly regressions can't break this job
+          # independently of our changes; bump deliberately when needed.
+          # Keep in sync with nightly-cfg.yml.
+          toolchain: nightly-2025-12-17
 
       - name: Setup mold linker
         uses: "./.github/shared/setup-mold"
@@ -99,7 +104,7 @@ jobs:
         run: |
           set -euo pipefail
           RUSTFLAGS="-Zemit-stack-sizes -Cforce-frame-pointers=yes" \
-            cargo +nightly build \
+            cargo +nightly-2025-12-17 build \
             --release \
             --locked \
             -p turso_cli \

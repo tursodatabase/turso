@@ -494,6 +494,24 @@ namespace turso
                     sync_config.pull_bytes_threshold = 0;
                 }
 
+                // logicalMvccPull (required for MVCC-mode remotes, see C ABI docs)
+                if (syncConfigObj.hasProperty(rt, "logicalMvccPull"))
+                {
+                    jsi::Value logicalMvccPullVal = syncConfigObj.getProperty(rt, "logicalMvccPull");
+                    if (logicalMvccPullVal.isBool())
+                    {
+                        sync_config.logical_mvcc_pull = logicalMvccPullVal.getBool();
+                    }
+                    else
+                    {
+                        sync_config.logical_mvcc_pull = false;
+                    }
+                }
+                else
+                {
+                    sync_config.logical_mvcc_pull = false;
+                }
+
                 // Create sync database instance
                 const turso_sync_database_t* database = nullptr;
                 const char* error = nullptr;

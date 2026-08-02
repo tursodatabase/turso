@@ -27,6 +27,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  ELLE_CLI_REV: 65fafcfa939cced8b7d279db1b2a666929885e65
 
 jobs:
   elle-check:
@@ -64,7 +65,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/elle-cli
-          key: elle-cli-${{ runner.os }}-${{ hashFiles('.github/workflows/elle.yml') }}
+          key: elle-cli-${{ runner.os }}-${{ env.ELLE_CLI_REV }}
 
       - name: Build simulator
         run: cargo build -p turso_whopper
@@ -100,8 +101,12 @@ jobs:
 
       - name: Build elle-cli
         run: |
-          if [ ! -d /tmp/elle-cli ]; then
-            git clone --depth 1 https://github.com/ligurio/elle-cli.git /tmp/elle-cli
+          if [ ! -d /tmp/elle-cli/.git ]; then
+            mkdir -p /tmp/elle-cli
+            git -C /tmp/elle-cli init
+            git -C /tmp/elle-cli remote add origin https://github.com/ligurio/elle-cli.git
+            git -C /tmp/elle-cli fetch --depth 1 origin "$ELLE_CLI_REV"
+            git -C /tmp/elle-cli checkout --detach FETCH_HEAD
           fi
           cd /tmp/elle-cli
           if [ ! -f target/*-standalone.jar ]; then

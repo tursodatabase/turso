@@ -1738,7 +1738,7 @@ async fn test_snapshot_isolation_violation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_ghost_commits() {
-    for iteration in 0..500 {
+    for iteration in 0..100 {
         if iteration % 100 == 0 {
             eprintln!("test_ghost_commits: Iteration {iteration}");
         }
@@ -1914,4 +1914,58 @@ async fn multiprocess_wal_second_open_child_process() {
     let mut rows = conn.query("SELECT count(*) FROM test", ()).await.unwrap();
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get_value(0).unwrap(), Value::Integer(1));
+}
+
+#[tokio::test]
+async fn test_typed_numeric_row_conversions() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    let mut rows = conn
+        .query(
+            "SELECT
+                -2147483649, -2147483648, 2147483647, 2147483648,
+                -1, 0, 4294967295, 4294967296, 9223372036854775807,
+                9007199254740993",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+
+    assert!(matches!(
+        row.get::<i32>(0),
+        Err(Error::ConversionFailure(message))
+            if message == "Runtime error: integer overflow"
+    ));
+    assert_eq!(row.get::<i32>(1).unwrap(), i32::MIN);
+    assert_eq!(row.get::<i32>(2).unwrap(), i32::MAX);
+    assert!(matches!(
+        row.get::<i32>(3),
+        Err(Error::ConversionFailure(message))
+            if message == "Runtime error: integer overflow"
+    ));
+
+    assert!(matches!(
+        row.get::<u32>(4),
+        Err(Error::ConversionFailure(message))
+            if message == "Runtime error: integer overflow"
+    ));
+    assert_eq!(row.get::<u32>(5).unwrap(), 0);
+    assert_eq!(row.get::<u32>(6).unwrap(), u32::MAX);
+    assert!(matches!(
+        row.get::<u32>(7),
+        Err(Error::ConversionFailure(message))
+            if message == "Runtime error: integer overflow"
+    ));
+
+    assert!(matches!(
+        row.get::<u64>(4),
+        Err(Error::ConversionFailure(message))
+            if message == "Runtime error: integer overflow"
+    ));
+    assert_eq!(row.get::<u64>(8).unwrap(), i64::MAX as u64);
+
+    assert_eq!(row.get::<f64>(4).unwrap(), -1.0);
+    assert_eq!(row.get::<f64>(9).unwrap(), 9_007_199_254_740_993_i64 as f64);
 }

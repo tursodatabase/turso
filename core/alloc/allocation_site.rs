@@ -2,10 +2,39 @@ use std::cell::Cell;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AllocationSite {
+    BTree(BTreeAllocationSite),
     MvStore(MvStoreAllocationSite),
     MvccCheckpoint(MvccCheckpointAllocationSite),
     Schema(SchemaAllocationSite),
+    ValueBlob(ValueBlobAllocationSite),
+    Vector(VectorAllocationSite),
     NoFaultInjection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum BTreeAllocationSite {
+    CellPayload,
+    OverflowRead,
+    Balance,
+    BlobRecordHeader,
+    IntegrityCheck,
+    OverflowCell,
+    RecordPayload,
+    SavedCursorRecord,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ValueBlobAllocationSite {
+    Concat,
+    FromSlice,
+    JsonbConstruction,
+    JsonbCopy,
+    Hash128,
+    RecordDecode,
+    CloneFrom,
+    RecordBuild,
+    RecordCopy,
+    AggAccumulate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -34,9 +63,27 @@ pub enum MvccCheckpointAllocationSite {
     CheckpointSequenceCompactions,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum VectorAllocationSite {
+    Parse,
+    Convert,
+    Concat,
+    Slice,
+    Serialize,
+    SparseConstruction,
+    Float8Construction,
+    IndexPayloadCopy,
+}
+
 impl From<MvStoreAllocationSite> for AllocationSite {
     fn from(site: MvStoreAllocationSite) -> Self {
         Self::MvStore(site)
+    }
+}
+
+impl From<BTreeAllocationSite> for AllocationSite {
+    fn from(site: BTreeAllocationSite) -> Self {
+        Self::BTree(site)
     }
 }
 
@@ -49,6 +96,18 @@ impl From<MvccCheckpointAllocationSite> for AllocationSite {
 impl From<SchemaAllocationSite> for AllocationSite {
     fn from(site: SchemaAllocationSite) -> Self {
         Self::Schema(site)
+    }
+}
+
+impl From<VectorAllocationSite> for AllocationSite {
+    fn from(site: VectorAllocationSite) -> Self {
+        Self::Vector(site)
+    }
+}
+
+impl From<ValueBlobAllocationSite> for AllocationSite {
+    fn from(site: ValueBlobAllocationSite) -> Self {
+        Self::ValueBlob(site)
     }
 }
 
@@ -101,6 +160,26 @@ macro_rules! with_mv_store_allocation_site {
         #[cfg(feature = "allocation_metric")]
         let _turso_allocation_site_guard =
             $crate::alloc::enter_allocation_site($crate::alloc::MvStoreAllocationSite::$site);
+        $expr
+    }};
+}
+
+#[macro_export]
+macro_rules! with_btree_allocation_site {
+    ($site:ident, $expr:expr) => {{
+        #[cfg(feature = "allocation_metric")]
+        let _turso_allocation_site_guard =
+            $crate::alloc::enter_allocation_site($crate::alloc::BTreeAllocationSite::$site);
+        $expr
+    }};
+}
+
+#[macro_export]
+macro_rules! with_value_blob_allocation_site {
+    ($site:ident, $expr:expr) => {{
+        #[cfg(feature = "allocation_metric")]
+        let _turso_allocation_site_guard =
+            $crate::alloc::enter_allocation_site($crate::alloc::ValueBlobAllocationSite::$site);
         $expr
     }};
 }

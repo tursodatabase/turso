@@ -1,3 +1,4 @@
+use crate::SqliteDialect;
 use std::collections::HashSet;
 
 use crate::io::{MemoryIO, PlatformIO, IO};
@@ -50,7 +51,15 @@ fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
 
 fn open_mvcc_database_with_opts(path: &str, opts: DatabaseOpts) -> Arc<Database> {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file_with_flags(io, path, OpenFlags::default(), opts, None).unwrap();
+    let db = Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::default(),
+        opts,
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
     let conn = db.connect().unwrap();
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     conn.close().unwrap();
@@ -70,7 +79,7 @@ struct SameConnectionWal {
 impl SameConnectionWal {
     fn new(path: &str) -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, path).unwrap();
+        let db = Database::open_file(io, path, Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
         let observer = db.connect().unwrap();
         Self { conn, observer }
@@ -86,7 +95,7 @@ impl SameConnectionWal {
 impl SameConnectionMvcc {
     fn new(path: &str) -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, path).unwrap();
+        let db = Database::open_file(io, path, Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         let observer = db.connect().unwrap();
@@ -285,7 +294,7 @@ fn prepare_wal_update_yielding_on_table_read(
 fn test_returning_owner_drop_does_not_commit_interrupted_drop_table() {
     let io = Arc::new(MemoryIO::new());
     let path = ":memory:returning-owner-interrupted-drop-table";
-    let db = Database::open_file(io.clone(), path).unwrap();
+    let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect().unwrap();
 
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
@@ -340,7 +349,7 @@ fn test_returning_owner_drop_does_not_commit_interrupted_drop_table() {
     drop(conn);
     drop(db);
 
-    let db = Database::open_file(io, path).expect(
+    let db = Database::open_file(io, path, Arc::new(SqliteDialect)).expect(
         "reopen should not fail; dropping a RETURNING owner must not commit another statement's interrupted DROP",
     );
     let conn = db.connect().unwrap();

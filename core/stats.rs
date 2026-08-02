@@ -1,6 +1,7 @@
 use crate::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
 
+use crate::alloc::TursoVecExt;
 use crate::schema::Schema;
 use crate::translate::emitter::TransactionMode;
 use crate::types::IOResult;
@@ -346,8 +347,9 @@ impl StatAccum {
     }
 
     /// Serialize to bytes for storage in a blob register.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(8 + 8 + 8 * self.n_col);
+    pub fn to_bytes(&self) -> crate::ValueBlob {
+        let mut bytes =
+            <crate::ValueBlob as TursoVecExt<u8>>::with_capacity(8 + 8 + 8 * self.n_col);
         bytes.extend_from_slice(&(self.n_col as u64).to_le_bytes());
         bytes.extend_from_slice(&self.n_row.to_le_bytes());
         for &d in &self.distinct {

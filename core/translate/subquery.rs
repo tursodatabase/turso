@@ -17,7 +17,8 @@ use crate::{
             emit_program_for_select_with_resolver, emit_query,
         },
         expr::{
-            compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr_mut, WalkControl,
+            compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr, walk_expr_mut,
+            WalkControl,
         },
         optimizer::optimize_select_plan,
         plan::{
@@ -138,6 +139,10 @@ fn count_shared_cte_references_in_plan(counts: &mut HashMap<usize, usize>, plan:
                 &right_most.non_from_clause_subqueries,
             );
         }
+        Plan::RecursiveCte(recursive_cte) => {
+            count_shared_cte_references_in_plan(counts, &recursive_cte.initial_query);
+            count_shared_cte_references_in_plan(counts, &recursive_cte.recursive_query);
+        }
         Plan::Delete(_) | Plan::Update(_) => {}
     }
 }
@@ -167,6 +172,10 @@ pub(crate) fn mark_shared_cte_materialization_requirements(
                     &mut right_most.table_references,
                     &mut right_most.non_from_clause_subqueries,
                 );
+            }
+            Plan::RecursiveCte(recursive_cte) => {
+                annotate_plan(&mut recursive_cte.initial_query);
+                annotate_plan(&mut recursive_cte.recursive_query);
             }
             Plan::Delete(_) | Plan::Update(_) => {}
         }
@@ -230,6 +239,32 @@ pub fn plan_subqueries_from_select_plan(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    // Common-subexpression elimination for scalar subqueries shared by GROUP BY and the SELECT
+    // list (e.g. `SELECT (subq) AS rs ... GROUP BY rs`, where the GROUP BY term is a copy of the
+    // result column): plan and evaluate the subquery once instead of once per use.
+    //
+    // The set of shared subqueries is computed up front, independent of the order the clause passes
+    // below run, so correctness does not hinge on GROUP BY being processed before the SELECT list.
+    // Whichever pass reaches a shared subquery first registers it in `cse_map`; the other reuses
+    // that registration. Shared subqueries are registered at the GROUP BY eval phase (the earliest
+    // phase among their uses), so the single evaluation is ready for whichever clause reads it.
+    let shared_subqueries: Vec<ast::Expr> = match &plan.group_by {
+        Some(group_by) => {
+            let in_group_by = collect_scalar_subqueries(group_by.exprs.iter())?;
+            if in_group_by.is_empty() {
+                Vec::new()
+            } else {
+                let in_select =
+                    collect_scalar_subqueries(plan.result_columns.iter().map(|c| &c.expr))?;
+                in_group_by
+                    .into_iter()
+                    .filter(|g| in_select.contains(g))
+                    .collect()
+            }
+        }
+        None => Vec::new(),
+    };
+    let mut cse_map: Vec<(ast::Expr, ast::Expr)> = Vec::new();
     // WHERE
     {
         crate::stack::trace_stack!("select_where");
@@ -243,6 +278,8 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryPosition::Where,
             SubqueryOrigin::SelectWhere,
             SubqueryPosition::Where.allow_correlated(),
+            &mut cse_map,
+            &[],
         )?;
     }
 
@@ -260,6 +297,8 @@ pub fn plan_subqueries_from_select_plan(
                 SubqueryPosition::GroupBy,
                 SubqueryOrigin::SelectGroupBy,
                 SubqueryPosition::GroupBy.allow_correlated(),
+                &mut cse_map,
+                &shared_subqueries,
             )?;
         }
         if let Some(having) = group_by.having.as_mut() {
@@ -274,6 +313,8 @@ pub fn plan_subqueries_from_select_plan(
                 SubqueryPosition::Having,
                 SubqueryOrigin::SelectHaving,
                 !group_by.exprs.is_empty(),
+                &mut cse_map,
+                &[],
             )?;
         }
     }
@@ -291,6 +332,8 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryPosition::ResultColumn,
             SubqueryOrigin::SelectList,
             SubqueryPosition::ResultColumn.allow_correlated(),
+            &mut cse_map,
+            &shared_subqueries,
         )?;
     }
 
@@ -307,6 +350,8 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryPosition::OrderBy,
             SubqueryOrigin::SelectOrderBy,
             SubqueryPosition::OrderBy.allow_correlated(),
+            &mut cse_map,
+            &[],
         )?;
     }
 
@@ -323,6 +368,8 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryPosition::LimitOffset,
             SubqueryOrigin::SelectLimitOffset,
             false,
+            &mut cse_map,
+            &[],
         );
         // Limit
         if let Some(limit) = &mut plan.limit {
@@ -384,6 +431,8 @@ pub fn plan_subqueries_from_where_clause(
         SubqueryPosition::Where,
         SubqueryOrigin::DmlWhere,
         SubqueryPosition::Where.allow_correlated(),
+        &mut Vec::new(),
+        &[],
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
@@ -412,6 +461,8 @@ pub fn plan_subqueries_from_values(
         SubqueryPosition::ResultColumn, // VALUES are similar to result columns in terms of subquery handling
         SubqueryOrigin::SelectList,
         SubqueryPosition::ResultColumn.allow_correlated(),
+        &mut Vec::new(),
+        &[],
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
@@ -439,6 +490,8 @@ pub fn plan_subqueries_from_update_sets(
         SubqueryPosition::ResultColumn,
         SubqueryOrigin::DmlSet,
         SubqueryPosition::ResultColumn.allow_correlated(),
+        &mut Vec::new(),
+        &[],
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
@@ -473,6 +526,8 @@ pub fn plan_subqueries_from_returning(
         SubqueryPosition::ResultColumn,
         SubqueryOrigin::DmlReturning,
         SubqueryPosition::ResultColumn.allow_correlated(),
+        &mut Vec::new(),
+        &[],
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
@@ -501,6 +556,8 @@ pub fn plan_subqueries_from_trigger_when_clause(
         SubqueryPosition::Where,
         SubqueryOrigin::TriggerWhen,
         false,
+        &mut Vec::new(),
+        &[],
     )
 }
 
@@ -517,6 +574,8 @@ fn plan_subqueries_with_outer_query_access<'a>(
     position: SubqueryPosition,
     origin: SubqueryOrigin,
     allow_correlated: bool,
+    cse_map: &mut Vec<(ast::Expr, ast::Expr)>,
+    shared: &[ast::Expr],
 ) -> Result<()> {
     // Most subqueries can reference columns from the outer query,
     // including nested cases where a subquery inside a subquery references columns from its parent's parent
@@ -575,12 +634,32 @@ fn plan_subqueries_with_outer_query_access<'a>(
         position,
         origin,
         allow_correlated,
+        cse_map,
+        shared,
     );
     for expr in exprs {
         walk_expr_mut(expr, &mut subquery_parser)?;
     }
 
     Ok(())
+}
+
+/// Collect every scalar-subquery (`ast::Expr::Subquery`) node that appears anywhere in `exprs`.
+/// Used to find, up front, the subqueries shared between the GROUP BY clause and the SELECT list
+/// so they can be common-subexpression-eliminated independently of the order the clause passes run.
+fn collect_scalar_subqueries<'a>(
+    exprs: impl Iterator<Item = &'a ast::Expr>,
+) -> Result<Vec<ast::Expr>> {
+    let mut found = Vec::new();
+    for expr in exprs {
+        walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+            if matches!(e, ast::Expr::Subquery(_)) {
+                found.push(e.clone());
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    Ok(found)
 }
 
 /// Create a closure that will walk the AST and replace subqueries with [ast::Expr::SubqueryResult] expressions.]
@@ -596,6 +675,8 @@ fn get_subquery_parser<'a>(
     position: SubqueryPosition,
     origin: SubqueryOrigin,
     allow_correlated: bool,
+    cse_map: &'a mut Vec<(ast::Expr, ast::Expr)>,
+    shared: &'a [ast::Expr],
 ) -> impl FnMut(&mut ast::Expr) -> Result<WalkControl> + 'a {
     let handle_unsupported_correlation =
         |correlated: bool, position: SubqueryPosition, allow_correlated: bool| -> Result<()> {
@@ -661,6 +742,27 @@ fn get_subquery_parser<'a>(
                 Ok(WalkControl::Continue)
             }
             ast::Expr::Subquery(_) => {
+                // CSE: a scalar subquery in `shared` appears in both GROUP BY and the SELECT list,
+                // so plan and evaluate it once. Whichever clause reaches it first registers it in
+                // cse_map; the other reuses that registration. Order-independent: membership in
+                // `shared` is computed up front, so this does not depend on GROUP BY being walked
+                // before the SELECT list.
+                let is_shared = shared.contains(&*expr);
+                if is_shared {
+                    if let Some((_, result)) = cse_map.iter().find(|(k, _)| *k == *expr) {
+                        *expr = result.clone();
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                }
+                let cse_key = is_shared.then(|| expr.clone());
+                // A shared subquery is registered at the GROUP BY eval phase (the earliest among its
+                // uses), so its single evaluation is ready for whichever clause reads it first,
+                // regardless of the order these passes run.
+                let effective_origin = if is_shared {
+                    SubqueryOrigin::SelectGroupBy
+                } else {
+                    origin
+                };
                 let subquery_id = program.table_reference_counter.next();
                 let outer_query_refs = {
                     crate::stack::trace_stack!("get_outer_refs");
@@ -766,9 +868,12 @@ fn get_subquery_parser<'a>(
                         plan: Some(Box::new(Plan::Select(plan))),
                     },
                     correlated,
-                    origin,
-                    eval_phase: origin.phase_floor(),
+                    origin: effective_origin,
+                    eval_phase: effective_origin.phase_floor(),
                 });
+                if let Some(key) = cse_key {
+                    cse_map.push((key, expr.clone()));
+                }
                 Ok(WalkControl::Continue)
             }
             ast::Expr::InSelect { .. } => {
@@ -943,21 +1048,33 @@ fn recollect_aggregates(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()
 
     // Collect from result columns (same order as original collection)
     for rc in &plan.result_columns {
-        resolve_window_and_aggregate_functions(&rc.expr, resolver, &mut new_aggregates, None)?;
+        resolve_window_and_aggregate_functions(
+            &rc.expr,
+            resolver,
+            &mut new_aggregates,
+            None,
+            &mut [],
+        )?;
     }
 
     // Collect from HAVING
     if let Some(group_by) = &plan.group_by {
         if let Some(having) = &group_by.having {
             for expr in having {
-                resolve_window_and_aggregate_functions(expr, resolver, &mut new_aggregates, None)?;
+                resolve_window_and_aggregate_functions(
+                    expr,
+                    resolver,
+                    &mut new_aggregates,
+                    None,
+                    &mut [],
+                )?;
             }
         }
     }
 
     // Collect from ORDER BY
     for (expr, _, _) in &plan.order_by {
-        resolve_window_and_aggregate_functions(expr, resolver, &mut new_aggregates, None)?;
+        resolve_window_and_aggregate_functions(expr, resolver, &mut new_aggregates, None, &mut [])?;
     }
 
     plan.aggregates = new_aggregates;
@@ -1035,6 +1152,10 @@ fn update_column_used_masks(
                 }
                 propagate_outer_refs_from_select_plan(table_refs, right_most)?;
             }
+            Plan::RecursiveCte(recursive_cte) => {
+                propagate_outer_refs_from_plan(table_refs, &recursive_cte.initial_query)?;
+                propagate_outer_refs_from_plan(table_refs, &recursive_cte.recursive_query)?;
+            }
             Plan::Delete(_) | Plan::Update(_) => {
                 return Err(crate::LimboError::InternalError(
                     "DELETE/UPDATE plans should not appear in FROM clause subqueries".into(),
@@ -1097,6 +1218,10 @@ fn pre_materialize_multi_ref_ctes(
                 pre_materialize_multi_ref_ctes_in_select_plan(program, select_plan, t_ctx)?;
             }
             pre_materialize_multi_ref_ctes_in_select_plan(program, right_most, t_ctx)?;
+        }
+        Plan::RecursiveCte(recursive_cte) => {
+            pre_materialize_multi_ref_ctes(program, &mut recursive_cte.initial_query, t_ctx)?;
+            pre_materialize_multi_ref_ctes(program, &mut recursive_cte.recursive_query, t_ctx)?;
         }
         Plan::Delete(_) | Plan::Update(_) => {}
     }
@@ -1292,7 +1417,9 @@ pub fn emit_from_clause_subqueries(
                                 format!("SCAN {table_name}")
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
+                        Scan::VirtualTable { .. }
+                        | Scan::Subquery { .. }
+                        | Scan::RecursiveCteInput => {
                             format!("SCAN {table_name}")
                         }
                     }
@@ -1572,13 +1699,14 @@ pub fn emit_from_clause_subquery(
                 emit_query(program, select_plan, &mut metadata)?
             }
             Plan::CompoundSelect { .. } => {
-                // Clone the plan to pass to emit_program_for_compound_select (it takes ownership)
-                let plan_clone = plan.clone();
                 let resolver = t_ctx.resolver.fork();
                 // emit_program_for_compound_select returns the result column start register
                 // for coroutine mode, which is needed by the outer query.
-                emit_program_for_compound_select(program, &resolver, plan_clone)?
+                emit_program_for_compound_select(program, &resolver, plan)?
                     .expect("compound CTE in coroutine mode must have result register")
+            }
+            Plan::RecursiveCte(recursive_cte) => {
+                super::recursive_cte::emit_recursive_cte(program, &t_ctx.resolver, recursive_cte)?
             }
             Plan::Delete(_) | Plan::Update(_) => {
                 unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
@@ -1661,9 +1789,11 @@ fn emit_indexed_materialized_subquery(
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
-            let plan_clone = plan.clone();
             let resolver = t_ctx.resolver.fork();
-            emit_program_for_compound_select(program, &resolver, plan_clone)?;
+            emit_program_for_compound_select(program, &resolver, plan)?;
+        }
+        Plan::RecursiveCte(_) => {
+            unreachable!("recursive CTEs require table-backed materialization for indexed access")
         }
         Plan::Delete(_) | Plan::Update(_) => {
             unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
@@ -1756,10 +1886,11 @@ fn emit_materialized_subquery_table(
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
-            // Clone the plan to pass to emit_program_for_compound_select (it takes ownership)
-            let plan_clone = plan.clone();
             let resolver = t_ctx.resolver.fork();
-            emit_program_for_compound_select(program, &resolver, plan_clone)?;
+            emit_program_for_compound_select(program, &resolver, plan)?;
+        }
+        Plan::RecursiveCte(recursive_cte) => {
+            super::recursive_cte::emit_recursive_cte(program, &t_ctx.resolver, recursive_cte)?;
         }
         Plan::Delete(_) | Plan::Update(_) => {
             unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
@@ -1841,8 +1972,8 @@ pub fn emit_non_from_clause_subquery(
                         emit_program_for_select(program, resolver, *select_plan)
                     }
                 }
-                compound @ Plan::CompoundSelect { .. } => {
-                    emit_program_for_compound_select(program, resolver, compound)?;
+                mut compound @ Plan::CompoundSelect { .. } => {
+                    emit_program_for_compound_select(program, resolver, &mut compound)?;
                     Ok(())
                 }
                 _ => unreachable!("DML plans cannot be subqueries"),
@@ -1990,9 +2121,30 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
         .as_ref()
         .is_some_and(|group_by| !group_by.exprs.is_empty());
 
+    // Subqueries inside an aggregate's arguments or FILTER clause are evaluated
+    // per input row by the aggregate step code in the main loop, even when the
+    // aggregate itself belongs to HAVING or ORDER BY. Deferring them to the
+    // grouped output subroutine would emit their materialization after their
+    // first use, so they must keep their phase floor (issue #6807).
+    let mut aggregate_subquery_ids: Vec<ast::TableInternalId> = Vec::new();
+    for agg in &plan.aggregates {
+        for expr in agg.args.iter().chain(agg.filter_expr.iter()) {
+            walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+                if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
+                    aggregate_subquery_ids.push(*subquery_id);
+                }
+                Ok(WalkControl::Continue)
+            })
+            .expect("walking an expression with an infallible visitor cannot fail");
+        }
+    }
+
     for subquery in plan.non_from_clause_subqueries.iter_mut() {
         subquery.eval_phase = match subquery.origin {
-            SubqueryOrigin::SelectHaving | SubqueryOrigin::SelectOrderBy if has_grouped_output => {
+            SubqueryOrigin::SelectHaving | SubqueryOrigin::SelectOrderBy
+                if has_grouped_output
+                    && !aggregate_subquery_ids.contains(&subquery.internal_id) =>
+            {
                 SubqueryEvalPhase::GroupedOutput
             }
             _ => subquery.origin.phase_floor(),

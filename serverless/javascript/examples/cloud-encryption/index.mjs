@@ -43,18 +43,18 @@ await client.batch(
 console.log("\nInserted 3 secrets into encrypted database");
 
 // Query the data back
-const result = await client.execute("SELECT * FROM secrets");
+const secrets = await client.all("SELECT * FROM secrets");
 console.log("\nSecrets retrieved:");
-for (const row of result.rows) {
+for (const row of secrets) {
     console.log(`  - id=${row.id}, data="${row.data}"`);
 }
 
 // Show table info
-const tables = await client.execute(
+const tables = await client.all(
     "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
 );
 console.log("\nTables in database:");
-for (const row of tables.rows) {
+for (const row of tables) {
     console.log(`  - ${row.name}`);
 }
 

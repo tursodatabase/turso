@@ -391,6 +391,17 @@ impl PageCache {
         self._delete(key, true)
     }
 
+    /// Test-only: evict every clean, unpinned page, exactly as sustained cache
+    /// pressure through `evict_one` eventually would (buffer taken, page unloaded),
+    /// but deterministically and without the clock's second-chance heuristics.
+    #[cfg(test)]
+    pub fn test_evict_all_unpinned_clean(&mut self) {
+        let keys: Vec<PageCacheKey> = self.map.keys().copied().collect();
+        for key in keys {
+            let _ = self._delete(key, true);
+        }
+    }
+
     #[inline]
     pub fn get(&mut self, key: &PageCacheKey) -> crate::Result<Option<PageRef>> {
         let Some(&entry_ptr) = self.map.get(key) else {

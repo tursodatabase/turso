@@ -12,7 +12,7 @@ bindings/java/libs
 /whopper-*
 testing/testing_clone.db
 testing/system/test_copy.db
-testing/sqltests/database/integrity_*.db
+sqlite/conformance/database/integrity_*.db
 
 # VCS
 .git

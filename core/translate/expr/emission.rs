@@ -1,4 +1,5 @@
 use super::*;
+use crate::alloc::TursoIteratorExt;
 
 /// Emit literal values - shared between regular and RETURNING expression evaluation
 pub fn emit_literal(
@@ -33,7 +34,7 @@ pub fn emit_literal(
             Ok(target_register)
         }
         ast::Literal::Blob(s) => {
-            let bytes = s
+            let bytes = ast::blob_literal_hex(s)
                 .as_bytes()
                 .chunks_exact(2)
                 .map(|pair| {
@@ -42,7 +43,7 @@ pub fn emit_literal(
                     let hex_byte = std::str::from_utf8(pair).unwrap();
                     u8::from_str_radix(hex_byte, 16).unwrap()
                 })
-                .collect();
+                .try_collect()?;
             program.emit_insn(Insn::Blob {
                 value: bytes,
                 dest: target_register,
@@ -306,9 +307,9 @@ pub(crate) fn emit_returning_results<'a>(
             let record_reg = program.alloc_register();
             let eph_rowid_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
-                start_reg: crate::vdbe::insn::to_u16(result_start_reg),
-                count: crate::vdbe::insn::to_u16(result_columns.len()),
-                dest_reg: crate::vdbe::insn::to_u16(record_reg),
+                start_reg: crate::vdbe::insn::to_u32(result_start_reg),
+                count: crate::vdbe::insn::to_u32(result_columns.len()),
+                dest_reg: crate::vdbe::insn::to_u32(record_reg),
                 index_name: None,
                 affinity_str: None,
             });

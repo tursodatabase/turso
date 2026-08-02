@@ -13,6 +13,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 #[cfg(not(feature = "codspeed"))]
 use pprof::criterion::{Output, PProfProfiler};
+use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{
@@ -74,7 +75,7 @@ fn setup_limbo_with_sync(temp_dir: &TempDir, schema: &str, sync_on: bool) -> Arc
     let db_path = temp_dir.path().join("bench.db");
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+    let db = Database::open_file(io, db_path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect().unwrap();
 
     // Set synchronous mode

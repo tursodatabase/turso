@@ -378,6 +378,7 @@ mod tests {
     use crate::storage::btree::BTreeCursor;
     use crate::sync::Arc;
     use crate::util::IOExt;
+    use crate::SqliteDialect;
     use crate::{Connection, Database, OpenFlags};
 
     /// Helper to create a test connection with a table and materialized view
@@ -404,6 +405,7 @@ mod tests {
                 unsafe_testing: false,
             },
             None,
+            Arc::new(SqliteDialect),
         )?;
         let conn = db.connect()?;
 
@@ -1750,7 +1752,7 @@ mod tests {
                 // For integers, type code is 1 for 1-byte int, 2 for 2-byte, etc.
                 // Using type 6 (8-byte integer) for all values
                 // Header: 4 bytes (header size byte + 3 type bytes)
-                let mut payload = vec![
+                let mut payload = crate::alloc::vec![
                     4u8, // header size
                     6u8, // type for rowid (8-byte int)
                     6u8, // type for value (8-byte int)
@@ -1801,7 +1803,7 @@ mod tests {
                 if count == 0 {
                     // First call returns IO (pending)
                     let completion = Completion::new_yield();
-                    Ok(IOResult::IO(IOCompletions::Single(completion)))
+                    Ok(IOResult::IO(IOCompletions(completion)))
                 } else {
                     // Subsequent calls return Done
                     Ok(IOResult::Done(()))
@@ -1813,7 +1815,7 @@ mod tests {
                 if count == 0 {
                     // First call returns IO (pending)
                     let completion = Completion::new_yield();
-                    Ok(IOResult::IO(IOCompletions::Single(completion)))
+                    Ok(IOResult::IO(IOCompletions(completion)))
                 } else {
                     // Subsequent calls return Done
                     Ok(IOResult::Done(()))

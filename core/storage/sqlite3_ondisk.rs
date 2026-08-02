@@ -539,7 +539,7 @@ impl TryFrom<u8> for PageType {
 #[derive(Debug, Clone)]
 pub struct OverflowCell {
     pub index: usize,
-    pub payload: Pin<Vec<u8>>,
+    pub payload: Pin<crate::alloc::Vec<u8>>,
 }
 
 /// Send read request for DB page read to the IO
@@ -1088,8 +1088,10 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     content_size
                 ))
             })?;
-            // SAFETY: SerialTypeKind is Text so this buffer is a valid string
-            let val = unsafe { std::str::from_utf8_unchecked(data) };
+            let val = simdutf8::basic::from_utf8(data).map_err(|_| {
+                mark_unlikely();
+                LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
+            })?;
             Ok((
                 ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
                 content_size,
@@ -1216,8 +1218,10 @@ pub fn read_value_serial_type<'a>(
                         content_size
                     ))
                 })?;
-                // SAFETY: SerialTypeKind is Text so this buffer is a valid string
-                let val = unsafe { std::str::from_utf8_unchecked(data) };
+                let val = simdutf8::basic::from_utf8(data).map_err(|_| {
+                    mark_unlikely();
+                    LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
+                })?;
                 Ok((
                     ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
                     content_size,
@@ -2226,8 +2230,16 @@ mod tests {
     #[case(&[0x40, 0x09, 0x21, 0xFB, 0x54, 0x44, 0x2D, 0x18], SerialType::f64(), Value::from_f64(std::f64::consts::PI))]
     #[case(&[1, 2], SerialType::const_int0(), Value::from_i64(0))]
     #[case(&[65, 66], SerialType::const_int1(), Value::from_i64(1))]
-    #[case(&[1, 2, 3], SerialType::blob(3), Value::Blob(vec![1, 2, 3]))]
-    #[case(&[], SerialType::blob(0), Value::Blob(vec![]))] // empty blob
+    #[case(
+        &[1, 2, 3],
+        SerialType::blob(3),
+        Value::from_slice(&[1, 2, 3]).expect(crate::alloc::ALLOC_ERR_MSG)
+    )]
+    #[case(
+        &[],
+        SerialType::blob(0),
+        Value::from_slice(&[]).expect(crate::alloc::ALLOC_ERR_MSG)
+    )] // empty blob
     #[case(&[65, 66, 67], SerialType::text(3), Value::build_text("ABC"))]
     #[case(&[0x80], SerialType::i8(), Value::from_i64(-128))]
     #[case(&[0x80, 0], SerialType::i16(), Value::from_i64(-32768))]
@@ -2247,7 +2259,27 @@ mod tests {
         #[case] expected: Value,
     ) {
         let result = read_value(buf, serial_type).unwrap();
-        assert_eq!(result.0.to_owned(), expected);
+        assert_eq!(
+            result.0.to_owned().expect(crate::alloc::ALLOC_ERR_MSG),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_text_decoders_reject_invalid_utf8() {
+        for result in [
+            read_value(&[0xff], SerialType::text(1)),
+            read_value_serial_type(&[0xff], 15),
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(LimboError::Corrupt(ref message))
+                        if message == "TEXT value contains invalid UTF-8"
+                ),
+                "unexpected result: {result:?}"
+            );
+        }
     }
 
     #[test]

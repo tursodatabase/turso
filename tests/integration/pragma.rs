@@ -454,3 +454,122 @@ fn test_pragma_wal_checkpoint_targets_attached_database(db: TempDatabase) {
         "aux pager should have checkpointed frames (got {checkpointed})"
     );
 }
+
+// Regression tests for https://github.com/tursodatabase/turso/issues/7466:
+// querying a pragma virtual table (pragma_table_info, pragma_function_list, ...)
+// left the connection's implicit read transaction open, so every subsequent
+// write on that connection reported success but was never committed.
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_vtab_query_does_not_break_subsequent_writes(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER, b TEXT)").unwrap();
+
+    // Full scan of a pragma virtual table.
+    let mut stmt = conn
+        .query("SELECT * FROM pragma_table_info('t')")
+        .unwrap()
+        .unwrap();
+    while let StepResult::Row = stmt.step().unwrap() {}
+    drop(stmt);
+
+    assert!(
+        conn.get_auto_commit(),
+        "autocommit must survive a pragma vtab query"
+    );
+
+    // This write must auto-commit at Halt like any other statement.
+    conn.execute("INSERT INTO t VALUES (1, 'one')").unwrap();
+
+    // A second connection only sees committed data.
+    let conn2 = db.connect_limbo();
+    let rows = limbo_exec_rows(&conn2, "SELECT a, b FROM t");
+    assert_eq!(
+        rows,
+        vec![vec![RValue::Integer(1), RValue::Text("one".to_string())]],
+        "insert after pragma vtab query must be committed"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_function_list_then_create_and_insert(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    let mut stmt = conn
+        .query("SELECT name FROM pragma_function_list()")
+        .unwrap()
+        .unwrap();
+    let mut n = 0;
+    while let StepResult::Row = stmt.step().unwrap() {
+        n += 1;
+    }
+    assert!(n > 0, "pragma_function_list should return rows");
+    drop(stmt);
+
+    conn.execute("CREATE TABLE t (x)").unwrap();
+    conn.execute("INSERT INTO t VALUES (42)").unwrap();
+
+    let conn2 = db.connect_limbo();
+    let rows = limbo_exec_rows(&conn2, "SELECT x FROM t");
+    assert_eq!(
+        rows,
+        vec![vec![RValue::Integer(42)]],
+        "writes after pragma_function_list query must be committed"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_vtab_partial_scan_does_not_break_subsequent_writes(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER, b TEXT, c REAL)")
+        .unwrap();
+
+    // Partial scan: step once, then abandon the statement mid-scan so cleanup
+    // goes through the abort path instead of Halt.
+    let mut stmt = conn
+        .query("SELECT * FROM pragma_table_info('t')")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected at least one row from pragma_table_info");
+    };
+    drop(stmt);
+
+    conn.execute("INSERT INTO t VALUES (1, 'one', 1.5)")
+        .unwrap();
+
+    let conn2 = db.connect_limbo();
+    let rows = limbo_exec_rows(&conn2, "SELECT a FROM t");
+    assert_eq!(
+        rows,
+        vec![vec![RValue::Integer(1)]],
+        "insert after abandoned pragma vtab scan must be committed"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_vtab_query_with_limit_then_write(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER, b TEXT, c REAL)")
+        .unwrap();
+
+    // LIMIT terminates the scan before the virtual table cursor is exhausted,
+    // so the program halts while the cursor still holds its helper statement.
+    let mut stmt = conn
+        .query("SELECT * FROM pragma_table_info('t') LIMIT 1")
+        .unwrap()
+        .unwrap();
+    while let StepResult::Row = stmt.step().unwrap() {}
+    drop(stmt);
+
+    conn.execute("INSERT INTO t VALUES (2, 'two', 2.5)")
+        .unwrap();
+
+    let conn2 = db.connect_limbo();
+    let rows = limbo_exec_rows(&conn2, "SELECT a FROM t");
+    assert_eq!(
+        rows,
+        vec![vec![RValue::Integer(2)]],
+        "insert after LIMITed pragma vtab query must be committed"
+    );
+}
