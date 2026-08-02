@@ -15,7 +15,7 @@ use crate::{
     sync::Arc,
     translate::collate::CollationSeq,
     vdbe::affinity::Affinity,
-    LimboError, SymbolTable,
+    SymbolTable,
 };
 
 fn parse_statement(sql: &str) -> ast::Stmt {

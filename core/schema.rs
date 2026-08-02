@@ -4660,6 +4660,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         }
     }
 
+    let has_virtual_columns = cols.iter().any(|column| column.is_virtual_generated());
+    let logical_to_physical_map =
+        BTreeTable::build_logical_to_physical_map(&cols, &primary_key_columns, has_rowid);
     let mut table = BTreeTable {
         root_page,
         name: table_name,
@@ -4712,8 +4715,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         },
         check_constraints,
         rowid_alias_conflict_clause,
-        has_virtual_columns: false,
-        logical_to_physical_map: vec![],
+        has_virtual_columns,
+        logical_to_physical_map,
         column_dependencies: Default::default(),
     };
     table.prepare_generated_columns()?;
