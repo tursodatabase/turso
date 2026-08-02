@@ -159,6 +159,103 @@ fn dml_constraint_failures_follow_the_hir_conflict_policy(tc: hegel::TestCase) {
 }
 
 // Examples:
+// - `INSERT OR IGNORE INTO dst SELECT * FROM src` must advance the materialized
+//   source cursor when a UNIQUE-index conflict skips one selected row.
+// - The same statement with an `INTEGER PRIMARY KEY` conflict must use the
+//   identical row-done boundary. Jumping to the row start retries forever.
+// Across generated widths and key positions, every IGNORE branch in the
+// INSERT-SELECT write loop must land on `Next`, whose success branch returns
+// to the start of the following source row.
+#[hegel::test]
+fn insert_select_ignore_advances_past_each_conflicting_source_row(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
+    let key_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let rowid_key = tc.draw(generators::booleans());
+    let source_columns = (0..width)
+        .map(|position| format!("c{position} INTEGER"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let target_columns = (0..width)
+        .map(|position| {
+            if rowid_key && position == key_position {
+                format!("c{position} INTEGER PRIMARY KEY")
+            } else {
+                format!("c{position} INTEGER")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = Arc::new(
+        BTreeTable::from_sql(&format!("CREATE TABLE src({source_columns})"), 10)
+            .expect("generated source table SQL is valid"),
+    );
+    let target = Arc::new(
+        BTreeTable::from_sql(&format!("CREATE TABLE dst({target_columns})"), 12)
+            .expect("generated target table SQL is valid"),
+    );
+    let symbols = SymbolTable::new();
+    let mut schema = Schema::new();
+    schema.add_btree_table(source).expect("src is unique");
+    schema
+        .add_btree_table(target.clone())
+        .expect("dst is unique");
+    if !rowid_key {
+        let index = Index::from_sql(
+            &symbols,
+            &format!("CREATE UNIQUE INDEX dst_key ON dst(c{key_position})"),
+            13,
+            &target,
+        )
+        .expect("generated unique index SQL is valid");
+        schema
+            .add_index(Arc::new(index))
+            .expect("dst_key is unique");
+    }
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement("INSERT OR IGNORE INTO dst SELECT * FROM src");
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated INSERT-SELECT has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed HIR has a physical plan");
+    let mut program = program();
+    emit_root(&plan, &mut program).expect("INSERT-SELECT IGNORE lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("all INSERT-SELECT conflict branches are closed");
+
+    let probe = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            if rowid_key {
+                matches!(instruction, Insn::NotExists { .. })
+            } else {
+                matches!(instruction, Insn::NoConflict { .. })
+            }
+        })
+        .expect("the generated key has a conflict probe");
+    let Insn::Goto { target_pc } = &program.insns[probe + 1].0 else {
+        panic!("IGNORE follows its conflict probe with a branch");
+    };
+    let (next_position, next_row) = program
+        .insns
+        .iter()
+        .enumerate()
+        .skip(probe + 2)
+        .find_map(|(position, (instruction, _))| match instruction {
+            Insn::Next { pc_if_next, .. } => Some((position, pc_if_next)),
+            _ => None,
+        })
+        .expect("the materialized INSERT source advances after each row");
+    assert_eq!(target_pc.as_offset_int() as usize, next_position);
+    assert!(next_row.as_offset_int() as usize <= probe);
+}
+
+// Examples:
 // - `INSERT INTO items VALUES (NULL)` with
 //   `c0 NOT NULL ON CONFLICT IGNORE` branches around the write.
 // - The same column with `ON CONFLICT REPLACE DEFAULT 7` substitutes 7 and

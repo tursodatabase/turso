@@ -255,12 +255,13 @@ pub(crate) fn emit_root_insert_with_context(
                 "INSERT query was not materialized",
             ))?;
             let done = program.allocate_label();
-            let next = program.allocate_label();
+            let row_start = program.allocate_label();
+            let row_done = program.allocate_label();
             program.emit_insn(Insn::Rewind {
                 cursor_id: query_rows.cursor,
                 pc_if_empty: done,
             });
-            program.preassign_label_to_next_insn(next);
+            program.preassign_label_to_next_insn(row_start);
             emit_insert_query_row(
                 plan,
                 program,
@@ -273,14 +274,15 @@ pub(crate) fn emit_root_insert_with_context(
                 record,
                 &indexes,
                 query_rows.cursor,
-                next,
+                row_done,
                 triggers,
                 autoincrement.as_mut(),
                 cdc,
             )?;
+            program.preassign_label_to_next_insn(row_done);
             program.emit_insn(Insn::Next {
                 cursor_id: query_rows.cursor,
-                pc_if_next: next,
+                pc_if_next: row_start,
             });
             program.preassign_label_to_next_insn(done);
         }
