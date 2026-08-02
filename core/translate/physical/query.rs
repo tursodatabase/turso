@@ -499,6 +499,29 @@ pub(crate) fn emit_root_query_with_inputs(
     program: &mut ProgramBuilder,
     inputs: &RootRuntimeInputs,
 ) -> QueryResult<()> {
+    emit_root_query_to_destination(plan, program, inputs, QueryDestination::ResultRows)
+}
+
+pub(crate) fn emit_root_query_into_ephemeral(
+    plan: &PhysicalPlan<'_>,
+    program: &mut ProgramBuilder,
+    cursor_id: usize,
+    table: &BTreeTable,
+) -> QueryResult<()> {
+    emit_root_query_to_destination(
+        plan,
+        program,
+        &RootRuntimeInputs::default(),
+        QueryDestination::EphemeralTable { cursor_id, table },
+    )
+}
+
+fn emit_root_query_to_destination(
+    plan: &PhysicalPlan<'_>,
+    program: &mut ProgramBuilder,
+    inputs: &RootRuntimeInputs,
+    destination: QueryDestination<'_>,
+) -> QueryResult<()> {
     let query_id = match &plan.root {
         PhysicalRoot::Query(query) => *query,
         PhysicalRoot::Insert(_)
@@ -528,7 +551,7 @@ pub(crate) fn emit_root_query_with_inputs(
         &mut bindings,
         &mut ctes,
         query_id,
-        QueryDestination::ResultRows,
+        destination,
     );
     if result.is_ok() {
         for cursor_id in ctes.temporary_cursors.iter().rev() {
@@ -5380,7 +5403,7 @@ fn open_cte_source<'document>(
     })
 }
 
-fn ephemeral_table(name: String, width: usize) -> Arc<BTreeTable> {
+pub(crate) fn ephemeral_table(name: String, width: usize) -> Arc<BTreeTable> {
     let columns = (0..width)
         .map(|position| {
             Column::new_default_text(Some(format!("column_{position}")), "BLOB".to_string(), None)

@@ -110,6 +110,8 @@ operations are not SQL binding.
   - [x] Table-function arguments and hidden-column inputs emit from frozen HIR.
   - [x] Two-source RIGHT and FULL joins preserve the original HIR sides and
         evaluate WHERE only after unmatched rows are null-extended.
+  - [x] CREATE TABLE AS derives its columns and materializes rows from one
+        closed HIR document without invoking the legacy SELECT planner.
 - [ ] UPDATE and DELETE, including FROM, RETURNING, triggers, and foreign keys.
   - [x] A catalog-free root dispatcher emits simple rowid B-tree DELETE directly
         from closed HIR and rejects every unimplemented write obligation before

@@ -265,6 +265,27 @@ expect error {
     UNIQUE constraint failed
 }
 
+# CREATE TABLE AS must derive names and declared types from the analyzed query,
+# then materialize the same HIR query including ordering and compound arms.
+@cross-check-integrity
+test create_table_as_select_uses_bound_query {
+    CREATE TABLE ctas_source(a INTEGER, b TEXT);
+    INSERT INTO ctas_source VALUES (2, 'b'), (1, 'a');
+    CREATE TABLE ctas_rows AS
+        SELECT a AS number, b AS label FROM ctas_source ORDER BY a;
+    SELECT number, label, typeof(number), typeof(label) FROM ctas_rows;
+
+    CREATE TABLE ctas_compound AS
+        SELECT 2 AS value UNION SELECT 1;
+    SELECT value FROM ctas_compound ORDER BY value;
+}
+expect {
+    1|a|integer|text
+    2|b|integer|text
+    1
+    2
+}
+
 @cross-check-integrity
 test create_table_primary_key_collate_desc_accepts_distinct_values {
     CREATE TABLE t_pkd(a, PRIMARY KEY(a COLLATE NOCASE DESC));
