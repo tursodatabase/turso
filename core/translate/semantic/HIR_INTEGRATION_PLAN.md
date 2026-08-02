@@ -182,6 +182,10 @@ operations are not SQL binding.
 One syntax root uses exactly one semantic implementation. Falling back after a
 semantic error is forbidden because it would hide analyzer defects.
 
+- [x] Both top-level `translate` and nested `translate_inner` route SELECT,
+      INSERT, UPDATE, and DELETE directly to the semantic root; the old DML
+      entrypoints are no longer executable prepare paths.
+
 ### 5. Delete the old representation
 
 - [ ] Remove every production use of `bind_and_rewrite_expr` and

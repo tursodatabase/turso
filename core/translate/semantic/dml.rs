@@ -4,25 +4,25 @@ use rustc_hash::FxHashSet as HashSet;
 use turso_parser::ast;
 
 use super::{
-    Analyzer, CatalogObjectKind, TriggerAnalysisInput,
     context::SemanticContext,
     dml_rules::{
-        DmlOperation, add_schema_named_target, configure_target_read_scope, configure_upsert_scope,
-        resolve_assignment_columns, resolve_insert_columns,
+        add_schema_named_target, configure_target_read_scope, configure_upsert_scope,
+        resolve_assignment_columns, resolve_insert_columns, DmlOperation,
     },
     expr::ExprPolicy,
     hir::{self, CatalogObject, DatabaseId, TargetColumn},
     query::IndexMetadataMode,
     scope::{QueryEnvironment, Scope},
+    Analyzer, CatalogObjectKind, TriggerAnalysisInput,
 };
 use crate::{
-    LimboError, Result,
     schema::{
-        BTreeTable, Index, IndexColumn, ResolvedFkRef, SQLITE_SEQUENCE_TABLE_NAME, Table, Trigger,
+        BTreeTable, Index, IndexColumn, ResolvedFkRef, Table, Trigger, SQLITE_SEQUENCE_TABLE_NAME,
     },
     schema_expr::SchemaExprProfile,
     sync::Arc,
-    translate::expr::{WalkControl, walk_expr},
+    translate::expr::{walk_expr, WalkControl},
+    LimboError, Result,
 };
 
 pub(super) enum InsertSourceSyntax<'a> {

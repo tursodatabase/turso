@@ -54,7 +54,6 @@ mod window;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
-use crate::translate::delete::translate_delete;
 use crate::translate::emitter::Resolver;
 use crate::translate::physical::{emit_root_with_context, PhysicalPlan};
 use crate::translate::plan::ResultSetColumn;
@@ -67,14 +66,11 @@ use crate::{bail_parse_error, Connection, Result, SymbolTable};
 use alter::translate_alter_table;
 use analyze::translate_analyze;
 use index::{translate_create_index, translate_drop_index, translate_optimize, translate_reindex};
-use insert::translate_insert;
 use rollback::{translate_release, translate_rollback, translate_savepoint};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
-use select::translate_select;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
 use turso_parser::ast;
-use update::translate_update;
 
 #[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
@@ -632,35 +628,17 @@ pub fn translate_inner(
         ast::Stmt::CreateVirtualTable(vtab) => {
             translate_create_virtual_table(vtab, resolver, program, connection)?
         }
-        ast::Stmt::Delete {
-            tbl_name,
-            where_clause,
-            limit,
-            returning,
-            indexed,
-            order_by,
-            with,
-        } => {
-            if !order_by.is_empty() {
-                bail_parse_error!("ORDER BY clause is not supported in DELETE");
-            }
-            if where_clause.is_none() && connection.get_dml_require_where() {
-                bail_parse_error!(
-                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
-                );
-            }
-            translate_delete(
-                &tbl_name,
-                resolver,
-                where_clause,
-                limit,
-                returning,
-                indexed,
-                with,
-                program,
-                connection,
-            )?
-        }
+        statement @ (ast::Stmt::Select(_)
+        | ast::Stmt::Insert { .. }
+        | ast::Stmt::Update(_)
+        | ast::Stmt::Delete { .. }) => translate_semantic_root(
+            resolver.schema(),
+            &statement,
+            program,
+            connection,
+            resolver.symbol_table,
+            crate::statement::StatementOrigin::Root,
+        )?,
         ast::Stmt::Detach { name } => {
             attach::translate_detach(&name, resolver, program, connection.clone())?
         }
@@ -743,44 +721,9 @@ pub fn translate_inner(
             savepoint_name,
         } => translate_rollback(program, tx_name, savepoint_name)?,
         ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
-        ast::Stmt::Select(select) => {
-            translate_select(
-                select,
-                resolver,
-                program,
-                plan::QueryDestination::ResultRows,
-                connection,
-            )?;
-        }
-        ast::Stmt::Update(update) => {
-            if update.where_clause.is_none() && connection.get_dml_require_where() {
-                bail_parse_error!(
-                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
-                );
-            }
-            translate_update(update, resolver, program, connection)?
-        }
         ast::Stmt::Vacuum { name, into } => {
             vacuum::translate_vacuum(program, name.as_ref(), into.as_deref(), connection.clone())?
         }
-        ast::Stmt::Insert {
-            with,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-        } => translate_insert(
-            resolver,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-            with,
-            program,
-            connection,
-        )?,
         ast::Stmt::CreateSequence {
             if_not_exists,
             seq_name,
