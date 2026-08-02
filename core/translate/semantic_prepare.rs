@@ -49,7 +49,8 @@ struct TriggerTarget<'document> {
 }
 
 struct ForeignKeyActionStackEntry {
-    child_table: hir::CatalogObjectId,
+    child_database: usize,
+    child_table: String,
     declaration_order: usize,
     parent_change: ForeignKeyParentChange,
     slot: Arc<OnceLock<Weak<PreparedProgram>>>,
@@ -295,9 +296,16 @@ fn prepare_one_foreign_key_action(
     stack: &mut Vec<ForeignKeyActionStackEntry>,
 ) -> Result<PreparedForeignKeyAction> {
     let child_table = foreign_key.child_table.id();
+    let child_database = foreign_key
+        .child_table
+        .database()
+        .ok_or_else(|| internal("foreign-key child has no database identity"))?
+        .index();
+    let child_table_name = crate::util::normalize_ident(foreign_key.child_table.value().get_name());
     let declaration_order = foreign_key.declaration.decl_order;
     if let Some(entry) = stack.iter().find(|entry| {
-        entry.child_table == child_table
+        entry.child_database == child_database
+            && entry.child_table == child_table_name
             && entry.declaration_order == declaration_order
             && entry.parent_change == parent_change
     }) {
@@ -311,14 +319,22 @@ fn prepare_one_foreign_key_action(
 
     let slot = Arc::new(OnceLock::new());
     stack.push(ForeignKeyActionStackEntry {
-        child_table,
+        child_database,
+        child_table: child_table_name,
         declaration_order,
         parent_change,
         slot: slot.clone(),
     });
     let compiled = (|| {
         let statement = foreign_key_action_statement(context, foreign_key, parent_change, action)?;
-        let nested_context = context.with_dml_policy(context.dml_policy().as_nested_statement());
+        let nested_context = context
+            .with_dml_policy(context.dml_policy().as_nested_statement())
+            .with_foreign_key_action(
+                child_database,
+                foreign_key.child_table.value().get_name(),
+                declaration_order,
+                parent_change == ForeignKeyParentChange::Update && action == RefAct::Cascade,
+            );
         let document = analyze(&nested_context, AnalyzeInput::Statement(&statement))?;
         let mut program = ProgramBuilder::new_for_subprogram(
             QueryMode::Normal,
@@ -848,11 +864,20 @@ mod properties {
         let action_statement =
             foreign_key_action_statement(&context, foreign_key, parent_change, action)
                 .expect("action syntax is generated from frozen FK facts");
-        let action_document = analyze(
-            &context.with_dml_policy(context.dml_policy().as_nested_statement()),
-            AnalyzeInput::Statement(&action_statement),
-        )
-        .expect("generated action analyzes into closed HIR");
+        let action_context = context
+            .with_dml_policy(context.dml_policy().as_nested_statement())
+            .with_foreign_key_action(
+                foreign_key
+                    .child_table
+                    .database()
+                    .expect("fixture child belongs to main")
+                    .index(),
+                foreign_key.child_table.value().get_name(),
+                foreign_key.declaration.decl_order,
+                parent_change == ForeignKeyParentChange::Update && action == RefAct::Cascade,
+            );
+        let action_document = analyze(&action_context, AnalyzeInput::Statement(&action_statement))
+            .expect("generated action analyzes into closed HIR");
         action_document
             .validate()
             .expect("generated action HIR is closed");
@@ -866,6 +891,17 @@ mod properties {
             ),
             _ => panic!("an FK action is child DML"),
         };
+        if let hir::HirRoot::Update(update) = &action_document.root {
+            // Examples:
+            // - `ON UPDATE CASCADE` generates `UPDATE children SET c2 = ?2`
+            //   and marks that exact outgoing FK as backed by the new parent;
+            // - `ON UPDATE SET NULL/DEFAULT` and every DELETE action leave the
+            //   mark false, so their resulting child values are still checked.
+            assert_eq!(
+                update.foreign_keys.outgoing[0].parent_action_guarantees_new_parent,
+                parent_change == ForeignKeyParentChange::Update && action == RefAct::Cascade
+            );
+        }
         let Some(hir::Expr::Binary { lhs, rhs, .. }) = predicate else {
             panic!("one-column FK action has one equality predicate");
         };

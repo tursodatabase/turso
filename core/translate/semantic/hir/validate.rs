@@ -663,6 +663,11 @@ impl<'document> HirValidator<'document> {
             foreign_key.parent_uses_rowid == parent_uses_rowid,
             "foreign-key rowid lookup fact does not match the parent column",
         )?;
+        self.require(
+            !foreign_key.parent_action_guarantees_new_parent
+                || foreign_key.declaration.on_update == turso_parser::ast::RefAct::Cascade,
+            "only an UPDATE CASCADE action can guarantee the new parent",
+        )?;
 
         match &foreign_key.parent_unique_index {
             Some(index) => {

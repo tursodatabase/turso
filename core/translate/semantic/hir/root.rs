@@ -182,6 +182,9 @@ pub struct ResolvedForeignKey {
     pub parent_positions: Box<[usize]>,
     pub parent_uses_rowid: bool,
     pub parent_unique_index: Option<ResolvedIndex>,
+    /// This generated CASCADE update copies the key of a parent row that the
+    /// calling mutation has already created.
+    pub parent_action_guarantees_new_parent: bool,
 }
 
 #[derive(Clone, Debug)]

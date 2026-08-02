@@ -514,6 +514,9 @@ impl Analyzer<'_, '_> {
         event: ast::TriggerEvent,
         assignments: &[hir::Assignment],
     ) -> Result<Vec<hir::ResolvedTrigger>> {
+        if self.context().dml_policy().user_triggers_disabled() {
+            return Ok(Vec::new());
+        }
         let updated_columns = assignments
             .iter()
             .flat_map(|assignment| assignment.columns.iter())
@@ -686,6 +689,12 @@ impl Analyzer<'_, '_> {
         foreign_key: ResolvedFkRef,
         parent: Arc<BTreeTable>,
     ) -> Result<hir::ResolvedForeignKey> {
+        let parent_action_guarantees_new_parent =
+            self.context().foreign_key_action_guarantees_new_parent(
+                database_id,
+                &foreign_key.child_table.name,
+                foreign_key.fk.decl_order,
+            );
         let child_id = self.catalog_object_id(
             Some(database_id),
             CatalogObjectKind::Table,
@@ -728,6 +737,7 @@ impl Analyzer<'_, '_> {
             parent_positions: foreign_key.parent_pos,
             parent_uses_rowid: foreign_key.parent_uses_rowid,
             parent_unique_index,
+            parent_action_guarantees_new_parent,
         })
     }
 

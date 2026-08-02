@@ -70,6 +70,18 @@ pub(crate) struct TriggerCatalogContext {
     pub(crate) trigger_name: String,
 }
 
+/// The foreign-key action whose generated DML is being analyzed.
+///
+/// Catalog object ids are local to one HIR document, so nested action
+/// documents use the stable database/table/declaration identity instead.
+#[derive(Clone, Debug)]
+struct ForeignKeyActionContext {
+    child_database: usize,
+    child_table: String,
+    declaration_order: usize,
+    guarantees_new_parent: bool,
+}
+
 /// Statement-policy facts that affect SQLite DML validation.
 ///
 /// These are captured before semantic analysis so DML rules do not need a
@@ -81,6 +93,7 @@ pub(crate) struct DmlPolicy {
     internal_schema_change: bool,
     check_constraints_ignored: bool,
     foreign_keys_enabled: bool,
+    user_triggers_disabled: bool,
 }
 
 impl DmlPolicy {
@@ -97,6 +110,7 @@ impl DmlPolicy {
             internal_schema_change,
             check_constraints_ignored,
             foreign_keys_enabled,
+            user_triggers_disabled: false,
         }
     }
 
@@ -118,6 +132,15 @@ impl DmlPolicy {
 
     pub(crate) const fn foreign_keys_enabled(self) -> bool {
         self.foreign_keys_enabled
+    }
+
+    pub(crate) const fn user_triggers_disabled(self) -> bool {
+        self.user_triggers_disabled
+    }
+
+    pub(crate) const fn without_user_triggers(mut self) -> Self {
+        self.user_triggers_disabled = true;
+        self
     }
 
     pub(crate) const fn as_nested_statement(mut self) -> Self {
@@ -161,6 +184,7 @@ pub(crate) struct SemanticContext<'a> {
     dqs_dml: DoubleQuotedDml,
     trigger: Option<TriggerCatalogContext>,
     dml_policy: DmlPolicy,
+    foreign_key_action: Option<ForeignKeyActionContext>,
     capture_data_changes: Option<CaptureDataChangesInfo>,
     internal_schema_change_sql: Option<&'a str>,
 }
@@ -197,6 +221,7 @@ impl<'a> SemanticContext<'a> {
             dqs_dml: DoubleQuotedDml::Enabled,
             trigger: None,
             dml_policy: DmlPolicy::default(),
+            foreign_key_action: None,
             capture_data_changes: None,
             internal_schema_change_sql: None,
         }
@@ -262,6 +287,7 @@ impl<'a> SemanticContext<'a> {
             dqs_dml,
             trigger: None,
             dml_policy: DmlPolicy::default(),
+            foreign_key_action: None,
             capture_data_changes: None,
             internal_schema_change_sql: None,
         }
@@ -348,6 +374,37 @@ impl<'a> SemanticContext<'a> {
         let mut context = self.clone();
         context.dml_policy = policy;
         context
+    }
+
+    pub(crate) fn with_foreign_key_action(
+        &self,
+        child_database: usize,
+        child_table: &str,
+        declaration_order: usize,
+        guarantees_new_parent: bool,
+    ) -> SemanticContext<'a> {
+        let mut context = self.clone();
+        context.foreign_key_action = Some(ForeignKeyActionContext {
+            child_database,
+            child_table: crate::util::normalize_ident(child_table),
+            declaration_order,
+            guarantees_new_parent,
+        });
+        context
+    }
+
+    pub(crate) fn foreign_key_action_guarantees_new_parent(
+        &self,
+        child_database: usize,
+        child_table: &str,
+        declaration_order: usize,
+    ) -> bool {
+        self.foreign_key_action.as_ref().is_some_and(|action| {
+            action.child_database == child_database
+                && action.child_table == crate::util::normalize_ident(child_table)
+                && action.declaration_order == declaration_order
+                && action.guarantees_new_parent
+        })
     }
 
     pub(crate) fn with_capture_data_changes(

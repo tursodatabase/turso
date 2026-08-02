@@ -16,10 +16,16 @@ use crate::translate::emitter::{
     DdlContext, OperationMode,
 };
 use crate::translate::expr::{walk_expr, WalkControl};
-use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::{
-    physical::{emit_root_query_into_ephemeral, ephemeral_table, PhysicalPlan},
-    semantic::{analyze, context::SemanticContext, hir, AnalyzeInput},
+    physical::{
+        emit_root_query_into_ephemeral, emit_root_with_context, ephemeral_table, PhysicalPlan,
+        RootRuntimeInputs,
+    },
+    semantic::{
+        analyze,
+        context::{DmlPolicy, SemanticContext},
+        hir, AnalyzeInput,
+    },
 };
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
@@ -1788,6 +1794,43 @@ fn validate_drop_table(
     Ok(())
 }
 
+fn emit_drop_table_row_delete(
+    tbl_name: &ast::QualifiedName,
+    ddl_context: &DdlContext<'_>,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let statement = ast::Stmt::Delete {
+        with: None,
+        tbl_name: tbl_name.clone(),
+        indexed: None,
+        where_clause: None,
+        returning: Vec::new(),
+        order_by: Vec::new(),
+        limit: None,
+    };
+    let context = ddl_context
+        .semantic_context(connection.get_dqs_dml().into())
+        .with_dml_policy(
+            DmlPolicy::new(
+                connection.is_nested_stmt(),
+                connection.is_mvcc_bootstrap_connection(),
+                false,
+                connection.check_constraints_ignored(),
+                true,
+            )
+            .without_user_triggers(),
+        );
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))?;
+    super::set_semantic_statement_journal_flags(program, &document)?;
+    let prepared =
+        super::semantic_prepare::prepare_triggers(&context, &document, program, connection)?;
+    let plan = PhysicalPlan::new(&document)
+        .map_err(|error| crate::LimboError::InternalError(error.to_string()))?;
+    emit_root_with_context(&plan, program, &RootRuntimeInputs::default(), &prepared)
+        .map_err(|error| crate::LimboError::InternalError(error.to_string()))
+}
+
 pub fn translate_drop_table(
     tbl_name: ast::QualifiedName,
     ddl_context: &mut DdlContext,
@@ -1810,12 +1853,12 @@ pub fn translate_drop_table(
         bail_parse_error!("No such table: {name}");
     };
     validate_drop_table(ddl_context, database_id, name, connection)?;
-    // Check if foreign keys are enabled and if this table is referenced by foreign keys
-    // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
-    if connection.foreign_keys_enabled()
-        && ddl_context.with_schema(database_id, |s| s.any_resolved_fks_referencing(name))
-    {
-        emit_fk_drop_table_check(program, ddl_context, name, connection, database_id)?;
+    // SQLite treats DROP TABLE as an implicit DELETE when foreign keys are
+    // enabled. Use the ordinary closed-HIR DELETE operation so child repairs,
+    // parent checks, and recursive actions share one implementation. User
+    // triggers are intentionally excluded from this implicit delete.
+    if connection.foreign_keys_enabled() && table.btree().is_some() {
+        emit_drop_table_row_delete(&tbl_name, ddl_context, program, connection)?;
     }
     let cdc_table = prepare_cdc_if_necessary(program, ddl_context.schema(), Some(SQLITE_TABLEID))?;
 

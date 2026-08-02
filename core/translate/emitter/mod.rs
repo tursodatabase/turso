@@ -3,7 +3,7 @@
 use super::{collate::CollationSeq, plan::BitSet};
 use crate::alloc::TursoIteratorExt;
 use crate::schema::{BTreeTable, Column, ColumnLayout, Schema, Table};
-use crate::translate::fkeys::FkActionCompileStack;
+use crate::translate::semantic::context::{DoubleQuotedDml, SemanticContext};
 use crate::vdbe::{
     builder::{CursorType, ProgramBuilder},
     insn::{to_u32, InsertFlags, Insn},
@@ -43,13 +43,6 @@ pub struct DdlContext<'a> {
     /// (e.g. via a nested sub-program), update this field on that
     /// path or switch to a live read.
     has_temp_schema: bool,
-    /// Foreign-key action programs currently being compiled by this ddl_context.
-    ///
-    /// This is shared with forked resolvers because `translate_inner` can fork
-    /// the ddl_context while compiling generated foreign-key action SQL. Without
-    /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
-    /// that its own action program is already being built.
-    pub(super) fk_action_compile_stack: FkActionCompileStack,
 }
 
 impl<'a> DdlContext<'a> {
@@ -77,12 +70,24 @@ impl<'a> DdlContext<'a> {
             enable_custom_types,
             dialect,
             has_temp_schema,
-            fk_action_compile_stack: FkActionCompileStack::default(),
         }
     }
 
     pub fn schema(&self) -> &Schema {
         self.schema
+    }
+
+    pub(crate) fn semantic_context(&self, dqs_dml: DoubleQuotedDml) -> SemanticContext<'a> {
+        SemanticContext::new(
+            self.schema,
+            self.database_schemas,
+            self.temp_database,
+            self.attached_databases,
+            self.symbol_table,
+            self.enable_custom_types,
+            dqs_dml,
+            self.dialect.clone(),
+        )
     }
 
     pub fn has_temp_database(&self) -> bool {

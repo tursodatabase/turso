@@ -127,7 +127,12 @@ pub(crate) fn emit_update_child_checks(
         if foreign_key.declaration.deferred {
             emit_old_child_repair(program, foreign_key, child_table, old_columns, old_rowid)?;
         }
-        emit_new_child_check(program, foreign_key, child_table, new_columns, new_rowid)?;
+        // An ON UPDATE CASCADE action assigns the NEW key supplied by the
+        // parent mutation. That parent row already exists, even when a fresh
+        // cursor in a self-referential action cannot observe the outer write.
+        if !foreign_key.parent_action_guarantees_new_parent {
+            emit_new_child_check(program, foreign_key, child_table, new_columns, new_rowid)?;
+        }
         program.preassign_label_to_next_insn(complete);
     }
     Ok(())

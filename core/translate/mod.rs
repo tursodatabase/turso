@@ -13,7 +13,6 @@ pub(crate) mod attach;
 pub(crate) mod collate;
 pub(crate) mod emitter;
 pub(crate) mod expr;
-pub(crate) mod fkeys;
 pub(crate) mod index;
 pub(crate) mod integrity_check;
 pub(crate) mod logical;
