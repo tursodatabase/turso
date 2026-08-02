@@ -2,7 +2,15 @@
 
 use std::fmt;
 
-use crate::vdbe::{builder::ProgramBuilder, insn::Insn, BranchOffset};
+use crate::{
+    sync::Arc,
+    translate::semantic::hir::{CatalogObjectId, ResolvedTrigger},
+    vdbe::{
+        builder::ProgramBuilder,
+        insn::{Insn, Subprogram},
+        BranchOffset, PreparedProgram,
+    },
+};
 
 use super::{
     ExpressionEmitter, PhysicalExpressionError, PhysicalPlan, PhysicalRoot, RootRuntimeInputs,
@@ -14,6 +22,119 @@ pub(crate) enum PhysicalTriggerError {
     Runtime(RuntimeBindingError),
     Expression(PhysicalExpressionError),
     Invalid(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TriggerParameter {
+    NewColumn(usize),
+    NewRowId,
+    OldColumn(usize),
+    OldRowId,
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedTrigger {
+    pub(crate) id: CatalogObjectId,
+    pub(crate) program: Arc<PreparedProgram>,
+    pub(crate) parameters: Vec<TriggerParameter>,
+}
+
+#[derive(Default)]
+pub(crate) struct PreparedTriggers {
+    programs: Vec<PreparedTrigger>,
+    suppressed: Vec<CatalogObjectId>,
+}
+
+impl PreparedTriggers {
+    pub(crate) fn push(&mut self, trigger: PreparedTrigger) {
+        self.programs.push(trigger);
+    }
+
+    pub(crate) fn suppress(&mut self, trigger: CatalogObjectId) {
+        self.suppressed.push(trigger);
+    }
+
+    fn find(&self, trigger: CatalogObjectId) -> Option<&PreparedTrigger> {
+        self.programs.iter().find(|program| program.id == trigger)
+    }
+
+    pub(crate) fn covers<'a>(
+        &self,
+        triggers: impl IntoIterator<Item = &'a ResolvedTrigger>,
+    ) -> bool {
+        triggers.into_iter().all(|trigger| {
+            self.find(trigger.id()).is_some() || self.suppressed.contains(&trigger.id())
+        })
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &PreparedTrigger> {
+        self.programs.iter()
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct TriggerRow {
+    pub(crate) columns: super::RegisterRange,
+    pub(crate) rowid: super::RegisterId,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct TriggerRows {
+    pub(crate) new: Option<TriggerRow>,
+    pub(crate) old: Option<TriggerRow>,
+}
+
+pub(super) fn resolve_trigger_parameters(
+    parameters: &[TriggerParameter],
+    rows: TriggerRows,
+) -> Result<Vec<usize>, PhysicalTriggerError> {
+    parameters
+        .iter()
+        .map(|parameter| {
+            match *parameter {
+                TriggerParameter::NewColumn(position) => rows
+                    .new
+                    .and_then(|row| row.columns.register(position))
+                    .map(|register| register.0),
+                TriggerParameter::NewRowId => rows.new.map(|row| row.rowid.0),
+                TriggerParameter::OldColumn(position) => rows
+                    .old
+                    .and_then(|row| row.columns.register(position))
+                    .map(|register| register.0),
+                TriggerParameter::OldRowId => rows.old.map(|row| row.rowid.0),
+            }
+            .ok_or(PhysicalTriggerError::Invalid(
+                "trigger parameter requests an unavailable row image",
+            ))
+        })
+        .collect()
+}
+
+/// Emit calls for the selected resolved triggers in their frozen order.
+pub(crate) fn emit_trigger_programs<'a>(
+    program: &mut ProgramBuilder,
+    prepared: &PreparedTriggers,
+    triggers: impl IntoIterator<Item = &'a ResolvedTrigger>,
+    rows: TriggerRows,
+    ignore_jump_target: BranchOffset,
+) -> Result<(), PhysicalTriggerError> {
+    for trigger in triggers {
+        let Some(compiled) = prepared.find(trigger.id()) else {
+            if prepared.suppressed.contains(&trigger.id()) {
+                continue;
+            }
+            return Err(PhysicalTriggerError::Invalid(
+                "resolved trigger has no prepared program",
+            ));
+        };
+        let param_registers = resolve_trigger_parameters(&compiled.parameters, rows)?;
+        program.emit_insn(Insn::Program {
+            param_registers,
+            program: Subprogram::PreparedProgram(compiled.program.clone()),
+            ignore_jump_target,
+        });
+    }
+    Ok(())
 }
 
 impl fmt::Display for PhysicalTriggerError {

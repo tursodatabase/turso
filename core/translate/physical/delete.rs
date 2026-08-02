@@ -8,6 +8,8 @@
 
 use std::fmt;
 
+use turso_parser::ast::TriggerTime;
+
 use crate::{
     schema::Table,
     translate::semantic::hir::{Expr, IndexCoverage, SourceKind},
@@ -19,9 +21,10 @@ use crate::{
 
 use super::{
     close_indexes, emit_index_delete, emit_index_key, emit_returning_result, emit_returning_values,
-    open_indexes, CursorId, ExpressionEmitter, PhysicalExpressionError, PhysicalIndexError,
-    PhysicalPlan, PhysicalQueryError, PhysicalRoot, PhysicalSourceKind, RegisterId,
-    RootRuntimeInputs, RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
+    emit_trigger_programs, open_indexes, CursorId, ExpressionEmitter, PhysicalExpressionError,
+    PhysicalIndexError, PhysicalPlan, PhysicalQueryError, PhysicalRoot, PhysicalSourceKind,
+    PhysicalTriggerError, PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs,
+    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess, TriggerRow, TriggerRows,
 };
 
 #[derive(Debug)]
@@ -29,6 +32,7 @@ pub(crate) enum PhysicalDeleteError {
     Runtime(RuntimeBindingError),
     Expression(PhysicalExpressionError),
     Index(PhysicalIndexError),
+    Trigger(PhysicalTriggerError),
     Invalid(&'static str),
     Unsupported(&'static str),
 }
@@ -39,6 +43,7 @@ impl fmt::Display for PhysicalDeleteError {
             Self::Runtime(error) => error.fmt(formatter),
             Self::Expression(error) => error.fmt(formatter),
             Self::Index(error) => error.fmt(formatter),
+            Self::Trigger(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical DELETE: {message}"),
             Self::Unsupported(message) => {
                 write!(formatter, "physical DELETE is not emitted yet: {message}")
@@ -64,6 +69,12 @@ impl From<PhysicalExpressionError> for PhysicalDeleteError {
 impl From<PhysicalIndexError> for PhysicalDeleteError {
     fn from(error: PhysicalIndexError) -> Self {
         Self::Index(error)
+    }
+}
+
+impl From<PhysicalTriggerError> for PhysicalDeleteError {
+    fn from(error: PhysicalTriggerError) -> Self {
+        Self::Trigger(error)
     }
 }
 
@@ -107,16 +118,28 @@ pub(crate) fn emit_root_with_inputs(
     program: &mut ProgramBuilder,
     inputs: &RootRuntimeInputs,
 ) -> Result<(), PhysicalRootError> {
+    emit_root_with_context(plan, program, inputs, &super::PreparedTriggers::default())
+}
+
+pub(crate) fn emit_root_with_context(
+    plan: &PhysicalPlan<'_>,
+    program: &mut ProgramBuilder,
+    inputs: &RootRuntimeInputs,
+    triggers: &super::PreparedTriggers,
+) -> Result<(), PhysicalRootError> {
     match plan.root {
         PhysicalRoot::Query(_) => super::emit_root_query_with_inputs(plan, program, inputs)
             .map_err(PhysicalRootError::Query),
-        PhysicalRoot::Delete(_) => {
-            emit_root_delete_with_inputs(plan, program, inputs).map_err(PhysicalRootError::Delete)
+        PhysicalRoot::Delete(_) => emit_root_delete_with_context(plan, program, inputs, triggers)
+            .map_err(PhysicalRootError::Delete),
+        PhysicalRoot::Insert(_) => {
+            super::emit_root_insert_with_context(plan, program, inputs, triggers)
+                .map_err(PhysicalRootError::Insert)
         }
-        PhysicalRoot::Insert(_) => super::emit_root_insert_with_inputs(plan, program, inputs)
-            .map_err(PhysicalRootError::Insert),
-        PhysicalRoot::Update(_) => super::emit_root_update_with_inputs(plan, program, inputs)
-            .map_err(PhysicalRootError::Update),
+        PhysicalRoot::Update(_) => {
+            super::emit_root_update_with_context(plan, program, inputs, triggers)
+                .map_err(PhysicalRootError::Update)
+        }
         PhysicalRoot::TriggerPredicate(_) => {
             Err(PhysicalRootError::Unsupported("trigger predicate root"))
         }
@@ -136,11 +159,20 @@ pub(crate) fn emit_root_delete_with_inputs(
     program: &mut ProgramBuilder,
     inputs: &RootRuntimeInputs,
 ) -> DeleteResult<()> {
+    emit_root_delete_with_context(plan, program, inputs, &super::PreparedTriggers::default())
+}
+
+pub(crate) fn emit_root_delete_with_context(
+    plan: &PhysicalPlan<'_>,
+    program: &mut ProgramBuilder,
+    inputs: &RootRuntimeInputs,
+    triggers: &super::PreparedTriggers,
+) -> DeleteResult<()> {
     let delete = match &plan.root {
         PhysicalRoot::Delete(delete) => *delete,
         _ => return Err(PhysicalDeleteError::Unsupported("non-DELETE HIR root")),
     };
-    let (source, table, database) = preflight_delete(plan, delete)?;
+    let (source, table, database) = preflight_delete(plan, delete, triggers)?;
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     let mut bindings = RuntimeBindings::new(plan.document, plan.document.snapshot)?;
     inputs.apply(&mut bindings)?;
@@ -153,6 +185,12 @@ pub(crate) fn emit_root_delete_with_inputs(
     });
     let indexes = open_indexes(program, source, database)?;
     let rowid = RegisterId(program.alloc_register());
+    let old_columns = (!delete.triggers.is_empty()).then(|| {
+        RegisterRange::new(
+            program.alloc_registers(source.columns.len()),
+            source.columns.len(),
+        )
+    });
     let loop_start = program.allocate_label();
     let loop_next = program.allocate_label();
     let loop_end = program.allocate_label();
@@ -172,15 +210,57 @@ pub(crate) fn emit_root_delete_with_inputs(
             jump_if_null: true,
         });
     }
-    let returning = delete
-        .returning
-        .as_ref()
-        .map(|returning| emit_returning_values(program, &mut bindings, returning))
-        .transpose()?;
     program.emit_insn(Insn::RowId {
         cursor_id: cursor,
         dest: rowid.0,
     });
+    if let Some(old_columns) = old_columns {
+        for position in 0..old_columns.width {
+            program.emit_column_or_rowid(cursor, position, old_columns.first.0 + position);
+        }
+        let rows = TriggerRows {
+            new: None,
+            old: Some(TriggerRow {
+                columns: old_columns,
+                rowid,
+            }),
+        };
+        emit_trigger_programs(
+            program,
+            triggers,
+            delete
+                .triggers
+                .iter()
+                .filter(|trigger| trigger.value().time == TriggerTime::Before),
+            rows,
+            loop_next,
+        )?;
+        program.emit_insn(Insn::NotExists {
+            cursor,
+            rowid_reg: rowid.0,
+            target_pc: loop_next,
+        });
+    }
+    let returning = if let Some(returning) = &delete.returning {
+        let previous = old_columns
+            .map(|columns| {
+                bindings.replace_source(
+                    delete.target,
+                    SourceRuntime::Registers {
+                        columns,
+                        rowid: Some(rowid),
+                    },
+                )
+            })
+            .transpose()?;
+        let result = emit_returning_values(program, &mut bindings, returning)?;
+        if let Some(previous) = previous {
+            bindings.replace_source(delete.target, previous)?;
+        }
+        Some(result)
+    } else {
+        None
+    };
     let mut keys = Vec::with_capacity(indexes.len());
     for index in &indexes {
         keys.push(emit_index_key(
@@ -200,6 +280,24 @@ pub(crate) fn emit_root_delete_with_inputs(
         table_name: table.name.clone(),
         is_part_of_update: false,
     });
+    if let Some(old_columns) = old_columns {
+        emit_trigger_programs(
+            program,
+            triggers,
+            delete
+                .triggers
+                .iter()
+                .filter(|trigger| trigger.value().time == TriggerTime::After),
+            TriggerRows {
+                new: None,
+                old: Some(TriggerRow {
+                    columns: old_columns,
+                    rowid,
+                }),
+            },
+            loop_next,
+        )?;
+    }
     if let Some(result) = returning {
         emit_returning_result(program, result);
     }
@@ -217,6 +315,7 @@ pub(crate) fn emit_root_delete_with_inputs(
 fn preflight_delete<'plan>(
     plan: &'plan PhysicalPlan<'plan>,
     delete: &crate::translate::semantic::hir::Delete,
+    triggers: &PreparedTriggers,
 ) -> DeleteResult<(
     &'plan crate::translate::semantic::hir::Source,
     crate::sync::Arc<crate::schema::BTreeTable>,
@@ -225,8 +324,10 @@ fn preflight_delete<'plan>(
     if !delete.order_by.is_empty() || delete.limit.is_some() {
         return Err(PhysicalDeleteError::Unsupported("ORDER BY or LIMIT"));
     }
-    if !delete.triggers.is_empty() {
-        return Err(PhysicalDeleteError::Unsupported("trigger execution"));
+    if !triggers.covers(&delete.triggers) {
+        return Err(PhysicalDeleteError::Invalid(
+            "resolved trigger has no prepared program",
+        ));
     }
     if !delete.foreign_keys.outgoing.is_empty() || !delete.foreign_keys.incoming.is_empty() {
         return Err(PhysicalDeleteError::Unsupported("foreign-key actions"));

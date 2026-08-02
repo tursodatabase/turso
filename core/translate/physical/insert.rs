@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use turso_parser::ast::ResolveType;
+use turso_parser::ast::{ResolveType, TriggerTime};
 
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY},
@@ -17,10 +17,11 @@ use crate::{
 use super::{
     close_indexes, emit_complete_logical_row, emit_index_insert, emit_index_key,
     emit_new_row_constraints, emit_query_for_dml, emit_returning_result, emit_returning_values,
-    emit_stored_record, emit_unique_check, open_indexes, CursorId, ExpressionEmitter, OpenedIndex,
-    PhysicalExpressionError, PhysicalIndexError, PhysicalPlan, PhysicalQueryError, PhysicalRoot,
-    PhysicalRowError, PhysicalSourceKind, RegisterId, RegisterRange, RootRuntimeInputs,
-    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
+    emit_stored_record, emit_trigger_programs, emit_unique_check, open_indexes, CursorId,
+    ExpressionEmitter, OpenedIndex, PhysicalExpressionError, PhysicalIndexError, PhysicalPlan,
+    PhysicalQueryError, PhysicalRoot, PhysicalRowError, PhysicalSourceKind, PhysicalTriggerError,
+    PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs, RuntimeBindingError,
+    RuntimeBindings, SourceRuntime, TableAccess, TriggerRow, TriggerRows,
 };
 
 #[derive(Debug)]
@@ -30,6 +31,7 @@ pub(crate) enum PhysicalInsertError {
     Row(PhysicalRowError),
     Index(PhysicalIndexError),
     Query(PhysicalQueryError),
+    Trigger(PhysicalTriggerError),
     Invalid(&'static str),
     Unsupported(&'static str),
 }
@@ -42,6 +44,7 @@ impl fmt::Display for PhysicalInsertError {
             Self::Row(error) => error.fmt(formatter),
             Self::Index(error) => error.fmt(formatter),
             Self::Query(error) => error.fmt(formatter),
+            Self::Trigger(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical INSERT: {message}"),
             Self::Unsupported(message) => {
                 write!(formatter, "physical INSERT is not emitted yet: {message}")
@@ -82,13 +85,24 @@ impl From<PhysicalQueryError> for PhysicalInsertError {
     }
 }
 
+impl From<PhysicalTriggerError> for PhysicalInsertError {
+    fn from(error: PhysicalTriggerError) -> Self {
+        Self::Trigger(error)
+    }
+}
+
 type InsertResult<T> = std::result::Result<T, PhysicalInsertError>;
 
 pub(crate) fn emit_root_insert(
     plan: &PhysicalPlan<'_>,
     program: &mut ProgramBuilder,
 ) -> InsertResult<()> {
-    emit_root_insert_with_inputs(plan, program, &RootRuntimeInputs::default())
+    emit_root_insert_with_context(
+        plan,
+        program,
+        &RootRuntimeInputs::default(),
+        &PreparedTriggers::default(),
+    )
 }
 
 pub(crate) fn emit_root_insert_with_inputs(
@@ -96,11 +110,20 @@ pub(crate) fn emit_root_insert_with_inputs(
     program: &mut ProgramBuilder,
     inputs: &RootRuntimeInputs,
 ) -> InsertResult<()> {
+    emit_root_insert_with_context(plan, program, inputs, &PreparedTriggers::default())
+}
+
+pub(crate) fn emit_root_insert_with_context(
+    plan: &PhysicalPlan<'_>,
+    program: &mut ProgramBuilder,
+    inputs: &RootRuntimeInputs,
+    triggers: &PreparedTriggers,
+) -> InsertResult<()> {
     let insert = match &plan.root {
         PhysicalRoot::Insert(insert) => *insert,
         _ => return Err(PhysicalInsertError::Unsupported("non-INSERT HIR root")),
     };
-    let (source, table, database) = preflight_insert(plan, insert)?;
+    let (source, table, database) = preflight_insert(plan, insert, triggers)?;
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     let logical = RegisterRange::new(
         program.alloc_registers(source.columns.len()),
@@ -155,6 +178,7 @@ pub(crate) fn emit_root_insert_with_inputs(
                 &indexes,
                 &[],
                 skip_row,
+                triggers,
             )?;
             program.preassign_label_to_next_insn(skip_row);
         }
@@ -173,6 +197,7 @@ pub(crate) fn emit_root_insert_with_inputs(
                     &indexes,
                     row,
                     skip_row,
+                    triggers,
                 )?;
                 program.preassign_label_to_next_insn(skip_row);
             }
@@ -200,6 +225,7 @@ pub(crate) fn emit_root_insert_with_inputs(
                 &indexes,
                 query_rows.cursor,
                 next,
+                triggers,
             )?;
             program.emit_insn(Insn::Next {
                 cursor_id: query_rows.cursor,
@@ -229,6 +255,7 @@ fn emit_insert_row(
     indexes: &[OpenedIndex<'_>],
     values: &[hir::Expr],
     skip_row: crate::vdbe::BranchOffset,
+    triggers: &PreparedTriggers,
 ) -> InsertResult<()> {
     if values.len() != insert.columns.len() {
         return Err(PhysicalInsertError::Invalid(
@@ -245,6 +272,7 @@ fn emit_insert_row(
     emit_insert_defaults(program, bindings, insert, logical)?;
     finish_insert_row(
         program, bindings, insert, table, cursor, logical, rowid, record, indexes, skip_row,
+        triggers,
     )
 }
 
@@ -261,6 +289,7 @@ fn emit_insert_query_row(
     indexes: &[OpenedIndex<'_>],
     query_cursor: usize,
     skip_row: crate::vdbe::BranchOffset,
+    triggers: &PreparedTriggers,
 ) -> InsertResult<()> {
     initialize_insert_row(program, logical, rowid);
     for (position, target) in insert.columns.iter().enumerate() {
@@ -270,6 +299,7 @@ fn emit_insert_query_row(
     emit_insert_defaults(program, bindings, insert, logical)?;
     finish_insert_row(
         program, bindings, insert, table, cursor, logical, rowid, record, indexes, skip_row,
+        triggers,
     )
 }
 
@@ -327,6 +357,7 @@ fn finish_insert_row(
     record: usize,
     indexes: &[OpenedIndex<'_>],
     skip_row: crate::vdbe::BranchOffset,
+    triggers: &PreparedTriggers,
 ) -> InsertResult<()> {
     let statement_conflict = insert.conflict.unwrap_or(ResolveType::Abort);
     if let Some((position, _)) = table.get_rowid_alias_column().filter(|(position, _)| {
@@ -368,6 +399,23 @@ fn finish_insert_row(
         });
     }
     emit_complete_logical_row(program, bindings, insert.target, table, logical)?;
+    let trigger_rows = TriggerRows {
+        new: Some(TriggerRow {
+            columns: logical,
+            rowid,
+        }),
+        old: None,
+    };
+    emit_trigger_programs(
+        program,
+        triggers,
+        insert
+            .triggers
+            .iter()
+            .filter(|trigger| trigger.value().time == TriggerTime::Before),
+        trigger_rows,
+        skip_row,
+    )?;
     if statement_conflict == ResolveType::Replace {
         emit_replace_not_null_defaults(program, bindings, insert, table, logical)?;
     }
@@ -466,6 +514,18 @@ fn finish_insert_row(
         flag: InsertFlags::new(),
         table_name: table.name.clone(),
     });
+    let after_trigger_done = program.allocate_label();
+    emit_trigger_programs(
+        program,
+        triggers,
+        insert
+            .triggers
+            .iter()
+            .filter(|trigger| trigger.value().time == TriggerTime::After),
+        trigger_rows,
+        after_trigger_done,
+    )?;
+    program.preassign_label_to_next_insn(after_trigger_done);
     if let Some(returning) = &insert.returning {
         let result = emit_returning_values(program, bindings, returning)?;
         emit_returning_result(program, result);
@@ -476,6 +536,7 @@ fn finish_insert_row(
 fn preflight_insert<'plan>(
     plan: &'plan PhysicalPlan<'plan>,
     insert: &hir::Insert,
+    triggers: &PreparedTriggers,
 ) -> InsertResult<(
     &'plan hir::Source,
     crate::sync::Arc<crate::schema::BTreeTable>,
@@ -510,8 +571,10 @@ fn preflight_insert<'plan>(
             "rowid assignment in UPSERT DO UPDATE",
         ));
     }
-    if !insert.triggers.is_empty() {
-        return Err(PhysicalInsertError::Unsupported("trigger execution"));
+    if !triggers.covers(&insert.triggers) {
+        return Err(PhysicalInsertError::Invalid(
+            "resolved trigger has no prepared program",
+        ));
     }
     if !insert.foreign_keys.outgoing.is_empty() || !insert.foreign_keys.incoming.is_empty() {
         return Err(PhysicalInsertError::Unsupported("foreign-key checks"));

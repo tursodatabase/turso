@@ -120,3 +120,51 @@ fn trigger_predicates_read_the_exact_supplied_row_image_position(tc: hegel::Test
         Insn::IfNot { target_pc, jump_if_null: true, .. } if *target_pc == false_target
     )));
 }
+
+// Example: a trigger body that reads `NEW.c2, OLD.rowid, NEW.rowid, OLD.c0`
+// must receive `[new_base + 2, old_rowid, new_rowid, old_base]` in that exact order.
+#[hegel::test]
+fn trigger_parameters_preserve_row_kind_position_and_reference_order(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(16)));
+    let new_base = usize::from(tc.draw(generators::integers::<u16>().min_value(1))) + 1;
+    let old_base = new_base + width + 5;
+    let new_rowid = old_base + width + 7;
+    let old_rowid = new_rowid + 3;
+    let first_position = usize::from(
+        tc.draw(generators::integers::<u8>().max_value(u8::try_from(width - 1).unwrap())),
+    );
+    let second_position = usize::from(
+        tc.draw(generators::integers::<u8>().max_value(u8::try_from(width - 1).unwrap())),
+    );
+    let parameters = [
+        TriggerParameter::NewColumn(first_position),
+        TriggerParameter::OldRowId,
+        TriggerParameter::NewRowId,
+        TriggerParameter::OldColumn(second_position),
+    ];
+
+    let resolved = resolve_trigger_parameters(
+        &parameters,
+        TriggerRows {
+            new: Some(TriggerRow {
+                columns: RegisterRange::new(new_base, width),
+                rowid: RegisterId(new_rowid),
+            }),
+            old: Some(TriggerRow {
+                columns: RegisterRange::new(old_base, width),
+                rowid: RegisterId(old_rowid),
+            }),
+        },
+    )
+    .expect("both generated trigger row images are available");
+
+    assert_eq!(
+        resolved,
+        vec![
+            new_base + first_position,
+            old_rowid,
+            new_rowid,
+            old_base + second_position,
+        ]
+    );
+}

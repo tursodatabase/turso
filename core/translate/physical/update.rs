@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use turso_parser::ast::ResolveType;
+use turso_parser::ast::{ResolveType, TriggerTime};
 
 use crate::{
     schema::Table,
@@ -16,10 +16,11 @@ use crate::{
 use super::{
     close_indexes, emit_complete_logical_row, emit_index_delete, emit_index_insert, emit_index_key,
     emit_new_row_constraints, emit_returning_result, emit_returning_values, emit_stored_record,
-    emit_unique_check, open_indexes, CursorId, ExpressionEmitter, PhysicalExpressionError,
-    PhysicalIndexError, PhysicalPlan, PhysicalRoot, PhysicalRowError, PhysicalSourceKind,
-    RegisterId, RegisterRange, RootRuntimeInputs, RuntimeBindingError, RuntimeBindings,
-    SourceRuntime, TableAccess,
+    emit_trigger_programs, emit_unique_check, open_indexes, CursorId, ExpressionEmitter,
+    PhysicalExpressionError, PhysicalIndexError, PhysicalPlan, PhysicalRoot, PhysicalRowError,
+    PhysicalSourceKind, PhysicalTriggerError, PreparedTriggers, RegisterId, RegisterRange,
+    RootRuntimeInputs, RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
+    TriggerRow, TriggerRows,
 };
 
 #[derive(Debug)]
@@ -29,6 +30,7 @@ pub(crate) enum PhysicalUpdateError {
     Row(PhysicalRowError),
     Index(PhysicalIndexError),
     Query(super::PhysicalQueryError),
+    Trigger(PhysicalTriggerError),
     Invalid(&'static str),
     Unsupported(&'static str),
 }
@@ -41,6 +43,7 @@ impl fmt::Display for PhysicalUpdateError {
             Self::Row(error) => error.fmt(formatter),
             Self::Index(error) => error.fmt(formatter),
             Self::Query(error) => error.fmt(formatter),
+            Self::Trigger(error) => error.fmt(formatter),
             Self::Invalid(message) => write!(formatter, "invalid physical UPDATE: {message}"),
             Self::Unsupported(message) => {
                 write!(formatter, "physical UPDATE is not emitted yet: {message}")
@@ -81,13 +84,24 @@ impl From<super::PhysicalQueryError> for PhysicalUpdateError {
     }
 }
 
+impl From<PhysicalTriggerError> for PhysicalUpdateError {
+    fn from(error: PhysicalTriggerError) -> Self {
+        Self::Trigger(error)
+    }
+}
+
 type UpdateResult<T> = std::result::Result<T, PhysicalUpdateError>;
 
 pub(crate) fn emit_root_update(
     plan: &PhysicalPlan<'_>,
     program: &mut ProgramBuilder,
 ) -> UpdateResult<()> {
-    emit_root_update_with_inputs(plan, program, &RootRuntimeInputs::default())
+    emit_root_update_with_context(
+        plan,
+        program,
+        &RootRuntimeInputs::default(),
+        &PreparedTriggers::default(),
+    )
 }
 
 pub(crate) fn emit_root_update_with_inputs(
@@ -95,11 +109,20 @@ pub(crate) fn emit_root_update_with_inputs(
     program: &mut ProgramBuilder,
     inputs: &RootRuntimeInputs,
 ) -> UpdateResult<()> {
+    emit_root_update_with_context(plan, program, inputs, &PreparedTriggers::default())
+}
+
+pub(crate) fn emit_root_update_with_context(
+    plan: &PhysicalPlan<'_>,
+    program: &mut ProgramBuilder,
+    inputs: &RootRuntimeInputs,
+    triggers: &PreparedTriggers,
+) -> UpdateResult<()> {
     let update = match &plan.root {
         PhysicalRoot::Update(update) => *update,
         _ => return Err(PhysicalUpdateError::Unsupported("non-UPDATE HIR root")),
     };
-    let (source, table, database) = preflight_update(plan, update)?;
+    let (source, table, database) = preflight_update(plan, update, triggers)?;
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     let mut bindings = RuntimeBindings::new(plan.document, plan.document.snapshot)?;
     inputs.apply(&mut bindings)?;
@@ -111,6 +134,12 @@ pub(crate) fn emit_root_update_with_inputs(
         program.alloc_registers(source.columns.len()),
         source.columns.len(),
     );
+    let old_columns = (!update.triggers.is_empty()).then(|| {
+        RegisterRange::new(
+            program.alloc_registers(source.columns.len()),
+            source.columns.len(),
+        )
+    });
     let record = program.alloc_register();
     program.emit_insn(Insn::Null {
         dest: rowset,
@@ -203,6 +232,12 @@ pub(crate) fn emit_root_update_with_inputs(
     });
 
     for (position, column) in table.columns().iter().enumerate() {
+        if let Some(old_columns) = old_columns {
+            ExpressionEmitter::new(program, &mut bindings).emit_into(
+                &Expr::column(update.target, position),
+                RegisterRange::new(old_columns.first.0 + position, 1),
+            )?;
+        }
         if column.generated_expr().is_some() {
             continue;
         }
@@ -265,6 +300,43 @@ pub(crate) fn emit_root_update_with_inputs(
         }
     }
 
+    let old_runtime = bindings.replace_source(
+        update.target,
+        SourceRuntime::Registers {
+            columns: logical,
+            rowid: Some(rowid),
+        },
+    )?;
+    emit_complete_logical_row(program, &mut bindings, update.target, &table, logical)?;
+    if let Some(old_columns) = old_columns {
+        emit_trigger_programs(
+            program,
+            triggers,
+            update
+                .triggers
+                .iter()
+                .filter(|trigger| trigger.value().time == TriggerTime::Before),
+            TriggerRows {
+                new: Some(TriggerRow {
+                    columns: logical,
+                    rowid,
+                }),
+                old: Some(TriggerRow {
+                    columns: old_columns,
+                    rowid,
+                }),
+            },
+            write_next,
+        )?;
+    }
+    bindings.replace_source(update.target, old_runtime)?;
+    if old_columns.is_some() {
+        program.emit_insn(Insn::NotExists {
+            cursor,
+            rowid_reg: rowid.0,
+            target_pc: write_next,
+        });
+    }
     let mut old_keys = Vec::with_capacity(indexes.len());
     for index in &indexes {
         old_keys.push(emit_index_key(
@@ -276,7 +348,6 @@ pub(crate) fn emit_root_update_with_inputs(
             false,
         )?);
     }
-
     let old_runtime = bindings.replace_source(
         update.target,
         SourceRuntime::Registers {
@@ -284,7 +355,6 @@ pub(crate) fn emit_root_update_with_inputs(
             rowid: Some(rowid),
         },
     )?;
-    emit_complete_logical_row(program, &mut bindings, update.target, &table, logical)?;
     emit_new_row_constraints(
         program,
         &mut bindings,
@@ -332,6 +402,29 @@ pub(crate) fn emit_root_update_with_inputs(
         flag: InsertFlags::new(),
         table_name: table.name.clone(),
     });
+    if let Some(old_columns) = old_columns {
+        let after_trigger_done = program.allocate_label();
+        emit_trigger_programs(
+            program,
+            triggers,
+            update
+                .triggers
+                .iter()
+                .filter(|trigger| trigger.value().time == TriggerTime::After),
+            TriggerRows {
+                new: Some(TriggerRow {
+                    columns: logical,
+                    rowid,
+                }),
+                old: Some(TriggerRow {
+                    columns: old_columns,
+                    rowid,
+                }),
+            },
+            after_trigger_done,
+        )?;
+        program.preassign_label_to_next_insn(after_trigger_done);
+    }
     if let Some(returning) = &update.returning {
         let old_runtime = bindings.replace_source(
             update.target,
@@ -367,6 +460,7 @@ pub(crate) fn emit_root_update_with_inputs(
 fn preflight_update<'plan>(
     plan: &'plan PhysicalPlan<'plan>,
     update: &hir::Update,
+    triggers: &PreparedTriggers,
 ) -> UpdateResult<(
     &'plan hir::Source,
     crate::sync::Arc<crate::schema::BTreeTable>,
@@ -378,8 +472,10 @@ fn preflight_update<'plan>(
     if update.conflict == Some(ResolveType::Replace) {
         return Err(PhysicalUpdateError::Unsupported("REPLACE conflict policy"));
     }
-    if !update.triggers.is_empty() {
-        return Err(PhysicalUpdateError::Unsupported("trigger execution"));
+    if !triggers.covers(&update.triggers) {
+        return Err(PhysicalUpdateError::Invalid(
+            "resolved trigger has no prepared program",
+        ));
     }
     if !update.foreign_keys.outgoing.is_empty() || !update.foreign_keys.incoming.is_empty() {
         return Err(PhysicalUpdateError::Unsupported("foreign-key checks"));
