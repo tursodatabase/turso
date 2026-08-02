@@ -201,6 +201,7 @@ fn translate_semantic_root(
     ));
     let document = analyze(&context, AnalyzeInput::Statement(stmt))?;
     set_semantic_conflict_policy(program, &document);
+    set_semantic_statement_journal_flags(program, &document)?;
     set_semantic_result_columns(program, &document);
     set_semantic_transactions(program, &document, is_write)?;
     let triggers = semantic_prepare::prepare_triggers(&context, &document, program, connection)?;
@@ -337,6 +338,132 @@ fn set_semantic_conflict_policy(program: &mut ProgramBuilder, document: &hir::Hi
     if let Some(conflict) = conflict {
         program.set_resolve_type(conflict);
     }
+}
+
+pub(super) fn set_semantic_statement_journal_flags(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+) -> Result<()> {
+    let target = match &document.root {
+        hir::HirRoot::Insert(root) => root.target,
+        hir::HirRoot::Update(root) => root.target,
+        hir::HirRoot::Delete(root) => root.target,
+        hir::HirRoot::Query(_) | hir::HirRoot::TriggerPredicate(_) => return Ok(()),
+    };
+    let source = document.source(target).ok_or_else(|| {
+        crate::LimboError::InternalError("HIR DML target source is missing".to_string())
+    })?;
+    let hir::SourceKind::Table(resolved) = &source.kind else {
+        return Ok(());
+    };
+    let Some(table) = resolved.value().btree() else {
+        return Ok(());
+    };
+    let index_modes = source
+        .index_expressions
+        .iter()
+        .map(|index| (index.index.value().on_conflict, index.index.value().unique))
+        .collect::<Vec<_>>();
+
+    match &document.root {
+        hir::HirRoot::Insert(root) => {
+            let multiple_rows = match &root.source {
+                hir::InsertSource::Values(rows) => rows.len() > 1,
+                hir::InsertSource::Query(_) => true,
+                hir::InsertSource::DefaultValues => false,
+            };
+            let has_triggers = !root.triggers.is_empty();
+            let has_foreign_keys =
+                !root.foreign_keys.outgoing.is_empty() || !root.foreign_keys.incoming.is_empty();
+            let has_upsert_do_update = root
+                .upserts
+                .iter()
+                .any(|upsert| matches!(upsert.action, hir::UpsertAction::Update { .. }));
+            let has_unique = table
+                .columns()
+                .iter()
+                .any(crate::schema::Column::is_rowid_alias)
+                || index_modes.iter().any(|(_, unique)| *unique);
+            let has_not_null = table
+                .columns()
+                .iter()
+                .any(|column| column.notnull() && !column.is_rowid_alias());
+            let statement_conflict = root.conflict.unwrap_or(ast::ResolveType::Abort);
+            let any_replace = stmt_journal::any_effective_replace(
+                root.conflict.is_some(),
+                statement_conflict,
+                table.rowid_alias_conflict_clause,
+                index_modes.iter().map(|(conflict, _)| *conflict),
+            );
+            if !multiple_rows
+                && !has_triggers
+                && !any_replace
+                && root.upserts.is_empty()
+                && root.autoincrement.is_none()
+            {
+                program.set_multi_write(false);
+            }
+            let may_abort = has_triggers
+                || has_foreign_keys
+                || (root.autoincrement.is_some() && multiple_rows)
+                || has_upsert_do_update
+                || stmt_journal::constraint_may_abort(
+                    root.conflict.is_some(),
+                    statement_conflict,
+                    table.rowid_alias_conflict_clause,
+                    index_modes.into_iter(),
+                    has_not_null,
+                    !table.check_constraints.is_empty(),
+                    has_unique,
+                );
+            program.set_may_abort(may_abort);
+        }
+        hir::HirRoot::Update(root) => {
+            let has_triggers = !root.triggers.is_empty();
+            let has_foreign_keys =
+                !root.foreign_keys.outgoing.is_empty() || !root.foreign_keys.incoming.is_empty();
+            let has_not_null = root.assignments.iter().any(|assignment| {
+                assignment.columns.iter().any(|column| match column {
+                    hir::TargetColumn::Column(position) => table
+                        .columns()
+                        .get(*position)
+                        .is_some_and(|column| column.notnull() && !column.is_rowid_alias()),
+                    hir::TargetColumn::RowId => false,
+                })
+            });
+            let has_unique = index_modes.iter().any(|(_, unique)| *unique)
+                || root.assignments.iter().any(|assignment| {
+                    assignment.columns.iter().any(|column| match column {
+                        hir::TargetColumn::RowId => true,
+                        hir::TargetColumn::Column(position) => table
+                            .columns()
+                            .get(*position)
+                            .is_some_and(crate::schema::Column::is_rowid_alias),
+                    })
+                });
+            let statement_conflict = root.conflict.unwrap_or(ast::ResolveType::Abort);
+            let may_abort = has_triggers
+                || has_foreign_keys
+                || stmt_journal::constraint_may_abort(
+                    root.conflict.is_some(),
+                    statement_conflict,
+                    table.rowid_alias_conflict_clause,
+                    index_modes.into_iter(),
+                    has_not_null,
+                    !table.check_constraints.is_empty(),
+                    has_unique,
+                );
+            program.set_may_abort(may_abort);
+        }
+        hir::HirRoot::Delete(root) => {
+            let has_triggers = !root.triggers.is_empty();
+            let has_foreign_keys =
+                !root.foreign_keys.outgoing.is_empty() || !root.foreign_keys.incoming.is_empty();
+            program.set_may_abort(has_triggers || has_foreign_keys);
+        }
+        hir::HirRoot::Query(_) | hir::HirRoot::TriggerPredicate(_) => unreachable!(),
+    }
+    Ok(())
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty

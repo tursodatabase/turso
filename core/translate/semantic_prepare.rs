@@ -22,7 +22,7 @@ use crate::{
             hir::{self, HirDocument, ResolvedTrigger, TriggerEnvironment},
             AnalyzeInput, TriggerAnalysisInput,
         },
-        set_semantic_transactions,
+        set_semantic_statement_journal_flags, set_semantic_transactions,
     },
     vdbe::{
         builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode},
@@ -152,6 +152,7 @@ fn prepare_one_trigger(
             hir::HirRoot::Insert(_) | hir::HirRoot::Update(_) | hir::HirRoot::Delete(_)
         );
         super::set_semantic_conflict_policy(&mut program, &document);
+        set_semantic_statement_journal_flags(&mut program, &document)?;
         set_semantic_transactions(&mut program, &document, is_write)?;
         let nested =
             prepare_document_triggers(&trigger_context, &document, &program, connection, stack)?;
