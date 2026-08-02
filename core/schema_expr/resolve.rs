@@ -1,4 +1,3 @@
-core/schema_expr/resolve.rs
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::{LimboError, Result};
 use turso_parser::ast::{self, Literal, Operator, UnaryOperator};
@@ -154,7 +153,7 @@ impl ResolverState<'_> {
                     collation,
                 })
             }
-            ast::Expr::FieldAccess { base, field } => {
+            ast::Expr::FieldAccess { base, field, .. } => {
                 let base = self.node(base)?;
                 self.field_access(base, field)
             }
@@ -282,6 +281,12 @@ impl ResolverState<'_> {
             ast::Expr::Default => parse_error(format!(
                 "DEFAULT is prohibited in stored {}",
                 self.profile.description()
+            )),
+            ast::Expr::Register(_)
+            | ast::Expr::Column { .. }
+            | ast::Expr::RowId { .. }
+            | ast::Expr::SubqueryResult { .. } => Err(LimboError::InternalError(
+                "stored expression resolution received an already-bound expression".to_string(),
             )),
         }
     }
@@ -667,7 +672,7 @@ impl ResolverState<'_> {
                         tag_index,
                         tag_name: tag_name.to_string(),
                         result_type: variant.type_name.clone(),
-                        result_array_dimensions: variant.array_dimensions,
+                        result_array_dimensions: 0,
                     },
                 )
             }
@@ -700,7 +705,7 @@ impl ResolverState<'_> {
                         field_index,
                         field_name: field_name.to_string(),
                         result_type: field.type_name.clone(),
-                        result_array_dimensions: field.array_dimensions,
+                        result_array_dimensions: 0,
                     },
                 )
             }

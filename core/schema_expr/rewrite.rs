@@ -1,4 +1,3 @@
-core/schema_expr/rewrite.rs
 use crate::{LimboError, Result, WalkControl};
 use turso_parser::ast;
 

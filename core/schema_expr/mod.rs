@@ -1,10 +1,11 @@
-core/schema_expr/mod.rs
 //! Stored expressions owned by schema objects.
 //!
 //! A valid expression records table columns by position. Parser syntax is kept
 //! only when schema loading deliberately preserves an expression that could not
 //! be resolved.
 
+#[cfg(test)]
+mod properties;
 mod render;
 mod resolve;
 mod rewrite;
