@@ -1031,6 +1031,11 @@ impl ProgramState {
         // CheckpointStateMachine again, so release its checkpoint lock before
         // replacing commit_state with Ready.
         self.commit_state.cleanup_mvcc_checkpoint_state();
+        // PRAGMA journal_mode owns its MVCC checkpoint state in `active_op_state`.
+        // If a statement is reset/dropped while that nested checkpoint is parked
+        // (e.g. yielded at AfterDurableBoundaryAdvanced), we must run its cleanup
+        // to release any held locks before clearing the active opcode state.
+        self.active_op_state.cleanup_journal_mode_checkpoint().ok();
         self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
         self.commit_state = CommitState::Ready;

@@ -19687,6 +19687,68 @@ fn test_passive_checkpoint_truncate_wal_tolerates_concurrent_drop_of_checkpointe
     assert_integrity_ok(&conn_c);
 }
 
+#[test]
+fn dropped_journal_mode_mvcc_checkpoint_releases_lock() {
+    use crate::StepResult;
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    let injector = FixedYieldInjector::new([
+        CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
+    ]);
+
+    conn.set_yield_injector(Some(injector.clone()));
+
+    let mut stmt = conn.prepare("PRAGMA journal_mode = WAL").unwrap();
+
+    // Step the statement until the injected yield fires, then abandon it.
+    let first_yield = loop {
+        match stmt.step() {
+            Ok(StepResult::IO | StepResult::Yield) => {
+                if injector.is_empty() {
+                    break true;
+                }
+            }
+            Ok(StepResult::Done) => break false,
+            Ok(StepResult::Row) => {}
+            Ok(other) => panic!("unexpected journal_mode step result: {other:?}"),
+            Err(err) => panic!("unexpected journal_mode error: {err:?}"),
+        }
+    };
+    assert!(
+        first_yield,
+        "injected checkpoint yield point never fired; scenario not exercised"
+    );
+
+    // Abandon the in-flight PRAGMA mid-checkpoint.
+    drop(stmt);
+    conn.set_yield_injector(None);
+
+    // Another connection must still be able to use the database.
+    let observer = db.connect();
+
+    observer
+        .execute("INSERT INTO t VALUES (2, 'b')")
+        .expect("insert after abandoned journal_mode checkpoint must not be Busy");
+
+    let rows = {
+        let mut stmt = observer.query("SELECT count(*) FROM t").unwrap().unwrap();
+        stmt.run_collect_rows()
+            .expect("select after abandoned journal_mode checkpoint must not be Busy")
+    };
+    assert_eq!(rows.len(), 1);
+
+    observer
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("checkpoint after abandoned journal_mode checkpoint must not be Busy");
+}
+
 /// Repro for https://github.com/tursodatabase/turso/issues/7956.
 ///
 /// A passive checkpoint must materialize CREATE at its snapshot, but publishing
