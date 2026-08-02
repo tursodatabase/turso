@@ -2473,6 +2473,93 @@ fn ranking_windows_rescan_the_bound_hir_source(tc: hegel::TestCase) {
     assert!(first_compare < result);
 }
 
+// Examples:
+// - `percent_rank() OVER (PARTITION BY g ORDER BY value)` divides the number
+//   of earlier rows by `partition_size - 1`, returning zero for one-row groups.
+// - `cume_dist() OVER (PARTITION BY g ORDER BY value DESC)` includes every
+//   peer in the numerator and divides by the filtered partition size.
+// - `ntile(4) OVER (PARTITION BY g ORDER BY value)` puts the extra rows in the
+//   first buckets and returns consecutive bucket numbers when buckets outnumber
+//   rows. The bucket expression, filter, and order are all frozen in HIR.
+#[hegel::test]
+fn distribution_windows_use_bound_partition_and_order_inputs(tc: hegel::TestCase) {
+    let descending = tc.draw(generators::booleans());
+    let bucket_count = i64::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
+    let filter_position = tc.draw(generators::integers::<usize>().max_value(2));
+    let direction = if descending { "DESC" } else { "ASC" };
+    let columns = ["g", "value", "keep"];
+    let items = BTreeTable::from_sql(
+        "CREATE TABLE items(g INTEGER, value INTEGER, keep INTEGER)",
+        59,
+    )
+    .expect("fixture table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(items))
+        .expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT percent_rank() OVER (PARTITION BY g ORDER BY value {direction}), \
+         cume_dist() OVER (PARTITION BY g ORDER BY value {direction}), \
+         ntile({bucket_count}) OVER (PARTITION BY g ORDER BY value {direction}) \
+         FROM items WHERE {} >= ?1",
+        columns[filter_position]
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated distribution query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed distribution HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("distribution windows emit from closed HIR");
+    program
+        .resolve_labels()
+        .expect("all distribution-window branches are closed");
+
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| {
+                matches!(
+                    instruction,
+                    Insn::OpenRead {
+                        root_page: 59,
+                        db: 0,
+                        ..
+                    }
+                )
+            })
+            .count(),
+        4,
+        "one output scan and one filtered partition rescan per function"
+    );
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::RealAffinity { .. })));
+    assert!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::Divide { .. }))
+            .count()
+            >= 4
+    );
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::MustBeInt { .. })));
+    assert!(!program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::HashDistinct { .. })));
+}
+
 // Example: `SELECT c3, sum(c5), count(*) FROM items GROUP BY c3`, where
 // `c3 TEXT COLLATE NOCASE`, sorts with the collation frozen in HIR, reloads
 // each sorted source row under the same SourceId, steps one accumulator per

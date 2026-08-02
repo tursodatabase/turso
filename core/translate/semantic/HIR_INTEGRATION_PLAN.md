@@ -95,6 +95,8 @@ operations are not SQL binding.
   - [x] `row_number`, `rank`, and `dense_rank` execute over one resolved B-tree
         source using stable WindowFunctionId bindings. The correctness-first
         implementation rescans the frozen HIR source for each output row.
+  - [x] `percent_rank`, `cume_dist`, and `ntile` derive filtered partition size,
+        peer position, and validated arguments from the same frozen HIR rescan.
   - [ ] Window execution, RIGHT/FULL OUTER JOIN, and the remaining compound
         combinations.
   - [x] Recursive CTE seeds and arms feed a frozen-HIR priority queue, bind

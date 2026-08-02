@@ -2245,7 +2245,7 @@ fn emit_ranking_window_query<'document>(
     limit: Option<LimitRuntime>,
     distinct: Option<&DistinctRuntime>,
 ) -> QueryResult<()> {
-    if block.aggregates.len() > 0 {
+    if !block.aggregates.is_empty() {
         return Err(PhysicalQueryError::Unsupported(
             "aggregate and window functions in one query block",
         ));
@@ -2256,8 +2256,14 @@ fn emit_ranking_window_query<'document>(
         ));
     };
     for function in &block.window_functions {
-        let Func::Window(WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank) =
-            function.call.function.value()
+        let Func::Window(
+            WindowFunc::RowNumber
+            | WindowFunc::Rank
+            | WindowFunc::DenseRank
+            | WindowFunc::PercentRank
+            | WindowFunc::CumeDist
+            | WindowFunc::Ntile,
+        ) = function.call.function.value()
         else {
             return Err(PhysicalQueryError::Unsupported(
                 "window function outside the ranking subset",
@@ -2340,7 +2346,12 @@ fn emit_ranking_window_row<'document>(
     let emission = (|| -> QueryResult<()> {
         for function in &block.window_functions {
             let Func::Window(
-                kind @ (WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank),
+                kind @ (WindowFunc::RowNumber
+                | WindowFunc::Rank
+                | WindowFunc::DenseRank
+                | WindowFunc::PercentRank
+                | WindowFunc::CumeDist
+                | WindowFunc::Ntile),
             ) = function.call.function.value()
             else {
                 return Err(PhysicalQueryError::Unsupported(
@@ -2368,6 +2379,46 @@ fn emit_ranking_window_row<'document>(
                 ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
                     .emit_into(&term.expr, RegisterRange::new(outer_order + position, 1))?;
             }
+            let ntile_argument = if matches!(kind, WindowFunc::Ntile) {
+                let argument = function
+                    .call
+                    .arguments
+                    .first()
+                    .ok_or(PhysicalQueryError::Invalid("ntile has no bucket argument"))?;
+                let register = program.alloc_register();
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                    .emit_into(argument, RegisterRange::new(register, 1))?;
+                let invalid = program.allocate_label();
+                let valid = program.allocate_label();
+                program.emit_insn(Insn::MustBeInt {
+                    reg: register,
+                    target_pc: Some(invalid),
+                });
+                let zero = program.alloc_register();
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: zero,
+                });
+                program.emit_insn(Insn::Gt {
+                    lhs: register,
+                    rhs: zero,
+                    target_pc: valid,
+                    flags: crate::vdbe::insn::CmpInsFlags::default(),
+                    collation: None,
+                });
+                program.preassign_label_to_next_insn(invalid);
+                program.emit_insn(Insn::Halt {
+                    err_code: crate::error::SQLITE_ERROR,
+                    description: "argument of ntile must be a positive integer".to_string(),
+                    on_error: None,
+                    description_reg: None,
+                });
+                program.preassign_label_to_next_insn(valid);
+                Some(register)
+            } else {
+                None
+            };
             let inner = open_source(plan, program, bindings, ctes, source)?;
             let ScanCursor::BTree(inner_cursor) = inner.cursor else {
                 return Err(PhysicalQueryError::Unsupported(
@@ -2380,13 +2431,25 @@ fn emit_ranking_window_row<'document>(
             )?;
             let value = bindings.window_function(function.id)?.register;
             program.emit_insn(Insn::Integer {
-                value: i64::from(!matches!(kind, WindowFunc::RowNumber)),
+                value: i64::from(matches!(kind, WindowFunc::Rank | WindowFunc::DenseRank)),
                 dest: value.0,
             });
             let one = program.alloc_register();
             program.emit_insn(Insn::Integer {
                 value: 1,
                 dest: one,
+            });
+            let partition_size = matches!(
+                kind,
+                WindowFunc::PercentRank | WindowFunc::CumeDist | WindowFunc::Ntile
+            )
+            .then(|| {
+                let register = program.alloc_register();
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: register,
+                });
+                register
             });
             let distinct_orders =
                 matches!(kind, WindowFunc::DenseRank).then(|| program.alloc_hash_table_id());
@@ -2439,8 +2502,15 @@ fn emit_ranking_window_row<'document>(
                 });
                 program.preassign_label_to_next_insn(same_partition);
             }
+            if let Some(partition_size) = partition_size {
+                program.emit_insn(Insn::Add {
+                    lhs: partition_size,
+                    rhs: one,
+                    dest: partition_size,
+                });
+            }
             if spec.order_by.is_empty() {
-                if matches!(kind, WindowFunc::RowNumber) {
+                if matches!(kind, WindowFunc::RowNumber | WindowFunc::Ntile) {
                     let inner_rowid = program.alloc_register();
                     program.emit_insn(Insn::RowId {
                         cursor_id: inner_cursor,
@@ -2460,6 +2530,10 @@ fn emit_ranking_window_row<'document>(
                         target_pc_lt: loop_next,
                         target_pc_eq: increment,
                         target_pc_gt: increment,
+                    });
+                } else if matches!(kind, WindowFunc::CumeDist) {
+                    program.emit_insn(Insn::Goto {
+                        target_pc: increment,
                     });
                 } else {
                     program.emit_insn(Insn::Goto {
@@ -2521,7 +2595,7 @@ fn emit_ranking_window_row<'document>(
                     target_pc: increment,
                 });
                 program.preassign_label_to_next_insn(equal);
-                if matches!(kind, WindowFunc::RowNumber) {
+                if matches!(kind, WindowFunc::RowNumber | WindowFunc::Ntile) {
                     let inner_rowid = program.alloc_register();
                     program.emit_insn(Insn::RowId {
                         cursor_id: inner_cursor,
@@ -2542,6 +2616,10 @@ fn emit_ranking_window_row<'document>(
                         target_pc_eq: increment,
                         target_pc_gt: increment,
                     });
+                } else if matches!(kind, WindowFunc::CumeDist) {
+                    program.emit_insn(Insn::Goto {
+                        target_pc: increment,
+                    });
                 } else {
                     program.emit_insn(Insn::Goto {
                         target_pc: loop_next,
@@ -2560,6 +2638,151 @@ fn emit_ranking_window_row<'document>(
                 pc_if_next: loop_start,
             });
             program.preassign_label_to_next_insn(done);
+            match kind {
+                WindowFunc::PercentRank => {
+                    let partition_size = partition_size.expect("percent_rank counts its partition");
+                    let denominator = program.alloc_register();
+                    program.emit_insn(Insn::Copy {
+                        src_reg: partition_size,
+                        dst_reg: denominator,
+                        extra_amount: 0,
+                    });
+                    program.emit_insn(Insn::AddImm {
+                        register: denominator,
+                        value: -1,
+                    });
+                    let divide = program.allocate_label();
+                    let calculated = program.allocate_label();
+                    program.emit_insn(Insn::If {
+                        reg: denominator,
+                        target_pc: divide,
+                        jump_if_null: false,
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: calculated,
+                    });
+                    program.preassign_label_to_next_insn(divide);
+                    program.emit_insn(Insn::RealAffinity { register: value.0 });
+                    program.emit_insn(Insn::Divide {
+                        lhs: value.0,
+                        rhs: denominator,
+                        dest: value.0,
+                    });
+                    program.preassign_label_to_next_insn(calculated);
+                }
+                WindowFunc::CumeDist => {
+                    let partition_size = partition_size.expect("cume_dist counts its partition");
+                    program.emit_insn(Insn::RealAffinity { register: value.0 });
+                    program.emit_insn(Insn::Divide {
+                        lhs: value.0,
+                        rhs: partition_size,
+                        dest: value.0,
+                    });
+                }
+                WindowFunc::Ntile => {
+                    let partition_size = partition_size.expect("ntile counts its partition");
+                    let bucket_count = ntile_argument.expect("ntile validates its argument");
+                    let row_index = program.alloc_register();
+                    program.emit_insn(Insn::Copy {
+                        src_reg: value.0,
+                        dst_reg: row_index,
+                        extra_amount: 0,
+                    });
+                    program.emit_insn(Insn::AddImm {
+                        register: row_index,
+                        value: -1,
+                    });
+                    let bucket_size = program.alloc_register();
+                    program.emit_insn(Insn::Divide {
+                        lhs: partition_size,
+                        rhs: bucket_count,
+                        dest: bucket_size,
+                    });
+                    let regular_buckets = program.allocate_label();
+                    let small_bucket = program.allocate_label();
+                    let bucket_done = program.allocate_label();
+                    program.emit_insn(Insn::If {
+                        reg: bucket_size,
+                        target_pc: regular_buckets,
+                        jump_if_null: false,
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: bucket_done,
+                    });
+                    program.preassign_label_to_next_insn(regular_buckets);
+                    let large_bucket_count = program.alloc_register();
+                    let bucketed_rows = program.alloc_register();
+                    program.emit_insn(Insn::Multiply {
+                        lhs: bucket_count,
+                        rhs: bucket_size,
+                        dest: bucketed_rows,
+                    });
+                    program.emit_insn(Insn::Subtract {
+                        lhs: partition_size,
+                        rhs: bucketed_rows,
+                        dest: large_bucket_count,
+                    });
+                    let large_bucket_size = program.alloc_register();
+                    program.emit_insn(Insn::Copy {
+                        src_reg: bucket_size,
+                        dst_reg: large_bucket_size,
+                        extra_amount: 0,
+                    });
+                    program.emit_insn(Insn::AddImm {
+                        register: large_bucket_size,
+                        value: 1,
+                    });
+                    let rows_in_large_buckets = program.alloc_register();
+                    program.emit_insn(Insn::Multiply {
+                        lhs: large_bucket_count,
+                        rhs: large_bucket_size,
+                        dest: rows_in_large_buckets,
+                    });
+                    program.emit_insn(Insn::Lt {
+                        lhs: row_index,
+                        rhs: rows_in_large_buckets,
+                        target_pc: small_bucket,
+                        flags: crate::vdbe::insn::CmpInsFlags::default(),
+                        collation: None,
+                    });
+                    program.emit_insn(Insn::Subtract {
+                        lhs: row_index,
+                        rhs: rows_in_large_buckets,
+                        dest: value.0,
+                    });
+                    program.emit_insn(Insn::Divide {
+                        lhs: value.0,
+                        rhs: bucket_size,
+                        dest: value.0,
+                    });
+                    program.emit_insn(Insn::Add {
+                        lhs: value.0,
+                        rhs: large_bucket_count,
+                        dest: value.0,
+                    });
+                    program.emit_insn(Insn::Add {
+                        lhs: value.0,
+                        rhs: one,
+                        dest: value.0,
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: bucket_done,
+                    });
+                    program.preassign_label_to_next_insn(small_bucket);
+                    program.emit_insn(Insn::Divide {
+                        lhs: row_index,
+                        rhs: large_bucket_size,
+                        dest: value.0,
+                    });
+                    program.emit_insn(Insn::Add {
+                        lhs: value.0,
+                        rhs: one,
+                        dest: value.0,
+                    });
+                    program.preassign_label_to_next_insn(bucket_done);
+                }
+                _ => {}
+            }
             if let Some(hash_table_id) = distinct_orders {
                 program.emit_insn(Insn::HashClose { hash_table_id });
             }
