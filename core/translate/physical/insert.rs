@@ -411,7 +411,12 @@ fn emit_virtual_insert<'document>(
             });
         }
     }
-    emit_insert_defaults(plan, program, &mut bindings, insert, logical)?;
+    emit_insert_defaults(plan, program, &mut bindings, insert, logical, |column| {
+        source
+            .columns
+            .get(column)
+            .is_some_and(|column| !column.hidden)
+    })?;
 
     program.emit_insn(Insn::VUpdate {
         cursor_id: cursor,
@@ -463,7 +468,7 @@ fn emit_insert_row<'document>(
             });
         }
     }
-    emit_insert_defaults(plan, program, bindings, insert, logical)?;
+    emit_insert_defaults(plan, program, bindings, insert, logical, |_| true)?;
     finish_insert_row(
         plan,
         program,
@@ -507,7 +512,7 @@ fn emit_insert_query_row<'document>(
             program.emit_column_or_rowid(query_cursor, position, destination.0);
         }
     }
-    emit_insert_defaults(plan, program, bindings, insert, logical)?;
+    emit_insert_defaults(plan, program, bindings, insert, logical, |_| true)?;
     finish_insert_row(
         plan,
         program,
@@ -556,9 +561,12 @@ fn emit_insert_defaults<'document>(
     bindings: &mut RuntimeBindings<'document>,
     insert: &hir::Insert,
     logical: RegisterRange,
+    mut include_column: impl FnMut(usize) -> bool,
 ) -> InsertResult<()> {
     for default in &insert.defaults {
-        if !insert_column_needs_default(&insert.source, &insert.columns, default.column) {
+        if !include_column(default.column)
+            || !insert_column_needs_default(&insert.source, &insert.columns, default.column)
+        {
             continue;
         }
         let destination = logical
