@@ -853,16 +853,14 @@ fn preserve_mode_keeps_parse_failures_explicit(tc: hegel::TestCase) {
     let parameters = type_parameters();
     let syntax = parse_expr("missing + 1");
 
-    assert!(
-        resolve(
-            &syntax,
-            profile,
-            &table,
-            &parameters,
-            ResolutionMode::Strict,
-        )
-        .is_err()
-    );
+    assert!(resolve(
+        &syntax,
+        profile,
+        &table,
+        &parameters,
+        ResolutionMode::Strict,
+    )
+    .is_err());
     let preserved = resolve(
         &syntax,
         profile,

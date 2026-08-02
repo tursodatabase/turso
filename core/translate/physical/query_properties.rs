@@ -3928,12 +3928,10 @@ fn a_first_outer_join_feeds_every_row_into_the_remaining_join_chain(tc: hegel::T
     assert!(is_nulled(left_cursor));
     assert_eq!(is_nulled(right_cursor), full);
     assert_eq!(is_nulled(tail_cursor), tail_is_left);
-    assert!(
-        program
-            .insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 3, .. }))
-    );
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 3, .. })));
 }
 
 // Examples:
@@ -4048,9 +4046,7 @@ fn a_full_join_after_an_inner_prefix_preserves_the_prefix_as_one_left_side(tc: h
 // or unmatched-right filter first. The one uncorrelated `IN` row set must be
 // open before all three paths, and every path must reuse that same cursor.
 #[hegel::test]
-fn uncorrelated_in_subqueries_are_ready_before_every_full_join_filter_path(
-    tc: hegel::TestCase,
-) {
+fn uncorrelated_in_subqueries_are_ready_before_every_full_join_filter_path(tc: hegel::TestCase) {
     let width = usize::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
     let left_output = tc.draw(generators::integers::<usize>().max_value(width - 1));
     let right_output = tc.draw(generators::integers::<usize>().max_value(width - 1));
@@ -4133,10 +4129,12 @@ fn uncorrelated_in_subqueries_are_ready_before_every_full_join_filter_path(
         let outer_rewind = program
             .insns
             .iter()
-            .position(|(instruction, _)| matches!(
-                instruction,
-                Insn::Rewind { cursor_id, .. } if *cursor_id == outer_cursor
-            ))
+            .position(|(instruction, _)| {
+                matches!(
+                    instruction,
+                    Insn::Rewind { cursor_id, .. } if *cursor_id == outer_cursor
+                )
+            })
             .expect("each FULL-join side starts a scan");
         assert!(row_set_open < outer_rewind);
     }

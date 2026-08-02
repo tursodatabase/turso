@@ -1673,10 +1673,7 @@ impl Analyzer<'_, '_> {
             hir::FunctionEvaluation::Window(self.allocate_window_function_id(block))
         } else if aggregate {
             let block = policy.query_block.ok_or_else(|| {
-                LimboError::ParseError(format!(
-                    "misuse of aggregate function {}()",
-                    function_name
-                ))
+                LimboError::ParseError(format!("misuse of aggregate function {}()", function_name))
             })?;
             hir::FunctionEvaluation::Aggregate(self.allocate_aggregate_id(block))
         } else {
