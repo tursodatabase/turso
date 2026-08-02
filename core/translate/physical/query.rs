@@ -3576,7 +3576,12 @@ fn emit_positional_window<'document>(
     program.preassign_label_to_next_insn(sort_done);
 
     let target = program.alloc_register();
-    let missing = program.allocate_label();
+    let no_value = program.allocate_label();
+    let missing_saved_row = matches!(
+        kind,
+        WindowFunc::FirstValue | WindowFunc::LastValue | WindowFunc::NthValue
+    )
+    .then(|| program.allocate_label());
     let target_instruction = match kind {
         WindowFunc::Lag => Insn::Subtract {
             lhs: outer_position,
@@ -3613,7 +3618,7 @@ fn emit_positional_window<'document>(
         program.emit_insn(Insn::Gt {
             lhs: target,
             rhs: peer_end,
-            target_pc: missing,
+            target_pc: no_value,
             flags: crate::vdbe::insn::CmpInsFlags::default(),
             collation: None,
         });
@@ -3621,7 +3626,7 @@ fn emit_positional_window<'document>(
     program.emit_insn(Insn::SeekRowid {
         cursor_id: positions_cursor,
         src_reg: target,
-        target_pc: missing,
+        target_pc: missing_saved_row.unwrap_or(no_value),
     });
     program.emit_insn(Insn::Column {
         cursor_id: positions_cursor,
@@ -3629,7 +3634,22 @@ fn emit_positional_window<'document>(
         dest: value.0,
         default: None,
     });
-    program.preassign_label_to_next_insn(missing);
+    if let Some(missing_saved_row) = missing_saved_row {
+        let lookup_done = program.allocate_label();
+        program.emit_insn(Insn::Goto {
+            target_pc: lookup_done,
+        });
+        program.preassign_label_to_next_insn(missing_saved_row);
+        program.emit_insn(Insn::Halt {
+            err_code: crate::error::SQLITE_ERROR,
+            description: "positional window could not find a saved row within its frame"
+                .to_string(),
+            on_error: None,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(lookup_done);
+    }
+    program.preassign_label_to_next_insn(no_value);
     program.emit_insn(Insn::Close { cursor_id: pseudo });
     program.emit_insn(Insn::Close { cursor_id: sorter });
     program.emit_insn(Insn::Close {
