@@ -2986,3 +2986,94 @@ fn left_join_keeps_join_matching_separate_from_where(tc: hegel::TestCase) {
         2
     );
 }
+
+// Examples: `l RIGHT JOIN r ON l.k = r.k` must null-extend `l` for an
+// unmatched right row; `l FULL JOIN r USING(k)` must additionally null-extend
+// `r` for an unmatched left row. NATURAL joins use the same frozen HIR merge
+// rule, and a later WHERE predicate runs only after either null extension.
+#[hegel::test]
+fn two_source_right_and_full_joins_preserve_the_hir_sides(tc: hegel::TestCase) {
+    let full = tc.draw(generators::integers::<u8>().max_value(1)) == 1;
+    let keyword = if full { "FULL JOIN" } else { "RIGHT JOIN" };
+    let join = match tc.draw(generators::integers::<u8>().max_value(2)) {
+        0 => format!("{keyword} r ON l.k = r.k"),
+        1 => format!("{keyword} r USING(k)"),
+        _ => format!("NATURAL {keyword} r"),
+    };
+    let left = BTreeTable::from_sql("CREATE TABLE l(k INTEGER, lv TEXT)", 41)
+        .expect("left table SQL is valid");
+    let right = BTreeTable::from_sql("CREATE TABLE r(k INTEGER, rv TEXT)", 43)
+        .expect("right table SQL is valid");
+    let mut schema = Schema::new();
+    schema.add_btree_table(Arc::new(left)).expect("l is unique");
+    schema
+        .add_btree_table(Arc::new(right))
+        .expect("r is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT l.k, l.lv, r.k, r.rv FROM l {join} WHERE l.lv IS NULL OR r.rv IS NULL"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated outer join has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let HirRoot::Query(root) = &document.root else {
+        panic!("the fixture is a query");
+    };
+    let query = &document.queries[root.query.index()];
+    let block = &query.blocks[query.first.index];
+    let from = block.from.as_ref().expect("outer join has FROM");
+    assert_eq!(
+        from.joins[0].kind,
+        if full {
+            crate::translate::semantic::hir::JoinKind::Full
+        } else {
+            crate::translate::semantic::hir::JoinKind::Right
+        }
+    );
+
+    let plan = PhysicalPlan::new(&document).expect("closed outer-join HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("outer join emits from HIR");
+    program
+        .resolve_labels()
+        .expect("all outer-join branches are closed");
+
+    let cursor_for_root = |root_page| {
+        program
+            .insns
+            .iter()
+            .find_map(|(instruction, _)| match instruction {
+                Insn::OpenRead {
+                    cursor_id,
+                    root_page: actual,
+                    ..
+                } if *actual == root_page => Some(*cursor_id),
+                _ => None,
+            })
+            .expect("resolved table cursor is opened")
+    };
+    let left_cursor = cursor_for_root(41);
+    let right_cursor = cursor_for_root(43);
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::NullRow { cursor_id } if *cursor_id == left_cursor
+    )));
+    assert_eq!(
+        program.insns.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::NullRow { cursor_id } if *cursor_id == right_cursor
+        )),
+        full
+    );
+    assert!(
+        program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 4, .. }))
+    );
+}

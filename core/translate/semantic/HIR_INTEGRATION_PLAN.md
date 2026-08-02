@@ -92,6 +92,8 @@ operations are not SQL binding.
   - [x] Recursive CTE seeds and arms feed a frozen-HIR priority queue, bind
         occurrence-local recursive inputs, and apply UNION seen-row equality.
   - [x] Table-function arguments and hidden-column inputs emit from frozen HIR.
+  - [x] Two-source RIGHT and FULL joins preserve the original HIR sides and
+        evaluate WHERE only after unmatched rows are null-extended.
 - [ ] UPDATE and DELETE, including FROM, RETURNING, triggers, and foreign keys.
   - [x] A catalog-free root dispatcher emits simple rowid B-tree DELETE directly
         from closed HIR and rejects every unimplemented write obligation before

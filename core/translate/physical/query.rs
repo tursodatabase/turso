@@ -25,7 +25,7 @@ use crate::{
     types::KeyInfo,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{HashDistinctData, IdxInsertFlags, InsertFlags, Insn, SortComparatorType, to_u32},
+        insn::{to_u32, HashDistinctData, IdxInsertFlags, InsertFlags, Insn, SortComparatorType},
     },
 };
 
@@ -1859,11 +1859,10 @@ fn emit_table_scans<'document>(
         ));
     }
     for join in &from.joins {
-        if !matches!(
-            join.kind,
-            JoinKind::Comma | JoinKind::Inner | JoinKind::Cross | JoinKind::Left
-        ) {
-            return Err(PhysicalQueryError::Unsupported("RIGHT or FULL OUTER JOIN"));
+        if matches!(join.kind, JoinKind::Right | JoinKind::Full) && source_ids.len() != 2 {
+            return Err(PhysicalQueryError::Unsupported(
+                "RIGHT or FULL OUTER JOIN in a multi-join tree",
+            ));
         }
     }
 
@@ -1880,17 +1879,67 @@ fn emit_table_scans<'document>(
         scans.push(scan);
     }
 
-    emit_nested_scan(
-        plan,
-        program,
-        bindings,
-        ctes,
-        &scans,
-        0,
-        &from.joins,
-        filter,
-        action,
-    )?;
+    match from.joins.as_slice() {
+        [join] if join.kind == JoinKind::Right => {
+            scans.swap(0, 1);
+            let normalized = [Join {
+                right: from.first,
+                kind: JoinKind::Left,
+                constraint: join.constraint.clone(),
+            }];
+            emit_nested_scan(
+                plan,
+                program,
+                bindings,
+                ctes,
+                &scans,
+                0,
+                &normalized,
+                filter,
+                action,
+            )?;
+        }
+        [join] if join.kind == JoinKind::Full => {
+            let normalized = [Join {
+                right: join.right,
+                kind: JoinKind::Left,
+                constraint: join.constraint.clone(),
+            }];
+            emit_nested_scan(
+                plan,
+                program,
+                bindings,
+                ctes,
+                &scans,
+                0,
+                &normalized,
+                filter,
+                action,
+            )?;
+            emit_full_join_unmatched_right(
+                plan,
+                program,
+                bindings,
+                ctes,
+                &scans[0],
+                &scans[1],
+                &join.constraint,
+                filter,
+                action,
+            )?;
+        }
+        _ => emit_nested_scan(
+            plan,
+            program,
+            bindings,
+            ctes,
+            &scans,
+            0,
+            &from.joins,
+            filter,
+            action,
+        )?,
+    }
     if let Some(done) = action.cleanup_label() {
         program.preassign_label_to_next_insn(done);
     }
@@ -1908,6 +1957,114 @@ fn emit_table_scans<'document>(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_full_join_unmatched_right<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    ctes: &mut MaterializedCtes,
+    left: &OpenedScan<'document>,
+    right: &OpenedScan<'document>,
+    constraint: &JoinConstraint,
+    filter: Option<&Expr>,
+    action: ScanRowAction<'document, '_>,
+) -> QueryResult<()> {
+    let right_start = program.allocate_label();
+    let right_next = program.allocate_label();
+    let done = program.allocate_label();
+    emit_scan_rewind(plan, program, bindings, ctes, right, done)?;
+    program.preassign_label_to_next_insn(right_start);
+    let matched = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: matched,
+    });
+
+    let left_start = program.allocate_label();
+    let left_next = program.allocate_label();
+    let left_done = program.allocate_label();
+    emit_scan_rewind(plan, program, bindings, ctes, left, left_done)?;
+    program.preassign_label_to_next_insn(left_start);
+    emit_join_constraint(plan, program, bindings, ctes, constraint, left_next)?;
+    program.emit_insn(Insn::Integer {
+        value: 1,
+        dest: matched,
+    });
+    program.preassign_label_to_next_insn(left_next);
+    emit_scan_next(program, left, left_start);
+
+    program.preassign_label_to_next_insn(left_done);
+    program.emit_insn(Insn::IfPos {
+        reg: matched,
+        target_pc: right_next,
+        decrement_by: 0,
+    });
+    program.emit_insn(Insn::NullRow {
+        cursor_id: left.cursor.id(),
+    });
+    if let Some(table_cursor) = left.deferred_table {
+        program.emit_insn(Insn::NullRow {
+            cursor_id: table_cursor,
+        });
+    }
+    if let Some(filter) = filter {
+        emit_filter(plan, program, bindings, ctes, filter, right_next)?;
+    }
+    emit_scan_action(plan, program, bindings, ctes, action)?;
+    program.preassign_label_to_next_insn(right_next);
+    emit_scan_next(program, right, right_start);
+    program.preassign_label_to_next_insn(done);
+    Ok(())
+}
+
+fn emit_scan_rewind<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    ctes: &mut MaterializedCtes,
+    scan: &OpenedScan<'document>,
+    empty: crate::vdbe::BranchOffset,
+) -> QueryResult<()> {
+    match scan.cursor {
+        ScanCursor::BTree(cursor_id) => program.emit_insn(Insn::Rewind {
+            cursor_id,
+            pc_if_empty: empty,
+        }),
+        ScanCursor::Virtual(cursor_id) => {
+            let (arg_count, args_reg, idx_str, idx_num) =
+                emit_virtual_filter_arguments(plan, program, bindings, ctes, scan)?;
+            program.emit_insn(Insn::VFilter {
+                cursor_id,
+                pc_if_empty: empty,
+                arg_count,
+                args_reg,
+                idx_str,
+                idx_num,
+            });
+        }
+        ScanCursor::Single(_) => {}
+    }
+    Ok(())
+}
+
+fn emit_scan_next(
+    program: &mut ProgramBuilder,
+    scan: &OpenedScan<'_>,
+    target: crate::vdbe::BranchOffset,
+) {
+    match scan.cursor {
+        ScanCursor::BTree(cursor_id) => program.emit_insn(Insn::Next {
+            cursor_id,
+            pc_if_next: target,
+        }),
+        ScanCursor::Virtual(cursor_id) => program.emit_insn(Insn::VNext {
+            cursor_id,
+            pc_if_next: target,
+        }),
+        ScanCursor::Single(_) => {}
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
