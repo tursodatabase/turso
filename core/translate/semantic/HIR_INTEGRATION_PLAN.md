@@ -83,11 +83,13 @@ operations are not SQL binding.
   - [ ] Ordered, DISTINCT, comparison-based, custom, and external aggregates.
   - [x] Binary `UNION`, `INTERSECT`, and `EXCEPT` use temporary set indexes
         whose equality collations come from the left HIR outputs.
-  - [ ] Mixed and multi-arm duplicate-removing compounds.
+  - [x] Mixed and multi-arm duplicate-removing compounds preserve SQLite's
+        left-to-right set boundaries, including trailing UNION ALL duplicates.
   - [x] LEFT JOIN preserves the separate HIR join constraint and WHERE phases
         and null-extends the right SourceId only when no join match exists.
-  - [ ] Window execution, RIGHT/FULL OUTER JOIN, table functions, recursive
+  - [ ] Window execution, RIGHT/FULL OUTER JOIN, recursive
         CTEs, and the remaining compound combinations.
+  - [x] Table-function arguments and hidden-column inputs emit from frozen HIR.
 - [ ] UPDATE and DELETE, including FROM, RETURNING, triggers, and foreign keys.
   - [x] A catalog-free root dispatcher emits simple rowid B-tree DELETE directly
         from closed HIR and rejects every unimplemented write obligation before

@@ -2629,6 +2629,90 @@ fn binary_set_compounds_use_hir_output_equality(tc: hegel::TestCase) {
     ));
 }
 
+// Examples: `SELECT 1 UNION SELECT 2 EXCEPT SELECT 3`, and
+// `SELECT 1 UNION ALL SELECT 1 INTERSECT SELECT 1 UNION ALL SELECT 2`.
+// Every set operator consumes the complete result to its left. UNION ALL arms
+// before the last set operator are therefore folded into that set, while arms
+// after it stay streaming so their duplicates are preserved.
+#[hegel::test]
+fn mixed_multi_arm_compounds_keep_left_to_right_set_boundaries(tc: hegel::TestCase) {
+    let arm_count = usize::from(tc.draw(generators::integers::<u8>().min_value(2).max_value(7)));
+    let set_position = tc.draw(generators::integers::<usize>().max_value(arm_count - 1));
+    let trailing_union_all = tc.draw(generators::integers::<u8>().max_value(1)) == 1;
+    let mut sql = "SELECT 0 COLLATE NOCASE".to_string();
+    let mut operators = Vec::with_capacity(arm_count);
+    for position in 0..arm_count {
+        let operator = if position == set_position {
+            match tc.draw(generators::integers::<u8>().max_value(2)) {
+                0 => CompoundOperator::Union,
+                1 => CompoundOperator::Intersect,
+                _ => CompoundOperator::Except,
+            }
+        } else if position > set_position && trailing_union_all {
+            CompoundOperator::UnionAll
+        } else {
+            match tc.draw(generators::integers::<u8>().max_value(3)) {
+                0 => CompoundOperator::Union,
+                1 => CompoundOperator::Intersect,
+                2 => CompoundOperator::Except,
+                _ => CompoundOperator::UnionAll,
+            }
+        };
+        let keyword = match operator {
+            CompoundOperator::Union => "UNION",
+            CompoundOperator::UnionAll => "UNION ALL",
+            CompoundOperator::Intersect => "INTERSECT",
+            CompoundOperator::Except => "EXCEPT",
+        };
+        sql.push_str(&format!(" {keyword} SELECT {}", position + 1));
+        operators.push(operator);
+    }
+
+    let schema = Schema::new();
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&sql);
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated mixed compound has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let HirRoot::Query(root) = &document.root else {
+        panic!("the fixture is a query");
+    };
+    let query = &document.queries[root.query.index()];
+    assert_eq!(query.compounds.len(), arm_count);
+    assert_eq!(
+        query
+            .compounds
+            .iter()
+            .map(|arm| arm.operator)
+            .collect::<Vec<_>>(),
+        operators
+    );
+
+    let plan = PhysicalPlan::new(&document).expect("closed mixed compound has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("mixed compound emits from HIR");
+    program
+        .resolve_labels()
+        .expect("all mixed compound branches are closed");
+
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::OpenEphemeral {
+            is_table: false,
+            ..
+        }
+    )));
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. })));
+}
+
 // Examples: `l LEFT JOIN r ON l.k = r.k`, `LEFT JOIN r USING(k)`, and
 // `NATURAL LEFT JOIN r`, all followed by `WHERE r.rv IS NULL`. A right row
 // marks the join as matched only after its ON/USING rule passes. If no row

@@ -25,7 +25,7 @@ use crate::{
     types::KeyInfo,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u32, HashDistinctData, IdxInsertFlags, InsertFlags, Insn, SortComparatorType},
+        insn::{HashDistinctData, IdxInsertFlags, InsertFlags, Insn, SortComparatorType, to_u32},
     },
 };
 
@@ -758,21 +758,17 @@ fn emit_set_compound_query<'document>(
     query: &super::PhysicalQuery<'document>,
     destination: QueryDestination<'_>,
 ) -> QueryResult<()> {
-    let [arm] = query.hir.compounds.as_slice() else {
-        return Err(PhysicalQueryError::Unsupported(
-            "multi-arm compounds containing UNION, INTERSECT, or EXCEPT",
-        ));
-    };
-    let [left, right] = query.blocks.as_slice() else {
-        return Err(PhysicalQueryError::Invalid(
-            "binary set compound does not have two blocks",
-        ));
-    };
-    if arm.block != right.id || arm.operator == CompoundOperator::UnionAll {
-        return Err(PhysicalQueryError::Invalid(
-            "set compound arm does not match its right block",
-        ));
-    }
+    let last_set_arm = query
+        .hir
+        .compounds
+        .iter()
+        .rposition(|arm| arm.operator != CompoundOperator::UnionAll)
+        .ok_or(PhysicalQueryError::Invalid(
+            "set-compound emission has no set operator",
+        ))?;
+    let first = query.blocks.first().ok_or(PhysicalQueryError::Invalid(
+        "set compound has no first block",
+    ))?;
 
     bindings.enter_query(query.id)?;
     let emission = (|| -> QueryResult<()> {
@@ -792,111 +788,188 @@ fn emit_set_compound_query<'document>(
             destination,
         )?;
         let row_destination = sorter.map_or(destination, OpenedSorter::destination);
-        let row_limit = if sorter.is_some() { None } else { limit };
+        let trailing_union_all = last_set_arm + 1 < query.hir.compounds.len();
+        let mut row_limit = if sorter.is_some() { None } else { limit };
+        if trailing_union_all {
+            if let Some(limit) = row_limit.as_mut() {
+                let stopped = RegisterId(program.alloc_register());
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: stopped.0,
+                });
+                limit.stopped = Some(stopped);
+            }
+        }
 
-        let (left_cursor, left_index) = open_compound_index(program, left.outputs)?;
+        let (mut set_cursor, mut set_index) = open_compound_index(program, first.outputs)?;
         emit_query_block(
             plan,
             program,
             bindings,
             ctes,
-            left,
+            first,
             QueryDestination::CompoundIndex {
-                cursor_id: left_cursor,
-                index: &left_index,
+                cursor_id: set_cursor,
+                index: &set_index,
                 delete: false,
             },
             None,
         )?;
+        let mut final_intersection = None;
 
-        match arm.operator {
-            CompoundOperator::Union => {
-                emit_query_block(
+        for (arm_index, arm) in query
+            .hir
+            .compounds
+            .iter()
+            .enumerate()
+            .take(last_set_arm + 1)
+        {
+            let right = &query.blocks[arm_index + 1];
+            match arm.operator {
+                CompoundOperator::Union | CompoundOperator::UnionAll => emit_query_block(
                     plan,
                     program,
                     bindings,
                     ctes,
                     right,
                     QueryDestination::CompoundIndex {
-                        cursor_id: left_cursor,
-                        index: &left_index,
+                        cursor_id: set_cursor,
+                        index: &set_index,
                         delete: false,
                     },
                     None,
-                )?;
-                emit_compound_index_rows(
-                    plan,
-                    program,
-                    bindings,
-                    ctes,
-                    left_cursor,
-                    left_index.columns.len(),
-                    None,
-                    row_destination,
-                    row_limit,
-                )?;
-            }
-            CompoundOperator::Except => {
-                emit_query_block(
+                )?,
+                CompoundOperator::Except => emit_query_block(
                     plan,
                     program,
                     bindings,
                     ctes,
                     right,
                     QueryDestination::CompoundIndex {
-                        cursor_id: left_cursor,
-                        index: &left_index,
+                        cursor_id: set_cursor,
+                        index: &set_index,
                         delete: true,
                     },
                     None,
-                )?;
-                emit_compound_index_rows(
-                    plan,
-                    program,
-                    bindings,
-                    ctes,
-                    left_cursor,
-                    left_index.columns.len(),
-                    None,
-                    row_destination,
-                    row_limit,
-                )?;
+                )?,
+                CompoundOperator::Intersect => {
+                    let (right_cursor, right_index) = open_compound_index(program, first.outputs)?;
+                    emit_query_block(
+                        plan,
+                        program,
+                        bindings,
+                        ctes,
+                        right,
+                        QueryDestination::CompoundIndex {
+                            cursor_id: right_cursor,
+                            index: &right_index,
+                            delete: false,
+                        },
+                        None,
+                    )?;
+                    if arm_index == last_set_arm {
+                        final_intersection = Some(right_cursor);
+                        continue;
+                    }
+                    let (next_cursor, next_index) = open_compound_index(program, first.outputs)?;
+                    emit_compound_index_rows(
+                        plan,
+                        program,
+                        bindings,
+                        ctes,
+                        set_cursor,
+                        set_index.columns.len(),
+                        Some(right_cursor),
+                        QueryDestination::CompoundIndex {
+                            cursor_id: next_cursor,
+                            index: &next_index,
+                            delete: false,
+                        },
+                        None,
+                    )?;
+                    program.emit_insn(Insn::Close {
+                        cursor_id: set_cursor,
+                    });
+                    program.emit_insn(Insn::Close {
+                        cursor_id: right_cursor,
+                    });
+                    set_cursor = next_cursor;
+                    set_index = next_index;
+                }
             }
-            CompoundOperator::Intersect => {
-                let (right_cursor, right_index) = open_compound_index(program, left.outputs)?;
+        }
+
+        let set_limit = if trailing_union_all {
+            row_limit.map(|limit| LimitRuntime {
+                done: program.allocate_label(),
+                ..limit
+            })
+        } else {
+            row_limit
+        };
+        emit_compound_index_rows(
+            plan,
+            program,
+            bindings,
+            ctes,
+            set_cursor,
+            set_index.columns.len(),
+            final_intersection,
+            row_destination,
+            set_limit,
+        )?;
+        program.emit_insn(Insn::Close {
+            cursor_id: set_cursor,
+        });
+        if let Some(cursor_id) = final_intersection {
+            program.emit_insn(Insn::Close { cursor_id });
+        }
+
+        if trailing_union_all {
+            if let Some(limit) = row_limit {
+                let stopped = limit.stopped.ok_or(PhysicalQueryError::Invalid(
+                    "mixed compound LIMIT has no stop register",
+                ))?;
+                program.emit_insn(Insn::If {
+                    reg: stopped.0,
+                    target_pc: limit.done,
+                    jump_if_null: false,
+                });
+            }
+            for block in query.blocks.iter().skip(last_set_arm + 2) {
+                let block_limit = row_limit.map(|limit| LimitRuntime {
+                    done: program.allocate_label(),
+                    ..limit
+                });
                 emit_query_block(
                     plan,
                     program,
                     bindings,
                     ctes,
-                    right,
-                    QueryDestination::CompoundIndex {
-                        cursor_id: right_cursor,
-                        index: &right_index,
-                        delete: false,
-                    },
-                    None,
-                )?;
-                emit_compound_index_rows(
-                    plan,
-                    program,
-                    bindings,
-                    ctes,
-                    left_cursor,
-                    left_index.columns.len(),
-                    Some(right_cursor),
+                    block,
                     row_destination,
-                    row_limit,
+                    block_limit,
                 )?;
-                program.emit_insn(Insn::Close {
-                    cursor_id: right_cursor,
-                });
+                if block.source_order.is_empty() {
+                    if let Some(done) = row_cleanup_label(row_destination, block_limit) {
+                        program.preassign_label_to_next_insn(done);
+                    }
+                }
+                if let Some(limit) = row_limit {
+                    let stopped = limit.stopped.ok_or(PhysicalQueryError::Invalid(
+                        "mixed compound LIMIT has no stop register",
+                    ))?;
+                    program.emit_insn(Insn::If {
+                        reg: stopped.0,
+                        target_pc: limit.done,
+                        jump_if_null: false,
+                    });
+                }
             }
-            CompoundOperator::UnionAll => unreachable!(),
+            if let Some(limit) = row_limit {
+                program.preassign_label_to_next_insn(limit.done);
+            }
         }
-        program.emit_insn(Insn::Close {
-            cursor_id: left_cursor,
-        });
 
         if let Some(sorter) = sorter {
             emit_sorted_rows(program, sorter, destination, limit)?;
