@@ -8,6 +8,10 @@ mod expr;
 mod query;
 mod root;
 mod schema_program;
+pub(crate) mod validate;
+
+#[cfg(test)]
+mod validation_properties;
 
 use std::fmt;
 
