@@ -1,0 +1,50 @@
+name: Swift Tests
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - v*
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  working-directory: bindings/swift
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
+
+jobs:
+  test:
+    runs-on: blacksmith-6vcpu-macos-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust(stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-swift"
+          cache-on-failure: true
+
+      - name: Build xcframework
+        run: make xcframework
+
+      - name: Run tests
+        run: swift test
