@@ -13165,14 +13165,12 @@ pub fn op_close(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Close { cursor_id }, insn);
+    invalidate_deferred_seeks_for_cursor(state, *cursor_id);
     let cursors = &mut state.cursors;
     cursors
         .get_mut(*cursor_id)
         .expect("cursor_id should be valid")
         .take();
-    if let Some(deferred_seek) = state.deferred_seeks.get_mut(*cursor_id) {
-        deferred_seek.take();
-    }
     state.ephemeral_temp_files.remove(cursor_id);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

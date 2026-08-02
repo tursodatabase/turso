@@ -372,21 +372,54 @@ pub(crate) fn finish_update_row(
     for (index, key) in indexes.iter().zip(old_keys) {
         emit_index_delete(program, index, key);
     }
+    let table_delete_done = program.allocate_label();
+    program.emit_insn(Insn::Eq {
+        lhs: old_rowid.0,
+        rhs: new_rowid.0,
+        target_pc: table_delete_done,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
     program.emit_insn(Insn::Delete {
         cursor_id: cursor,
         table_name: table.name.clone(),
         is_part_of_update: true,
     });
+    program.preassign_label_to_next_insn(table_delete_done);
     for (index, key) in indexes.iter().zip(new_keys) {
         emit_index_insert(program, index, key)?;
     }
+    let overwrite_row = program.allocate_label();
+    let table_insert_done = program.allocate_label();
+    program.emit_insn(Insn::Eq {
+        lhs: old_rowid.0,
+        rhs: new_rowid.0,
+        target_pc: overwrite_row,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
     program.emit_insn(Insn::Insert {
         cursor,
         key_reg: new_rowid.0,
         record_reg: record,
-        flag: InsertFlags::new(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .update_rowid_change()
+            .skip_last_rowid(),
         table_name: table.name.clone(),
     });
+    program.emit_insn(Insn::Goto {
+        target_pc: table_insert_done,
+    });
+    program.preassign_label_to_next_insn(overwrite_row);
+    program.emit_insn(Insn::Insert {
+        cursor,
+        key_reg: new_rowid.0,
+        record_reg: record,
+        flag: InsertFlags::new().skip_last_rowid(),
+        table_name: table.name.clone(),
+    });
+    program.preassign_label_to_next_insn(table_insert_done);
     if !foreign_keys.incoming.is_empty() {
         emit_update_parent_repairs(
             program,

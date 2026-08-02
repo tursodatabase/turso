@@ -194,7 +194,6 @@ pub(crate) fn emit_root_update_with_context_and_after(
         db: database,
     });
     let target_scan = open_dml_target_scan(plan, program, update.target, cursor)?;
-    let indexes = open_indexes(program, source, database)?;
     let from_rows = update
         .from
         .as_ref()
@@ -256,6 +255,7 @@ pub(crate) fn emit_root_update_with_context_and_after(
         program.preassign_label_to_next_insn(scan_done);
     }
     target_scan.close(program);
+    let indexes = open_indexes(program, source, database)?;
 
     let write_start = program.allocate_label();
     let write_next = program.allocate_label();

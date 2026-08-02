@@ -36,8 +36,11 @@ fn program() -> ProgramBuilder {
 //   must probe i, insert i's packed key, then insert the table record.
 // - `UPDATE items SET c0 = c0 + 1` with
 //   `INDEX i ON items(c0 + 7) WHERE c1 > 3` must build OLD and NEW expression
-//   keys from frozen HIR, probe the NEW unique key when needed, then perform
-//   old IdxDelete -> table Delete -> new IdxInsert -> table Insert.
+//   keys from frozen HIR, probe the NEW unique key when needed, then replace
+//   the index key before either overwriting the stable table row or moving it.
+//   For example, `UPDATE items SET c0 = 7 WHERE rowid = 5` keeps rowid 5 and
+//   skips table Delete, while `UPDATE items SET rowid = 9 WHERE rowid = 5`
+//   deletes rowid 5 before inserting rowid 9.
 // - `DELETE FROM items WHERE c1` must perform IdxDelete before table Delete.
 // Dropping the schema before emission proves ordinary, expression, and partial
 // index behavior comes from the closed HIR document.
@@ -143,11 +146,15 @@ fn dml_maintains_frozen_hir_indexes_in_sqlite_order(tc: hegel::TestCase) {
             assert_eq!(index_deletes.len(), 1);
             assert_eq!(index_inserts.len(), 1);
             assert_eq!(table_deletes.len(), 1);
-            assert_eq!(table_inserts.len(), 1);
+            // The bytecode has mutually exclusive inserts: one moves a changed
+            // rowid and the other overwrites an unchanged rowid.
+            assert_eq!(table_inserts.len(), 2);
             assert!(
                 index_deletes[0] < table_deletes[0]
                     && table_deletes[0] < index_inserts[0]
-                    && index_inserts[0] < table_inserts[0]
+                    && table_inserts
+                        .iter()
+                        .all(|table_insert| index_inserts[0] < *table_insert)
             );
             assert_eq!(
                 positions(&|instruction| matches!(instruction, Insn::NoConflict { .. })).len(),

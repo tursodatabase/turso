@@ -221,7 +221,6 @@ pub(crate) fn emit_root_delete_with_context(
         db: database,
     });
     let target_scan = open_dml_target_scan(plan, program, delete.target, cursor)?;
-    let indexes = open_indexes(program, source, database)?;
     let rowid = RegisterId(program.alloc_register());
     let old_columns = (!delete.triggers.is_empty()
         || !delete.foreign_keys.outgoing.is_empty()
@@ -245,6 +244,7 @@ pub(crate) fn emit_root_delete_with_context(
         delete.limit.as_ref(),
     )?;
     target_scan.close(program);
+    let indexes = open_indexes(program, source, database)?;
     let loop_start = program.allocate_label();
     let loop_next = program.allocate_label();
     let loop_end = program.allocate_label();
