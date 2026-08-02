@@ -2653,6 +2653,92 @@ fn navigation_windows_materialize_bound_window_order(tc: hegel::TestCase) {
         .any(|(instruction, _)| matches!(instruction, Insn::Add { .. })));
 }
 
+// Examples under SQLite's default `RANGE UNBOUNDED PRECEDING .. CURRENT ROW`:
+// - `first_value(value) OVER (PARTITION BY g ORDER BY rank)` reads ordinal 1.
+// - `last_value(value) OVER (PARTITION BY g ORDER BY rank)` reads the last peer,
+//   so duplicate rank values share the same answer.
+// - `nth_value(value, 3) OVER (...)` is NULL until ordinal 3 enters the frame.
+// The order keys and positive N are bound once in HIR; physical emission only
+// materializes and seeks the resolved partition positions.
+#[hegel::test]
+fn positional_value_windows_use_the_bound_default_frame(tc: hegel::TestCase) {
+    let descending = tc.draw(generators::booleans());
+    let nth = i64::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
+    let direction = if descending { "DESC" } else { "ASC" };
+    let items = BTreeTable::from_sql(
+        "CREATE TABLE items(g INTEGER, value INTEGER, rank INTEGER, keep INTEGER)",
+        67,
+    )
+    .expect("fixture table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(items))
+        .expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT first_value(value) OVER (PARTITION BY g ORDER BY rank {direction}), \
+         last_value(value) OVER (PARTITION BY g ORDER BY rank {direction}), \
+         nth_value(value, {nth}) OVER (PARTITION BY g ORDER BY rank {direction}) \
+         FROM items WHERE keep >= ?1"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated positional query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed positional HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("positional windows emit from closed HIR");
+    program
+        .resolve_labels()
+        .expect("all positional-window branches are closed");
+
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| {
+                matches!(
+                    instruction,
+                    Insn::OpenRead {
+                        root_page: 67,
+                        db: 0,
+                        ..
+                    }
+                )
+            })
+            .count(),
+        4
+    );
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::SorterOpen { .. }))
+            .count(),
+        3
+    );
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::SeekRowid { .. }))
+            .count(),
+        3
+    );
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::MustBeInt { .. })));
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::Compare { count, .. } if *count == 1)));
+}
+
 // Example: `SELECT c3, sum(c5), count(*) FROM items GROUP BY c3`, where
 // `c3 TEXT COLLATE NOCASE`, sorts with the collation frozen in HIR, reloads
 // each sorted source row under the same SourceId, steps one accumulator per

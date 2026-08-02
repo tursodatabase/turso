@@ -2264,7 +2264,10 @@ fn emit_ranking_window_query<'document>(
             | WindowFunc::CumeDist
             | WindowFunc::Ntile
             | WindowFunc::Lag
-            | WindowFunc::Lead,
+            | WindowFunc::Lead
+            | WindowFunc::FirstValue
+            | WindowFunc::LastValue
+            | WindowFunc::NthValue,
         ) = function.call.function.value()
         else {
             return Err(PhysicalQueryError::Unsupported(
@@ -2355,7 +2358,10 @@ fn emit_ranking_window_row<'document>(
                 | WindowFunc::CumeDist
                 | WindowFunc::Ntile
                 | WindowFunc::Lag
-                | WindowFunc::Lead),
+                | WindowFunc::Lead
+                | WindowFunc::FirstValue
+                | WindowFunc::LastValue
+                | WindowFunc::NthValue),
             ) = function.call.function.value()
             else {
                 return Err(PhysicalQueryError::Unsupported(
@@ -2369,8 +2375,15 @@ fn emit_ranking_window_row<'document>(
                 .ok_or(PhysicalQueryError::Invalid(
                     "window call has no specification",
                 ))?;
-            if matches!(kind, WindowFunc::Lag | WindowFunc::Lead) {
-                emit_navigation_window(
+            if matches!(
+                kind,
+                WindowFunc::Lag
+                    | WindowFunc::Lead
+                    | WindowFunc::FirstValue
+                    | WindowFunc::LastValue
+                    | WindowFunc::NthValue
+            ) {
+                emit_positional_window(
                     plan,
                     program,
                     bindings,
@@ -2829,7 +2842,7 @@ fn emit_ranking_window_row<'document>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_navigation_window<'document>(
+fn emit_positional_window<'document>(
     plan: &PhysicalPlan<'document>,
     program: &mut ProgramBuilder,
     bindings: &mut RuntimeBindings<'document>,
@@ -2842,29 +2855,95 @@ fn emit_navigation_window<'document>(
     outer_rowid: RegisterId,
 ) -> QueryResult<()> {
     let value = bindings.window_function(function.id)?.register;
-    if let Some(default) = function.call.arguments.get(2) {
-        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
-        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
-            .emit_into(default, RegisterRange::new(value.0, 1))?;
+    if matches!(kind, WindowFunc::Lag | WindowFunc::Lead) {
+        if let Some(default) = function.call.arguments.get(2) {
+            let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+            ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                .emit_into(default, RegisterRange::new(value.0, 1))?;
+        } else {
+            program.emit_insn(Insn::Null {
+                dest: value.0,
+                dest_end: None,
+            });
+        }
     } else {
         program.emit_insn(Insn::Null {
             dest: value.0,
             dest_end: None,
         });
     }
-    let offset = if let Some(offset) = function.call.arguments.get(1) {
+    if matches!(
+        kind,
+        WindowFunc::FirstValue | WindowFunc::LastValue | WindowFunc::NthValue
+    ) && function
+        .call
+        .window
+        .as_ref()
+        .is_some_and(|spec| spec.frame.is_some())
+    {
+        return Err(PhysicalQueryError::Unsupported(
+            "explicit frame for a positional value window",
+        ));
+    }
+    let offset = if matches!(kind, WindowFunc::Lag | WindowFunc::Lead) {
+        if let Some(offset) = function.call.arguments.get(1) {
+            let register = program.alloc_register();
+            let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+            ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                .emit_into(offset, RegisterRange::new(register, 1))?;
+            Some(register)
+        } else {
+            let register = program.alloc_register();
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: register,
+            });
+            Some(register)
+        }
+    } else {
+        None
+    };
+    let nth = if matches!(kind, WindowFunc::NthValue) {
+        let nth = function
+            .call
+            .arguments
+            .get(1)
+            .ok_or(PhysicalQueryError::Invalid(
+                "nth_value has no position argument",
+            ))?;
         let register = program.alloc_register();
         let mut subqueries = QuerySubqueryEmitter { plan, ctes };
         ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
-            .emit_into(offset, RegisterRange::new(register, 1))?;
-        register
-    } else {
-        let register = program.alloc_register();
-        program.emit_insn(Insn::Integer {
-            value: 1,
-            dest: register,
+            .emit_into(nth, RegisterRange::new(register, 1))?;
+        let invalid = program.allocate_label();
+        let valid = program.allocate_label();
+        program.emit_insn(Insn::MustBeInt {
+            reg: register,
+            target_pc: Some(invalid),
         });
-        register
+        let zero = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: zero,
+        });
+        program.emit_insn(Insn::Gt {
+            lhs: register,
+            rhs: zero,
+            target_pc: valid,
+            flags: crate::vdbe::insn::CmpInsFlags::default(),
+            collation: None,
+        });
+        program.preassign_label_to_next_insn(invalid);
+        program.emit_insn(Insn::Halt {
+            err_code: crate::error::SQLITE_ERROR,
+            description: "second argument to nth_value must be a positive integer".to_string(),
+            on_error: None,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(valid);
+        Some(register)
+    } else {
+        None
     };
     let outer_partition = program.alloc_registers(spec.partition_by.len());
     for (position, expression) in spec.partition_by.iter().enumerate() {
@@ -2873,6 +2952,12 @@ fn emit_navigation_window<'document>(
             expression,
             RegisterRange::new(outer_partition + position, 1),
         )?;
+    }
+    let outer_order = program.alloc_registers(spec.order_by.len());
+    for (position, term) in spec.order_by.iter().enumerate() {
+        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+            .emit_into(&term.expr, RegisterRange::new(outer_order + position, 1))?;
     }
 
     let key_count = spec.order_by.len() + 1;
@@ -3015,8 +3100,13 @@ fn emit_navigation_window<'document>(
         num_fields: key_count + 1,
     });
     let outer_position = program.alloc_register();
+    let peer_end = program.alloc_register();
     program.emit_insn(Insn::Null {
         dest: outer_position,
+        dest_end: None,
+    });
+    program.emit_insn(Insn::Null {
+        dest: peer_end,
         dest_end: None,
     });
     let sort_start = program.allocate_label();
@@ -3038,6 +3128,54 @@ fn emit_navigation_window<'document>(
         rowid_reg: ordinal,
         prev_largest_reg: 0,
     });
+    let after_peer = program.allocate_label();
+    if spec.order_by.is_empty() {
+        program.emit_insn(Insn::Copy {
+            src_reg: ordinal,
+            dst_reg: peer_end,
+            extra_amount: 0,
+        });
+    } else {
+        let sorted_order = program.alloc_registers(spec.order_by.len());
+        for position in 0..spec.order_by.len() {
+            program.emit_insn(Insn::Column {
+                cursor_id: pseudo,
+                column: position,
+                dest: sorted_order + position,
+                default: None,
+            });
+        }
+        program.emit_insn(Insn::Compare {
+            start_reg_a: outer_order,
+            start_reg_b: sorted_order,
+            count: spec.order_by.len(),
+            key_info: spec
+                .order_by
+                .iter()
+                .map(|term| KeyInfo {
+                    sort_order: term.order,
+                    collation: term
+                        .collation
+                        .as_ref()
+                        .map_or(CollationSeq::Binary, |collation| *collation.value()),
+                    nulls_order: term.nulls,
+                })
+                .collect(),
+        });
+        let update_peer = program.allocate_label();
+        program.emit_insn(Insn::Jump {
+            target_pc_lt: after_peer,
+            target_pc_eq: update_peer,
+            target_pc_gt: after_peer,
+        });
+        program.preassign_label_to_next_insn(update_peer);
+        program.emit_insn(Insn::Copy {
+            src_reg: ordinal,
+            dst_reg: peer_end,
+            extra_amount: 0,
+        });
+    }
+    program.preassign_label_to_next_insn(after_peer);
     let sorted_rowid = program.alloc_register();
     program.emit_insn(Insn::Column {
         cursor_id: pseudo,
@@ -3087,24 +3225,48 @@ fn emit_navigation_window<'document>(
     program.preassign_label_to_next_insn(sort_done);
 
     let target = program.alloc_register();
-    program.emit_insn(match kind {
+    let missing = program.allocate_label();
+    let target_instruction = match kind {
         WindowFunc::Lag => Insn::Subtract {
             lhs: outer_position,
-            rhs: offset,
+            rhs: offset.expect("lag has an offset"),
             dest: target,
         },
         WindowFunc::Lead => Insn::Add {
             lhs: outer_position,
-            rhs: offset,
+            rhs: offset.expect("lead has an offset"),
             dest: target,
+        },
+        WindowFunc::FirstValue => Insn::Integer {
+            value: 1,
+            dest: target,
+        },
+        WindowFunc::LastValue => Insn::Copy {
+            src_reg: peer_end,
+            dst_reg: target,
+            extra_amount: 0,
+        },
+        WindowFunc::NthValue => Insn::Copy {
+            src_reg: nth.expect("nth_value validates its position"),
+            dst_reg: target,
+            extra_amount: 0,
         },
         _ => {
             return Err(PhysicalQueryError::Invalid(
-                "non-navigation function reached navigation emission",
+                "non-positional function reached positional emission",
             ));
         }
-    });
-    let missing = program.allocate_label();
+    };
+    program.emit_insn(target_instruction);
+    if matches!(kind, WindowFunc::NthValue) {
+        program.emit_insn(Insn::Gt {
+            lhs: target,
+            rhs: peer_end,
+            target_pc: missing,
+            flags: crate::vdbe::insn::CmpInsFlags::default(),
+            collation: None,
+        });
+    }
     program.emit_insn(Insn::SeekRowid {
         cursor_id: positions_cursor,
         src_reg: target,

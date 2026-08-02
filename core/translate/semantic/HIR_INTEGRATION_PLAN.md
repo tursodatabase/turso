@@ -99,6 +99,8 @@ operations are not SQL binding.
         peer position, and validated arguments from the same frozen HIR rescan.
   - [x] `lag` and `lead` materialize each filtered HIR partition in resolved
         window order and seek an ordinal without parser-expression rewrites.
+  - [x] `first_value`, `last_value`, and `nth_value` use the bound default RANGE
+        frame, including peer ends and positive-N validation.
   - [ ] Window execution, RIGHT/FULL OUTER JOIN, and the remaining compound
         combinations.
   - [x] Recursive CTE seeds and arms feed a frozen-HIR priority queue, bind
