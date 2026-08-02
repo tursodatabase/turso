@@ -1,4 +1,4 @@
-//! Resolver-free CDC emission from catalog facts frozen in HIR.
+//! Catalog-free CDC emission from facts frozen in HIR.
 
 use crate::{
     function::{Func, FuncCtx, ScalarFunc},
