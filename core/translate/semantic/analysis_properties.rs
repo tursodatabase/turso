@@ -822,6 +822,51 @@ fn outgoing_non_rowid_foreign_keys_carry_the_exact_parent_unique_index(tc: hegel
     );
 }
 
+// Example: with CHECK constraints ignored, both `INSERT INTO items VALUES
+// (-1)` and `UPDATE items SET c0 = -1` must still carry a complete DML row
+// contract. Ignored checks become stored `TRUE` programs so physical lowering
+// can distinguish a deliberate no-op from unfinished binding.
+#[hegel::test]
+fn ignored_checks_still_close_the_dml_row_contract(tc: hegel::TestCase) {
+    let table = BTreeTable::from_sql("CREATE TABLE items(c0 INTEGER CHECK(c0 > 0))", 2)
+        .expect("the CHECK table is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(table))
+        .expect("the table name is unique");
+    let symbols = SymbolTable::new();
+    let context = semantic_context(&schema, &symbols)
+        .with_dml_policy(DmlPolicy::new(false, false, false, true, false));
+    let sql = if tc.draw(generators::booleans()) {
+        "INSERT INTO items VALUES (-1)"
+    } else {
+        "UPDATE items SET c0 = -1"
+    };
+    let statement = parse_statement(sql);
+
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("ignored CHECKs leave a complete DML document");
+    let target = match &document.root {
+        HirRoot::Insert(insert) => insert.target,
+        HirRoot::Update(update) => update.target,
+        _ => unreachable!("the fixture emits INSERT or UPDATE"),
+    };
+    let checks = document
+        .source(target)
+        .expect("the DML target exists")
+        .check_constraints
+        .as_ref()
+        .expect("the DML target carries CHECK metadata");
+    assert_eq!(checks.len(), 1);
+    assert!(matches!(
+        checks[0].expression,
+        Expr::Literal(ast::Literal::True)
+    ));
+    document
+        .validate()
+        .expect("the explicit empty CHECK program set closes HIR");
+}
+
 // Example: `INSERT INTO items(c0) VALUES (1)` on a table with generated `c1`,
 // defaulted `c2`, `CHECK(c0 >= 0)`, and
 // `CREATE INDEX items_expr ON items(c0 + 1) WHERE c0 > 0` closes every program

@@ -543,6 +543,26 @@ impl Analyzer<'_, '_> {
         table: &Table,
     ) -> Result<()> {
         if self.context().dml_policy().check_constraints_ignored() {
+            let constraints = table
+                .btree()
+                .map(|table| {
+                    table
+                        .check_constraints
+                        .iter()
+                        .map(|check| hir::CheckConstraint {
+                            expression: hir::Expr::Literal(ast::Literal::True),
+                            description: check
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| check.expr.to_string()),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let definition = self.source_mut(source).ok_or_else(|| {
+                LimboError::InternalError(format!("missing semantic source {source}"))
+            })?;
+            definition.check_constraints = Some(constraints);
             return Ok(());
         }
         let Table::BTree(table) = table else {
