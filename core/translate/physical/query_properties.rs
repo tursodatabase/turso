@@ -4152,6 +4152,90 @@ fn uncorrelated_in_subqueries_are_ready_before_every_full_join_filter_path(
 }
 
 // Examples:
+// - `l FULL JOIN r ON l.c0 = r.c0 WHERE EXISTS
+//   (SELECT 1 FROM v WHERE v.c1 = l.c2)` captures the left source.
+// - `l FULL JOIN r ON l.c0 = r.c0 WHERE
+//   (SELECT v.c1 FROM v WHERE v.c1 = r.c2) IS NOT NULL` captures the right.
+// - `l.c2 IN (SELECT v.c1 FROM v WHERE v.c1 = r.c2)` captures through `IN`.
+// Binding must preserve the exact captured SourceId. Physical planning must
+// then return main's established FULL JOIN limit, while an uncorrelated child
+// remains supported by the property above.
+#[hegel::test]
+fn correlated_subqueries_with_full_join_keep_their_binding_before_rejection(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
+    let join_column = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let capture_column = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let inner_column = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let capture_left = tc.draw(generators::booleans());
+    let captured_alias = if capture_left { "l" } else { "r" };
+    let subquery_form = tc.draw(generators::integers::<u8>().max_value(2));
+    let filter = match subquery_form {
+        0 => format!(
+            "EXISTS (SELECT 1 FROM v WHERE v.c{inner_column} = \
+             {captured_alias}.c{capture_column})"
+        ),
+        1 => format!(
+            "(SELECT v.c{inner_column} FROM v WHERE v.c{inner_column} = \
+             {captured_alias}.c{capture_column}) IS NOT NULL"
+        ),
+        _ => format!(
+            "{captured_alias}.c{capture_column} IN \
+             (SELECT v.c{inner_column} FROM v WHERE v.c{inner_column} = \
+             {captured_alias}.c{capture_column})"
+        ),
+    };
+    let columns = (0..width)
+        .map(|position| format!("c{position} INTEGER"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut schema = Schema::new();
+    for (name, root_page) in [("l", 101), ("r", 103), ("v", 107)] {
+        let table = BTreeTable::from_sql(&format!("CREATE TABLE {name}({columns})"), root_page)
+            .expect("generated table SQL is valid");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("fixture table name is unique");
+    }
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT l.c{capture_column}, r.c{capture_column} \
+         FROM l FULL JOIN r ON l.c{join_column} = r.c{join_column} \
+         WHERE {filter}"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("correlated FULL-join subquery binds into closed HIR");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let HirRoot::Query(root) = &document.root else {
+        panic!("the fixture is a query");
+    };
+    let outer = &document.queries[root.query.index()];
+    let from = outer.blocks[outer.first.index]
+        .from
+        .as_ref()
+        .expect("FULL JOIN has FROM");
+    let captured_source = if capture_left {
+        from.first
+    } else {
+        from.joins[0].right
+    };
+    assert!(document
+        .queries
+        .iter()
+        .filter(|query| query.parent == Some(outer.id))
+        .any(|query| query.captures.contains(&captured_source)));
+
+    assert!(matches!(
+        PhysicalPlan::new(&document),
+        Err(PhysicalPlanError::UnsupportedQuery(_))
+    ));
+}
+
+// Examples:
 // - `SELECT (SELECT 7 UNION ALL SELECT 9)` returns the first compound row, so
 //   later arms must not overwrite the scalar result after an early jump.
 // - `SELECT EXISTS(SELECT 1 WHERE 0 UNION ALL SELECT 2 WHERE 1)` is true even

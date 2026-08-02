@@ -31,10 +31,11 @@ use crate::{
 };
 
 use super::{
-    AggregateRuntime, ExpressionEmitter, ExpressionResult, OutputRuntime, PhysicalAggregate,
-    PhysicalExpressionError, PhysicalPlan, PhysicalRoot, PhysicalSource, PhysicalSourceKind,
-    PhysicalSubqueryEmitter, QueryRuntime, RegisterId, RegisterRange, RootRuntimeInputs,
-    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
+    plan::query_tree_has_outer_dependency, AggregateRuntime, ExpressionEmitter, ExpressionResult,
+    OutputRuntime, PhysicalAggregate, PhysicalExpressionError, PhysicalPlan, PhysicalRoot,
+    PhysicalSource, PhysicalSourceKind, PhysicalSubqueryEmitter, QueryRuntime, RegisterId,
+    RegisterRange, RootRuntimeInputs, RuntimeBindingError, RuntimeBindings, SourceRuntime,
+    TableAccess,
 };
 
 #[derive(Debug)]
@@ -460,7 +461,7 @@ impl<'document> PhysicalSubqueryEmitter<'document> for QuerySubqueryEmitter<'_, 
             .ok_or(PhysicalExpressionError::Subquery(
                 "query is missing from the physical plan".to_string(),
             ))?;
-        let has_outer_dependency = query_tree_has_outer_dependency(self.plan, query_id);
+        let has_outer_dependency = query_tree_has_outer_dependency(self.plan.document, query_id);
         match subquery {
             SubqueryExpr::Scalar { .. } => {
                 let once_done = (!has_outer_dependency).then(|| {
@@ -1376,37 +1377,6 @@ fn emit_query<'document>(
     }
 }
 
-/// Return whether this query tree reads a source owned outside the tree.
-/// Direct captures are not enough: an otherwise capture-free scalar query can
-/// contain a derived query that reaches through it to the scalar query's
-/// parent.
-fn query_tree_has_outer_dependency(plan: &PhysicalPlan<'_>, root: QueryId) -> bool {
-    let mut tree = FxHashSet::default();
-    let mut pending = vec![root];
-    while let Some(query_id) = pending.pop() {
-        if !tree.insert(query_id) {
-            continue;
-        }
-        pending.extend(
-            plan.queries
-                .iter()
-                .filter(|query| query.hir.parent == Some(query_id))
-                .map(|query| query.id),
-        );
-    }
-    tree.iter().any(|query_id| {
-        plan.query(*query_id).is_some_and(|query| {
-            query.hir.captures.iter().any(|source_id| {
-                !matches!(
-                    plan.document.source(*source_id).map(|source| source.owner),
-                    Some(crate::translate::semantic::hir::SourceOwner::QueryBlock(block))
-                        if tree.contains(&block.query)
-                )
-            })
-        })
-    })
-}
-
 /// Emit query-independent subqueries before any row-production branch can use
 /// their runtime result. FULL joins emit the same filter for matched and
 /// unmatched rows, and either branch may run first. Keeping this setup at the
@@ -1535,7 +1505,7 @@ fn prepare_uncorrelated_subqueries<'document>(
         let child = plan.query(query_id).ok_or(PhysicalQueryError::Invalid(
             "subquery is missing from the physical plan",
         ))?;
-        if query_tree_has_outer_dependency(plan, child.id) {
+        if query_tree_has_outer_dependency(plan.document, child.id) {
             continue;
         }
         let mut emitter = QuerySubqueryEmitter { plan, ctes };

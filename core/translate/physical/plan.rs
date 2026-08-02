@@ -120,6 +120,7 @@ impl<'hir> PhysicalPlan<'hir> {
         for query in &document.queries {
             for block in &query.blocks {
                 reject_unsupported_full_join_constraint(block)?;
+                reject_correlated_subquery_with_full_join(document, query, block)?;
             }
         }
         let root = match &document.root {
@@ -226,6 +227,134 @@ fn reject_unsupported_full_join_constraint(block: &QueryBlock) -> Result<(), Phy
         }
     }
     Ok(())
+}
+
+fn reject_correlated_subquery_with_full_join(
+    document: &HirDocument,
+    query: &Query,
+    block: &QueryBlock,
+) -> Result<(), PhysicalPlanError> {
+    let has_full_join = block.from.as_ref().is_some_and(|from| {
+        from.joins
+            .iter()
+            .any(|join| join.kind == hir::JoinKind::Full)
+    });
+    if !has_full_join {
+        return Ok(());
+    }
+
+    let mut has_correlated_subquery = false;
+    let mut inspect = |expression: &hir::Expr| {
+        expression.walk(&mut |expression| {
+            let hir::Expr::Subquery(subquery) = expression else {
+                return;
+            };
+            let query_id = match subquery {
+                hir::SubqueryExpr::Scalar { query, .. }
+                | hir::SubqueryExpr::Exists(query)
+                | hir::SubqueryExpr::In { query, .. } => *query,
+            };
+            has_correlated_subquery |= query_tree_has_outer_dependency(document, query_id);
+        });
+    };
+
+    for output in &block.outputs {
+        inspect(&output.expr);
+    }
+    if let Some(from) = &block.from {
+        for join in &from.joins {
+            match &join.constraint {
+                hir::JoinConstraint::On(expression) => inspect(expression),
+                hir::JoinConstraint::Using(columns) | hir::JoinConstraint::Natural(columns) => {
+                    for column in columns {
+                        inspect(&column.left);
+                    }
+                }
+                hir::JoinConstraint::None => {}
+            }
+        }
+    }
+    match &block.body {
+        hir::QueryBlockBody::Select {
+            filter,
+            grouping,
+            windows,
+            ..
+        } => {
+            if let Some(filter) = filter {
+                inspect(filter);
+            }
+            if let Some(grouping) = grouping {
+                for key in &grouping.keys {
+                    inspect(key);
+                }
+                if let Some(having) = &grouping.having {
+                    inspect(having);
+                }
+            }
+            for window in windows {
+                for expression in &window.spec.partition_by {
+                    inspect(expression);
+                }
+                for term in &window.spec.order_by {
+                    inspect(&term.expr);
+                }
+            }
+        }
+        hir::QueryBlockBody::Values { rows } => {
+            for expression in rows.iter().flatten() {
+                inspect(expression);
+            }
+        }
+    }
+    if block.id == query.first {
+        for term in &query.order_by {
+            inspect(&term.expr);
+        }
+        if let Some(limit) = &query.limit {
+            inspect(&limit.limit);
+            if let Some(offset) = &limit.offset {
+                inspect(offset);
+            }
+        }
+    }
+
+    if has_correlated_subquery {
+        return Err(PhysicalPlanError::UnsupportedQuery(
+            "FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables",
+        ));
+    }
+    Ok(())
+}
+
+/// Return whether this query tree reads a source owned outside the tree.
+/// Direct captures are not enough: a capture-free scalar query can contain a
+/// derived query that reaches through it to the scalar query's parent.
+pub(super) fn query_tree_has_outer_dependency(document: &HirDocument, root: QueryId) -> bool {
+    let mut tree = rustc_hash::FxHashSet::default();
+    let mut pending = vec![root];
+    while let Some(query_id) = pending.pop() {
+        if !tree.insert(query_id) {
+            continue;
+        }
+        pending.extend(
+            document
+                .queries
+                .iter()
+                .filter(|query| query.parent == Some(query_id))
+                .map(|query| query.id),
+        );
+    }
+    tree.iter().any(|query_id| {
+        document.query(*query_id).is_some_and(|query| {
+            query.captures.iter().any(|source_id| {
+                !matches!(
+                    document.source(*source_id).map(|source| source.owner),
+                    Some(hir::SourceOwner::QueryBlock(block)) if tree.contains(&block.query)
+                )
+            })
+        })
+    })
 }
 
 fn collect_block_functions<'hir>(
