@@ -619,8 +619,8 @@ fn ordered_update_from_freezes_values_and_selection_before_writing(tc: hegel::Te
 // Examples:
 // - `DELETE FROM items WHERE EXISTS (SELECT 1 FROM lookup WHERE
 //   lookup.c0 = items.c0)` must keep the outer target SourceId live while the
-//   nested query scans its own resolved source, then close that query before
-//   deleting the matching row.
+//   nested query scans its own resolved source, freeze every matching rowid,
+//   then finish all reads before deleting the first row.
 // - `UPDATE items SET c1 = (SELECT lookup.c1 FROM lookup WHERE
 //   lookup.c0 = items.c0 LIMIT 1) WHERE EXISTS (...)` must use the same query
 //   layer for both the predicate and assignment; neither expression may fall
@@ -676,6 +676,23 @@ fn dml_subqueries_share_the_closed_hir_query_layer(tc: hegel::TestCase) {
         .filter(|(instruction, _)| matches!(instruction, Insn::OpenRead { root_page: 13, .. }))
         .count();
     assert_eq!(lookup_scans, if update { 2 } else { 1 });
+    if !update {
+        let frozen = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| {
+                matches!(instruction, Insn::Insert { table_name, .. } if table_name == "ordered_dml_rowids")
+            })
+            .expect("DELETE selection is frozen before mutation");
+        let delete = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| {
+                matches!(instruction, Insn::Delete { table_name, .. } if table_name == "items")
+            })
+            .expect("the target row is deleted");
+        assert!(frozen < delete);
+    }
     assert!(program.insns.iter().any(|(instruction, _)| {
         matches!(
             instruction,
@@ -699,11 +716,15 @@ fn dml_subqueries_share_the_closed_hir_query_layer(tc: hegel::TestCase) {
 // - `DELETE FROM items WHERE c2 > 0 ORDER BY c0 ASC LIMIT 3 OFFSET 0`
 //   follows the same rule: sorting, filtering, and slicing finish before the
 //   first target row is deleted.
+// - Adding `INDEXED BY items_idx` makes the read phase walk that frozen index
+//   and defer-seek the target table, while the write phase still consumes only
+//   the materialized rowids.
 // Varying statement kind, direction, limit, and offset checks that both DML
 // roots use one closed-HIR selection layer rather than separate binders.
 #[hegel::test]
 fn ordered_dml_freezes_selected_rowids_before_writing(tc: hegel::TestCase) {
     let update = tc.draw(generators::booleans());
+    let forced_index = tc.draw(generators::booleans());
     let descending = tc.draw(generators::booleans());
     let limit = usize::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(8)));
     let offset = usize::from(tc.draw(generators::integers::<u8>().max_value(4)));
@@ -712,20 +733,30 @@ fn ordered_dml_freezes_selected_rowids_before_writing(tc: hegel::TestCase) {
         BTreeTable::from_sql("CREATE TABLE items(c0 INTEGER, c1 INTEGER, c2 INTEGER)", 12)
             .expect("fixture target SQL is valid"),
     );
+    let symbols = SymbolTable::new();
+    let index = Arc::new(
+        Index::from_sql(&symbols, "CREATE INDEX items_idx ON items(c0)", 13, &items)
+            .expect("fixture index SQL is valid"),
+    );
     let mut schema = Schema::new();
     schema.add_btree_table(items).expect("items is unique");
-    let symbols = SymbolTable::new();
+    schema.add_index(index).expect("items_idx is unique");
     let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
     let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
     let direction = if descending { "DESC" } else { "ASC" };
+    let access = if forced_index {
+        " INDEXED BY items_idx"
+    } else {
+        ""
+    };
     let sql = if update {
         format!(
-            "UPDATE items SET c1 = c1 + {increment} WHERE c2 > 0 \
+            "UPDATE items{access} SET c1 = c1 + {increment} WHERE c2 > 0 \
              ORDER BY c0 {direction} LIMIT {limit} OFFSET {offset}"
         )
     } else {
         format!(
-            "DELETE FROM items WHERE c2 > 0 \
+            "DELETE FROM items{access} WHERE c2 > 0 \
              ORDER BY c0 {direction} LIMIT {limit} OFFSET {offset}"
         )
     };
@@ -777,4 +808,61 @@ fn ordered_dml_freezes_selected_rowids_before_writing(tc: hegel::TestCase) {
         .insns
         .iter()
         .any(|(instruction, _)| matches!(instruction, Insn::DecrJumpZero { .. })));
+    assert_eq!(
+        program.insns.iter().any(|(instruction, _)| {
+            matches!(instruction, Insn::OpenRead { root_page: 13, .. })
+        }),
+        forced_index
+    );
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::DeferredSeek { .. })),
+        forced_index
+    );
+}
+
+// Example: `UPDATE items SET c1 = (SELECT SUM(c1) FROM items)` evaluates the
+// closed, uncorrelated scalar query once. Every target row receives the same
+// original sum even though earlier rows have already been written; a query
+// such as `... WHERE inner.c0 = items.c0` has captures and must not use Once.
+#[hegel::test]
+fn uncorrelated_dml_subqueries_run_once_while_correlated_ones_run_per_row(tc: hegel::TestCase) {
+    let correlated = tc.draw(generators::booleans());
+    let items = Arc::new(
+        BTreeTable::from_sql("CREATE TABLE items(c0 INTEGER, c1 INTEGER)", 12)
+            .expect("fixture target SQL is valid"),
+    );
+    let mut schema = Schema::new();
+    schema.add_btree_table(items).expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let sql = if correlated {
+        "UPDATE items SET c1 = (SELECT SUM(nested_items.c1) FROM items AS nested_items WHERE nested_items.c0 = items.c0)"
+    } else {
+        "UPDATE items SET c1 = (SELECT SUM(nested_items.c1) FROM items AS nested_items)"
+    };
+    let statement = parse_statement(sql);
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated scalar UPDATE has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed scalar UPDATE has a physical plan");
+    let mut program = program();
+    emit_root(&plan, &mut program).expect("scalar UPDATE emits without a resolver");
+    program
+        .resolve_labels()
+        .expect("all scalar UPDATE branches are closed");
+
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Once { .. })),
+        !correlated
+    );
 }

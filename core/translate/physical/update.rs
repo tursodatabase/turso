@@ -19,11 +19,11 @@ use super::{
     emit_index_insert, emit_index_key, emit_new_row_constraints, emit_replace_conflicting_row,
     emit_replace_not_null_defaults, emit_replace_unique_check, emit_returning_result,
     emit_returning_values, emit_stored_record, emit_trigger_programs, emit_unique_check,
-    open_indexes, record_from_registers, update_record, CdcChange, CursorId, ExpressionEmitter,
-    PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError, PhysicalPlan,
-    PhysicalRoot, PhysicalRowError, PhysicalSourceKind, PhysicalTriggerError, PreparedCdc,
-    PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs, RuntimeBindingError,
-    RuntimeBindings, SourceRuntime, TableAccess, TriggerRow, TriggerRows,
+    open_dml_target_scan, open_indexes, record_from_registers, update_record, CdcChange, CursorId,
+    ExpressionEmitter, PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError,
+    PhysicalPlan, PhysicalRoot, PhysicalRowError, PhysicalSourceKind, PhysicalTriggerError,
+    PreparedCdc, PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs,
+    RuntimeBindingError, RuntimeBindings, SourceRuntime, TriggerRow, TriggerRows,
 };
 
 #[derive(Debug)]
@@ -185,6 +185,7 @@ pub(crate) fn emit_root_update_with_context_and_after(
         root_page: RegisterOrLiteral::Literal(table.root_page),
         db: database,
     });
+    let target_scan = open_dml_target_scan(plan, program, update.target, cursor)?;
     let indexes = open_indexes(program, source, database)?;
     let from_rows = update
         .from
@@ -195,7 +196,7 @@ pub(crate) fn emit_root_update_with_context_and_after(
                 program,
                 &mut bindings,
                 update.target,
-                cursor,
+                target_scan,
                 from,
                 update.predicate.as_ref(),
                 &update.assignments,
@@ -211,7 +212,7 @@ pub(crate) fn emit_root_update_with_context_and_after(
             plan,
             program,
             &mut bindings,
-            cursor,
+            target_scan,
             update.predicate.as_ref(),
             &update.order_by,
             update.limit.as_ref(),
@@ -223,11 +224,9 @@ pub(crate) fn emit_root_update_with_context_and_after(
         let scan_start = program.allocate_label();
         let scan_next = program.allocate_label();
         let scan_done = program.allocate_label();
-        program.emit_insn(Insn::Rewind {
-            cursor_id: cursor,
-            pc_if_empty: scan_done,
-        });
+        target_scan.rewind(program, scan_done);
         program.preassign_label_to_next_insn(scan_start);
+        target_scan.prepare_row(program);
         if let Some(predicate) = &update.predicate {
             let condition = emit_expression_for_dml(plan, program, &mut bindings, predicate)?;
             if condition.width != 1 {
@@ -239,21 +238,16 @@ pub(crate) fn emit_root_update_with_context_and_after(
                 jump_if_null: true,
             });
         }
-        program.emit_insn(Insn::RowId {
-            cursor_id: cursor,
-            dest: rowid.0,
-        });
+        target_scan.rowid(program, rowid.0);
         program.emit_insn(Insn::RowSetAdd {
             rowset_reg: rowset,
             value_reg: rowid.0,
         });
         program.preassign_label_to_next_insn(scan_next);
-        program.emit_insn(Insn::Next {
-            cursor_id: cursor,
-            pc_if_next: scan_start,
-        });
+        target_scan.next(program, scan_start);
         program.preassign_label_to_next_insn(scan_done);
     }
+    target_scan.close(program);
 
     let write_start = program.allocate_label();
     let write_next = program.allocate_label();
@@ -769,14 +763,11 @@ fn preflight_update<'plan>(
         .ok_or(PhysicalUpdateError::Invalid(
             "physical target source is missing",
         ))?;
-    let PhysicalSourceKind::CatalogTable { table, access } = &physical.kind else {
+    let PhysicalSourceKind::CatalogTable { table, access: _ } = &physical.kind else {
         return Err(PhysicalUpdateError::Invalid(
             "target is not a catalog table",
         ));
     };
-    if !matches!(access, TableAccess::Scan) {
-        return Err(PhysicalUpdateError::Unsupported("indexed target access"));
-    }
     let database = table
         .database()
         .ok_or(PhysicalUpdateError::Invalid(

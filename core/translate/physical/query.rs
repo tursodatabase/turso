@@ -94,6 +94,122 @@ struct OpenedScan<'hir> {
     owned: bool,
 }
 
+/// Read-side cursor used to freeze a DML target before its write phase.
+///
+/// The table cursor remains the runtime binding for column reads. When HIR
+/// carries `INDEXED BY`, `cursor` walks that exact index and defers each table
+/// seek until the predicate or rowid needs it.
+#[derive(Clone, Copy)]
+pub(crate) struct DmlTargetScan {
+    cursor: usize,
+    table_cursor: usize,
+    indexed: bool,
+}
+
+impl DmlTargetScan {
+    fn opened(self) -> OpenedScan<'static> {
+        OpenedScan {
+            cursor: ScanCursor::BTree(self.cursor),
+            runtime_cursor: self.table_cursor,
+            deferred_table: self.indexed.then_some(self.table_cursor),
+            virtual_filter: None,
+            owned: false,
+        }
+    }
+
+    pub(crate) fn rewind(self, program: &mut ProgramBuilder, empty: crate::vdbe::BranchOffset) {
+        program.emit_insn(Insn::Rewind {
+            cursor_id: self.cursor,
+            pc_if_empty: empty,
+        });
+    }
+
+    pub(crate) fn prepare_row(self, program: &mut ProgramBuilder) {
+        if self.indexed {
+            program.emit_insn(Insn::DeferredSeek {
+                index_cursor_id: self.cursor,
+                table_cursor_id: self.table_cursor,
+            });
+        }
+    }
+
+    pub(crate) fn rowid(self, program: &mut ProgramBuilder, dest: usize) {
+        if self.indexed {
+            program.emit_insn(Insn::IdxRowId {
+                cursor_id: self.cursor,
+                dest,
+            });
+        } else {
+            program.emit_insn(Insn::RowId {
+                cursor_id: self.cursor,
+                dest,
+            });
+        }
+    }
+
+    pub(crate) fn next(self, program: &mut ProgramBuilder, target: crate::vdbe::BranchOffset) {
+        program.emit_insn(Insn::Next {
+            cursor_id: self.cursor,
+            pc_if_next: target,
+        });
+    }
+
+    pub(crate) fn close(self, program: &mut ProgramBuilder) {
+        if self.indexed {
+            program.emit_insn(Insn::Close {
+                cursor_id: self.cursor,
+            });
+        }
+    }
+}
+
+pub(crate) fn open_dml_target_scan(
+    plan: &PhysicalPlan<'_>,
+    program: &mut ProgramBuilder,
+    target: SourceId,
+    table_cursor: usize,
+) -> QueryResult<DmlTargetScan> {
+    let source = plan
+        .source(target)
+        .ok_or(PhysicalQueryError::Invalid("DML target source is missing"))?;
+    let PhysicalSourceKind::CatalogTable { table, access } = &source.kind else {
+        return Err(PhysicalQueryError::Invalid(
+            "DML target is not a catalog table",
+        ));
+    };
+    match access {
+        TableAccess::Scan => Ok(DmlTargetScan {
+            cursor: table_cursor,
+            table_cursor,
+            indexed: false,
+        }),
+        TableAccess::ForcedIndex(index) => {
+            let database = table.database().ok_or(PhysicalQueryError::Invalid(
+                "DML target has no database identity",
+            ))?;
+            if index.database() != Some(database)
+                || index.value().index_method.is_some()
+                || !index.value().has_rowid
+            {
+                return Err(PhysicalQueryError::Unsupported(
+                    "custom or rowid-free forced DML index",
+                ));
+            }
+            let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.handle()));
+            program.emit_insn(Insn::OpenRead {
+                cursor_id: cursor,
+                root_page: index.value().root_page,
+                db: database.index(),
+            });
+            Ok(DmlTargetScan {
+                cursor,
+                table_cursor,
+                indexed: true,
+            })
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ScanRowAction<'hir, 'destination> {
     Project {
@@ -337,6 +453,13 @@ impl<'document> PhysicalSubqueryEmitter<'document> for QuerySubqueryEmitter<'_, 
             ))?;
         match subquery {
             SubqueryExpr::Scalar { .. } => {
+                let once_done = query.hir.captures.is_empty().then(|| {
+                    let done = program.allocate_label();
+                    program.emit_insn(Insn::Once {
+                        target_pc_when_reentered: done,
+                    });
+                    done
+                });
                 let width = query.hir.output.len();
                 if width == 0 {
                     return Err(PhysicalExpressionError::Subquery(
@@ -386,6 +509,9 @@ impl<'document> PhysicalSubqueryEmitter<'document> for QuerySubqueryEmitter<'_, 
                     }
                     program.preassign_label_to_next_insn(done);
                     program.emit_insn(Insn::Close { cursor_id: cursor });
+                    if let Some(once_done) = once_done {
+                        program.preassign_label_to_next_insn(once_done);
+                    }
                     return Ok(runtime);
                 }
                 let done = program.allocate_label();
@@ -402,9 +528,19 @@ impl<'document> PhysicalSubqueryEmitter<'document> for QuerySubqueryEmitter<'_, 
                 // scalar subquery here. Anchor the shared destination after
                 // every child-query shape, including ungrouped aggregates.
                 program.preassign_label_to_next_insn_if_unassigned(done);
+                if let Some(once_done) = once_done {
+                    program.preassign_label_to_next_insn(once_done);
+                }
                 Ok(runtime)
             }
             SubqueryExpr::Exists(_) => {
+                let once_done = query.hir.captures.is_empty().then(|| {
+                    let done = program.allocate_label();
+                    program.emit_insn(Insn::Once {
+                        target_pc_when_reentered: done,
+                    });
+                    done
+                });
                 let register = RegisterId(program.alloc_register());
                 program.emit_insn(Insn::Integer {
                     value: 0,
@@ -445,6 +581,9 @@ impl<'document> PhysicalSubqueryEmitter<'document> for QuerySubqueryEmitter<'_, 
                     });
                     program.preassign_label_to_next_insn(done);
                     program.emit_insn(Insn::Close { cursor_id: cursor });
+                    if let Some(once_done) = once_done {
+                        program.preassign_label_to_next_insn(once_done);
+                    }
                     return Ok(runtime);
                 }
                 let done = program.allocate_label();
@@ -458,6 +597,9 @@ impl<'document> PhysicalSubqueryEmitter<'document> for QuerySubqueryEmitter<'_, 
                 )
                 .map_err(|error| PhysicalExpressionError::Subquery(error.to_string()))?;
                 program.preassign_label_to_next_insn_if_unassigned(done);
+                if let Some(once_done) = once_done {
+                    program.preassign_label_to_next_insn(once_done);
+                }
                 Ok(runtime)
             }
             SubqueryExpr::In { comparison, .. } => {
@@ -691,7 +833,7 @@ pub(crate) fn emit_ordered_dml_rowids<'document>(
     plan: &PhysicalPlan<'document>,
     program: &mut ProgramBuilder,
     bindings: &mut RuntimeBindings<'document>,
-    target_cursor: usize,
+    target_scan: DmlTargetScan,
     predicate: Option<&Expr>,
     order_by: &'document [OrderTerm],
     limit: Option<&'document crate::translate::semantic::hir::Limit>,
@@ -745,11 +887,9 @@ pub(crate) fn emit_ordered_dml_rowids<'document>(
     let scan_start = program.allocate_label();
     let scan_next = program.allocate_label();
     let scan_done = program.allocate_label();
-    program.emit_insn(Insn::Rewind {
-        cursor_id: target_cursor,
-        pc_if_empty: scan_done,
-    });
+    target_scan.rewind(program, scan_done);
     program.preassign_label_to_next_insn(scan_start);
+    target_scan.prepare_row(program);
     if let Some(predicate) = predicate {
         let condition = emit_expression_for_dml(plan, program, bindings, predicate)?;
         if condition.width != 1 {
@@ -762,10 +902,7 @@ pub(crate) fn emit_ordered_dml_rowids<'document>(
         });
     }
     let rowid = RegisterId(program.alloc_register());
-    program.emit_insn(Insn::RowId {
-        cursor_id: target_cursor,
-        dest: rowid.0,
-    });
+    target_scan.rowid(program, rowid.0);
     if let Some(sorter) = sorter {
         let fields = program.alloc_registers(order_by.len() + 1);
         for (position, term) in order_by.iter().enumerate() {
@@ -806,10 +943,7 @@ pub(crate) fn emit_ordered_dml_rowids<'document>(
         )?;
     }
     program.preassign_label_to_next_insn(scan_next);
-    program.emit_insn(Insn::Next {
-        cursor_id: target_cursor,
-        pc_if_next: scan_start,
-    });
+    target_scan.next(program, scan_start);
     program.preassign_label_to_next_insn(scan_done);
 
     if let Some(sorter) = sorter {
@@ -842,7 +976,7 @@ pub(crate) fn emit_update_from_rows<'document>(
     program: &mut ProgramBuilder,
     bindings: &mut RuntimeBindings<'document>,
     target: SourceId,
-    target_cursor: usize,
+    target_scan: DmlTargetScan,
     from: &HirFrom,
     filter: Option<&Expr>,
     assignments: &'document [Assignment],
@@ -888,13 +1022,7 @@ pub(crate) fn emit_update_from_rows<'document>(
     }
 
     let mut scans = Vec::with_capacity(source_ids.len() + 1);
-    scans.push(OpenedScan {
-        cursor: ScanCursor::BTree(target_cursor),
-        runtime_cursor: target_cursor,
-        deferred_table: None,
-        virtual_filter: None,
-        owned: false,
-    });
+    scans.push(target_scan.opened());
     for source_id in &source_ids {
         let source = plan
             .source(*source_id)

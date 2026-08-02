@@ -20,13 +20,12 @@ use crate::{
 };
 
 use super::{
-    close_indexes, emit_expression_for_dml, emit_index_delete, emit_index_key,
-    emit_returning_result, emit_returning_values, emit_trigger_programs, open_indexes,
-    record_from_cursor, CdcChange, CursorId, PhysicalExpressionError, PhysicalForeignKeyError,
-    PhysicalIndexError, PhysicalPlan, PhysicalQueryError, PhysicalRoot, PhysicalSourceKind,
-    PhysicalTriggerError, PreparedCdc, PreparedTriggers, RegisterId, RegisterRange,
-    RootRuntimeInputs, RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
-    TriggerRow, TriggerRows,
+    close_indexes, emit_index_delete, emit_index_key, emit_returning_result, emit_returning_values,
+    emit_trigger_programs, open_dml_target_scan, open_indexes, record_from_cursor, CdcChange,
+    CursorId, PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError, PhysicalPlan,
+    PhysicalQueryError, PhysicalRoot, PhysicalSourceKind, PhysicalTriggerError, PreparedCdc,
+    PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs, RuntimeBindingError,
+    RuntimeBindings, SourceRuntime, TriggerRow, TriggerRows,
 };
 
 #[derive(Debug)]
@@ -213,6 +212,7 @@ pub(crate) fn emit_root_delete_with_context(
         root_page: RegisterOrLiteral::Literal(table.root_page),
         db: database,
     });
+    let target_scan = open_dml_target_scan(plan, program, delete.target, cursor)?;
     let indexes = open_indexes(program, source, database)?;
     let rowid = RegisterId(program.alloc_register());
     let old_columns = (!delete.triggers.is_empty()
@@ -224,58 +224,38 @@ pub(crate) fn emit_root_delete_with_context(
             source.columns.len(),
         )
     });
-    let ordered_rows = (!delete.order_by.is_empty() || delete.limit.is_some())
-        .then(|| {
-            super::emit_ordered_dml_rowids(
-                plan,
-                program,
-                &mut bindings,
-                cursor,
-                delete.predicate.as_ref(),
-                &delete.order_by,
-                delete.limit.as_ref(),
-            )
-        })
-        .transpose()?;
+    // Freeze every selected rowid before the first write. Besides making
+    // ORDER BY/LIMIT stable, this prevents a self-referencing subquery from
+    // observing rows deleted earlier by the same statement.
+    let ordered_rows = super::emit_ordered_dml_rowids(
+        plan,
+        program,
+        &mut bindings,
+        target_scan,
+        delete.predicate.as_ref(),
+        &delete.order_by,
+        delete.limit.as_ref(),
+    )?;
+    target_scan.close(program);
     let loop_start = program.allocate_label();
     let loop_next = program.allocate_label();
     let loop_end = program.allocate_label();
     program.emit_insn(Insn::Rewind {
-        cursor_id: ordered_rows
-            .as_ref()
-            .map_or(cursor, |ordered_rows| ordered_rows.cursor),
+        cursor_id: ordered_rows.cursor,
         pc_if_empty: loop_end,
     });
     program.preassign_label_to_next_insn(loop_start);
-    if let Some(ordered_rows) = &ordered_rows {
-        program.emit_insn(Insn::Column {
-            cursor_id: ordered_rows.cursor,
-            column: 0,
-            dest: rowid.0,
-            default: None,
-        });
-        program.emit_insn(Insn::NotExists {
-            cursor,
-            rowid_reg: rowid.0,
-            target_pc: loop_next,
-        });
-    } else if let Some(predicate) = &delete.predicate {
-        let condition = emit_expression_for_dml(plan, program, &mut bindings, predicate)?;
-        if condition.width != 1 {
-            return Err(PhysicalDeleteError::Invalid("WHERE result is not scalar"));
-        }
-        program.emit_insn(Insn::IfNot {
-            reg: condition.first.0,
-            target_pc: loop_next,
-            jump_if_null: true,
-        });
-    }
-    if ordered_rows.is_none() {
-        program.emit_insn(Insn::RowId {
-            cursor_id: cursor,
-            dest: rowid.0,
-        });
-    }
+    program.emit_insn(Insn::Column {
+        cursor_id: ordered_rows.cursor,
+        column: 0,
+        dest: rowid.0,
+        default: None,
+    });
+    program.emit_insn(Insn::NotExists {
+        cursor,
+        rowid_reg: rowid.0,
+        target_pc: loop_next,
+    });
     if let Some(old_columns) = old_columns {
         for position in 0..old_columns.width {
             program.emit_column_or_rowid(cursor, position, old_columns.first.0 + position);
@@ -407,17 +387,13 @@ pub(crate) fn emit_root_delete_with_context(
     }
     program.preassign_label_to_next_insn(loop_next);
     program.emit_insn(Insn::Next {
-        cursor_id: ordered_rows
-            .as_ref()
-            .map_or(cursor, |ordered_rows| ordered_rows.cursor),
+        cursor_id: ordered_rows.cursor,
         pc_if_next: loop_start,
     });
     program.preassign_label_to_next_insn(loop_end);
     close_indexes(program, &indexes);
     program.emit_insn(Insn::Close { cursor_id: cursor });
-    if let Some(ordered_rows) = ordered_rows {
-        ordered_rows.close(program);
-    }
+    ordered_rows.close(program);
     if let Some(cdc) = cdc {
         cdc.emit_autocommit_commit(program)?;
         cdc.close(program);
@@ -477,14 +453,11 @@ fn preflight_delete<'plan>(
         .ok_or(PhysicalDeleteError::Invalid(
             "physical target source is missing",
         ))?;
-    let PhysicalSourceKind::CatalogTable { table, access } = &physical_source.kind else {
+    let PhysicalSourceKind::CatalogTable { table, access: _ } = &physical_source.kind else {
         return Err(PhysicalDeleteError::Invalid(
             "physical target is not a catalog table",
         ));
     };
-    if !matches!(access, TableAccess::Scan) {
-        return Err(PhysicalDeleteError::Unsupported("indexed target scan"));
-    }
     let database = table
         .database()
         .ok_or(PhysicalDeleteError::Invalid(
