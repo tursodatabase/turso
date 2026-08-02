@@ -453,6 +453,7 @@ fn mvcc_autoincrement_lowers_from_the_frozen_sequence_operation(tc: hegel::TestC
 
     let plan = PhysicalPlan::new(&document).expect("closed HIR has a physical plan");
     let mut program = program();
+    program.set_mvcc_enabled(true);
     emit_root(&plan, &mut program).expect("AUTOINCREMENT INSERT lowers without a catalog");
 
     assert!(program
@@ -466,6 +467,82 @@ fn mvcc_autoincrement_lowers_from_the_frozen_sequence_operation(tc: hegel::TestC
             ..
         }
     )));
+}
+
+// Examples: in the ordinary rollback-journal engine,
+// `INSERT INTO items DEFAULT VALUES` reads and advances the frozen
+// `sqlite_sequence` row, while `INSERT INTO items(id) VALUES (-7)` still
+// creates the missing row at zero. Even when HIR also carries the MVCC hidden
+// sequence, this mode must use `sqlite_sequence` so manual SQL updates to
+// `sqlite_sequence.seq` control the next generated key.
+#[hegel::test]
+fn ordinary_autoincrement_uses_the_frozen_sqlite_sequence_table(tc: hegel::TestCase) {
+    let explicit_negative = tc.draw(generators::booleans());
+    let magnitude = i64::from(tc.draw(generators::integers::<u16>())) + 1;
+    let target = BTreeTable::from_sql(
+        "CREATE TABLE items(id INTEGER PRIMARY KEY AUTOINCREMENT, value INTEGER)",
+        9,
+    )
+    .expect("fixture target SQL is valid");
+    let sqlite_sequence = BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name,seq)", 10)
+        .expect("fixture sqlite_sequence SQL is valid");
+    let sequence_name = crate::schema::autoincrement_sequence_name("items");
+    let backing = BTreeTable::from_sql(
+        &crate::translate::sequence::sequence_backing_table_sql(&sequence_name),
+        11,
+    )
+    .expect("fixture sequence backing-table SQL is valid");
+    let sequence = Arc::new(
+        Sequence::new(sequence_name.clone(), Some(1), Some(1), None, None, false)
+            .expect("AUTOINCREMENT sequence bounds are valid"),
+    );
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(target))
+        .expect("items is unique");
+    schema
+        .add_btree_table(Arc::new(sqlite_sequence))
+        .expect("sqlite_sequence is unique");
+    schema
+        .add_btree_table(Arc::new(backing))
+        .expect("the sequence backing table is unique");
+    schema.sequences.insert(sequence_name, sequence);
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let sql = if explicit_negative {
+        format!("INSERT INTO items(id) VALUES (-{magnitude})")
+    } else {
+        "INSERT INTO items DEFAULT VALUES".to_string()
+    };
+    let statement = parse_statement(&sql);
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated AUTOINCREMENT INSERT has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed HIR has a physical plan");
+    let mut program = program();
+    emit_root(&plan, &mut program).expect("ordinary AUTOINCREMENT lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("all AUTOINCREMENT branches are closed");
+
+    assert!(!program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::SequenceComputeNext { .. })));
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::OpenWrite {
+            root_page: crate::vdbe::insn::RegisterOrLiteral::Literal(10),
+            ..
+        }
+    )));
+    assert!(program.insns.iter().any(|(instruction, _)| {
+        matches!(instruction, Insn::Insert { table_name, .. } if table_name == "sqlite_sequence")
+    }));
 }
 
 // Example: `INSERT INTO items(c0, c1) SELECT c0 + 7, c1 FROM items WHERE c1`

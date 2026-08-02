@@ -188,7 +188,8 @@ pub(crate) fn emit_root_insert_with_context(
         root_page: RegisterOrLiteral::Literal(table.root_page),
         db: database,
     });
-    let mut autoincrement = if insert.autoincrement_sequence.is_some() {
+    let mut autoincrement = if program.is_mvcc_enabled() && insert.autoincrement_sequence.is_some()
+    {
         None
     } else {
         open_autoincrement(program, insert.autoincrement.as_ref(), &table, database)?
@@ -277,6 +278,13 @@ pub(crate) fn emit_root_insert_with_context(
     }
     close_indexes(program, &indexes);
     if let Some(autoincrement) = autoincrement {
+        let already_exists = program.allocate_label();
+        program.emit_insn(Insn::NotNull {
+            reg: autoincrement.sequence_rowid,
+            target_pc: already_exists,
+        });
+        emit_update_sqlite_sequence(program, autoincrement, autoincrement.maximum)?;
+        program.preassign_label_to_next_insn(already_exists);
         program.emit_insn(Insn::Close {
             cursor_id: autoincrement.cursor,
         });
@@ -490,7 +498,11 @@ fn finish_insert_row<'document>(
         reg: rowid.0,
         target_pc: explicit_rowid,
     });
-    if let Some(sequence) = &insert.autoincrement_sequence {
+    if let Some(sequence) = insert
+        .autoincrement_sequence
+        .as_ref()
+        .filter(|_| program.is_mvcc_enabled())
+    {
         emit_generated_sequence_rowid(program, sequence, rowid)?;
     } else if let Some(autoincrement) = autoincrement.as_deref_mut() {
         emit_generated_autoincrement_rowid(program, cursor, rowid, *autoincrement)?;
@@ -509,7 +521,11 @@ fn finish_insert_row<'document>(
         reg: rowid.0,
         target_pc: None,
     });
-    if let Some(sequence) = &insert.autoincrement_sequence {
+    if let Some(sequence) = insert
+        .autoincrement_sequence
+        .as_ref()
+        .filter(|_| program.is_mvcc_enabled())
+    {
         emit_explicit_sequence_rowid(program, sequence, rowid)?;
     } else if let Some(autoincrement) = autoincrement {
         emit_explicit_autoincrement_rowid(program, rowid, *autoincrement)?;
@@ -967,7 +983,9 @@ fn emit_update_sqlite_sequence(
         count: 2,
         dest_reg: record as u32,
         index_name: None,
-        affinity_str: Some("BB".to_string()),
+        // When the engine advances sqlite_sequence, SQLite stores the new value
+        // as an integer even if a user previously wrote text into seq.
+        affinity_str: Some("BI".to_string()),
     });
     let replace = program.allocate_label();
     let done = program.allocate_label();
