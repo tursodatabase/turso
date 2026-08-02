@@ -22,8 +22,8 @@ use crate::{
         },
     },
     vdbe::{
-        builder::ProgramBuilder,
-        insn::{CmpInsFlags, Insn},
+        builder::{CursorType, ProgramBuilder},
+        insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral},
     },
 };
 
@@ -878,10 +878,8 @@ impl<'program, 'bindings, 'document> ExpressionEmitter<'program, 'bindings, 'doc
                 "aggregate or window function form",
             ));
         }
-        if call.sequence_operation.is_some() {
-            return Err(PhysicalExpressionError::Unsupported(
-                "sequence state operation",
-            ));
+        if let Some(operation) = &call.sequence_operation {
+            return self.emit_sequence_function(call, operation, target);
         }
         if let Some(operation) = &call.custom_type_operation {
             return self.emit_custom_type_function(operation, &call.arguments, target);
@@ -953,16 +951,154 @@ impl<'program, 'bindings, 'document> ExpressionEmitter<'program, 'bindings, 'doc
                 | ScalarFunc::Detach
                 | ScalarFunc::StatInit
                 | ScalarFunc::StatPush
-                | ScalarFunc::StatGet
-                | ScalarFunc::ConnTxnId
-                | ScalarFunc::IsAutocommit
-                | ScalarFunc::SequenceWatermark,
+                | ScalarFunc::StatGet,
             )
             | Func::AlterTable(_) => Err(PhysicalExpressionError::Unsupported(
                 "statement-internal function",
             )),
             _ => self.emit_direct_function(call, target),
         }
+    }
+
+    fn emit_sequence_function(
+        &mut self,
+        call: &hir::FunctionCall,
+        operation: &hir::SequenceOperation,
+        target: usize,
+    ) -> ExpressionResult<()> {
+        let argument_count = call.arguments.len();
+        let arguments = self.program.alloc_registers(argument_count);
+        for (position, argument) in call.arguments.iter().enumerate() {
+            self.emit_into(argument, RegisterRange::new(arguments + position, 1))?;
+        }
+
+        self.program
+            .begin_write_on_database(operation.database.index(), operation.schema_cookie)
+            .map_err(|error| PhysicalExpressionError::Emission(error.to_string()))?;
+
+        let Table::BTree(backing_table) = operation.backing_table.value() else {
+            return Err(PhysicalExpressionError::Invalid(
+                "sequence backing object is not a B-tree table",
+            ));
+        };
+        let sqlite_sequence = operation
+            .sqlite_sequence
+            .as_ref()
+            .map(|table| match table.value() {
+                Table::BTree(table) => Ok(table.clone()),
+                _ => Err(PhysicalExpressionError::Invalid(
+                    "sqlite_sequence object is not a B-tree table",
+                )),
+            })
+            .transpose()?;
+
+        match operation.kind {
+            hir::SequenceOperationKind::NextValue => {
+                if argument_count != 1 {
+                    return Err(PhysicalExpressionError::Invalid(
+                        "NEXTVAL has the wrong argument count",
+                    ));
+                }
+                crate::translate::sequence::emit_disk_read_nextval_from_resolved(
+                    self.program,
+                    operation.database.index(),
+                    &operation.normalized_name,
+                    &operation.sequence,
+                    backing_table.clone(),
+                    sqlite_sequence,
+                    target,
+                    Some(arguments),
+                )
+                .map_err(|error| PhysicalExpressionError::Emission(error.to_string()))?;
+            }
+            hir::SequenceOperationKind::SetValue => {
+                if !(2..=3).contains(&argument_count) {
+                    return Err(PhysicalExpressionError::Invalid(
+                        "SETVAL has the wrong argument count",
+                    ));
+                }
+                let cursor = self
+                    .program
+                    .alloc_cursor_id(CursorType::BTreeTable(backing_table.clone()));
+                self.program.emit_insn(Insn::OpenWrite {
+                    cursor_id: cursor,
+                    root_page: RegisterOrLiteral::Literal(backing_table.root_page),
+                    db: operation.database.index(),
+                });
+                self.program.emit_insn(Insn::Function {
+                    constant_mask: 0,
+                    start_reg: arguments,
+                    dest: target,
+                    func: FuncCtx {
+                        func: call.function.value().clone(),
+                        arg_count: argument_count,
+                    },
+                });
+
+                let empty = self.program.allocate_label();
+                let delete = self.program.allocate_label();
+                self.program.emit_insn(Insn::Rewind {
+                    cursor_id: cursor,
+                    pc_if_empty: empty,
+                });
+                self.program.preassign_label_to_next_insn(delete);
+                self.program.emit_insn(Insn::Delete {
+                    cursor_id: cursor,
+                    table_name: operation.normalized_name.clone(),
+                    is_part_of_update: true,
+                });
+                self.program.emit_insn(Insn::Next {
+                    cursor_id: cursor,
+                    pc_if_next: delete,
+                });
+                self.program.preassign_label_to_next_insn(empty);
+
+                let columns = self.program.alloc_registers(7);
+                emit_copy(self.program, arguments + 1, columns, 1);
+                if argument_count == 3 {
+                    emit_copy(self.program, arguments + 2, columns + 1, 1);
+                } else {
+                    self.program.emit_insn(Insn::Integer {
+                        dest: columns + 1,
+                        value: 1,
+                    });
+                }
+                crate::translate::sequence::emit_sequence_descriptor_literals(
+                    self.program,
+                    &operation.sequence,
+                    columns + 2,
+                );
+                let record = self.program.alloc_register();
+                self.program.emit_insn(Insn::MakeRecord {
+                    start_reg: to_u32(columns),
+                    count: 7,
+                    dest_reg: to_u32(record),
+                    index_name: None,
+                    affinity_str: None,
+                });
+                self.program.emit_insn(Insn::Insert {
+                    cursor,
+                    key_reg: arguments + 1,
+                    record_reg: record,
+                    flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+                    table_name: operation.normalized_name.clone(),
+                });
+                self.program.emit_insn(Insn::SetSequenceCurrval {
+                    seq_name_reg: arguments,
+                    value_reg: arguments + 1,
+                });
+                self.program.emit_insn(Insn::Close { cursor_id: cursor });
+                crate::translate::sequence::emit_autoincrement_sqlite_sequence_sync_from_resolved(
+                    self.program,
+                    operation.database.index(),
+                    &operation.normalized_name,
+                    arguments + 1,
+                    sqlite_sequence,
+                )
+                .map_err(|error| PhysicalExpressionError::Emission(error.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     fn emit_direct_function(

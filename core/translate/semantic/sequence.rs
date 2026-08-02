@@ -6,7 +6,11 @@ use super::{
     hir::{self, CatalogObject, DatabaseId},
     Analyzer, CatalogObjectKind,
 };
-use crate::{schema::Table, sync::Arc, LimboError, Result, MAIN_DB_ID};
+use crate::{
+    schema::{Table, AUTOINCREMENT_SEQ_PREFIX, SQLITE_SEQUENCE_TABLE_NAME},
+    sync::Arc,
+    LimboError, Result, MAIN_DB_ID,
+};
 
 impl Analyzer<'_, '_> {
     /// Freeze every catalog object needed to execute NEXTVAL or SETVAL.
@@ -34,7 +38,7 @@ impl Analyzer<'_, '_> {
         let normalized_name = crate::util::normalize_ident(sequence_name);
         let backing_table_name =
             crate::translate::sequence::sequence_backing_table_name(&normalized_name);
-        let (backing_table, sequence, schema_cookie) = {
+        let (backing_table, sqlite_sequence, sequence, schema_cookie) = {
             let schema = self.context().schema(database_id).ok_or_else(|| {
                 LimboError::InternalError(format!(
                     "resolved sequence database {database_id} is absent from the catalog snapshot"
@@ -49,7 +53,24 @@ impl Analyzer<'_, '_> {
                 .ok_or_else(|| {
                     LimboError::ParseError(format!("sequence \"{user_name}\" does not exist"))
                 })?;
-            (backing_table, sequence, schema.schema_version)
+            let sqlite_sequence = normalized_name
+                .strip_prefix(AUTOINCREMENT_SEQ_PREFIX)
+                .map(|_| {
+                    schema
+                        .get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+                        .ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "resolved AUTOINCREMENT sequence {normalized_name:?} has no sqlite_sequence table"
+                            ))
+                        })
+                })
+                .transpose()?;
+            (
+                backing_table,
+                sqlite_sequence,
+                sequence,
+                schema.schema_version,
+            )
         };
         let object_id = self.catalog_object_id(
             Some(database_id),
@@ -62,6 +83,19 @@ impl Analyzer<'_, '_> {
             Some(DatabaseId::new(database_id)),
             Arc::new(Table::BTree(backing_table)),
         );
+        let sqlite_sequence = sqlite_sequence.map(|table| {
+            let object_id = self.catalog_object_id(
+                Some(database_id),
+                CatalogObjectKind::Table,
+                SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+            );
+            CatalogObject::new(
+                object_id,
+                self.context().snapshot(),
+                Some(DatabaseId::new(database_id)),
+                Arc::new(Table::BTree(table)),
+            )
+        });
 
         Ok(hir::SequenceOperation {
             kind,
@@ -69,6 +103,7 @@ impl Analyzer<'_, '_> {
             user_name,
             normalized_name,
             backing_table,
+            sqlite_sequence,
             sequence,
             schema_cookie,
         })

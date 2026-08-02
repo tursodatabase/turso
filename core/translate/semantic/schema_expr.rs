@@ -1522,6 +1522,11 @@ fn sequence_operation_equivalent(
                 && lhs.user_name == rhs.user_name
                 && lhs.normalized_name == rhs.normalized_name
                 && catalog_equivalent(&lhs.backing_table, &rhs.backing_table)
+                && match (&lhs.sqlite_sequence, &rhs.sqlite_sequence) {
+                    (None, None) => true,
+                    (Some(lhs), Some(rhs)) => catalog_equivalent(lhs, rhs),
+                    _ => false,
+                }
                 && lhs.schema_cookie == rhs.schema_cookie
                 && lhs.sequence.name == rhs.sequence.name
                 && lhs.sequence.start_value == rhs.sequence.start_value

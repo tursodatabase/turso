@@ -370,7 +370,7 @@ impl<'document> HirValidator<'document> {
             _ => {
                 return self.invalid(format!(
                     "non-table DML source {target} carries trigger metadata"
-                ))
+                ));
             }
         };
         let updated_columns = assignments
@@ -1675,6 +1675,9 @@ impl<'document> HirValidator<'document> {
     fn visit_sequence_operation(&self, operation: &SequenceOperation) -> ValidationResult {
         self.require_database(operation.database)?;
         self.visit_catalog_object(&operation.backing_table, "sequence backing table")?;
+        if let Some(sqlite_sequence) = &operation.sqlite_sequence {
+            self.visit_catalog_object(sqlite_sequence, "sqlite_sequence table")?;
+        }
         let expected = self
             .document
             .databases

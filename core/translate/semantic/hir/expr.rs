@@ -178,6 +178,10 @@ pub struct SequenceOperation {
     pub user_name: String,
     pub normalized_name: String,
     pub backing_table: ResolvedTable,
+    /// Present only for the internal sequence behind an AUTOINCREMENT table.
+    /// Physical lowering uses this frozen object to keep sqlite_sequence in
+    /// sync without reopening the catalog.
+    pub sqlite_sequence: Option<ResolvedTable>,
     pub sequence: Arc<Sequence>,
     pub schema_cookie: u32,
 }

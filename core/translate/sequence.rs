@@ -190,6 +190,41 @@ pub fn emit_disk_read_nextval(
                 "missing backing table for sequence \"{seq_name}\""
             ))
         })?;
+    let sqlite_sequence = seq_name
+        .strip_prefix(AUTOINCREMENT_SEQ_PREFIX)
+        .and_then(|_| {
+            resolver.with_schema(database_id, |schema| {
+                schema.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+            })
+        });
+    emit_disk_read_nextval_from_resolved(
+        program,
+        database_id,
+        seq_name,
+        seq,
+        backing_table,
+        sqlite_sequence,
+        target_register,
+        seq_name_reg,
+    )
+}
+
+/// Lower NEXTVAL using catalog objects frozen during semantic analysis.
+///
+/// This is the resolver-free entry point used by HIR physical emission. The
+/// compatibility wrapper above remains for schema translation until that path
+/// also owns a semantic document.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_disk_read_nextval_from_resolved(
+    program: &mut ProgramBuilder,
+    database_id: usize,
+    seq_name: &str,
+    seq: &Sequence,
+    backing_table: Arc<BTreeTable>,
+    sqlite_sequence: Option<Arc<BTreeTable>>,
+    target_register: usize,
+    seq_name_reg: Option<usize>,
+) -> Result<()> {
     let root_page = backing_table.root_page;
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(backing_table));
 
@@ -350,12 +385,12 @@ pub fn emit_disk_read_nextval(
     // AUTOINCREMENT inserts to the same table through the
     // `sqlite_sequence` row; the existing inner-tx retry budget in
     // `op_sequence_commit_inner_tx` absorbs the WW-conflicts.
-    emit_autoincrement_sqlite_sequence_sync(
+    emit_autoincrement_sqlite_sequence_sync_from_resolved(
         program,
-        resolver,
         database_id,
         seq_name,
         target_register,
+        sqlite_sequence,
     )?;
 
     // Register the active allocation against the outer tx *before* the inner
@@ -664,6 +699,23 @@ pub(crate) fn emit_sqlite_sequence_sync(
     }) else {
         return Ok(false);
     };
+    emit_sqlite_sequence_sync_from_resolved(
+        program,
+        database_id,
+        autoinc_table_name,
+        value_reg,
+        sseq_table,
+    );
+    Ok(true)
+}
+
+pub(crate) fn emit_sqlite_sequence_sync_from_resolved(
+    program: &mut ProgramBuilder,
+    database_id: usize,
+    autoinc_table_name: &str,
+    value_reg: usize,
+    sseq_table: Arc<BTreeTable>,
+) {
     let sseq_root = sseq_table.root_page;
     let sseq_cursor = program.alloc_cursor_id(CursorType::BTreeTable(sseq_table));
 
@@ -742,7 +794,6 @@ pub(crate) fn emit_sqlite_sequence_sync(
     program.emit_insn(Insn::Close {
         cursor_id: sseq_cursor,
     });
-    Ok(true)
 }
 
 /// If `seq` is an AUTOINCREMENT-backing sequence (its name begins with
@@ -762,6 +813,31 @@ pub(crate) fn emit_autoincrement_sqlite_sequence_sync(
         return Ok(());
     };
     emit_sqlite_sequence_sync(program, resolver, database_id, table_name, value_reg)?;
+    Ok(())
+}
+
+pub(crate) fn emit_autoincrement_sqlite_sequence_sync_from_resolved(
+    program: &mut ProgramBuilder,
+    database_id: usize,
+    seq_name: &str,
+    value_reg: usize,
+    sqlite_sequence: Option<Arc<BTreeTable>>,
+) -> Result<()> {
+    let Some(table_name) = seq_name.strip_prefix(AUTOINCREMENT_SEQ_PREFIX) else {
+        return Ok(());
+    };
+    let sqlite_sequence = sqlite_sequence.ok_or_else(|| {
+        crate::LimboError::InternalError(format!(
+            "resolved AUTOINCREMENT sequence {seq_name:?} has no sqlite_sequence table"
+        ))
+    })?;
+    emit_sqlite_sequence_sync_from_resolved(
+        program,
+        database_id,
+        table_name,
+        value_reg,
+        sqlite_sequence,
+    );
     Ok(())
 }
 

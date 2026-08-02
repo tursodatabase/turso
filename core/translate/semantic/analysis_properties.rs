@@ -11,7 +11,7 @@ use super::{
 };
 use crate::{
     dialect::{Dialect, SqliteDialect},
-    schema::{BTreeTable, Index, Schema, Trigger},
+    schema::{BTreeTable, Index, Schema, Sequence, Trigger},
     sync::Arc,
     translate::collate::CollationSeq,
     vdbe::affinity::Affinity,
@@ -92,6 +92,81 @@ fn typed_items_schema(types: &[&str]) -> Schema {
         .add_btree_table(Arc::new(table))
         .expect("generated table has a unique name");
     schema
+}
+
+// Example: `SELECT nextval('s')` and `SELECT setval('s', 42, false)` must
+// carry `main.__turso_internal_seq_s`, the immutable sequence descriptor, and
+// the main schema cookie in HIR. Dropping the prepare-time schema afterwards
+// must not make physical lowering repeat a name or catalog lookup.
+#[hegel::test]
+fn sequence_calls_freeze_every_catalog_fact_needed_by_physical_lowering(tc: hegel::TestCase) {
+    let increments = [-7, -1, 1, 7];
+    let increment =
+        increments[tc.draw(generators::integers::<usize>().max_value(increments.len() - 1))];
+    let start = tc.draw(generators::integers::<i64>().min_value(-50).max_value(50));
+    let cycle = tc.draw(generators::booleans());
+    let is_setval = tc.draw(generators::booleans());
+    let sequence = Arc::new(
+        Sequence::new(
+            "s".to_string(),
+            Some(start),
+            Some(increment),
+            Some(-100),
+            Some(100),
+            cycle,
+        )
+        .expect("generated sequence bounds are valid"),
+    );
+    let backing_name = crate::translate::sequence::sequence_backing_table_name("s");
+    let backing = BTreeTable::from_sql(
+        &crate::translate::sequence::sequence_backing_table_sql("s"),
+        2,
+    )
+    .expect("the sequence backing-table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(backing))
+        .expect("the backing table name is unique");
+    schema.sequences.insert("s".to_string(), sequence.clone());
+    let symbols = SymbolTable::new();
+    let context = semantic_context(&schema, &symbols);
+    let sql = if is_setval {
+        "SELECT setval('s', 42, false)"
+    } else {
+        "SELECT nextval('s')"
+    };
+    let statement = parse_statement(sql);
+
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("the generated sequence call has valid SQL meaning");
+    let HirRoot::Query(root) = &document.root else {
+        unreachable!("the fixture is a SELECT");
+    };
+    let query = document.query(root.query).expect("the root query exists");
+    let Expr::Function(call) = &query.blocks[query.first.index].outputs[0].expr else {
+        panic!("the SELECT output is a resolved function");
+    };
+    let operation = call
+        .sequence_operation
+        .as_ref()
+        .expect("NEXTVAL and SETVAL carry a resolved sequence operation");
+    assert_eq!(operation.database.index(), crate::MAIN_DB_ID);
+    assert_eq!(operation.normalized_name, "s");
+    let crate::schema::Table::BTree(backing_table) = operation.backing_table.value() else {
+        panic!("the frozen sequence backing object is a B-tree table");
+    };
+    assert_eq!(backing_table.name, backing_name);
+    assert!(operation.sqlite_sequence.is_none());
+    assert_eq!(operation.sequence.start_value, start);
+    assert_eq!(operation.sequence.increment_by, increment);
+    assert_eq!(operation.sequence.cycle, cycle);
+    assert_eq!(operation.schema_cookie, schema.schema_version);
+
+    drop(context);
+    drop(schema);
+    document
+        .validate()
+        .expect("the sequence operation remains closed without the catalog");
 }
 
 // Example: with `c4 TEXT` and `c1 INTEGER`, `c4 = 7` uses TEXT affinity,
