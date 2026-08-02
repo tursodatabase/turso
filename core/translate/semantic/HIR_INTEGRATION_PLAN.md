@@ -121,7 +121,9 @@ operations are not SQL binding.
   - [x] UPSERT DO UPDATE keeps the conflicting target and completed excluded
         row as separate SourceId bindings, rebuilds generated/constraint/index
         programs under ABORT semantics, and returns the written NEW row.
-  - [ ] REPLACE conflict paths.
+  - [x] INSERT OR REPLACE deletes all OLD index entries and the conflicting
+        row before the NEW write for rowid and UNIQUE conflicts; NOT NULL uses
+        its frozen default and falls back to ABORT when the default is NULL.
 - [ ] Trigger commands and predicates with explicit OLD/NEW runtime bindings.
 - [ ] Generated columns, defaults, CHECK constraints, expression and partial
       indexes, and custom-type schema programs.

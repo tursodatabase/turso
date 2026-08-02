@@ -5,7 +5,7 @@ use std::fmt;
 use turso_parser::ast::ResolveType;
 
 use crate::{
-    error::SQLITE_CONSTRAINT_PRIMARYKEY,
+    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY},
     schema::Table,
     translate::semantic::hir::{self, IndexCoverage, InsertSource, UpsertAction},
     vdbe::{
@@ -359,13 +359,21 @@ fn finish_insert_row(
         });
     }
     emit_complete_logical_row(program, bindings, insert.target, table, logical)?;
+    if statement_conflict == ResolveType::Replace {
+        emit_replace_not_null_defaults(program, bindings, insert, table, logical)?;
+    }
+    let row_conflict = if statement_conflict == ResolveType::Replace {
+        ResolveType::Abort
+    } else {
+        statement_conflict
+    };
     emit_new_row_constraints(
         program,
         bindings,
         insert.target,
         table,
         logical,
-        statement_conflict,
+        row_conflict,
         skip_row,
     )?;
     let rowid_is_unique = program.allocate_label();
@@ -381,6 +389,17 @@ fn finish_insert_row(
     if let Some(upsert) = upsert_for_rowid(insert) {
         emit_upsert_action(
             program, bindings, insert, upsert, table, cursor, logical, record, indexes, rowid,
+            skip_row,
+        )?;
+    } else if statement_conflict == ResolveType::Replace {
+        emit_replace_conflicting_row(
+            program,
+            bindings,
+            insert.target,
+            table,
+            cursor,
+            indexes,
+            rowid,
             skip_row,
         )?;
     } else if statement_conflict == ResolveType::Ignore {
@@ -409,7 +428,21 @@ fn finish_insert_row(
                 .conflict
                 .or(index.index.on_conflict)
                 .unwrap_or(ResolveType::Abort);
-            emit_unique_check(program, index, &key, None, conflict, skip_row)?;
+            if conflict == ResolveType::Replace {
+                emit_replace_unique_check(
+                    program,
+                    bindings,
+                    insert.target,
+                    table,
+                    cursor,
+                    indexes,
+                    index,
+                    &key,
+                    skip_row,
+                )?;
+            } else {
+                emit_unique_check(program, index, &key, None, conflict, skip_row)?;
+            }
         }
         keys.push(key);
     }
@@ -449,9 +482,6 @@ fn preflight_insert<'plan>(
             ));
         }
     }
-    if insert.conflict == Some(ResolveType::Replace) {
-        return Err(PhysicalInsertError::Unsupported("REPLACE conflict policy"));
-    }
     if insert.upserts.is_empty() != insert.excluded_source.is_none() {
         return Err(PhysicalInsertError::Invalid(
             "UPSERT and excluded source must exist together",
@@ -481,13 +511,6 @@ fn preflight_insert<'plan>(
         .document
         .source(insert.target)
         .ok_or(PhysicalInsertError::Invalid("target source is missing"))?;
-    if source.index_expressions.iter().any(|index| {
-        insert.conflict.or(index.index.value().on_conflict) == Some(ResolveType::Replace)
-    }) {
-        return Err(PhysicalInsertError::Unsupported(
-            "REPLACE index conflict policy",
-        ));
-    }
     let IndexCoverage::Complete { indexes: _ } = &source.index_coverage else {
         return Err(PhysicalInsertError::Invalid(
             "target does not carry complete index metadata",
@@ -545,6 +568,136 @@ fn upsert_for_rowid(insert: &hir::Insert) -> Option<&hir::Upsert> {
         Some(target) => target.matched_index.is_none(),
         None => true,
     })
+}
+
+fn emit_replace_not_null_defaults(
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
+    insert: &hir::Insert,
+    table: &crate::schema::BTreeTable,
+    logical: RegisterRange,
+) -> InsertResult<()> {
+    for (position, column) in table.columns().iter().enumerate() {
+        if !column.notnull() || column.is_rowid_alias() {
+            continue;
+        }
+        let present = program.allocate_label();
+        program.emit_insn(Insn::NotNull {
+            reg: logical.first.0 + position,
+            target_pc: present,
+        });
+        let default = insert
+            .defaults
+            .iter()
+            .find(|default| default.column == position)
+            .ok_or(PhysicalInsertError::Invalid(
+                "NOT NULL column has no frozen default",
+            ))?;
+        ExpressionEmitter::new(program, bindings).emit_into(
+            &default.value,
+            RegisterRange::new(logical.first.0 + position, 1),
+        )?;
+        program.emit_insn(Insn::NotNull {
+            reg: logical.first.0 + position,
+            target_pc: present,
+        });
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_NOTNULL,
+            description: format!("{}.{}", table.name, column.name.as_deref().unwrap_or("")),
+            on_error: Some(ResolveType::Abort),
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(present);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_replace_unique_check(
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
+    source: hir::SourceId,
+    table: &crate::sync::Arc<crate::schema::BTreeTable>,
+    cursor: usize,
+    indexes: &[OpenedIndex<'_>],
+    index: &OpenedIndex<'_>,
+    key: &super::IndexKey,
+    skip_row: crate::vdbe::BranchOffset,
+) -> InsertResult<()> {
+    if !index.index.unique {
+        return Ok(());
+    }
+    let no_conflict = program.allocate_label();
+    if let Some(predicate) = key.predicate {
+        program.emit_insn(Insn::IfNot {
+            reg: predicate,
+            target_pc: no_conflict,
+            jump_if_null: true,
+        });
+    }
+    program.emit_insn(Insn::NoConflict {
+        cursor_id: index.cursor,
+        target_pc: no_conflict,
+        record_reg: key.start,
+        num_regs: key.columns,
+    });
+    let conflicting_rowid = RegisterId(program.alloc_register());
+    program.emit_insn(Insn::IdxRowId {
+        cursor_id: index.cursor,
+        dest: conflicting_rowid.0,
+    });
+    emit_replace_conflicting_row(
+        program,
+        bindings,
+        source,
+        table,
+        cursor,
+        indexes,
+        conflicting_rowid,
+        skip_row,
+    )?;
+    program.preassign_label_to_next_insn(no_conflict);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_replace_conflicting_row(
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
+    source: hir::SourceId,
+    table: &crate::sync::Arc<crate::schema::BTreeTable>,
+    cursor: usize,
+    indexes: &[OpenedIndex<'_>],
+    conflicting_rowid: RegisterId,
+    not_found: crate::vdbe::BranchOffset,
+) -> InsertResult<()> {
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: cursor,
+        src_reg: conflicting_rowid.0,
+        target_pc: not_found,
+    });
+    let proposed = bindings.replace_source(source, SourceRuntime::Cursor(CursorId(cursor)))?;
+    let mut old_keys = Vec::with_capacity(indexes.len());
+    for index in indexes {
+        old_keys.push(emit_index_key(
+            program,
+            bindings,
+            source,
+            conflicting_rowid,
+            index,
+            false,
+        )?);
+    }
+    for (index, key) in indexes.iter().zip(&old_keys) {
+        super::emit_index_delete(program, index, key);
+    }
+    program.emit_insn(Insn::Delete {
+        cursor_id: cursor,
+        table_name: table.name.clone(),
+        is_part_of_update: false,
+    });
+    bindings.replace_source(source, proposed)?;
+    Ok(())
 }
 
 fn upsert_for_index<'insert>(

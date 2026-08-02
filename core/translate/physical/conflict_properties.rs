@@ -375,3 +375,105 @@ fn upsert_do_update_keeps_target_and_excluded_as_distinct_hir_rows(tc: hegel::Te
         assert!(old_index_delete < delete && delete < new_index_insert);
     }
 }
+
+// Examples:
+// - `INSERT OR REPLACE INTO items VALUES (1)` on an INTEGER PRIMARY KEY must
+//   seek and delete the conflicting table row before inserting the new one.
+// - The same statement on a UNIQUE index must delete every OLD index key,
+//   delete the table row, then insert the NEW index key and table row.
+// - `INSERT OR REPLACE ... VALUES (NULL)` for
+//   `c0 NOT NULL DEFAULT 7` substitutes the frozen HIR default; if that default
+//   were NULL, the remaining NOT NULL failure would use ABORT rather than
+//   treating a row-local value failure as a row replacement.
+#[hegel::test]
+fn insert_replace_deletes_conflicting_rows_and_uses_frozen_not_null_defaults(tc: hegel::TestCase) {
+    let conflict_kind = tc.draw(generators::integers::<u8>().max_value(2));
+    let table_sql = match conflict_kind {
+        0 => "CREATE TABLE items(c0 INTEGER PRIMARY KEY)",
+        1 => "CREATE TABLE items(c0 INTEGER)",
+        _ => "CREATE TABLE items(c0 INTEGER NOT NULL DEFAULT 7)",
+    };
+    let table = Arc::new(BTreeTable::from_sql(table_sql, 12).expect("fixture table SQL is valid"));
+    let symbols = SymbolTable::new();
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(table.clone())
+        .expect("items is unique");
+    if conflict_kind == 1 {
+        let index = Index::from_sql(
+            &symbols,
+            "CREATE UNIQUE INDEX items_c0 ON items(c0)",
+            13,
+            &table,
+        )
+        .expect("fixture index SQL is valid");
+        schema
+            .add_index(Arc::new(index))
+            .expect("items_c0 is unique");
+    }
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let value = if conflict_kind == 2 { "NULL" } else { "1" };
+    let statement = parse_statement(&format!("INSERT OR REPLACE INTO items VALUES ({value})"));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated REPLACE has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed HIR has a physical plan");
+    let mut program = program();
+    emit_root(&plan, &mut program).expect("REPLACE lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("all REPLACE branches are closed");
+
+    if conflict_kind == 2 {
+        let default = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::Integer { value: 7, .. }))
+            .expect("REPLACE emits the frozen NOT NULL default");
+        let fallback = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| {
+                matches!(instruction, Insn::Halt { err_code, on_error: Some(ResolveType::Abort), .. } if *err_code == SQLITE_CONSTRAINT_NOTNULL)
+            })
+            .expect("a NULL default falls back to ABORT");
+        assert!(default < fallback);
+        return;
+    }
+
+    let delete = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::Delete { .. }))
+        .expect("REPLACE has a conflicting-row delete path");
+    let replacement = program
+        .insns
+        .iter()
+        .enumerate()
+        .skip(delete)
+        .find_map(|(position, (instruction, _))| {
+            matches!(instruction, Insn::Insert { table_name, .. } if table_name == "items")
+                .then_some(position)
+        })
+        .expect("REPLACE inserts the new table row");
+    assert!(delete < replacement);
+    assert!(!program.insns.iter().any(|(instruction, _)| {
+        matches!(instruction, Insn::Halt { err_code, .. } if *err_code == SQLITE_CONSTRAINT_PRIMARYKEY || *err_code == SQLITE_CONSTRAINT_UNIQUE)
+    }));
+    if conflict_kind == 1 {
+        let old_index = program.insns[..delete]
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::IdxDelete { .. }))
+            .expect("REPLACE deletes the OLD unique key");
+        let new_index = program.insns[delete..replacement]
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::IdxInsert { .. }))
+            .map(|position| position + delete)
+            .expect("REPLACE inserts the NEW unique key");
+        assert!(old_index < delete && delete < new_index && new_index < replacement);
+    }
+}
