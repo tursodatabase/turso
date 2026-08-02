@@ -83,6 +83,13 @@ pub(crate) struct AggregateRuntime {
     /// Per-aggregate duplicate set. This is runtime state selected by physical
     /// emission; the HIR only records whether DISTINCT was written.
     pub(crate) distinct_hash_table: Option<usize>,
+    pub(crate) ordered_sorter: Option<OrderedAggregateRuntime>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OrderedAggregateRuntime {
+    pub(crate) cursor: usize,
+    pub(crate) record: RegisterId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

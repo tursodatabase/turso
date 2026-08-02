@@ -82,7 +82,8 @@ operations are not SQL binding.
         materialization.
   - [x] DISTINCT, comparison-based, custom, and external aggregates carry
         independent runtime state from their frozen HIR calls.
-  - [ ] Aggregate argument ORDER BY.
+  - [x] Aggregate argument ORDER BY uses one sorter per stable AggregateId;
+        grouped queries reopen and drain that sorter per group before AggFinal.
   - [x] Binary `UNION`, `INTERSECT`, and `EXCEPT` use temporary set indexes
         whose equality collations come from the left HIR outputs.
   - [x] Mixed and multi-arm duplicate-removing compounds preserve SQLite's

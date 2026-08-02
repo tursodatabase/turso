@@ -1889,6 +1889,12 @@ fn emit_grouped_aggregate<'document>(
                 AggregateRuntime {
                     register: RegisterId(accumulator_start + position),
                     distinct_hash_table,
+                    ordered_sorter: (!aggregate.call.argument_order.is_empty()).then(|| {
+                        super::OrderedAggregateRuntime {
+                            cursor: program.alloc_cursor_id(CursorType::Sorter),
+                            record: RegisterId(program.alloc_register()),
+                        }
+                    }),
                 },
             )?;
         }
@@ -1999,6 +2005,7 @@ fn emit_grouped_aggregate<'document>(
         }
 
         program.preassign_label_to_next_insn(start_group);
+        open_ordered_aggregate_sorters(program, bindings, &block.aggregates)?;
         program.emit_insn(Insn::Copy {
             src_reg: current_keys,
             dst_reg: previous_keys,
@@ -2046,6 +2053,7 @@ fn emit_grouped_aggregate<'document>(
         program.emit_insn(Insn::Goto { target_pc: cleanup });
 
         program.preassign_label_to_next_insn(output_group);
+        drain_ordered_aggregate_sorters(plan, program, bindings, &block.aggregates)?;
         for aggregate in &block.aggregates {
             let Func::Agg(function) = aggregate.call.function.value() else {
                 return Err(PhysicalQueryError::Unsupported(
@@ -2132,9 +2140,16 @@ fn emit_ungrouped_aggregate<'document>(
             AggregateRuntime {
                 register: RegisterId(accumulator_start + position),
                 distinct_hash_table,
+                ordered_sorter: (!aggregate.call.argument_order.is_empty()).then(|| {
+                    super::OrderedAggregateRuntime {
+                        cursor: program.alloc_cursor_id(CursorType::Sorter),
+                        record: RegisterId(program.alloc_register()),
+                    }
+                }),
             },
         )?;
     }
+    open_ordered_aggregate_sorters(program, bindings, &block.aggregates)?;
 
     match block.source_order.as_slice() {
         [] => {
@@ -2164,6 +2179,7 @@ fn emit_ungrouped_aggregate<'document>(
         )?,
     }
 
+    drain_ordered_aggregate_sorters(plan, program, bindings, &block.aggregates)?;
     for aggregate in &block.aggregates {
         let Func::Agg(function) = aggregate.call.function.value() else {
             return Err(PhysicalQueryError::Unsupported(
@@ -2197,6 +2213,211 @@ fn emit_ungrouped_aggregate<'document>(
     Ok(())
 }
 
+fn open_ordered_aggregate_sorters<'document>(
+    program: &mut ProgramBuilder,
+    bindings: &RuntimeBindings<'document>,
+    aggregates: &[PhysicalAggregate<'document>],
+) -> QueryResult<()> {
+    for aggregate in aggregates {
+        let Some(sorter) = bindings.aggregate(aggregate.id)?.ordered_sorter else {
+            continue;
+        };
+        let order_by = &aggregate.call.argument_order;
+        program.emit_insn(Insn::SorterOpen {
+            cursor_id: sorter.cursor,
+            columns: order_by.len(),
+            order_collations_nulls: order_by
+                .iter()
+                .map(|term| {
+                    (
+                        term.order,
+                        term.collation.as_ref().map(|collation| *collation.value()),
+                        term.nulls,
+                    )
+                })
+                .collect(),
+            comparators: order_by
+                .iter()
+                .map(|term| sort_comparator(&term.type_fact))
+                .collect(),
+        });
+    }
+    Ok(())
+}
+
+fn drain_ordered_aggregate_sorters<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &RuntimeBindings<'document>,
+    aggregates: &[PhysicalAggregate<'document>],
+) -> QueryResult<()> {
+    for aggregate in aggregates {
+        let call = aggregate.call;
+        let Some(sorter) = bindings.aggregate(aggregate.id)?.ordered_sorter else {
+            continue;
+        };
+        let Func::Agg(function) = call.function.value() else {
+            return Err(PhysicalQueryError::Unsupported(
+                "external aggregate function",
+            ));
+        };
+        let field_count = call.argument_order.len() + call.arguments.len();
+        let data = program.alloc_register();
+        let pseudo = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
+            column_count: field_count,
+        }));
+        program.emit_insn(Insn::OpenPseudo {
+            cursor_id: pseudo,
+            content_reg: data,
+            num_fields: field_count,
+        });
+        let loop_start = program.allocate_label();
+        let done = program.allocate_label();
+        program.emit_insn(Insn::SorterSort {
+            cursor_id: sorter.cursor,
+            pc_if_empty: done,
+        });
+        program.preassign_label_to_next_insn(loop_start);
+        program.emit_insn(Insn::SorterData {
+            cursor_id: sorter.cursor,
+            dest_reg: data,
+            pseudo_cursor: pseudo,
+        });
+        let arguments = program.alloc_registers(call.arguments.len());
+        for position in 0..call.arguments.len() {
+            program.emit_insn(Insn::Column {
+                cursor_id: pseudo,
+                column: call.argument_order.len() + position,
+                dest: arguments + position,
+                default: None,
+            });
+        }
+        let (column, delimiter, comparator, collation) = match function {
+            AggFunc::Count0 => {
+                return Err(PhysicalQueryError::Invalid(
+                    "count(*) cannot have argument ORDER BY",
+                ));
+            }
+            AggFunc::Avg
+            | AggFunc::Count
+            | AggFunc::Max
+            | AggFunc::Min
+            | AggFunc::Sum
+            | AggFunc::Total
+            | AggFunc::ArrayAgg => {
+                if call.arguments.len() != 1 {
+                    return Err(PhysicalQueryError::Invalid(
+                        "ordered aggregate has the wrong argument count",
+                    ));
+                }
+                let comparison = matches!(function, AggFunc::Min | AggFunc::Max);
+                (
+                    arguments,
+                    0,
+                    comparison
+                        .then(|| expression_type_fact(plan, &call.arguments[0]))
+                        .flatten()
+                        .as_ref()
+                        .and_then(sort_comparator),
+                    comparison.then(|| expression_collation(plan, &call.arguments[0])),
+                )
+            }
+            AggFunc::GroupConcat => {
+                if !(1..=2).contains(&call.arguments.len()) {
+                    return Err(PhysicalQueryError::Invalid(
+                        "ordered group_concat has the wrong argument count",
+                    ));
+                }
+                let delimiter = if call.arguments.len() == 2 {
+                    arguments + 1
+                } else {
+                    let delimiter = program.alloc_register();
+                    program.emit_insn(Insn::String8 {
+                        value: ",".to_string(),
+                        dest: delimiter,
+                    });
+                    delimiter
+                };
+                (arguments, delimiter, None, None)
+            }
+            AggFunc::StringAgg => {
+                if call.arguments.len() != 2 {
+                    return Err(PhysicalQueryError::Invalid(
+                        "ordered string_agg has the wrong argument count",
+                    ));
+                }
+                (arguments, arguments + 1, None, None)
+            }
+            #[cfg(feature = "json")]
+            AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
+                if call.arguments.len() != 2 {
+                    return Err(PhysicalQueryError::Invalid(
+                        "ordered JSON object aggregate has the wrong argument count",
+                    ));
+                }
+                (arguments, arguments + 1, None, None)
+            }
+            #[cfg(feature = "json")]
+            AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
+                if call.arguments.len() != 1 {
+                    return Err(PhysicalQueryError::Invalid(
+                        "ordered JSON array aggregate has the wrong argument count",
+                    ));
+                }
+                (arguments, 0, None, None)
+            }
+            AggFunc::External(_) => (arguments, 0, None, None),
+            AggFunc::Mode | AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+                return Err(PhysicalQueryError::Invalid(
+                    "WITHIN GROUP aggregate also has argument ORDER BY",
+                ));
+            }
+        };
+        let runtime = bindings.aggregate(aggregate.id)?;
+        let duplicate = call
+            .distinctness
+            .is_some()
+            .then(|| program.allocate_label());
+        if let Some(duplicate) = duplicate {
+            let hash_table_id = runtime
+                .distinct_hash_table
+                .ok_or(PhysicalQueryError::Invalid(
+                    "DISTINCT aggregate has no duplicate set",
+                ))?;
+            program.emit_insn(Insn::HashDistinct {
+                data: Box::new(HashDistinctData {
+                    hash_table_id,
+                    key_start_reg: column,
+                    num_keys: 1,
+                    collations: vec![expression_collation(plan, &call.arguments[0])],
+                    target_pc: duplicate,
+                }),
+            });
+        }
+        program.emit_insn(Insn::AggStep {
+            acc_reg: runtime.register.0,
+            col: column,
+            delimiter,
+            func: AccumulatorFunc::Agg(function.clone()),
+            comparator,
+            collation,
+        });
+        if let Some(duplicate) = duplicate {
+            program.preassign_label_to_next_insn(duplicate);
+        }
+        program.emit_insn(Insn::SorterNext {
+            cursor_id: sorter.cursor,
+            pc_if_next: loop_start,
+        });
+        program.preassign_label_to_next_insn(done);
+        program.emit_insn(Insn::Close { cursor_id: pseudo });
+        program.emit_insn(Insn::Close {
+            cursor_id: sorter.cursor,
+        });
+    }
+    Ok(())
+}
+
 fn emit_aggregate_steps<'document>(
     plan: &PhysicalPlan<'document>,
     program: &mut ProgramBuilder,
@@ -2206,10 +2427,44 @@ fn emit_aggregate_steps<'document>(
 ) -> QueryResult<()> {
     for aggregate in aggregates {
         let call = aggregate.call;
-        if !call.argument_order.is_empty() {
-            return Err(PhysicalQueryError::Unsupported(
-                "aggregate argument ORDER BY",
-            ));
+        if let Some(sorter) = bindings.aggregate(aggregate.id)?.ordered_sorter {
+            let skip = call.filter.as_ref().map(|_| program.allocate_label());
+            if let (Some(filter), Some(skip)) = (call.filter.as_deref(), skip) {
+                emit_filter(plan, program, bindings, ctes, filter, skip)?;
+            }
+            if call.arguments.is_empty() {
+                return Err(PhysicalQueryError::Invalid(
+                    "ordered aggregate has no arguments",
+                ));
+            }
+            let fields = program.alloc_registers(call.argument_order.len() + call.arguments.len());
+            for (position, term) in call.argument_order.iter().enumerate() {
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                    .emit_into(&term.expr, RegisterRange::new(fields + position, 1))?;
+            }
+            for (position, argument) in call.arguments.iter().enumerate() {
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries).emit_into(
+                    argument,
+                    RegisterRange::new(fields + call.argument_order.len() + position, 1),
+                )?;
+            }
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u32(fields),
+                count: to_u32(call.argument_order.len() + call.arguments.len()),
+                dest_reg: to_u32(sorter.record.0),
+                index_name: None,
+                affinity_str: None,
+            });
+            program.emit_insn(Insn::SorterInsert {
+                cursor_id: sorter.cursor,
+                record_reg: sorter.record.0,
+            });
+            if let Some(skip) = skip {
+                program.preassign_label_to_next_insn(skip);
+            }
+            continue;
         }
         let Func::Agg(function) = call.function.value() else {
             return Err(PhysicalQueryError::Unsupported(

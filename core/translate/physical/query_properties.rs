@@ -8,25 +8,26 @@ use turso_parser::{
 
 use super::*;
 use crate::{
-    Connection, LimboError, QueryMode, SymbolTable, Value,
     dialect::{Dialect, SqliteDialect},
     schema::{BTreeTable, Index, Schema},
     sync::{Arc, RwLock},
     translate::{
         collate::CollationSeq,
         semantic::{
-            AnalyzeInput, analyze,
+            analyze,
             context::SemanticContext,
             hir::{Expr, FunctionEvaluation, HirRoot, QueryBlockBody},
+            AnalyzeInput,
         },
     },
     vdbe::{
-        BranchOffset,
         affinity::Affinity,
         builder::{CursorType, ProgramBuilder, ProgramBuilderOpts},
         insn::Insn,
+        BranchOffset,
     },
     vtab::{InternalVirtualTable, InternalVirtualTableCursor, VirtualTable},
+    Connection, LimboError, QueryMode, SymbolTable, Value,
 };
 
 #[derive(Debug)]
@@ -229,12 +230,10 @@ fn a_root_table_scan_emits_only_from_closed_hir(tc: hegel::TestCase) {
         instruction,
         Insn::Ge { flags, .. } if flags.get_affinity() == Affinity::Integer
     )));
-    assert!(
-        program
-            .insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 2, .. }))
-    );
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 2, .. })));
 }
 
 // Examples: `position_args(?1)`, `position_args(?1, ?2)`, and
@@ -534,12 +533,10 @@ fn derived_sources_materialize_query_outputs_in_their_own_position_space(tc: heg
             (derived_cursor, 0),
         ]
     );
-    assert!(
-        program
-            .insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::MakeRecord { count: 1, .. }))
-    );
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::MakeRecord { count: 1, .. })));
     assert!(program.insns.iter().any(|(instruction, _)| matches!(
         instruction,
         Insn::NewRowid { cursor, .. } if *cursor == derived_cursor
@@ -642,16 +639,14 @@ fn repeated_cte_sources_share_rows_but_keep_independent_source_cursors(tc: hegel
         instruction,
         Insn::Rewind { cursor_id, .. } if *cursor_id == backing_cursor
     )));
-    assert!(
-        duplicate_cursors
-            .iter()
-            .all(
-                |cursor| program.insns.iter().any(|(instruction, _)| matches!(
-                    instruction,
-                    Insn::Rewind { cursor_id, .. } if cursor_id == cursor
-                ))
-            )
-    );
+    assert!(duplicate_cursors
+        .iter()
+        .all(
+            |cursor| program.insns.iter().any(|(instruction, _)| matches!(
+                instruction,
+                Insn::Rewind { cursor_id, .. } if cursor_id == cursor
+            ))
+        ));
 
     let table_cursor = program
         .insns
@@ -676,16 +671,14 @@ fn repeated_cte_sources_share_rows_but_keep_independent_source_cursors(tc: hegel
         })
         .collect::<Vec<_>>();
     assert_eq!(table_reads, [filter_position, output_position]);
-    assert!(
-        duplicate_cursors
-            .iter()
-            .all(
-                |cursor| program.insns.iter().any(|(instruction, _)| matches!(
-                    instruction,
-                    Insn::Column { cursor_id, column: 0, .. } if cursor_id == cursor
-                ))
-            )
-    );
+    assert!(duplicate_cursors
+        .iter()
+        .all(
+            |cursor| program.insns.iter().any(|(instruction, _)| matches!(
+                instruction,
+                Insn::Column { cursor_id, column: 0, .. } if cursor_id == cursor
+            ))
+        ));
 }
 
 // Example: `SELECT o.c7,
@@ -805,24 +798,18 @@ fn correlated_scalar_and_exists_subqueries_use_exact_captures_and_stop_cleanly(
                 if matches!(program.insns[*target as usize].0, Insn::Close { cursor_id } if cursor_id == *inner)
         )));
     }
-    assert!(
-        program
-            .insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::Null { .. }))
-    );
-    assert!(
-        program
-            .insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::Integer { value: 0, .. }))
-    );
-    assert!(
-        program
-            .insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::Integer { value: 1, .. }))
-    );
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::Null { .. })));
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::Integer { value: 0, .. })));
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::Integer { value: 1, .. })));
 }
 
 // Example: `WITH unused(x) AS (VALUES (99)), chosen(x) AS
@@ -885,12 +872,10 @@ fn cte_reachability_follows_nested_queries_without_executing_unused_ctes(tc: heg
             .count(),
         1
     );
-    assert!(
-        !program
-            .insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::Integer { value: 99, .. }))
-    );
+    assert!(!program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::Integer { value: 99, .. })));
     let table_cursor = program
         .insns
         .iter()
@@ -1176,12 +1161,10 @@ fn values_rows_use_one_exact_source_free_result_range(tc: hegel::TestCase) {
     let mut program = program();
     emit_root_query(&plan, &mut program).expect("VALUES lowers without a catalog");
 
-    assert!(
-        !program.insns.iter().any(|(instruction, _)| matches!(
-            instruction,
-            Insn::OpenRead { .. } | Insn::VOpen { .. }
-        ))
-    );
+    assert!(!program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::OpenRead { .. } | Insn::VOpen { .. })));
     let result_rows = program
         .insns
         .iter()
@@ -1191,11 +1174,9 @@ fn values_rows_use_one_exact_source_free_result_range(tc: hegel::TestCase) {
         })
         .collect::<Vec<_>>();
     assert_eq!(result_rows.len(), row_count);
-    assert!(
-        result_rows
-            .iter()
-            .all(|(start, count)| *start == result_rows[0].0 && *count == width)
-    );
+    assert!(result_rows
+        .iter()
+        .all(|(start, count)| *start == result_rows[0].0 && *count == width));
 }
 
 // Example: `WITH rows(a, b) AS (
@@ -1287,16 +1268,14 @@ fn union_all_materializes_hir_arms_in_order_at_one_exact_width(tc: hegel::TestCa
         first_rows + second_rows
     );
     let record_width = u32::try_from(width).expect("generated width fits in a VDBE operand");
-    assert!(
-        program
-            .insns
-            .iter()
-            .filter_map(|(instruction, _)| match instruction {
-                Insn::MakeRecord { count, .. } => Some(*count),
-                _ => None,
-            })
-            .all(|count| count == record_width)
-    );
+    assert!(program
+        .insns
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::MakeRecord { count, .. } => Some(*count),
+            _ => None,
+        })
+        .all(|count| count == record_width));
 
     let scan_cursor = program
         .insns
@@ -1363,24 +1342,18 @@ fn recursive_cte_uses_a_closed_hir_queue_and_input_binding(tc: hegel::TestCase) 
         .resolve_labels()
         .expect("all recursive queue branches are closed");
 
-    assert!(
-        program
-            .insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::OpenPseudo { .. }))
-    );
-    assert!(
-        program
-            .insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::Sequence { .. }))
-    );
-    assert!(
-        program
-            .insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::IdxDelete { .. }))
-    );
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::OpenPseudo { .. })));
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::Sequence { .. })));
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::IdxDelete { .. })));
     let ephemeral_indexes = program
         .insns
         .iter()
@@ -1497,14 +1470,12 @@ fn compound_order_by_remaps_each_hir_arm_and_keeps_frozen_sort_facts(tc: hegel::
                 _ => None,
             })
             .expect("the selected arm is inserted into the sorter");
-        assert!(
-            program.insns[variable_position + 1..insert_position]
-                .iter()
-                .any(|(instruction, _)| matches!(
-                    instruction,
-                    Insn::Copy { src_reg, .. } if *src_reg == variable_register
-                ))
-        );
+        assert!(program.insns[variable_position + 1..insert_position]
+            .iter()
+            .any(|(instruction, _)| matches!(
+                instruction,
+                Insn::Copy { src_reg, .. } if *src_reg == variable_register
+            )));
     }
     assert_eq!(
         program
@@ -1611,11 +1582,9 @@ fn sorted_limit_and_offset_control_final_hir_rows_and_reach_cleanup(tc: hegel::T
         .iter()
         .position(|(instruction, _)| matches!(instruction, Insn::OpenRead { root_page: 7, .. }))
         .expect("the resolved table opens after counter setup");
-    assert!(
-        variables
-            .iter()
-            .all(|(position, _, _)| *position < table_open)
-    );
+    assert!(variables
+        .iter()
+        .all(|(position, _, _)| *position < table_open));
 
     let sorter_data = program
         .insns
@@ -2183,22 +2152,18 @@ fn correlated_in_subqueries_use_captures_and_frozen_comparison_facts(tc: hegel::
             _ => None,
         })
         .expect("membership produces one SQL value");
-    assert!(
-        program.insns[comparison.0..result.0]
-            .iter()
-            .any(|(instruction, _)| matches!(
-                instruction,
-                Insn::Null { dest, .. } if *dest == result.1
-            ))
-    );
-    assert!(
-        program.insns[comparison.0..result.0]
-            .iter()
-            .any(|(instruction, _)| matches!(
-                instruction,
-                Insn::Integer { value: 1, dest } if *dest == result.1
-            ))
-    );
+    assert!(program.insns[comparison.0..result.0]
+        .iter()
+        .any(|(instruction, _)| matches!(
+            instruction,
+            Insn::Null { dest, .. } if *dest == result.1
+        )));
+    assert!(program.insns[comparison.0..result.0]
+        .iter()
+        .any(|(instruction, _)| matches!(
+            instruction,
+            Insn::Integer { value: 1, dest } if *dest == result.1
+        )));
 
     let row_set_close = program
         .insns
@@ -2884,12 +2849,10 @@ fn mixed_multi_arm_compounds_keep_left_to_right_set_boundaries(tc: hegel::TestCa
             ..
         }
     )));
-    assert!(
-        program
-            .insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. }))
-    );
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. })));
 }
 
 // Examples: `l LEFT JOIN r ON l.k = r.k`, `LEFT JOIN r USING(k)`, and
@@ -3031,29 +2994,21 @@ fn left_join_keeps_join_matching_separate_from_where(tc: hegel::TestCase) {
         })
         .expect("an unmatched left row null-extends the right SourceId");
     assert!(match_zero < right_rewind && right_rewind < match_one && match_one < null_row);
-    assert!(
-        program.insns[right_rewind..match_one]
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::IfNot { .. }))
-    );
-    assert!(
-        program.insns[match_one..null_row]
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::IfNot { .. }))
-    );
-    assert!(
-        program.insns[..null_row]
-            .iter()
-            .any(|(instruction, _)| matches!(
-                instruction,
-                Insn::IfPos { reg, .. } if *reg == match_register
-            ))
-    );
-    assert!(
-        program.insns[null_row + 1..]
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::IfNot { .. }))
-    );
+    assert!(program.insns[right_rewind..match_one]
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::IfNot { .. })));
+    assert!(program.insns[match_one..null_row]
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::IfNot { .. })));
+    assert!(program.insns[..null_row]
+        .iter()
+        .any(|(instruction, _)| matches!(
+            instruction,
+            Insn::IfPos { reg, .. } if *reg == match_register
+        )));
+    assert!(program.insns[null_row + 1..]
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::IfNot { .. })));
     assert_eq!(
         program
             .insns
@@ -3147,12 +3102,10 @@ fn two_source_right_and_full_joins_preserve_the_hir_sides(tc: hegel::TestCase) {
         )),
         full
     );
-    assert!(
-        program
-            .insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 4, .. }))
-    );
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 4, .. })));
 }
 
 // Examples:
@@ -3196,4 +3149,87 @@ fn compound_scalar_and_exists_subqueries_read_one_materialized_hir_result(tc: he
     assert!(program.insns.iter().any(|(instruction, _)| {
         matches!(instruction, Insn::Insert { table_name, .. } if table_name.starts_with("exists_compound_"))
     }));
+}
+
+// Examples:
+// - `SELECT group_concat(x ORDER BY rank ASC) FROM items` must feed AggStep
+//   only after the HIR ordering sorter is drained.
+// - `SELECT g, group_concat(DISTINCT x ORDER BY rank DESC) FROM items GROUP BY g`
+//   needs a fresh argument sorter and duplicate set for every group; the group
+//   sorter must not replace the aggregate's independent ordering.
+// Varying grouping, DISTINCT, and direction checks that the FunctionCall's
+// stable AggregateId owns all of these runtime resources without rebinding.
+#[hegel::test]
+fn aggregate_argument_order_drains_before_hir_aggregate_steps(tc: hegel::TestCase) {
+    let grouped = tc.draw(generators::booleans());
+    let distinct = tc.draw(generators::booleans());
+    let descending = tc.draw(generators::booleans());
+    let items = BTreeTable::from_sql("CREATE TABLE items(g INTEGER, x TEXT, rank INTEGER)", 47)
+        .expect("fixture table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(items))
+        .expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let distinct = if distinct { "DISTINCT " } else { "" };
+    let direction = if descending { "DESC" } else { "ASC" };
+    let sql = if grouped {
+        format!(
+            "SELECT g, group_concat({distinct}x ORDER BY rank {direction}) \
+             FROM items GROUP BY g"
+        )
+    } else {
+        format!(
+            "SELECT group_concat({distinct}x ORDER BY rank {direction}) \
+             FROM items"
+        )
+    };
+    let statement = parse_statement(&sql);
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("ordered aggregate has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("ordered aggregate has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("ordered aggregate emits from closed HIR");
+    program
+        .resolve_labels()
+        .expect("all ordered aggregate branches are closed");
+
+    let step = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::AggStep { .. }))
+        .expect("ordered values eventually step the aggregate");
+    let final_position = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::AggFinal { .. }))
+        .expect("the ordered aggregate is finalized");
+    let drain = program.insns[..step]
+        .iter()
+        .rposition(|(instruction, _)| matches!(instruction, Insn::SorterSort { .. }))
+        .expect("an argument sorter is drained before AggStep");
+    let insert = program.insns[..drain]
+        .iter()
+        .rposition(|(instruction, _)| matches!(instruction, Insn::SorterInsert { .. }))
+        .expect("argument values enter a sorter before it is drained");
+    assert!(insert < drain && drain < step && step < final_position);
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::SorterOpen { .. }))
+            .count(),
+        if grouped { 2 } else { 1 }
+    );
+    if distinct == "DISTINCT " {
+        assert!(program.insns[drain..step]
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::HashDistinct { .. })));
+    }
 }
