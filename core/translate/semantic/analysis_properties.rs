@@ -4,20 +4,21 @@ use hegel::generators;
 use turso_parser::{ast, parser::Parser};
 
 use super::{
-    AnalyzeInput, analyze,
+    analyze,
     context::{DmlPolicy, SemanticContext},
     hir::{
         Expr, HirDocument, HirRoot, JoinConstraint, QueryBlockBody, SourceKind, SourceOwner,
         SubqueryExpr,
     },
+    AnalyzeInput,
 };
 use crate::{
-    SymbolTable,
     dialect::{Dialect, SqliteDialect},
     schema::{BTreeTable, Index, Schema, Sequence, Trigger},
     sync::Arc,
     translate::collate::CollationSeq,
     vdbe::affinity::Affinity,
+    SymbolTable,
 };
 
 fn parse_statement(sql: &str) -> ast::Stmt {

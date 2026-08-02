@@ -4,7 +4,6 @@ use hegel::generators;
 
 use super::*;
 use crate::{
-    QueryMode, SymbolTable,
     dialect::{Dialect, SqliteDialect},
     schema::{BTreeTable, Schema, Table},
     schema_expr::{
@@ -15,14 +14,15 @@ use crate::{
     translate::semantic::{
         context::SemanticContext,
         schema_expr::{
-            SchemaExprInput, SchemaSyntaxInput, analyze_positional_scalar_syntax,
-            analyze_schema_expr, analyze_table_schema_syntax,
+            analyze_positional_scalar_syntax, analyze_schema_expr, analyze_table_schema_syntax,
+            SchemaExprInput, SchemaSyntaxInput,
         },
     },
     vdbe::{
         builder::{ProgramBuilder, ProgramBuilderOpts},
         insn::Insn,
     },
+    QueryMode, SymbolTable,
 };
 use turso_parser::ast;
 
@@ -235,29 +235,23 @@ fn partial_index_predicate_can_be_emitted_before_its_key(tc: hegel::TestCase) {
     emit_root_schema_expression_into(&plan, &mut program, &inputs, 1, 301)
         .expect("key emits independently");
 
-    assert!(
-        program.insns[..predicate_end]
-            .iter()
-            .any(|(instruction, _)| {
-                matches!(instruction, Insn::Copy { src_reg, dst_reg, extra_amount: 0 }
+    assert!(program.insns[..predicate_end]
+        .iter()
+        .any(|(instruction, _)| {
+            matches!(instruction, Insn::Copy { src_reg, dst_reg, extra_amount: 0 }
             if *src_reg == 100 + predicate_position && *dst_reg == 300)
-            })
-    );
-    assert!(
-        !program.insns[..predicate_end]
-            .iter()
-            .any(|(instruction, _)| {
-                matches!(instruction, Insn::Copy { src_reg, .. } if *src_reg == 100 + key_position)
-            })
-    );
-    assert!(
-        program.insns[predicate_end..]
-            .iter()
-            .any(|(instruction, _)| {
-                matches!(instruction, Insn::Copy { src_reg, dst_reg, extra_amount: 0 }
+        }));
+    assert!(!program.insns[..predicate_end]
+        .iter()
+        .any(|(instruction, _)| {
+            matches!(instruction, Insn::Copy { src_reg, .. } if *src_reg == 100 + key_position)
+        }));
+    assert!(program.insns[predicate_end..]
+        .iter()
+        .any(|(instruction, _)| {
+            matches!(instruction, Insn::Copy { src_reg, dst_reg, extra_amount: 0 }
                 if *src_reg == 100 + key_position && *dst_reg == 301)
-            })
-    );
+        }));
 }
 
 // Example: for `CREATE TABLE t(a, g AS (a), h AS (g))` followed by

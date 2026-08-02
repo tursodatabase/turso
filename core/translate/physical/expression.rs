@@ -23,7 +23,7 @@ use crate::{
     },
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral, to_u32},
+        insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral},
     },
 };
 

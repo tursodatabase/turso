@@ -13,7 +13,7 @@ use crate::{
     translate::semantic::hir::{self, ColumnReadExpression},
     vdbe::{
         builder::ProgramBuilder,
-        insn::{to_u32, Insn},
+        insn::{Insn, to_u32},
     },
 };
 
@@ -268,20 +268,16 @@ pub(crate) fn emit_replace_not_null_defaults(
             reg: logical.first.0 + position,
             target_pc: present,
         });
-        let default = defaults
-            .iter()
-            .find(|default| default.column == position)
-            .ok_or(PhysicalRowError::Invalid(
-                "NOT NULL column has no frozen default",
-            ))?;
-        ExpressionEmitter::new(program, bindings).emit_into(
-            &default.value,
-            RegisterRange::new(logical.first.0 + position, 1),
-        )?;
-        program.emit_insn(Insn::NotNull {
-            reg: logical.first.0 + position,
-            target_pc: present,
-        });
+        if let Some(default) = defaults.iter().find(|default| default.column == position) {
+            ExpressionEmitter::new(program, bindings).emit_into(
+                &default.value,
+                RegisterRange::new(logical.first.0 + position, 1),
+            )?;
+            program.emit_insn(Insn::NotNull {
+                reg: logical.first.0 + position,
+                target_pc: present,
+            });
+        }
         constraint_halt(
             program,
             SQLITE_CONSTRAINT_NOTNULL,
