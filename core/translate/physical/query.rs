@@ -1066,6 +1066,7 @@ pub(crate) fn emit_update_from_rows<'document>(
         0,
         &joins,
         None,
+        false,
         filter,
         ScanRowAction::UpdateCandidate {
             target,
@@ -4674,8 +4675,10 @@ fn emit_table_scans<'document>(
         full_join_position = Some(position);
     }
 
-    let mut scans = Vec::with_capacity(source_ids.len());
-    for source_id in source_ids {
+    let execution_order = inner_scan_order(plan, source_ids, from)?;
+    let reordered = execution_order != source_ids;
+    let mut scans = Vec::with_capacity(execution_order.len());
+    for source_id in &execution_order {
         let source = plan
             .source(*source_id)
             .ok_or(PhysicalQueryError::Invalid("query source is missing"))?;
@@ -4699,6 +4702,7 @@ fn emit_table_scans<'document>(
                 0,
                 &from.joins,
                 Some((0, JoinKind::Left)),
+                false,
                 filter,
                 action,
             )?;
@@ -4714,6 +4718,7 @@ fn emit_table_scans<'document>(
                 0,
                 &from.joins,
                 Some((position, JoinKind::Left)),
+                false,
                 filter,
                 action,
             )?;
@@ -4739,6 +4744,7 @@ fn emit_table_scans<'document>(
             0,
             &from.joins,
             None,
+            reordered,
             filter,
             action,
         )?,
@@ -4760,6 +4766,69 @@ fn emit_table_scans<'document>(
         }
     }
     Ok(())
+}
+
+fn inner_scan_order<'document>(
+    plan: &PhysicalPlan<'document>,
+    source_ids: &[SourceId],
+    from: &HirFrom,
+) -> QueryResult<Vec<SourceId>> {
+    if from.joins.iter().any(|join| {
+        !matches!(
+            join.kind,
+            JoinKind::Comma | JoinKind::Inner | JoinKind::Cross
+        )
+    }) {
+        return Ok(source_ids.to_vec());
+    }
+
+    let local_sources = source_ids.iter().copied().collect::<FxHashSet<_>>();
+    let mut ordered = Vec::with_capacity(source_ids.len());
+    let mut remaining = source_ids.to_vec();
+    while !remaining.is_empty() {
+        let Some(position) = remaining.iter().position(|source_id| {
+            table_function_dependencies(plan, *source_id)
+                .iter()
+                .all(|dependency| {
+                    !local_sources.contains(dependency) || ordered.contains(dependency)
+                })
+        }) else {
+            return Err(PhysicalQueryError::Unsupported(
+                "cyclic table-function source dependencies",
+            ));
+        };
+        ordered.push(remaining.remove(position));
+    }
+    Ok(ordered)
+}
+
+fn table_function_dependencies(
+    plan: &PhysicalPlan<'_>,
+    source_id: SourceId,
+) -> FxHashSet<SourceId> {
+    let mut dependencies = FxHashSet::default();
+    let Some(PhysicalSource {
+        kind: PhysicalSourceKind::TableFunction { arguments, .. },
+        ..
+    }) = plan.source(source_id)
+    else {
+        return dependencies;
+    };
+    for argument in *arguments {
+        argument.walk(&mut |expression| match expression {
+            Expr::Column(reference) => {
+                dependencies.insert(reference.source);
+            }
+            Expr::RowId(source) => {
+                dependencies.insert(*source);
+            }
+            Expr::MergedColumn(column) => {
+                dependencies.insert(column.right.source);
+            }
+            _ => {}
+        });
+    }
+    dependencies
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4810,7 +4879,7 @@ fn emit_full_join_unmatched_right<'document>(
     let tail_level = full_join_position + 2;
     if tail_level < scans.len() {
         emit_nested_scan(
-            plan, program, bindings, ctes, scans, tail_level, joins, None, filter, action,
+            plan, program, bindings, ctes, scans, tail_level, joins, None, false, filter, action,
         )?;
     } else {
         if let Some(filter) = filter {
@@ -4950,6 +5019,7 @@ fn emit_nested_scan<'document>(
     level: usize,
     joins: &[crate::translate::semantic::hir::Join],
     join_override: Option<(usize, JoinKind)>,
+    defer_inner_constraints: bool,
     filter: Option<&Expr>,
     action: ScanRowAction<'document, '_>,
 ) -> QueryResult<()> {
@@ -4961,7 +5031,9 @@ fn emit_nested_scan<'document>(
     let loop_next = program.allocate_label();
     let loop_end = program.allocate_label();
     let join_position = level.checked_sub(1);
-    let join = join_position.and_then(|position| joins.get(position));
+    let join = (!defer_inner_constraints)
+        .then(|| join_position.and_then(|position| joins.get(position)))
+        .flatten();
     let join_kind = join_position
         .zip(join)
         .map(|(position, join)| match join_override {
@@ -5025,10 +5097,16 @@ fn emit_nested_scan<'document>(
             level + 1,
             joins,
             join_override,
+            defer_inner_constraints,
             filter,
             action,
         )?;
     } else {
+        if defer_inner_constraints {
+            for join in joins {
+                emit_join_constraint(plan, program, bindings, ctes, &join.constraint, loop_next)?;
+            }
+        }
         if let Some(filter) = filter {
             emit_filter(plan, program, bindings, ctes, filter, loop_next)?;
         }
@@ -5065,6 +5143,7 @@ fn emit_nested_scan<'document>(
                 level + 1,
                 joins,
                 join_override,
+                defer_inner_constraints,
                 filter,
                 action,
             )?;

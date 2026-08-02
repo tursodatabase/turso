@@ -1354,7 +1354,7 @@ impl Analyzer<'_, '_> {
                 &hidden_columns,
                 &mut counts,
             );
-            let prefix = counts.iter().take_while(|count| **count == 1).count();
+            let prefix = counts.iter().take_while(|count| **count > 0).count();
             if prefix == 0 {
                 continue;
             }
@@ -1962,6 +1962,7 @@ impl Analyzer<'_, '_> {
         for (join, source) in syntax.joins.iter().zip(&right_sources) {
             self.analyze_table_function_arguments(&join.table, *source, &complete_scope)?;
         }
+        self.reject_cyclic_table_function_dependencies(first, &right_sources)?;
 
         let mut scope = self.scope_for_environment(environment)?;
         self.add_source_to_scope(&mut scope, first, true)?;
@@ -2343,9 +2344,34 @@ impl Analyzer<'_, '_> {
         source: hir::SourceId,
         scope: &Scope,
     ) -> Result<()> {
-        let ast::SelectTable::TableCall(_, syntax_arguments, _) = syntax else {
+        let ast::SelectTable::TableCall(name, syntax_arguments, _) = syntax else {
             return Ok(());
         };
+        let max_arguments = self
+            .source(source)
+            .and_then(|definition| match &definition.kind {
+                hir::SourceKind::TableFunction { table, .. } => table.value().virtual_table(),
+                _ => None,
+            })
+            .map(|table| {
+                table
+                    .columns
+                    .iter()
+                    .filter(|column| column.hidden())
+                    .count()
+            })
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "table-function source {source} has no virtual table"
+                ))
+            })?;
+        if syntax_arguments.len() > max_arguments {
+            crate::bail_parse_error!(
+                "too many arguments on {}() - max {}",
+                name.name.as_str(),
+                max_arguments
+            );
+        }
         let mut arguments = Vec::with_capacity(syntax_arguments.len());
         for argument in syntax_arguments {
             arguments.push(
@@ -2371,6 +2397,50 @@ impl Analyzer<'_, '_> {
             )));
         };
         *resolved = arguments;
+        Ok(())
+    }
+
+    fn reject_cyclic_table_function_dependencies(
+        &self,
+        first: hir::SourceId,
+        right_sources: &[hir::SourceId],
+    ) -> Result<()> {
+        let local_sources = std::iter::once(first)
+            .chain(right_sources.iter().copied())
+            .collect::<rustc_hash::FxHashSet<_>>();
+        let mut available = rustc_hash::FxHashSet::default();
+        let mut remaining = local_sources.iter().copied().collect::<Vec<_>>();
+        while !remaining.is_empty() {
+            let Some(position) = remaining.iter().position(|source_id| {
+                let Some(source) = self.source(*source_id) else {
+                    return false;
+                };
+                let hir::SourceKind::TableFunction { arguments, .. } = &source.kind else {
+                    return true;
+                };
+                let mut dependencies = rustc_hash::FxHashSet::default();
+                for argument in arguments {
+                    argument.walk(&mut |expression| match expression {
+                        hir::Expr::Column(reference) => {
+                            dependencies.insert(reference.source);
+                        }
+                        hir::Expr::RowId(source) => {
+                            dependencies.insert(*source);
+                        }
+                        hir::Expr::MergedColumn(column) => {
+                            dependencies.insert(column.right.source);
+                        }
+                        _ => {}
+                    });
+                }
+                dependencies.iter().all(|dependency| {
+                    !local_sources.contains(dependency) || available.contains(dependency)
+                })
+            }) else {
+                crate::bail_parse_error!("no query solution");
+            };
+            available.insert(remaining.remove(position));
+        }
         Ok(())
     }
 
@@ -2602,8 +2672,10 @@ fn extract_hidden_virtual_equalities(
 ) -> Option<hir::Expr> {
     if let Some((position, argument)) = hidden_virtual_equality(&expression, source, hidden_columns)
     {
-        arguments[position] = Some(argument.clone());
-        return None;
+        if arguments[position].is_none() {
+            arguments[position] = Some(argument.clone());
+            return None;
+        }
     }
     match expression {
         hir::Expr::Binary {

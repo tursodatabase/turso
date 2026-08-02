@@ -238,9 +238,10 @@ fn a_root_table_scan_emits_only_from_closed_hir(tc: hegel::TestCase) {
 
 // Examples: `position_args(?1, ?2)` and `position_args WHERE second = ?2 AND
 // first = ?1` both bind arguments to the hidden first and second columns in
-// schema order. The WHERE spelling becomes the same HIR source and consumes
-// the omitted equality terms. Physical lowering must place parameters in the
-// exact contiguous range passed to `VFilter` after the catalog is dropped.
+// schema order. With `... AND first = ?3`, the first equality is passed to
+// `VFilter` and the duplicate stays in the HIR filter. Physical lowering must
+// keep the filter argument order and the residual predicate after the catalog
+// is dropped.
 #[hegel::test]
 fn table_function_arguments_keep_their_bound_hidden_column_order(tc: hegel::TestCase) {
     let arity = usize::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(3)));
@@ -249,6 +250,7 @@ fn table_function_arguments_keep_their_bound_hidden_column_order(tc: hegel::Test
         .collect::<Vec<_>>()
         .join(", ");
     let via_where = tc.draw(generators::booleans());
+    let duplicate = via_where && tc.draw(generators::booleans());
     let mut schema = Schema::new();
     schema
         .add_virtual_table(
@@ -261,12 +263,17 @@ fn table_function_arguments_keep_their_bound_hidden_column_order(tc: hegel::Test
     let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
     let sql = if via_where {
         let names = ["first", "second", "third"];
-        let constraints = (1..=arity)
+        let mut constraints = (1..=arity)
             .rev()
             .map(|position| format!("{} = ?{position}", names[position - 1]))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        format!("SELECT value FROM position_args WHERE {constraints}")
+            .collect::<Vec<_>>();
+        if duplicate {
+            constraints.push(format!("first = ?{}", arity + 1));
+        }
+        format!(
+            "SELECT value FROM position_args WHERE {}",
+            constraints.join(" AND ")
+        )
     } else {
         format!("SELECT value FROM position_args({arguments})")
     };
@@ -292,10 +299,16 @@ fn table_function_arguments_keep_their_bound_hidden_column_order(tc: hegel::Test
             _ => unreachable!("the fixture is a query"),
         };
         let query = document.query(root.query).expect("the root query exists");
-        assert!(matches!(
-            query.blocks[0].body,
-            QueryBlockBody::Select { filter: None, .. }
-        ));
+        assert_eq!(
+            matches!(
+                query.blocks[0].body,
+                QueryBlockBody::Select {
+                    filter: Some(_),
+                    ..
+                }
+            ),
+            duplicate
+        );
     }
     drop(context);
     drop(schema);
