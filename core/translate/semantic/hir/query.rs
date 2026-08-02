@@ -64,6 +64,10 @@ pub struct Output {
     pub expr: Expr,
     pub type_fact: TypeFact,
     pub affinity: Affinity,
+    /// Affinity used when this result becomes a stored schema column.
+    /// Compound queries preserve the leftmost arm here even when their
+    /// runtime comparison affinity is merged across every arm.
+    pub schema_affinity: Affinity,
     /// Whether SQLite comparison rules treat `affinity` as declared affinity.
     /// Literals and most computed expressions have no affinity even when their
     /// storage type is known; a real BLOB column does have BLOB affinity.

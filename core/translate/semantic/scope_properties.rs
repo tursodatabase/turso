@@ -98,6 +98,7 @@ fn output_with_kind(position: usize, name: String, name_kind: OutputNameKind) ->
         expr: Expr::Literal(Literal::Null),
         type_fact: TypeFact::known(Type::Integer),
         affinity: Affinity::Integer,
+        schema_affinity: Affinity::Integer,
         has_affinity: true,
         collation: None,
         collation_is_explicit: false,

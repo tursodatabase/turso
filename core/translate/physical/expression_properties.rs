@@ -87,6 +87,7 @@ fn source_document(width: usize, expression: Expr) -> (HirDocument, QueryId, Sou
                         expr: expression,
                         type_fact: TypeFact::known(Type::Integer),
                         affinity: Affinity::Integer,
+                        schema_affinity: Affinity::Integer,
                         has_affinity: true,
                         collation: None,
                         collation_is_explicit: false,

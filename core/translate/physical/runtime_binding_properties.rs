@@ -58,6 +58,7 @@ fn output(id: OutputId, expression: Expr) -> Output {
         expr: expression,
         type_fact: TypeFact::known(Type::Integer),
         affinity: Affinity::Integer,
+        schema_affinity: Affinity::Integer,
         has_affinity: true,
         collation: None,
         collation_is_explicit: false,

@@ -976,11 +976,7 @@ fn derive_ctas_schema(
     let mut col_defs = Vec::with_capacity(result_columns.len());
 
     for (column, name) in result_columns.iter().zip(names) {
-        let ty = column
-            .type_fact
-            .declared
-            .as_ref()
-            .map_or("", |declared| declared.name.as_str());
+        let ty = column.schema_affinity.short_type_name();
 
         let quoted = quote_identifier(&name);
         if ty.is_empty() {

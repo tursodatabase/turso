@@ -97,6 +97,66 @@ fn typed_items_schema(types: &[&str]) -> Schema {
     schema
 }
 
+// Example: `SELECT c0 FROM left_items UNION ALL SELECT c0 FROM right_items`
+// with `left_items.c0 INTEGER` and `right_items.c0 TEXT` may merge to BLOB
+// affinity for runtime comparisons, but `CREATE TABLE ... AS` must still use
+// the leftmost `INT` schema type.
+#[hegel::test]
+fn compound_outputs_keep_leftmost_schema_affinity(tc: hegel::TestCase) {
+    let declared_types = [
+        ("BLOB", Affinity::Blob),
+        ("TEXT", Affinity::Text),
+        ("NUMERIC", Affinity::Numeric),
+        ("INTEGER", Affinity::Integer),
+        ("REAL", Affinity::Real),
+    ];
+    let left_type = tc.draw(generators::integers::<usize>().max_value(declared_types.len() - 1));
+    let right_type = tc.draw(generators::integers::<usize>().max_value(declared_types.len() - 1));
+    let operators = ["UNION ALL", "UNION", "INTERSECT", "EXCEPT"];
+    let operator =
+        operators[tc.draw(generators::integers::<usize>().max_value(operators.len() - 1))];
+    let left = BTreeTable::from_sql(
+        &format!(
+            "CREATE TABLE left_items(c0 {})",
+            declared_types[left_type].0
+        ),
+        2,
+    )
+    .expect("the generated left table is valid");
+    let right = BTreeTable::from_sql(
+        &format!(
+            "CREATE TABLE right_items(c0 {})",
+            declared_types[right_type].0
+        ),
+        3,
+    )
+    .expect("the generated right table is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(left))
+        .expect("the left table name is unique");
+    schema
+        .add_btree_table(Arc::new(right))
+        .expect("the right table name is unique");
+    let symbols = SymbolTable::new();
+    let context = semantic_context(&schema, &symbols);
+    let statement = parse_statement(&format!(
+        "SELECT c0 FROM left_items {operator} SELECT c0 FROM right_items"
+    ));
+
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("the generated compound SELECT has valid SQL meaning");
+    let HirRoot::Query(root) = &document.root else {
+        unreachable!("the fixture is a SELECT");
+    };
+    let query = document.query(root.query).expect("the root query exists");
+    let output = &query.blocks[query.first.index].outputs[0];
+    assert_eq!(output.schema_affinity, declared_types[left_type].1);
+    document
+        .validate()
+        .expect("compound schema affinity remains closed in HIR");
+}
+
 // Example: `SELECT nextval('s')` and `SELECT setval('s', 42, false)` must
 // carry `main.__turso_internal_seq_s`, the immutable sequence descriptor, and
 // the main schema cookie in HIR. Dropping the prepare-time schema afterwards
