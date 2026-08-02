@@ -224,22 +224,17 @@ pub(crate) fn emit_update_parent_actions(
         let complete = program.allocate_label();
         let changed = program.allocate_label();
         let width = foreign_key.parent_positions.len();
-        let old_key = program.alloc_registers(width);
-        let new_key = program.alloc_registers(width);
-        for (offset, position) in foreign_key.parent_positions.iter().copied().enumerate() {
+        let (old_key, new_key) = copy_parent_change_keys(
+            program,
+            parent_table,
+            &foreign_key.parent_positions,
+            old_columns,
+            new_columns,
+            old_rowid,
+            new_rowid,
+        )?;
+        for offset in 0..width {
             let next_equal = (offset + 1 != width).then(|| program.allocate_label());
-            let old = child_register(parent_table, old_columns, old_rowid, position)?;
-            let new = child_register(parent_table, new_columns, new_rowid, position)?;
-            program.emit_insn(Insn::Copy {
-                src_reg: old,
-                dst_reg: old_key + offset,
-                extra_amount: 0,
-            });
-            program.emit_insn(Insn::Copy {
-                src_reg: new,
-                dst_reg: new_key + offset,
-                extra_amount: 0,
-            });
             program.emit_insn(Insn::Eq {
                 lhs: old_key + offset,
                 rhs: new_key + offset,
@@ -311,25 +306,22 @@ fn emit_update_parent_check(
         .index();
     let complete = program.allocate_label();
     let changed = program.allocate_label();
-    let old_key = program.alloc_registers(foreign_key.parent_positions.len());
-    let new_key = program.alloc_registers(foreign_key.parent_positions.len());
-    for (offset, position) in foreign_key.parent_positions.iter().copied().enumerate() {
-        let old = child_register(parent_table, old_columns, old_rowid, position)?;
-        let new = child_register(parent_table, new_columns, new_rowid, position)?;
-        program.emit_insn(Insn::Copy {
-            src_reg: old,
-            dst_reg: old_key + offset,
-            extra_amount: 0,
-        });
-        program.emit_insn(Insn::Copy {
-            src_reg: new,
-            dst_reg: new_key + offset,
-            extra_amount: 0,
-        });
+    let (old_key, new_key) = copy_parent_change_keys(
+        program,
+        parent_table,
+        &foreign_key.parent_positions,
+        old_columns,
+        new_columns,
+        old_rowid,
+        new_rowid,
+    )?;
+    for offset in 0..foreign_key.parent_positions.len() {
         program.emit_insn(Insn::IsNull {
             reg: old_key + offset,
             target_pc: complete,
         });
+    }
+    for offset in 0..foreign_key.parent_positions.len() {
         let collation = foreign_key
             .parent_unique_index
             .as_ref()
@@ -759,6 +751,15 @@ fn emit_new_child_check(
         });
     }
 
+    let invalid_rowid = foreign_key.parent_uses_rowid.then(|| {
+        let invalid = program.allocate_label();
+        program.emit_insn(Insn::MustBeInt {
+            reg: key,
+            target_pc: Some(invalid),
+        });
+        invalid
+    });
+
     if same_table(foreign_key) {
         let different = program.allocate_label();
         for (offset, position) in foreign_key.parent_positions.iter().copied().enumerate() {
@@ -785,10 +786,6 @@ fn emit_new_child_check(
         }
         let cursor = open_parent_table(program, parent_table, database);
         let missing = program.allocate_label();
-        program.emit_insn(Insn::MustBeInt {
-            reg: key,
-            target_pc: Some(missing),
-        });
         program.emit_insn(Insn::NotExists {
             cursor,
             rowid_reg: key,
@@ -800,6 +797,9 @@ fn emit_new_child_check(
         });
         program.preassign_label_to_next_insn(missing);
         program.emit_insn(Insn::Close { cursor_id: cursor });
+        if let Some(invalid_rowid) = invalid_rowid {
+            program.preassign_label_to_next_insn(invalid_rowid);
+        }
     } else {
         let resolved_index =
             foreign_key
@@ -868,6 +868,35 @@ fn child_register(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn copy_parent_change_keys(
+    program: &mut ProgramBuilder,
+    parent_table: &BTreeTable,
+    parent_positions: &[usize],
+    old_columns: RegisterRange,
+    new_columns: RegisterRange,
+    old_rowid: RegisterId,
+    new_rowid: RegisterId,
+) -> ForeignKeyResult<(usize, usize)> {
+    let old_key = program.alloc_registers(parent_positions.len());
+    let new_key = program.alloc_registers(parent_positions.len());
+    for (offset, position) in parent_positions.iter().copied().enumerate() {
+        let old = child_register(parent_table, old_columns, old_rowid, position)?;
+        let new = child_register(parent_table, new_columns, new_rowid, position)?;
+        program.emit_insn(Insn::Copy {
+            src_reg: old,
+            dst_reg: old_key + offset,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: new,
+            dst_reg: new_key + offset,
+            extra_amount: 0,
+        });
+    }
+    Ok((old_key, new_key))
+}
+
 fn same_table(foreign_key: &ResolvedForeignKey) -> bool {
     foreign_key.child_table.id() == foreign_key.parent_table.id()
         && foreign_key.child_table.database() == foreign_key.parent_table.database()
@@ -903,4 +932,69 @@ fn index_affinities(index: &Index, table: &BTreeTable) -> String {
                 .aff_mask()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod properties {
+    use hegel::generators;
+
+    use super::*;
+    use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
+
+    // Examples: changing parent key `(a, b)` from `(1, 2)` to `(10, 20)`
+    // must copy all four values before either component can branch to an
+    // `ON UPDATE` check or CASCADE program. The same rule holds for wider
+    // keys: an early difference in `a` cannot leave the later `b` parameter
+    // uninitialized in `UPDATE parent SET a = 10, b = 20`.
+    #[hegel::test]
+    fn parent_update_copies_the_complete_old_and_new_keys_before_comparing(tc: hegel::TestCase) {
+        let width = usize::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(12)));
+        let columns = (0..width)
+            .map(|position| format!("c{position} INTEGER"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let table = BTreeTable::from_sql(&format!("CREATE TABLE parent({columns})"), 2)
+            .expect("generated parent table is valid");
+        let mut program = ProgramBuilder::new(
+            QueryMode::Normal,
+            None,
+            ProgramBuilderOpts::new(0, width * 2, 0),
+        );
+        let old_columns = RegisterRange::new(program.alloc_registers(width), width);
+        let new_columns = RegisterRange::new(program.alloc_registers(width), width);
+        let old_rowid = RegisterId(program.alloc_register());
+        let new_rowid = RegisterId(program.alloc_register());
+        let positions = (0..width).collect::<Vec<_>>();
+
+        let (old_key, new_key) = copy_parent_change_keys(
+            &mut program,
+            &table,
+            &positions,
+            old_columns,
+            new_columns,
+            old_rowid,
+            new_rowid,
+        )
+        .expect("generated positions belong to the parent row");
+
+        assert_eq!(program.insns.len(), width * 2);
+        for (offset, pair) in program.insns.chunks_exact(2).enumerate() {
+            assert!(matches!(
+                pair[0].0,
+                Insn::Copy {
+                    src_reg,
+                    dst_reg,
+                    extra_amount: 0,
+                } if src_reg == old_columns.first.0 + offset && dst_reg == old_key + offset
+            ));
+            assert!(matches!(
+                pair[1].0,
+                Insn::Copy {
+                    src_reg,
+                    dst_reg,
+                    extra_amount: 0,
+                } if src_reg == new_columns.first.0 + offset && dst_reg == new_key + offset
+            ));
+        }
+    }
 }
