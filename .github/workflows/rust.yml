@@ -189,6 +189,21 @@ jobs:
             exit $LASTEXITCODE
           }
 
+  build-wasm32-unknown-unknown:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Add wasm32 Rust target
+        run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - name: Check turso builds for wasm32-unknown-unknown
+        run: cargo check -p turso --target wasm32-unknown-unknown --locked
+
   shuttle-tests:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30

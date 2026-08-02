@@ -1057,6 +1057,7 @@ impl TursoConnection {
         self.connection.set_load_extension_enabled(enabled);
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub fn load_extension(&self, path: &str) -> Result<(), TursoError> {
         turso_core::resolve_ext_path(path)
             .and_then(|path| self.connection.load_extension(path))

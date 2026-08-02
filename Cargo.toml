@@ -149,6 +149,7 @@ miette = "7.6.0"
 bitflags = "2.9.4"
 fallible-iterator = "0.3.0"
 allocator-api2 = "0.4"
+getrandom = "0.4.2"
 
 criterion = "0.5.0"
 codspeed-criterion-compat = "4.2.1"
