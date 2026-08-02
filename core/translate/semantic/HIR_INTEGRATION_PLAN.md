@@ -137,6 +137,9 @@ operations are not SQL binding.
   - [x] UPSERT DO UPDATE keeps the conflicting target and completed excluded
         row as separate SourceId bindings, rebuilds generated/constraint/index
         programs under ABORT semantics, and returns the written NEW row.
+  - [x] UPSERT DO UPDATE keeps the conflicting OLD rowid separate from an
+        assigned NEW rowid or INTEGER PRIMARY KEY alias, probes the NEW key,
+        restores OLD, and writes every index and RETURNING value from NEW.
   - [x] INSERT OR REPLACE deletes all OLD index entries and the conflicting
         row before the NEW write for rowid and UNIQUE conflicts; NOT NULL uses
         its frozen default and falls back to ABORT when the default is NULL.

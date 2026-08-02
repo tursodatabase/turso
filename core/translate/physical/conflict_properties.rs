@@ -8,6 +8,7 @@ use turso_parser::{
 
 use super::*;
 use crate::{
+    QueryMode, SymbolTable,
     dialect::{Dialect, SqliteDialect},
     error::{
         SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
@@ -15,12 +16,11 @@ use crate::{
     },
     schema::{BTreeTable, Index, Schema},
     sync::Arc,
-    translate::semantic::{analyze, context::SemanticContext, AnalyzeInput},
+    translate::semantic::{AnalyzeInput, analyze, context::SemanticContext},
     vdbe::{
         builder::{ProgramBuilder, ProgramBuilderOpts},
         insn::Insn,
     },
-    QueryMode, SymbolTable,
 };
 
 fn parse_statement(sql: &str) -> ast::Stmt {
@@ -139,15 +139,17 @@ fn dml_constraint_failures_follow_the_hir_conflict_policy(tc: hegel::TestCase) {
 
     if policy == ResolveType::Ignore {
         assert!(matching_halts.is_empty());
-        assert!(program
-            .insns
-            .iter()
-            .any(|(instruction, _)| match instruction {
-                Insn::Goto { target_pc } | Insn::IsNull { target_pc, .. } => {
-                    target_pc.is_offset() && target_pc.as_offset_int() as usize > first_write
-                }
-                _ => false,
-            }));
+        assert!(
+            program
+                .insns
+                .iter()
+                .any(|(instruction, _)| match instruction {
+                    Insn::Goto { target_pc } | Insn::IsNull { target_pc, .. } => {
+                        target_pc.is_offset() && target_pc.as_offset_int() as usize > first_write
+                    }
+                    _ => false,
+                })
+        );
     } else {
         assert_eq!(matching_halts.len(), 1);
         assert_eq!(matching_halts[0].1, None);
@@ -203,23 +205,29 @@ fn column_conflict_policies_are_used_without_a_statement_override(tc: hegel::Tes
         .expect("all column-policy branches are closed");
 
     match kind {
-        0 => assert!(program
-            .insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::IsNull { .. }))),
-        1 => assert!(program
-            .insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::Integer { value: 7, .. }))),
+        0 => assert!(
+            program
+                .insns
+                .iter()
+                .any(|(instruction, _)| matches!(instruction, Insn::IsNull { .. }))
+        ),
+        1 => assert!(
+            program
+                .insns
+                .iter()
+                .any(|(instruction, _)| matches!(instruction, Insn::Integer { value: 7, .. }))
+        ),
         _ => {
             let collision = program
                 .insns
                 .iter()
                 .position(|(instruction, _)| matches!(instruction, Insn::NotExists { .. }))
                 .expect("rowid uniqueness is checked");
-            assert!(program.insns[collision + 1..]
-                .iter()
-                .any(|(instruction, _)| matches!(instruction, Insn::Goto { .. })));
+            assert!(
+                program.insns[collision + 1..]
+                    .iter()
+                    .any(|(instruction, _)| matches!(instruction, Insn::Goto { .. }))
+            );
         }
     }
 }
@@ -421,9 +429,11 @@ fn upsert_do_update_keeps_target_and_excluded_as_distinct_hir_rows(tc: hegel::Te
             matches!(instruction, Insn::ResultRow { .. }).then_some(position)
         })
         .expect("DO UPDATE returns the written NEW row");
-    assert!(program.insns[seek..delete]
-        .iter()
-        .any(|(instruction, _)| matches!(instruction, Insn::Column { .. })));
+    assert!(
+        program.insns[seek..delete]
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Column { .. }))
+    );
     assert!(
         program.insns[seek..delete]
             .iter()
@@ -619,10 +629,12 @@ fn update_replace_uses_frozen_defaults_and_removes_other_unique_rows(tc: hegel::
         return;
     }
 
-    assert!(program
-        .insns
-        .iter()
-        .any(|(instruction, _)| matches!(instruction, Insn::Eq { .. })));
+    assert!(
+        program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Eq { .. }))
+    );
     assert!(
         program
             .insns
@@ -659,4 +671,83 @@ fn update_replace_uses_frozen_defaults_and_removes_other_unique_rows(tc: hegel::
         })
         .expect("UPDATE then replaces its current row");
     assert!(conflicting_delete < current_delete);
+}
+
+// Examples:
+// - `... ON CONFLICT(c0) DO UPDATE SET rowid = excluded.id + 4` must probe the
+//   proposed key, restore the conflicting OLD row, and insert NEW under that
+//   proposed key rather than the conflict rowid.
+// - Assigning the `INTEGER PRIMARY KEY` alias follows the identical path, so
+//   `SET id = ...` and `SET rowid = ...` cannot drift apart.
+#[hegel::test]
+fn upsert_rowid_assignment_separates_the_conflict_and_written_keys(tc: hegel::TestCase) {
+    let use_alias = tc.draw(generators::booleans());
+    let offset = i64::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(31)));
+    let symbols = SymbolTable::new();
+    let table = Arc::new(
+        BTreeTable::from_sql(
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, c0 INTEGER, c1 INTEGER)",
+            12,
+        )
+        .expect("fixture table SQL is valid"),
+    );
+    let index = Index::from_sql(
+        &symbols,
+        "CREATE UNIQUE INDEX items_c0 ON items(c0)",
+        13,
+        &table,
+    )
+    .expect("fixture index SQL is valid");
+    let mut schema = Schema::new();
+    schema.add_btree_table(table).expect("items is unique");
+    schema
+        .add_index(Arc::new(index))
+        .expect("items_c0 is unique");
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let target = if use_alias { "id" } else { "rowid" };
+    let statement = parse_statement(&format!(
+        "INSERT INTO items(id, c0, c1) VALUES (1, 5, 9) \
+         ON CONFLICT(c0) DO UPDATE SET {target} = excluded.id + {offset} RETURNING id"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated rowid UPSERT has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed rowid UPSERT has a physical plan");
+    let mut program = program();
+    emit_root(&plan, &mut program).expect("rowid UPSERT emits without a resolver");
+    program
+        .resolve_labels()
+        .expect("all rowid UPSERT branches are closed");
+
+    let written_key = program
+        .insns
+        .iter()
+        .rev()
+        .find_map(|(instruction, _)| match instruction {
+            Insn::Insert {
+                key_reg,
+                table_name,
+                ..
+            } if table_name == "items" => Some(*key_reg),
+            _ => None,
+        })
+        .expect("UPSERT writes the NEW table row");
+    assert!(program.insns.iter().any(|(instruction, _)| {
+        matches!(instruction, Insn::MustBeInt { reg, .. } if *reg == written_key)
+    }));
+    assert!(program.insns.iter().any(|(instruction, _)| {
+        matches!(instruction, Insn::NotExists { rowid_reg, .. } if *rowid_reg == written_key)
+    }));
+    assert!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::SeekRowid { .. }))
+            .count()
+            >= 2
+    );
 }

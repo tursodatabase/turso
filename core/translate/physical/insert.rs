@@ -6,24 +6,24 @@ use turso_parser::ast::{ResolveType, TriggerTime};
 
 use crate::{
     error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_FULL},
-    schema::{Table, SQLITE_SEQUENCE_TABLE_NAME},
+    schema::{SQLITE_SEQUENCE_TABLE_NAME, Table},
     translate::semantic::hir::{self, IndexCoverage, InsertSource, UpsertAction},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{InsertFlags, Insn, RegisterOrLiteral},
+        insn::{CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral},
     },
 };
 
 use super::{
-    close_indexes, emit_complete_logical_row, emit_expression_for_dml, emit_index_insert,
-    emit_index_key, emit_new_row_constraints, emit_query_for_dml, emit_replace_conflicting_row,
-    emit_replace_not_null_defaults, emit_replace_unique_check, emit_returning_result,
-    emit_returning_values, emit_stored_record, emit_trigger_programs, emit_unique_check,
-    open_indexes, record_from_registers, CdcChange, CursorId, ExpressionEmitter, OpenedIndex,
-    PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError, PhysicalPlan,
-    PhysicalQueryError, PhysicalRoot, PhysicalRowError, PhysicalSourceKind, PhysicalTriggerError,
-    PreparedCdc, PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs,
-    RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess, TriggerRow, TriggerRows,
+    CdcChange, CursorId, ExpressionEmitter, OpenedIndex, PhysicalExpressionError,
+    PhysicalForeignKeyError, PhysicalIndexError, PhysicalPlan, PhysicalQueryError, PhysicalRoot,
+    PhysicalRowError, PhysicalSourceKind, PhysicalTriggerError, PreparedCdc, PreparedTriggers,
+    RegisterId, RegisterRange, RootRuntimeInputs, RuntimeBindingError, RuntimeBindings,
+    SourceRuntime, TableAccess, TriggerRow, TriggerRows, close_indexes, emit_complete_logical_row,
+    emit_expression_for_dml, emit_index_insert, emit_index_key, emit_new_row_constraints,
+    emit_query_for_dml, emit_replace_conflicting_row, emit_replace_not_null_defaults,
+    emit_replace_unique_check, emit_returning_result, emit_returning_values, emit_stored_record,
+    emit_trigger_programs, emit_unique_check, open_indexes, record_from_registers,
 };
 
 #[derive(Debug)]
@@ -1024,20 +1024,6 @@ fn preflight_insert<'plan>(
             "UPSERT and excluded source must exist together",
         ));
     }
-    if insert.upserts.iter().any(|upsert| {
-        matches!(
-            &upsert.action,
-            UpsertAction::Update { assignments, .. }
-                if assignments
-                    .iter()
-                    .flat_map(|assignment| &assignment.columns)
-                    .any(|column| matches!(column, hir::TargetColumn::RowId))
-        )
-    }) {
-        return Err(PhysicalInsertError::Unsupported(
-            "rowid assignment in UPSERT DO UPDATE",
-        ));
-    }
     if !triggers.covers(&insert.triggers) {
         return Err(PhysicalInsertError::Invalid(
             "resolved trigger has no prepared program",
@@ -1232,6 +1218,12 @@ fn emit_upsert_action<'document>(
     }
 
     let updated = RegisterRange::new(program.alloc_registers(excluded.width), excluded.width);
+    let updated_rowid = RegisterId(program.alloc_register());
+    program.emit_insn(Insn::Copy {
+        src_reg: conflicting_rowid.0,
+        dst_reg: updated_rowid.0,
+        extra_amount: 0,
+    });
     for (position, column) in table.columns().iter().enumerate() {
         if column.generated_expr().is_some() {
             continue;
@@ -1243,23 +1235,37 @@ fn emit_upsert_action<'document>(
     }
     for (columns, value) in assignment_values {
         for (position, column) in columns.iter().enumerate() {
-            let hir::TargetColumn::Column(column) = column else {
-                return Err(PhysicalInsertError::Unsupported(
-                    "rowid assignment in UPSERT DO UPDATE",
-                ));
+            let destination = match column {
+                hir::TargetColumn::Column(column)
+                    if table
+                        .columns()
+                        .get(*column)
+                        .is_some_and(|column| column.is_rowid_alias()) =>
+                {
+                    updated_rowid.0
+                }
+                hir::TargetColumn::Column(column) => updated.first.0 + column,
+                hir::TargetColumn::RowId => updated_rowid.0,
             };
             program.emit_insn(Insn::Copy {
                 src_reg: value.first.0 + position,
-                dst_reg: updated.first.0 + column,
+                dst_reg: destination,
                 extra_amount: 0,
             });
         }
+    }
+    if let Some((position, _)) = table.get_rowid_alias_column() {
+        program.emit_insn(Insn::Copy {
+            src_reg: updated_rowid.0,
+            dst_reg: updated.first.0 + position,
+            extra_amount: 0,
+        });
     }
     let old_target = bindings.replace_source(
         insert.target,
         SourceRuntime::Registers {
             columns: updated,
-            rowid: Some(conflicting_rowid),
+            rowid: Some(updated_rowid),
         },
     )?;
     emit_complete_logical_row(program, bindings, insert.target, table, updated)?;
@@ -1272,16 +1278,38 @@ fn emit_upsert_action<'document>(
         Some(ResolveType::Abort),
         skip_row,
     )?;
+    let rowid_is_unique = program.allocate_label();
+    program.emit_insn(Insn::MustBeInt {
+        reg: updated_rowid.0,
+        target_pc: None,
+    });
+    program.emit_insn(Insn::Eq {
+        lhs: updated_rowid.0,
+        rhs: conflicting_rowid.0,
+        target_pc: rowid_is_unique,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::NotExists {
+        cursor,
+        rowid_reg: updated_rowid.0,
+        target_pc: rowid_is_unique,
+    });
+    super::constraint_halt(
+        program,
+        SQLITE_CONSTRAINT_PRIMARYKEY,
+        format!("{}.rowid", table.name),
+        ResolveType::Abort,
+    );
+    program.preassign_label_to_next_insn(rowid_is_unique);
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: cursor,
+        src_reg: conflicting_rowid.0,
+        target_pc: skip_row,
+    });
     let mut new_keys = Vec::with_capacity(indexes.len());
     for index in indexes {
-        let key = emit_index_key(
-            program,
-            bindings,
-            insert.target,
-            conflicting_rowid,
-            index,
-            true,
-        )?;
+        let key = emit_index_key(program, bindings, insert.target, updated_rowid, index, true)?;
         emit_unique_check(
             program,
             index,
@@ -1306,7 +1334,7 @@ fn emit_upsert_action<'document>(
     }
     program.emit_insn(Insn::Insert {
         cursor,
-        key_reg: conflicting_rowid.0,
+        key_reg: updated_rowid.0,
         record_reg: record,
         flag: InsertFlags::new(),
         table_name: table.name.clone(),
