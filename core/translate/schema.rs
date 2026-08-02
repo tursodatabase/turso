@@ -24,7 +24,9 @@ use crate::translate::{
     semantic::{
         analyze,
         context::{DmlPolicy, SemanticContext},
-        hir, AnalyzeInput,
+        hir,
+        schema_expr::{analyze_table_schema_syntax, SchemaSyntaxInput},
+        AnalyzeInput,
     },
 };
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
@@ -732,6 +734,7 @@ fn validate_check_types_in_expr(
 fn validate(
     body: &ast::CreateTableBody,
     table_name: &str,
+    database_id: usize,
     ddl_context: &DdlContext,
     conn: &Connection,
 ) -> Result<()> {
@@ -881,6 +884,32 @@ fn validate(
         }
 
         let table = create_table(table_name, body, 0)?;
+        let generated_syntax = columns
+            .iter()
+            .enumerate()
+            .flat_map(|(column_index, column)| {
+                column.constraints.iter().filter_map(move |constraint| {
+                    let ast::ColumnConstraint::Generated { expr, .. } = &constraint.constraint
+                    else {
+                        return None;
+                    };
+                    Some(SchemaSyntaxInput {
+                        syntax: expr,
+                        profile: crate::schema_expr::SchemaExprProfile::GeneratedColumn,
+                        owner_column: Some(column_index),
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        if !generated_syntax.is_empty() {
+            let context = ddl_context.semantic_context(conn.get_dqs_dml().into());
+            analyze_table_schema_syntax(
+                &context,
+                database_id,
+                Arc::new(Table::BTree(Arc::new(table.clone()))),
+                &generated_syntax,
+            )?;
+        }
         if !table.has_rowid {
             if table.has_autoincrement {
                 bail_parse_error!("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");
@@ -1125,7 +1154,13 @@ pub fn translate_create_table(
     let schema_cookie = ddl_context.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
-    validate(&body, &normalized_tbl_name, ddl_context, connection)?;
+    validate(
+        &body,
+        &normalized_tbl_name,
+        database_id,
+        ddl_context,
+        connection,
+    )?;
 
     // Gate array column types behind the experimental custom types flag.
     if !connection.experimental_custom_types_enabled() {
