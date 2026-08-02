@@ -113,6 +113,9 @@ operations are not SQL binding.
   - [x] UPDATE FROM evaluates predicates and assignments while target and FROM
         SourceIds are live, then materializes one stable value row per target
         rowid before the write phase.
+  - [x] UPDATE FROM freezes FROM-derived ORDER BY values with each candidate,
+        applies LIMIT/OFFSET to that closed candidate set, and carries only the
+        selected target rowids and assignment values into the write phase.
   - [x] Correlated scalar and EXISTS subqueries in UPDATE predicates and
         assignments, and DELETE predicates, share the query layer's QueryId
         destinations and CTE lifetime rules.

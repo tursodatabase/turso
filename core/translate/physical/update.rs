@@ -189,6 +189,8 @@ pub(crate) fn emit_root_update_with_context(
                 from,
                 update.predicate.as_ref(),
                 &update.assignments,
+                &update.order_by,
+                update.limit.as_ref(),
             )
         })
         .transpose()?;
@@ -252,10 +254,19 @@ pub(crate) fn emit_root_update_with_context(
             pc_if_empty: write_done,
         });
         program.preassign_label_to_next_insn(write_start);
-        program.emit_insn(Insn::RowId {
-            cursor_id: from_rows.cursor,
-            dest: rowid.0,
-        });
+        if let Some(column) = from_rows.rowid_column {
+            program.emit_insn(Insn::Column {
+                cursor_id: from_rows.cursor,
+                column,
+                dest: rowid.0,
+                default: None,
+            });
+        } else {
+            program.emit_insn(Insn::RowId {
+                cursor_id: from_rows.cursor,
+                dest: rowid.0,
+            });
+        }
     } else if let Some(ordered_rows) = &ordered_rows {
         program.emit_insn(Insn::Rewind {
             cursor_id: ordered_rows.cursor,
@@ -323,7 +334,7 @@ pub(crate) fn emit_root_update_with_context(
             for position in 0..assignment.columns.len() {
                 program.emit_insn(Insn::Column {
                     cursor_id: from_rows.cursor,
-                    column: offset + position,
+                    column: from_rows.assignment_offset + offset + position,
                     dest: values.first.0 + position,
                     default: None,
                 });
@@ -698,9 +709,6 @@ fn preflight_update<'plan>(
     crate::sync::Arc<crate::schema::BTreeTable>,
     usize,
 )> {
-    if update.from.is_some() && (!update.order_by.is_empty() || update.limit.is_some()) {
-        return Err(PhysicalUpdateError::Unsupported("ORDER BY or LIMIT"));
-    }
     if !triggers.covers(&update.triggers) {
         return Err(PhysicalUpdateError::Invalid(
             "resolved trigger has no prepared program",

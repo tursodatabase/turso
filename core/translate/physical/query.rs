@@ -112,6 +112,7 @@ enum ScanRowAction<'hir, 'destination> {
     UpdateCandidate {
         target: SourceId,
         assignments: &'hir [Assignment],
+        order_by: &'hir [OrderTerm],
         cursor: usize,
         table: &'destination BTreeTable,
     },
@@ -247,6 +248,8 @@ pub(crate) struct MaterializedQuery {
 pub(crate) struct MaterializedUpdateRows {
     pub(crate) cursor: usize,
     pub(crate) width: usize,
+    pub(crate) rowid_column: Option<usize>,
+    pub(crate) assignment_offset: usize,
 }
 
 pub(crate) struct MaterializedDmlRowids {
@@ -794,6 +797,8 @@ pub(crate) fn emit_update_from_rows<'document>(
     from: &HirFrom,
     filter: Option<&Expr>,
     assignments: &'document [Assignment],
+    order_by: &'document [OrderTerm],
+    limit: Option<&'document crate::translate::semantic::hir::Limit>,
 ) -> QueryResult<MaterializedUpdateRows> {
     let width = assignments
         .iter()
@@ -804,7 +809,8 @@ pub(crate) fn emit_update_from_rows<'document>(
             "UPDATE FROM has no assignment values",
         ));
     }
-    let table = ephemeral_table(format!("update_from_{}", target.index()), width);
+    let candidate_width = width + order_by.len();
+    let table = ephemeral_table(format!("update_from_{}", target.index()), candidate_width);
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id: cursor,
@@ -870,6 +876,7 @@ pub(crate) fn emit_update_from_rows<'document>(
         ScanRowAction::UpdateCandidate {
             target,
             assignments,
+            order_by,
             cursor,
             table: &table,
         },
@@ -884,6 +891,137 @@ pub(crate) fn emit_update_from_rows<'document>(
             });
         }
     }
+    let selected = if order_by.is_empty() && limit.is_none() {
+        MaterializedUpdateRows {
+            cursor,
+            width,
+            rowid_column: None,
+            assignment_offset: 0,
+        }
+    } else {
+        let selected_table = ephemeral_table(
+            format!("selected_update_from_{}", target.index()),
+            width + 1,
+        );
+        let selected_cursor =
+            program.alloc_cursor_id(CursorType::BTreeTable(selected_table.clone()));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id: selected_cursor,
+            is_table: true,
+        });
+        let destination = QueryDestination::EphemeralTable {
+            cursor_id: selected_cursor,
+            table: &selected_table,
+        };
+        let runtime_limit = open_limit(plan, program, bindings, &mut ctes, limit, destination)?;
+        let sorter = if order_by.is_empty() {
+            None
+        } else {
+            let sorter_cursor = program.alloc_cursor_id(CursorType::Sorter);
+            program.emit_insn(Insn::SorterOpen {
+                cursor_id: sorter_cursor,
+                columns: order_by.len(),
+                order_collations_nulls: order_by
+                    .iter()
+                    .map(|term| {
+                        (
+                            term.order,
+                            term.collation.as_ref().map(|collation| *collation.value()),
+                            term.nulls,
+                        )
+                    })
+                    .collect(),
+                comparators: order_by
+                    .iter()
+                    .map(|term| sort_comparator(&term.type_fact))
+                    .collect(),
+            });
+            Some(OpenedSorter {
+                cursor_id: sorter_cursor,
+                record: RegisterId(program.alloc_register()),
+                order_by,
+                first_block: QueryBlockId::new(QueryId::new(0), 0),
+                width: width + 1,
+            })
+        };
+        let scan_start = program.allocate_label();
+        let scan_done = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: cursor,
+            pc_if_empty: scan_done,
+        });
+        program.preassign_label_to_next_insn(scan_start);
+        let target_rowid = program.alloc_register();
+        program.emit_insn(Insn::RowId {
+            cursor_id: cursor,
+            dest: target_rowid,
+        });
+        let row = program.alloc_registers(width + 1);
+        program.emit_insn(Insn::Copy {
+            src_reg: target_rowid,
+            dst_reg: row,
+            extra_amount: 0,
+        });
+        for position in 0..width {
+            program.emit_insn(Insn::Column {
+                cursor_id: cursor,
+                column: position,
+                dest: row + 1 + position,
+                default: None,
+            });
+        }
+        if let Some(sorter) = sorter {
+            let fields = program.alloc_registers(order_by.len() + width + 1);
+            for position in 0..order_by.len() {
+                program.emit_insn(Insn::Column {
+                    cursor_id: cursor,
+                    column: width + position,
+                    dest: fields + position,
+                    default: None,
+                });
+            }
+            program.emit_insn(Insn::Copy {
+                src_reg: row,
+                dst_reg: fields + order_by.len(),
+                extra_amount: width,
+            });
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u32(fields),
+                count: to_u32(order_by.len() + width + 1),
+                dest_reg: to_u32(sorter.record.0),
+                index_name: None,
+                affinity_str: None,
+            });
+            program.emit_insn(Insn::SorterInsert {
+                cursor_id: sorter.cursor_id,
+                record_reg: sorter.record.0,
+            });
+        } else {
+            emit_row_destination_without_context(
+                program,
+                RegisterRange::new(row, width + 1),
+                destination,
+                runtime_limit,
+            )?;
+        }
+        program.emit_insn(Insn::Next {
+            cursor_id: cursor,
+            pc_if_next: scan_start,
+        });
+        program.preassign_label_to_next_insn(scan_done);
+        if let Some(sorter) = sorter {
+            emit_sorted_rows(program, sorter, destination, runtime_limit)?;
+        } else if let Some(limit) = runtime_limit {
+            program.preassign_label_to_next_insn(limit.done);
+        }
+        program.emit_insn(Insn::Close { cursor_id: cursor });
+        MaterializedUpdateRows {
+            cursor: selected_cursor,
+            width,
+            rowid_column: Some(0),
+            assignment_offset: 1,
+        }
+    };
     for cursor_id in ctes.temporary_cursors.iter().rev() {
         program.emit_insn(Insn::Close {
             cursor_id: *cursor_id,
@@ -894,7 +1032,7 @@ pub(crate) fn emit_update_from_rows<'document>(
             cursor_id: cte.cursor_id,
         });
     }
-    Ok(MaterializedUpdateRows { cursor, width })
+    Ok(selected)
 }
 
 fn emit_query<'document>(
@@ -2844,6 +2982,7 @@ fn emit_scan_action<'document>(
         ScanRowAction::UpdateCandidate {
             target,
             assignments,
+            order_by,
             cursor,
             table,
         } => {
@@ -2857,10 +2996,11 @@ fn emit_scan_action<'document>(
                 cursor_id: target_cursor.0,
                 dest: rowid,
             });
-            let width = assignments
+            let assignment_width = assignments
                 .iter()
                 .map(|assignment| assignment.columns.len())
                 .sum::<usize>();
+            let width = assignment_width + order_by.len();
             let values = program.alloc_registers(width);
             let mut offset = 0;
             for assignment in assignments {
@@ -2870,6 +3010,12 @@ fn emit_scan_action<'document>(
                     RegisterRange::new(values + offset, assignment.columns.len()),
                 )?;
                 offset += assignment.columns.len();
+            }
+            for term in order_by {
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                    .emit_into(&term.expr, RegisterRange::new(values + offset, 1))?;
+                offset += 1;
             }
             let record = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
