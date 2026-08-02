@@ -6,7 +6,8 @@ use turso_parser::{ast, parser::Parser};
 use super::*;
 use crate::{
     dialect::{Dialect, SqliteDialect},
-    schema::{BTreeTable, Schema},
+    error::SQLITE_CONSTRAINT_FOREIGNKEY,
+    schema::{BTreeTable, Index, Schema},
     sync::Arc,
     translate::semantic::{
         analyze,
@@ -34,6 +35,124 @@ fn parse_statement(sql: &str) -> ast::Stmt {
 
 fn program() -> ProgramBuilder {
     ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 32, 8))
+}
+
+// Examples: changing `parents.p3` from `old` to `new` with
+// `children.c1 REFERENCES parents(p3)` must compare the frozen OLD/NEW parent
+// positions before scanning child position one. NO ACTION counts old matches
+// and repairs deferred matches after the new row exists; RESTRICT halts before
+// the write. Varying both positions proves no column name is rebound here.
+#[hegel::test]
+fn update_parent_checks_only_a_changed_frozen_key(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(10)));
+    let child_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let parent_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let restrict = tc.draw(generators::booleans());
+    let deferred = tc.draw(generators::booleans());
+    let parent_columns = (0..width)
+        .map(|position| format!("p{position} TEXT"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let child_columns = (0..width)
+        .map(|position| {
+            if position == child_position {
+                format!(
+                    "c{position} TEXT REFERENCES parents(p{parent_position}) ON UPDATE {}{}",
+                    if restrict { "RESTRICT" } else { "NO ACTION" },
+                    if deferred {
+                        " DEFERRABLE INITIALLY DEFERRED"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                format!("c{position} TEXT")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let parent = Arc::new(
+        BTreeTable::from_sql(&format!("CREATE TABLE parents({parent_columns})"), 23)
+            .expect("parent table SQL is valid"),
+    );
+    let child = Arc::new(
+        BTreeTable::from_sql(&format!("CREATE TABLE children({child_columns})"), 29)
+            .expect("child table SQL is valid"),
+    );
+    let symbols = SymbolTable::new();
+    let parent_index = Index::from_sql(
+        &symbols,
+        &format!("CREATE UNIQUE INDEX parents_key ON parents(p{parent_position})"),
+        31,
+        &parent,
+    )
+    .expect("parent unique index SQL is valid");
+    let mut schema = Schema::new();
+    schema.add_btree_table(parent).expect("parents is unique");
+    schema.add_btree_table(child).expect("children is unique");
+    schema
+        .add_index(Arc::new(parent_index))
+        .expect("parents_key is unique");
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect)
+        .with_dml_policy(DmlPolicy::new(false, false, false, false, true));
+    let statement = parse_statement(&format!("UPDATE parents SET p{parent_position} = 'new'"));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated parent UPDATE has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed FK UPDATE has a physical plan");
+    let mut program = program();
+    emit_root_update(&plan, &mut program).expect("parent FK UPDATE emits without a resolver");
+    program
+        .resolve_labels()
+        .expect("all parent FK UPDATE branches are closed");
+
+    let child_read = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(
+                instruction,
+                Insn::OpenRead {
+                    root_page: 29,
+                    db: 0,
+                    ..
+                }
+            )
+        })
+        .expect("the frozen child table is scanned");
+    let parent_delete = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(instruction, Insn::Delete { table_name, .. } if table_name == "parents")
+        })
+        .expect("the old parent row is removed");
+    assert!(child_read < parent_delete);
+    if restrict {
+        assert!(program.insns.iter().any(|(instruction, _)| {
+            matches!(instruction, Insn::Halt { err_code, .. } if *err_code == SQLITE_CONSTRAINT_FOREIGNKEY)
+        }));
+    } else {
+        assert!(program.insns.iter().any(|(instruction, _)| {
+            matches!(instruction, Insn::FkCounter { increment_value: 1, deferred: actual } if *actual == deferred)
+        }));
+        assert_eq!(
+            program.insns.iter().any(|(instruction, _)| {
+                matches!(
+                    instruction,
+                    Insn::FkCounter {
+                        increment_value: -1,
+                        deferred: true
+                    }
+                )
+            }),
+            deferred
+        );
+    }
 }
 
 // Examples: `UPDATE children SET c3 = 8` removes any deferred violation for

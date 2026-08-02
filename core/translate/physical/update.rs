@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use turso_parser::ast::{ResolveType, TriggerTime};
+use turso_parser::ast::{RefAct, ResolveType, TriggerTime};
 
 use crate::{
     schema::Table,
@@ -154,6 +154,7 @@ pub(crate) fn emit_root_update_with_context(
     );
     let old_columns = (!update.triggers.is_empty()
         || !update.foreign_keys.outgoing.is_empty()
+        || !update.foreign_keys.incoming.is_empty()
         || cdc.is_some_and(|cdc| cdc.has_before() || cdc.has_updates()))
     .then(|| {
         RegisterRange::new(
@@ -398,6 +399,16 @@ pub(crate) fn emit_root_update_with_context(
             rowid,
         )?;
     }
+    if !update.foreign_keys.incoming.is_empty() {
+        super::emit_update_parent_checks(
+            program,
+            &update.foreign_keys.incoming,
+            &table,
+            old_columns.expect("incoming foreign keys require the frozen OLD row"),
+            logical,
+            rowid,
+        )?;
+    }
     let mut new_keys = Vec::with_capacity(indexes.len());
     for index in &indexes {
         let key = emit_index_key(program, &mut bindings, update.target, rowid, index, true)?;
@@ -451,6 +462,15 @@ pub(crate) fn emit_root_update_with_context(
         flag: InsertFlags::new(),
         table_name: table.name.clone(),
     });
+    if !update.foreign_keys.incoming.is_empty() {
+        super::emit_insert_parent_repairs(
+            program,
+            &update.foreign_keys.incoming,
+            &table,
+            logical,
+            rowid,
+        )?;
+    }
     if let Some(old_columns) = old_columns {
         let after_trigger_done = program.allocate_label();
         emit_trigger_programs(
@@ -552,9 +572,14 @@ fn preflight_update<'plan>(
             "resolved trigger has no prepared program",
         ));
     }
-    if !update.foreign_keys.incoming.is_empty() {
+    if update.foreign_keys.incoming.iter().any(|foreign_key| {
+        !matches!(
+            foreign_key.declaration.on_update,
+            RefAct::NoAction | RefAct::Restrict
+        )
+    }) {
         return Err(PhysicalUpdateError::Unsupported(
-            "parent-side foreign-key update checks and actions",
+            "mutating parent-side foreign-key update actions",
         ));
     }
     if update
