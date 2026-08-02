@@ -13,7 +13,10 @@ use crate::{
     sync::Arc,
     translate::semantic::{
         context::SemanticContext,
-        schema_expr::{analyze_schema_expr, analyze_table_schema_syntax, SchemaSyntaxInput},
+        schema_expr::{
+            analyze_positional_scalar_syntax, analyze_schema_expr, analyze_table_schema_syntax,
+            SchemaExprInput, SchemaSyntaxInput,
+        },
     },
     vdbe::{
         builder::{ProgramBuilder, ProgramBuilderOpts},
@@ -22,6 +25,68 @@ use crate::{
     QueryMode, SymbolTable,
 };
 use turso_parser::ast;
+
+// Examples:
+// - Input `c2` over `[c0, c1, c2]` reads register 42 when the caller binds the
+//   input range at register 40.
+// - Binding the same closed HIR at register 90 makes `c2` read register 92;
+//   the parser expression remains the identifier `c2` in both cases.
+// For every generated width, position, and register base, semantic analysis
+// turns the input name into one stable HIR position. Runtime placement is a
+// separate physical concern and cannot leak register nodes into parser syntax.
+#[hegel::test]
+fn positional_scalar_inputs_bind_by_hir_position_not_parser_mutation(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(16)));
+    let position = usize::from(
+        tc.draw(generators::integers::<u8>().max_value(u8::try_from(width - 1).unwrap())),
+    );
+    let register_base =
+        usize::from(tc.draw(generators::integers::<u16>().min_value(1).max_value(1000)));
+    let inputs = (0..width)
+        .map(|column| SchemaExprInput {
+            name: format!("c{column}"),
+            declared_type: None,
+            array_dimensions: 0,
+            type_fact: None,
+        })
+        .collect::<Vec<_>>();
+    let expected_name = format!("c{position}");
+    let syntax = ast::Expr::Id(ast::Name::exact(expected_name.clone()));
+    let schema = Schema::new();
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let analyzed = analyze_positional_scalar_syntax(&context, 0, &syntax, &inputs)
+        .expect("positional expression closes into HIR");
+    let root = match &analyzed.document.root {
+        crate::translate::semantic::hir::HirRoot::SchemaExpressions(root) => root,
+        _ => panic!("positional analysis returns a schema-expression root"),
+    };
+    let plan = PhysicalPlan::new(&analyzed.document).expect("closed HIR plans");
+    let mut runtime = RootRuntimeInputs::default();
+    runtime.bind_source(
+        root.source,
+        SourceRuntime::Registers {
+            columns: RegisterRange::new(register_base, width),
+            rowid: None,
+        },
+    );
+    let mut program =
+        ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 32, 8));
+
+    emit_root_schema_expression_into(&plan, &mut program, &runtime, 0, 2000)
+        .expect("positional expression emits");
+
+    assert!(matches!(
+        &syntax,
+        ast::Expr::Id(name) if name.as_str() == expected_name
+    ));
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Copy { src_reg, dst_reg, extra_amount: 0 }
+            if *src_reg == register_base + position && *dst_reg == 2000
+    )));
+}
 
 // Examples:
 // - Stored index key `c2` over `[c0, c1, c2]` reads runtime register 102

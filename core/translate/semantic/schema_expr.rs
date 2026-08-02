@@ -17,7 +17,9 @@ use crate::vdbe::affinity::Affinity;
 use crate::{LimboError, Result};
 
 use super::hir::{self, CatalogObject, DatabaseId, SourceId, SourceKind, SourceOwner, TypeFact};
-use super::{context::SemanticContext, scope::Scope, Analyzer, CatalogObjectKind};
+use super::{
+    context::SemanticContext, expr::ExprPolicy, scope::Scope, Analyzer, CatalogObjectKind,
+};
 
 /// One stored expression analyzed against one explicit source occurrence.
 ///
@@ -56,6 +58,71 @@ pub(crate) struct SchemaExprInput {
     pub(crate) declared_type: Option<String>,
     pub(crate) array_dimensions: u32,
     pub(crate) type_fact: Option<TypeFact>,
+}
+
+/// Analyze one runtime scalar that has no table inputs.
+///
+/// ATTACH/DETACH use this boundary: syntax and catalog meaning are closed
+/// before the bytecode emitter receives the expression.
+pub(crate) fn analyze_scalar_syntax(
+    context: &SemanticContext<'_>,
+    database_id: usize,
+    syntax: &ast::Expr,
+) -> Result<AnalyzedSchemaExpr> {
+    let mut analyzer = Analyzer::new(context);
+    let source = analyzer.create_schema_expression_source(database_id, &[])?;
+    let expression = analyzer.analyze_expr(
+        syntax,
+        &Scope::default(),
+        ExprPolicy::select()
+            .without_subqueries()
+            .without_aggregate()
+            .without_window(),
+    )?;
+    let document = analyzer.finish(hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
+        source,
+        expressions: vec![expression],
+    }))?;
+    Ok(AnalyzedSchemaExpr { document })
+}
+
+/// Analyze an incremental expression against positional runtime inputs.
+/// Input column names become HIR column identities; registers are supplied
+/// only to physical emission and never written into parser syntax.
+pub(crate) fn analyze_positional_scalar_syntax(
+    context: &SemanticContext<'_>,
+    database_id: usize,
+    syntax: &ast::Expr,
+    inputs: &[SchemaExprInput],
+) -> Result<AnalyzedSchemaExpr> {
+    let mut analyzer = Analyzer::new(context);
+    let table = SchemaTable::new(
+        "incremental expression inputs",
+        inputs
+            .iter()
+            .map(|input| SchemaColumn::new(input.name.clone(), false, input.declared_type.clone()))
+            .collect(),
+        false,
+    );
+    let resolver = SemanticSchemaExprResolver {
+        context,
+        database_id,
+        source_types: Vec::new(),
+    };
+    let expression = SchemaExpr::resolve(
+        syntax,
+        crate::schema_expr::SchemaExprProfile::GeneratedColumn,
+        SchemaExprContext::for_table(&table),
+        &resolver,
+        ResolutionMode::Strict,
+    )?;
+    let source = analyzer.create_schema_expression_source(database_id, inputs)?;
+    let expression = analyzer.instantiate_schema_expr(expression.as_valid()?, source)?;
+    let document = analyzer.finish(hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
+        source,
+        expressions: vec![expression],
+    }))?;
+    Ok(AnalyzedSchemaExpr { document })
 }
 
 /// Resolve a stored expression against the same immutable catalog snapshot as
