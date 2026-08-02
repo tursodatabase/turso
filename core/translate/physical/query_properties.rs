@@ -2739,6 +2739,104 @@ fn positional_value_windows_use_the_bound_default_frame(tc: hegel::TestCase) {
         .any(|(instruction, _)| matches!(instruction, Insn::Compare { count, .. } if *count == 1)));
 }
 
+// Examples under the default peer frame:
+// - `sum(value) OVER (PARTITION BY g ORDER BY rank)` includes all earlier rows
+//   and every current peer, even when table rowid order differs from rank.
+// - `count(*) FILTER (WHERE keep) OVER (...)` applies the SELECT filter first,
+//   then the aggregate's independent FILTER only to rows inside the frame.
+// - `group_concat(value, ':') OVER (...)` evaluates both bound arguments for
+//   every included row and finalizes one accumulator per outer row.
+#[hegel::test]
+fn aggregate_windows_step_only_the_bound_default_frame(tc: hegel::TestCase) {
+    let descending = tc.draw(generators::booleans());
+    let filter_position = tc.draw(generators::integers::<usize>().max_value(3));
+    let direction = if descending { "DESC" } else { "ASC" };
+    let columns = ["g", "value", "rank", "keep"];
+    let items = BTreeTable::from_sql(
+        "CREATE TABLE items(g INTEGER, value INTEGER, rank INTEGER, keep INTEGER)",
+        71,
+    )
+    .expect("fixture table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(items))
+        .expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT sum(value) OVER (PARTITION BY g ORDER BY rank {direction}), \
+         count(*) FILTER (WHERE keep > 0) \
+           OVER (PARTITION BY g ORDER BY rank {direction}), \
+         group_concat(value, ':') \
+           OVER (PARTITION BY g ORDER BY rank {direction}) \
+         FROM items WHERE {} >= ?1",
+        columns[filter_position]
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated aggregate-window query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed aggregate-window HIR has a plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("aggregate windows emit from closed HIR");
+    program
+        .resolve_labels()
+        .expect("all aggregate-window branches are closed");
+
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| {
+                matches!(
+                    instruction,
+                    Insn::OpenRead {
+                        root_page: 71,
+                        db: 0,
+                        ..
+                    }
+                )
+            })
+            .count(),
+        4
+    );
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::AggStep { .. }))
+            .count(),
+        3
+    );
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::AggFinal { .. }))
+            .count(),
+        3
+    );
+    let first_step = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::AggStep { .. }))
+        .expect("window rows step an accumulator");
+    let first_final = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::AggFinal { .. }))
+        .expect("window accumulators are finalized");
+    let result = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { .. }))
+        .expect("the outer row is emitted");
+    assert!(first_step < first_final && first_final < result);
+}
+
 // Example: `SELECT c3, sum(c5), count(*) FROM items GROUP BY c3`, where
 // `c3 TEXT COLLATE NOCASE`, sorts with the collation frozen in HIR, reloads
 // each sorted source row under the same SourceId, steps one accumulator per

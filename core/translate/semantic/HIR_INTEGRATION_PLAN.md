@@ -101,6 +101,8 @@ operations are not SQL binding.
         window order and seek an ordinal without parser-expression rewrites.
   - [x] `first_value`, `last_value`, and `nth_value` use the bound default RANGE
         frame, including peer ends and positive-N validation.
+  - [x] Aggregate window calls step their resolved arguments and FILTER over
+        the bound default RANGE frame and finalize through WindowFunctionId.
   - [ ] Window execution, RIGHT/FULL OUTER JOIN, and the remaining compound
         combinations.
   - [x] Recursive CTE seeds and arms feed a frozen-HIR priority queue, bind

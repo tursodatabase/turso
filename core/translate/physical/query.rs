@@ -2256,24 +2256,27 @@ fn emit_ranking_window_query<'document>(
         ));
     };
     for function in &block.window_functions {
-        let Func::Window(
-            WindowFunc::RowNumber
-            | WindowFunc::Rank
-            | WindowFunc::DenseRank
-            | WindowFunc::PercentRank
-            | WindowFunc::CumeDist
-            | WindowFunc::Ntile
-            | WindowFunc::Lag
-            | WindowFunc::Lead
-            | WindowFunc::FirstValue
-            | WindowFunc::LastValue
-            | WindowFunc::NthValue,
-        ) = function.call.function.value()
-        else {
-            return Err(PhysicalQueryError::Unsupported(
-                "window function outside the ranking subset",
-            ));
-        };
+        match function.call.function.value() {
+            Func::Agg(_) => {}
+            Func::Window(
+                WindowFunc::RowNumber
+                | WindowFunc::Rank
+                | WindowFunc::DenseRank
+                | WindowFunc::PercentRank
+                | WindowFunc::CumeDist
+                | WindowFunc::Ntile
+                | WindowFunc::Lag
+                | WindowFunc::Lead
+                | WindowFunc::FirstValue
+                | WindowFunc::LastValue
+                | WindowFunc::NthValue,
+            ) => {}
+            _ => {
+                return Err(PhysicalQueryError::Unsupported(
+                    "window function outside the HIR subset",
+                ));
+            }
+        }
         bindings.bind_window_function(
             function.id,
             super::WindowFunctionRuntime {
@@ -2350,6 +2353,12 @@ fn emit_ranking_window_row<'document>(
 
     let emission = (|| -> QueryResult<()> {
         for function in &block.window_functions {
+            if matches!(function.call.function.value(), Func::Agg(_)) {
+                emit_default_aggregate_window(
+                    plan, program, bindings, ctes, function, source, filter,
+                )?;
+                continue;
+            }
             let Func::Window(
                 kind @ (WindowFunc::RowNumber
                 | WindowFunc::Rank
@@ -2838,6 +2847,324 @@ fn emit_ranking_window_row<'document>(
         )
     })();
     bindings.replace_source(*source_id, previous_outer)?;
+    emission
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_default_aggregate_window<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    ctes: &mut MaterializedCtes,
+    window: &super::PhysicalWindowFunction<'document>,
+    source: &PhysicalSource<'document>,
+    filter: Option<&'document Expr>,
+) -> QueryResult<()> {
+    let call = window.call;
+    let Func::Agg(function) = call.function.value() else {
+        return Err(PhysicalQueryError::Invalid(
+            "non-aggregate reached aggregate-window emission",
+        ));
+    };
+    let spec = call.window.as_ref().ok_or(PhysicalQueryError::Invalid(
+        "aggregate window has no specification",
+    ))?;
+    if spec.frame.is_some() {
+        return Err(PhysicalQueryError::Unsupported(
+            "explicit frame for an aggregate window",
+        ));
+    }
+    if !call.argument_order.is_empty() {
+        return Err(PhysicalQueryError::Unsupported(
+            "argument ORDER BY inside an aggregate window",
+        ));
+    }
+    let value = bindings.window_function(window.id)?.register;
+    program.emit_insn(Insn::Null {
+        dest: value.0,
+        dest_end: None,
+    });
+    let distinct = call.distinctness.is_some().then(|| {
+        let hash_table_id = program.alloc_hash_table_id();
+        program.emit_insn(Insn::HashClear { hash_table_id });
+        hash_table_id
+    });
+    let outer_partition = program.alloc_registers(spec.partition_by.len());
+    for (position, expression) in spec.partition_by.iter().enumerate() {
+        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries).emit_into(
+            expression,
+            RegisterRange::new(outer_partition + position, 1),
+        )?;
+    }
+    let outer_order = program.alloc_registers(spec.order_by.len());
+    for (position, term) in spec.order_by.iter().enumerate() {
+        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+            .emit_into(&term.expr, RegisterRange::new(outer_order + position, 1))?;
+    }
+
+    let inner = open_source(plan, program, bindings, ctes, source)?;
+    let ScanCursor::BTree(inner_cursor) = inner.cursor else {
+        return Err(PhysicalQueryError::Unsupported(
+            "aggregate window over a non-B-tree source",
+        ));
+    };
+    let outer_runtime = bindings.replace_source(
+        source.id,
+        SourceRuntime::Cursor(super::CursorId(inner.runtime_cursor)),
+    )?;
+    let emission = (|| -> QueryResult<()> {
+        let loop_start = program.allocate_label();
+        let loop_next = program.allocate_label();
+        let done = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: inner_cursor,
+            pc_if_empty: done,
+        });
+        program.preassign_label_to_next_insn(loop_start);
+        if let Some(filter) = filter {
+            emit_filter(plan, program, bindings, ctes, filter, loop_next)?;
+        }
+        if !spec.partition_by.is_empty() {
+            let inner_partition = program.alloc_registers(spec.partition_by.len());
+            for (position, expression) in spec.partition_by.iter().enumerate() {
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries).emit_into(
+                    expression,
+                    RegisterRange::new(inner_partition + position, 1),
+                )?;
+            }
+            program.emit_insn(Insn::Compare {
+                start_reg_a: outer_partition,
+                start_reg_b: inner_partition,
+                count: spec.partition_by.len(),
+                key_info: spec
+                    .partition_by
+                    .iter()
+                    .map(|expression| KeyInfo {
+                        sort_order: SortOrder::Asc,
+                        collation: expression_collation(plan, expression),
+                        nulls_order: None,
+                    })
+                    .collect(),
+            });
+            let same_partition = program.allocate_label();
+            program.emit_insn(Insn::Jump {
+                target_pc_lt: loop_next,
+                target_pc_eq: same_partition,
+                target_pc_gt: loop_next,
+            });
+            program.preassign_label_to_next_insn(same_partition);
+        }
+        if !spec.order_by.is_empty() {
+            let inner_order = program.alloc_registers(spec.order_by.len());
+            for (position, term) in spec.order_by.iter().enumerate() {
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                    .emit_into(&term.expr, RegisterRange::new(inner_order + position, 1))?;
+            }
+            program.emit_insn(Insn::Compare {
+                start_reg_a: outer_order,
+                start_reg_b: inner_order,
+                count: spec.order_by.len(),
+                key_info: spec
+                    .order_by
+                    .iter()
+                    .map(|term| KeyInfo {
+                        sort_order: term.order,
+                        collation: term
+                            .collation
+                            .as_ref()
+                            .map_or(CollationSeq::Binary, |collation| *collation.value()),
+                        nulls_order: term.nulls,
+                    })
+                    .collect(),
+            });
+            let inside_frame = program.allocate_label();
+            program.emit_insn(Insn::Jump {
+                target_pc_lt: loop_next,
+                target_pc_eq: inside_frame,
+                target_pc_gt: inside_frame,
+            });
+            program.preassign_label_to_next_insn(inside_frame);
+        }
+        if let Some(aggregate_filter) = call.filter.as_deref() {
+            emit_filter(plan, program, bindings, ctes, aggregate_filter, loop_next)?;
+        }
+        let (column, delimiter, comparator, collation) = match function {
+            AggFunc::Count0 => {
+                let one = program.alloc_register();
+                program.emit_insn(Insn::Integer {
+                    value: 1,
+                    dest: one,
+                });
+                (one, 0, None, None)
+            }
+            AggFunc::Avg
+            | AggFunc::Count
+            | AggFunc::Max
+            | AggFunc::Min
+            | AggFunc::Sum
+            | AggFunc::Total
+            | AggFunc::ArrayAgg => {
+                let [argument] = call.arguments.as_slice() else {
+                    return Err(PhysicalQueryError::Invalid(
+                        "aggregate window has the wrong argument count",
+                    ));
+                };
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                let argument_value =
+                    ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                        .emit_new(argument)?;
+                let comparison = matches!(function, AggFunc::Min | AggFunc::Max);
+                (
+                    argument_value.first.0,
+                    0,
+                    comparison
+                        .then(|| expression_type_fact(plan, argument))
+                        .flatten()
+                        .as_ref()
+                        .and_then(sort_comparator),
+                    comparison.then(|| expression_collation(plan, argument)),
+                )
+            }
+            AggFunc::GroupConcat | AggFunc::StringAgg => {
+                let ([argument] | [argument, _]) = call.arguments.as_slice() else {
+                    return Err(PhysicalQueryError::Invalid(
+                        "string aggregate window has the wrong argument count",
+                    ));
+                };
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                let argument_value =
+                    ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                        .emit_new(argument)?;
+                let delimiter = if let Some(delimiter) = call.arguments.get(1) {
+                    let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                    ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                        .emit_new(delimiter)?
+                        .first
+                        .0
+                } else {
+                    let delimiter = program.alloc_register();
+                    program.emit_insn(Insn::String8 {
+                        value: ",".to_string(),
+                        dest: delimiter,
+                    });
+                    delimiter
+                };
+                (argument_value.first.0, delimiter, None, None)
+            }
+            #[cfg(feature = "json")]
+            AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
+                let [key, object_value] = call.arguments.as_slice() else {
+                    return Err(PhysicalQueryError::Invalid(
+                        "JSON object window has the wrong argument count",
+                    ));
+                };
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                let key = ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                    .emit_new(key)?;
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                let object_value =
+                    ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                        .emit_new(object_value)?;
+                (key.first.0, object_value.first.0, None, None)
+            }
+            #[cfg(feature = "json")]
+            AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
+                let [argument] = call.arguments.as_slice() else {
+                    return Err(PhysicalQueryError::Invalid(
+                        "JSON array window has the wrong argument count",
+                    ));
+                };
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                let argument_value =
+                    ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                        .emit_new(argument)?;
+                (argument_value.first.0, 0, None, None)
+            }
+            AggFunc::Mode | AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+                return Err(PhysicalQueryError::Unsupported(
+                    "ordered-set aggregate window",
+                ));
+            }
+            AggFunc::External(external) => {
+                let first = if call.arguments.is_empty() {
+                    0
+                } else {
+                    let arguments = program.alloc_registers(call.arguments.len());
+                    for (position, argument) in call.arguments.iter().enumerate() {
+                        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                            .emit_into(argument, RegisterRange::new(arguments + position, 1))?;
+                    }
+                    arguments
+                };
+                if external.agg_args().is_err() {
+                    return Err(PhysicalQueryError::Invalid(
+                        "resolved external aggregate window has no aggregate implementation",
+                    ));
+                }
+                (first, 0, None, None)
+            }
+        };
+        if let Some(hash_table_id) = distinct {
+            let duplicate = program.allocate_label();
+            program.emit_insn(Insn::HashDistinct {
+                data: Box::new(HashDistinctData {
+                    hash_table_id,
+                    key_start_reg: column,
+                    num_keys: 1,
+                    collations: vec![call
+                        .arguments
+                        .first()
+                        .map_or(CollationSeq::Binary, |argument| {
+                            expression_collation(plan, argument)
+                        })],
+                    target_pc: duplicate,
+                }),
+            });
+            program.emit_insn(Insn::AggStep {
+                acc_reg: value.0,
+                col: column,
+                delimiter,
+                func: AccumulatorFunc::Agg(function.clone()),
+                comparator,
+                collation,
+            });
+            program.preassign_label_to_next_insn(duplicate);
+        } else {
+            program.emit_insn(Insn::AggStep {
+                acc_reg: value.0,
+                col: column,
+                delimiter,
+                func: AccumulatorFunc::Agg(function.clone()),
+                comparator,
+                collation,
+            });
+        }
+        program.preassign_label_to_next_insn(loop_next);
+        program.emit_insn(Insn::Next {
+            cursor_id: inner_cursor,
+            pc_if_next: loop_start,
+        });
+        program.preassign_label_to_next_insn(done);
+        program.emit_insn(Insn::AggFinal {
+            register: value.0,
+            func: AccumulatorFunc::Agg(function.clone()),
+        });
+        if let Some(hash_table_id) = distinct {
+            program.emit_insn(Insn::HashClose { hash_table_id });
+        }
+        if inner.owned {
+            program.emit_insn(Insn::Close {
+                cursor_id: inner.cursor.id(),
+            });
+        }
+        Ok(())
+    })();
+    bindings.replace_source(source.id, outer_runtime)?;
     emission
 }
 
