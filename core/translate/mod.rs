@@ -55,9 +55,14 @@ use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::translate::delete::translate_delete;
 use crate::translate::emitter::Resolver;
-use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
+use crate::translate::physical::{PhysicalPlan, emit_root};
+use crate::translate::plan::ResultSetColumn;
+use crate::translate::semantic::{
+    AnalyzeInput, analyze, context::DmlPolicy, context::SemanticContext, hir,
+};
 use crate::vdbe::Program;
-use crate::{bail_parse_error, Connection, Result, SymbolTable};
+use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
+use crate::{Connection, Result, SymbolTable, bail_parse_error};
 use alter::translate_alter_table;
 use analyze::translate_analyze;
 use index::{translate_create_index, translate_drop_index, translate_optimize, translate_reindex};
@@ -65,7 +70,7 @@ use insert::translate_insert;
 use rollback::{translate_release, translate_rollback, translate_savepoint};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
 use select::translate_select;
-use tracing::{instrument, Level};
+use tracing::{Level, instrument};
 use transaction::{translate_tx_begin, translate_tx_commit};
 use turso_parser::ast;
 use update::translate_update;
@@ -144,6 +149,158 @@ pub fn translate(
     program.epilogue(schema);
 
     program.build(connection, change_cnt_on, input)
+}
+
+#[allow(dead_code)]
+fn translate_semantic_root(
+    schema: &Schema,
+    stmt: &ast::Stmt,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    syms: &SymbolTable,
+    origin: crate::statement::StatementOrigin,
+) -> Result<()> {
+    let is_write = matches!(
+        stmt,
+        ast::Stmt::Insert { .. } | ast::Stmt::Update(_) | ast::Stmt::Delete { .. }
+    );
+    if is_write && connection.get_query_only() {
+        bail_parse_error!("attempt to write a readonly database");
+    }
+    match stmt {
+        ast::Stmt::Update(update)
+            if update.where_clause.is_none() && connection.get_dml_require_where() =>
+        {
+            bail_parse_error!(
+                "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+            );
+        }
+        ast::Stmt::Delete {
+            where_clause: None, ..
+        } if connection.get_dml_require_where() => {
+            bail_parse_error!(
+                "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+            );
+        }
+        _ => {}
+    }
+
+    let dialect = if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
+        Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
+    } else {
+        connection.dialect()
+    };
+    let context = SemanticContext::new(
+        schema,
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        syms,
+        connection.experimental_custom_types_enabled(),
+        connection.get_dqs_dml().into(),
+        dialect,
+    )
+    .with_dml_policy(DmlPolicy::new(
+        connection.is_nested_stmt(),
+        connection.is_mvcc_bootstrap_connection(),
+        false,
+        connection.check_constraints_ignored(),
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(stmt))?;
+    set_semantic_result_columns(program, &document);
+    set_semantic_transactions(program, &document, is_write)?;
+    let plan = PhysicalPlan::new(&document)
+        .map_err(|error| crate::LimboError::InternalError(error.to_string()))?;
+    emit_root(&plan, program)
+        .map_err(|error| crate::LimboError::InternalError(error.to_string()))?;
+    Ok(())
+}
+
+fn semantic_outputs(document: &hir::HirDocument) -> Option<&[hir::Output]> {
+    match &document.root {
+        hir::HirRoot::Query(root) => {
+            let query = document.query(root.query)?;
+            Some(&document.query_block(query.first)?.outputs)
+        }
+        hir::HirRoot::Insert(insert) => insert
+            .returning
+            .as_ref()
+            .map(|returning| returning.outputs.as_slice()),
+        hir::HirRoot::Update(update) => update
+            .returning
+            .as_ref()
+            .map(|returning| returning.outputs.as_slice()),
+        hir::HirRoot::Delete(delete) => delete
+            .returning
+            .as_ref()
+            .map(|returning| returning.outputs.as_slice()),
+        hir::HirRoot::TriggerPredicate(_) => None,
+    }
+}
+
+fn set_semantic_result_columns(program: &mut ProgramBuilder, document: &hir::HirDocument) {
+    let Some(outputs) = semantic_outputs(document) else {
+        return;
+    };
+    program.result_columns = outputs
+        .iter()
+        .map(|output| ResultSetColumn {
+            expr: ast::Expr::Id(ast::Name::empty()),
+            alias: Some(output.name.clone()),
+            implicit_column_name: None,
+            contains_aggregates: false,
+        })
+        .collect();
+}
+
+fn set_semantic_transactions(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+    is_write: bool,
+) -> Result<()> {
+    let write_database = match &document.root {
+        hir::HirRoot::Insert(insert) => Some(insert.target),
+        hir::HirRoot::Update(update) => Some(update.target),
+        hir::HirRoot::Delete(delete) => Some(delete.target),
+        hir::HirRoot::Query(_) | hir::HirRoot::TriggerPredicate(_) => None,
+    }
+    .and_then(|source| document.source(source))
+    .and_then(|source| match &source.kind {
+        hir::SourceKind::Table(table) | hir::SourceKind::Pseudo { table, .. } => table.database(),
+        _ => None,
+    });
+
+    for source in &document.sources {
+        let database = match &source.kind {
+            hir::SourceKind::Table(table)
+            | hir::SourceKind::TableFunction { table, .. }
+            | hir::SourceKind::Pseudo { table, .. } => table.database(),
+            hir::SourceKind::SchemaExpression
+            | hir::SourceKind::Cte(_)
+            | hir::SourceKind::Derived(_)
+            | hir::SourceKind::RecursiveInput(_) => None,
+        };
+        let Some(database) = database else {
+            continue;
+        };
+        let cookie = document
+            .databases
+            .iter()
+            .find(|snapshot| snapshot.database == database)
+            .map(|snapshot| snapshot.schema_version)
+            .ok_or_else(|| {
+                crate::LimboError::InternalError(format!(
+                    "HIR source database {} has no schema snapshot",
+                    database.index()
+                ))
+            })?;
+        if is_write && write_database == Some(database) {
+            program.begin_write_on_database(database.index(), cookie)?;
+        } else {
+            program.begin_read_on_database(database.index(), cookie)?;
+        }
+    }
+    Ok(())
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
@@ -532,12 +689,49 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alloc::TryClone;
-    use crate::io::MemoryIO;
-    use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
-    use crate::vdbe::insn::Insn;
     use crate::Database;
     use crate::SqliteDialect;
+    use crate::alloc::TryClone;
+    use crate::io::MemoryIO;
+    use crate::schema::{BTreeTable, SQLITE_SEQUENCE_TABLE_NAME, Table};
+    use crate::vdbe::insn::Insn;
+
+    #[test]
+    fn semantic_prepare_adapter_owns_root_metadata_and_emission() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = db.connect().unwrap();
+        let schema = db.schema.lock().clone();
+        let mut parser = turso_parser::parser::Parser::new(b"SELECT 1 AS answer");
+        let ast::Cmd::Stmt(statement) = parser.next().unwrap().unwrap() else {
+            panic!("expected a statement");
+        };
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 32, 2));
+        program.prologue();
+        translate_semantic_root(
+            &schema,
+            &statement,
+            &mut program,
+            &connection,
+            &SymbolTable::new(),
+            crate::statement::StatementOrigin::Root,
+        )
+        .unwrap();
+        program.epilogue(&schema);
+        let built = program
+            .build(connection, false, "SELECT 1 AS answer")
+            .unwrap();
+
+        assert_eq!(built.result_columns.len(), 1);
+        assert_eq!(built.result_columns[0].alias.as_deref(), Some("answer"));
+        assert!(
+            built
+                .insns
+                .iter()
+                .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. }))
+        );
+    }
 
     /// Verify that REGEXP produces the correct error when no regexp function is registered.
     #[test]
