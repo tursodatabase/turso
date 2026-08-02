@@ -4,25 +4,24 @@ use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq, turso_assert_
 use turso_parser::{ast, parser::Parser};
 
 use super::{
-    schema::{SQLITE_TABLEID, validate_check_expr},
+    schema::{validate_check_expr, SQLITE_TABLEID},
     update::translate_update_for_schema_change,
 };
 use crate::{
-    LimboError, Numeric, Result, Value, ValueRef,
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
     schema::{CheckConstraint, Column, ColumnLayout, ForeignKey, RESERVED_TABLE_PREFIXES},
     translate::{
         emitter::Resolver,
-        expr::{WalkControl, translate_expr, walk_expr, walk_expr_mut},
+        expr::{walk_expr, walk_expr_mut, WalkControl},
         physical::{
-            PhysicalPlan, RegisterId, RegisterRange, RootRuntimeInputs, SourceRuntime,
-            emit_root_schema_expression_into,
+            emit_root_schema_expression_into, CursorId, PhysicalPlan, RegisterId, RegisterRange,
+            RootRuntimeInputs, SourceRuntime,
         },
         semantic::{
             context::SemanticContext,
             hir::HirRoot,
-            schema_expr::{SchemaSyntaxInput, analyze_table_schema_syntax},
+            schema_expr::{analyze_table_schema_syntax, SchemaSyntaxInput},
         },
         trigger::create_trigger_to_sql,
     },
@@ -34,9 +33,10 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorType, ProgramBuilder},
-        insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral, to_u32},
+        insn::{to_u32, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
+    LimboError, Numeric, Result, Value, ValueRef,
 };
 use either::Either;
 use rustc_hash::FxHashSet as HashSet;
@@ -788,6 +788,7 @@ fn emit_add_column_check_validation(
     column: &Column,
     constraints: &[ast::NamedColumnConstraint],
     resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
     database_id: usize,
 ) -> Result<()> {
     // Determine the effective default value. If no DEFAULT, existing rows get NULL,
@@ -844,13 +845,15 @@ fn emit_add_column_check_validation(
     });
 
     let skip_check_label = program.allocate_label();
+    let check_loop = program.allocate_label();
     program.emit_insn(Insn::Rewind {
         cursor_id: check_cursor_id,
         pc_if_empty: skip_check_label,
     });
+    program.preassign_label_to_next_insn(check_loop);
 
-    // Table has rows -- evaluate each CHECK constraint with the default value substituted.
-    for (constraint_name, check_expr) in &all_checks {
+    let mut substituted_checks = Vec::with_capacity(all_checks.len());
+    for (constraint_name, check_expr) in all_checks {
         let mut substituted = *check_expr.clone();
 
         // Replace references to the new column with the default value expression.
@@ -874,8 +877,62 @@ fn emit_add_column_check_validation(
             },
         );
 
+        substituted_checks.push((constraint_name, check_expr, substituted));
+    }
+
+    let context = SemanticContext::new(
+        resolver.schema(),
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        resolver.symbol_table,
+        connection.experimental_custom_types_enabled(),
+        connection.get_dqs_dml().into(),
+        connection.dialect(),
+    );
+    let syntax = substituted_checks
+        .iter()
+        .map(|(_, _, expression)| SchemaSyntaxInput {
+            syntax: expression,
+            profile: crate::schema_expr::SchemaExprProfile::Check {
+                strict_types: btree.is_strict,
+            },
+            owner_column: None,
+        })
+        .collect::<Vec<_>>();
+    let analyzed = analyze_table_schema_syntax(
+        &context,
+        database_id,
+        Arc::new(crate::schema::Table::BTree(Arc::new(btree.clone()))),
+        &syntax,
+    )?;
+    let plan = PhysicalPlan::new(&analyzed.document)
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    let root = match &analyzed.document.root {
+        HirRoot::SchemaExpressions(root) => root,
+        _ => unreachable!("stored schema analysis returns a schema-expression root"),
+    };
+    let mut runtime_inputs = RootRuntimeInputs::default();
+    runtime_inputs.bind_source(
+        root.source,
+        SourceRuntime::Cursor(CursorId(check_cursor_id)),
+    );
+
+    // Table has rows -- evaluate each CHECK against every existing row. The
+    // newly added column has already been replaced by its effective default;
+    // references to existing columns stay as frozen HIR source positions.
+    for (expression_index, (constraint_name, check_expr, _)) in
+        substituted_checks.iter().enumerate()
+    {
         let result_reg = program.alloc_register();
-        translate_expr(program, None, &substituted, result_reg, resolver)?;
+        emit_root_schema_expression_into(
+            &plan,
+            program,
+            &runtime_inputs,
+            expression_index,
+            result_reg,
+        )
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
 
         // CHECK passes if the result is NULL or non-zero (truthy).
         let check_passed_label = program.allocate_label();
@@ -905,6 +962,11 @@ fn emit_add_column_check_validation(
 
         program.preassign_label_to_next_insn(check_passed_label);
     }
+
+    program.emit_insn(Insn::Next {
+        cursor_id: check_cursor_id,
+        pc_if_next: check_loop,
+    });
 
     program.preassign_label_to_next_insn(skip_check_label);
     Ok(())
@@ -1539,6 +1601,7 @@ pub fn translate_alter_table(
                     &column,
                     &constraints,
                     resolver,
+                    connection,
                     database_id,
                 )?;
             }
