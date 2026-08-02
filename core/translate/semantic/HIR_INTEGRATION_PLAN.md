@@ -116,7 +116,9 @@ operations are not SQL binding.
   - [x] RETURNING projects the written NEW HIR row after INSERT.
   - [x] ABORT, FAIL, ROLLBACK, and IGNORE route NOT NULL, CHECK, rowid, and
         UNIQUE failures before mutation using the statement or index policy.
-  - [ ] REPLACE conflict paths and UPSERT/excluded.
+  - [x] UPSERT DO NOTHING routes resolved rowid, UNIQUE-index, and catch-all
+        conflict targets around the complete row write.
+  - [ ] REPLACE conflict paths and UPSERT DO UPDATE/excluded.
 - [ ] Trigger commands and predicates with explicit OLD/NEW runtime bindings.
 - [ ] Generated columns, defaults, CHECK constraints, expression and partial
       indexes, and custom-type schema programs.

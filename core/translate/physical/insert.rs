@@ -7,7 +7,7 @@ use turso_parser::ast::ResolveType;
 use crate::{
     error::SQLITE_CONSTRAINT_PRIMARYKEY,
     schema::Table,
-    translate::semantic::hir::{self, IndexCoverage, InsertSource},
+    translate::semantic::hir::{self, IndexCoverage, InsertSource, UpsertAction},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{InsertFlags, Insn, RegisterOrLiteral},
@@ -311,6 +311,10 @@ fn finish_insert_row(
     skip_row: crate::vdbe::BranchOffset,
 ) -> InsertResult<()> {
     let statement_conflict = insert.conflict.unwrap_or(ResolveType::Abort);
+    let rowid_conflict = upsert_for_rowid(insert)
+        .map(upsert_do_nothing_policy)
+        .transpose()?
+        .unwrap_or(statement_conflict);
     if let Some((position, _)) = table.get_rowid_alias_column().filter(|(position, _)| {
         insert
             .columns
@@ -359,7 +363,7 @@ fn finish_insert_row(
         .get_rowid_alias_column()
         .and_then(|(_, column)| column.name.as_deref())
         .unwrap_or("rowid");
-    if statement_conflict == ResolveType::Ignore {
+    if rowid_conflict == ResolveType::Ignore {
         program.emit_insn(Insn::Goto {
             target_pc: skip_row,
         });
@@ -367,7 +371,7 @@ fn finish_insert_row(
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
             description: format!("{}.{}", table.name, rowid_name),
-            on_error: Some(statement_conflict),
+            on_error: Some(rowid_conflict),
             description_reg: None,
         });
     }
@@ -385,10 +389,15 @@ fn finish_insert_row(
     let mut keys = Vec::with_capacity(indexes.len());
     for index in indexes {
         let key = emit_index_key(program, bindings, insert.target, rowid, index, true)?;
-        let conflict = insert
-            .conflict
-            .or(index.index.on_conflict)
-            .unwrap_or(ResolveType::Abort);
+        let conflict = upsert_for_index(insert, index)
+            .map(upsert_do_nothing_policy)
+            .transpose()?
+            .unwrap_or_else(|| {
+                insert
+                    .conflict
+                    .or(index.index.on_conflict)
+                    .unwrap_or(ResolveType::Abort)
+            });
         emit_unique_check(program, index, &key, None, conflict, skip_row)?;
         keys.push(key);
     }
@@ -431,8 +440,17 @@ fn preflight_insert<'plan>(
     if insert.conflict == Some(ResolveType::Replace) {
         return Err(PhysicalInsertError::Unsupported("REPLACE conflict policy"));
     }
-    if !insert.upserts.is_empty() || insert.excluded_source.is_some() {
-        return Err(PhysicalInsertError::Unsupported("UPSERT"));
+    if insert.upserts.is_empty() != insert.excluded_source.is_none() {
+        return Err(PhysicalInsertError::Invalid(
+            "UPSERT and excluded source must exist together",
+        ));
+    }
+    if insert
+        .upserts
+        .iter()
+        .any(|upsert| !matches!(upsert.action, UpsertAction::Nothing))
+    {
+        return Err(PhysicalInsertError::Unsupported("UPSERT DO UPDATE"));
     }
     if insert.trigger.is_some() || !insert.triggers.is_empty() {
         return Err(PhysicalInsertError::Unsupported("trigger execution"));
@@ -501,4 +519,31 @@ fn preflight_insert<'plan>(
         ));
     }
     Ok((source, table.clone(), database))
+}
+
+fn upsert_for_rowid(insert: &hir::Insert) -> Option<&hir::Upsert> {
+    insert.upserts.iter().find(|upsert| match &upsert.target {
+        Some(target) => target.matched_index.is_none(),
+        None => true,
+    })
+}
+
+fn upsert_for_index<'insert>(
+    insert: &'insert hir::Insert,
+    index: &OpenedIndex<'_>,
+) -> Option<&'insert hir::Upsert> {
+    insert.upserts.iter().find(|upsert| match &upsert.target {
+        Some(target) => target
+            .matched_index
+            .as_ref()
+            .is_some_and(|matched| matched.id() == index.expressions.index.id()),
+        None => true,
+    })
+}
+
+fn upsert_do_nothing_policy(upsert: &hir::Upsert) -> InsertResult<ResolveType> {
+    match upsert.action {
+        UpsertAction::Nothing => Ok(ResolveType::Ignore),
+        UpsertAction::Update { .. } => Err(PhysicalInsertError::Unsupported("UPSERT DO UPDATE")),
+    }
 }
