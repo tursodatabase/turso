@@ -200,6 +200,7 @@ fn translate_semantic_root(
         connection.foreign_keys_enabled(),
     ));
     let document = analyze(&context, AnalyzeInput::Statement(stmt))?;
+    set_semantic_conflict_policy(program, &document);
     set_semantic_result_columns(program, &document);
     set_semantic_transactions(program, &document, is_write)?;
     let triggers = semantic_prepare::prepare_triggers(&context, &document, program, connection)?;
@@ -322,6 +323,20 @@ pub(super) fn set_semantic_transactions(
         }
     }
     Ok(())
+}
+
+fn set_semantic_conflict_policy(program: &mut ProgramBuilder, document: &hir::HirDocument) {
+    let conflict = match &document.root {
+        hir::HirRoot::Insert(root) => root.conflict,
+        hir::HirRoot::Update(root) => root.conflict,
+        hir::HirRoot::Delete(_) | hir::HirRoot::Query(_) | hir::HirRoot::TriggerPredicate(_) => {
+            None
+        }
+    };
+    program.flags.set_has_statement_conflict(conflict.is_some());
+    if let Some(conflict) = conflict {
+        program.set_resolve_type(conflict);
+    }
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty

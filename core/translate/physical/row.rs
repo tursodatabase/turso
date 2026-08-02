@@ -5,7 +5,10 @@ use std::fmt;
 use turso_parser::ast::ResolveType;
 
 use crate::{
-    error::{SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL},
+    error::{
+        SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
+        SQLITE_CONSTRAINT_UNIQUE,
+    },
     schema::BTreeTable,
     translate::semantic::hir::{self, ColumnReadExpression},
     vdbe::{
@@ -13,6 +16,39 @@ use crate::{
         insn::{to_u32, Insn},
     },
 };
+
+pub(super) fn constraint_halt(
+    program: &mut ProgramBuilder,
+    err_code: usize,
+    description: String,
+    conflict: ResolveType,
+) {
+    let (description, on_error) = if program.flags.has_statement_conflict() {
+        (description, None)
+    } else {
+        match conflict {
+            ResolveType::Fail | ResolveType::Rollback => {
+                let kind = match err_code {
+                    SQLITE_CONSTRAINT_CHECK => "CHECK",
+                    SQLITE_CONSTRAINT_NOTNULL => "NOT NULL",
+                    SQLITE_CONSTRAINT_PRIMARYKEY | SQLITE_CONSTRAINT_UNIQUE => "UNIQUE",
+                    _ => "constraint",
+                };
+                (
+                    format!("{kind} constraint failed: {description} (19)"),
+                    Some(conflict),
+                )
+            }
+            ResolveType::Abort | ResolveType::Ignore | ResolveType::Replace => (description, None),
+        }
+    };
+    program.emit_insn(Insn::Halt {
+        err_code,
+        description,
+        on_error,
+        description_reg: None,
+    });
+}
 
 use super::{
     ExpressionEmitter, PhysicalExpressionError, RegisterRange, RuntimeBindingError, RuntimeBindings,
@@ -136,12 +172,12 @@ pub(crate) fn emit_check_constraints(
                 target_pc: skip_row,
             });
         } else {
-            program.emit_insn(Insn::Halt {
-                err_code: SQLITE_CONSTRAINT_CHECK,
-                description: check.description.clone(),
-                on_error: Some(conflict),
-                description_reg: None,
-            });
+            constraint_halt(
+                program,
+                SQLITE_CONSTRAINT_CHECK,
+                check.description.clone(),
+                conflict,
+            );
         }
         program.preassign_label_to_next_insn(passed);
     }
@@ -172,12 +208,12 @@ pub(crate) fn emit_new_row_constraints(
                     reg: logical.first.0 + position,
                     target_pc: present,
                 });
-                program.emit_insn(Insn::Halt {
-                    err_code: SQLITE_CONSTRAINT_NOTNULL,
-                    description: format!("{}.{}", table.name, column.name.as_deref().unwrap_or("")),
-                    on_error: Some(conflict),
-                    description_reg: None,
-                });
+                constraint_halt(
+                    program,
+                    SQLITE_CONSTRAINT_NOTNULL,
+                    format!("{}.{}", table.name, column.name.as_deref().unwrap_or("")),
+                    conflict,
+                );
                 program.preassign_label_to_next_insn(present);
             }
         }
@@ -226,12 +262,12 @@ pub(crate) fn emit_replace_not_null_defaults(
             reg: logical.first.0 + position,
             target_pc: present,
         });
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_NOTNULL,
-            description: format!("{}.{}", table.name, column.name.as_deref().unwrap_or("")),
-            on_error: Some(ResolveType::Abort),
-            description_reg: None,
-        });
+        constraint_halt(
+            program,
+            SQLITE_CONSTRAINT_NOTNULL,
+            format!("{}.{}", table.name, column.name.as_deref().unwrap_or("")),
+            ResolveType::Abort,
+        );
         program.preassign_label_to_next_insn(present);
     }
     Ok(())

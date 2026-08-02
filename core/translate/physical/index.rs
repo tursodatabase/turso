@@ -247,12 +247,7 @@ pub(crate) fn emit_unique_check(
             .map(|column| format!("{}.{}", opened.index.table_name, column.name))
             .collect::<Vec<_>>()
             .join(", ");
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_UNIQUE,
-            description,
-            on_error: Some(conflict),
-            description_reg: None,
-        });
+        super::constraint_halt(program, SQLITE_CONSTRAINT_UNIQUE, description, conflict);
     }
     program.preassign_label_to_next_insn(done);
     Ok(())

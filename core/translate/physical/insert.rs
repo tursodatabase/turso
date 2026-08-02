@@ -538,12 +538,12 @@ fn finish_insert_row(
             target_pc: skip_row,
         });
     } else {
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-            description: format!("{}.{}", table.name, rowid_name),
-            on_error: Some(statement_conflict),
-            description_reg: None,
-        });
+        super::constraint_halt(
+            program,
+            SQLITE_CONSTRAINT_PRIMARYKEY,
+            format!("{}.{}", table.name, rowid_name),
+            statement_conflict,
+        );
     }
     program.preassign_label_to_next_insn(rowid_is_unique);
     let mut keys = Vec::with_capacity(indexes.len());

@@ -105,6 +105,8 @@ fn dml_constraint_failures_follow_the_hir_conflict_policy(tc: hegel::TestCase) {
 
     let plan = PhysicalPlan::new(&document).expect("closed HIR has a physical plan");
     let mut program = program();
+    program.flags.set_has_statement_conflict(true);
+    program.set_resolve_type(policy);
     emit_root(&plan, &mut program).expect("conflict-aware DML lowers without a catalog");
     program
         .resolve_labels()
@@ -148,7 +150,8 @@ fn dml_constraint_failures_follow_the_hir_conflict_policy(tc: hegel::TestCase) {
             }));
     } else {
         assert_eq!(matching_halts.len(), 1);
-        assert_eq!(matching_halts[0].1, Some(policy));
+        assert_eq!(matching_halts[0].1, None);
+        assert_eq!(program.resolve_type, policy);
         assert!(matching_halts[0].0 < first_write);
     }
 }
@@ -423,6 +426,8 @@ fn insert_replace_deletes_conflicting_rows_and_uses_frozen_not_null_defaults(tc:
 
     let plan = PhysicalPlan::new(&document).expect("closed HIR has a physical plan");
     let mut program = program();
+    program.flags.set_has_statement_conflict(true);
+    program.set_resolve_type(ResolveType::Replace);
     emit_root(&plan, &mut program).expect("REPLACE lowers without a catalog");
     program
         .resolve_labels()
@@ -438,7 +443,7 @@ fn insert_replace_deletes_conflicting_rows_and_uses_frozen_not_null_defaults(tc:
             .insns
             .iter()
             .position(|(instruction, _)| {
-                matches!(instruction, Insn::Halt { err_code, on_error: Some(ResolveType::Abort), .. } if *err_code == SQLITE_CONSTRAINT_NOTNULL)
+                matches!(instruction, Insn::Halt { err_code, on_error: None, .. } if *err_code == SQLITE_CONSTRAINT_NOTNULL)
             })
             .expect("a NULL default falls back to ABORT");
         assert!(default < fallback);
