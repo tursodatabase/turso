@@ -543,9 +543,7 @@ fn emit_root_query_to_destination(
     let mut bindings = RuntimeBindings::new(plan.document, plan.document.snapshot)?;
     inputs.apply(&mut bindings)?;
     let mut ctes = MaterializedCtes::default();
-    for cte in query_tree_ctes(plan, query_id)? {
-        materialize_cte(plan, program, &mut bindings, &mut ctes, cte)?;
-    }
+    materialize_ctes_owned_by_current_query(plan, program, &mut bindings, &mut ctes, query_id)?;
     let result = emit_query(
         plan,
         program,
@@ -587,9 +585,7 @@ pub(crate) fn emit_query_for_dml<'document>(
         ));
     }
     let mut ctes = MaterializedCtes::default();
-    for cte in query_tree_ctes(plan, query_id)? {
-        materialize_cte(plan, program, bindings, &mut ctes, cte)?;
-    }
+    materialize_ctes_owned_by_current_query(plan, program, bindings, &mut ctes, query_id)?;
     let table = ephemeral_table(
         format!("dml_query_{}", query_id.index()),
         query.hir.output.len(),
@@ -644,9 +640,7 @@ pub(crate) fn emit_expression_for_dml<'document>(
 
     let mut ctes = MaterializedCtes::default();
     for query_id in query_ids {
-        for cte in query_tree_ctes(plan, query_id)? {
-            materialize_cte(plan, program, bindings, &mut ctes, cte)?;
-        }
+        materialize_ctes_owned_by_current_query(plan, program, bindings, &mut ctes, query_id)?;
     }
     let mut subqueries = QuerySubqueryEmitter {
         plan,
@@ -1113,6 +1107,7 @@ fn emit_query<'document>(
         ));
     }
     bindings.enter_query(query_id)?;
+    materialize_ctes_owned_by_current_query(plan, program, bindings, ctes, query_id)?;
     let sorter = if query.hir.order_by.is_empty()
         || matches!(destination, QueryDestination::Exists { .. })
     {
@@ -5067,7 +5062,7 @@ fn materialize_cte<'document>(
     let query = plan
         .query(query_id)
         .ok_or(PhysicalQueryError::Invalid("CTE body query is missing"))?;
-    if query.hir.parent.is_some() || !query.hir.captures.is_empty() {
+    if !query.hir.captures.is_empty() {
         ctes.visiting.remove(&cte_id);
         return Err(PhysicalQueryError::Invalid(
             "ordinary CTE query has an outer query dependency",
@@ -5462,6 +5457,35 @@ fn query_tree_ctes(plan: &PhysicalPlan<'_>, root: QueryId) -> QueryResult<Vec<Ct
         }
     }
     Ok(ctes)
+}
+
+fn materialize_ctes_owned_by_current_query<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    ctes: &mut MaterializedCtes,
+    root: QueryId,
+) -> QueryResult<()> {
+    let current = bindings.current_query();
+    for cte_id in query_tree_ctes(plan, root)? {
+        let cte = plan
+            .document
+            .cte(cte_id)
+            .ok_or(PhysicalQueryError::Invalid("reachable CTE is missing"))?;
+        let body = match &cte.body {
+            CteBody::Query(query) => *query,
+            CteBody::Recursive(recursive) => recursive.seed,
+        };
+        let parent = plan
+            .query(body)
+            .ok_or(PhysicalQueryError::Invalid("CTE body query is missing"))?
+            .hir
+            .parent;
+        if parent == current {
+            materialize_cte(plan, program, bindings, ctes, cte_id)?;
+        }
+    }
+    Ok(())
 }
 
 fn emit_filter<'document>(

@@ -901,6 +901,60 @@ fn cte_reachability_follows_nested_queries_without_executing_unused_ctes(tc: heg
     assert_eq!(table_reads, [filter_position, output_position]);
 }
 
+// Example: `SELECT (WITH t(x) AS (VALUES (1), (2), (3)) SELECT SUM(x) FROM t)`
+// gives the CTE body a lexical parent because its WITH clause belongs to the
+// scalar child query. It has no captures, so that parent must not be mistaken
+// for a runtime dependency when the physical layer materializes the CTE.
+#[hegel::test]
+fn a_cte_declared_inside_a_scalar_query_uses_captures_not_its_lexical_parent(tc: hegel::TestCase) {
+    let row_count = usize::from(tc.draw(generators::integers::<u8>().max_value(15))) + 1;
+    let values = (1..=row_count)
+        .map(|value| format!("({value})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let schema = Schema::new();
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT (WITH t(x) AS (VALUES {values}) SELECT SUM(x) FROM t)"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("a local uncorrelated CTE has valid SQL meaning");
+    let cte_query = document
+        .ctes
+        .iter()
+        .find_map(|cte| match cte.body {
+            crate::translate::semantic::hir::CteBody::Query(query) => Some(query),
+            crate::translate::semantic::hir::CteBody::Recursive(_) => None,
+        })
+        .expect("the statement declares one ordinary CTE");
+    let cte_query = document.query(cte_query).expect("the CTE query exists");
+    assert!(
+        cte_query.parent.is_some(),
+        "the CTE keeps lexical ownership"
+    );
+    assert!(
+        cte_query.captures.is_empty(),
+        "the constant VALUES body has no runtime outer dependency"
+    );
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed local-CTE HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program)
+        .expect("an uncorrelated local CTE lowers using its frozen captures");
+    program
+        .resolve_labels()
+        .expect("local-CTE branches are all closed");
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::OpenEphemeral { .. })));
+}
+
 // Example: `SELECT l.c4, r.c6 FROM left_items AS l JOIN right_items AS r
 // ON l.c2 = r.c3 WHERE r.c5 >= ?1` must form a nested loop over the two
 // resolved source identities. Both ON and WHERE failures advance the inner
