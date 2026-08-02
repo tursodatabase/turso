@@ -1063,6 +1063,7 @@ pub(crate) fn emit_update_from_rows<'document>(
         &scans,
         0,
         &joins,
+        None,
         filter,
         ScanRowAction::UpdateCandidate {
             target,
@@ -4501,8 +4502,8 @@ fn emit_table_scans<'document>(
             "physical source order does not match FROM",
         ));
     }
-    for join in &from.joins {
-        if matches!(join.kind, JoinKind::Right | JoinKind::Full) && source_ids.len() != 2 {
+    for (position, join) in from.joins.iter().enumerate() {
+        if matches!(join.kind, JoinKind::Right | JoinKind::Full) && position != 0 {
             return Err(PhysicalQueryError::Unsupported(
                 "RIGHT or FULL OUTER JOIN in a multi-join tree",
             ));
@@ -4522,14 +4523,9 @@ fn emit_table_scans<'document>(
         scans.push(scan);
     }
 
-    match from.joins.as_slice() {
-        [join] if join.kind == JoinKind::Right => {
+    match from.joins.first() {
+        Some(join) if join.kind == JoinKind::Right => {
             scans.swap(0, 1);
-            let normalized = [Join {
-                right: from.first,
-                kind: JoinKind::Left,
-                constraint: join.constraint.clone(),
-            }];
             emit_nested_scan(
                 plan,
                 program,
@@ -4537,17 +4533,13 @@ fn emit_table_scans<'document>(
                 ctes,
                 &scans,
                 0,
-                &normalized,
+                &from.joins,
+                Some(JoinKind::Left),
                 filter,
                 action,
             )?;
         }
-        [join] if join.kind == JoinKind::Full => {
-            let normalized = [Join {
-                right: join.right,
-                kind: JoinKind::Left,
-                constraint: join.constraint.clone(),
-            }];
+        Some(join) if join.kind == JoinKind::Full => {
             emit_nested_scan(
                 plan,
                 program,
@@ -4555,7 +4547,8 @@ fn emit_table_scans<'document>(
                 ctes,
                 &scans,
                 0,
-                &normalized,
+                &from.joins,
+                Some(JoinKind::Left),
                 filter,
                 action,
             )?;
@@ -4564,8 +4557,8 @@ fn emit_table_scans<'document>(
                 program,
                 bindings,
                 ctes,
-                &scans[0],
-                &scans[1],
+                &scans,
+                &from.joins,
                 &join.constraint,
                 filter,
                 action,
@@ -4579,6 +4572,7 @@ fn emit_table_scans<'document>(
             &scans,
             0,
             &from.joins,
+            None,
             filter,
             action,
         )?,
@@ -4608,12 +4602,17 @@ fn emit_full_join_unmatched_right<'document>(
     program: &mut ProgramBuilder,
     bindings: &mut RuntimeBindings<'document>,
     ctes: &mut MaterializedCtes,
-    left: &OpenedScan<'document>,
-    right: &OpenedScan<'document>,
+    scans: &[OpenedScan<'document>],
+    joins: &[crate::translate::semantic::hir::Join],
     constraint: &JoinConstraint,
     filter: Option<&Expr>,
     action: ScanRowAction<'document, '_>,
 ) -> QueryResult<()> {
+    let [left, right, ..] = scans else {
+        return Err(PhysicalQueryError::Invalid(
+            "FULL OUTER JOIN is missing one of its sources",
+        ));
+    };
     let right_start = program.allocate_label();
     let right_next = program.allocate_label();
     let done = program.allocate_label();
@@ -4652,10 +4651,16 @@ fn emit_full_join_unmatched_right<'document>(
             cursor_id: table_cursor,
         });
     }
-    if let Some(filter) = filter {
-        emit_filter(plan, program, bindings, ctes, filter, right_next)?;
+    if scans.len() > 2 {
+        emit_nested_scan(
+            plan, program, bindings, ctes, scans, 2, joins, None, filter, action,
+        )?;
+    } else {
+        if let Some(filter) = filter {
+            emit_filter(plan, program, bindings, ctes, filter, right_next)?;
+        }
+        emit_scan_action(plan, program, bindings, ctes, action)?;
     }
-    emit_scan_action(plan, program, bindings, ctes, action)?;
     program.preassign_label_to_next_insn(right_next);
     emit_scan_next(program, right, right_start);
     program.preassign_label_to_next_insn(done);
@@ -4719,6 +4724,7 @@ fn emit_nested_scan<'document>(
     scans: &[OpenedScan<'document>],
     level: usize,
     joins: &[crate::translate::semantic::hir::Join],
+    first_join_override: Option<JoinKind>,
     filter: Option<&Expr>,
     action: ScanRowAction<'document, '_>,
 ) -> QueryResult<()> {
@@ -4729,10 +4735,16 @@ fn emit_nested_scan<'document>(
     let loop_start = program.allocate_label();
     let loop_next = program.allocate_label();
     let loop_end = program.allocate_label();
-    let join = level
-        .checked_sub(1)
-        .and_then(|position| joins.get(position));
-    let left_join = join.is_some_and(|join| join.kind == JoinKind::Left);
+    let join_position = level.checked_sub(1);
+    let join = join_position.and_then(|position| joins.get(position));
+    let join_kind = join_position.zip(join).map(|(position, join)| {
+        if position == 0 {
+            first_join_override.unwrap_or(join.kind)
+        } else {
+            join.kind
+        }
+    });
+    let left_join = join_kind == Some(JoinKind::Left);
     let unmatched = left_join.then(|| program.allocate_label());
     let matched = left_join.then(|| program.alloc_register());
     if let Some(matched) = matched {
@@ -4788,6 +4800,7 @@ fn emit_nested_scan<'document>(
             scans,
             level + 1,
             joins,
+            first_join_override,
             filter,
             action,
         )?;
@@ -4834,6 +4847,7 @@ fn emit_nested_scan<'document>(
                 scans,
                 level + 1,
                 joins,
+                first_join_override,
                 filter,
                 action,
             )?;

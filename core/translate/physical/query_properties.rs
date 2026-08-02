@@ -3760,6 +3760,106 @@ fn two_source_right_and_full_joins_preserve_the_hir_sides(tc: hegel::TestCase) {
 }
 
 // Examples:
+// - `l FULL JOIN r ON l.k = r.k LEFT JOIN t ON coalesce(l.k, r.k) = t.k`
+//   sends matched rows and both null-extended sides through the `t` join.
+// - `l RIGHT JOIN r ON l.k = r.k JOIN t ON r.k = t.k` sends an unmatched
+//   `r` row through the inner join after null-extending `l`.
+#[hegel::test]
+fn a_first_outer_join_feeds_every_row_into_the_remaining_join_chain(tc: hegel::TestCase) {
+    let full = tc.draw(generators::booleans());
+    let tail_is_left = tc.draw(generators::booleans());
+    let outer_keyword = if full { "FULL JOIN" } else { "RIGHT JOIN" };
+    let tail_keyword = if tail_is_left { "LEFT JOIN" } else { "JOIN" };
+    let left =
+        BTreeTable::from_sql("CREATE TABLE l(k INTEGER)", 47).expect("left table SQL is valid");
+    let right =
+        BTreeTable::from_sql("CREATE TABLE r(k INTEGER)", 53).expect("right table SQL is valid");
+    let tail =
+        BTreeTable::from_sql("CREATE TABLE t(k INTEGER)", 59).expect("tail table SQL is valid");
+    let mut schema = Schema::new();
+    schema.add_btree_table(Arc::new(left)).expect("l is unique");
+    schema
+        .add_btree_table(Arc::new(right))
+        .expect("r is unique");
+    schema.add_btree_table(Arc::new(tail)).expect("t is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT l.k, r.k, t.k FROM l {outer_keyword} r ON l.k = r.k \
+         {tail_keyword} t ON coalesce(l.k, r.k) = t.k"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated outer-join chain has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let HirRoot::Query(root) = &document.root else {
+        panic!("the fixture is a query");
+    };
+    let query = &document.queries[root.query.index()];
+    let from = query.blocks[query.first.index]
+        .from
+        .as_ref()
+        .expect("outer-join chain has FROM");
+    assert_eq!(
+        from.joins.iter().map(|join| join.kind).collect::<Vec<_>>(),
+        [
+            if full {
+                crate::translate::semantic::hir::JoinKind::Full
+            } else {
+                crate::translate::semantic::hir::JoinKind::Right
+            },
+            if tail_is_left {
+                crate::translate::semantic::hir::JoinKind::Left
+            } else {
+                crate::translate::semantic::hir::JoinKind::Inner
+            },
+        ]
+    );
+
+    let plan = PhysicalPlan::new(&document).expect("closed outer-join HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("outer-join chain emits from HIR");
+    program
+        .resolve_labels()
+        .expect("all outer-join-chain branches are closed");
+
+    let cursor_for_root = |root_page| {
+        program
+            .insns
+            .iter()
+            .find_map(|(instruction, _)| match instruction {
+                Insn::OpenRead {
+                    cursor_id,
+                    root_page: actual,
+                    ..
+                } if *actual == root_page => Some(*cursor_id),
+                _ => None,
+            })
+            .expect("resolved table cursor is opened")
+    };
+    let left_cursor = cursor_for_root(47);
+    let right_cursor = cursor_for_root(53);
+    let tail_cursor = cursor_for_root(59);
+    let is_nulled = |cursor| {
+        program.insns.iter().any(|(instruction, _)| {
+            matches!(instruction, Insn::NullRow { cursor_id } if *cursor_id == cursor)
+        })
+    };
+    assert!(is_nulled(left_cursor));
+    assert_eq!(is_nulled(right_cursor), full);
+    assert_eq!(is_nulled(tail_cursor), tail_is_left);
+    assert!(
+        program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 3, .. }))
+    );
+}
+
+// Examples:
 // - `SELECT (SELECT 7 UNION ALL SELECT 9)` returns the first compound row, so
 //   later arms must not overwrite the scalar result after an early jump.
 // - `SELECT EXISTS(SELECT 1 WHERE 0 UNION ALL SELECT 2 WHERE 1)` is true even
