@@ -5268,11 +5268,6 @@ fn open_derived_source<'document>(
     let query_plan = plan
         .query(query)
         .ok_or(PhysicalQueryError::Invalid("derived query is missing"))?;
-    if !query_plan.hir.captures.is_empty() {
-        return Err(PhysicalQueryError::Unsupported(
-            "correlated FROM subquery materialization",
-        ));
-    }
     if query_plan.hir.output.len() != source.width {
         return Err(PhysicalQueryError::Invalid(
             "derived query width does not match its source",

@@ -2078,6 +2078,85 @@ fn distinct_uses_frozen_output_collations_before_offset_and_limit(tc: hegel::Tes
     assert!(scan_close < hash_close);
 }
 
+// Example: `SELECT (SELECT d.v FROM
+// (SELECT i.c4 AS v FROM inner_items AS i WHERE i.c2 = o.c3) AS d)
+// FROM outer_items AS o` gives the derived query the exact `o` capture. Its
+// ephemeral table is rebuilt inside the outer row's scalar-subquery path, so
+// each outer row sees only the inner rows selected by its own `o.c3` value.
+#[hegel::test]
+fn correlated_derived_tables_materialize_with_their_exact_outer_capture(tc: hegel::TestCase) {
+    let outer_width = usize::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
+    let inner_width = usize::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
+    let outer_key = tc.draw(generators::integers::<usize>().max_value(outer_width - 1));
+    let inner_key = tc.draw(generators::integers::<usize>().max_value(inner_width - 1));
+    let inner_value = tc.draw(generators::integers::<usize>().max_value(inner_width - 1));
+    let table_sql = |name: &str, width: usize| {
+        let columns = (0..width)
+            .map(|position| format!("c{position} INTEGER"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("CREATE TABLE {name}({columns})")
+    };
+    let outer_table = BTreeTable::from_sql(&table_sql("outer_items", outer_width), 7)
+        .expect("generated outer table is valid");
+    let inner_table = BTreeTable::from_sql(&table_sql("inner_items", inner_width), 11)
+        .expect("generated inner table is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(outer_table))
+        .expect("outer_items is unique");
+    schema
+        .add_btree_table(Arc::new(inner_table))
+        .expect("inner_items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT (SELECT d.v FROM (\
+             SELECT i.c{inner_value} AS v FROM inner_items AS i \
+             WHERE i.c{inner_key} = o.c{outer_key}\
+         ) AS d) FROM outer_items AS o"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated correlated derived table has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let root = match &document.root {
+        HirRoot::Query(query) => query.query,
+        _ => panic!("generated SELECT has a query root"),
+    };
+    let root_source = document.queries[root.index()].blocks[0]
+        .from
+        .as_ref()
+        .expect("root query reads outer_items")
+        .first;
+    let derived = document
+        .queries
+        .iter()
+        .find(|query| query.captures == [root_source])
+        .expect("derived query captures exactly the outer source");
+    let scalar = derived
+        .parent
+        .expect("derived query is nested inside the scalar query");
+    assert_ne!(scalar, root);
+    assert_eq!(document.queries[scalar.index()].parent, Some(root));
+
+    let plan = PhysicalPlan::new(&document).expect("closed correlated HIR has a physical plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program)
+        .expect("correlated derived table lowers without reopening the catalog");
+    program
+        .resolve_labels()
+        .expect("correlated-derived-table branches are all closed");
+
+    assert!(program
+        .insns
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::OpenEphemeral { is_table: true, .. })));
+}
+
 // Example: `SELECT outer_items.c0 COLLATE NOCASE IN
 // (SELECT inner_items.c1 FROM inner_items
 //  WHERE inner_items.c2 = outer_items.c3) FROM outer_items` must rebuild the
