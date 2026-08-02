@@ -42,6 +42,36 @@ fn insert_defaults_fill_exactly_the_omitted_columns(tc: hegel::TestCase) {
     }
 }
 
+// Examples:
+// - `INSERT INTO t DEFAULT VALUES` evaluates every column default even though
+//   the implicit target list names every writable column.
+// - `INSERT INTO t(a) VALUES (1)` keeps `a` and evaluates only omitted fields.
+// For every generated target position, DEFAULT VALUES must win over the
+// implicit column list while VALUES must preserve supplied positions.
+#[hegel::test]
+fn default_values_evaluates_every_frozen_default(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(16)));
+    let position = usize::from(
+        tc.draw(generators::integers::<u8>().max_value(u8::try_from(width - 1).unwrap())),
+    );
+    let supplied = tc.draw(generators::booleans());
+    let default_values = tc.draw(generators::booleans());
+    let columns = supplied
+        .then_some(TargetColumn::Column(position))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let source = if default_values {
+        InsertSource::DefaultValues
+    } else {
+        InsertSource::Values(vec![Vec::new()])
+    };
+
+    assert_eq!(
+        insert_column_needs_default(&source, &columns, position),
+        default_values || !supplied
+    );
+}
+
 fn parse_statement(sql: &str) -> ast::Stmt {
     let command = Parser::new(sql.as_bytes())
         .next_cmd()

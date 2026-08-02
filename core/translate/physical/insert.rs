@@ -400,7 +400,7 @@ fn emit_insert_defaults(
     logical: RegisterRange,
 ) -> InsertResult<()> {
     for default in &insert.defaults {
-        if !column_needs_default(&insert.columns, default.column) {
+        if !insert_column_needs_default(&insert.source, &insert.columns, default.column) {
             continue;
         }
         let destination = logical
@@ -412,6 +412,14 @@ fn emit_insert_defaults(
             .emit_into(&default.value, RegisterRange::new(destination.0, 1))?;
     }
     Ok(())
+}
+
+pub(super) fn insert_column_needs_default(
+    source: &InsertSource,
+    columns: &[hir::TargetColumn],
+    column: usize,
+) -> bool {
+    matches!(source, InsertSource::DefaultValues) || column_needs_default(columns, column)
 }
 
 pub(super) fn column_needs_default(columns: &[hir::TargetColumn], column: usize) -> bool {
