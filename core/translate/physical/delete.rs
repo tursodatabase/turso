@@ -221,15 +221,42 @@ pub(crate) fn emit_root_delete_with_context(
             source.columns.len(),
         )
     });
+    let ordered_rows = (!delete.order_by.is_empty() || delete.limit.is_some())
+        .then(|| {
+            super::emit_ordered_dml_rowids(
+                plan,
+                program,
+                &mut bindings,
+                cursor,
+                delete.predicate.as_ref(),
+                &delete.order_by,
+                delete.limit.as_ref(),
+            )
+        })
+        .transpose()?;
     let loop_start = program.allocate_label();
     let loop_next = program.allocate_label();
     let loop_end = program.allocate_label();
     program.emit_insn(Insn::Rewind {
-        cursor_id: cursor,
+        cursor_id: ordered_rows
+            .as_ref()
+            .map_or(cursor, |ordered_rows| ordered_rows.cursor),
         pc_if_empty: loop_end,
     });
     program.preassign_label_to_next_insn(loop_start);
-    if let Some(predicate) = &delete.predicate {
+    if let Some(ordered_rows) = &ordered_rows {
+        program.emit_insn(Insn::Column {
+            cursor_id: ordered_rows.cursor,
+            column: 0,
+            dest: rowid.0,
+            default: None,
+        });
+        program.emit_insn(Insn::NotExists {
+            cursor,
+            rowid_reg: rowid.0,
+            target_pc: loop_next,
+        });
+    } else if let Some(predicate) = &delete.predicate {
         let condition = emit_expression_for_dml(plan, program, &mut bindings, predicate)?;
         if condition.width != 1 {
             return Err(PhysicalDeleteError::Invalid("WHERE result is not scalar"));
@@ -240,10 +267,12 @@ pub(crate) fn emit_root_delete_with_context(
             jump_if_null: true,
         });
     }
-    program.emit_insn(Insn::RowId {
-        cursor_id: cursor,
-        dest: rowid.0,
-    });
+    if ordered_rows.is_none() {
+        program.emit_insn(Insn::RowId {
+            cursor_id: cursor,
+            dest: rowid.0,
+        });
+    }
     if let Some(old_columns) = old_columns {
         for position in 0..old_columns.width {
             program.emit_column_or_rowid(cursor, position, old_columns.first.0 + position);
@@ -375,12 +404,17 @@ pub(crate) fn emit_root_delete_with_context(
     }
     program.preassign_label_to_next_insn(loop_next);
     program.emit_insn(Insn::Next {
-        cursor_id: cursor,
+        cursor_id: ordered_rows
+            .as_ref()
+            .map_or(cursor, |ordered_rows| ordered_rows.cursor),
         pc_if_next: loop_start,
     });
     program.preassign_label_to_next_insn(loop_end);
     close_indexes(program, &indexes);
     program.emit_insn(Insn::Close { cursor_id: cursor });
+    if let Some(ordered_rows) = ordered_rows {
+        ordered_rows.close(program);
+    }
     if let Some(cdc) = cdc {
         cdc.emit_autocommit_commit(program)?;
         cdc.close(program);
@@ -397,9 +431,6 @@ fn preflight_delete<'plan>(
     crate::sync::Arc<crate::schema::BTreeTable>,
     usize,
 )> {
-    if !delete.order_by.is_empty() || delete.limit.is_some() {
-        return Err(PhysicalDeleteError::Unsupported("ORDER BY or LIMIT"));
-    }
     if !triggers.covers(&delete.triggers) {
         return Err(PhysicalDeleteError::Invalid(
             "resolved trigger has no prepared program",

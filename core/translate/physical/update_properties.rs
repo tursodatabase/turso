@@ -5,21 +5,20 @@ use turso_parser::{ast, parser::Parser};
 
 use super::*;
 use crate::{
+    QueryMode, SymbolTable,
     dialect::{Dialect, SqliteDialect},
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, Index, Schema},
     sync::Arc,
     translate::semantic::{
-        analyze,
+        AnalyzeInput, analyze,
         context::{DmlPolicy, SemanticContext},
         hir::{Expr, HirRoot, TargetColumn},
-        AnalyzeInput,
     },
     vdbe::{
         builder::{ProgramBuilder, ProgramBuilderOpts},
         insn::Insn,
     },
-    QueryMode, SymbolTable,
 };
 
 fn parse_statement(sql: &str) -> ast::Stmt {
@@ -321,10 +320,12 @@ fn update_uses_a_stable_rowset_and_recomputes_the_hir_row(tc: hegel::TestCase) {
         2,
         "one addition evaluates the assignment and one recomputes c2"
     );
-    assert!(program
-        .insns
-        .iter()
-        .any(|(instruction, _)| matches!(instruction, Insn::MakeRecord { count: 2, .. })));
+    assert!(
+        program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::MakeRecord { count: 2, .. }))
+    );
 }
 
 // Examples: `UPDATE items SET rowid = rowid + 7 RETURNING rowid` and
@@ -421,9 +422,11 @@ fn update_rowid_assignment_keeps_old_and_new_keys_separate(tc: hegel::TestCase) 
         })
         .expect("the OLD row is deleted");
     assert!(collision_check < delete && delete < insert_position);
-    assert!(program.insns[insert_position + 1..]
-        .iter()
-        .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { .. })));
+    assert!(
+        program.insns[insert_position + 1..]
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { .. }))
+    );
 }
 
 // Examples:
@@ -528,10 +531,12 @@ fn update_from_materializes_hir_assignment_values_before_writing(tc: hegel::Test
         .expect("SET expression is evaluated");
     assert!(assignment < candidate_insert && candidate_insert < delete);
     assert!(delete < target_insert && target_insert < returning);
-    assert!(!program
-        .insns
-        .iter()
-        .any(|(instruction, _)| matches!(instruction, Insn::RowSetAdd { .. })));
+    assert!(
+        !program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::RowSetAdd { .. }))
+    );
 }
 
 // Examples:
@@ -608,4 +613,93 @@ fn dml_subqueries_share_the_closed_hir_query_layer(tc: hegel::TestCase) {
             matches!(instruction, Insn::Insert { table_name, .. } if table_name == "items")
         }));
     }
+}
+
+// Examples:
+// - `UPDATE items SET c1 = c1 + 7 WHERE c2 > 0 ORDER BY c0 DESC
+//   LIMIT 2 OFFSET 1` must first freeze the two selected rowids, then change
+//   those exact rows. The write cannot rescan values changed by the UPDATE.
+// - `DELETE FROM items WHERE c2 > 0 ORDER BY c0 ASC LIMIT 3 OFFSET 0`
+//   follows the same rule: sorting, filtering, and slicing finish before the
+//   first target row is deleted.
+// Varying statement kind, direction, limit, and offset checks that both DML
+// roots use one closed-HIR selection layer rather than separate binders.
+#[hegel::test]
+fn ordered_dml_freezes_selected_rowids_before_writing(tc: hegel::TestCase) {
+    let update = tc.draw(generators::booleans());
+    let descending = tc.draw(generators::booleans());
+    let limit = usize::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(8)));
+    let offset = usize::from(tc.draw(generators::integers::<u8>().max_value(4)));
+    let increment = i64::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(31)));
+    let items = Arc::new(
+        BTreeTable::from_sql("CREATE TABLE items(c0 INTEGER, c1 INTEGER, c2 INTEGER)", 12)
+            .expect("fixture target SQL is valid"),
+    );
+    let mut schema = Schema::new();
+    schema.add_btree_table(items).expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let direction = if descending { "DESC" } else { "ASC" };
+    let sql = if update {
+        format!(
+            "UPDATE items SET c1 = c1 + {increment} WHERE c2 > 0 \
+             ORDER BY c0 {direction} LIMIT {limit} OFFSET {offset}"
+        )
+    } else {
+        format!(
+            "DELETE FROM items WHERE c2 > 0 \
+             ORDER BY c0 {direction} LIMIT {limit} OFFSET {offset}"
+        )
+    };
+    let statement = parse_statement(&sql);
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("ordered DML has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("ordered DML has a physical plan");
+    let mut program = program();
+    emit_root(&plan, &mut program).expect("ordered DML emits without a resolver");
+    program
+        .resolve_labels()
+        .expect("all ordered DML branches are closed");
+
+    let sorter = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::SorterOpen { columns: 1, .. }))
+        .expect("ORDER BY opens one HIR sorter key");
+    let (materialize, selected_cursor) = program
+        .insns
+        .iter()
+        .enumerate()
+        .find_map(|(position, (instruction, _))| match instruction {
+            Insn::Insert {
+                cursor, table_name, ..
+            } if table_name == "ordered_dml_rowids" => Some((position, *cursor)),
+            _ => None,
+        })
+        .expect("selected rowids are materialized");
+    let write = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(instruction, Insn::Delete { table_name, .. } if table_name == "items")
+        })
+        .expect("the target is changed");
+    let read_selected_rowid = program.insns[materialize + 1..write]
+        .iter()
+        .any(|(instruction, _)| {
+            matches!(instruction, Insn::Column { cursor_id, column: 0, .. } if *cursor_id == selected_cursor)
+        });
+    assert!(sorter < materialize && materialize < write);
+    assert!(read_selected_rowid);
+    assert!(
+        program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::DecrJumpZero { .. }))
+    );
 }

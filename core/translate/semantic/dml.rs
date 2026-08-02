@@ -4,25 +4,25 @@ use rustc_hash::FxHashSet as HashSet;
 use turso_parser::ast;
 
 use super::{
+    Analyzer, CatalogObjectKind, TriggerAnalysisInput,
     context::SemanticContext,
     dml_rules::{
-        add_schema_named_target, configure_target_read_scope, configure_upsert_scope,
-        resolve_assignment_columns, resolve_insert_columns, DmlOperation,
+        DmlOperation, add_schema_named_target, configure_target_read_scope, configure_upsert_scope,
+        resolve_assignment_columns, resolve_insert_columns,
     },
     expr::ExprPolicy,
     hir::{self, CatalogObject, DatabaseId, TargetColumn},
     query::IndexMetadataMode,
     scope::{QueryEnvironment, Scope},
-    Analyzer, CatalogObjectKind, TriggerAnalysisInput,
 };
 use crate::{
+    LimboError, Result,
     schema::{
-        BTreeTable, Index, IndexColumn, ResolvedFkRef, Table, Trigger, SQLITE_SEQUENCE_TABLE_NAME,
+        BTreeTable, Index, IndexColumn, ResolvedFkRef, SQLITE_SEQUENCE_TABLE_NAME, Table, Trigger,
     },
     schema_expr::SchemaExprProfile,
     sync::Arc,
-    translate::expr::{walk_expr, WalkControl},
-    LimboError, Result,
+    translate::expr::{WalkControl, walk_expr},
 };
 
 pub(super) enum InsertSourceSyntax<'a> {
@@ -376,10 +376,6 @@ impl Analyzer<'_, '_> {
         validate_dml_target(self.context(), database_id, &table, DmlOperation::Update)?;
         self.populate_dml_check_constraints(target, &table)?;
         let defaults = self.analyze_insert_defaults(&table, target, database_id)?;
-        if !order_by_syntax.is_empty() {
-            crate::bail_parse_error!("ORDER BY is not supported in UPDATE");
-        }
-
         let (from, mut read_scope) = match from_syntax {
             Some(syntax) => {
                 let (from, scope) =
@@ -401,6 +397,8 @@ impl Analyzer<'_, '_> {
                 self.analyze_expr(syntax, &read_scope, scalar_expr_policy(trigger.is_some()))
             })
             .transpose()?;
+        let order_by =
+            self.analyze_dml_order_by(order_by_syntax, &read_scope, trigger.is_some())?;
         let limit = self.analyze_dml_limit(limit_syntax, &environment, trigger.is_some())?;
         let returning =
             self.analyze_dml_returning(returning_syntax, &environment, target, trigger.is_some())?;
@@ -418,7 +416,7 @@ impl Analyzer<'_, '_> {
             from,
             assignments,
             predicate,
-            order_by: Vec::new(),
+            order_by,
             limit,
             conflict,
             returning,

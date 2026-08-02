@@ -192,8 +192,22 @@ pub(crate) fn emit_root_update_with_context(
             )
         })
         .transpose()?;
+    let ordered_rows = (from_rows.is_none()
+        && (!update.order_by.is_empty() || update.limit.is_some()))
+    .then(|| {
+        super::emit_ordered_dml_rowids(
+            plan,
+            program,
+            &mut bindings,
+            cursor,
+            update.predicate.as_ref(),
+            &update.order_by,
+            update.limit.as_ref(),
+        )
+    })
+    .transpose()?;
 
-    if from_rows.is_none() {
+    if from_rows.is_none() && ordered_rows.is_none() {
         let scan_start = program.allocate_label();
         let scan_next = program.allocate_label();
         let scan_done = program.allocate_label();
@@ -241,6 +255,18 @@ pub(crate) fn emit_root_update_with_context(
         program.emit_insn(Insn::RowId {
             cursor_id: from_rows.cursor,
             dest: rowid.0,
+        });
+    } else if let Some(ordered_rows) = &ordered_rows {
+        program.emit_insn(Insn::Rewind {
+            cursor_id: ordered_rows.cursor,
+            pc_if_empty: write_done,
+        });
+        program.preassign_label_to_next_insn(write_start);
+        program.emit_insn(Insn::Column {
+            cursor_id: ordered_rows.cursor,
+            column: 0,
+            dest: rowid.0,
+            default: None,
         });
     } else {
         program.preassign_label_to_next_insn(write_start);
@@ -637,6 +663,11 @@ pub(crate) fn emit_root_update_with_context(
             cursor_id: from_rows.cursor,
             pc_if_next: write_start,
         });
+    } else if let Some(ordered_rows) = &ordered_rows {
+        program.emit_insn(Insn::Next {
+            cursor_id: ordered_rows.cursor,
+            pc_if_next: write_start,
+        });
     } else {
         program.emit_insn(Insn::Goto {
             target_pc: write_start,
@@ -647,6 +678,9 @@ pub(crate) fn emit_root_update_with_context(
     program.emit_insn(Insn::Close { cursor_id: cursor });
     if let Some(from_rows) = from_rows {
         from_rows.close(program);
+    }
+    if let Some(ordered_rows) = ordered_rows {
+        ordered_rows.close(program);
     }
     if let Some(cdc) = cdc {
         cdc.emit_autocommit_commit(program)?;
@@ -664,7 +698,7 @@ fn preflight_update<'plan>(
     crate::sync::Arc<crate::schema::BTreeTable>,
     usize,
 )> {
-    if !update.order_by.is_empty() || update.limit.is_some() {
+    if update.from.is_some() && (!update.order_by.is_empty() || update.limit.is_some()) {
         return Err(PhysicalUpdateError::Unsupported("ORDER BY or LIMIT"));
     }
     if !triggers.covers(&update.triggers) {

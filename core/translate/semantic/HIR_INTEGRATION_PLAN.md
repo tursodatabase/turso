@@ -116,6 +116,9 @@ operations are not SQL binding.
   - [x] Correlated scalar and EXISTS subqueries in UPDATE predicates and
         assignments, and DELETE predicates, share the query layer's QueryId
         destinations and CTE lifetime rules.
+  - [x] UPDATE and DELETE ORDER BY/LIMIT freeze selected rowids from HIR before
+        the first mutation, so sorting, OFFSET, and LIMIT cannot observe their
+        own writes.
   - [x] UPDATE child-key changes remove deferred OLD violations and validate
         the complete NEW row through frozen parent table/index identities.
   - [x] Triggers and foreign keys.

@@ -25,7 +25,7 @@ use crate::{
     types::KeyInfo,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{HashDistinctData, IdxInsertFlags, InsertFlags, Insn, SortComparatorType, to_u32},
+        insn::{to_u32, HashDistinctData, IdxInsertFlags, InsertFlags, Insn, SortComparatorType},
     },
 };
 
@@ -247,6 +247,18 @@ pub(crate) struct MaterializedQuery {
 pub(crate) struct MaterializedUpdateRows {
     pub(crate) cursor: usize,
     pub(crate) width: usize,
+}
+
+pub(crate) struct MaterializedDmlRowids {
+    pub(crate) cursor: usize,
+}
+
+impl MaterializedDmlRowids {
+    pub(crate) fn close(self, program: &mut ProgramBuilder) {
+        program.emit_insn(Insn::Close {
+            cursor_id: self.cursor,
+        });
+    }
 }
 
 impl MaterializedUpdateRows {
@@ -619,6 +631,153 @@ pub(crate) fn emit_expression_for_dml<'document>(
         }
     }
     result.map_err(Into::into)
+}
+
+/// Freeze the target rowids selected by a DML ORDER BY/LIMIT before any row is
+/// changed. ORDER BY terms are evaluated against the live target SourceId and
+/// LIMIT/OFFSET are applied while draining the sorter into a private table.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_ordered_dml_rowids<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    target_cursor: usize,
+    predicate: Option<&Expr>,
+    order_by: &'document [OrderTerm],
+    limit: Option<&'document crate::translate::semantic::hir::Limit>,
+) -> QueryResult<MaterializedDmlRowids> {
+    let table = ephemeral_table("ordered_dml_rowids".to_string(), 1);
+    let output_cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: output_cursor,
+        is_table: true,
+    });
+    let destination = QueryDestination::EphemeralTable {
+        cursor_id: output_cursor,
+        table: &table,
+    };
+    let mut ctes = MaterializedCtes::default();
+    let runtime_limit = open_limit(plan, program, bindings, &mut ctes, limit, destination)?;
+
+    let sorter = if order_by.is_empty() {
+        None
+    } else {
+        let cursor_id = program.alloc_cursor_id(CursorType::Sorter);
+        program.emit_insn(Insn::SorterOpen {
+            cursor_id,
+            columns: order_by.len(),
+            order_collations_nulls: order_by
+                .iter()
+                .map(|term| {
+                    (
+                        term.order,
+                        term.collation.as_ref().map(|collation| *collation.value()),
+                        term.nulls,
+                    )
+                })
+                .collect(),
+            comparators: order_by
+                .iter()
+                .map(|term| sort_comparator(&term.type_fact))
+                .collect(),
+        });
+        Some(OpenedSorter {
+            cursor_id,
+            record: RegisterId(program.alloc_register()),
+            order_by,
+            first_block: QueryBlockId::new(QueryId::new(0), 0),
+            width: 1,
+        })
+    };
+
+    let scan_start = program.allocate_label();
+    let scan_next = program.allocate_label();
+    let scan_done = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: target_cursor,
+        pc_if_empty: scan_done,
+    });
+    program.preassign_label_to_next_insn(scan_start);
+    if let Some(predicate) = predicate {
+        let condition = emit_expression_for_dml(plan, program, bindings, predicate)?;
+        if condition.width != 1 {
+            return Err(PhysicalQueryError::Invalid("DML predicate is not scalar"));
+        }
+        program.emit_insn(Insn::IfNot {
+            reg: condition.first.0,
+            target_pc: scan_next,
+            jump_if_null: true,
+        });
+    }
+    let rowid = RegisterId(program.alloc_register());
+    program.emit_insn(Insn::RowId {
+        cursor_id: target_cursor,
+        dest: rowid.0,
+    });
+    if let Some(sorter) = sorter {
+        let fields = program.alloc_registers(order_by.len() + 1);
+        for (position, term) in order_by.iter().enumerate() {
+            let value = emit_expression_for_dml(plan, program, bindings, &term.expr)?;
+            if value.width != 1 {
+                return Err(PhysicalQueryError::Invalid(
+                    "DML ORDER BY term is not scalar",
+                ));
+            }
+            program.emit_insn(Insn::Copy {
+                src_reg: value.first.0,
+                dst_reg: fields + position,
+                extra_amount: 0,
+            });
+        }
+        program.emit_insn(Insn::Copy {
+            src_reg: rowid.0,
+            dst_reg: fields + order_by.len(),
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(fields),
+            count: to_u32(order_by.len() + 1),
+            dest_reg: to_u32(sorter.record.0),
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::SorterInsert {
+            cursor_id: sorter.cursor_id,
+            record_reg: sorter.record.0,
+        });
+    } else {
+        emit_row_destination_without_context(
+            program,
+            RegisterRange::new(rowid.0, 1),
+            destination,
+            runtime_limit,
+        )?;
+    }
+    program.preassign_label_to_next_insn(scan_next);
+    program.emit_insn(Insn::Next {
+        cursor_id: target_cursor,
+        pc_if_next: scan_start,
+    });
+    program.preassign_label_to_next_insn(scan_done);
+
+    if let Some(sorter) = sorter {
+        emit_sorted_rows(program, sorter, destination, runtime_limit)?;
+    } else if let Some(limit) = runtime_limit {
+        program.preassign_label_to_next_insn(limit.done);
+    }
+    for cursor_id in ctes.temporary_cursors.iter().rev() {
+        program.emit_insn(Insn::Close {
+            cursor_id: *cursor_id,
+        });
+    }
+    for cte in ctes.by_id.values() {
+        program.emit_insn(Insn::Close {
+            cursor_id: cte.cursor_id,
+        });
+    }
+    Ok(MaterializedDmlRowids {
+        cursor: output_cursor,
+    })
 }
 
 /// Materialize one stable UPDATE FROM candidate per target rowid. Assignment
