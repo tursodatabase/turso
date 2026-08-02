@@ -1,15 +1,16 @@
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc,
 };
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream;
 use tokio::net::TcpListener;
-use tracing::{error, info};
-use turso_core::Value;
-use turso_pg::{split_statements, Connection, PgConnection};
+use tracing::{error, info, warn};
+use turso_core::{LimboError, Value};
+use turso_pg::{split_statements, Connection};
 
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::portal::{Format, Portal};
@@ -28,7 +29,8 @@ use pgwire::types::format::FormatOptions;
 pub struct TursoPgServer {
     address: String,
     db_file: String,
-    conn: Arc<Mutex<PgConnection>>,
+    db: Arc<turso_core::Database>,
+    busy_timeout: Duration,
     interrupt_count: Arc<AtomicUsize>,
 }
 
@@ -36,13 +38,15 @@ impl TursoPgServer {
     pub fn new(
         address: String,
         db_file: String,
-        conn: Connection,
+        db: Arc<turso_core::Database>,
+        busy_timeout: Duration,
         interrupt_count: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             address,
             db_file,
-            conn: Arc::new(Mutex::new(conn)),
+            db,
+            busy_timeout,
             interrupt_count,
         }
     }
@@ -59,24 +63,43 @@ impl TursoPgServer {
             self.address, self.db_file
         );
 
-        let factory = Arc::new(TursoPgFactory {
-            handler: Arc::new(TursoPgHandler {
-                conn: self.conn.clone(),
-                db_file: self.db_file.clone(),
-                query_parser: Arc::new(NoopQueryParser::new()),
-            }),
-        });
-
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
                         Ok((socket, addr)) => {
                             info!("PostgreSQL client connected from {}", addr);
-                            let factory_ref = factory.clone();
+                            let db = self.db.clone();
+                            let db_file = self.db_file.clone();
+                            let busy_timeout = self.busy_timeout;
                             tokio::spawn(async move {
-                                if let Err(e) = process_socket(socket, None, factory_ref).await {
+                                let minted = tokio::task::spawn_blocking({
+                                    let db_file = db_file.clone();
+                                    move || new_client_connection(&db, &db_file, busy_timeout)
+                                })
+                                .await
+                                .map_err(|e| e.to_string())
+                                .and_then(|r| r.map_err(|e| e.to_string()));
+                                let conn = match minted {
+                                    Ok(conn) => conn,
+                                    Err(e) => {
+                                        error!("Failed to open a connection for client {}: {}", addr, e);
+                                        return;
+                                    }
+                                };
+                                let factory = Arc::new(TursoPgFactory {
+                                    handler: Arc::new(TursoPgHandler {
+                                        conn: conn.clone(),
+                                        db_file,
+                                        query_parser: Arc::new(NoopQueryParser::new()),
+                                    }),
+                                });
+                                if let Err(e) = process_socket(socket, None, factory).await {
                                     error!("Error processing connection from {}: {}", addr, e);
+                                }
+                                // Rolls back any open transaction and releases its locks.
+                                if let Err(e) = conn.close() {
+                                    warn!("Error closing connection for {}: {}", addr, e);
                                 }
                             });
                         }
@@ -101,55 +124,99 @@ impl TursoPgServer {
     }
 }
 
+/// Open one client's dedicated connection; clients share no transaction or
+/// session state. Runs on the blocking pool so attaching schema files
+/// cannot stall the accept loop.
+fn new_client_connection(
+    db: &Arc<turso_core::Database>,
+    db_file: &str,
+    busy_timeout: Duration,
+) -> turso_core::Result<Connection> {
+    let conn = Connection::new(db.connect()?);
+    conn.inner().set_busy_timeout(busy_timeout);
+    auto_attach_pg_schemas(&conn, db_file);
+    Ok(conn)
+}
+
+/// Discover and attach existing PG schema database files in the same directory.
+pub fn auto_attach_pg_schemas(conn: &Connection, db_file: &str) {
+    if db_file == ":memory:" {
+        return;
+    }
+    let dir = std::path::Path::new(db_file)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(schema) = name
+            .strip_prefix("turso-postgres-schema-")
+            .and_then(|s| s.strip_suffix(".db"))
+        else {
+            continue;
+        };
+        let path = entry.path().to_string_lossy().to_string();
+        let sql = format!("ATTACH '{path}' AS \"{schema}\"");
+        info!("Auto-attaching PG schema '{}' from {}", schema, path);
+        if let Err(e) = conn.inner().execute(&sql) {
+            warn!("Failed to attach schema '{}': {}", schema, e);
+        }
+    }
+}
+
 struct TursoPgHandler {
-    conn: Arc<Mutex<PgConnection>>,
+    conn: Connection,
     db_file: String,
     query_parser: Arc<NoopQueryParser>,
 }
 
-impl TursoPgHandler {
-    /// After a DROP SCHEMA query succeeds, delete the schema's database file.
-    /// Uses simple string matching to detect DROP SCHEMA statements.
-    fn cleanup_dropped_schema_file(&self, query: &str) {
-        if self.db_file == ":memory:" {
-            return;
+/// After a DROP SCHEMA query succeeds, delete the schema's database file.
+/// Uses simple string matching to detect DROP SCHEMA statements.
+fn cleanup_dropped_schema_file(db_file: &str, query: &str) {
+    if db_file == ":memory:" {
+        return;
+    }
+    // Simple detection: look for DROP SCHEMA pattern
+    let trimmed = query.trim().to_lowercase();
+    if !trimmed.starts_with("drop schema") {
+        return;
+    }
+    // Extract schema name: "drop schema [if exists] <name> [cascade|restrict]"
+    let rest = trimmed.strip_prefix("drop schema").unwrap().trim();
+    let rest = rest
+        .strip_prefix("if exists")
+        .map(|s| s.trim())
+        .unwrap_or(rest);
+    // Take the first word as the schema name
+    let name = rest
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches('"');
+    if name.is_empty() || name == "public" {
+        return;
+    }
+    let parent = std::path::Path::new(db_file)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let schema_file = parent.join(format!("turso-postgres-schema-{name}.db"));
+    if schema_file.exists() {
+        if let Err(e) = std::fs::remove_file(&schema_file) {
+            warn!("Failed to delete schema file {:?}: {}", schema_file, e);
+        } else {
+            info!("Deleted schema file {:?}", schema_file);
         }
-        // Simple detection: look for DROP SCHEMA pattern
-        let trimmed = query.trim().to_lowercase();
-        if !trimmed.starts_with("drop schema") {
-            return;
-        }
-        // Extract schema name: "drop schema [if exists] <name> [cascade|restrict]"
-        let rest = trimmed.strip_prefix("drop schema").unwrap().trim();
-        let rest = rest
-            .strip_prefix("if exists")
-            .map(|s| s.trim())
-            .unwrap_or(rest);
-        // Take the first word as the schema name
-        let name = rest
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_matches('"');
-        if name.is_empty() || name == "public" {
-            return;
-        }
-        let parent = std::path::Path::new(&self.db_file)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let schema_file = parent.join(format!("turso-postgres-schema-{name}.db"));
-        if schema_file.exists() {
-            if let Err(e) = std::fs::remove_file(&schema_file) {
-                tracing::warn!("Failed to delete schema file {:?}: {}", schema_file, e);
-            } else {
-                tracing::info!("Deleted schema file {:?}", schema_file);
-            }
-            // Also clean up WAL and SHM files
-            let wal = schema_file.with_extension("db-wal");
-            let shm = schema_file.with_extension("db-shm");
-            let _ = std::fs::remove_file(wal);
-            let _ = std::fs::remove_file(shm);
-        }
+        // Also clean up WAL and SHM files
+        let wal = schema_file.with_extension("db-wal");
+        let shm = schema_file.with_extension("db-shm");
+        let _ = std::fs::remove_file(wal);
+        let _ = std::fs::remove_file(shm);
     }
 }
 
@@ -177,43 +244,45 @@ impl SimpleQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = self.conn.clone();
+        let db_file = self.db_file.clone();
+        let query = query.to_string();
 
-        // Per the PostgreSQL simple query protocol, a query string may contain
-        // multiple semicolon-separated statements. Split and execute each one.
-        let statements = split_statements(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        run_blocking(move || {
+            // Per the PostgreSQL simple query protocol, a query string may contain
+            // multiple semicolon-separated statements. Split and execute each one.
+            let statements = split_statements(&query).map_err(|e| limbo_error_to_pg(&e))?;
 
-        let mut responses = Vec::new();
-        for sql in &statements {
-            let result = (|| {
-                let mut stmt = conn
-                    .prepare(sql)
-                    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            let mut responses = Vec::new();
+            for sql in &statements {
+                let result = (|| {
+                    let mut stmt = conn.prepare(sql).map_err(|e| limbo_error_to_pg(&e))?;
 
-                self.cleanup_dropped_schema_file(sql);
+                    cleanup_dropped_schema_file(&db_file, sql);
 
-                if stmt.num_columns() == 0 || is_pg_non_query(sql) {
-                    execute_non_query(&mut stmt, sql)
-                } else {
-                    let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
-                    execute_query(&mut stmt, header)
-                }
-            })();
-            match result {
-                Ok(response) => responses.push(response),
-                // An error ends the message. Report it as a response, not
-                // Err: pgwire drops earlier tags and transaction
-                // transitions on Err, so after a BEGIN the client would
-                // be told idle while the connection is in a transaction.
-                Err(e) => {
-                    responses.push(Response::Error(Box::new(e.into())));
-                    break;
+                    if stmt.num_columns() == 0 || is_pg_non_query(sql) {
+                        execute_non_query(&mut stmt, sql)
+                    } else {
+                        let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+                        execute_query(&mut stmt, header)
+                    }
+                })();
+                match result {
+                    Ok(response) => responses.push(response),
+                    // An error ends the message. Report it as a response, not
+                    // Err: pgwire drops earlier tags and transaction
+                    // transitions on Err, so after a BEGIN the client would
+                    // be told idle while the connection is in a transaction.
+                    Err(e) => {
+                        responses.push(Response::Error(Box::new(e.into())));
+                        break;
+                    }
                 }
             }
-        }
 
-        Ok(responses)
+            Ok(responses)
+        })
+        .await
     }
 }
 
@@ -235,25 +304,30 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
-        let query = &portal.statement.statement;
+        let conn = self.conn.clone();
+        let db_file = self.db_file.clone();
+        let query = portal.statement.statement.clone();
+        let parameters = portal.parameters.clone();
+        let parameter_types = portal.statement.parameter_types.clone();
+        let result_format = portal.result_column_format.clone();
 
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        run_blocking(move || {
+            let mut stmt = conn.prepare(&query).map_err(|e| limbo_error_to_pg(&e))?;
 
-        // Clean up schema file after successful DROP SCHEMA
-        self.cleanup_dropped_schema_file(query);
+            // Clean up schema file after successful DROP SCHEMA
+            cleanup_dropped_schema_file(&db_file, &query);
 
-        // Bind parameters from the portal
-        bind_portal_parameters(&mut stmt, portal)?;
+            // Bind parameters from the portal
+            bind_parameters(&mut stmt, &parameters, &parameter_types)?;
 
-        if stmt.num_columns() == 0 || is_pg_non_query(query) {
-            return execute_non_query(&mut stmt, query);
-        }
+            if stmt.num_columns() == 0 || is_pg_non_query(&query) {
+                return execute_non_query(&mut stmt, &query);
+            }
 
-        let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
-        execute_query(&mut stmt, header)
+            let header = Arc::new(build_field_info(&stmt, &result_format));
+            execute_query(&mut stmt, header)
+        })
+        .await
     }
 
     async fn do_describe_statement<C>(
@@ -264,19 +338,20 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
-        let stmt = conn
-            .prepare(&target.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
-
+        let conn = self.conn.clone();
+        let query = target.statement.clone();
         let param_types: Vec<Type> = target
             .parameter_types
             .iter()
             .map(|t| t.clone().unwrap_or(Type::TEXT))
             .collect();
 
-        let fields = build_field_info(&stmt, &Format::UnifiedText);
-        Ok(DescribeStatementResponse::new(param_types, fields))
+        run_blocking(move || {
+            let stmt = conn.prepare(&query).map_err(|e| limbo_error_to_pg(&e))?;
+            let fields = build_field_info(&stmt, &Format::UnifiedText);
+            Ok(DescribeStatementResponse::new(param_types, fields))
+        })
+        .await
     }
 
     async fn do_describe_portal<C>(
@@ -287,13 +362,16 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
-        let stmt = conn
-            .prepare(&portal.statement.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        let conn = self.conn.clone();
+        let query = portal.statement.statement.clone();
+        let result_format = portal.result_column_format.clone();
 
-        let fields = build_field_info(&stmt, &portal.result_column_format);
-        Ok(DescribePortalResponse::new(fields))
+        run_blocking(move || {
+            let stmt = conn.prepare(&query).map_err(|e| limbo_error_to_pg(&e))?;
+            let fields = build_field_info(&stmt, &result_format);
+            Ok(DescribePortalResponse::new(fields))
+        })
+        .await
     }
 }
 
@@ -414,7 +492,7 @@ fn execute_query(
         rows.push(encoder.finish());
         Ok(())
     })
-    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+    .map_err(|e| limbo_error_to_pg(&e))?;
 
     let data_stream = stream::iter(rows);
     Ok(Response::Query(QueryResponse::new(header, data_stream)))
@@ -422,8 +500,7 @@ fn execute_query(
 
 /// Execute a non-SELECT statement and build an Execution response.
 fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireResult<Response> {
-    stmt.run_ignore_rows()
-        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+    stmt.run_ignore_rows().map_err(|e| limbo_error_to_pg(&e))?;
 
     let affected = stmt.n_change();
     let tag = command_tag(query, affected as usize);
@@ -457,30 +534,30 @@ fn transaction_aware_response(query: &str, tag: Tag) -> Response {
     }
 }
 
-/// Extract parameters from a Portal and bind them to a prepared statement.
+/// Bind parameter values (raw bytes plus declared types) to a prepared
+/// statement.
 ///
 /// PostgreSQL parameters ($1, $2, ...) map to portal parameters 0, 1, ...
 /// The bytecode compiler may allocate internal parameter indices in a different
 /// order than the $N numbering (e.g. if $2 appears before $1 in the SQL), so we
 /// look up each parameter's internal index by name.
-fn bind_portal_parameters(
+fn bind_parameters<B: AsRef<[u8]>>(
     stmt: &mut turso_core::Statement,
-    portal: &Portal<String>,
+    parameters: &[Option<B>],
+    parameter_types: &[Option<Type>],
 ) -> PgWireResult<()> {
-    for i in 0..portal.parameter_len() {
-        let value = match &portal.parameters[i] {
+    for (i, param) in parameters.iter().enumerate() {
+        let value = match param {
             None => Value::Null,
             Some(bytes) => {
-                let pg_type = portal
-                    .statement
-                    .parameter_types
+                let pg_type = parameter_types
                     .get(i)
                     .and_then(|t| t.as_ref())
                     .unwrap_or(&Type::UNKNOWN);
-                pg_bytes_to_value(bytes, pg_type)?
+                pg_bytes_to_value(bytes.as_ref(), pg_type)?
             }
         };
-        // Portal parameter i corresponds to PostgreSQL $N where N = i + 1.
+        // Parameter i corresponds to PostgreSQL $N where N = i + 1.
         // Look up the internal index that the bytecode compiler assigned to $N.
         let pg_param_name = format!("${}", i + 1);
         let idx = stmt
@@ -797,6 +874,42 @@ fn is_create_table_as(upper: &str) -> bool {
 
 fn error_info(message: &str) -> ErrorInfo {
     ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), message.to_owned())
+}
+
+/// Run a database operation on the blocking pool. Statements can hold a
+/// thread for seconds (busy-handler lock waits); if run on the async
+/// runtime, that blocking can leave another client's COMMIT unprocessed
+/// until the blocked statement times out.
+async fn run_blocking<T: Send + 'static>(
+    f: impl FnOnce() -> PgWireResult<T> + Send + 'static,
+) -> PgWireResult<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+}
+
+/// Map a turso error to a PG wire error: lock contention gets real
+/// SQLSTATEs so client retry logic works, everything else stays XX000.
+fn limbo_error_to_pg(e: &LimboError) -> PgWireError {
+    let mut info = match e {
+        // Busy timeout expired waiting for the write lock; PostgreSQL's
+        // code for a lock wait timing out is 55P03 lock_not_available.
+        LimboError::Busy => ErrorInfo::new(
+            "ERROR".to_owned(),
+            "55P03".to_owned(),
+            "canceling statement due to lock timeout".to_owned(),
+        ),
+        // Stale read snapshot: the transaction must be rolled back and
+        // retried. PostgreSQL reports this as 40001 serialization_failure.
+        LimboError::BusySnapshot => ErrorInfo::new(
+            "ERROR".to_owned(),
+            "40001".to_owned(),
+            "could not serialize access due to concurrent update".to_owned(),
+        ),
+        _ => return PgWireError::UserError(Box::new(error_info(&e.to_string()))),
+    };
+    info.detail = Some(e.to_string());
+    PgWireError::UserError(Box::new(info))
 }
 
 #[cfg(test)]

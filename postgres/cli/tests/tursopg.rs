@@ -953,6 +953,14 @@ fn copy_from_file_not_found_repl() {
 /// for a free ephemeral port and verify our own child is the process that
 /// came up on it, retrying with a fresh port if the child dies on bind.
 fn start_tursopg_server() -> (Child, u16) {
+    start_tursopg_server_with_args(&[])
+}
+
+fn start_tursopg_server_with_args(extra_args: &[&str]) -> (Child, u16) {
+    start_tursopg_server_with_db_and_args(":memory:", extra_args)
+}
+
+fn start_tursopg_server_with_db_and_args(db_path: &str, extra_args: &[&str]) -> (Child, u16) {
     for _ in 0..10 {
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -961,9 +969,10 @@ fn start_tursopg_server() -> (Child, u16) {
             .port();
         let addr = format!("127.0.0.1:{port}");
         let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-            .arg(":memory:")
+            .arg(db_path)
             .arg("--server")
             .arg(&addr)
+            .args(extra_args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -1694,4 +1703,185 @@ fn wire_end_and_abort_report_commit_and_rollback_tags() {
         assert_eq!(c.query_command_tags("ABORT"), ["ROLLBACK"]);
         assert_eq!(c.query_single_text("SELECT count(*) FROM t"), "0");
     });
+}
+
+// ---------------------------------------------------------------------------
+// Per-client connections
+// ---------------------------------------------------------------------------
+
+/// Each client gets its own transaction scope. With one shared connection,
+/// the second client's BEGIN fails with "cannot start a transaction
+/// within a transaction" (e.g. from psycopg's implicit BEGIN).
+#[test]
+fn wire_two_clients_get_independent_transactions() {
+    let (mut server, port) = start_tursopg_server();
+    let mut a = PgTestClient::connect(port);
+    let mut b = PgTestClient::connect(port);
+
+    assert_eq!(a.query_command_tags("BEGIN"), ["BEGIN"]);
+    assert_eq!(b.query_command_tags("BEGIN"), ["BEGIN"]);
+    assert_eq!(a.query_command_tags("COMMIT"), ["COMMIT"]);
+    assert_eq!(b.query_command_tags("COMMIT"), ["COMMIT"]);
+
+    server.kill().ok();
+    server.wait().ok();
+}
+
+/// Uncommitted writes are invisible to other clients until COMMIT. DDL
+/// committed in an explicit transaction must also reach other
+/// connections' schemas.
+#[test]
+fn wire_transaction_isolation_between_clients() {
+    let (mut server, port) = start_tursopg_server();
+    let mut a = PgTestClient::connect(port);
+    let mut b = PgTestClient::connect(port);
+
+    a.query_command_tags("BEGIN");
+    a.query_command_tags("CREATE TABLE t (x INTEGER)");
+    a.query_command_tags("COMMIT");
+
+    a.query_command_tags("BEGIN");
+    a.query_command_tags("INSERT INTO t VALUES (1)");
+    assert_eq!(b.query_single_text("SELECT count(*) FROM t"), "0");
+    a.query_command_tags("COMMIT");
+    assert_eq!(b.query_single_text("SELECT count(*) FROM t"), "1");
+
+    server.kill().ok();
+    server.wait().ok();
+}
+
+/// A blocked writer must proceed once the competing transaction commits.
+/// Pins query execution on the blocking pool: when run inline, the other
+/// client's COMMIT goes unprocessed and this writer times out instead.
+#[test]
+fn wire_blocked_write_succeeds_after_commit() {
+    let (mut server, port) = start_tursopg_server();
+    let mut a = PgTestClient::connect(port);
+    a.query_command_tags("CREATE TABLE t (x INTEGER)");
+    a.query_command_tags("BEGIN");
+    a.query_command_tags("INSERT INTO t VALUES (1)");
+
+    let blocked = std::thread::spawn(move || {
+        let mut b = PgTestClient::connect(port);
+        let start = std::time::Instant::now();
+        let tags = b.query_command_tags("INSERT INTO t VALUES (2)");
+        (tags, start.elapsed())
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    a.query_command_tags("COMMIT");
+
+    let (tags, elapsed) = blocked.join().unwrap();
+    assert_eq!(tags, ["INSERT 0 1"]);
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "blocked write took {elapsed:?}"
+    );
+    assert_eq!(a.query_single_text("SELECT count(*) FROM t"), "2");
+
+    server.kill().ok();
+    server.wait().ok();
+}
+
+/// Busy timeout expiry while another client holds the write lock reports
+/// SQLSTATE 55P03 (lock_not_available), like PostgreSQL's lock_timeout.
+#[test]
+fn wire_write_lock_timeout_reports_lock_not_available() {
+    let (mut server, port) = start_tursopg_server_with_args(&["--busy-timeout", "100"]);
+    let mut a = PgTestClient::connect(port);
+    let mut b = PgTestClient::connect(port);
+    a.query_command_tags("CREATE TABLE t (x INTEGER)");
+    a.query_command_tags("BEGIN");
+    a.query_command_tags("INSERT INTO t VALUES (1)");
+
+    let response = b.query_raw("INSERT INTO t VALUES (2)");
+    assert_eq!(
+        extract_error_field(&response, b'C').as_deref(),
+        Some("55P03")
+    );
+    // Turso's own message is in the detail field.
+    assert!(extract_error_field(&response, b'D').is_some());
+
+    a.query_command_tags("COMMIT");
+    // The lock is free again: the same write now succeeds.
+    assert_eq!(
+        b.query_command_tags("INSERT INTO t VALUES (2)"),
+        ["INSERT 0 1"]
+    );
+
+    server.kill().ok();
+    server.wait().ok();
+}
+
+/// A write from a stale snapshot (another client committed after it was
+/// taken) fails at once with SQLSTATE 40001, the code PostgreSQL
+/// REPEATABLE READ uses for writes to concurrently-modified rows; the
+/// client rolls back and retries.
+#[test]
+fn wire_stale_snapshot_write_reports_serialization_failure() {
+    let (mut server, port) = start_tursopg_server();
+    let mut a = PgTestClient::connect(port);
+    let mut b = PgTestClient::connect(port);
+    a.query_command_tags("CREATE TABLE t (x INTEGER)");
+
+    a.query_command_tags("BEGIN");
+    assert_eq!(a.query_single_text("SELECT count(*) FROM t"), "0");
+    b.query_command_tags("INSERT INTO t VALUES (1)");
+
+    let response = a.query_raw("INSERT INTO t VALUES (2)");
+    assert_eq!(
+        extract_error_field(&response, b'C').as_deref(),
+        Some("40001")
+    );
+
+    a.query_command_tags("ROLLBACK");
+    assert_eq!(a.query_single_text("SELECT count(*) FROM t"), "1");
+
+    server.kill().ok();
+    server.wait().ok();
+}
+
+/// Disconnecting mid-transaction must not wedge the single writer: the
+/// server rolls back and releases the write lock.
+#[test]
+fn wire_disconnect_mid_transaction_releases_write_lock() {
+    let (mut server, port) = start_tursopg_server();
+    let mut a = PgTestClient::connect(port);
+    let mut b = PgTestClient::connect(port);
+    a.query_command_tags("CREATE TABLE t (x INTEGER)");
+    a.query_command_tags("BEGIN");
+    a.query_command_tags("INSERT INTO t VALUES (1)");
+
+    drop(a);
+
+    assert_eq!(
+        b.query_command_tags("INSERT INTO t VALUES (2)"),
+        ["INSERT 0 1"]
+    );
+    // The dropped client's uncommitted row was rolled back.
+    assert_eq!(b.query_single_text("SELECT count(*) FROM t"), "1");
+
+    server.kill().ok();
+    server.wait().ok();
+}
+
+/// Schema files attach at connect time: a schema created after the server
+/// started works for clients that connect later.
+#[test]
+fn wire_schema_files_attach_for_new_clients() {
+    let dir = std::env::temp_dir().join(format!("tursopg-attach-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("main.db");
+
+    let (mut server, port) = start_tursopg_server_with_db_and_args(db_path.to_str().unwrap(), &[]);
+    let mut a = PgTestClient::connect(port);
+    a.query_command_tags("CREATE SCHEMA app");
+    a.query_command_tags("CREATE TABLE app.items (x INTEGER)");
+    a.query_command_tags("INSERT INTO app.items VALUES (1)");
+
+    let mut b = PgTestClient::connect(port);
+    assert_eq!(b.query_single_text("SELECT count(*) FROM app.items"), "1");
+
+    server.kill().ok();
+    server.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
 }
