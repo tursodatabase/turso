@@ -13,7 +13,7 @@ use crate::{
     },
 };
 
-use super::{RegisterId, RegisterRange};
+use super::{ForeignKeyParentChange, PreparedTriggers, RegisterId, RegisterRange};
 
 #[derive(Debug)]
 pub(crate) enum PhysicalForeignKeyError {
@@ -105,7 +105,12 @@ pub(crate) fn emit_delete_parent_checks(
     old_columns: RegisterRange,
     rowid: RegisterId,
 ) -> ForeignKeyResult<()> {
-    for foreign_key in foreign_keys {
+    for foreign_key in foreign_keys.iter().filter(|foreign_key| {
+        matches!(
+            foreign_key.declaration.on_delete,
+            turso_parser::ast::RefAct::NoAction | turso_parser::ast::RefAct::Restrict
+        )
+    }) {
         emit_delete_parent_check(program, foreign_key, parent_table, old_columns, rowid)?;
     }
     Ok(())
@@ -119,7 +124,12 @@ pub(crate) fn emit_update_parent_checks(
     new_columns: RegisterRange,
     rowid: RegisterId,
 ) -> ForeignKeyResult<()> {
-    for foreign_key in foreign_keys {
+    for foreign_key in foreign_keys.iter().filter(|foreign_key| {
+        matches!(
+            foreign_key.declaration.on_update,
+            turso_parser::ast::RefAct::NoAction | turso_parser::ast::RefAct::Restrict
+        )
+    }) {
         emit_update_parent_check(
             program,
             foreign_key,
@@ -128,6 +138,131 @@ pub(crate) fn emit_update_parent_checks(
             new_columns,
             rowid,
         )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn emit_delete_parent_actions(
+    program: &mut ProgramBuilder,
+    foreign_keys: &[ResolvedForeignKey],
+    parent_table: &BTreeTable,
+    old_columns: RegisterRange,
+    rowid: RegisterId,
+    prepared: &PreparedTriggers,
+) -> ForeignKeyResult<()> {
+    use turso_parser::ast::RefAct;
+
+    for foreign_key in foreign_keys.iter().filter(|foreign_key| {
+        matches!(
+            foreign_key.declaration.on_delete,
+            RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault
+        )
+    }) {
+        let action = prepared
+            .foreign_key_action(
+                foreign_key.child_table.id(),
+                &foreign_key.declaration,
+                ForeignKeyParentChange::Delete,
+            )
+            .ok_or(PhysicalForeignKeyError::Invalid(
+                "mutating ON DELETE action has no prepared HIR program",
+            ))?;
+        let complete = program.allocate_label();
+        let key = program.alloc_registers(foreign_key.parent_positions.len());
+        for (offset, position) in foreign_key.parent_positions.iter().copied().enumerate() {
+            let source = child_register(parent_table, old_columns, rowid, position)?;
+            program.emit_insn(Insn::Copy {
+                src_reg: source,
+                dst_reg: key + offset,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::IsNull {
+                reg: key + offset,
+                target_pc: complete,
+            });
+        }
+        program.emit_insn(Insn::Program {
+            param_registers: (key..key + foreign_key.parent_positions.len()).collect(),
+            program: action.program.clone(),
+            ignore_jump_target: complete,
+        });
+        program.preassign_label_to_next_insn(complete);
+    }
+    Ok(())
+}
+
+pub(crate) fn emit_update_parent_actions(
+    program: &mut ProgramBuilder,
+    foreign_keys: &[ResolvedForeignKey],
+    parent_table: &BTreeTable,
+    old_columns: RegisterRange,
+    new_columns: RegisterRange,
+    rowid: RegisterId,
+    prepared: &PreparedTriggers,
+) -> ForeignKeyResult<()> {
+    use turso_parser::ast::RefAct;
+
+    for foreign_key in foreign_keys.iter().filter(|foreign_key| {
+        matches!(
+            foreign_key.declaration.on_update,
+            RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault
+        )
+    }) {
+        let action = prepared
+            .foreign_key_action(
+                foreign_key.child_table.id(),
+                &foreign_key.declaration,
+                ForeignKeyParentChange::Update,
+            )
+            .ok_or(PhysicalForeignKeyError::Invalid(
+                "mutating ON UPDATE action has no prepared HIR program",
+            ))?;
+        let complete = program.allocate_label();
+        let changed = program.allocate_label();
+        let width = foreign_key.parent_positions.len();
+        let old_key = program.alloc_registers(width);
+        let new_key = program.alloc_registers(width);
+        for (offset, position) in foreign_key.parent_positions.iter().copied().enumerate() {
+            let next_equal = (offset + 1 != width).then(|| program.allocate_label());
+            let old = child_register(parent_table, old_columns, rowid, position)?;
+            let new = child_register(parent_table, new_columns, rowid, position)?;
+            program.emit_insn(Insn::Copy {
+                src_reg: old,
+                dst_reg: old_key + offset,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::Copy {
+                src_reg: new,
+                dst_reg: new_key + offset,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::Eq {
+                lhs: old_key + offset,
+                rhs: new_key + offset,
+                target_pc: next_equal.unwrap_or(complete),
+                flags: CmpInsFlags::default().null_eq(),
+                collation: foreign_key
+                    .parent_unique_index
+                    .as_ref()
+                    .and_then(|index| index.value().columns.get(offset))
+                    .and_then(|column| column.collation),
+            });
+            program.emit_insn(Insn::Goto { target_pc: changed });
+            if let Some(next_equal) = next_equal {
+                program.preassign_label_to_next_insn(next_equal);
+            }
+        }
+        program.preassign_label_to_next_insn(changed);
+        let mut parameters = (old_key..old_key + width).collect::<Vec<_>>();
+        if foreign_key.declaration.on_update == RefAct::Cascade {
+            parameters.extend(new_key..new_key + width);
+        }
+        program.emit_insn(Insn::Program {
+            param_registers: parameters,
+            program: action.program.clone(),
+            ignore_jump_target: complete,
+        });
+        program.preassign_label_to_next_insn(complete);
     }
     Ok(())
 }

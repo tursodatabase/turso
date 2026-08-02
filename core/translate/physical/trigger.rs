@@ -3,6 +3,7 @@
 use std::fmt;
 
 use crate::{
+    schema::ForeignKey,
     sync::Arc,
     translate::semantic::hir::{CatalogObjectId, ResolvedTrigger},
     vdbe::{
@@ -39,10 +40,25 @@ pub(crate) struct PreparedTrigger {
     pub(crate) parameters: Vec<TriggerParameter>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForeignKeyParentChange {
+    Delete,
+    Update,
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedForeignKeyAction {
+    pub(crate) child_table: CatalogObjectId,
+    pub(crate) declaration_order: usize,
+    pub(crate) parent_change: ForeignKeyParentChange,
+    pub(crate) program: Subprogram,
+}
+
 #[derive(Default)]
 pub(crate) struct PreparedTriggers {
     programs: Vec<PreparedTrigger>,
     suppressed: Vec<CatalogObjectId>,
+    foreign_key_actions: Vec<PreparedForeignKeyAction>,
 }
 
 impl PreparedTriggers {
@@ -52,6 +68,23 @@ impl PreparedTriggers {
 
     pub(crate) fn suppress(&mut self, trigger: CatalogObjectId) {
         self.suppressed.push(trigger);
+    }
+
+    pub(crate) fn push_foreign_key_action(&mut self, action: PreparedForeignKeyAction) {
+        self.foreign_key_actions.push(action);
+    }
+
+    pub(crate) fn foreign_key_action(
+        &self,
+        child_table: CatalogObjectId,
+        foreign_key: &ForeignKey,
+        parent_change: ForeignKeyParentChange,
+    ) -> Option<&PreparedForeignKeyAction> {
+        self.foreign_key_actions.iter().find(|action| {
+            action.child_table == child_table
+                && action.declaration_order == foreign_key.decl_order
+                && action.parent_change == parent_change
+        })
     }
 
     fn find(&self, trigger: CatalogObjectId) -> Option<&PreparedTrigger> {
@@ -69,6 +102,10 @@ impl PreparedTriggers {
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = &PreparedTrigger> {
         self.programs.iter()
+    }
+
+    pub(crate) fn foreign_key_actions(&self) -> impl Iterator<Item = &PreparedForeignKeyAction> {
+        self.foreign_key_actions.iter()
     }
 }
 

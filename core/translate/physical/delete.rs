@@ -333,6 +333,16 @@ pub(crate) fn emit_root_delete_with_context(
         table_name: table.name.clone(),
         is_part_of_update: false,
     });
+    if !delete.foreign_keys.incoming.is_empty() {
+        super::emit_delete_parent_actions(
+            program,
+            &delete.foreign_keys.incoming,
+            &table,
+            old_columns.expect("foreign keys require the frozen OLD row"),
+            rowid,
+            triggers,
+        )?;
+    }
     if let Some(old_columns) = old_columns {
         emit_trigger_programs(
             program,
@@ -387,13 +397,19 @@ fn preflight_delete<'plan>(
         ));
     }
     if delete.foreign_keys.incoming.iter().any(|foreign_key| {
-        !matches!(
+        matches!(
             foreign_key.declaration.on_delete,
-            RefAct::NoAction | RefAct::Restrict
-        )
+            RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault
+        ) && triggers
+            .foreign_key_action(
+                foreign_key.child_table.id(),
+                &foreign_key.declaration,
+                super::ForeignKeyParentChange::Delete,
+            )
+            .is_none()
     }) {
-        return Err(PhysicalDeleteError::Unsupported(
-            "mutating foreign-key actions",
+        return Err(PhysicalDeleteError::Invalid(
+            "mutating foreign-key action has no prepared HIR program",
         ));
     }
     if delete.predicate.as_ref().is_some_and(contains_subquery) {

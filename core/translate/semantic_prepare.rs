@@ -4,17 +4,18 @@
 //! physical lowering. Trigger syntax is analyzed into a separate HIR document
 //! before this layer allocates parameters or registers for it.
 
-use std::num::NonZeroU32;
+use std::num::{NonZero, NonZeroU32};
 
-use turso_parser::ast::ResolveType;
+use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct, ResolveType};
 
 use crate::{
-    schema::Table,
-    sync::Arc,
+    schema::{ForeignKey, Table},
+    sync::{Arc, OnceLock, Weak},
     translate::{
         physical::{
-            self, PhysicalPlan, PreparedTrigger, PreparedTriggers, RegisterId, RegisterRange,
-            RootRuntimeInputs, SourceRuntime, TriggerParameter, TriggerRow, TriggerRows,
+            self, ForeignKeyParentChange, PhysicalPlan, PreparedForeignKeyAction, PreparedTrigger,
+            PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs, SourceRuntime,
+            TriggerParameter, TriggerRow, TriggerRows,
         },
         semantic::{
             analyze,
@@ -26,10 +27,10 @@ use crate::{
     },
     vdbe::{
         builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode},
-        insn::Insn,
+        insn::{Insn, Subprogram},
         PrepareContext,
     },
-    Connection, LimboError, Result,
+    Connection, LimboError, PreparedProgram, Result,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,14 +48,29 @@ struct TriggerTarget<'document> {
     triggers: &'document [ResolvedTrigger],
 }
 
+struct ForeignKeyActionStackEntry {
+    child_table: hir::CatalogObjectId,
+    declaration_order: usize,
+    parent_change: ForeignKeyParentChange,
+    slot: Arc<OnceLock<Weak<PreparedProgram>>>,
+}
+
 pub(super) fn prepare_triggers(
     context: &SemanticContext<'_>,
     document: &HirDocument,
     parent: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<PreparedTriggers> {
-    let mut stack = Vec::new();
-    let prepared = prepare_document_triggers(context, document, parent, connection, &mut stack)?;
+    let mut trigger_stack = Vec::new();
+    let mut foreign_key_stack = Vec::new();
+    let prepared = prepare_document_triggers(
+        context,
+        document,
+        parent,
+        connection,
+        &mut trigger_stack,
+        &mut foreign_key_stack,
+    )?;
     inherit_trigger_transactions(context, parent, &prepared)?;
     Ok(prepared)
 }
@@ -65,22 +81,39 @@ fn prepare_document_triggers(
     parent: &ProgramBuilder,
     connection: &Arc<Connection>,
     stack: &mut Vec<TriggerIdentity>,
+    foreign_key_stack: &mut Vec<ForeignKeyActionStackEntry>,
 ) -> Result<PreparedTriggers> {
-    let Some(target) = trigger_target(document)? else {
-        return Ok(PreparedTriggers::default());
-    };
     let mut prepared = PreparedTriggers::default();
-    for trigger in target.triggers {
-        let identity = trigger_identity(trigger)?;
-        if stack.contains(&identity) {
-            prepared.suppress(trigger.id());
-            continue;
+    if let Some(target) = trigger_target(document)? {
+        for trigger in target.triggers {
+            let identity = trigger_identity(trigger)?;
+            if stack.contains(&identity) {
+                prepared.suppress(trigger.id());
+                continue;
+            }
+            stack.push(identity);
+            let compiled = prepare_one_trigger(
+                context,
+                &target,
+                trigger,
+                parent,
+                connection,
+                stack,
+                foreign_key_stack,
+            );
+            stack.pop();
+            prepared.push(compiled?);
         }
-        stack.push(identity);
-        let compiled = prepare_one_trigger(context, &target, trigger, parent, connection, stack);
-        stack.pop();
-        prepared.push(compiled?);
     }
+    prepare_document_foreign_key_actions(
+        context,
+        document,
+        parent,
+        connection,
+        stack,
+        foreign_key_stack,
+        &mut prepared,
+    )?;
     Ok(prepared)
 }
 
@@ -91,6 +124,7 @@ fn prepare_one_trigger(
     parent: &ProgramBuilder,
     connection: &Arc<Connection>,
     stack: &mut Vec<TriggerIdentity>,
+    foreign_key_stack: &mut Vec<ForeignKeyActionStackEntry>,
 ) -> Result<PreparedTrigger> {
     let owner_database = trigger
         .database()
@@ -154,8 +188,14 @@ fn prepare_one_trigger(
         super::set_semantic_conflict_policy(&mut program, &document);
         set_semantic_statement_journal_flags(&mut program, &document)?;
         set_semantic_transactions(&mut program, &document, is_write)?;
-        let nested =
-            prepare_document_triggers(&trigger_context, &document, &program, connection, stack)?;
+        let nested = prepare_document_triggers(
+            &trigger_context,
+            &document,
+            &program,
+            connection,
+            stack,
+            foreign_key_stack,
+        )?;
         inherit_trigger_transactions(&trigger_context, &mut program, &nested)?;
         let inputs = trigger_inputs(&document, rows)?;
         let plan = PhysicalPlan::new(&document).map_err(|error| internal(error.to_string()))?;
@@ -178,6 +218,284 @@ fn prepare_one_trigger(
         program: Arc::new(prepared),
         parameters,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_document_foreign_key_actions(
+    context: &SemanticContext<'_>,
+    document: &HirDocument,
+    parent: &ProgramBuilder,
+    connection: &Arc<Connection>,
+    trigger_stack: &mut Vec<TriggerIdentity>,
+    stack: &mut Vec<ForeignKeyActionStackEntry>,
+    prepared: &mut PreparedTriggers,
+) -> Result<()> {
+    let (foreign_keys, parent_change) = match &document.root {
+        hir::HirRoot::Delete(delete) => (
+            delete.foreign_keys.incoming.as_slice(),
+            ForeignKeyParentChange::Delete,
+        ),
+        hir::HirRoot::Update(update) => (
+            update.foreign_keys.incoming.as_slice(),
+            ForeignKeyParentChange::Update,
+        ),
+        hir::HirRoot::Insert(_) | hir::HirRoot::Query(_) | hir::HirRoot::TriggerPredicate(_) => {
+            return Ok(())
+        }
+    };
+    for foreign_key in foreign_keys {
+        let action = match parent_change {
+            ForeignKeyParentChange::Delete => foreign_key.declaration.on_delete,
+            ForeignKeyParentChange::Update => foreign_key.declaration.on_update,
+        };
+        if matches!(action, RefAct::NoAction | RefAct::Restrict) {
+            continue;
+        }
+        prepared.push_foreign_key_action(prepare_one_foreign_key_action(
+            context,
+            foreign_key,
+            parent_change,
+            action,
+            parent,
+            connection,
+            trigger_stack,
+            stack,
+        )?);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_one_foreign_key_action(
+    context: &SemanticContext<'_>,
+    foreign_key: &hir::ResolvedForeignKey,
+    parent_change: ForeignKeyParentChange,
+    action: RefAct,
+    parent: &ProgramBuilder,
+    connection: &Arc<Connection>,
+    trigger_stack: &mut Vec<TriggerIdentity>,
+    stack: &mut Vec<ForeignKeyActionStackEntry>,
+) -> Result<PreparedForeignKeyAction> {
+    let child_table = foreign_key.child_table.id();
+    let declaration_order = foreign_key.declaration.decl_order;
+    if let Some(entry) = stack.iter().find(|entry| {
+        entry.child_table == child_table
+            && entry.declaration_order == declaration_order
+            && entry.parent_change == parent_change
+    }) {
+        return Ok(PreparedForeignKeyAction {
+            child_table,
+            declaration_order,
+            parent_change,
+            program: Subprogram::Pending(entry.slot.clone()),
+        });
+    }
+
+    let slot = Arc::new(OnceLock::new());
+    stack.push(ForeignKeyActionStackEntry {
+        child_table,
+        declaration_order,
+        parent_change,
+        slot: slot.clone(),
+    });
+    let compiled = (|| {
+        let statement = foreign_key_action_statement(context, foreign_key, parent_change, action)?;
+        let nested_context = context.with_dml_policy(context.dml_policy().as_nested_statement());
+        let document = analyze(&nested_context, AnalyzeInput::Statement(&statement))?;
+        let mut program = ProgramBuilder::new_for_subprogram(
+            QueryMode::Normal,
+            parent.capture_data_changes_info().clone(),
+            ProgramBuilderOpts::new(2, 32, 4),
+        );
+        program.set_mvcc_enabled(connection.mvcc_enabled());
+        program.prologue();
+        super::set_semantic_conflict_policy(&mut program, &document);
+        set_semantic_statement_journal_flags(&mut program, &document)?;
+        set_semantic_transactions(&mut program, &document, true)?;
+        let nested = prepare_document_triggers(
+            &nested_context,
+            &document,
+            &program,
+            connection,
+            trigger_stack,
+            stack,
+        )?;
+        inherit_trigger_transactions(&nested_context, &mut program, &nested)?;
+        let plan = PhysicalPlan::new(&document).map_err(|error| internal(error.to_string()))?;
+        physical::emit_root_with_context(
+            &plan,
+            &mut program,
+            &RootRuntimeInputs::default(),
+            &nested,
+        )
+        .map_err(|error| internal(error.to_string()))?;
+        program.epilogue(context.main_schema());
+        let description = foreign_key_action_description(parent_change, action);
+        program.build_prepared_program(
+            PrepareContext::from_connection(connection),
+            true,
+            description,
+        )
+    })();
+    let ended = stack
+        .pop()
+        .expect("foreign-key action preparation stack underflow");
+    debug_assert!(Arc::ptr_eq(&ended.slot, &slot));
+    let program = Arc::new(compiled?);
+    slot.set(Arc::downgrade(&program))
+        .expect("foreign-key action slot is set once");
+    Ok(PreparedForeignKeyAction {
+        child_table,
+        declaration_order,
+        parent_change,
+        program: Subprogram::PreparedProgram(program),
+    })
+}
+
+fn foreign_key_action_statement(
+    context: &SemanticContext<'_>,
+    foreign_key: &hir::ResolvedForeignKey,
+    parent_change: ForeignKeyParentChange,
+    action: RefAct,
+) -> Result<ast::Stmt> {
+    let database = foreign_key
+        .child_table
+        .database()
+        .ok_or_else(|| internal("foreign-key child has no database identity"))?
+        .index();
+    let database_name = (database != crate::MAIN_DB_ID)
+        .then(|| context.database_name(database).map(str::to_string))
+        .flatten();
+    if database != crate::MAIN_DB_ID && database_name.is_none() {
+        return Err(internal("foreign-key child database has no name"));
+    }
+    let Table::BTree(child_table) = foreign_key.child_table.value() else {
+        return Err(internal("foreign-key action target is not a B-tree table"));
+    };
+    let parameters = ForeignKeyActionParameters::new(
+        foreign_key.child_positions.len(),
+        parent_change == ForeignKeyParentChange::Update,
+    );
+    let table_name = QualifiedName {
+        db_name: database_name.map(Name::from_string),
+        name: Name::from_string(&child_table.name),
+        alias: None,
+    };
+    let predicate = foreign_key_action_predicate(&foreign_key.declaration, &parameters);
+    if action == RefAct::Cascade && parent_change == ForeignKeyParentChange::Delete {
+        return Ok(ast::Stmt::Delete {
+            with: None,
+            tbl_name: table_name,
+            indexed: None,
+            where_clause: Some(Box::new(predicate)),
+            returning: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+        });
+    }
+    let sets = foreign_key
+        .declaration
+        .child_columns
+        .iter()
+        .enumerate()
+        .map(|(offset, column)| {
+            let expression = match action {
+                RefAct::SetNull => Expr::Literal(Literal::Null),
+                RefAct::SetDefault => child_table
+                    .get_column(column)
+                    .and_then(|(_, column)| column.default.as_deref().cloned())
+                    .unwrap_or(Expr::Literal(Literal::Null)),
+                RefAct::Cascade => parameter_expression(
+                    parameters
+                        .new_parameter(offset)
+                        .expect("UPDATE CASCADE has NEW parameters"),
+                ),
+                RefAct::NoAction | RefAct::Restrict => unreachable!(),
+            };
+            ast::Set {
+                col_names: vec![Name::from_string(column)],
+                expr: Box::new(expression),
+            }
+        })
+        .collect();
+    Ok(ast::Stmt::Update(ast::Update {
+        with: None,
+        or_conflict: None,
+        tbl_name: table_name,
+        indexed: None,
+        sets,
+        from: None,
+        where_clause: Some(Box::new(predicate)),
+        returning: Vec::new(),
+        order_by: Vec::new(),
+        limit: None,
+    }))
+}
+
+struct ForeignKeyActionParameters {
+    width: usize,
+    new_start: Option<usize>,
+}
+
+impl ForeignKeyActionParameters {
+    fn new(width: usize, has_new: bool) -> Self {
+        Self {
+            width,
+            new_start: has_new.then_some(width + 1),
+        }
+    }
+
+    fn old(&self, offset: usize) -> NonZero<usize> {
+        NonZero::new(offset + 1).expect("foreign-key parameter is one-indexed")
+    }
+
+    fn new_parameter(&self, offset: usize) -> Option<NonZero<usize>> {
+        self.new_start
+            .and_then(|start| NonZero::new(start + offset))
+    }
+}
+
+fn foreign_key_action_predicate(
+    foreign_key: &ForeignKey,
+    parameters: &ForeignKeyActionParameters,
+) -> Expr {
+    debug_assert_eq!(foreign_key.child_columns.len(), parameters.width);
+    foreign_key
+        .child_columns
+        .iter()
+        .enumerate()
+        .map(|(offset, column)| {
+            Expr::Binary(
+                Box::new(Expr::Id(Name::from_string(column))),
+                ast::Operator::Equals,
+                Box::new(parameter_expression(parameters.old(offset))),
+            )
+        })
+        .reduce(|left, right| Expr::Binary(Box::new(left), ast::Operator::And, Box::new(right)))
+        .expect("foreign keys have at least one child column")
+}
+
+fn parameter_expression(index: NonZero<usize>) -> Expr {
+    let index = u32::try_from(index.get())
+        .ok()
+        .and_then(NonZeroU32::new)
+        .expect("foreign-key parameter index fits in u32");
+    Expr::Variable(ast::Variable::indexed(index))
+}
+
+fn foreign_key_action_description(
+    parent_change: ForeignKeyParentChange,
+    action: RefAct,
+) -> &'static str {
+    match (parent_change, action) {
+        (ForeignKeyParentChange::Delete, RefAct::Cascade) => "foreign-key cascade delete",
+        (ForeignKeyParentChange::Delete, RefAct::SetNull) => "foreign-key set null on delete",
+        (ForeignKeyParentChange::Delete, RefAct::SetDefault) => "foreign-key set default on delete",
+        (ForeignKeyParentChange::Update, RefAct::Cascade) => "foreign-key cascade update",
+        (ForeignKeyParentChange::Update, RefAct::SetNull) => "foreign-key set null on update",
+        (ForeignKeyParentChange::Update, RefAct::SetDefault) => "foreign-key set default on update",
+        (_, RefAct::NoAction | RefAct::Restrict) => unreachable!(),
+    }
 }
 
 fn allocate_trigger_parameters(
@@ -342,17 +660,31 @@ fn inherit_trigger_transactions(
     triggers: &PreparedTriggers,
 ) -> Result<()> {
     for trigger in triggers.iter() {
-        for database in &trigger.program.write_databases {
-            let cookie = schema_cookie(context, database)?;
-            parent.begin_write_on_database(database, cookie)?;
+        inherit_program_transactions(context, parent, &trigger.program)?;
+    }
+    for action in triggers.foreign_key_actions() {
+        if let Subprogram::PreparedProgram(program) = &action.program {
+            inherit_program_transactions(context, parent, program)?;
         }
-        for database in &trigger.program.read_databases {
-            if trigger.program.write_databases.get(database) {
-                continue;
-            }
-            let cookie = schema_cookie(context, database)?;
-            parent.begin_read_on_database(database, cookie)?;
+    }
+    Ok(())
+}
+
+fn inherit_program_transactions(
+    context: &SemanticContext<'_>,
+    parent: &mut ProgramBuilder,
+    program: &PreparedProgram,
+) -> Result<()> {
+    for database in &program.write_databases {
+        let cookie = schema_cookie(context, database)?;
+        parent.begin_write_on_database(database, cookie)?;
+    }
+    for database in &program.read_databases {
+        if program.write_databases.get(database) {
+            continue;
         }
+        let cookie = schema_cookie(context, database)?;
+        parent.begin_read_on_database(database, cookie)?;
     }
     Ok(())
 }
@@ -375,8 +707,157 @@ fn internal(message: impl Into<String>) -> LimboError {
 #[cfg(test)]
 mod properties {
     use hegel::generators;
+    use turso_parser::parser::Parser;
 
     use super::*;
+    use crate::{
+        dialect::{Dialect, SqliteDialect},
+        schema::{BTreeTable, Schema},
+        translate::semantic::context::DmlPolicy,
+        SymbolTable,
+    };
+
+    fn parse_statement(sql: &str) -> ast::Stmt {
+        let command = Parser::new(sql.as_bytes())
+            .next_cmd()
+            .expect("generated SQL parses")
+            .expect("generated SQL contains a statement");
+        let ast::Cmd::Stmt(statement) = command else {
+            panic!("generated SQL contains a statement");
+        };
+        statement
+    }
+
+    // Examples:
+    // - deleting `parents.p4` with `ON DELETE CASCADE` becomes a child DELETE
+    //   whose `c2 = ?1` predicate binds to frozen child position two;
+    // - updating that parent with `ON UPDATE CASCADE` becomes a child UPDATE
+    //   whose assignment uses `?2`, while SET NULL and SET DEFAULT freeze their
+    //   respective values. Varying positions, action, and parent change proves
+    //   the generated action is analyzed into ordinary closed HIR.
+    #[hegel::test]
+    fn foreign_key_actions_are_closed_hir_child_mutations(tc: hegel::TestCase) {
+        let width = usize::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(10)));
+        let child_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+        let parent_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+        let parent_change = if tc.draw(generators::booleans()) {
+            ForeignKeyParentChange::Delete
+        } else {
+            ForeignKeyParentChange::Update
+        };
+        let action = match tc.draw(generators::integers::<u8>().max_value(2)) {
+            0 => RefAct::Cascade,
+            1 => RefAct::SetNull,
+            _ => RefAct::SetDefault,
+        };
+        let parent_columns = (0..width)
+            .map(|position| {
+                if position == parent_position {
+                    format!("p{position} INTEGER PRIMARY KEY")
+                } else {
+                    format!("p{position} INTEGER")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let child_columns = (0..width)
+            .map(|position| {
+                if position == child_position {
+                    format!(
+                        "c{position} INTEGER DEFAULT 17 REFERENCES parents(p{parent_position}) ON {} {}",
+                        if parent_change == ForeignKeyParentChange::Delete {
+                            "DELETE"
+                        } else {
+                            "UPDATE"
+                        },
+                        match action {
+                            RefAct::Cascade => "CASCADE",
+                            RefAct::SetNull => "SET NULL",
+                            RefAct::SetDefault => "SET DEFAULT",
+                            RefAct::NoAction | RefAct::Restrict => unreachable!(),
+                        }
+                    )
+                } else {
+                    format!("c{position} INTEGER")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let parent = BTreeTable::from_sql(&format!("CREATE TABLE parents({parent_columns})"), 23)
+            .expect("parent table SQL is valid");
+        let child = BTreeTable::from_sql(&format!("CREATE TABLE children({child_columns})"), 29)
+            .expect("child table SQL is valid");
+        let mut schema = Schema::new();
+        schema
+            .add_btree_table(Arc::new(parent))
+            .expect("parents is unique");
+        schema
+            .add_btree_table(Arc::new(child))
+            .expect("children is unique");
+        let symbols = SymbolTable::new();
+        let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+        let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect)
+            .with_dml_policy(DmlPolicy::new(false, false, false, false, true));
+        let root_statement = parse_statement(match parent_change {
+            ForeignKeyParentChange::Delete => "DELETE FROM parents",
+            ForeignKeyParentChange::Update => "UPDATE parents SET p0 = p0",
+        });
+        let root = analyze(&context, AnalyzeInput::Statement(&root_statement))
+            .expect("parent mutation has valid SQL meaning");
+        let foreign_key = match &root.root {
+            hir::HirRoot::Delete(delete) => &delete.foreign_keys.incoming[0],
+            hir::HirRoot::Update(update) => &update.foreign_keys.incoming[0],
+            _ => panic!("fixture produces parent DML"),
+        };
+        let action_statement =
+            foreign_key_action_statement(&context, foreign_key, parent_change, action)
+                .expect("action syntax is generated from frozen FK facts");
+        let action_document = analyze(
+            &context.with_dml_policy(context.dml_policy().as_nested_statement()),
+            AnalyzeInput::Statement(&action_statement),
+        )
+        .expect("generated action analyzes into closed HIR");
+        action_document
+            .validate()
+            .expect("generated action HIR is closed");
+
+        let (target, predicate, assignment) = match &action_document.root {
+            hir::HirRoot::Delete(delete) => (delete.target, delete.predicate.as_ref(), None),
+            hir::HirRoot::Update(update) => (
+                update.target,
+                update.predicate.as_ref(),
+                Some(&update.assignments[0]),
+            ),
+            _ => panic!("an FK action is child DML"),
+        };
+        let Some(hir::Expr::Binary { lhs, rhs, .. }) = predicate else {
+            panic!("one-column FK action has one equality predicate");
+        };
+        let hir::Expr::Column(column) = lhs.as_ref() else {
+            panic!("action predicate reads the frozen child column");
+        };
+        let hir::Expr::Parameter(parameter) = rhs.as_ref() else {
+            panic!("action predicate compares against the OLD parent parameter");
+        };
+        assert_eq!(column.source, target);
+        assert_eq!(column.column, child_position);
+        assert_eq!(parameter.index.get(), 1);
+        if let Some(assignment) = assignment {
+            assert!(matches!(
+                assignment.columns.as_slice(),
+                [hir::TargetColumn::Column(position)] if *position == child_position
+            ));
+            if action == RefAct::Cascade {
+                let hir::Expr::Parameter(parameter) = &assignment.value else {
+                    panic!("UPDATE CASCADE assigns the NEW parent parameter");
+                };
+                assert_eq!(parameter.index.get(), 2);
+            }
+        } else {
+            assert_eq!(parent_change, ForeignKeyParentChange::Delete);
+            assert_eq!(action, RefAct::Cascade);
+        }
+    }
 
     // Example: UPDATE of a three-column table allocates
     // `NEW.c0..NEW.c2, NEW.rowid, OLD.c0..OLD.c2, OLD.rowid` as parameters 1..8.

@@ -471,6 +471,17 @@ pub(crate) fn emit_root_update_with_context(
             rowid,
         )?;
     }
+    if !update.foreign_keys.incoming.is_empty() {
+        super::emit_update_parent_actions(
+            program,
+            &update.foreign_keys.incoming,
+            &table,
+            old_columns.expect("incoming foreign keys require the frozen OLD row"),
+            logical,
+            rowid,
+            triggers,
+        )?;
+    }
     if let Some(old_columns) = old_columns {
         let after_trigger_done = program.allocate_label();
         emit_trigger_programs(
@@ -573,13 +584,19 @@ fn preflight_update<'plan>(
         ));
     }
     if update.foreign_keys.incoming.iter().any(|foreign_key| {
-        !matches!(
+        matches!(
             foreign_key.declaration.on_update,
-            RefAct::NoAction | RefAct::Restrict
-        )
+            RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault
+        ) && triggers
+            .foreign_key_action(
+                foreign_key.child_table.id(),
+                &foreign_key.declaration,
+                super::ForeignKeyParentChange::Update,
+            )
+            .is_none()
     }) {
-        return Err(PhysicalUpdateError::Unsupported(
-            "mutating parent-side foreign-key update actions",
+        return Err(PhysicalUpdateError::Invalid(
+            "mutating foreign-key action has no prepared HIR program",
         ));
     }
     if update

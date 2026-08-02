@@ -119,6 +119,11 @@ impl DmlPolicy {
     pub(crate) const fn foreign_keys_enabled(self) -> bool {
         self.foreign_keys_enabled
     }
+
+    pub(crate) const fn as_nested_statement(mut self) -> Self {
+        self.nested_statement = true;
+        self
+    }
 }
 
 impl TriggerCatalogContext {
