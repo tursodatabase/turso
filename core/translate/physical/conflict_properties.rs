@@ -233,3 +233,145 @@ fn upsert_do_nothing_routes_the_resolved_hir_conflict_target(tc: hegel::TestCase
         matches!(instruction, Insn::Goto { target_pc } if target_pc.is_offset() && target_pc.as_offset_int() as usize > first_write)
     }));
 }
+
+// Examples:
+// - `... DO UPDATE SET c1 = excluded.c1 + c1` must read `excluded.c1` from
+//   the completed proposed row and unqualified `c1` from the conflicting OLD
+//   table row; the two names must never collapse to one runtime source.
+// - With `c2 AS (c1 + 7)`, the updated generated value and RETURNING output
+//   must be built after SET and before the replacement write.
+// - A false `WHERE excluded.c1 > 0` skips the update, while a true one seeks
+//   the conflicting row and performs old-index delete -> table delete ->
+//   new-index insert -> table insert.
+#[hegel::test]
+fn upsert_do_update_keeps_target_and_excluded_as_distinct_hir_rows(tc: hegel::TestCase) {
+    let rowid_target = tc.draw(generators::booleans());
+    let generated_offset =
+        i64::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(31)));
+    let key = if rowid_target {
+        "c0 INTEGER PRIMARY KEY"
+    } else {
+        "c0 INTEGER"
+    };
+    let table = Arc::new(
+        BTreeTable::from_sql(
+            &format!(
+                "CREATE TABLE items({key}, c1 INTEGER, c2 INTEGER AS (c1 + {generated_offset}))"
+            ),
+            12,
+        )
+        .expect("fixture table SQL is valid"),
+    );
+    let symbols = SymbolTable::new();
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(table.clone())
+        .expect("items is unique");
+    if !rowid_target {
+        let index = Index::from_sql(
+            &symbols,
+            "CREATE UNIQUE INDEX items_c0 ON items(c0)",
+            13,
+            &table,
+        )
+        .expect("fixture index SQL is valid");
+        schema
+            .add_index(Arc::new(index))
+            .expect("items_c0 is unique");
+    }
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(
+        "INSERT INTO items(c0, c1) VALUES (1, 9) \
+         ON CONFLICT(c0) DO UPDATE SET c1 = excluded.c1 + c1 \
+         WHERE excluded.c1 > 0 RETURNING c1, c2",
+    );
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated UPSERT has valid SQL meaning");
+    let crate::translate::semantic::hir::HirRoot::Insert(insert) = &document.root else {
+        panic!("fixture produces INSERT HIR");
+    };
+    let excluded = insert.excluded_source.expect("UPSERT has excluded");
+    let crate::translate::semantic::hir::UpsertAction::Update { assignments, .. } =
+        &insert.upserts[0].action
+    else {
+        panic!("fixture produces DO UPDATE HIR");
+    };
+    let mut sources = Vec::new();
+    assignments[0].value.walk(&mut |expression| {
+        if let crate::translate::semantic::hir::Expr::Column(column) = expression {
+            sources.push(column.source);
+        }
+    });
+    assert!(sources.contains(&insert.target));
+    assert!(sources.contains(&excluded));
+    assert_ne!(insert.target, excluded);
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed HIR has a physical plan");
+    let mut program = program();
+    emit_root(&plan, &mut program).expect("DO UPDATE lowers without a catalog");
+    program
+        .resolve_labels()
+        .expect("all DO UPDATE branches are closed");
+
+    let seek = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::SeekRowid { .. }))
+        .expect("DO UPDATE seeks the conflicting row");
+    let delete = program
+        .insns
+        .iter()
+        .enumerate()
+        .skip(seek)
+        .find_map(|(position, (instruction, _))| {
+            matches!(instruction, Insn::Delete { .. }).then_some(position)
+        })
+        .expect("DO UPDATE deletes the old table record");
+    let table_insert = program
+        .insns
+        .iter()
+        .enumerate()
+        .skip(delete)
+        .find_map(|(position, (instruction, _))| {
+            matches!(instruction, Insn::Insert { table_name, .. } if table_name == "items")
+                .then_some(position)
+        })
+        .expect("DO UPDATE inserts the replacement record");
+    let returning = program
+        .insns
+        .iter()
+        .enumerate()
+        .skip(table_insert)
+        .find_map(|(position, (instruction, _))| {
+            matches!(instruction, Insn::ResultRow { .. }).then_some(position)
+        })
+        .expect("DO UPDATE returns the written NEW row");
+    assert!(program.insns[seek..delete]
+        .iter()
+        .any(|(instruction, _)| matches!(instruction, Insn::Column { .. })));
+    assert!(
+        program.insns[seek..delete]
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::Add { .. }))
+            .count()
+            >= 2
+    );
+    assert!(seek < delete && delete < table_insert && table_insert < returning);
+    if !rowid_target {
+        let old_index_delete = program.insns[seek..delete]
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::IdxDelete { .. }))
+            .map(|position| position + seek)
+            .expect("DO UPDATE removes the old unique key");
+        let new_index_insert = program.insns[delete..table_insert]
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::IdxInsert { .. }))
+            .map(|position| position + delete)
+            .expect("DO UPDATE inserts the new unique key");
+        assert!(old_index_delete < delete && delete < new_index_insert);
+    }
+}

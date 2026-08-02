@@ -53,10 +53,10 @@ pub(crate) struct OpenedIndex<'hir> {
 }
 
 pub(crate) struct IndexKey {
-    predicate: Option<usize>,
-    start: usize,
-    columns: usize,
-    record: Option<usize>,
+    pub(crate) predicate: Option<usize>,
+    pub(crate) start: usize,
+    pub(crate) columns: usize,
+    pub(crate) record: Option<usize>,
 }
 
 pub(crate) fn open_indexes<'hir>(

@@ -118,7 +118,10 @@ operations are not SQL binding.
         UNIQUE failures before mutation using the statement or index policy.
   - [x] UPSERT DO NOTHING routes resolved rowid, UNIQUE-index, and catch-all
         conflict targets around the complete row write.
-  - [ ] REPLACE conflict paths and UPSERT DO UPDATE/excluded.
+  - [x] UPSERT DO UPDATE keeps the conflicting target and completed excluded
+        row as separate SourceId bindings, rebuilds generated/constraint/index
+        programs under ABORT semantics, and returns the written NEW row.
+  - [ ] REPLACE conflict paths.
 - [ ] Trigger commands and predicates with explicit OLD/NEW runtime bindings.
 - [ ] Generated columns, defaults, CHECK constraints, expression and partial
       indexes, and custom-type schema programs.

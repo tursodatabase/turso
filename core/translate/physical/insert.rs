@@ -17,7 +17,7 @@ use crate::{
 use super::{
     close_indexes, emit_complete_logical_row, emit_index_insert, emit_index_key,
     emit_new_row_constraints, emit_query_for_dml, emit_returning_result, emit_returning_values,
-    emit_stored_record, emit_unique_check, open_indexes, ExpressionEmitter, OpenedIndex,
+    emit_stored_record, emit_unique_check, open_indexes, CursorId, ExpressionEmitter, OpenedIndex,
     PhysicalExpressionError, PhysicalIndexError, PhysicalPlan, PhysicalQueryError, PhysicalRoot,
     PhysicalRowError, PhysicalSourceKind, RegisterId, RegisterRange, RuntimeBindingError,
     RuntimeBindings, SourceRuntime, TableAccess,
@@ -108,6 +108,15 @@ pub(crate) fn emit_root_insert(
             rowid: Some(rowid),
         },
     )?;
+    if let Some(excluded) = insert.excluded_source {
+        bindings.bind_source(
+            excluded,
+            SourceRuntime::Registers {
+                columns: logical,
+                rowid: Some(rowid),
+            },
+        )?;
+    }
     let query_rows = match &insert.source {
         InsertSource::Query(query) => {
             Some(emit_query_for_dml(plan, program, &mut bindings, *query)?)
@@ -311,10 +320,6 @@ fn finish_insert_row(
     skip_row: crate::vdbe::BranchOffset,
 ) -> InsertResult<()> {
     let statement_conflict = insert.conflict.unwrap_or(ResolveType::Abort);
-    let rowid_conflict = upsert_for_rowid(insert)
-        .map(upsert_do_nothing_policy)
-        .transpose()?
-        .unwrap_or(statement_conflict);
     if let Some((position, _)) = table.get_rowid_alias_column().filter(|(position, _)| {
         insert
             .columns
@@ -353,29 +358,6 @@ fn finish_insert_row(
             extra_amount: 0,
         });
     }
-    let rowid_is_unique = program.allocate_label();
-    program.emit_insn(Insn::NotExists {
-        cursor,
-        rowid_reg: rowid.0,
-        target_pc: rowid_is_unique,
-    });
-    let rowid_name = table
-        .get_rowid_alias_column()
-        .and_then(|(_, column)| column.name.as_deref())
-        .unwrap_or("rowid");
-    if rowid_conflict == ResolveType::Ignore {
-        program.emit_insn(Insn::Goto {
-            target_pc: skip_row,
-        });
-    } else {
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-            description: format!("{}.{}", table.name, rowid_name),
-            on_error: Some(rowid_conflict),
-            description_reg: None,
-        });
-    }
-    program.preassign_label_to_next_insn(rowid_is_unique);
     emit_complete_logical_row(program, bindings, insert.target, table, logical)?;
     emit_new_row_constraints(
         program,
@@ -386,19 +368,49 @@ fn finish_insert_row(
         statement_conflict,
         skip_row,
     )?;
+    let rowid_is_unique = program.allocate_label();
+    program.emit_insn(Insn::NotExists {
+        cursor,
+        rowid_reg: rowid.0,
+        target_pc: rowid_is_unique,
+    });
+    let rowid_name = table
+        .get_rowid_alias_column()
+        .and_then(|(_, column)| column.name.as_deref())
+        .unwrap_or("rowid");
+    if let Some(upsert) = upsert_for_rowid(insert) {
+        emit_upsert_action(
+            program, bindings, insert, upsert, table, cursor, logical, record, indexes, rowid,
+            skip_row,
+        )?;
+    } else if statement_conflict == ResolveType::Ignore {
+        program.emit_insn(Insn::Goto {
+            target_pc: skip_row,
+        });
+    } else {
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+            description: format!("{}.{}", table.name, rowid_name),
+            on_error: Some(statement_conflict),
+            description_reg: None,
+        });
+    }
+    program.preassign_label_to_next_insn(rowid_is_unique);
     let mut keys = Vec::with_capacity(indexes.len());
     for index in indexes {
         let key = emit_index_key(program, bindings, insert.target, rowid, index, true)?;
-        let conflict = upsert_for_index(insert, index)
-            .map(upsert_do_nothing_policy)
-            .transpose()?
-            .unwrap_or_else(|| {
-                insert
-                    .conflict
-                    .or(index.index.on_conflict)
-                    .unwrap_or(ResolveType::Abort)
-            });
-        emit_unique_check(program, index, &key, None, conflict, skip_row)?;
+        if let Some(upsert) = upsert_for_index(insert, index) {
+            emit_upsert_unique_check(
+                program, bindings, insert, upsert, table, cursor, logical, record, indexes, index,
+                &key, skip_row,
+            )?;
+        } else {
+            let conflict = insert
+                .conflict
+                .or(index.index.on_conflict)
+                .unwrap_or(ResolveType::Abort);
+            emit_unique_check(program, index, &key, None, conflict, skip_row)?;
+        }
         keys.push(key);
     }
     emit_stored_record(program, bindings, insert.target, table, logical, record)?;
@@ -445,12 +457,19 @@ fn preflight_insert<'plan>(
             "UPSERT and excluded source must exist together",
         ));
     }
-    if insert
-        .upserts
-        .iter()
-        .any(|upsert| !matches!(upsert.action, UpsertAction::Nothing))
-    {
-        return Err(PhysicalInsertError::Unsupported("UPSERT DO UPDATE"));
+    if insert.upserts.iter().any(|upsert| {
+        matches!(
+            &upsert.action,
+            UpsertAction::Update { assignments, .. }
+                if assignments
+                    .iter()
+                    .flat_map(|assignment| &assignment.columns)
+                    .any(|column| matches!(column, hir::TargetColumn::RowId))
+        )
+    }) {
+        return Err(PhysicalInsertError::Unsupported(
+            "rowid assignment in UPSERT DO UPDATE",
+        ));
     }
     if insert.trigger.is_some() || !insert.triggers.is_empty() {
         return Err(PhysicalInsertError::Unsupported("trigger execution"));
@@ -541,9 +560,217 @@ fn upsert_for_index<'insert>(
     })
 }
 
-fn upsert_do_nothing_policy(upsert: &hir::Upsert) -> InsertResult<ResolveType> {
-    match upsert.action {
-        UpsertAction::Nothing => Ok(ResolveType::Ignore),
-        UpsertAction::Update { .. } => Err(PhysicalInsertError::Unsupported("UPSERT DO UPDATE")),
+#[allow(clippy::too_many_arguments)]
+fn emit_upsert_unique_check(
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
+    insert: &hir::Insert,
+    upsert: &hir::Upsert,
+    table: &crate::sync::Arc<crate::schema::BTreeTable>,
+    cursor: usize,
+    excluded: RegisterRange,
+    record: usize,
+    indexes: &[OpenedIndex<'_>],
+    index: &OpenedIndex<'_>,
+    key: &super::IndexKey,
+    skip_row: crate::vdbe::BranchOffset,
+) -> InsertResult<()> {
+    if !index.index.unique {
+        return Ok(());
     }
+    let no_conflict = program.allocate_label();
+    if let Some(predicate) = key.predicate {
+        program.emit_insn(Insn::IfNot {
+            reg: predicate,
+            target_pc: no_conflict,
+            jump_if_null: true,
+        });
+    }
+    program.emit_insn(Insn::NoConflict {
+        cursor_id: index.cursor,
+        target_pc: no_conflict,
+        record_reg: key.start,
+        num_regs: key.columns,
+    });
+    let conflicting_rowid = RegisterId(program.alloc_register());
+    program.emit_insn(Insn::IdxRowId {
+        cursor_id: index.cursor,
+        dest: conflicting_rowid.0,
+    });
+    emit_upsert_action(
+        program,
+        bindings,
+        insert,
+        upsert,
+        table,
+        cursor,
+        excluded,
+        record,
+        indexes,
+        conflicting_rowid,
+        skip_row,
+    )?;
+    program.preassign_label_to_next_insn(no_conflict);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_upsert_action(
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
+    insert: &hir::Insert,
+    upsert: &hir::Upsert,
+    table: &crate::sync::Arc<crate::schema::BTreeTable>,
+    cursor: usize,
+    excluded: RegisterRange,
+    record: usize,
+    indexes: &[OpenedIndex<'_>],
+    conflicting_rowid: RegisterId,
+    skip_row: crate::vdbe::BranchOffset,
+) -> InsertResult<()> {
+    let UpsertAction::Update {
+        assignments,
+        predicate,
+    } = &upsert.action
+    else {
+        program.emit_insn(Insn::Goto {
+            target_pc: skip_row,
+        });
+        return Ok(());
+    };
+
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: cursor,
+        src_reg: conflicting_rowid.0,
+        target_pc: skip_row,
+    });
+    let proposed_target =
+        bindings.replace_source(insert.target, SourceRuntime::Cursor(CursorId(cursor)))?;
+    if let Some(predicate) = predicate {
+        let condition = ExpressionEmitter::new(program, bindings).emit_new(predicate)?;
+        if condition.width != 1 {
+            return Err(PhysicalInsertError::Invalid(
+                "UPSERT WHERE result is not scalar",
+            ));
+        }
+        program.emit_insn(Insn::IfNot {
+            reg: condition.first.0,
+            target_pc: skip_row,
+            jump_if_null: true,
+        });
+    }
+
+    let mut assignment_values = Vec::with_capacity(assignments.len());
+    for assignment in assignments {
+        let value = ExpressionEmitter::new(program, bindings).emit_new(&assignment.value)?;
+        if value.width != assignment.columns.len() {
+            return Err(PhysicalInsertError::Invalid(
+                "UPSERT assignment width does not match its target columns",
+            ));
+        }
+        assignment_values.push((&assignment.columns, value));
+    }
+
+    let mut old_keys = Vec::with_capacity(indexes.len());
+    for index in indexes {
+        old_keys.push(emit_index_key(
+            program,
+            bindings,
+            insert.target,
+            conflicting_rowid,
+            index,
+            false,
+        )?);
+    }
+
+    let updated = RegisterRange::new(program.alloc_registers(excluded.width), excluded.width);
+    for (position, column) in table.columns().iter().enumerate() {
+        if column.generated_expr().is_some() {
+            continue;
+        }
+        ExpressionEmitter::new(program, bindings).emit_into(
+            &hir::Expr::column(insert.target, position),
+            RegisterRange::new(updated.first.0 + position, 1),
+        )?;
+    }
+    for (columns, value) in assignment_values {
+        for (position, column) in columns.iter().enumerate() {
+            let hir::TargetColumn::Column(column) = column else {
+                return Err(PhysicalInsertError::Unsupported(
+                    "rowid assignment in UPSERT DO UPDATE",
+                ));
+            };
+            program.emit_insn(Insn::Copy {
+                src_reg: value.first.0 + position,
+                dst_reg: updated.first.0 + column,
+                extra_amount: 0,
+            });
+        }
+    }
+    let old_target = bindings.replace_source(
+        insert.target,
+        SourceRuntime::Registers {
+            columns: updated,
+            rowid: Some(conflicting_rowid),
+        },
+    )?;
+    emit_complete_logical_row(program, bindings, insert.target, table, updated)?;
+    emit_new_row_constraints(
+        program,
+        bindings,
+        insert.target,
+        table,
+        updated,
+        ResolveType::Abort,
+        skip_row,
+    )?;
+    let mut new_keys = Vec::with_capacity(indexes.len());
+    for index in indexes {
+        let key = emit_index_key(
+            program,
+            bindings,
+            insert.target,
+            conflicting_rowid,
+            index,
+            true,
+        )?;
+        emit_unique_check(
+            program,
+            index,
+            &key,
+            Some(conflicting_rowid),
+            ResolveType::Abort,
+            skip_row,
+        )?;
+        new_keys.push(key);
+    }
+    emit_stored_record(program, bindings, insert.target, table, updated, record)?;
+    for (index, key) in indexes.iter().zip(&old_keys) {
+        super::emit_index_delete(program, index, key);
+    }
+    program.emit_insn(Insn::Delete {
+        cursor_id: cursor,
+        table_name: table.name.clone(),
+        is_part_of_update: true,
+    });
+    for (index, key) in indexes.iter().zip(&new_keys) {
+        emit_index_insert(program, index, key)?;
+    }
+    program.emit_insn(Insn::Insert {
+        cursor,
+        key_reg: conflicting_rowid.0,
+        record_reg: record,
+        flag: InsertFlags::new(),
+        table_name: table.name.clone(),
+    });
+    if let Some(returning) = &insert.returning {
+        let result = emit_returning_values(program, bindings, returning)?;
+        emit_returning_result(program, result);
+    }
+    bindings.replace_source(insert.target, old_target)?;
+    bindings.replace_source(insert.target, proposed_target)?;
+    program.emit_insn(Insn::Goto {
+        target_pc: skip_row,
+    });
+    Ok(())
 }
