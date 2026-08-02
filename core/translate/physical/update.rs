@@ -5,11 +5,12 @@ use std::fmt;
 use turso_parser::ast::{RefAct, ResolveType, TriggerTime};
 
 use crate::{
+    error::SQLITE_CONSTRAINT_PRIMARYKEY,
     schema::Table,
     translate::semantic::hir::{self, Expr, IndexCoverage},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{InsertFlags, Insn, RegisterOrLiteral},
+        insn::{CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral},
     },
 };
 
@@ -19,9 +20,10 @@ use super::{
     PhysicalTriggerError, PreparedCdc, PreparedTriggers, RegisterId, RegisterRange,
     RootRuntimeInputs, RuntimeBindingError, RuntimeBindings, SourceRuntime, TableAccess,
     TriggerRow, TriggerRows, close_indexes, emit_complete_logical_row, emit_index_delete,
-    emit_index_insert, emit_index_key, emit_new_row_constraints, emit_replace_not_null_defaults,
-    emit_replace_unique_check, emit_returning_result, emit_returning_values, emit_stored_record,
-    emit_trigger_programs, emit_unique_check, open_indexes, record_from_registers, update_record,
+    emit_index_insert, emit_index_key, emit_new_row_constraints, emit_replace_conflicting_row,
+    emit_replace_not_null_defaults, emit_replace_unique_check, emit_returning_result,
+    emit_returning_values, emit_stored_record, emit_trigger_programs, emit_unique_check,
+    open_indexes, record_from_registers, update_record,
 };
 
 #[derive(Debug)]
@@ -148,6 +150,7 @@ pub(crate) fn emit_root_update_with_context(
 
     let rowset = program.alloc_register();
     let rowid = RegisterId(program.alloc_register());
+    let new_rowid = RegisterId(program.alloc_register());
     let logical = RegisterRange::new(
         program.alloc_registers(source.columns.len()),
         source.columns.len(),
@@ -252,6 +255,11 @@ pub(crate) fn emit_root_update_with_context(
         rowid_reg: rowid.0,
         target_pc: write_next,
     });
+    program.emit_insn(Insn::Copy {
+        src_reg: rowid.0,
+        dst_reg: new_rowid.0,
+        extra_amount: 0,
+    });
 
     for (position, column) in table.columns().iter().enumerate() {
         if let Some(old_columns) = old_columns {
@@ -311,22 +319,38 @@ pub(crate) fn emit_root_update_with_context(
     }
     for (columns, values) in assignments {
         for (position, column) in columns.iter().enumerate() {
-            let hir::TargetColumn::Column(column) = column else {
-                return Err(PhysicalUpdateError::Unsupported("rowid assignment"));
+            let destination = match column {
+                hir::TargetColumn::Column(column)
+                    if table
+                        .columns()
+                        .get(*column)
+                        .is_some_and(|column| column.is_rowid_alias()) =>
+                {
+                    new_rowid.0
+                }
+                hir::TargetColumn::Column(column) => logical.first.0 + column,
+                hir::TargetColumn::RowId => new_rowid.0,
             };
             program.emit_insn(Insn::Copy {
                 src_reg: values.first.0 + position,
-                dst_reg: logical.first.0 + column,
+                dst_reg: destination,
                 extra_amount: 0,
             });
         }
+    }
+    if let Some((position, _)) = table.get_rowid_alias_column() {
+        program.emit_insn(Insn::Copy {
+            src_reg: new_rowid.0,
+            dst_reg: logical.first.0 + position,
+            extra_amount: 0,
+        });
     }
 
     let old_runtime = bindings.replace_source(
         update.target,
         SourceRuntime::Registers {
             columns: logical,
-            rowid: Some(rowid),
+            rowid: Some(new_rowid),
         },
     )?;
     emit_complete_logical_row(program, &mut bindings, update.target, &table, logical)?;
@@ -341,7 +365,7 @@ pub(crate) fn emit_root_update_with_context(
             TriggerRows {
                 new: Some(TriggerRow {
                     columns: logical,
-                    rowid,
+                    rowid: new_rowid,
                 }),
                 old: Some(TriggerRow {
                     columns: old_columns,
@@ -374,7 +398,7 @@ pub(crate) fn emit_root_update_with_context(
         update.target,
         SourceRuntime::Registers {
             columns: logical,
-            rowid: Some(rowid),
+            rowid: Some(new_rowid),
         },
     )?;
     emit_replace_not_null_defaults(
@@ -394,6 +418,57 @@ pub(crate) fn emit_root_update_with_context(
         update.conflict,
         write_next,
     )?;
+    let rowid_is_unique = program.allocate_label();
+    program.emit_insn(Insn::MustBeInt {
+        reg: new_rowid.0,
+        target_pc: None,
+    });
+    program.emit_insn(Insn::Eq {
+        lhs: new_rowid.0,
+        rhs: rowid.0,
+        target_pc: rowid_is_unique,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::NotExists {
+        cursor,
+        rowid_reg: new_rowid.0,
+        target_pc: rowid_is_unique,
+    });
+    let rowid_conflict = update
+        .conflict
+        .or(table.rowid_alias_conflict_clause)
+        .unwrap_or(ResolveType::Abort);
+    match rowid_conflict {
+        ResolveType::Replace => emit_replace_conflicting_row(
+            program,
+            &mut bindings,
+            update.target,
+            &table,
+            cursor,
+            &indexes,
+            new_rowid,
+            Some(rowid),
+            write_next,
+        )?,
+        ResolveType::Ignore => program.emit_insn(Insn::Goto {
+            target_pc: write_next,
+        }),
+        conflict => super::constraint_halt(
+            program,
+            SQLITE_CONSTRAINT_PRIMARYKEY,
+            format!("{}.rowid", table.name),
+            conflict,
+        ),
+    }
+    program.preassign_label_to_next_insn(rowid_is_unique);
+    // NotExists on the proposed key moves the table cursor. Restore the OLD
+    // row before deriving its index keys and issuing the update delete.
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: cursor,
+        src_reg: rowid.0,
+        target_pc: write_next,
+    });
     if !update.foreign_keys.outgoing.is_empty() {
         super::emit_update_child_checks(
             program,
@@ -402,6 +477,7 @@ pub(crate) fn emit_root_update_with_context(
             old_columns.expect("outgoing foreign keys require the frozen OLD row"),
             logical,
             rowid,
+            new_rowid,
         )?;
     }
     if !update.foreign_keys.incoming.is_empty() {
@@ -412,11 +488,19 @@ pub(crate) fn emit_root_update_with_context(
             old_columns.expect("incoming foreign keys require the frozen OLD row"),
             logical,
             rowid,
+            new_rowid,
         )?;
     }
     let mut new_keys = Vec::with_capacity(indexes.len());
     for index in &indexes {
-        let key = emit_index_key(program, &mut bindings, update.target, rowid, index, true)?;
+        let key = emit_index_key(
+            program,
+            &mut bindings,
+            update.target,
+            new_rowid,
+            index,
+            true,
+        )?;
         let conflict = update
             .conflict
             .or(index.index.on_conflict)
@@ -462,7 +546,7 @@ pub(crate) fn emit_root_update_with_context(
     }
     program.emit_insn(Insn::Insert {
         cursor,
-        key_reg: rowid.0,
+        key_reg: new_rowid.0,
         record_reg: record,
         flag: InsertFlags::new(),
         table_name: table.name.clone(),
@@ -473,7 +557,7 @@ pub(crate) fn emit_root_update_with_context(
             &update.foreign_keys.incoming,
             &table,
             logical,
-            rowid,
+            new_rowid,
         )?;
     }
     if !update.foreign_keys.incoming.is_empty() {
@@ -484,6 +568,7 @@ pub(crate) fn emit_root_update_with_context(
             old_columns.expect("incoming foreign keys require the frozen OLD row"),
             logical,
             rowid,
+            new_rowid,
             triggers,
         )?;
     }
@@ -499,7 +584,7 @@ pub(crate) fn emit_root_update_with_context(
             TriggerRows {
                 new: Some(TriggerRow {
                     columns: logical,
-                    rowid,
+                    rowid: new_rowid,
                 }),
                 old: Some(TriggerRow {
                     columns: old_columns,
@@ -521,14 +606,14 @@ pub(crate) fn emit_root_update_with_context(
         });
         let after = cdc
             .has_after()
-            .then(|| record_from_registers(program, &table, logical, rowid));
+            .then(|| record_from_registers(program, &table, logical, new_rowid));
         let updates = cdc
             .has_updates()
             .then(|| update_record(program, source.columns.len(), &update.assignments, logical));
         cdc.emit_change(
             program,
             CdcChange::Update,
-            rowid,
+            new_rowid,
             before,
             after,
             updates,
@@ -540,7 +625,7 @@ pub(crate) fn emit_root_update_with_context(
             update.target,
             SourceRuntime::Registers {
                 columns: logical,
-                rowid: Some(rowid),
+                rowid: Some(new_rowid),
             },
         )?;
         let result = emit_returning_values(program, &mut bindings, returning)?;
@@ -603,14 +688,6 @@ fn preflight_update<'plan>(
         return Err(PhysicalUpdateError::Invalid(
             "mutating foreign-key action has no prepared HIR program",
         ));
-    }
-    if update
-        .assignments
-        .iter()
-        .flat_map(|assignment| &assignment.columns)
-        .any(|column| matches!(column, hir::TargetColumn::RowId))
-    {
-        return Err(PhysicalUpdateError::Unsupported("rowid assignment"));
     }
     let source = plan
         .document

@@ -13,7 +13,7 @@ use crate::{
     translate::semantic::hir::{self, ColumnReadExpression},
     vdbe::{
         builder::ProgramBuilder,
-        insn::{Insn, to_u32},
+        insn::{to_u32, Insn},
     },
 };
 

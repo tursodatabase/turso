@@ -5,21 +5,20 @@ use turso_parser::{ast, parser::Parser};
 
 use super::*;
 use crate::{
+    QueryMode, SymbolTable,
     dialect::{Dialect, SqliteDialect},
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, Index, Schema},
     sync::Arc,
     translate::semantic::{
-        analyze,
+        AnalyzeInput, analyze,
         context::{DmlPolicy, SemanticContext},
         hir::{Expr, HirRoot, TargetColumn},
-        AnalyzeInput,
     },
     vdbe::{
         builder::{ProgramBuilder, ProgramBuilderOpts},
         insn::Insn,
     },
-    QueryMode, SymbolTable,
 };
 
 fn parse_statement(sql: &str) -> ast::Stmt {
@@ -321,10 +320,113 @@ fn update_uses_a_stable_rowset_and_recomputes_the_hir_row(tc: hegel::TestCase) {
         2,
         "one addition evaluates the assignment and one recomputes c2"
     );
-    assert!(program
+    assert!(
+        program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::MakeRecord { count: 2, .. }))
+    );
+}
+
+// Examples: `UPDATE items SET rowid = rowid + 7 RETURNING rowid` and
+// `UPDATE OR IGNORE items SET id = id + 1` for an INTEGER PRIMARY KEY alias.
+// The stable rowset and OLD index deletion keep the original key, while NEW
+// constraints, index records, table insertion, triggers, and RETURNING use a
+// separate assigned key. A collision is checked before any OLD row is deleted.
+#[hegel::test]
+fn update_rowid_assignment_keeps_old_and_new_keys_separate(tc: hegel::TestCase) {
+    let offset = i64::from(tc.draw(generators::integers::<u8>().min_value(1).max_value(31)));
+    let alias = tc.draw(generators::booleans());
+    let table_sql = if alias {
+        "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)"
+    } else {
+        "CREATE TABLE items(value TEXT)"
+    };
+    let table = BTreeTable::from_sql(table_sql, 12).expect("fixture table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(table))
+        .expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let key = if alias { "id" } else { "rowid" };
+    let statement = parse_statement(&format!(
+        "UPDATE OR IGNORE items SET {key} = {key} + {offset} RETURNING {key}"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated rowid UPDATE has valid SQL meaning");
+    let HirRoot::Update(update) = &document.root else {
+        panic!("fixture produces UPDATE HIR");
+    };
+    assert!(if alias {
+        matches!(
+            update.assignments[0].columns.as_slice(),
+            [TargetColumn::Column(0)]
+        )
+    } else {
+        matches!(
+            update.assignments[0].columns.as_slice(),
+            [TargetColumn::RowId]
+        )
+    });
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed rowid UPDATE has a physical plan");
+    let mut program = program();
+    emit_root(&plan, &mut program).expect("rowid assignment emits directly from HIR");
+    program
+        .resolve_labels()
+        .expect("all rowid collision branches are closed");
+
+    let old_rowid = program
         .insns
         .iter()
-        .any(|(instruction, _)| matches!(instruction, Insn::MakeRecord { count: 2, .. })));
+        .find_map(|(instruction, _)| match instruction {
+            Insn::RowSetRead { dest_reg, .. } => Some(*dest_reg),
+            _ => None,
+        })
+        .expect("the stable OLD rowid is read from the rowset");
+    let (insert_position, new_rowid) = program
+        .insns
+        .iter()
+        .enumerate()
+        .find_map(|(position, (instruction, _))| match instruction {
+            Insn::Insert {
+                table_name,
+                key_reg,
+                ..
+            } if table_name == "items" => Some((position, *key_reg)),
+            _ => None,
+        })
+        .expect("the NEW row is inserted");
+    assert_ne!(old_rowid, new_rowid);
+    let collision_check = program.insns[..insert_position]
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(instruction, Insn::NotExists { rowid_reg, .. } if *rowid_reg == new_rowid)
+        })
+        .expect("the assigned key is checked for collision");
+    let delete = program.insns[..insert_position]
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(
+                instruction,
+                Insn::Delete {
+                    is_part_of_update: true,
+                    ..
+                }
+            )
+        })
+        .expect("the OLD row is deleted");
+    assert!(collision_check < delete && delete < insert_position);
+    assert!(
+        program.insns[insert_position + 1..]
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { .. }))
+    );
 }
 
 // Examples:
@@ -429,8 +531,10 @@ fn update_from_materializes_hir_assignment_values_before_writing(tc: hegel::Test
         .expect("SET expression is evaluated");
     assert!(assignment < candidate_insert && candidate_insert < delete);
     assert!(delete < target_insert && target_insert < returning);
-    assert!(!program
-        .insns
-        .iter()
-        .any(|(instruction, _)| matches!(instruction, Insn::RowSetAdd { .. })));
+    assert!(
+        !program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::RowSetAdd { .. }))
+    );
 }

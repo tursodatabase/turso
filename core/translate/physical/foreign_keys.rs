@@ -71,13 +71,14 @@ pub(crate) fn emit_update_child_checks(
     child_table: &BTreeTable,
     old_columns: RegisterRange,
     new_columns: RegisterRange,
-    rowid: RegisterId,
+    old_rowid: RegisterId,
+    new_rowid: RegisterId,
 ) -> ForeignKeyResult<()> {
     for foreign_key in foreign_keys {
         if foreign_key.declaration.deferred {
-            emit_old_child_repair(program, foreign_key, child_table, old_columns, rowid)?;
+            emit_old_child_repair(program, foreign_key, child_table, old_columns, old_rowid)?;
         }
-        emit_new_child_check(program, foreign_key, child_table, new_columns, rowid)?;
+        emit_new_child_check(program, foreign_key, child_table, new_columns, new_rowid)?;
     }
     Ok(())
 }
@@ -122,7 +123,8 @@ pub(crate) fn emit_update_parent_checks(
     parent_table: &BTreeTable,
     old_columns: RegisterRange,
     new_columns: RegisterRange,
-    rowid: RegisterId,
+    old_rowid: RegisterId,
+    new_rowid: RegisterId,
 ) -> ForeignKeyResult<()> {
     for foreign_key in foreign_keys.iter().filter(|foreign_key| {
         matches!(
@@ -136,7 +138,8 @@ pub(crate) fn emit_update_parent_checks(
             parent_table,
             old_columns,
             new_columns,
-            rowid,
+            old_rowid,
+            new_rowid,
         )?;
     }
     Ok(())
@@ -197,7 +200,8 @@ pub(crate) fn emit_update_parent_actions(
     parent_table: &BTreeTable,
     old_columns: RegisterRange,
     new_columns: RegisterRange,
-    rowid: RegisterId,
+    old_rowid: RegisterId,
+    new_rowid: RegisterId,
     prepared: &PreparedTriggers,
 ) -> ForeignKeyResult<()> {
     use turso_parser::ast::RefAct;
@@ -224,8 +228,8 @@ pub(crate) fn emit_update_parent_actions(
         let new_key = program.alloc_registers(width);
         for (offset, position) in foreign_key.parent_positions.iter().copied().enumerate() {
             let next_equal = (offset + 1 != width).then(|| program.allocate_label());
-            let old = child_register(parent_table, old_columns, rowid, position)?;
-            let new = child_register(parent_table, new_columns, rowid, position)?;
+            let old = child_register(parent_table, old_columns, old_rowid, position)?;
+            let new = child_register(parent_table, new_columns, new_rowid, position)?;
             program.emit_insn(Insn::Copy {
                 src_reg: old,
                 dst_reg: old_key + offset,
@@ -273,7 +277,8 @@ fn emit_update_parent_check(
     parent_table: &BTreeTable,
     old_columns: RegisterRange,
     new_columns: RegisterRange,
-    rowid: RegisterId,
+    old_rowid: RegisterId,
+    new_rowid: RegisterId,
 ) -> ForeignKeyResult<()> {
     use turso_parser::ast::RefAct;
 
@@ -309,8 +314,8 @@ fn emit_update_parent_check(
     let old_key = program.alloc_registers(foreign_key.parent_positions.len());
     let new_key = program.alloc_registers(foreign_key.parent_positions.len());
     for (offset, position) in foreign_key.parent_positions.iter().copied().enumerate() {
-        let old = child_register(parent_table, old_columns, rowid, position)?;
-        let new = child_register(parent_table, new_columns, rowid, position)?;
+        let old = child_register(parent_table, old_columns, old_rowid, position)?;
+        let new = child_register(parent_table, new_columns, new_rowid, position)?;
         program.emit_insn(Insn::Copy {
             src_reg: old,
             dst_reg: old_key + offset,
@@ -381,13 +386,13 @@ fn emit_update_parent_check(
         let not_current = program.allocate_label();
         program.emit_insn(Insn::Ne {
             lhs: child_rowid,
-            rhs: rowid.0,
+            rhs: old_rowid.0,
             target_pc: not_current,
             flags: CmpInsFlags::default(),
             collation: None,
         });
         for (offset, position) in foreign_key.child_positions.iter().copied().enumerate() {
-            let new_child = child_register(parent_table, new_columns, rowid, position)?;
+            let new_child = child_register(parent_table, new_columns, new_rowid, position)?;
             program.emit_insn(Insn::Ne {
                 lhs: new_child,
                 rhs: old_key + offset,
