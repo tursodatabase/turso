@@ -356,6 +356,11 @@ fn dml_hir_closes_over_target_and_expression_positions(tc: hegel::TestCase) {
         indexes: Vec::new(),
     };
     let target_id = target.id;
+    let new_source = matches!(operation, GeneratedDml::Update).then(|| {
+        let mut source = target.clone();
+        source.id = hir::SourceId::new(1);
+        source
+    });
     let root = match operation {
         GeneratedDml::Insert => hir::HirRoot::Insert(hir::Insert {
             target: target_id,
@@ -375,6 +380,7 @@ fn dml_hir_closes_over_target_and_expression_positions(tc: hegel::TestCase) {
         }),
         GeneratedDml::Update => hir::HirRoot::Update(hir::Update {
             target: target_id,
+            new_source: new_source.as_ref().expect("UPDATE has a NEW row").id,
             defaults: Vec::new(),
             from: None,
             assignments: vec![hir::Assignment {
@@ -410,7 +416,7 @@ fn dml_hir_closes_over_target_and_expression_positions(tc: hegel::TestCase) {
         }],
         root,
         queries: Vec::new(),
-        sources: vec![target],
+        sources: std::iter::once(target).chain(new_source).collect(),
         ctes: Vec::new(),
         schema_programs: Vec::new(),
         cdc: None,

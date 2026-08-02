@@ -325,8 +325,15 @@ impl<'document> HirValidator<'document> {
 
     fn visit_update(&self, update: &Update) -> ValidationResult {
         self.visit_source(update.target, Some(SourceOwner::Root))?;
+        self.visit_source(update.new_source, Some(SourceOwner::Root))?;
+        self.require(
+            update.target != update.new_source,
+            "UPDATE OLD and NEW rows must have distinct source identities",
+        )?;
         self.require_complete_row_image(update.target)?;
+        self.require_complete_row_image(update.new_source)?;
         self.require_complete_index_metadata(update.target)?;
+        self.require_complete_index_metadata(update.new_source)?;
         self.visit_dml_triggers(
             update.target,
             &update.triggers,
@@ -335,7 +342,7 @@ impl<'document> HirValidator<'document> {
         )?;
         self.visit_dml_foreign_keys(update.target, &update.foreign_keys)?;
         for default in &update.defaults {
-            self.validate_column_position(update.target, default.column)?;
+            self.validate_column_position(update.new_source, default.column)?;
             self.visit_expr(&default.value)?;
         }
         if let Some(from) = &update.from {
@@ -1059,7 +1066,8 @@ impl<'document> HirValidator<'document> {
                 .enumerate()
             {
                 self.require(
-                    expression.is_some() == column.expr.is_some(),
+                    expression.is_some()
+                        == (column.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL),
                     format!(
                         "source {id} index column {position} has incomplete expression metadata"
                     ),

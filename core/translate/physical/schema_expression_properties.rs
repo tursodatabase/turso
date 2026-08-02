@@ -4,6 +4,7 @@ use hegel::generators;
 
 use super::*;
 use crate::{
+    QueryMode, SymbolTable,
     dialect::{Dialect, SqliteDialect},
     schema::{BTreeTable, Schema, Table},
     schema_expr::{
@@ -14,15 +15,14 @@ use crate::{
     translate::semantic::{
         context::SemanticContext,
         schema_expr::{
-            analyze_positional_scalar_syntax, analyze_schema_expr, analyze_table_schema_syntax,
-            SchemaExprInput, SchemaSyntaxInput,
+            SchemaExprInput, SchemaSyntaxInput, analyze_positional_scalar_syntax,
+            analyze_schema_expr, analyze_table_schema_syntax,
         },
     },
     vdbe::{
         builder::{ProgramBuilder, ProgramBuilderOpts},
         insn::Insn,
     },
-    QueryMode, SymbolTable,
 };
 use turso_parser::ast;
 
@@ -235,21 +235,106 @@ fn partial_index_predicate_can_be_emitted_before_its_key(tc: hegel::TestCase) {
     emit_root_schema_expression_into(&plan, &mut program, &inputs, 1, 301)
         .expect("key emits independently");
 
-    assert!(program.insns[..predicate_end]
-        .iter()
-        .any(|(instruction, _)| {
-            matches!(instruction, Insn::Copy { src_reg, dst_reg, extra_amount: 0 }
+    assert!(
+        program.insns[..predicate_end]
+            .iter()
+            .any(|(instruction, _)| {
+                matches!(instruction, Insn::Copy { src_reg, dst_reg, extra_amount: 0 }
             if *src_reg == 100 + predicate_position && *dst_reg == 300)
-        }));
-    assert!(!program.insns[..predicate_end]
-        .iter()
-        .any(|(instruction, _)| {
-            matches!(instruction, Insn::Copy { src_reg, .. } if *src_reg == 100 + key_position)
-        }));
-    assert!(program.insns[predicate_end..]
-        .iter()
-        .any(|(instruction, _)| {
-            matches!(instruction, Insn::Copy { src_reg, dst_reg, extra_amount: 0 }
+            })
+    );
+    assert!(
+        !program.insns[..predicate_end]
+            .iter()
+            .any(|(instruction, _)| {
+                matches!(instruction, Insn::Copy { src_reg, .. } if *src_reg == 100 + key_position)
+            })
+    );
+    assert!(
+        program.insns[predicate_end..]
+            .iter()
+            .any(|(instruction, _)| {
+                matches!(instruction, Insn::Copy { src_reg, dst_reg, extra_amount: 0 }
                 if *src_reg == 100 + key_position && *dst_reg == 301)
-        }));
+            })
+    );
+}
+
+// Example: for `CREATE TABLE t(a, g AS (a), h AS (g))` followed by
+// `CREATE INDEX i ON t(h)`, the stored key program for `h` must read physical
+// column `a`. It must not emit `Column(g)`, because `g` is virtual and has no
+// field in the table record. The same rule holds for every generated depth.
+#[hegel::test]
+fn cursor_schema_expressions_close_transitive_generated_reads(tc: hegel::TestCase) {
+    let depth = usize::from(tc.draw(generators::integers::<u8>().min_value(2).max_value(8)));
+    let mut columns = vec!["base INTEGER".to_string()];
+    for generated in 0..depth {
+        let dependency = if generated == 0 {
+            "base".to_string()
+        } else {
+            format!("g{}", generated - 1)
+        };
+        columns.push(format!("g{generated} INTEGER AS ({dependency}) VIRTUAL"));
+    }
+    let table = Arc::new(
+        BTreeTable::from_sql(&format!("CREATE TABLE items({})", columns.join(", ")), 2)
+            .expect("the generated-column chain is valid"),
+    );
+    let owner = depth;
+    let expression = table.columns()[owner]
+        .generated_expr()
+        .expect("the final column is generated")
+        .clone();
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(table.clone())
+        .expect("the fixture table is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let analyzed = analyze_table_schema_syntax(
+        &context,
+        0,
+        Arc::new(Table::BTree(table)),
+        &[SchemaSyntaxInput {
+            syntax: &expression,
+            profile: SchemaExprProfile::IndexKey,
+            owner_column: Some(owner),
+        }],
+    )
+    .expect("the generated index key closes into HIR");
+    let root = match &analyzed.document.root {
+        crate::translate::semantic::hir::HirRoot::SchemaExpressions(root) => root,
+        _ => panic!("stored analysis returns a schema-expression root"),
+    };
+    let source = analyzed
+        .document
+        .source(root.source)
+        .expect("the schema-expression source exists");
+    for dependency in 1..owner {
+        assert!(matches!(
+            source.generated_expressions[dependency],
+            crate::translate::semantic::hir::ColumnReadExpression::Planned(_)
+        ));
+    }
+
+    let plan = PhysicalPlan::new(&analyzed.document).expect("closed HIR plans");
+    let cursor = CursorId(7);
+    let mut inputs = RootRuntimeInputs::default();
+    inputs.bind_source(root.source, SourceRuntime::Cursor(cursor));
+    let mut program =
+        ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 32, 8));
+    emit_root_schema_expression_into(&plan, &mut program, &inputs, 0, 300)
+        .expect("the transitive generated key emits");
+
+    let physical_reads = program.insns.iter().filter_map(|(instruction, _)| {
+        let Insn::Column {
+            cursor_id, column, ..
+        } = instruction
+        else {
+            return None;
+        };
+        (*cursor_id == cursor.0).then_some(*column)
+    });
+    assert_eq!(physical_reads.collect::<Vec<_>>(), vec![0]);
 }

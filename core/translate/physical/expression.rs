@@ -23,7 +23,7 @@ use crate::{
     },
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral},
+        insn::{CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral, to_u32},
     },
 };
 
@@ -475,6 +475,20 @@ impl<'program, 'bindings, 'document> ExpressionEmitter<'program, 'bindings, 'doc
         cursor: CursorId,
         target: usize,
     ) -> ExpressionResult<()> {
+        match &source.generated_expressions[column] {
+            hir::ColumnReadExpression::Planned(expression) => {
+                self.emit_into(expression, RegisterRange::new(target, 1))?;
+                self.program
+                    .emit_column_affinity(target, source.columns[column].affinity);
+                return Ok(());
+            }
+            hir::ColumnReadExpression::NotRequired => {
+                return Err(PhysicalExpressionError::Invalid(
+                    "referenced generated column has no closed read expression",
+                ));
+            }
+            hir::ColumnReadExpression::Absent => {}
+        }
         let table = match &source.kind {
             hir::SourceKind::Table(table)
             | hir::SourceKind::TableFunction { table, .. }
@@ -493,7 +507,7 @@ impl<'program, 'bindings, 'document> ExpressionEmitter<'program, 'bindings, 'doc
             });
             return Ok(());
         };
-        let Table::BTree(table) = table.value() else {
+        let Table::BTree(_) = table.value() else {
             self.program.emit_insn(Insn::VColumn {
                 cursor_id: cursor.0,
                 column,
@@ -501,26 +515,6 @@ impl<'program, 'bindings, 'document> ExpressionEmitter<'program, 'bindings, 'doc
             });
             return Ok(());
         };
-        let catalog_column =
-            table
-                .columns()
-                .get(column)
-                .ok_or(PhysicalExpressionError::Invalid(
-                    "column position is outside its catalog table",
-                ))?;
-        if catalog_column.is_virtual_generated() {
-            let hir::ColumnReadExpression::Planned(expression) =
-                &source.generated_expressions[column]
-            else {
-                return Err(PhysicalExpressionError::Invalid(
-                    "virtual generated column has no closed read expression",
-                ));
-            };
-            self.emit_into(expression, RegisterRange::new(target, 1))?;
-            self.program
-                .emit_column_affinity(target, source.columns[column].affinity);
-            return Ok(());
-        }
         if source.columns[column].rowid_alias {
             self.program.emit_insn(Insn::RowId {
                 cursor_id: cursor.0,

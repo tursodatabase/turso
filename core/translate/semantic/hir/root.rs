@@ -134,7 +134,11 @@ pub enum TargetColumn {
 
 #[derive(Clone, Debug)]
 pub struct Update {
+    /// OLD row identity used by predicates, assignment inputs, and index removal.
     pub target: SourceId,
+    /// NEW row identity used by generated values, constraints, index insertion,
+    /// and RETURNING.
+    pub new_source: SourceId,
     pub defaults: Vec<ResolvedDefault>,
     pub from: Option<From>,
     pub assignments: Vec<Assignment>,

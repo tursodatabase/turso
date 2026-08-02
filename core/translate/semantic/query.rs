@@ -370,7 +370,7 @@ impl Analyzer<'_, '_> {
 
     /// Record which source columns own stored read expressions without
     /// compiling them. Unused unresolved schema text must remain dormant.
-    fn initialize_table_read_expression_slots(
+    pub(super) fn initialize_table_read_expression_slots(
         &mut self,
         source: hir::SourceId,
         table: &Table,
@@ -456,7 +456,35 @@ impl Analyzer<'_, '_> {
         // itself is represented in HIR, every target field must be closed.
         let dml_target = match root {
             hir::HirRoot::Insert(insert) => Some(insert.target),
-            hir::HirRoot::Update(update) => Some(update.target),
+            hir::HirRoot::Update(update) => {
+                let old_width = self
+                    .source(update.target)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "missing UPDATE OLD source {}",
+                            update.target
+                        ))
+                    })?
+                    .columns
+                    .len();
+                let new_width = self
+                    .source(update.new_source)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "missing UPDATE NEW source {}",
+                            update.new_source
+                        ))
+                    })?
+                    .columns
+                    .len();
+                for column in 0..old_width {
+                    self.require_source_column(update.target, column);
+                }
+                for column in 0..new_width {
+                    self.require_source_column(update.new_source, column);
+                }
+                None
+            }
             hir::HirRoot::Delete(delete) => Some(delete.target),
             hir::HirRoot::Query(_)
             | hir::HirRoot::TriggerPredicate(_)
@@ -518,8 +546,13 @@ impl Analyzer<'_, '_> {
                 hir::SourceKind::Table(table) | hir::SourceKind::TableFunction { table, .. } => {
                     table.handle()
                 }
-                hir::SourceKind::SchemaExpression
-                | hir::SourceKind::Cte(_)
+                hir::SourceKind::SchemaExpression => {
+                    let Some(table) = self.source_catalog_table(source) else {
+                        return Ok(());
+                    };
+                    table.clone()
+                }
+                hir::SourceKind::Cte(_)
                 | hir::SourceKind::Derived(_)
                 | hir::SourceKind::RecursiveInput(_)
                 | hir::SourceKind::Pseudo { .. } => return Ok(()),
@@ -594,10 +627,9 @@ impl Analyzer<'_, '_> {
         match (stored, state) {
             (None, hir::ColumnReadExpression::Absent)
             | (Some(_), hir::ColumnReadExpression::Planned(_)) => Ok(None),
-            (Some(stored), hir::ColumnReadExpression::NotRequired) => {
-                self.instantiate_column_schema_syntax(stored, profile, source, column)
-                    .map(Some)
-            }
+            (Some(stored), hir::ColumnReadExpression::NotRequired) => self
+                .instantiate_column_schema_syntax(stored, profile, source, column)
+                .map(Some),
             (None, hir::ColumnReadExpression::NotRequired)
             | (None, hir::ColumnReadExpression::Planned(_))
             | (Some(_), hir::ColumnReadExpression::Absent) => {
@@ -755,11 +787,6 @@ impl Analyzer<'_, '_> {
 
             // Validate the complete index before instantiating any part. An
             // omitted index must never leave partial semantic dependencies.
-            let stored_columns = index
-                .columns
-                .iter()
-                .map(|column| column.expr.as_deref())
-                .collect::<Vec<_>>();
             let stored_predicate = index.where_clause.as_deref();
             let may_omit_invalid_pattern =
                 mode == IndexMetadataMode::Read && matches!(&index_hint, hir::IndexHint::None);
@@ -773,18 +800,28 @@ impl Analyzer<'_, '_> {
                 }
             }
 
-            let columns = stored_columns
-                .into_iter()
-                .map(|expression| {
-                    expression
-                        .map(|expression| {
-                            self.instantiate_table_schema_syntax(
-                                expression,
-                                SchemaExprProfile::IndexKey,
-                                source,
-                            )
-                        })
-                        .transpose()
+            let columns = index
+                .columns
+                .iter()
+                .map(|column| {
+                    if column.pos_in_table != crate::schema::EXPR_INDEX_SENTINEL {
+                        // A direct generated column also carries its generation
+                        // expression in the catalog. Keep it as a column here so
+                        // its declared generation program and affinity stay intact.
+                        return Ok(None);
+                    }
+                    let expression = column.expr.as_deref().ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "expression index {} has no expression",
+                            index.name
+                        ))
+                    })?;
+                    self.instantiate_table_schema_syntax(
+                        expression,
+                        SchemaExprProfile::IndexKey,
+                        source,
+                    )
+                    .map(Some)
                 })
                 .collect::<Result<Vec<_>>>()?;
             let predicate = stored_predicate

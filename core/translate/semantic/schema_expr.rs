@@ -296,7 +296,8 @@ fn create_table_schema_source(
             index_method_patterns: Vec::new(),
         },
     )?;
-    analyzer.bind_source_catalog_table(source_id, table);
+    analyzer.bind_source_catalog_table(source_id, table.clone());
+    analyzer.initialize_table_read_expression_slots(source_id, &table)?;
 
     Ok(source_id)
 }

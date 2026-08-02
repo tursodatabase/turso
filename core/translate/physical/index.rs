@@ -125,8 +125,35 @@ pub(crate) fn emit_index_key(
     opened: &OpenedIndex<'_>,
     make_record: bool,
 ) -> IndexResult<IndexKey> {
-    let predicate = opened
-        .expressions
+    emit_index_key_from_expressions(
+        program,
+        bindings,
+        source,
+        rowid,
+        opened,
+        opened.expressions,
+        make_record,
+    )
+}
+
+/// Build a key for a different row identity of the same opened index. UPDATE
+/// uses this to keep OLD and NEW schema programs distinct without opening the
+/// physical index twice.
+pub(crate) fn emit_index_key_from_expressions(
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'_>,
+    source: hir::SourceId,
+    rowid: RegisterId,
+    opened: &OpenedIndex<'_>,
+    expressions: &hir::IndexExpressions,
+    make_record: bool,
+) -> IndexResult<IndexKey> {
+    if expressions.index != opened.expressions.index {
+        return Err(PhysicalIndexError::Invalid(
+            "OLD and NEW index programs refer to different indexes",
+        ));
+    }
+    let predicate = expressions
         .predicate
         .as_ref()
         .map(|predicate| ExpressionEmitter::new(program, bindings).emit_new(predicate))
@@ -151,7 +178,7 @@ pub(crate) fn emit_index_key(
         .index
         .columns
         .iter()
-        .zip(&opened.expressions.columns)
+        .zip(&expressions.columns)
         .enumerate()
     {
         let expression = expression
@@ -160,7 +187,11 @@ pub(crate) fn emit_index_key(
             .unwrap_or_else(|| Expr::column(source, catalog_column.pos_in_table));
         ExpressionEmitter::new(program, bindings)
             .emit_into(&expression, super::RegisterRange::new(start + position, 1))?;
-        if opened.expressions.columns[position].is_none() {
+        // Direct generated columns carry their stored expression in the
+        // catalog, but they are still table columns and must receive that
+        // column's declared affinity. Only a true expression-index term uses
+        // the sentinel position and has no table-column affinity.
+        if catalog_column.pos_in_table != crate::schema::EXPR_INDEX_SENTINEL {
             let affinity = source_definition
                 .columns
                 .get(catalog_column.pos_in_table)

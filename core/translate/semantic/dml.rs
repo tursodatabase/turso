@@ -394,7 +394,14 @@ impl Analyzer<'_, '_> {
         let database_id = resolved_table_database_id(&resolved_table)?;
         let table = resolved_table.handle();
         validate_dml_target(self.context(), database_id, &table, DmlOperation::Update)?;
-        let defaults = self.analyze_insert_defaults(&table, target, database_id)?;
+        let new_source = self.analyze_base_table_source(
+            table_name,
+            None,
+            None,
+            hir::SourceOwner::Root,
+            IndexMetadataMode::Dml,
+        )?;
+        let defaults = self.analyze_insert_defaults(&table, new_source, database_id)?;
         let (from, mut read_scope) = match from_syntax {
             Some(syntax) => {
                 let (from, scope) =
@@ -411,7 +418,7 @@ impl Analyzer<'_, '_> {
 
         let assignments =
             self.analyze_assignments(sets, &table, target, &read_scope, trigger.is_some(), true)?;
-        self.populate_dml_check_constraints(target, &table, Some(&assignments))?;
+        self.populate_dml_check_constraints(new_source, &table, Some(&assignments))?;
         let predicate = predicate_syntax
             .map(|syntax| {
                 self.analyze_expr(syntax, &read_scope, scalar_expr_policy(trigger.is_some()))
@@ -420,8 +427,12 @@ impl Analyzer<'_, '_> {
         let order_by =
             self.analyze_dml_order_by(order_by_syntax, &read_scope, trigger.is_some())?;
         let limit = self.analyze_dml_limit(limit_syntax, &environment, trigger.is_some())?;
-        let returning =
-            self.analyze_dml_returning(returning_syntax, &environment, target, trigger.is_some())?;
+        let returning = self.analyze_dml_returning(
+            returning_syntax,
+            &environment,
+            new_source,
+            trigger.is_some(),
+        )?;
         let triggers = self.resolve_dml_triggers(
             database_id,
             &table,
@@ -439,6 +450,7 @@ impl Analyzer<'_, '_> {
 
         Ok(hir::HirRoot::Update(hir::Update {
             target,
+            new_source,
             defaults,
             from,
             assignments,

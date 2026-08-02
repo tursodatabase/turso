@@ -4,21 +4,20 @@ use hegel::generators;
 use turso_parser::{ast, parser::Parser};
 
 use super::{
-    analyze,
+    AnalyzeInput, analyze,
     context::{DmlPolicy, SemanticContext},
     hir::{
         Expr, HirDocument, HirRoot, JoinConstraint, QueryBlockBody, SourceKind, SourceOwner,
         SubqueryExpr,
     },
-    AnalyzeInput,
 };
 use crate::{
+    SymbolTable,
     dialect::{Dialect, SqliteDialect},
     schema::{BTreeTable, Index, Schema, Sequence, Trigger},
     sync::Arc,
     translate::collate::CollationSeq,
     vdbe::affinity::Affinity,
-    SymbolTable,
 };
 
 fn parse_statement(sql: &str) -> ast::Stmt {
@@ -1136,6 +1135,76 @@ fn dml_analysis_closes_generated_default_check_and_index_programs(tc: hegel::Tes
         document.validate().is_err(),
         "removing one required stored program must break HIR closure"
     );
+}
+
+// Example: with `g AS (base)`, `CREATE INDEX direct ON items(g)` keeps key
+// position `g` as a direct table-column read, while
+// `CREATE INDEX computed ON items(g + 0)` owns a separate HIR expression.
+// INSERT and both UPDATE row identities must preserve that distinction even
+// though the catalog stores a helper expression for the direct generated key.
+#[hegel::test]
+fn dml_index_metadata_distinguishes_generated_columns_from_expression_terms(tc: hegel::TestCase) {
+    let symbols = SymbolTable::new();
+    let table = Arc::new(
+        BTreeTable::from_sql(
+            "CREATE TABLE items(base INTEGER, g INTEGER AS (base) VIRTUAL)",
+            2,
+        )
+        .expect("the generated-column table is valid"),
+    );
+    let direct = Index::from_sql(&symbols, "CREATE INDEX direct ON items(g)", 3, &table)
+        .expect("the direct generated-column index is valid");
+    let computed = Index::from_sql(&symbols, "CREATE INDEX computed ON items(g + 0)", 4, &table)
+        .expect("the expression index is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(table)
+        .expect("the table name is unique");
+    schema
+        .add_index(Arc::new(direct))
+        .expect("the direct index name is unique");
+    schema
+        .add_index(Arc::new(computed))
+        .expect("the expression index name is unique");
+    let context = semantic_context(&schema, &symbols);
+    let update = tc.draw(generators::booleans());
+    let statement = parse_statement(if update {
+        "UPDATE items SET base = base + 1"
+    } else {
+        "INSERT INTO items(base) VALUES (1)"
+    });
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("the generated DML has valid SQL meaning");
+    let sources = match &document.root {
+        HirRoot::Insert(insert) => vec![insert.target],
+        HirRoot::Update(update) => vec![update.target, update.new_source],
+        _ => unreachable!("the fixture emits INSERT or UPDATE"),
+    };
+
+    for source_id in sources {
+        let source = document.source(source_id).expect("the DML source exists");
+        let direct = source
+            .index_expressions
+            .iter()
+            .find(|expressions| expressions.index.value().name == "direct")
+            .expect("the direct index metadata exists");
+        let computed = source
+            .index_expressions
+            .iter()
+            .find(|expressions| expressions.index.value().name == "computed")
+            .expect("the expression index metadata exists");
+        assert_eq!(direct.index.value().columns[0].pos_in_table, 1);
+        assert!(direct.index.value().columns[0].expr.is_some());
+        assert!(direct.columns[0].is_none());
+        assert_eq!(
+            computed.index.value().columns[0].pos_in_table,
+            crate::schema::EXPR_INDEX_SENTINEL
+        );
+        assert!(computed.columns[0].is_some());
+    }
+    document
+        .validate()
+        .expect("the direct and expression index forms both close HIR");
 }
 
 // Examples: `SELECT c2 AS grouped, sum(c0) FROM items GROUP BY grouped`

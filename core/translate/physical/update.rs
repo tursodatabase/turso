@@ -16,14 +16,15 @@ use crate::{
 
 use super::{
     close_indexes, emit_complete_logical_row, emit_expression_for_dml, emit_index_key,
-    emit_new_row_constraints, emit_replace_conflicting_row, emit_replace_not_null_defaults,
-    emit_replace_unique_check, emit_returning_result, emit_returning_values, emit_stored_record,
-    emit_trigger_programs, emit_unique_check, open_dml_target_scan, open_indexes,
-    record_from_registers, update_record, CdcChange, CursorId, ExpressionEmitter,
-    PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError, PhysicalMutationError,
-    PhysicalPlan, PhysicalRoot, PhysicalRowError, PhysicalSourceKind, PhysicalTriggerError,
-    PreparedCdc, PreparedTriggers, RegisterId, RegisterRange, RootRuntimeInputs,
-    RuntimeBindingError, RuntimeBindings, SourceRuntime, TriggerRow, TriggerRows,
+    emit_index_key_from_expressions, emit_new_row_constraints, emit_replace_conflicting_row,
+    emit_replace_not_null_defaults, emit_replace_unique_check, emit_returning_result,
+    emit_returning_values, emit_stored_record, emit_trigger_programs, emit_unique_check,
+    open_dml_target_scan, open_indexes, record_from_registers, update_record, CdcChange, CursorId,
+    ExpressionEmitter, PhysicalExpressionError, PhysicalForeignKeyError, PhysicalIndexError,
+    PhysicalMutationError, PhysicalPlan, PhysicalRoot, PhysicalRowError, PhysicalSourceKind,
+    PhysicalTriggerError, PreparedCdc, PreparedTriggers, RegisterId, RegisterRange,
+    RootRuntimeInputs, RuntimeBindingError, RuntimeBindings, SourceRuntime, TriggerRow,
+    TriggerRows,
 };
 
 #[derive(Debug)]
@@ -173,16 +174,17 @@ pub(crate) fn emit_root_update_with_context_and_after(
         program.alloc_registers(source.columns.len()),
         source.columns.len(),
     );
-    let old_columns = (!update.triggers.is_empty()
-        || !update.foreign_keys.outgoing.is_empty()
-        || !update.foreign_keys.incoming.is_empty()
-        || cdc.is_some_and(|cdc| cdc.has_before() || cdc.has_updates()))
-    .then(|| {
-        RegisterRange::new(
-            program.alloc_registers(source.columns.len()),
-            source.columns.len(),
-        )
-    });
+    let old_columns = RegisterRange::new(
+        program.alloc_registers(source.columns.len()),
+        source.columns.len(),
+    );
+    bindings.bind_source(
+        update.new_source,
+        SourceRuntime::Registers {
+            columns: logical,
+            rowid: Some(new_rowid),
+        },
+    )?;
     let record = program.alloc_register();
     program.emit_insn(Insn::Null {
         dest: rowset,
@@ -311,20 +313,26 @@ pub(crate) fn emit_root_update_with_context_and_after(
     });
 
     for (position, column) in table.columns().iter().enumerate() {
-        if let Some(old_columns) = old_columns {
-            ExpressionEmitter::new(program, &mut bindings).emit_into(
-                &Expr::column(update.target, position),
-                RegisterRange::new(old_columns.first.0 + position, 1),
-            )?;
-        }
+        ExpressionEmitter::new(program, &mut bindings).emit_into(
+            &Expr::column(update.target, position),
+            RegisterRange::new(old_columns.first.0 + position, 1),
+        )?;
         if column.generated_expr().is_some() {
             continue;
         }
-        ExpressionEmitter::new(program, &mut bindings).emit_into(
-            &Expr::column(update.target, position),
-            RegisterRange::new(logical.first.0 + position, 1),
-        )?;
+        program.emit_insn(Insn::Copy {
+            src_reg: old_columns.first.0 + position,
+            dst_reg: logical.first.0 + position,
+            extra_amount: 0,
+        });
     }
+    bindings.replace_source(
+        update.target,
+        SourceRuntime::Registers {
+            columns: old_columns,
+            rowid: Some(rowid),
+        },
+    )?;
     let mut assignments = Vec::with_capacity(update.assignments.len());
     if let Some(from_rows) = &from_rows {
         let expected_width = update
@@ -394,43 +402,31 @@ pub(crate) fn emit_root_update_with_context_and_after(
         });
     }
 
-    let old_runtime = bindings.replace_source(
-        update.target,
-        SourceRuntime::Registers {
-            columns: logical,
-            rowid: Some(new_rowid),
+    emit_complete_logical_row(program, &mut bindings, update.new_source, &table, logical)?;
+    emit_trigger_programs(
+        program,
+        triggers,
+        update
+            .triggers
+            .iter()
+            .filter(|trigger| trigger.value().time == TriggerTime::Before),
+        TriggerRows {
+            new: Some(TriggerRow {
+                columns: logical,
+                rowid: new_rowid,
+            }),
+            old: Some(TriggerRow {
+                columns: old_columns,
+                rowid,
+            }),
         },
+        write_next,
     )?;
-    emit_complete_logical_row(program, &mut bindings, update.target, &table, logical)?;
-    if let Some(old_columns) = old_columns {
-        emit_trigger_programs(
-            program,
-            triggers,
-            update
-                .triggers
-                .iter()
-                .filter(|trigger| trigger.value().time == TriggerTime::Before),
-            TriggerRows {
-                new: Some(TriggerRow {
-                    columns: logical,
-                    rowid: new_rowid,
-                }),
-                old: Some(TriggerRow {
-                    columns: old_columns,
-                    rowid,
-                }),
-            },
-            write_next,
-        )?;
-    }
-    bindings.replace_source(update.target, old_runtime)?;
-    if old_columns.is_some() {
-        program.emit_insn(Insn::NotExists {
-            cursor,
-            rowid_reg: rowid.0,
-            target_pc: write_next,
-        });
-    }
+    program.emit_insn(Insn::NotExists {
+        cursor,
+        rowid_reg: rowid.0,
+        target_pc: write_next,
+    });
     let mut old_keys = Vec::with_capacity(indexes.len());
     for index in &indexes {
         old_keys.push(emit_index_key(
@@ -442,13 +438,6 @@ pub(crate) fn emit_root_update_with_context_and_after(
             false,
         )?);
     }
-    let old_runtime = bindings.replace_source(
-        update.target,
-        SourceRuntime::Registers {
-            columns: logical,
-            rowid: Some(new_rowid),
-        },
-    )?;
     emit_replace_not_null_defaults(
         program,
         &mut bindings,
@@ -460,7 +449,7 @@ pub(crate) fn emit_root_update_with_context_and_after(
     emit_new_row_constraints(
         program,
         &mut bindings,
-        update.target,
+        update.new_source,
         &table,
         logical,
         update.conflict,
@@ -523,12 +512,20 @@ pub(crate) fn emit_root_update_with_context_and_after(
     });
     let mut new_keys = Vec::with_capacity(indexes.len());
     for index in &indexes {
-        let key = emit_index_key(
+        let expressions = plan
+            .document
+            .source(update.new_source)
+            .and_then(|source| source.index_expressions.get(new_keys.len()))
+            .ok_or(PhysicalUpdateError::Invalid(
+                "NEW row is missing an index program",
+            ))?;
+        let key = emit_index_key_from_expressions(
             program,
             &mut bindings,
-            update.target,
+            update.new_source,
             new_rowid,
             index,
+            expressions,
             true,
         )?;
         let conflict = update
@@ -562,7 +559,7 @@ pub(crate) fn emit_root_update_with_context_and_after(
             program,
             &mut bindings,
             &table,
-            old_columns.expect("foreign keys require the frozen OLD row"),
+            old_columns,
             logical,
             rowid,
             new_rowid,
@@ -572,13 +569,11 @@ pub(crate) fn emit_root_update_with_context_and_after(
     emit_stored_record(
         program,
         &mut bindings,
-        update.target,
+        update.new_source,
         &table,
         logical,
         record,
     )?;
-    bindings.replace_source(update.target, old_runtime)?;
-
     super::finish_update_row(
         program,
         &mut bindings,
@@ -588,45 +583,38 @@ pub(crate) fn emit_root_update_with_context_and_after(
         &old_keys,
         &new_keys,
         record,
-        old_columns.unwrap_or(logical),
+        old_columns,
         logical,
         rowid,
         new_rowid,
         &update.foreign_keys,
         triggers,
     )?;
-    if let Some(old_columns) = old_columns {
-        let after_trigger_done = program.allocate_label();
-        emit_trigger_programs(
-            program,
-            triggers,
-            update
-                .triggers
-                .iter()
-                .filter(|trigger| trigger.value().time == TriggerTime::After),
-            TriggerRows {
-                new: Some(TriggerRow {
-                    columns: logical,
-                    rowid: new_rowid,
-                }),
-                old: Some(TriggerRow {
-                    columns: old_columns,
-                    rowid,
-                }),
-            },
-            after_trigger_done,
-        )?;
-        program.preassign_label_to_next_insn(after_trigger_done);
-    }
-    if let Some(cdc) = cdc {
-        let before = cdc.has_before().then(|| {
-            record_from_registers(
-                program,
-                &table,
-                old_columns.expect("CDC BEFORE requires the frozen OLD row"),
+    let after_trigger_done = program.allocate_label();
+    emit_trigger_programs(
+        program,
+        triggers,
+        update
+            .triggers
+            .iter()
+            .filter(|trigger| trigger.value().time == TriggerTime::After),
+        TriggerRows {
+            new: Some(TriggerRow {
+                columns: logical,
+                rowid: new_rowid,
+            }),
+            old: Some(TriggerRow {
+                columns: old_columns,
                 rowid,
-            )
-        });
+            }),
+        },
+        after_trigger_done,
+    )?;
+    program.preassign_label_to_next_insn(after_trigger_done);
+    if let Some(cdc) = cdc {
+        let before = cdc
+            .has_before()
+            .then(|| record_from_registers(program, &table, old_columns, rowid));
         let after = cdc
             .has_after()
             .then(|| record_from_registers(program, &table, logical, new_rowid));
@@ -653,15 +641,7 @@ pub(crate) fn emit_root_update_with_context_and_after(
         )?;
     }
     if let Some(returning) = &update.returning {
-        let old_runtime = bindings.replace_source(
-            update.target,
-            SourceRuntime::Registers {
-                columns: logical,
-                rowid: Some(new_rowid),
-            },
-        )?;
         let result = emit_returning_values(plan, program, &mut bindings, returning)?;
-        bindings.replace_source(update.target, old_runtime)?;
         emit_returning_result(program, result);
     }
     program.preassign_label_to_next_insn(write_next);
@@ -747,14 +727,23 @@ fn preflight_update<'plan>(
         .document
         .source(update.target)
         .ok_or(PhysicalUpdateError::Invalid("target source is missing"))?;
+    let new_source = plan
+        .document
+        .source(update.new_source)
+        .ok_or(PhysicalUpdateError::Invalid("NEW source is missing"))?;
+    if source.columns.len() != new_source.columns.len() {
+        return Err(PhysicalUpdateError::Invalid(
+            "OLD and NEW row widths differ",
+        ));
+    }
     let IndexCoverage::Complete { indexes: _ } = &source.index_coverage else {
         return Err(PhysicalUpdateError::Invalid(
             "target does not carry complete index metadata",
         ));
     };
-    if source.check_constraints.is_none() {
+    if new_source.check_constraints.is_none() {
         return Err(PhysicalUpdateError::Invalid(
-            "target does not carry CHECK metadata",
+            "NEW row does not carry CHECK metadata",
         ));
     }
     let physical = plan

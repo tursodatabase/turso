@@ -281,20 +281,20 @@ fn translate_integrity_check_impl(
                 let mut columns = Vec::with_capacity(index.columns.len());
                 let mut unique_nullable = Vec::with_capacity(index.columns.len());
                 for col in &index.columns {
-                    if let Some(expr) = col.expr.as_deref() {
-                        let affinity = if col.pos_in_table != EXPR_INDEX_SENTINEL {
-                            Some(btree_table.columns()[col.pos_in_table].affinity())
-                        } else {
-                            // expression indexes don't apply affinity from the basae table
-                            None
-                        };
+                    if col.pos_in_table == EXPR_INDEX_SENTINEL {
+                        let expr = col.expr.as_deref().ok_or_else(|| {
+                            crate::LimboError::InternalError(format!(
+                                "expression index {} has no expression",
+                                index.name
+                            ))
+                        })?;
                         let position = syntax.len();
                         syntax.push(SchemaSyntaxInput {
                             syntax: expr,
                             profile: crate::schema_expr::SchemaExprProfile::IndexKey,
                             owner_column: None,
                         });
-                        columns.push(BoundIndexColumn::Expr(position, affinity));
+                        columns.push(BoundIndexColumn::Expr(position, None));
                         unique_nullable.push(true);
                     } else {
                         match btree_table.columns()[col.pos_in_table].generated_type() {
