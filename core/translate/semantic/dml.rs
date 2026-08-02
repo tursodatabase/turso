@@ -282,8 +282,7 @@ impl Analyzer<'_, '_> {
         let expected_types = self.destination_expected_types(target, &columns)?;
         let expected_defaults = columns
             .iter()
-            .copied()
-            .map(|column| default_for_target(column, &defaults).map(Some))
+            .map(|target| default_for_target(target.column, &defaults).map(Some))
             .collect::<Result<Vec<_>>>()?;
         let (source, upsert_syntax) = match source_syntax {
             InsertSourceSyntax::DefaultValues => (hir::InsertSource::DefaultValues, None),
@@ -784,7 +783,7 @@ impl Analyzer<'_, '_> {
         syntax: &ast::Select,
         environment: &QueryEnvironment,
         table: &Table,
-        columns: &[TargetColumn],
+        columns: &[hir::InsertTarget],
         defaults: &[hir::ResolvedDefault],
         expected_types: &[Option<hir::ResolvedType>],
         expected_defaults: &[Option<hir::Expr>],
@@ -814,7 +813,7 @@ impl Analyzer<'_, '_> {
                     let mut resolved = Vec::with_capacity(row.len());
                     for (index, expression) in row.iter().enumerate() {
                         if matches!(expression.as_ref(), ast::Expr::Default) {
-                            resolved.push(default_for_target(columns[index], defaults)?);
+                            resolved.push(default_for_target(columns[index].column, defaults)?);
                             continue;
                         }
                         let mut policy = scalar_expr_policy(in_trigger)
@@ -863,16 +862,15 @@ impl Analyzer<'_, '_> {
     fn destination_expected_types(
         &self,
         target: hir::SourceId,
-        columns: &[TargetColumn],
+        columns: &[hir::InsertTarget],
     ) -> Result<Vec<Option<hir::ResolvedType>>> {
         let source = self.source(target).ok_or_else(|| {
             LimboError::InternalError(format!("missing INSERT target source {target}"))
         })?;
         Ok(columns
             .iter()
-            .copied()
-            .map(|column| {
-                target_type_fact(column, source)
+            .map(|target| {
+                target_type_fact(target.column, source)
                     .declared
                     .and_then(|declared| declared.custom().cloned())
             })

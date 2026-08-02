@@ -338,16 +338,18 @@ fn emit_insert_row<'document>(
     initialize_insert_row(program, logical, rowid);
 
     for (target, value) in insert.columns.iter().zip(values) {
-        let destination = target_register(*target, logical, rowid)?;
         let result = emit_expression_for_dml(plan, program, bindings, value)?;
         if result.width != 1 {
             return Err(PhysicalInsertError::Invalid("INSERT value is not scalar"));
         }
-        program.emit_insn(Insn::Copy {
-            src_reg: result.first.0,
-            dst_reg: destination.0,
-            extra_amount: 0,
-        });
+        if target.uses_value {
+            let destination = target_register(target.column, logical, rowid)?;
+            program.emit_insn(Insn::Copy {
+                src_reg: result.first.0,
+                dst_reg: destination.0,
+                extra_amount: 0,
+            });
+        }
     }
     emit_insert_defaults(plan, program, bindings, insert, logical)?;
     finish_insert_row(
@@ -388,8 +390,10 @@ fn emit_insert_query_row<'document>(
 ) -> InsertResult<()> {
     initialize_insert_row(program, logical, rowid);
     for (position, target) in insert.columns.iter().enumerate() {
-        let destination = target_register(*target, logical, rowid)?;
-        program.emit_column_or_rowid(query_cursor, position, destination.0);
+        if target.uses_value {
+            let destination = target_register(target.column, logical, rowid)?;
+            program.emit_column_or_rowid(query_cursor, position, destination.0);
+        }
     }
     emit_insert_defaults(plan, program, bindings, insert, logical)?;
     finish_insert_row(
@@ -465,14 +469,16 @@ fn emit_insert_defaults<'document>(
 
 pub(super) fn insert_column_needs_default(
     source: &InsertSource,
-    columns: &[hir::TargetColumn],
+    columns: &[hir::InsertTarget],
     column: usize,
 ) -> bool {
     matches!(source, InsertSource::DefaultValues) || column_needs_default(columns, column)
 }
 
-pub(super) fn column_needs_default(columns: &[hir::TargetColumn], column: usize) -> bool {
-    !columns.contains(&hir::TargetColumn::Column(column))
+pub(super) fn column_needs_default(columns: &[hir::InsertTarget], column: usize) -> bool {
+    !columns
+        .iter()
+        .any(|target| target.column == hir::TargetColumn::Column(column))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -495,7 +501,8 @@ fn finish_insert_row<'document>(
     if let Some((position, _)) = table.get_rowid_alias_column().filter(|(position, _)| {
         insert
             .columns
-            .contains(&hir::TargetColumn::Column(*position))
+            .iter()
+            .any(|target| target.column == hir::TargetColumn::Column(*position))
     }) {
         program.emit_insn(Insn::Copy {
             src_reg: logical.first.0 + position,

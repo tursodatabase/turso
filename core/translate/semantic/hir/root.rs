@@ -61,7 +61,7 @@ pub struct Insert {
     /// allocation. Present only when the target database exposes that
     /// sequence in the semantic snapshot.
     pub autoincrement_sequence: Option<super::SequenceOperation>,
-    pub columns: Vec<TargetColumn>,
+    pub columns: Vec<InsertTarget>,
     pub defaults: Vec<ResolvedDefault>,
     pub source: InsertSource,
     pub conflict: Option<ResolveType>,
@@ -80,6 +80,16 @@ pub struct Insert {
 pub struct ResolvedDefault {
     pub column: usize,
     pub value: Expr,
+}
+
+/// One INSERT target position and whether its paired source value supplies it.
+///
+/// SQLite keeps duplicate targets for arity and expression analysis. Ordinary
+/// columns use their first value, while rowid targets use their last value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InsertTarget {
+    pub column: TargetColumn,
+    pub uses_value: bool,
 }
 
 #[derive(Clone, Debug)]

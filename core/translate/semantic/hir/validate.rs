@@ -257,8 +257,8 @@ impl<'document> HirValidator<'document> {
                 "MVCC AUTOINCREMENT sequence has no sqlite_sequence table",
             )?;
         }
-        for column in &insert.columns {
-            self.validate_target_column(insert.target, *column)?;
+        for target in &insert.columns {
+            self.validate_target_column(insert.target, target.column)?;
         }
         for default in &insert.defaults {
             self.validate_column_position(insert.target, default.column)?;

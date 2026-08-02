@@ -9,7 +9,7 @@ use super::{
         add_schema_named_target, configure_target_read_scope, configure_upsert_scope,
         resolve_assignment_columns, resolve_insert_columns, resolve_target_column, DmlOperation,
     },
-    hir::{self, DatabaseId, TargetColumn},
+    hir::{self, DatabaseId, InsertTarget, TargetColumn},
     scope::{NamePrecedence, Scope},
     source, source_columns, BindingOutcome,
 };
@@ -80,7 +80,10 @@ fn omitted_insert_targets_are_visible_writable_columns_in_schema_order(tc: hegel
         .zip(&hidden)
         .enumerate()
         .filter(|(_, (generated, hidden))| !**generated && !**hidden)
-        .map(|(position, _)| TargetColumn::Column(position))
+        .map(|(position, _)| InsertTarget {
+            column: TargetColumn::Column(position),
+            uses_value: true,
+        })
         .collect::<Vec<_>>();
 
     let actual = resolve_insert_columns(&table, &[]).expect("omitted target list is valid");
@@ -88,26 +91,39 @@ fn omitted_insert_targets_are_visible_writable_columns_in_schema_order(tc: hegel
     assert_eq!(actual, expected);
 }
 
-// Example: `INSERT INTO items(C3, c0, C3) ...` preserves the written order and
-// duplicate destinations while binding names without ASCII case sensitivity.
+// Examples:
+// - `INSERT INTO items(c3, C3) VALUES (2, 3)` binds both positions to c3, but
+//   only the first value supplies that ordinary column.
+// - `INSERT INTO items(rowid, C0) VALUES (2, 3)` binds both names to an INTEGER
+//   PRIMARY KEY c0, and only the last value supplies that rowid alias.
 #[hegel::test]
-fn explicit_insert_targets_bind_exact_positions_in_syntax_order(tc: hegel::TestCase) {
-    let count = generated_count(&tc);
+fn duplicate_insert_targets_bind_positions_and_choose_the_sqlite_value(tc: hegel::TestCase) {
+    let count = generated_count(&tc) + 1;
     let table = table_from_sql(&format!(
         "CREATE TABLE items ({})",
         (0..count)
-            .map(|position| format!("c{position} INTEGER"))
+            .map(|position| if position == 0 {
+                "c0 INTEGER PRIMARY KEY".to_string()
+            } else {
+                format!("c{position} INTEGER")
+            })
             .collect::<Vec<_>>()
             .join(", ")
     ));
     let target_count = generated_count(&tc);
-    let positions = (0..target_count)
+    let ordinary = generated_position(&tc, count - 1) + 1;
+    let mut positions = (0..target_count)
         .map(|_| generated_position(&tc, count))
         .collect::<Vec<_>>();
+    positions.extend([0, ordinary, 0, ordinary]);
     let names = positions
         .iter()
         .map(|position| {
-            let value = format!("c{position}");
+            let value = if *position == 0 && tc.draw(generators::booleans()) {
+                ["rowid", "_rowid_", "oid"][generated_position(&tc, 3)].to_string()
+            } else {
+                format!("c{position}")
+            };
             name(if tc.draw(generators::booleans()) {
                 value.to_ascii_uppercase()
             } else {
@@ -118,8 +134,19 @@ fn explicit_insert_targets_bind_exact_positions_in_syntax_order(tc: hegel::TestC
 
     let actual = resolve_insert_columns(&table, &names).expect("generated targets exist");
     let expected = positions
-        .into_iter()
-        .map(TargetColumn::Column)
+        .iter()
+        .enumerate()
+        .map(|(index, position)| InsertTarget {
+            column: TargetColumn::Column(*position),
+            uses_value: if *position == 0 {
+                positions
+                    .iter()
+                    .rposition(|candidate| candidate == position)
+                    == Some(index)
+            } else {
+                positions.iter().position(|candidate| candidate == position) == Some(index)
+            },
+        })
         .collect::<Vec<_>>();
 
     assert_eq!(actual, expected);
@@ -366,7 +393,10 @@ fn dml_hir_closes_over_target_and_expression_positions(tc: hegel::TestCase) {
             target: target_id,
             autoincrement: None,
             autoincrement_sequence: None,
-            columns: vec![TargetColumn::Column(position)],
+            columns: vec![InsertTarget {
+                column: TargetColumn::Column(position),
+                uses_value: true,
+            }],
             defaults: Vec::new(),
             source: hir::InsertSource::Values(vec![vec![hir::Expr::Literal(ast::Literal::Null)]]),
             conflict: None,
@@ -425,7 +455,7 @@ fn dml_hir_closes_over_target_and_expression_positions(tc: hegel::TestCase) {
     document.validate().expect("generated DML HIR is closed");
 
     match &mut document.root {
-        hir::HirRoot::Insert(insert) => insert.columns[0] = TargetColumn::Column(width),
+        hir::HirRoot::Insert(insert) => insert.columns[0].column = TargetColumn::Column(width),
         hir::HirRoot::Update(update) => {
             update.assignments[0].columns[0] = TargetColumn::Column(width)
         }

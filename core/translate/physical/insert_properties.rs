@@ -10,7 +10,7 @@ use crate::{
     translate::semantic::{
         analyze,
         context::{DmlPolicy, SemanticContext},
-        hir::{ColumnReadExpression, HirRoot, InsertSource, TargetColumn},
+        hir::{ColumnReadExpression, HirRoot, InsertSource, InsertTarget, TargetColumn},
         AnalyzeInput,
     },
     vdbe::{
@@ -34,7 +34,12 @@ fn insert_defaults_fill_exactly_the_omitted_columns(tc: hegel::TestCase) {
     let columns = supplied
         .iter()
         .enumerate()
-        .filter_map(|(position, supplied)| supplied.then_some(TargetColumn::Column(position)))
+        .filter_map(|(position, supplied)| {
+            supplied.then_some(InsertTarget {
+                column: TargetColumn::Column(position),
+                uses_value: true,
+            })
+        })
         .collect::<Vec<_>>();
 
     for (position, supplied) in supplied.into_iter().enumerate() {
@@ -57,7 +62,10 @@ fn default_values_evaluates_every_frozen_default(tc: hegel::TestCase) {
     let supplied = tc.draw(generators::booleans());
     let default_values = tc.draw(generators::booleans());
     let columns = supplied
-        .then_some(TargetColumn::Column(position))
+        .then_some(InsertTarget {
+            column: TargetColumn::Column(position),
+            uses_value: true,
+        })
         .into_iter()
         .collect::<Vec<_>>();
     let source = if default_values {
@@ -237,7 +245,16 @@ fn values_insert_builds_complete_rows_from_hir(tc: hegel::TestCase) {
     };
     assert!(matches!(
         insert.columns.as_slice(),
-        [TargetColumn::Column(0), TargetColumn::Column(2)]
+        [
+            InsertTarget {
+                column: TargetColumn::Column(0),
+                uses_value: true
+            },
+            InsertTarget {
+                column: TargetColumn::Column(2),
+                uses_value: true
+            }
+        ]
     ));
     assert!(insert.defaults.iter().any(|default| default.column == 1));
     assert!(matches!(&insert.source, InsertSource::Values(values) if values.len() == row_count));

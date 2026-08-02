@@ -3,7 +3,7 @@
 use turso_parser::ast;
 
 use super::{
-    hir::{self, TargetColumn},
+    hir::{self, InsertTarget, TargetColumn},
     scope::Scope,
 };
 use crate::{schema::Table, Result};
@@ -28,21 +28,59 @@ impl DmlOperation {
 pub(super) fn resolve_insert_columns(
     table: &Table,
     columns: &[ast::Name],
-) -> Result<Vec<TargetColumn>> {
+) -> Result<Vec<InsertTarget>> {
     if columns.is_empty() {
         return Ok(table
             .columns()
             .iter()
             .enumerate()
             .filter(|(_, column)| !column.hidden() && !column.is_generated())
-            .map(|(index, _)| TargetColumn::Column(index))
+            .map(|(index, _)| InsertTarget {
+                column: TargetColumn::Column(index),
+                uses_value: true,
+            })
             .collect());
     }
 
-    columns
+    let resolved = columns
         .iter()
         .map(|name| resolve_target_column(table, name, DmlOperation::Insert))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let mut selected = vec![None; table.columns().len() + 1];
+    for (position, target) in resolved.iter().copied().enumerate() {
+        let slot = match target {
+            TargetColumn::Column(column) => column,
+            TargetColumn::RowId => table.columns().len(),
+        };
+        if insert_target_uses_last_value(table, target) || selected[slot].is_none() {
+            selected[slot] = Some(position);
+        }
+    }
+
+    Ok(resolved
+        .into_iter()
+        .enumerate()
+        .map(|(position, column)| {
+            let slot = match column {
+                TargetColumn::Column(column) => column,
+                TargetColumn::RowId => table.columns().len(),
+            };
+            InsertTarget {
+                column,
+                uses_value: selected[slot] == Some(position),
+            }
+        })
+        .collect())
+}
+
+fn insert_target_uses_last_value(table: &Table, target: TargetColumn) -> bool {
+    match target {
+        TargetColumn::RowId => true,
+        TargetColumn::Column(column) => table
+            .columns()
+            .get(column)
+            .is_some_and(|column| column.is_rowid_alias()),
+    }
 }
 
 pub(super) fn resolve_assignment_columns(
