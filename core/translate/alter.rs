@@ -4,16 +4,26 @@ use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq, turso_assert_
 use turso_parser::{ast, parser::Parser};
 
 use super::{
-    schema::{validate_check_expr, SQLITE_TABLEID},
+    schema::{SQLITE_TABLEID, validate_check_expr},
     update::translate_update_for_schema_change,
 };
 use crate::{
+    LimboError, Numeric, Result, Value, ValueRef,
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
     schema::{CheckConstraint, Column, ColumnLayout, ForeignKey, RESERVED_TABLE_PREFIXES},
     translate::{
-        emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
-        expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
+        emitter::Resolver,
+        expr::{WalkControl, translate_expr, walk_expr, walk_expr_mut},
+        physical::{
+            PhysicalPlan, RegisterId, RegisterRange, RootRuntimeInputs, SourceRuntime,
+            emit_root_schema_expression_into,
+        },
+        semantic::{
+            context::SemanticContext,
+            hir::HirRoot,
+            schema_expr::{SchemaSyntaxInput, analyze_table_schema_syntax},
+        },
         trigger::create_trigger_to_sql,
     },
     util::{
@@ -23,11 +33,10 @@ use crate::{
     },
     vdbe::{
         affinity::Affinity,
-        builder::{CursorType, DmlColumnContext, ProgramBuilder},
-        insn::{to_u32, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
+        builder::{CursorType, ProgramBuilder},
+        insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral, to_u32},
     },
     vtab::VirtualTable,
-    LimboError, Numeric, Result, Value, ValueRef,
 };
 use either::Either;
 use rustc_hash::FxHashSet as HashSet;
@@ -565,20 +574,20 @@ fn emit_add_virtual_column_validation(
     database_id: usize,
 ) -> Result<()> {
     let has_notnull = column.notnull();
-    let check_constraints: Vec<CheckConstraint> = constraints
-        .iter()
-        .filter_map(|c| {
-            if let ast::ColumnConstraint::Check(expr) = &c.constraint {
-                Some(CheckConstraint::new(
-                    c.name.as_ref(),
-                    expr,
-                    column.name.as_deref(),
-                ))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let check_constraints: Vec<_> = if connection.check_constraints_ignored() {
+        Vec::new()
+    } else {
+        constraints
+            .iter()
+            .filter_map(|constraint| match &constraint.constraint {
+                ast::ColumnConstraint::Check(expression) => Some((
+                    constraint.name.as_ref().map(ToString::to_string),
+                    expression,
+                )),
+                _ => None,
+            })
+            .collect()
+    };
 
     if !has_notnull && check_constraints.is_empty() {
         return Ok(());
@@ -623,55 +632,119 @@ fn emit_add_virtual_column_validation(
         dest: rowid_reg,
     });
 
+    let context = SemanticContext::new(
+        resolver.schema(),
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        resolver.symbol_table,
+        connection.experimental_custom_types_enabled(),
+        connection.get_dqs_dml().into(),
+        connection.dialect(),
+    );
+    let mut syntax = Vec::new();
+    let generated_expressions = resolved_table
+        .columns_topo_sort()?
+        .iter()
+        .filter_map(|(column_index, column)| match column.generated_type() {
+            crate::schema::GeneratedType::Virtual { expr, .. } => {
+                let expression_index = syntax.len();
+                syntax.push(SchemaSyntaxInput {
+                    syntax: expr,
+                    profile: crate::schema_expr::SchemaExprProfile::GeneratedColumn,
+                    owner_column: Some(column_index),
+                });
+                Some((column_index, expression_index, column.affinity()))
+            }
+            crate::schema::GeneratedType::NotGenerated => None,
+        })
+        .collect::<Vec<_>>();
+    let check_expressions = check_constraints
+        .iter()
+        .map(|(name, expression)| {
+            let expression_index = syntax.len();
+            syntax.push(SchemaSyntaxInput {
+                syntax: expression,
+                profile: crate::schema_expr::SchemaExprProfile::Check {
+                    strict_types: resolved_table.is_strict,
+                },
+                owner_column: None,
+            });
+            (name, expression_index, expression)
+        })
+        .collect::<Vec<_>>();
+    let analyzed = analyze_table_schema_syntax(
+        &context,
+        database_id,
+        Arc::new(crate::schema::Table::BTree(Arc::new(
+            resolved_table.clone(),
+        ))),
+        &syntax,
+    )?;
+    let plan = PhysicalPlan::new(&analyzed.document)
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    let root = match &analyzed.document.root {
+        HirRoot::SchemaExpressions(root) => root,
+        _ => unreachable!("stored schema analysis returns a schema-expression root"),
+    };
+
+    // Keep the scan row in logical column order. SourceRuntime::Registers is
+    // deliberately independent of the table's on-disk layout.
+    let base_dest_reg = program.alloc_registers(resolved_table.columns().len());
     let layout = resolved_table.column_layout()?;
-    let base_dest_reg = program.alloc_registers(layout.column_count());
     for (idx, table_column) in resolved_table.columns().iter().enumerate() {
         if table_column.is_virtual_generated() || table_column.is_rowid_alias() {
             continue;
         }
 
-        program.emit_column_or_rowid(
-            cursor_id,
-            layout.to_reg_offset(idx),
-            layout.to_register(base_dest_reg, idx),
-        );
+        program.emit_column_or_rowid(cursor_id, layout.to_reg_offset(idx), base_dest_reg + idx);
     }
 
-    let dml_ctx =
-        DmlColumnContext::layout(resolved_table.columns(), base_dest_reg, rowid_reg, layout);
-    let resolved_table_arc = Arc::new(resolved_table.clone());
-    compute_virtual_columns(
-        program,
-        &resolved_table.columns_topo_sort()?,
-        &dml_ctx,
-        resolver,
-        &resolved_table_arc,
-    )?;
-    let result_reg = dml_ctx.to_column_reg(new_column_idx);
+    let mut runtime_inputs = RootRuntimeInputs::default();
+    runtime_inputs.bind_source(
+        root.source,
+        SourceRuntime::Registers {
+            columns: RegisterRange::new(base_dest_reg, resolved_table.columns().len()),
+            rowid: Some(RegisterId(rowid_reg)),
+        },
+    );
+    for (column_index, expression_index, affinity) in generated_expressions {
+        let target = base_dest_reg + column_index;
+        emit_root_schema_expression_into(&plan, program, &runtime_inputs, expression_index, target)
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        if affinity != Affinity::Blob {
+            program.emit_column_affinity(target, affinity);
+        }
+    }
+    let result_reg = base_dest_reg + new_column_idx;
 
-    if !check_constraints.is_empty() {
-        let mut check_resolver = resolver.fork();
-        let skip_row_label = program.allocate_label();
-        emit_check_constraints(
+    for (name, expression_index, expression) in check_expressions {
+        let check_reg = program.alloc_register();
+        emit_root_schema_expression_into(
+            &plan,
             program,
-            &check_constraints,
-            &mut check_resolver,
-            resolved_table.name.as_str(),
-            rowid_reg,
-            resolved_table
-                .columns()
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, col)| {
-                    col.name
-                        .as_deref()
-                        .map(|name| (name, dml_ctx.to_column_reg(idx)))
-                }),
-            connection,
-            ast::ResolveType::Abort,
-            skip_row_label,
-            None,
-        )?;
+            &runtime_inputs,
+            expression_index,
+            check_reg,
+        )
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        let passed = program.allocate_label();
+        program.emit_insn(Insn::IsNull {
+            reg: check_reg,
+            target_pc: passed,
+        });
+        program.emit_insn(Insn::If {
+            reg: check_reg,
+            target_pc: passed,
+            jump_if_null: false,
+        });
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_CHECK,
+            description: name.clone().unwrap_or_else(|| expression.to_string()),
+            on_error: None,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(passed);
     }
 
     if has_notnull {

@@ -1,5 +1,5 @@
-use crate::alloc::vec;
 use crate::alloc::TursoFromIterator;
+use crate::alloc::vec;
 use crate::alloc::*;
 use crate::function::{Deterministic, Func, ScalarFunc};
 use crate::incremental::view::IncrementalView;
@@ -8,17 +8,14 @@ use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
-use crate::translate::emitter::Resolver;
-use crate::translate::expr::{
-    bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
-};
+use crate::translate::expr::{WalkControl, walk_expr, walk_expr_mut};
 use crate::translate::index::{
     reject_explicit_nulls, resolve_index_method_parameters, resolve_sorted_columns,
 };
 use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
-use crate::vdbe::affinity::Affinity;
 use crate::vdbe::CursorID;
+use crate::vdbe::affinity::Affinity;
 use crate::{turso_assert, turso_debug_assert};
 use smallvec::SmallVec;
 use turso_macros::AtomicEnum;
@@ -144,16 +141,16 @@ impl Trigger {
     }
 }
 
+use crate::Result;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
+use crate::translate::plan::{BitSet, ColumnMask, Plan};
 use crate::util::{
-    module_args_from_sql, module_name_from_sql, type_from_name, UnparsedFromSqlIndex,
+    UnparsedFromSqlIndex, module_args_from_sql, module_name_from_sql, type_from_name,
 };
-use crate::Result;
-use crate::{bail_parse_error, LimboError, MvCursor, Pager, SymbolTable, ValueRef, VirtualTable};
+use crate::{LimboError, MvCursor, Pager, SymbolTable, ValueRef, VirtualTable, bail_parse_error};
 use bitflags::bitflags;
 use core::fmt;
 use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
@@ -6013,26 +6010,6 @@ impl Index {
         });
         ok
     }
-
-    pub fn bind_where_expr(
-        &self,
-        table_refs: Option<&mut TableReferences>,
-        resolver: &Resolver,
-    ) -> Option<ast::Expr> {
-        let Some(where_clause) = &self.where_clause else {
-            return None;
-        };
-        let mut expr = where_clause.clone();
-        bind_and_rewrite_expr(
-            &mut expr,
-            table_refs,
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )
-        .ok()?;
-        Some(*expr)
-    }
 }
 
 #[cfg(test)]
@@ -6104,8 +6081,8 @@ mod tests {
     }
 
     #[test]
-    pub fn test_column_is_rowid_alias_single_integer_separate_primary_key_definition_without_rowid(
-    ) -> Result<()> {
+    pub fn test_column_is_rowid_alias_single_integer_separate_primary_key_definition_without_rowid()
+    -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a)) WITHOUT ROWID;"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
@@ -6838,10 +6815,12 @@ mod tests {
             &|_| None,
             &crate::dialect::SqliteDialect,
         );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("generated columns"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("generated columns")
+        );
     }
 
     #[test]
@@ -6863,10 +6842,12 @@ mod tests {
             &|_| None,
             &crate::dialect::SqliteDialect,
         );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("root_page must be 0 for virtual table v1"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("root_page must be 0 for virtual table v1")
+        );
     }
 
     #[test]

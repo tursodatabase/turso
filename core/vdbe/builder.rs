@@ -1,20 +1,20 @@
-use crate::{alloc, turso_assert, turso_assert_eq, turso_debug_assert, Result, Value, ValueRef};
+use crate::{Result, Value, ValueRef, alloc, turso_assert, turso_assert_eq, turso_debug_assert};
 
 use rustc_hash::FxHashMap as HashMap;
 use std::num::NonZeroU32;
-use tracing::{instrument, Level};
+use tracing::{Level, instrument};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
 use crate::{
+    Arc, CaptureDataChangesInfo, Connection, VirtualTable,
     index_method::IndexMethodAttachment,
     parameters::Parameters,
     schema::{BTreeTable, Column, ColumnLayout, Index, PseudoCursorType, Schema, Table, Trigger},
     translate::{
         collate::CollationSeq,
-        emitter::{MaterializedColumnRef, TransactionMode},
+        emitter::TransactionMode,
         plan::{ResultSetColumn, TableReferences},
     },
-    Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
 
 // Keep distinct hash-table ids far from table internal ids to avoid collisions.
@@ -41,8 +41,8 @@ impl TableRefIdCounter {
 }
 
 use super::{
-    affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, PrepareContext,
-    PreparedProgram, Program,
+    BranchOffset, CursorID, Insn, InsnReference, PrepareContext, PreparedProgram, Program,
+    affinity::Affinity,
 };
 use crate::translate::plan::BitSet;
 use std::num::NonZeroUsize;
@@ -245,10 +245,6 @@ pub struct ProgramBuilder {
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
     pub id_register_overrides: HashMap<String, usize>,
-    /// Hash join build signatures keyed by hash table id.
-    hash_build_signatures: HashMap<usize, HashBuildSignature>,
-    /// Hash tables to keep open across subplans (e.g. materialization).
-    hash_tables_to_keep_open: BitSet,
     /// Maps table internal_id to result_columns_start_reg for FROM clause subqueries.
     /// Used when nested subqueries need to reference columns from outer query subqueries.
     subquery_result_regs: HashMap<TableInternalId, usize>,
@@ -425,30 +421,6 @@ impl ProgramBuilderFlags {
     pub const fn set_suppress_column_default(&mut self, v: bool) {
         self.set(Self::SUPPRESS_COLUMN_DEFAULT, v)
     }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum MaterializedBuildInputModeTag {
-    RowidOnly,
-    Payload,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// Signature of a hash build to allow reuse when inputs are unchanged.
-/// TODO: this is very heavy... we might consider hashing instead of storing full data.
-pub struct HashBuildSignature {
-    /// WHERE term indices used as hash join keys.
-    pub join_key_indices: Vec<usize>,
-    /// Build-table columns stored as payload.
-    pub payload_refs: Vec<MaterializedColumnRef>,
-    /// Affinity string applied to join keys.
-    pub key_affinities: String,
-    /// Whether a bloom filter is enabled for this build.
-    pub use_bloom_filter: bool,
-    /// Rowid input cursor when the build side is materialized.
-    pub materialized_input_cursor: Option<CursorID>,
-    /// RowidOnly vs KeyPayload
-    pub materialized_mode: Option<MaterializedBuildInputModeTag>,
 }
 
 /// Information about a materialized CTE, used for sharing data across multiple references.
@@ -700,8 +672,6 @@ impl ProgramBuilder {
             trigger_conflict_override: None,
             cursor_overrides: HashMap::default(),
             id_register_overrides: HashMap::default(),
-            hash_build_signatures: HashMap::default(),
-            hash_tables_to_keep_open: BitSet::default(),
             subquery_result_regs: HashMap::default(),
             next_cte_id: 0,
             materialized_ctes: HashMap::default(),
@@ -805,51 +775,6 @@ impl ProgramBuilder {
     /// should use this conflict resolution instead of their own OR clauses.
     pub const fn set_trigger_conflict_override(&mut self, resolve_type: ResolveType) {
         self.trigger_conflict_override = Some(resolve_type);
-    }
-
-    /// Returns true if the given hash table id should be kept open across subplans.
-    pub fn should_keep_hash_table_open(&self, hash_table_id: usize) -> bool {
-        self.hash_tables_to_keep_open.get(hash_table_id)
-    }
-
-    /// Set the set of hash tables to keep open across subplans.
-    pub fn set_hash_tables_to_keep_open(&mut self, tables: &BitSet) {
-        self.hash_tables_to_keep_open.clone_from(tables);
-    }
-
-    /// Reset the set of hash tables to keep open.
-    pub fn clear_hash_tables_to_keep_open(&mut self) {
-        self.hash_tables_to_keep_open = BitSet::default();
-    }
-
-    /// Returns true if the given hash build signature matches the recorded one for the given hash table id.
-    pub fn hash_build_signature_matches(
-        &self,
-        hash_table_id: usize,
-        signature: &HashBuildSignature,
-    ) -> bool {
-        self.hash_build_signatures
-            .get(&hash_table_id)
-            .is_some_and(|existing| existing == signature)
-    }
-
-    /// Returns true if there is a recorded hash build signature for the given hash table id.
-    pub fn has_hash_build_signature(&self, hash_table_id: usize) -> bool {
-        self.hash_build_signatures.contains_key(&hash_table_id)
-    }
-
-    /// Insert or update the hash build signature for the given hash table id.
-    pub fn record_hash_build_signature(
-        &mut self,
-        hash_table_id: usize,
-        signature: HashBuildSignature,
-    ) {
-        self.hash_build_signatures.insert(hash_table_id, signature);
-    }
-
-    /// Clear the hash build signature for the given hash table id.
-    pub fn clear_hash_build_signature(&mut self, hash_table_id: usize) {
-        self.hash_build_signatures.remove(&hash_table_id);
     }
 
     /// Store the result_columns_start_reg for a FROM clause subquery by its internal_id.

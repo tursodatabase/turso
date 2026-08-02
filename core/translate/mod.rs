@@ -7,65 +7,50 @@
 //! a SELECT statement will be translated into a sequence of instructions that
 //! will read rows from the database and filter them according to a WHERE clause.
 
-pub(crate) mod aggregation;
 pub(crate) mod alter;
 pub(crate) mod analyze;
 pub(crate) mod attach;
 pub(crate) mod collate;
-mod compound_select;
 pub(crate) mod display;
 pub(crate) mod emitter;
 pub(crate) mod expr;
-pub(crate) mod expression_index;
 pub(crate) mod fkeys;
-pub(crate) mod group_by;
 pub(crate) mod index;
 pub(crate) mod integrity_check;
 pub(crate) mod logical;
-pub(crate) mod main_loop;
-pub(crate) mod optimizer;
-pub(crate) mod order_by;
 pub(crate) mod physical;
 pub(crate) mod plan;
-pub(crate) mod planner;
 pub(crate) mod pragma;
-pub(crate) mod recursive_cte;
-pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;
-pub(crate) mod select;
 pub(crate) mod semantic;
 mod semantic_prepare;
 pub(crate) mod sequence;
 pub(crate) mod stmt_journal;
-pub(crate) mod subquery;
 pub(crate) mod transaction;
 pub(crate) mod trigger;
-pub(crate) mod trigger_exec;
 pub(crate) mod update;
 pub(crate) mod vacuum;
-mod values;
 pub(crate) mod view;
-mod window;
 
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
-use crate::translate::physical::{emit_root_with_context, PhysicalPlan};
+use crate::translate::physical::{PhysicalPlan, emit_root_with_context};
 use crate::translate::plan::ResultSetColumn;
 use crate::translate::semantic::{
-    analyze, context::DmlPolicy, context::SemanticContext, hir, AnalyzeInput,
+    AnalyzeInput, analyze, context::DmlPolicy, context::SemanticContext, hir,
 };
-use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
-use crate::{bail_parse_error, Connection, Result, SymbolTable};
+use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
+use crate::{Connection, Result, SymbolTable, bail_parse_error};
 use alter::translate_alter_table;
 use analyze::translate_analyze;
 use index::{translate_create_index, translate_drop_index, translate_optimize, translate_reindex};
 use rollback::{translate_release, translate_rollback, translate_savepoint};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
-use tracing::{instrument, Level};
+use tracing::{Level, instrument};
 use transaction::{translate_tx_begin, translate_tx_commit};
 use turso_parser::ast;
 
@@ -818,12 +803,12 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alloc::TryClone;
-    use crate::io::MemoryIO;
-    use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
-    use crate::vdbe::insn::Insn;
     use crate::Database;
     use crate::SqliteDialect;
+    use crate::alloc::TryClone;
+    use crate::io::MemoryIO;
+    use crate::schema::{BTreeTable, SQLITE_SEQUENCE_TABLE_NAME, Table};
+    use crate::vdbe::insn::Insn;
 
     #[test]
     fn semantic_prepare_adapter_owns_root_metadata_and_emission() {
@@ -854,10 +839,12 @@ mod tests {
 
         assert_eq!(built.result_columns.len(), 1);
         assert_eq!(built.result_columns[0].alias.as_deref(), Some("answer"));
-        assert!(built
-            .insns
-            .iter()
-            .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. })));
+        assert!(
+            built
+                .insns
+                .iter()
+                .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. }))
+        );
     }
 
     #[test]

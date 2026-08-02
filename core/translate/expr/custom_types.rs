@@ -1,5 +1,152 @@
 use super::*;
 
+/// Read an argument that must be a SQL string literal.
+pub(super) fn extract_string_literal(expr: &ast::Expr) -> Result<String> {
+    match expr {
+        ast::Expr::Literal(ast::Literal::String(value)) => Ok(value.trim_matches('\'').to_string()),
+        _ => crate::bail_parse_error!("expected a string literal argument"),
+    }
+}
+
+fn resolve_column_type_str(
+    table: ast::TableInternalId,
+    column: usize,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Option<String> {
+    if let Some((_, table)) =
+        referenced_tables.and_then(|tables| tables.find_table_by_internal_id(table))
+    {
+        return table
+            .columns()
+            .get(column)
+            .map(|column| column.ty_str.clone());
+    }
+    if table.is_self_table() {
+        return resolver.self_table_column_type_str(column);
+    }
+    None
+}
+
+fn resolve_typedef_from_column(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Option<Arc<TypeDef>> {
+    let type_name = match expr {
+        ast::Expr::Column { table, column, .. } => {
+            resolve_column_type_str(*table, *column, referenced_tables, resolver)?
+        }
+        ast::Expr::Variable(variable) => variable.col_type.as_ref()?.to_string(),
+        _ => return None,
+    };
+    resolver
+        .schema()
+        .get_type_def_unchecked(&type_name)
+        .cloned()
+}
+
+pub(super) fn resolve_union_from_column(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Option<Arc<TypeDef>> {
+    resolve_typedef_from_column(expr, referenced_tables, resolver).filter(|ty| ty.is_union())
+}
+
+pub(super) fn resolve_struct_from_expr(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Option<Arc<TypeDef>> {
+    match expr {
+        ast::Expr::Column { .. } => resolve_typedef_from_column(expr, referenced_tables, resolver)
+            .filter(|ty| ty.is_struct()),
+        ast::Expr::FunctionCall { name, args, .. } => {
+            match normalize_ident(name.as_str()).as_str() {
+                "union_extract" if args.len() == 2 => {
+                    let tag = extract_string_literal(&args[1]).ok()?;
+                    let union = resolve_union_from_column(&args[0], referenced_tables, resolver)?;
+                    let (_, variant) = union.find_union_variant(&tag)?;
+                    resolver
+                        .schema()
+                        .get_type_def_unchecked(&variant.type_name)
+                        .filter(|ty| ty.is_struct())
+                        .cloned()
+                }
+                "struct_extract" if args.len() == 2 => {
+                    let field = extract_string_literal(&args[1]).ok()?;
+                    let parent = resolve_struct_from_expr(&args[0], referenced_tables, resolver)?;
+                    let (_, field) = parent.find_struct_field(&field)?;
+                    resolver
+                        .schema()
+                        .get_type_def_unchecked(&field.type_name)
+                        .filter(|ty| ty.is_struct())
+                        .cloned()
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn resolve_expr_output_type<'a>(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &'a Resolver<'a>,
+) -> Result<&'a TypeDef> {
+    match expr {
+        ast::Expr::Column { table, column, .. } => {
+            let Some((_, table)) =
+                referenced_tables.and_then(|tables| tables.find_table_by_internal_id(*table))
+            else {
+                crate::bail_parse_error!("cannot resolve type: table not found");
+            };
+            let column = &table.columns()[*column];
+            resolver
+                .schema()
+                .get_type_def_unchecked(&column.ty_str)
+                .map(AsRef::as_ref)
+                .ok_or_else(|| {
+                    LimboError::ParseError(format!(
+                        "column '{}' has type '{}' which is not a known struct or union type",
+                        column.name.as_deref().unwrap_or("?"),
+                        column.ty_str
+                    ))
+                })
+        }
+        ast::Expr::FieldAccess { base, field, .. } => {
+            let parent = resolve_expr_output_type(base, referenced_tables, resolver)?;
+            let field_name = normalize_ident(field.as_str());
+            let inner_type_name = if let Some((_, variant)) = parent.find_union_variant(&field_name)
+            {
+                &variant.type_name
+            } else if let Some((_, field)) = parent.find_struct_field(&field_name) {
+                &field.type_name
+            } else {
+                let kind = if parent.is_union() {
+                    "variant"
+                } else {
+                    "field"
+                };
+                crate::bail_parse_error!("no such {} '{}' in type", kind, field_name);
+            };
+            resolver
+                .schema()
+                .get_type_def_unchecked(inner_type_name)
+                .map(AsRef::as_ref)
+                .ok_or_else(|| {
+                    LimboError::ParseError(format!(
+                        "'{}' resolves to type '{}' which is not a known type",
+                        field_name, inner_type_name
+                    ))
+                })
+        }
+        _ => crate::bail_parse_error!("expression does not produce a known custom type"),
+    }
+}
+
 /// Map an AST operator to the string representation used in custom type operator definitions.
 pub(super) fn operator_to_str(op: &ast::Operator) -> Option<&'static str> {
     match op {

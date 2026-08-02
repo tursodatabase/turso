@@ -1,9 +1,9 @@
 use crate::error::{SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
 use crate::turso_assert;
-use tracing::{instrument, Level};
+use tracing::{Level, instrument};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 
-use super::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
+use super::collate::{CollationSeq, get_collseq_from_expr_with_symbols};
 use super::emitter::Resolver;
 use super::plan::TableReferences;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -21,9 +21,9 @@ use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, DmlColumnContext, SelfTableContext};
 use crate::vdbe::{
+    BranchOffset, CursorID,
     builder::ProgramBuilder,
     insn::{CmpInsFlags, InsertFlags, Insn},
-    BranchOffset, CursorID,
 };
 use crate::{LimboError, Numeric, Result, Value};
 
@@ -33,7 +33,6 @@ mod metadata;
 mod affinity;
 mod arrays;
 mod binary;
-mod binding;
 mod columns;
 mod condition;
 mod custom_types;
@@ -50,8 +49,6 @@ use affinity::*;
 use arrays::*;
 #[allow(unused_imports)]
 use binary::*;
-#[allow(unused_imports)]
-use binding::*;
 #[allow(unused_imports)]
 use columns::*;
 #[allow(unused_imports)]
@@ -74,38 +71,31 @@ use vectors::*;
 use walk::*;
 
 pub(crate) use affinity::{
-    compare_affinity, expr_data_type, get_expr_affinity_info, ExprAffinityInfo, StorageClassMask,
+    ExprAffinityInfo, StorageClassMask, compare_affinity, expr_data_type, get_expr_affinity_info,
 };
 pub use affinity::{comparison_affinity, get_expr_affinity};
 pub(crate) use arrays::{
     emit_array_decode, emit_custom_type_decode_columns, emit_custom_type_encode_columns,
 };
 pub(crate) use binary::expr_is_array;
-pub use binding::{bind_and_rewrite_expr, BindingBehavior};
 pub use columns::{emit_table_column, emit_table_column_for_dml};
 pub use condition::translate_condition_expr;
 pub(crate) use custom_types::{
     emit_dml_expr_index_value, emit_trigger_decode_registers, emit_type_expr,
     emit_user_facing_column_value,
 };
-pub use emission::{
-    emit_function_call, emit_literal, process_returning_clause, ReturningBufferCtx,
-};
-pub(crate) use emission::{
-    emit_returning_results, emit_returning_scan_back, restore_returning_row_image_in_cache,
-    seed_returning_row_image_in_cache,
-};
+pub use emission::{emit_function_call, emit_literal};
 pub use metadata::ConditionMetadata;
 pub(crate) use metadata::{normalize_expr_for_index_matching, single_table_column_usage};
 pub use translator::{
-    resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
+    NoConstantOptReason, resolve_expr, translate_expr, translate_expr_no_constant_opt,
 };
 pub use utils::{
-    as_binary_components, maybe_apply_affinity, sanitize_string, unwrap_parens,
-    unwrap_parens_owned, ConstraintOperator,
+    ConstraintOperator, as_binary_components, maybe_apply_affinity, sanitize_string, unwrap_parens,
+    unwrap_parens_owned,
 };
 pub use vectors::expr_vector_size;
 pub use walk::{
-    expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
-    expr_references_subquery_id, walk_expr, walk_expr_mut, WalkControl,
+    WalkControl, expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
+    expr_references_subquery_id, walk_expr, walk_expr_mut,
 };
