@@ -8,7 +8,7 @@ use std::fmt;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use turso_ext::{ConstraintInfo, ConstraintOp};
-use turso_parser::ast::{CompoundOperator, Distinctness, Literal, SortOrder};
+use turso_parser::ast::{CompoundOperator, Distinctness, Literal, NullsOrder, SortOrder};
 
 use crate::{
     function::{AccumulatorFunc, AggFunc, Func},
@@ -19,8 +19,8 @@ use crate::{
     translate::collate::CollationSeq,
     translate::semantic::hir::{
         Assignment, CteBody, CteId, Expr, From as HirFrom, Grouping, Join, JoinConstraint,
-        JoinKind, OrderTerm, QueryBlockBody, QueryBlockId, QueryId, ResolvedTable, SourceId,
-        SubqueryExpr, TypeFact,
+        JoinKind, OrderTerm, QueryBlockBody, QueryBlockId, QueryId, RecursiveCte,
+        RecursiveOrderTerm, ResolvedTable, SourceId, SubqueryExpr, TypeFact,
     },
     types::KeyInfo,
     vdbe::{
@@ -77,6 +77,7 @@ type QueryResult<T> = std::result::Result<T, PhysicalQueryError>;
 enum ScanCursor {
     BTree(usize),
     Virtual(usize),
+    Single(usize),
 }
 
 struct VirtualFilter<'hir> {
@@ -156,6 +157,12 @@ enum QueryDestination<'table> {
         index: &'table Index,
         delete: bool,
     },
+    RecursiveQueue {
+        cursor_id: usize,
+        index: &'table Index,
+        order: &'table [RecursiveOrderTerm],
+        seen: Option<(usize, &'table Index)>,
+    },
     Scalar {
         registers: RegisterRange,
         done: crate::vdbe::BranchOffset,
@@ -179,6 +186,7 @@ impl QueryDestination<'_> {
             Self::ResultRows
             | Self::EphemeralTable { .. }
             | Self::CompoundIndex { .. }
+            | Self::RecursiveQueue { .. }
             | Self::Sorter { .. } => None,
         }
     }
@@ -227,6 +235,7 @@ struct MaterializedCte {
 struct MaterializedCtes {
     by_id: FxHashMap<CteId, MaterializedCte>,
     visiting: FxHashSet<CteId>,
+    recursive_inputs: FxHashMap<CteId, (usize, usize)>,
     temporary_cursors: Vec<usize>,
 }
 
@@ -372,7 +381,7 @@ impl<'document> PhysicalSubqueryEmitter<'document> for QuerySubqueryEmitter<'_, 
 impl ScanCursor {
     const fn id(self) -> usize {
         match self {
-            Self::BTree(cursor) | Self::Virtual(cursor) => cursor,
+            Self::BTree(cursor) | Self::Virtual(cursor) | Self::Single(cursor) => cursor,
         }
     }
 }
@@ -1950,6 +1959,7 @@ fn emit_nested_scan<'document>(
                 idx_num,
             });
         }
+        ScanCursor::Single(_) => {}
     }
     program.preassign_label_to_next_insn(loop_start);
     if let Some(table_cursor_id) = scan.deferred_table {
@@ -1997,6 +2007,7 @@ fn emit_nested_scan<'document>(
             cursor_id,
             pc_if_next: loop_start,
         }),
+        ScanCursor::Single(_) => {}
     }
 
     if let (Some(unmatched), Some(matched)) = (unmatched, matched) {
@@ -2203,9 +2214,26 @@ fn open_source<'document>(
             PhysicalSourceKind::TableFunction { table, arguments } => {
                 open_table_function(program, table, arguments)
             }
-            PhysicalSourceKind::RecursiveInput(_)
-            | PhysicalSourceKind::Pseudo { .. }
-            | PhysicalSourceKind::SchemaExpression => {
+            PhysicalSourceKind::RecursiveInput(cte) => {
+                let (cursor, width) = ctes
+                    .recursive_inputs
+                    .get(cte)
+                    .copied()
+                    .ok_or(PhysicalQueryError::Invalid("recursive input is not active"))?;
+                if width != source.width {
+                    return Err(PhysicalQueryError::Invalid(
+                        "recursive input width does not match its source",
+                    ));
+                }
+                Ok(OpenedScan {
+                    cursor: ScanCursor::Single(cursor),
+                    runtime_cursor: cursor,
+                    deferred_table: None,
+                    virtual_filter: None,
+                    owned: false,
+                })
+            }
+            PhysicalSourceKind::Pseudo { .. } | PhysicalSourceKind::SchemaExpression => {
                 Err(PhysicalQueryError::Unsupported("non-table FROM source"))
             }
             PhysicalSourceKind::Cte(cte) => open_cte_source(program, ctes, source, *cte),
@@ -2465,12 +2493,22 @@ fn materialize_cte<'document>(
         .document
         .cte(cte_id)
         .ok_or(PhysicalQueryError::Invalid("reachable CTE is missing"))?;
-    let query_id = match cte.body {
-        CteBody::Query(query) => query,
-        CteBody::Recursive(_) => {
-            ctes.visiting.remove(&cte_id);
-            return Err(PhysicalQueryError::Unsupported("recursive CTE"));
-        }
+    if let CteBody::Recursive(recursive) = &cte.body {
+        let result = materialize_recursive_cte(
+            plan,
+            program,
+            bindings,
+            ctes,
+            cte_id,
+            &cte.name,
+            cte.columns.len(),
+            recursive,
+        );
+        ctes.visiting.remove(&cte_id);
+        return result;
+    }
+    let CteBody::Query(query_id) = cte.body else {
+        unreachable!();
     };
     let query = plan
         .query(query_id)
@@ -2522,6 +2560,283 @@ fn materialize_cte<'document>(
         },
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_recursive_cte<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    ctes: &mut MaterializedCtes,
+    cte_id: CteId,
+    name: &str,
+    width: usize,
+    recursive: &RecursiveCte,
+) -> QueryResult<()> {
+    let seed = plan
+        .query(recursive.seed)
+        .ok_or(PhysicalQueryError::Invalid("recursive CTE seed is missing"))?;
+    if seed.hir.output.len() != width || recursive.arms.is_empty() {
+        return Err(PhysicalQueryError::Invalid(
+            "recursive CTE shape does not match its columns",
+        ));
+    }
+    for arm in &recursive.arms {
+        let query = plan
+            .query(arm.query)
+            .ok_or(PhysicalQueryError::Invalid("recursive CTE arm is missing"))?;
+        if query.hir.output.len() != width {
+            return Err(PhysicalQueryError::Invalid(
+                "recursive CTE arm width does not match its columns",
+            ));
+        }
+    }
+
+    let mut dependencies = query_tree_ctes(plan, recursive.seed)?;
+    for arm in &recursive.arms {
+        dependencies.extend(query_tree_ctes(plan, arm.query)?);
+    }
+    dependencies.sort_by_key(|dependency| dependency.index());
+    dependencies.dedup();
+    for dependency in dependencies {
+        if dependency != cte_id {
+            materialize_cte(plan, program, bindings, ctes, dependency)?;
+        }
+    }
+
+    let result_table = ephemeral_table(format!("cte_{name}"), width);
+    let result_cursor = program.alloc_cursor_id(CursorType::BTreeTable(result_table.clone()));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: result_cursor,
+        is_table: true,
+    });
+
+    let input_record = program.alloc_register();
+    let input_cursor = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
+        column_count: width,
+    }));
+    program.emit_insn(Insn::OpenPseudo {
+        cursor_id: input_cursor,
+        content_reg: input_record,
+        num_fields: width,
+    });
+    if ctes
+        .recursive_inputs
+        .insert(cte_id, (input_cursor, width))
+        .is_some()
+    {
+        return Err(PhysicalQueryError::Invalid(
+            "recursive CTE input is already active",
+        ));
+    }
+
+    let (queue_cursor, queue_index, sort_width) =
+        open_recursive_queue(program, name, width, recursive)?;
+    let distinct = recursive
+        .arms
+        .iter()
+        .any(|arm| arm.operator != CompoundOperator::UnionAll);
+    let seen = if distinct {
+        Some(open_recursive_seen(program, name, width, recursive)?)
+    } else {
+        None
+    };
+    let seen_destination = seen
+        .as_ref()
+        .map(|(cursor, index)| (*cursor, index.as_ref()));
+    let queue_destination = QueryDestination::RecursiveQueue {
+        cursor_id: queue_cursor,
+        index: &queue_index,
+        order: &recursive.queue_order,
+        seen: seen_destination,
+    };
+    emit_query(
+        plan,
+        program,
+        bindings,
+        ctes,
+        recursive.seed,
+        queue_destination,
+    )?;
+
+    let result_destination = QueryDestination::EphemeralTable {
+        cursor_id: result_cursor,
+        table: &result_table,
+    };
+    let limit = open_limit(
+        plan,
+        program,
+        bindings,
+        ctes,
+        recursive.limit.as_ref(),
+        result_destination,
+    )?;
+    let finished = limit
+        .map(|limit| limit.done)
+        .unwrap_or_else(|| program.allocate_label());
+    let dequeue = program.allocate_label();
+    program.preassign_label_to_next_insn(dequeue);
+    program.emit_insn(Insn::Rewind {
+        cursor_id: queue_cursor,
+        pc_if_empty: finished,
+    });
+    let queue_width = sort_width + 1 + width;
+    let queue_row = program.alloc_registers(queue_width);
+    for column in 0..queue_width {
+        program.emit_insn(Insn::Column {
+            cursor_id: queue_cursor,
+            column,
+            dest: queue_row + column,
+            default: None,
+        });
+    }
+    let result = RegisterRange::new(queue_row + sort_width + 1, width);
+    program.emit_insn(Insn::IdxDelete {
+        start_reg: queue_row,
+        num_regs: queue_width,
+        cursor_id: queue_cursor,
+        raise_error_if_no_matching_entry: false,
+    });
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(result.first.0),
+        count: to_u32(width),
+        dest_reg: to_u32(input_record),
+        index_name: None,
+        affinity_str: None,
+    });
+    emit_row_destination(
+        plan,
+        program,
+        bindings,
+        ctes,
+        result,
+        result_destination,
+        limit,
+        None,
+    )?;
+    for arm in &recursive.arms {
+        emit_query(plan, program, bindings, ctes, arm.query, queue_destination)?;
+    }
+    program.emit_insn(Insn::Goto { target_pc: dequeue });
+    program.preassign_label_to_next_insn(finished);
+    program.emit_insn(Insn::Close {
+        cursor_id: queue_cursor,
+    });
+    if let Some((cursor_id, _)) = seen {
+        program.emit_insn(Insn::Close { cursor_id });
+    }
+    program.emit_insn(Insn::Close {
+        cursor_id: input_cursor,
+    });
+    ctes.recursive_inputs.remove(&cte_id);
+    ctes.by_id.insert(
+        cte_id,
+        MaterializedCte {
+            cursor_id: result_cursor,
+            table: result_table,
+            width,
+        },
+    );
+    Ok(())
+}
+
+fn open_recursive_queue(
+    program: &mut ProgramBuilder,
+    name: &str,
+    width: usize,
+    recursive: &RecursiveCte,
+) -> QueryResult<(usize, Arc<Index>, usize)> {
+    let mut columns = Vec::new();
+    for (position, term) in recursive.queue_order.iter().enumerate() {
+        let default = match term.order {
+            SortOrder::Asc => NullsOrder::First,
+            SortOrder::Desc => NullsOrder::Last,
+        };
+        if term.nulls.is_some_and(|nulls| nulls != default) {
+            columns.push(IndexColumn::new(
+                format!("null-rank-{position}"),
+                columns.len(),
+            ));
+        }
+        let mut column = IndexColumn::new(format!("priority-{position}"), columns.len());
+        column.order = term.order;
+        column.collation = term
+            .explicit_collation
+            .as_ref()
+            .map(|collation| *collation.value())
+            .or_else(|| {
+                recursive
+                    .comparison_collations
+                    .get(term.output)
+                    .and_then(|collation| collation.as_ref())
+                    .map(|collation| *collation.value())
+            });
+        columns.push(column);
+    }
+    let sort_width = columns.len();
+    columns.push(IndexColumn::new("sequence", columns.len()));
+    for output in 0..width {
+        columns.push(IndexColumn::new(format!("result-{output}"), columns.len()));
+    }
+    let index = Arc::new(Index {
+        name: format!("hir_recursive_queue_{name}"),
+        table_name: String::new(),
+        root_page: 0,
+        columns,
+        unique: true,
+        ephemeral: true,
+        has_rowid: false,
+        where_clause: None,
+        index_method: None,
+        on_conflict: None,
+    });
+    let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: cursor,
+        is_table: false,
+    });
+    Ok((cursor, index, sort_width))
+}
+
+fn open_recursive_seen(
+    program: &mut ProgramBuilder,
+    name: &str,
+    width: usize,
+    recursive: &RecursiveCte,
+) -> QueryResult<(usize, Arc<Index>)> {
+    if recursive.comparison_collations.len() != width {
+        return Err(PhysicalQueryError::Invalid(
+            "recursive comparison width does not match its columns",
+        ));
+    }
+    let columns = recursive
+        .comparison_collations
+        .iter()
+        .enumerate()
+        .map(|(position, collation)| {
+            let mut column = IndexColumn::new(format!("distinct-{position}"), position);
+            column.collation = collation.as_ref().map(|collation| *collation.value());
+            column
+        })
+        .collect();
+    let index = Arc::new(Index {
+        name: format!("hir_recursive_seen_{name}"),
+        table_name: String::new(),
+        root_page: 0,
+        columns,
+        unique: false,
+        ephemeral: true,
+        has_rowid: false,
+        where_clause: None,
+        index_method: None,
+        on_conflict: None,
+    });
+    let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: cursor,
+        is_table: false,
+    });
+    Ok((cursor, index))
 }
 
 fn open_cte_source<'document>(
@@ -3069,6 +3384,107 @@ fn emit_result_destination(
                     unpacked_count: None,
                     flags: IdxInsertFlags::new().no_op_duplicate(),
                 });
+            }
+        }
+        QueryDestination::RecursiveQueue {
+            cursor_id,
+            index,
+            order,
+            seen,
+        } => {
+            let skip_seen = seen.map(|(seen_cursor, seen_index)| {
+                let skip = program.allocate_label();
+                let record = program.alloc_register();
+                program.emit_insn(Insn::MakeRecord {
+                    start_reg: to_u32(result.first.0),
+                    count: to_u32(result.width),
+                    dest_reg: to_u32(record),
+                    index_name: Some(seen_index.name.clone()),
+                    affinity_str: None,
+                });
+                program.emit_insn(Insn::Found {
+                    cursor_id: seen_cursor,
+                    target_pc: skip,
+                    record_reg: record,
+                    num_regs: 0,
+                });
+                program.emit_insn(Insn::IdxInsert {
+                    cursor_id: seen_cursor,
+                    record_reg: record,
+                    unpacked_start: Some(result.first.0),
+                    unpacked_count: Some(to_u32(result.width)),
+                    flags: IdxInsertFlags::new().no_op_duplicate().use_seek(true),
+                });
+                skip
+            });
+            let sort_width = order
+                .iter()
+                .map(|term| {
+                    let default = match term.order {
+                        SortOrder::Asc => NullsOrder::First,
+                        SortOrder::Desc => NullsOrder::Last,
+                    };
+                    1 + usize::from(term.nulls.is_some_and(|nulls| nulls != default))
+                })
+                .sum::<usize>();
+            let queue_row = program.alloc_registers(sort_width + 1 + result.width);
+            let mut target = queue_row;
+            for term in order {
+                let default = match term.order {
+                    SortOrder::Asc => NullsOrder::First,
+                    SortOrder::Desc => NullsOrder::Last,
+                };
+                if let Some(nulls) = term.nulls.filter(|nulls| *nulls != default) {
+                    let ready = program.allocate_label();
+                    let nulls_last = nulls == NullsOrder::Last;
+                    program.emit_insn(Insn::Integer {
+                        value: i64::from(nulls_last),
+                        dest: target,
+                    });
+                    program.emit_insn(Insn::IsNull {
+                        reg: result.first.0 + term.output,
+                        target_pc: ready,
+                    });
+                    program.emit_insn(Insn::Integer {
+                        value: i64::from(!nulls_last),
+                        dest: target,
+                    });
+                    program.preassign_label_to_next_insn(ready);
+                    target += 1;
+                }
+                program.emit_insn(Insn::Copy {
+                    src_reg: result.first.0 + term.output,
+                    dst_reg: target,
+                    extra_amount: 0,
+                });
+                target += 1;
+            }
+            program.emit_insn(Insn::Sequence {
+                cursor_id,
+                target_reg: queue_row + sort_width,
+            });
+            program.emit_insn(Insn::Copy {
+                src_reg: result.first.0,
+                dst_reg: queue_row + sort_width + 1,
+                extra_amount: result.width - 1,
+            });
+            let record = program.alloc_register();
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u32(queue_row),
+                count: to_u32(sort_width + 1 + result.width),
+                dest_reg: to_u32(record),
+                index_name: Some(index.name.clone()),
+                affinity_str: None,
+            });
+            program.emit_insn(Insn::IdxInsert {
+                cursor_id,
+                record_reg: record,
+                unpacked_start: None,
+                unpacked_count: None,
+                flags: IdxInsertFlags::new().no_op_duplicate(),
+            });
+            if let Some(skip) = skip_seen {
+                program.preassign_label_to_next_insn(skip);
             }
         }
         QueryDestination::Scalar { registers, done } => {

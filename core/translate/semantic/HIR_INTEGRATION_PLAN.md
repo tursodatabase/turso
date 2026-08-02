@@ -87,8 +87,10 @@ operations are not SQL binding.
         left-to-right set boundaries, including trailing UNION ALL duplicates.
   - [x] LEFT JOIN preserves the separate HIR join constraint and WHERE phases
         and null-extends the right SourceId only when no join match exists.
-  - [ ] Window execution, RIGHT/FULL OUTER JOIN, recursive
-        CTEs, and the remaining compound combinations.
+  - [ ] Window execution, RIGHT/FULL OUTER JOIN, and the remaining compound
+        combinations.
+  - [x] Recursive CTE seeds and arms feed a frozen-HIR priority queue, bind
+        occurrence-local recursive inputs, and apply UNION seen-row equality.
   - [x] Table-function arguments and hidden-column inputs emit from frozen HIR.
 - [ ] UPDATE and DELETE, including FROM, RETURNING, triggers, and foreign keys.
   - [x] A catalog-free root dispatcher emits simple rowid B-tree DELETE directly
