@@ -1,5 +1,5 @@
-use crate::alloc::TursoFromIterator;
 use crate::alloc::vec;
+use crate::alloc::TursoFromIterator;
 use crate::alloc::*;
 use crate::function::{Deterministic, Func, ScalarFunc};
 use crate::incremental::view::IncrementalView;
@@ -8,13 +8,12 @@ use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
-use crate::translate::expr::{WalkControl, walk_expr, walk_expr_mut};
+use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::index::{
     reject_explicit_nulls, resolve_index_method_parameters, resolve_sorted_columns,
 };
 use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
-use crate::vdbe::CursorID;
 use crate::vdbe::affinity::Affinity;
 use crate::{turso_assert, turso_debug_assert};
 use smallvec::SmallVec;
@@ -141,16 +140,16 @@ impl Trigger {
     }
 }
 
-use crate::Result;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{BitSet, ColumnMask, Plan};
+use crate::translate::plan::{BitSet, ColumnMask};
 use crate::util::{
-    UnparsedFromSqlIndex, module_args_from_sql, module_name_from_sql, type_from_name,
+    module_args_from_sql, module_name_from_sql, type_from_name, UnparsedFromSqlIndex,
 };
-use crate::{LimboError, MvCursor, Pager, SymbolTable, ValueRef, VirtualTable, bail_parse_error};
+use crate::Result;
+use crate::{bail_parse_error, LimboError, MvCursor, Pager, SymbolTable, ValueRef, VirtualTable};
 use bitflags::bitflags;
 use core::fmt;
 use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
@@ -2711,32 +2710,6 @@ impl TryClone for BTreeTable {
     }
 }
 
-impl TryClone for FromClauseSubquery {
-    type Error = TryReserveError;
-
-    fn try_clone(&self) -> Result<Self, Self::Error> {
-        Ok(Self {
-            name: self.name.clone(),
-            plan: self.plan.clone(),
-            columns: self.columns.try_clone()?,
-            result_columns_start_reg: self.result_columns_start_reg,
-            materialized_cursor_id: self.materialized_cursor_id,
-            cte: self.cte,
-        })
-    }
-}
-
-impl TryClone for RecursiveCteInput {
-    type Error = TryReserveError;
-
-    fn try_clone(&self) -> Result<Self, Self::Error> {
-        Ok(Self {
-            name: self.name.clone(),
-            columns: self.columns.try_clone()?,
-        })
-    }
-}
-
 impl TryClone for Table {
     type Error = TryReserveError;
 
@@ -2744,12 +2717,6 @@ impl TryClone for Table {
         Ok(match self {
             Table::BTree(table) => Table::BTree(Arc::new(table.as_ref().try_clone()?)),
             Table::Virtual(table) => Table::Virtual(Arc::new(table.as_ref().try_clone()?)),
-            Table::FromClauseSubquery(from_clause_subquery) => {
-                Table::FromClauseSubquery(Arc::new(from_clause_subquery.as_ref().try_clone()?))
-            }
-            Table::RecursiveCteInput(input) => {
-                Table::RecursiveCteInput(Arc::new(input.as_ref().try_clone()?))
-            }
         })
     }
 }
@@ -2873,12 +2840,6 @@ impl ColumnLayout {
             Table::Virtual(vtable) => Ok(Self::Identity {
                 column_count: vtable.as_ref().columns.len(),
             }),
-            Table::FromClauseSubquery(subquery) => Ok(Self::Identity {
-                column_count: subquery.columns.len(),
-            }),
-            Table::RecursiveCteInput(input) => Ok(Self::Identity {
-                column_count: input.columns.len(),
-            }),
         }
     }
 
@@ -2985,8 +2946,6 @@ impl ColumnLayout {
 pub enum Table {
     BTree(Arc<BTreeTable>),
     Virtual(Arc<VirtualTable>),
-    FromClauseSubquery(Arc<FromClauseSubquery>),
-    RecursiveCteInput(Arc<RecursiveCteInput>),
 }
 
 impl Table {
@@ -2996,12 +2955,6 @@ impl Table {
             Table::Virtual(_) => Err(crate::LimboError::InternalError(
                 "Virtual tables do not have a root page".to_string(),
             )),
-            Table::FromClauseSubquery(_) => Err(crate::LimboError::InternalError(
-                "FROM clause subqueries do not have a root page".to_string(),
-            )),
-            Table::RecursiveCteInput(_) => Err(crate::LimboError::InternalError(
-                "recursive CTE inputs do not have a root page".to_string(),
-            )),
         }
     }
 
@@ -3009,8 +2962,6 @@ impl Table {
         match self {
             Self::BTree(table) => &table.name,
             Self::Virtual(table) => &table.name,
-            Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.name,
-            Self::RecursiveCteInput(input) => &input.name,
         }
     }
 
@@ -3018,10 +2969,6 @@ impl Table {
         match self {
             Self::BTree(table) => table.columns.get(index),
             Self::Virtual(table) => table.columns.get(index),
-            Self::FromClauseSubquery(from_clause_subquery) => {
-                from_clause_subquery.columns.get(index)
-            }
-            Self::RecursiveCteInput(input) => input.columns.get(index),
         }
     }
 
@@ -3034,20 +2981,6 @@ impl Table {
                     .as_ref()
                     .is_some_and(|n| n.eq_ignore_ascii_case(name))
             }),
-            Self::FromClauseSubquery(from_clause_subquery) => from_clause_subquery
-                .columns
-                .iter()
-                .enumerate()
-                .find(|(_, col)| {
-                    col.name
-                        .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(name))
-                }),
-            Self::RecursiveCteInput(input) => input.columns.iter().enumerate().find(|(_, col)| {
-                col.name
-                    .as_ref()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
-            }),
         }
     }
 
@@ -3055,8 +2988,6 @@ impl Table {
         match self {
             Self::BTree(table) => &table.columns,
             Self::Virtual(table) => &table.columns,
-            Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.columns,
-            Self::RecursiveCteInput(input) => &input.columns,
         }
     }
 
@@ -3064,8 +2995,6 @@ impl Table {
         match self {
             Self::BTree(table) => table.is_strict,
             Self::Virtual(_) => false,
-            Self::FromClauseSubquery(_) => false,
-            Self::RecursiveCteInput(_) => false,
         }
     }
 
@@ -3073,8 +3002,6 @@ impl Table {
         match self {
             Self::BTree(table) => Some(table.clone()),
             Self::Virtual(_) => None,
-            Self::FromClauseSubquery(_) => None,
-            Self::RecursiveCteInput(_) => None,
         }
     }
 
@@ -3091,8 +3018,6 @@ impl Table {
         match self {
             Self::BTree(table) => Some(table),
             Self::Virtual(_) => None,
-            Self::FromClauseSubquery(_) => None,
-            Self::RecursiveCteInput(_) => None,
         }
     }
 
@@ -3969,79 +3894,6 @@ impl PseudoCursorType {
         Self {
             column_count: columns.as_ref().len(),
         }
-    }
-}
-
-/// A derived table from a FROM clause subquery.
-#[derive(Debug, Clone)]
-pub struct FromClauseSubquery {
-    /// The name of the derived table; uses the alias if available.
-    pub name: String,
-    /// The query plan for the derived table. Can be either a simple SelectPlan
-    /// or a compound select (UNION/INTERSECT/EXCEPT).
-    pub plan: Box<Plan>,
-    /// The columns of the derived table.
-    pub columns: Vec<Column>,
-    /// The start register for the result columns of the derived table;
-    /// must be set before data is read from it.
-    pub result_columns_start_reg: Option<usize>,
-    /// The table cursor backing a materialized EphemeralTable representation of
-    /// this subquery, if one was emitted.
-    pub materialized_cursor_id: Option<CursorID>,
-    /// CTE-specific materialization metadata, when this FROM-subquery is a CTE
-    /// reference rather than an inline derived table.
-    pub cte: Option<FromClauseSubqueryCteMetadata>,
-}
-
-/// The one-row table read by the recursive part of a recursive CTE.
-#[derive(Debug, Clone)]
-pub struct RecursiveCteInput {
-    pub name: String,
-    pub columns: Vec<Column>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct FromClauseSubqueryCteMetadata {
-    /// Identity shared by all references to the same CTE definition.
-    pub id: usize,
-    /// True when more than one read in the same query tree can reuse one
-    /// materialized result for this CTE.
-    pub shared_materialization: bool,
-    /// True for explicit WITH ... AS MATERIALIZED.
-    pub materialize_hint: bool,
-}
-
-impl FromClauseSubquery {
-    pub fn cte_id(&self) -> Option<usize> {
-        self.cte.map(|cte| cte.id)
-    }
-
-    pub fn materialize_hint(&self) -> bool {
-        self.cte.is_some_and(|cte| cte.materialize_hint)
-    }
-
-    pub fn shared_materialization(&self) -> bool {
-        self.cte.is_some_and(|cte| cte.shared_materialization)
-    }
-
-    pub fn set_shared_materialization(&mut self, shared: bool) {
-        if let Some(cte) = &mut self.cte {
-            cte.shared_materialization = shared;
-        }
-    }
-
-    /// Shared CTE references and explicit MATERIALIZED hints both force a
-    /// table-backed materialization that can be scanned or probed later.
-    pub fn requires_table_materialization(&self) -> bool {
-        self.shared_materialization() || self.materialize_hint()
-    }
-
-    /// Only simple single-reference SELECT subqueries can safely use their
-    /// synthesized seek index as the storage target directly. Compound
-    /// subqueries still need table-backed storage so their set-operation
-    /// semantics are preserved before any later SEARCH shape is chosen.
-    pub fn supports_direct_index_materialization(&self) -> bool {
-        matches!(self.plan.as_ref(), Plan::Select(_)) && !self.requires_table_materialization()
     }
 }
 
@@ -6081,8 +5933,8 @@ mod tests {
     }
 
     #[test]
-    pub fn test_column_is_rowid_alias_single_integer_separate_primary_key_definition_without_rowid()
-    -> Result<()> {
+    pub fn test_column_is_rowid_alias_single_integer_separate_primary_key_definition_without_rowid(
+    ) -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a)) WITHOUT ROWID;"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
@@ -6815,12 +6667,10 @@ mod tests {
             &|_| None,
             &crate::dialect::SqliteDialect,
         );
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("generated columns")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("generated columns"));
     }
 
     #[test]
@@ -6842,12 +6692,10 @@ mod tests {
             &|_| None,
             &crate::dialect::SqliteDialect,
         );
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("root_page must be 0 for virtual table v1")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("root_page must be 0 for virtual table v1"));
     }
 
     #[test]

@@ -1,5 +1,12 @@
-use super::*;
 use crate::alloc::TursoIteratorExt;
+use crate::vdbe::insn::Insn;
+use crate::{
+    functions::datetime, util::parse_numeric_literal, vdbe::builder::ProgramBuilder, Numeric,
+    Result, Value,
+};
+use turso_parser::ast;
+
+use super::sanitize_string;
 
 pub fn emit_literal(
     program: &mut ProgramBuilder,
@@ -91,19 +98,4 @@ pub fn emit_literal(
             Ok(target_register)
         }
     }
-}
-
-pub fn emit_function_call(
-    program: &mut ProgramBuilder,
-    func_ctx: FuncCtx,
-    arg_registers: &[usize],
-    target_register: usize,
-) -> Result<()> {
-    program.emit_insn(Insn::Function {
-        constant_mask: 0,
-        start_reg: arg_registers.first().copied().unwrap_or(target_register),
-        dest: target_register,
-        func: func_ctx,
-    });
-    Ok(())
 }

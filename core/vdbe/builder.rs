@@ -8,11 +8,8 @@ use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 use crate::{
     index_method::IndexMethodAttachment,
     parameters::Parameters,
-    schema::{BTreeTable, Column, ColumnLayout, Index, PseudoCursorType, Schema, Trigger},
-    translate::{
-        collate::CollationSeq, emitter::TransactionMode, plan::TableReferences,
-        result::ResultSetColumn,
-    },
+    schema::{BTreeTable, Index, PseudoCursorType, Schema, Trigger},
+    translate::{collate::CollationSeq, emitter::TransactionMode, result::ResultSetColumn},
     Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
 
@@ -102,90 +99,6 @@ impl CursorKey {
             (Some(self_index), Some(other_index)) => self_index.name == other_index.name,
             (None, None) => true,
             _ => false,
-        }
-    }
-}
-
-/// Context for resolving `Expr::Column` that has a `TableInternalId::SELF_TABLE` placeholder.
-#[derive(Clone)]
-pub enum SelfTableContext {
-    ForSelect {
-        table_ref_id: TableInternalId,
-        referenced_tables: TableReferences,
-    },
-    ForDML {
-        dml_ctx: DmlColumnContext,
-        table: Arc<BTreeTable>,
-    },
-}
-
-#[derive(Clone)]
-enum DmlColumnRegisters {
-    // Used to compute column registers lazily
-    Layout {
-        base_reg: usize,
-        rowid_reg: usize,
-        layout: ColumnLayout,
-    },
-    Indexed {
-        column_regs: Vec<usize>,
-    },
-}
-
-#[derive(Clone)]
-pub struct DmlColumnContext {
-    registers: DmlColumnRegisters,
-    rowid_alias_col: Option<usize>,
-}
-
-impl DmlColumnContext {
-    pub fn layout(
-        columns: &[Column],
-        base_reg: usize,
-        rowid_reg: usize,
-        layout: ColumnLayout,
-    ) -> Self {
-        let rowid_alias_col = columns.iter().position(|c| c.is_rowid_alias());
-
-        Self {
-            registers: DmlColumnRegisters::Layout {
-                base_reg,
-                rowid_reg,
-                layout,
-            },
-            rowid_alias_col,
-        }
-    }
-
-    pub fn from_column_reg_mapping<'a>(pairs: impl Iterator<Item = (&'a Column, usize)>) -> Self {
-        let mut rowid_alias_col = None;
-        let mut column_regs = Vec::new();
-        for (idx, (col, reg)) in pairs.enumerate() {
-            column_regs.push(reg);
-            if col.is_rowid_alias() {
-                rowid_alias_col = Some(idx);
-            }
-        }
-        Self {
-            registers: DmlColumnRegisters::Indexed { column_regs },
-            rowid_alias_col,
-        }
-    }
-
-    pub fn to_column_reg(&self, col_idx: usize) -> usize {
-        match &self.registers {
-            DmlColumnRegisters::Layout {
-                base_reg,
-                rowid_reg,
-                layout,
-            } => {
-                if self.rowid_alias_col == Some(col_idx) {
-                    *rowid_reg
-                } else {
-                    layout.to_register(*base_reg, col_idx)
-                }
-            }
-            DmlColumnRegisters::Indexed { column_regs } => column_regs[col_idx],
         }
     }
 }

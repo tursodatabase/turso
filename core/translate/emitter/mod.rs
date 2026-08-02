@@ -1,46 +1,24 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
-use super::{
-    collate::{CollationSeq, get_expr_collation_ctx_with_symbols},
-    expr::ExprAffinityInfo,
-    plan::{BitSet, ColumnMask, JoinedTable, TableReferences},
-};
-use crate::alloc::{TryClone, TursoIteratorExt};
+use super::{collate::CollationSeq, plan::BitSet};
+use crate::alloc::TursoIteratorExt;
 use crate::schema::{BTreeTable, Column, ColumnLayout, Schema, Table};
 use crate::translate::fkeys::FkActionCompileStack;
 use crate::vdbe::{
-    affinity::Affinity,
-    builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
-    insn::{InsertFlags, Insn, to_u32},
+    builder::{CursorType, ProgramBuilder},
+    insn::{to_u32, InsertFlags, Insn},
 };
 use crate::{
-    CaptureDataChangesExt, Database, DatabaseCatalog, LimboError, Result, RwLock, SymbolTable,
-    function::Func,
-    sync::Arc,
-    turso_assert_ne,
-    util::{exprs_are_equivalent, normalize_ident},
+    function::Func, sync::Arc, turso_assert_ne, util::normalize_ident, CaptureDataChangesExt,
+    Database, DatabaseCatalog, LimboError, Result, RwLock, SymbolTable,
 };
 use rustc_hash::FxHashMap as HashMap;
-use std::borrow::Cow;
 use std::cell::RefCell;
-use turso_parser::ast::{self, TableInternalId};
-
-pub(crate) mod gencol;
+use turso_parser::ast;
 
 // Would make more sense to not have RwLock for the attached databases and get all the schemas on prepare,
 // because there could be some data race where at 1 point you check the attached db, it has a table,
 // but after some write it could not be there anymore. However, leaving it as it is to avoid more complicated logic on something that is experimental
-#[derive(Debug, Clone)]
-pub struct CachedExprReg<'a> {
-    pub expr: Cow<'a, ast::Expr>,
-    pub reg: usize,
-    pub needs_decode: bool,
-    pub collation: CachedExprCollation,
-}
-
-pub type CachedExprCollation = Option<(CollationSeq, bool)>;
-pub type CachedExprRegHit = (usize, bool, CachedExprCollation);
-
 /// Whether SQLite's DQS (double-quoted strings) misfeature is enabled for DML.
 /// When `Enabled`, unresolved double-quoted identifiers fall back to string literals;
 /// when `Disabled`, they raise "no such column" errors.
@@ -73,34 +51,7 @@ pub struct Resolver<'a> {
     attached_databases: &'a RwLock<DatabaseCatalog>,
     non_main_schema_cache: RefCell<HashMap<usize, Arc<Schema>>>,
     pub symbol_table: &'a SymbolTable,
-    pub expr_to_reg_cache_enabled: bool,
-    /// Cache entries for previously translated expressions.
-    /// The `needs_custom_type_decode` flag is true for hash-join payload registers
-    /// that contain raw encoded values and need DECODE applied when read.
-    pub expr_to_reg_cache: Vec<CachedExprReg<'a>>,
-    /// Maps register indices to column affinities for expression index evaluation.
-    /// Populated temporarily during UPDATE new-image expression index key computation,
-    /// where column references have been rewritten to Expr::Register and comparison
-    /// operators need the original column affinity. Analogous to SQLite's iSelfTab
-    /// mechanism, but operates as a side-channel since limbo rewrites the AST rather
-    /// than redirecting column reads at codegen time.
-    pub register_affinities: HashMap<usize, Affinity>,
-    /// Maps register indices to declared column collations, the collation
-    /// counterpart of `register_affinities`: when column references are
-    /// rewritten to Expr::Register (UPSERT DO UPDATE WHERE/SET), comparisons
-    /// must still use the column's implicit collation per SQLite's rule 2.
-    pub register_collations: HashMap<usize, CollationSeq>,
-    /// Affinity metadata for planned scalar subqueries keyed by their internal ID.
-    /// This lets comparison affinity follow SQLite rules for expressions like
-    /// `(SELECT text_col FROM ...) > some_numeric_expr`.
-    pub(crate) subquery_affinities: RefCell<HashMap<TableInternalId, ExprAffinityInfo>>,
-    /// Context and metadata for resolving Expr::Column values that use
-    /// [TableInternalId::SELF_TABLE] as a placeholder.
-    self_table_scope: RefCell<Option<SelfTableScope>>,
     pub enable_custom_types: bool,
-    /// Controls whether unresolved double-quoted identifiers fall back to string
-    /// literals (SQLite's DQS misfeature) in DML statements.
-    pub dqs_dml: DoubleQuotedDml,
     /// Schema dialect of the database being compiled against; used when a
     /// fresh placeholder schema must be constructed during resolution.
     pub(crate) dialect: Arc<dyn crate::dialect::Dialect>,
@@ -128,65 +79,6 @@ pub struct Resolver<'a> {
     /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
-}
-
-#[derive(Clone)]
-struct SelfTableScope {
-    context: SelfTableContext,
-    affinities: Option<Arc<[Affinity]>>,
-}
-
-impl SelfTableScope {
-    fn new(context: SelfTableContext) -> Self {
-        let affinities = match &context {
-            SelfTableContext::ForDML { table, .. } => Some(
-                table
-                    .columns()
-                    .iter()
-                    .map(|c| c.affinity_with_strict(table.is_strict))
-                    .collect(),
-            ),
-            SelfTableContext::ForSelect {
-                table_ref_id,
-                referenced_tables,
-            } => referenced_tables
-                .find_table_by_internal_id(*table_ref_id)
-                .and_then(|(_, table_ref)| table_ref.btree())
-                .map(|btree| {
-                    btree
-                        .columns()
-                        .iter()
-                        .map(|c| c.affinity_with_strict(btree.is_strict))
-                        .collect()
-                }),
-        };
-
-        Self {
-            context,
-            affinities,
-        }
-    }
-
-    fn affinity(&self, column: usize) -> Option<Affinity> {
-        self.affinities
-            .as_ref()
-            .and_then(|affinities| affinities.get(column).copied())
-    }
-
-    fn column_type_str(&self, column: usize) -> Option<String> {
-        match &self.context {
-            SelfTableContext::ForDML { table, .. } => {
-                table.columns().get(column).map(|c| c.ty_str.clone())
-            }
-            SelfTableContext::ForSelect {
-                table_ref_id,
-                referenced_tables,
-            } => referenced_tables
-                .find_table_by_internal_id(*table_ref_id)
-                .and_then(|(_, table_ref)| table_ref.columns().get(column))
-                .map(|c| c.ty_str.clone()),
-        }
-    }
 }
 
 /// Context for restricting table resolution during trigger subprogram compilation.
@@ -227,14 +119,7 @@ impl<'a> Resolver<'a> {
             attached_databases,
             non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table,
-            expr_to_reg_cache_enabled: false,
-            expr_to_reg_cache: Vec::new(),
-            register_affinities: HashMap::default(),
-            register_collations: HashMap::default(),
-            subquery_affinities: RefCell::new(HashMap::default()),
-            self_table_scope: RefCell::new(None),
             enable_custom_types,
-            dqs_dml,
             dialect,
             trigger_context: None,
             has_temp_schema,
@@ -248,103 +133,6 @@ impl<'a> Resolver<'a> {
 
     pub fn has_temp_database(&self) -> bool {
         self.has_temp_schema
-    }
-
-    pub fn fork(&self) -> Resolver<'a> {
-        Resolver {
-            schema: self.schema,
-            database_schemas: self.database_schemas,
-            temp_database: self.temp_database,
-            attached_databases: self.attached_databases,
-            non_main_schema_cache: RefCell::new(HashMap::default()),
-            symbol_table: self.symbol_table,
-            expr_to_reg_cache_enabled: false,
-            expr_to_reg_cache: Vec::new(),
-            register_affinities: HashMap::default(),
-            register_collations: HashMap::default(),
-            subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
-            self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
-            enable_custom_types: self.enable_custom_types,
-            dqs_dml: self.dqs_dml,
-            dialect: self.dialect.clone(),
-            trigger_context: self.trigger_context.clone(),
-            has_temp_schema: self.has_temp_schema,
-            fk_action_compile_stack: self.fk_action_compile_stack.clone(),
-        }
-    }
-
-    pub fn fork_with_expr_cache(&self) -> Resolver<'a> {
-        Resolver {
-            schema: self.schema,
-            database_schemas: self.database_schemas,
-            temp_database: self.temp_database,
-            attached_databases: self.attached_databases,
-            non_main_schema_cache: RefCell::new(HashMap::default()),
-            symbol_table: self.symbol_table,
-            expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
-            expr_to_reg_cache: self.expr_to_reg_cache.clone(),
-            register_affinities: self.register_affinities.clone(),
-            register_collations: self.register_collations.clone(),
-            subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
-            self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
-            enable_custom_types: self.enable_custom_types,
-            dqs_dml: self.dqs_dml,
-            dialect: self.dialect.clone(),
-            trigger_context: self.trigger_context.clone(),
-            has_temp_schema: self.has_temp_schema,
-            fk_action_compile_stack: self.fk_action_compile_stack.clone(),
-        }
-    }
-
-    pub fn require_custom_types(&self, feature: &str) -> crate::Result<()> {
-        if !self.enable_custom_types {
-            crate::bail_parse_error!("{} require --experimental-custom-types flag", feature);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn with_self_table_context<T>(
-        &self,
-        program: &mut ProgramBuilder,
-        ctx: Option<&SelfTableContext>,
-        f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> Result<T>,
-    ) -> Result<T> {
-        match ctx {
-            Some(ctx) => {
-                let scope = SelfTableScope::new(ctx.clone());
-                let prev = self.self_table_scope.borrow_mut().replace(scope);
-                let result = f(program, Some(ctx));
-                *self.self_table_scope.borrow_mut() = prev;
-                result
-            }
-            None => f(program, None),
-        }
-    }
-
-    pub(crate) fn with_existing_self_table_context<T>(
-        &self,
-        f: impl FnOnce(Option<&SelfTableContext>) -> Result<T>,
-    ) -> Result<T> {
-        let ctx = self
-            .self_table_scope
-            .borrow()
-            .as_ref()
-            .map(|scope| scope.context.clone());
-        f(ctx.as_ref())
-    }
-
-    pub(crate) fn self_table_affinity(&self, column: usize) -> Option<Affinity> {
-        self.self_table_scope
-            .borrow()
-            .as_ref()
-            .and_then(|scope| scope.affinity(column))
-    }
-
-    pub(crate) fn self_table_column_type_str(&self, column: usize) -> Option<String> {
-        self.self_table_scope
-            .borrow()
-            .as_ref()
-            .and_then(|scope| scope.column_type_str(column))
     }
 
     fn cached_non_main_schema(&self, database_id: usize) -> Arc<Schema> {
@@ -424,65 +212,11 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    pub(crate) fn enable_expr_to_reg_cache(&mut self) {
-        self.expr_to_reg_cache_enabled = true;
-    }
-
-    pub fn cache_expr_reg(
-        &mut self,
-        expr: Cow<'a, ast::Expr>,
-        reg: usize,
-        needs_decode: bool,
-        collation: CachedExprCollation,
-    ) {
-        self.expr_to_reg_cache.push(CachedExprReg {
-            expr,
-            reg,
-            needs_decode,
-            collation,
-        });
-    }
-
-    /// Cache a scalar expression result together with the collation metadata that
-    /// standalone expression translation would have propagated to a parent comparison.
-    pub fn cache_scalar_expr_reg(
-        &mut self,
-        expr: Cow<'a, ast::Expr>,
-        reg: usize,
-        needs_decode: bool,
-        referenced_tables: &TableReferences,
-    ) -> Result<()> {
-        let collation = get_expr_collation_ctx_with_symbols(
-            expr.as_ref(),
-            referenced_tables,
-            Some(self.symbol_table),
-        )?;
-        self.cache_expr_reg(expr, reg, needs_decode, collation);
-        Ok(())
-    }
-
     pub fn resolve_collation(&self, name: &str) -> Result<CollationSeq> {
         if let Some(collation) = self.symbol_table.resolve_collation(name) {
             return Ok(collation);
         }
         CollationSeq::new(name)
-    }
-
-    /// Returns the register, decode flag, and collation metadata for a previously translated expression.
-    ///
-    /// We scan from newest to oldest so later translations win when equivalent
-    /// expressions are seen multiple times in the same translation pass.
-    /// Returns `(register, needs_custom_type_decode, collation_ctx)`.
-    pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<CachedExprRegHit> {
-        if self.expr_to_reg_cache_enabled {
-            self.expr_to_reg_cache
-                .iter()
-                .rev()
-                .find(|entry| exprs_are_equivalent(expr, &entry.expr))
-                .map(|entry| (entry.reg, entry.needs_decode, entry.collation))
-        } else {
-            None
-        }
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning
@@ -707,30 +441,13 @@ impl<'a> Resolver<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
-/// Update row source for UPDATE statements
-/// `Normal` is the default mode, it will iterate either the table itself or an index on the table.
-/// `PrebuiltEphemeralTable` is used when an ephemeral table containing the target rowids to update has
-/// been built and it is being used for iteration.
-pub enum UpdateRowSource {
-    /// Iterate over the table itself or an index on the table
-    Normal,
-    /// Iterate over an ephemeral table containing the target rowids to update
-    PrebuiltEphemeralTable {
-        /// The cursor id of the ephemeral table that is being used to iterate the target rowids to update.
-        ephemeral_table_cursor_id: usize,
-        /// The table that is being updated.
-        target_table: Arc<JoinedTable>,
-    },
-}
-
 /// Used to distinguish database operations
 #[allow(clippy::upper_case_acronyms, dead_code)]
 #[derive(Debug, Clone)]
 pub enum OperationMode {
     SELECT,
     INSERT,
-    UPDATE(UpdateRowSource),
+    UPDATE,
     DELETE,
 }
 
@@ -1013,7 +730,7 @@ fn emit_cdc_insns_v1(
 
     let change_type = match operation_mode {
         OperationMode::INSERT => 1,
-        OperationMode::UPDATE { .. } | OperationMode::SELECT => 0,
+        OperationMode::UPDATE | OperationMode::SELECT => 0,
         OperationMode::DELETE => -1,
     };
     program.emit_int(change_type, turso_cdc_registers + 2);
@@ -1142,7 +859,7 @@ fn emit_cdc_insns_v2(
     // change_type
     let change_type = match operation_mode {
         OperationMode::INSERT => 1,
-        OperationMode::UPDATE { .. } | OperationMode::SELECT => 0,
+        OperationMode::UPDATE | OperationMode::SELECT => 0,
         OperationMode::DELETE => -1,
     };
     program.emit_int(change_type, turso_cdc_registers + 3);
@@ -1388,98 +1105,4 @@ pub fn emit_cdc_explicit_commit_insns(
 
     program.preassign_label_to_next_insn(skip_label);
     Ok(())
-}
-/// Emits `target_columns`, plus the stored columns needed by `target_columns`, into a
-/// DML row context. This takes into account stored columns, and any stored columns
-/// required by virtual columns in `target_columns`.
-///
-/// Non-rowid target columns are allocated in target order. Rowid-alias columns resolve
-/// to `rowid_reg`, so callers that need an unpacked contiguous key or record must
-/// materialize one from `DmlColumnContext::to_column_reg`.
-pub(crate) fn emit_columns_and_dependencies(
-    program: &mut ProgramBuilder,
-    table: &BTreeTable,
-    cursor_id: usize,
-    rowid_reg: usize,
-    target_columns: impl IntoIterator<Item = usize>,
-    resolver: &Resolver,
-) -> Result<DmlColumnContext> {
-    let targets: Vec<usize> = target_columns.into_iter().collect();
-    let target_mask: ColumnMask = targets.iter().copied().try_collect()?;
-    let non_rowid_targets: Vec<usize> = targets
-        .iter()
-        .copied()
-        .filter(|&idx| !table.columns()[idx].is_rowid_alias())
-        .collect();
-    let mut non_rowid_target_positions = vec![None; table.columns().len()];
-    for (pos, idx) in non_rowid_targets.iter().copied().enumerate() {
-        non_rowid_target_positions[idx] = Some(pos);
-    }
-    let dependencies = table.dependencies_of_columns(targets.iter().copied())?;
-
-    let target_base = if non_rowid_targets.is_empty() {
-        0
-    } else {
-        program.alloc_registers(non_rowid_targets.len())
-    };
-    let extra_base = {
-        let mut dependencies_not_in_targets: ColumnMask = dependencies.try_clone()?;
-        dependencies_not_in_targets -= &target_mask;
-
-        let extra_count = table
-            .columns()
-            .iter()
-            .enumerate()
-            .filter(|(idx, col)| dependencies_not_in_targets.get(*idx) && !col.is_rowid_alias())
-            .count();
-
-        if extra_count > 0 {
-            program.alloc_registers(extra_count)
-        } else {
-            0
-        }
-    };
-
-    let mut extra_idx = 0;
-    let pairs = table.columns().iter().enumerate().map(|(idx, col)| {
-        let reg = if let Some(pos) = non_rowid_target_positions[idx] {
-            let reg = target_base + pos;
-            if !col.is_virtual_generated() {
-                program.emit_column_or_rowid(cursor_id, idx, reg);
-            }
-            reg
-        } else if col.is_rowid_alias() {
-            rowid_reg
-        } else if dependencies.get(idx) {
-            let reg = extra_base + extra_idx;
-            program.emit_column_or_rowid(cursor_id, idx, reg);
-            extra_idx += 1;
-            reg
-        } else {
-            0
-        };
-        (col, reg)
-    });
-    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
-    if targets
-        .iter()
-        .all(|&idx| !table.columns()[idx].is_rowid_alias())
-    {
-        debug_assert!(
-            targets
-                .windows(2)
-                .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 })
-        );
-    }
-
-    let table_arc = Arc::new(table.clone());
-    gencol::compute_virtual_columns(
-        program,
-        &table.columns_topo_sort()?,
-        &dml_ctx,
-        resolver,
-        &table_arc,
-    )?;
-
-    Ok(dml_ctx)
 }

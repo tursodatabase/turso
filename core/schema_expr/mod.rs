@@ -8,9 +8,6 @@
 mod properties;
 mod render;
 mod resolve;
-mod rewrite;
-
-pub(crate) use rewrite::{rename_schema_expr_identifiers, validate_column_rename_using_clause};
 
 use crate::function::Func;
 use crate::schema::TypeDef;
@@ -635,3 +632,4 @@ pub(crate) enum DropRemap {
     Remapped,
     UnresolvedSyntaxPreserved,
 }
+mod rewrite;

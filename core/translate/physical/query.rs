@@ -4843,9 +4843,6 @@ fn open_source<'document>(
                 owned: true,
             })
         }
-        Table::FromClauseSubquery(_) | Table::RecursiveCteInput(_) => {
-            Err(PhysicalQueryError::Unsupported("non-catalog table cursor"))
-        }
     }
 }
 
