@@ -1538,3 +1538,15 @@ expect {
     1|10|-5
     0
 }
+
+@cross-check-integrity
+test partial-index-qualified-where-update-with-cte-named-like-target {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    CREATE INDEX t_positive_b ON t(a) WHERE t.b > 0;
+    INSERT INTO t VALUES (1, 1);
+    WITH t(x) AS (SELECT 2) UPDATE t SET a = 5 WHERE b > 0;
+    SELECT a, b FROM t;
+}
+expect {
+    5|1
+}

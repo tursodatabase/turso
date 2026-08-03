@@ -6029,16 +6029,31 @@ impl Index {
         };
         let mut expr = where_clause.clone();
         let target_identifier = table_refs.as_deref().and_then(|refs| {
-            refs.joined_tables()
+            // Only a real b-tree table can be the DML target that owns this index.
+            // A CTE or subquery sharing the table's name (e.g. `WITH t AS ...
+            // UPDATE t ...`) must not be picked, so match on b-tree identity.
+            let mut matches = refs
+                .joined_tables()
                 .iter()
-                .map(|jt| (&jt.identifier, jt.table.get_name()))
+                .map(|jt| (&jt.identifier, &jt.table))
                 .chain(
                     refs.outer_query_refs()
                         .iter()
-                        .map(|r| (&r.identifier, r.table.get_name())),
+                        .map(|r| (&r.identifier, &r.table)),
                 )
-                .find(|(_, table_name)| normalize_ident(table_name) == self.table_name)
-                .map(|(identifier, _)| identifier.clone())
+                .filter(|(_, table)| {
+                    table
+                        .btree()
+                        .is_some_and(|bt| normalize_ident(&bt.name) == self.table_name)
+                })
+                .map(|(identifier, _)| identifier);
+            let target = matches.next().cloned();
+            assert!(
+                matches.next().is_none(),
+                "multiple table references match the table of partial index {}",
+                self.name
+            );
+            target
         });
         if let Some(identifier) = target_identifier {
             walk_expr_mut(&mut expr, &mut |e: &mut Expr| {
