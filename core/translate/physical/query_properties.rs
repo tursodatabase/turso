@@ -2788,12 +2788,14 @@ fn distribution_windows_use_bound_partition_and_order_inputs(tc: hegel::TestCase
 //   in window order, not the previous physical table row.
 // - `lead(value, 3, -1) OVER (PARTITION BY g ORDER BY rank DESC)` evaluates
 //   offset and default against the current outer row and never crosses groups.
+// - `lag(value, -3, -1) OVER (ORDER BY rank)` returns the default because the
+//   streaming lag path has only buffered the single next row.
 // Each filtered partition is sorted from HIR order terms into a private ordinal
 // table, so duplicate order keys use rowid only as their deterministic tie-break.
 #[hegel::test]
 fn navigation_windows_materialize_bound_window_order(tc: hegel::TestCase) {
     let descending = tc.draw(generators::booleans());
-    let offset = i64::from(tc.draw(generators::integers::<u8>().max_value(5)));
+    let offset = i64::from(tc.draw(generators::integers::<u8>().max_value(10))) - 5;
     let default = i64::from(tc.draw(generators::integers::<u8>().max_value(31))) - 15;
     let filter_position = tc.draw(generators::integers::<usize>().max_value(3));
     let direction = if descending { "DESC" } else { "ASC" };
@@ -2866,6 +2868,15 @@ fn navigation_windows_materialize_bound_window_order(tc: hegel::TestCase) {
             .count(),
         3,
         "one outer window-order sorter and one private ordinal sorter per function"
+    );
+    assert!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::Lt { .. }))
+            .count()
+            >= 1,
+        "lag guards lookups beyond SQLite's one-row lookahead"
     );
     assert_eq!(
         program

@@ -4769,6 +4769,20 @@ fn emit_positional_window<'document>(
         WindowFunc::FirstValue | WindowFunc::LastValue | WindowFunc::NthValue
     )
     .then(|| program.allocate_label());
+    if *kind == WindowFunc::Lag {
+        let last_buffered_lookahead = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            value: -1,
+            dest: last_buffered_lookahead,
+        });
+        program.emit_insn(Insn::Lt {
+            lhs: offset.expect("lag has an offset"),
+            rhs: last_buffered_lookahead,
+            target_pc: no_value,
+            flags: crate::vdbe::insn::CmpInsFlags::default(),
+            collation: None,
+        });
+    }
     let target_instruction = match kind {
         WindowFunc::Lag => Insn::Subtract {
             lhs: outer_position,
