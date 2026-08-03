@@ -1010,7 +1010,13 @@ fn generate_order_by<C: Capabilities>(
                 // Avoid bare literals — SQLite interprets integer literals in
                 // ORDER BY as column-ordinal positions (e.g. ORDER BY 2).
                 // Also catch unary wrappers like -478008 or +3.
-                if looks_like_literal(&e) {
+                //
+                // Also avoid any term without a column reference: it computes
+                // the same value for every row, so all keys tie and the order
+                // is whatever scan order the engine used. With a LIMIT that
+                // makes the surviving rows engine-specific, and both answers
+                // are allowed.
+                if looks_like_literal(&e) || !e.contains_column_ref() {
                     pick_scoped_column_ref(ctx)?
                 } else {
                     e
@@ -2053,6 +2059,32 @@ mod tests {
              offset_range={saw_offset_range}, \
              unexcluded_removable_prefix={saw_unexcluded_removable_prefix}"
         );
+    }
+
+    #[test]
+    fn order_by_terms_always_reference_a_column() {
+        // A term that computes the same value for every row (e.g.
+        // REPLACE('a','b','c')) makes every key tie, so with a LIMIT the
+        // surviving rows depend on engine scan order.
+        let generator = test_generator();
+        for seed in 0..300 {
+            let mut ctx = Context::new_with_seed(seed);
+            ctx.with_table_scope(
+                [(generator.schema().tables[0].clone(), None)],
+                |ctx| -> Result<(), GenError> {
+                    let items = generate_order_by(&generator, ctx)?;
+                    for item in items {
+                        assert!(
+                            item.expr.contains_column_ref(),
+                            "seed {seed} produced constant ORDER BY term: {}",
+                            item.expr
+                        );
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
     }
 
     #[test]
