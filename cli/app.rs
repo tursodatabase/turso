@@ -1209,10 +1209,19 @@ impl Limbo {
                         if i > 0 {
                             let _ = self.write(b"|");
                         }
-                        if matches!(value, Value::Null) {
-                            let _ = self.write(null_value.as_bytes());
-                        } else {
-                            write!(self, "{value}").map_err(|e| io_error(e, "write"))?;
+                        match value {
+                            Value::Null => {
+                                let _ = self.write(null_value.as_bytes());
+                            }
+                            // Write blob bytes raw, like sqlite3 does in list
+                            // mode. Going through Display would replace bytes
+                            // that are not valid UTF-8 with U+FFFD.
+                            Value::Blob(bytes) => {
+                                self.write(bytes).map_err(|e| io_error(e, "write"))?;
+                            }
+                            _ => {
+                                write!(self, "{value}").map_err(|e| io_error(e, "write"))?;
+                            }
                         }
                     }
                     let _ = self.writeln("");
