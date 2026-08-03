@@ -1151,12 +1151,18 @@ pub fn translate_create_table(
         }
     }
 
-    if !connection.experimental_without_rowid_enabled() {
-        if let ast::CreateTableBody::ColumnsAndConstraints { options, .. } = &body {
-            if options.contains_without_rowid() {
+    if let ast::CreateTableBody::ColumnsAndConstraints { options, .. } = &body {
+        if options.contains_without_rowid() {
+            if !connection.experimental_without_rowid_enabled() {
                 bail_parse_error!(
                     "WITHOUT ROWID tables are an experimental feature. Enable with --experimental-without-rowid flag"
                 );
+            }
+            // Reject here instead of at cursor-open time, otherwise the CREATE
+            // writes the schema row and then fails, leaving behind a table that
+            // can never be opened.
+            if connection.mvcc_enabled() {
+                bail_parse_error!("WITHOUT ROWID tables are not supported in MVCC mode");
             }
         }
     }
