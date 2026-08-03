@@ -488,7 +488,7 @@ fn window_function_uses_subtypes(window_func: &AccumulatorFunc) -> bool {
 /// path, including evaluating scalar calls separately for step and inverse.
 fn rewrite_late_window_arg(
     arg: &mut Expr,
-    aggregates: &mut Vec<Aggregate>,
+    aggregates: &mut [Aggregate],
     ctx: &mut WindowSubqueryContext,
 ) -> Result<()> {
     walk_expr_mut(arg, &mut |node| {
