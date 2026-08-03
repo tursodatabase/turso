@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -478,6 +479,43 @@ def test_read_command():
     shell.quit()
 
 
+def test_blob_bytes_are_printed_raw_in_list_mode():
+    # Regression test for https://github.com/tursodatabase/turso/issues/4247.
+    # sqlite3 writes blob bytes to stdout unchanged in list mode, even when
+    # they are not valid UTF-8. tursodb used to replace every invalid byte
+    # with U+FFFD (EF BF BD), which mangled blob output.
+    #
+    # The TursoShell pipe harness decodes output as UTF-8, so it cannot check
+    # raw bytes. Run the shell directly and capture stdout as bytes instead.
+    exec_name = os.environ.get("SQLITE_EXEC", "./scripts/limbo-sqlite3")
+
+    console.test("Running test: blob-with-invalid-utf8-prints-raw-bytes")
+    result = subprocess.run(
+        [exec_name, ":memory:", "SELECT X'900A6280';"],
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b"\x90\x0a\x62\x80\x0a", (
+        f"blob bytes must be written raw, not replaced with U+FFFD; got {result.stdout.hex()}"
+    )
+
+    # Mix printable ASCII with invalid UTF-8 bytes, taken from the
+    # trigger-inserted row in the issue's repro script. Blobs with ASCII
+    # control bytes are left out on purpose: sqlite3 escapes those as ^X in
+    # list mode, which is a separate behavior.
+    console.test("Running test: mixed-ascii-and-invalid-utf8-blob-prints-raw-bytes")
+    result = subprocess.run(
+        [exec_name, ":memory:", "SELECT X'B66552C3', X'64AC767B';"],
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b"\xb6\x65\x52\xc3|\x64\xac\x76\x7b\x0a", (
+        f"blob bytes must be written raw, not replaced with U+FFFD; got {result.stdout.hex()}"
+    )
+
+
 def main():
     console.info("Running all turso CLI tests...")
     test_read_command()
@@ -505,6 +543,7 @@ def main():
     test_parse_error()
     test_tables_with_attached_db()
     test_dbtotxt()
+    test_blob_bytes_are_printed_raw_in_list_mode()
     console.info("All tests have passed")
 
 
