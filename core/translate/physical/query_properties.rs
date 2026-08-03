@@ -2687,17 +2687,19 @@ fn ranking_windows_rescan_the_bound_hir_source(tc: hegel::TestCase) {
 // Examples:
 // - `percent_rank() OVER (PARTITION BY g ORDER BY value)` divides the number
 //   of earlier rows by `partition_size - 1`, returning zero for one-row groups.
-// - `cume_dist() OVER (PARTITION BY g ORDER BY value DESC)` includes every
-//   peer in the numerator and divides by the filtered partition size.
+// - `cume_dist() OVER (PARTITION BY g ORDER BY value DESC NULLS FIRST)` puts
+//   the NULL peer group first and includes every peer in the numerator.
 // - `ntile(4) OVER (PARTITION BY g ORDER BY value)` puts the extra rows in the
 //   first buckets and returns consecutive bucket numbers when buckets outnumber
 //   rows. The bucket expression, filter, and order are all frozen in HIR.
 #[hegel::test]
 fn distribution_windows_use_bound_partition_and_order_inputs(tc: hegel::TestCase) {
     let descending = tc.draw(generators::booleans());
+    let nulls_first = tc.draw(generators::booleans());
     let bucket_count = i64::from(tc.draw(generators::integers::<u8>().max_value(7))) + 1;
     let filter_position = tc.draw(generators::integers::<usize>().max_value(2));
     let direction = if descending { "DESC" } else { "ASC" };
+    let nulls = if nulls_first { "FIRST" } else { "LAST" };
     let columns = ["g", "value", "keep"];
     let items = BTreeTable::from_sql(
         "CREATE TABLE items(g INTEGER, value INTEGER, keep INTEGER)",
@@ -2712,9 +2714,9 @@ fn distribution_windows_use_bound_partition_and_order_inputs(tc: hegel::TestCase
     let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
     let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
     let statement = parse_statement(&format!(
-        "SELECT percent_rank() OVER (PARTITION BY g ORDER BY value {direction}), \
-         cume_dist() OVER (PARTITION BY g ORDER BY value {direction}), \
-         ntile({bucket_count}) OVER (PARTITION BY g ORDER BY value {direction}) \
+        "SELECT percent_rank() OVER (PARTITION BY g ORDER BY value {direction} NULLS {nulls}), \
+         cume_dist() OVER (PARTITION BY g ORDER BY value {direction} NULLS {nulls}), \
+         ntile({bucket_count}) OVER (PARTITION BY g ORDER BY value {direction} NULLS {nulls}) \
          FROM items WHERE {} >= ?1",
         columns[filter_position]
     ));
@@ -2777,6 +2779,18 @@ fn distribution_windows_use_bound_partition_and_order_inputs(tc: hegel::TestCase
             ..
         }
     )));
+    assert!(program.insns.iter().any(|(instruction, _)| {
+        matches!(
+            instruction,
+            Insn::Compare { key_info, .. }
+                if key_info.iter().any(|key| key.nulls_order
+                    == Some(if nulls_first {
+                        ast::NullsOrder::First
+                    } else {
+                        ast::NullsOrder::Last
+                    }))
+        )
+    }));
     assert!(!program
         .insns
         .iter()
