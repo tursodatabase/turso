@@ -3,8 +3,12 @@ use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Output, Stdio};
 
 fn run_tursopg(input: &[u8]) -> Output {
+    run_tursopg_with_db(":memory:", input)
+}
+
+fn run_tursopg_with_db(db_path: impl AsRef<std::ffi::OsStr>, input: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-        .arg(":memory:")
+        .arg(db_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1503,4 +1507,48 @@ fn wire_multi_column_select_classifies_each() {
             vec![OID_INT4, OID_TEXT, OID_FLOAT8, OID_INT4, OID_TEXT]
         );
     });
+}
+
+/// Verify that a schema created in one tursopg session is accessible in a
+/// subsequent session opened against the same file.
+#[test]
+fn schema_sidecar_reattaches_on_reopen() {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let test_dir = std::env::temp_dir().join(format!("tursopg_schema_persist_{timestamp}"));
+    std::fs::create_dir(&test_dir).expect("failed to create temp test directory");
+
+    let db_path = test_dir.join("main.db");
+    let schema_name = "persist_sidecar";
+
+    let first_sql = format!(
+        "CREATE SCHEMA {schema_name};\n\
+         CREATE TABLE {schema_name}.demo(id INT, label TEXT);\n\
+         INSERT INTO {schema_name}.demo VALUES (1, 'persisted');\n"
+    );
+    let out1 = run_tursopg_with_db(&db_path, first_sql.as_bytes());
+    assert_eq!(
+        out1.status.code(),
+        Some(0),
+        "first run failed: {}",
+        stdout(&out1)
+    );
+
+    let second_sql = format!("SELECT id, label FROM {schema_name}.demo;\n");
+    let out2 = run_tursopg_with_db(&db_path, second_sql.as_bytes());
+
+    std::fs::remove_dir_all(&test_dir).ok();
+
+    let out = stdout(&out2);
+    assert_eq!(
+        out2.status.code(),
+        Some(0),
+        "second run failed, schema sidecar not reattached on reopen: {out}"
+    );
+    assert!(
+        out.contains("persisted"),
+        "expected 'persisted' in output, got: {out}"
+    );
 }
