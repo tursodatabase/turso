@@ -2571,6 +2571,11 @@ fn emit_sorted_window_rows<'document>(
         content_reg: content,
         num_fields: sorter.field_count,
     });
+    let outer_ordinal = RegisterId(program.alloc_register());
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: outer_ordinal.0,
+    });
     let loop_start = program.allocate_label();
     let cleanup = row_cleanup_label(destination, limit).unwrap_or_else(|| program.allocate_label());
     program.emit_insn(Insn::SorterSort {
@@ -2582,6 +2587,10 @@ fn emit_sorted_window_rows<'document>(
         cursor_id: sorter.cursor_id,
         dest_reg: content,
         pseudo_cursor: pseudo,
+    });
+    program.emit_insn(Insn::AddImm {
+        register: outer_ordinal.0,
+        value: 1,
     });
     let mut previous_sources = Vec::with_capacity(rows.sources.len());
     for source in &rows.sources {
@@ -2658,6 +2667,7 @@ fn emit_sorted_window_rows<'document>(
         distinct,
         rows,
         bound.rowid,
+        outer_ordinal,
     );
     restore_window_row(bindings, bound)?;
     emission?;
@@ -2710,6 +2720,7 @@ fn emit_materialized_window_rows<'document>(
         limit,
         distinct,
         rows,
+        bound.rowid,
         bound.rowid,
     );
     restore_window_row(bindings, bound)?;
@@ -3324,8 +3335,15 @@ fn emit_ranking_window_query<'document>(
     let rows = open_window_rows(plan, program, &block.source_order, &block.aggregates)?;
     let sorter = block
         .window_functions
-        .last()
-        .and_then(|function| function.call.window.as_ref())
+        .iter()
+        .filter_map(|function| function.call.window.as_ref())
+        .find(|spec| !spec.partition_by.is_empty() || !spec.order_by.is_empty())
+        .or_else(|| {
+            block
+                .window_functions
+                .first()
+                .and_then(|function| function.call.window.as_ref())
+        })
         .map(|spec| open_window_sorter(plan, program, &rows, spec))
         .transpose()?;
     if block.aggregates.is_empty() {
@@ -3414,6 +3432,7 @@ fn emit_ranking_window_row<'document>(
     distinct: Option<&DistinctRuntime>,
     rows: &WindowRows,
     outer_rowid: RegisterId,
+    outer_ordinal: RegisterId,
 ) -> QueryResult<()> {
     (|| -> QueryResult<()> {
         for function in &block.window_functions {
@@ -3448,6 +3467,18 @@ fn emit_ranking_window_row<'document>(
                 .ok_or(PhysicalQueryError::Invalid(
                     "window call has no specification",
                 ))?;
+            if *kind == WindowFunc::RowNumber
+                && spec.partition_by.is_empty()
+                && spec.order_by.is_empty()
+            {
+                let value = bindings.window_function(function.id)?.register;
+                program.emit_insn(Insn::Copy {
+                    src_reg: outer_ordinal.0,
+                    dst_reg: value.0,
+                    extra_amount: 0,
+                });
+                continue;
+            }
             if matches!(
                 kind,
                 WindowFunc::Lag

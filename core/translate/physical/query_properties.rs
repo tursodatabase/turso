@@ -2886,6 +2886,75 @@ fn navigation_windows_materialize_bound_window_order(tc: hegel::TestCase) {
         .any(|(instruction, _)| matches!(instruction, Insn::Add { .. })));
 }
 
+// Examples:
+// - `row_number() OVER (), lag(value) OVER (ORDER BY rank DESC)` emits rows in
+//   `rank DESC` order, and the empty outer window numbers that delivered order.
+// - Adding a later `row_number() OVER (PARTITION BY g ORDER BY rank ASC)` must
+//   not replace the earlier ordered stage as the final row stream.
+// Varying the order column and direction proves this choice follows frozen HIR
+// window order rather than a hard-coded output position.
+#[hegel::test]
+fn multiple_windows_keep_the_first_non_empty_hir_order(tc: hegel::TestCase) {
+    let descending = tc.draw(generators::booleans());
+    let order_position = tc.draw(generators::integers::<usize>().min_value(1).max_value(2));
+    let other_position = if order_position == 1 { 2 } else { 1 };
+    let direction = if descending { "DESC" } else { "ASC" };
+    let other_direction = if descending { "ASC" } else { "DESC" };
+    let items = BTreeTable::from_sql(
+        "CREATE TABLE items(g INTEGER, first_value INTEGER, second_value INTEGER)",
+        73,
+    )
+    .expect("fixture table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(items))
+        .expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT row_number() OVER (), \
+         lag(c{order_position}) OVER (ORDER BY c{order_position} {direction}), \
+         row_number() OVER (PARTITION BY g ORDER BY c{other_position} {other_direction}) \
+         FROM (SELECT g, first_value AS c1, second_value AS c2 FROM items)"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated multi-window query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let plan = PhysicalPlan::new(&document).expect("closed multi-window HIR has a plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("multiple windows emit from closed HIR");
+    program
+        .resolve_labels()
+        .expect("all multi-window branches are closed");
+
+    let (columns, order_collations_nulls) = program
+        .insns
+        .iter()
+        .find_map(|(instruction, _)| match instruction {
+            Insn::SorterOpen {
+                columns,
+                order_collations_nulls,
+                ..
+            } => Some((*columns, order_collations_nulls)),
+            _ => None,
+        })
+        .expect("an ordered window opens the outer sorter");
+    assert_eq!(columns, 2, "one HIR order key plus the stable row key");
+    assert_eq!(
+        order_collations_nulls[0].0,
+        if descending {
+            ast::SortOrder::Desc
+        } else {
+            ast::SortOrder::Asc
+        },
+        "the first non-empty HIR window chooses the outer order"
+    );
+}
+
 // Examples under SQLite's default `RANGE UNBOUNDED PRECEDING .. CURRENT ROW`:
 // - `first_value(value) OVER (PARTITION BY g ORDER BY rank)` reads ordinal 1.
 // - `last_value(value) OVER (PARTITION BY g ORDER BY rank)` reads the last peer,
