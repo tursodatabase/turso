@@ -143,6 +143,25 @@ fn new_join_type(n0: &[u8], n1: Option<&[u8]>, n2: Option<&[u8]>) -> Result<Join
     Ok(jt)
 }
 
+/// True if `e` is a bare subquery, possibly wrapped in one or more layers of
+/// single-element parentheses (e.g. `(SELECT ...)`, `((SELECT ...))`).
+fn is_bare_subquery(e: &Expr) -> bool {
+    match e {
+        Expr::Subquery(_) => true,
+        Expr::Parenthesized(inner) => inner.len() == 1 && is_bare_subquery(&inner[0]),
+        _ => false,
+    }
+}
+
+/// Unwrap a bare subquery previously confirmed by [`is_bare_subquery`].
+fn into_bare_subquery(e: Box<Expr>) -> Select {
+    match *e {
+        Expr::Subquery(select) => select,
+        Expr::Parenthesized(mut inner) => into_bare_subquery(inner.pop().expect("single element")),
+        _ => unreachable!("into_bare_subquery called on a non-subquery expression"),
+    }
+}
+
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
 
@@ -2202,6 +2221,21 @@ impl<'a> Parser<'a> {
                                         // Simplified to a constant leaf.
                                         leaf = true;
                                         Box::new(Expr::Literal(Literal::Numeric(name.into())))
+                                    } else if exprs.len() == 1 && is_bare_subquery(&exprs[0]) {
+                                        // `x IN ((SELECT ...))` is subquery membership,
+                                        // the same as `x IN (SELECT ...)`: an empty
+                                        // subquery yields 0/1, not NULL. This matches
+                                        // SQLite. A list of two or more values, or a
+                                        // subquery embedded in a larger expression, stays
+                                        // a value list.
+                                        self.last_expr_height = 1;
+                                        Box::new(Expr::InSelect {
+                                            lhs: result,
+                                            not,
+                                            rhs: into_bare_subquery(
+                                                exprs.into_iter().next().expect("one element"),
+                                            ),
+                                        })
                                     } else {
                                         Box::new(Expr::InList {
                                             lhs: result,
