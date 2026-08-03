@@ -78,6 +78,44 @@ i.e. straight from the 70s! The DP algorithm is explained below.
     - If the best overall plan is still best even with the sorting penalty, then keep it. A sorting operation is later applied to sort the rows according to the desired order.
 5. **Mutate the plan's `join_order` and `Operation`s to match the computed best plan.**
 
+### Interesting join orders
+
+The memo table is keyed by `(subset mask, last table, interesting order signature)` rather than
+just `(subset mask, last table)`. An ordering of a partial join's output rows is _interesting_
+if a table outside the subset joins on that ordering's column (making a later merge join
+possible without sorting), or if it matches the query's ORDER BY / GROUP BY target.
+
+For each subset the planner keeps the cheapest plan per signature, dropping plans that cost
+more while providing no ordering another retained plan lacks. The single-table base case also
+seeds ordered variants explicitly: for each interesting order a table can provide, the cheapest
+index scan that produces that order is added to the memo even when a plain table scan is
+cheaper. Without this, `SELECT * FROM l JOIN r ON l.k = r.k` (both sides indexed on `k`)
+would memoize only the table scan for `{l}` and the merge join between the two indexes could
+never be discovered.
+
+This follows the classic treatment in Database System Concepts §16.4.1: it is not enough to
+store the best join order per subset; the best order per (subset, interesting sort order) must
+be retained.
+
+### Join algorithms
+
+For the inner side of a join the planner chooses between:
+
+1. **Nested loop** with a scan, rowid seek, or index seek per outer row.
+2. **Hash join**: the previous table becomes the build side, the new table is probed.
+3. **Merge join**: when the join is an INNER equi-join, the prefix's output is ordered on the
+   outer key expressions (proven via `plan_satisfies_order_target`), and the inner table has a
+   btree path ordered on the same keys (rowid order or an index whose leading columns match).
+   Both streams then advance in lockstep: the inner cursor never rewinds and is advanced with
+   comparisons against the current outer key, re-seeking only to replay a duplicate group when
+   consecutive outer rows share a key. This replaces one B-tree descent per outer row with a
+   single sequential pass over both sides. Unlike the textbook algorithm, no in-memory buffer
+   of the duplicate group is needed because the group is replayed by re-seeking the btree.
+
+   Merge join validity also requires that applying the comparison affinity to the outer key
+   stream preserves its order (checked via `sqlite3IndexAffinityOk` semantics against the outer
+   column's affinity) and that both sides order text under the same collation.
+
 ### Estimation of cost and cardinalities + a note on table statistics
 
 Currently, in the absence of `ANALYZE`, `sqlite_stat1` etc. we assume the following:

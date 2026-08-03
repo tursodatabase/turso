@@ -1102,6 +1102,11 @@ fn emit_update_insns<'a>(
                 "access through HashJoin is not supported for update operations"
             )
         }
+        Operation::MergeJoin(_) => {
+            crate::bail_parse_error!(
+                "access through MergeJoin is not supported for update operations"
+            )
+        }
         Operation::MultiIndexScan(_) => {
             crate::bail_parse_error!(
                 "access through MultiIndexScan is not supported for update operations"

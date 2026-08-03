@@ -135,6 +135,17 @@ pub(crate) fn format_eqp_detail(table: &JoinedTable) -> String {
             };
             format!("HASH JOIN {table_name}")
         }
+        Operation::MergeJoin(merge) => {
+            let table_name = if table.table.get_name() == table.identifier {
+                table.identifier.clone()
+            } else {
+                format!("{} AS {}", table.table.get_name(), table.identifier)
+            };
+            match &merge.index {
+                Some(index) => format!("MERGE JOIN {table_name} USING INDEX {}", index.name),
+                None => format!("MERGE JOIN {table_name} USING INTEGER PRIMARY KEY"),
+            }
+        }
     }
 }
 
@@ -345,6 +356,24 @@ impl Display for SelectPlan {
                 Operation::HashJoin(_) => {
                     writeln!(f, "{indent}HASH JOIN")?;
                 }
+                Operation::MergeJoin(merge) => {
+                    let table_name = if reference.table.get_name() == reference.identifier {
+                        reference.identifier.clone()
+                    } else {
+                        format!("{} AS {}", reference.table.get_name(), reference.identifier)
+                    };
+                    match &merge.index {
+                        Some(index) => writeln!(
+                            f,
+                            "{indent}MERGE JOIN {table_name} USING INDEX {}",
+                            index.name
+                        )?,
+                        None => writeln!(
+                            f,
+                            "{indent}MERGE JOIN {table_name} USING INTEGER PRIMARY KEY"
+                        )?,
+                    }
+                }
                 Operation::MultiIndexScan(multi_idx) => {
                     let index_names: Vec<&str> = multi_idx
                         .branches
@@ -464,6 +493,9 @@ impl Display for DeletePlan {
                 }
                 Operation::HashJoin(_) => {
                     unreachable!("Delete plan should not have hash joins");
+                }
+                Operation::MergeJoin(_) => {
+                    unreachable!("Delete plan should not have merge joins");
                 }
                 Operation::MultiIndexScan(multi_idx) => {
                     let index_names: Vec<&str> = multi_idx
@@ -596,6 +628,9 @@ impl fmt::Display for UpdatePlan {
                 }
                 Operation::HashJoin(_) => {
                     unreachable!("Update plan should not have hash joins");
+                }
+                Operation::MergeJoin(_) => {
+                    unreachable!("Update plan should not have merge joins");
                 }
                 Operation::MultiIndexScan(_) => {
                     unreachable!("Update plan should not have multi-index scans");

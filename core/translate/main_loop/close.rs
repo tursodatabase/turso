@@ -232,6 +232,23 @@ impl CloseLoop {
                     });
                     program.preassign_label_to_next_insn(loop_labels.loop_end);
                 }
+                Operation::MergeJoin(_) => {
+                    resolve_next(program);
+                    let meta = t_ctx.meta_merge_joins[table_index]
+                        .expect("merge join metadata must be initialized before close_loop");
+                    let iteration_cursor_id = index_cursor_id.unwrap_or_else(|| {
+                        table_cursor_id.expect("merge join requires a table or index cursor")
+                    });
+                    program.emit_insn(Insn::Next {
+                        cursor_id: iteration_cursor_id,
+                        pc_if_next: loop_labels.loop_start,
+                    });
+                    program.emit_insn(Insn::Integer {
+                        value: 1,
+                        dest: meta.eof_reg,
+                    });
+                    program.preassign_label_to_next_insn(loop_labels.loop_end);
+                }
                 Operation::HashJoin(ref hash_join_op) => {
                     if let Some(hash_ctx) = t_ctx
                         .hash_table_contexts

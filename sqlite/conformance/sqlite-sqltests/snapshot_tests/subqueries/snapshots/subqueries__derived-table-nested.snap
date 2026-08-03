@@ -27,11 +27,11 @@ QUERY PLAN
 `--SEARCH top_customers USING INDEX ephemeral_subquery_t4 (total_spent>?)
    |--SCAN stats
    |  `--SCAN orders USING INDEX idx_orders_customer
-   `--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
+   `--MERGE JOIN customers AS c USING INTEGER PRIMARY KEY
 
 BYTECODE
 addr  opcode                    p1  p2  p3  p4            p5  comment
-   0          Init               0  63   0                 0  Start at 63
+   0          Init               0  84   0                 0  Start at 84
    1          OpenEphemeral      0   0   0                 0  cursor=0 is_table=false
    2          InitCoroutine      3  40   3                 0
    3          Null               0  11   0                 0  r[11]=NULL
@@ -72,27 +72,48 @@ addr  opcode                    p1  p2  p3  p4            p5  comment
   38  Return                    15   0   0                 0
   39  EndCoroutine               3   0   0                 0
   40  OpenRead                   3   6   0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
-  41  InitCoroutine              3   0   3                 0
-  42    Yield                    3  53   0                 0
-  43    Copy                     4  18   0                 0  r[18]=r[4]
-  44    SeekRowid                3  18  52                 0  if (r[18]!=cursor 3 for table customers.rowid) goto 52
-  45    Column                   3   1  16                 0  r[16]=customers.name
-  46    Copy                     5  17   0                 0  r[17]=r[5]
-  47    Copy                    17  20   0                 0  r[20]=r[17]
-  48    Copy                    16  21   0                 0  r[21]=r[16]
-  49    Sequence                 0  22   0                 0
-  50    MakeRecord              20   3  19                 0  r[19]=mkrec(r[20..22]); for ephemeral_subquery_t4
-  51    IdxInsert                0  19   0                 8  key=r[19]
-  52  Goto                       0  42   0                 0
-  53  Last                       0  62   0                 0
-  54  Integer                 1000  25   0                 0  r[25]=1000
-  55    IdxLE                    0  62  25                 0  key=[25..25]
-  56    Column                   0   1   1                 0  r[1]=ephemeral(ephemeral_subquery_t4).name
-  57    Column                   0   0   2                 0  r[2]=ephemeral(ephemeral_subquery_t4).total_spent
-  58    Column                   0   1  23                 0  r[23]=ephemeral(ephemeral_subquery_t4).name
-  59    Column                   0   0  24                 0  r[24]=ephemeral(ephemeral_subquery_t4).total_spent
-  60    ResultRow               23   2   0                 0  output=r[23..24]
-  61  Prev                       0  55   0                 0
-  62  Halt                       0   0   0                 0
-  63  Transaction                0   1  11                 0  iDb=0 tx_mode=Read
-  64  Goto                       0   1   0                 0
+  41  Null                       0  18   0                 0  r[18]=NULL
+  42  Integer                    1  20   0                 0  r[20]=1
+  43  Rewind                     3  45   0                 0  Rewind table customers
+  44  Integer                    0  20   0                 0  r[20]=0
+  45  InitCoroutine              3   0   3                 0
+  46    Yield                    3  74   0                 0
+  47    Copy                     4  19   0                 0  r[19]=r[4]
+  48    IsNull                  19  73   0                 0  if (r[19]==NULL) goto 73
+  49    Affinity                19   1   0                 0  r[19..20] = C
+  50    Compare                 18  19   1  k(1, Binary)   0  r[18..18]==r[19..19]
+  51    Jump                    55  52  52                 0
+  52    Copy                    19  18   0                 0  r[18]=r[19]
+  53    SeekGE                   3  60  19                 0  key=[19..19]
+  54    Goto                     0  62   0                 0
+  55    IfPos                   20  73   0                 0  r[20]>0 -> r[20]-=0, goto 73
+  56    Copy                    19  18   0                 0  r[18]=r[19]
+  57      RowId                  3  21   0                 0  r[21]=customers.rowid
+  58      Ge                    21  19  62                 0  if r[21]>=r[19] goto 62
+  59    Next                     3  57   0                 0
+  60    Integer                  1  20   0                 0  r[20]=1
+  61    Goto                     0  73   0                 0
+  62      RowId                  3  21   0                 0  r[21]=customers.rowid
+  63      Gt                    21  19  73                 0  if r[21]>r[19] goto 73
+  64      Column                 3   1  16                 0  r[16]=customers.name
+  65      Copy                   5  17   0                 0  r[17]=r[5]
+  66      Copy                  17  23   0                 0  r[23]=r[17]
+  67      Copy                  16  24   0                 0  r[24]=r[16]
+  68      Sequence               0  25   0                 0
+  69      MakeRecord            23   3  22                 0  r[22]=mkrec(r[23..25]); for ephemeral_subquery_t4
+  70      IdxInsert              0  22   0                 8  key=r[22]
+  71    Next                     3  62   0                 0
+  72    Integer                  1  20   0                 0  r[20]=1
+  73  Goto                       0  46   0                 0
+  74  Last                       0  83   0                 0
+  75  Integer                 1000  28   0                 0  r[28]=1000
+  76    IdxLE                    0  83  28                 0  key=[28..28]
+  77    Column                   0   1   1                 0  r[1]=ephemeral(ephemeral_subquery_t4).name
+  78    Column                   0   0   2                 0  r[2]=ephemeral(ephemeral_subquery_t4).total_spent
+  79    Column                   0   1  26                 0  r[26]=ephemeral(ephemeral_subquery_t4).name
+  80    Column                   0   0  27                 0  r[27]=ephemeral(ephemeral_subquery_t4).total_spent
+  81    ResultRow               26   2   0                 0  output=r[26..27]
+  82  Prev                       0  76   0                 0
+  83  Halt                       0   0   0                 0
+  84  Transaction                0   1  11                 0  iDb=0 tx_mode=Read
+  85  Goto                       0   1   0                 0

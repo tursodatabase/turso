@@ -31,8 +31,8 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN order_items AS oi
-|--SEARCH o USING INTEGER PRIMARY KEY (rowid=?)
+|--SCAN order_items AS oi USING INDEX idx_order_items_order_id
+|--MERGE JOIN orders AS o USING INTEGER PRIMARY KEY
 |--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
 |--SEARCH p USING INTEGER PRIMARY KEY (rowid=?)
 `--USE SORTER FOR ORDER BY

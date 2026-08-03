@@ -1,0 +1,590 @@
+@database :memory:
+
+test merge-pk-pk-partial-overlap {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES (1,'a1'),(2,'a2'),(3,'a3'),(5,'a5'),(7,'a7'),(8,'a8'),(10,'a10'),(12,'a12');
+    INSERT INTO t2 VALUES (2,'b2'),(3,'b3'),(4,'b4'),(7,'b7'),(9,'b9'),(10,'b10'),(11,'b11'),(13,'b13');
+    SELECT t1.id, t1.a, t2.b FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY t1.id;
+}
+expect {
+    2|a2|b2
+    3|a3|b3
+    7|a7|b7
+    10|a10|b10
+}
+
+test merge-pk-pk-count {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES (1,'a1'),(2,'a2'),(3,'a3'),(5,'a5'),(7,'a7'),(8,'a8'),(10,'a10'),(12,'a12');
+    INSERT INTO t2 VALUES (2,'b2'),(3,'b3'),(4,'b4'),(7,'b7'),(9,'b9'),(10,'b10'),(11,'b11'),(13,'b13');
+    SELECT count(*) FROM t1 JOIN t2 ON t1.id = t2.id;
+}
+expect {
+    4
+}
+
+test merge-dup-keys-cross-product {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, k INTEGER, v TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, k INTEGER, w TEXT);
+    CREATE INDEX t1k ON t1(k);
+    CREATE INDEX t2k ON t2(k);
+    INSERT INTO t1 VALUES (1,5,'L1'),(2,5,'L2'),(3,5,'L3'),(4,2,'L4'),(5,2,'L5'),(6,9,'L6'),(7,NULL,'L7');
+    INSERT INTO t2 VALUES (1,5,'R1'),(2,5,'R2'),(3,2,'R3'),(4,2,'R4'),(5,2,'R5'),(6,7,'R6'),(7,NULL,'R7');
+    SELECT t1.k, t1.v, t2.w FROM t1 JOIN t2 ON t1.k = t2.k ORDER BY t1.k, t1.v, t2.w;
+}
+expect {
+    2|L4|R3
+    2|L4|R4
+    2|L4|R5
+    2|L5|R3
+    2|L5|R4
+    2|L5|R5
+    5|L1|R1
+    5|L1|R2
+    5|L2|R1
+    5|L2|R2
+    5|L3|R1
+    5|L3|R2
+}
+
+test merge-dup-keys-count {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, k INTEGER, v TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, k INTEGER, w TEXT);
+    CREATE INDEX t1k ON t1(k);
+    CREATE INDEX t2k ON t2(k);
+    INSERT INTO t1 VALUES (1,5,'L1'),(2,5,'L2'),(3,5,'L3'),(4,2,'L4'),(5,2,'L5'),(6,9,'L6'),(7,NULL,'L7');
+    INSERT INTO t2 VALUES (1,5,'R1'),(2,5,'R2'),(3,2,'R3'),(4,2,'R4'),(5,2,'R5'),(6,7,'R6'),(7,NULL,'R7');
+    SELECT count(*) FROM t1 JOIN t2 ON t1.k = t2.k;
+}
+expect {
+    12
+}
+
+test merge-null-keys-never-match {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE INDEX t1k ON t1(k);
+    CREATE INDEX t2k ON t2(k);
+    INSERT INTO t1 VALUES (1,NULL),(2,1),(3,NULL),(4,2),(5,3);
+    INSERT INTO t2 VALUES (1,NULL),(2,NULL),(3,2),(4,3),(5,4);
+    SELECT t1.id, t2.id FROM t1 JOIN t2 ON t1.k = t2.k ORDER BY t1.id, t2.id;
+}
+expect {
+    4|3
+    5|4
+}
+
+test merge-null-keys-count {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE INDEX t1k ON t1(k);
+    CREATE INDEX t2k ON t2(k);
+    INSERT INTO t1 VALUES (1,NULL),(2,1),(3,NULL),(4,2),(5,3);
+    INSERT INTO t2 VALUES (1,NULL),(2,NULL),(3,2),(4,3),(5,4);
+    SELECT count(*) FROM t1 JOIN t2 ON t1.k = t2.k;
+}
+expect {
+    2
+}
+
+test merge-composite-pk-join-on-prefix {
+    CREATE TABLE pairs(a INTEGER, b INTEGER, v TEXT, PRIMARY KEY(a, b));
+    CREATE TABLE singles(a INTEGER PRIMARY KEY, s TEXT);
+    INSERT INTO pairs VALUES (1,1,'p11'),(1,2,'p12'),(2,1,'p21'),(3,1,'p31'),(3,2,'p32'),(3,3,'p33'),(5,1,'p51');
+    INSERT INTO singles VALUES (1,'s1'),(2,'s2'),(3,'s3'),(4,'s4');
+    SELECT singles.a, singles.s, pairs.b, pairs.v FROM singles JOIN pairs ON singles.a = pairs.a ORDER BY singles.a, pairs.b;
+}
+expect {
+    1|s1|1|p11
+    1|s1|2|p12
+    2|s2|1|p21
+    3|s3|1|p31
+    3|s3|2|p32
+    3|s3|3|p33
+}
+
+test merge-composite-pk-join-on-both {
+    CREATE TABLE pairs(a INTEGER, b INTEGER, v TEXT, PRIMARY KEY(a, b));
+    CREATE TABLE singles(a INTEGER PRIMARY KEY, s TEXT);
+    INSERT INTO pairs VALUES (1,1,'p11'),(1,2,'p12'),(2,1,'p21'),(3,1,'p31'),(3,2,'p32'),(3,3,'p33'),(5,1,'p51');
+    INSERT INTO singles VALUES (1,'s1'),(2,'s2'),(3,'s3'),(4,'s4');
+    CREATE TABLE pairs2(a INTEGER, b INTEGER, w TEXT, PRIMARY KEY(a, b));
+    INSERT INTO pairs2 VALUES (1,2,'q12'),(2,1,'q21'),(3,2,'q32'),(3,3,'q33'),(4,1,'q41');
+    SELECT p.a, p.b, p.v, q.w FROM pairs p JOIN pairs2 q ON p.a = q.a AND p.b = q.b ORDER BY p.a, p.b;
+}
+expect {
+    1|2|p12|q12
+    2|1|p21|q21
+    3|2|p32|q32
+    3|3|p33|q33
+}
+
+test merge-three-way-chain-filter {
+    CREATE TABLE customer(c_id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE orders(o_id INTEGER PRIMARY KEY, custkey INTEGER);
+    CREATE TABLE lineitem(orderkey INTEGER, linenum INTEGER, qty INTEGER, PRIMARY KEY(orderkey, linenum));
+    INSERT INTO customer VALUES (1,'alice'),(2,'bob'),(3,'carol'),(4,'dave');
+    INSERT INTO orders VALUES (10,1),(11,2),(12,1),(13,3),(14,5);
+    INSERT INTO lineitem VALUES (10,1,5),(10,2,3),(11,1,7),(12,1,2),(12,2,9),(13,1,4),(15,1,8);
+    SELECT c.name, o.o_id, l.linenum, l.qty FROM orders o JOIN lineitem l ON o.o_id = l.orderkey JOIN customer c ON o.custkey = c.c_id WHERE l.qty >= 3 ORDER BY o.o_id, l.linenum;
+}
+expect {
+    alice|10|1|5
+    alice|10|2|3
+    bob|11|1|7
+    alice|12|2|9
+    carol|13|1|4
+}
+
+test merge-three-way-chain-agg {
+    CREATE TABLE customer(c_id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE orders(o_id INTEGER PRIMARY KEY, custkey INTEGER);
+    CREATE TABLE lineitem(orderkey INTEGER, linenum INTEGER, qty INTEGER, PRIMARY KEY(orderkey, linenum));
+    INSERT INTO customer VALUES (1,'alice'),(2,'bob'),(3,'carol'),(4,'dave');
+    INSERT INTO orders VALUES (10,1),(11,2),(12,1),(13,3),(14,5);
+    INSERT INTO lineitem VALUES (10,1,5),(10,2,3),(11,1,7),(12,1,2),(12,2,9),(13,1,4),(15,1,8);
+    SELECT c.name, count(*), sum(l.qty) FROM orders o JOIN lineitem l ON o.o_id = l.orderkey JOIN customer c ON o.custkey = c.c_id GROUP BY c.name ORDER BY c.name;
+}
+expect {
+    alice|4|19
+    bob|1|7
+    carol|1|4
+}
+
+test merge-text-keys-binary-collation {
+    CREATE TABLE t1(k TEXT, v INTEGER);
+    CREATE TABLE t2(k TEXT, w INTEGER);
+    CREATE INDEX t1k ON t1(k);
+    CREATE INDEX t2k ON t2(k);
+    INSERT INTO t1 VALUES ('apple',1),('Apple',2),('banana',3),('cherry',4),('date',5);
+    INSERT INTO t2 VALUES ('apple',10),('APPLE',20),('banana',30),('Banana',40),('date',50),('fig',60);
+    SELECT t1.k, t1.v, t2.w FROM t1 JOIN t2 ON t1.k = t2.k ORDER BY t1.k, t1.v, t2.w;
+}
+expect {
+    apple|1|10
+    banana|3|30
+    date|5|50
+}
+
+test merge-mixed-affinity-int-vs-text {
+    CREATE TABLE nums(id INTEGER PRIMARY KEY, tag TEXT);
+    CREATE TABLE strs(s TEXT, note TEXT);
+    CREATE INDEX strss ON strs(s);
+    INSERT INTO nums VALUES (1,'one'),(2,'two'),(3,'three'),(4,'four');
+    INSERT INTO strs VALUES ('1','s1'),('2','s2'),('03','s3'),('2.0','s4'),('x','s5'),('4','s6');
+    SELECT nums.id, strs.s, strs.note FROM nums JOIN strs ON nums.id = strs.s ORDER BY nums.id, strs.s;
+}
+expect {
+    1|1|s1
+    2|2|s2
+    2|2.0|s4
+    3|03|s3
+    4|4|s6
+}
+
+test merge-mixed-affinity-count {
+    CREATE TABLE nums(id INTEGER PRIMARY KEY, tag TEXT);
+    CREATE TABLE strs(s TEXT, note TEXT);
+    CREATE INDEX strss ON strs(s);
+    INSERT INTO nums VALUES (1,'one'),(2,'two'),(3,'three'),(4,'four');
+    INSERT INTO strs VALUES ('1','s1'),('2','s2'),('03','s3'),('2.0','s4'),('x','s5'),('4','s6');
+    SELECT count(*) FROM nums JOIN strs ON nums.id = strs.s;
+}
+expect {
+    5
+}
+
+test merge-real-vs-int-keys {
+    CREATE TABLE ints(id INTEGER PRIMARY KEY, tag TEXT);
+    CREATE TABLE reals(r REAL, note TEXT);
+    CREATE INDEX realsr ON reals(r);
+    INSERT INTO ints VALUES (1,'i1'),(2,'i2'),(3,'i3'),(4,'i4'),(5,'i5');
+    INSERT INTO reals VALUES (1.0,'r1'),(2.5,'r2'),(3.0,'r3'),(3.5,'r4'),(5.0,'r5'),(6.0,'r6');
+    SELECT ints.id, reals.r, reals.note FROM ints JOIN reals ON ints.id = reals.r ORDER BY ints.id;
+}
+expect {
+    1|1.0|r1
+    3|3.0|r3
+    5|5.0|r5
+}
+
+test merge-left-join-pk {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES (1,'a1'),(2,'a2'),(3,'a3'),(5,'a5'),(7,'a7'),(8,'a8'),(10,'a10'),(12,'a12');
+    INSERT INTO t2 VALUES (2,'b2'),(3,'b3'),(4,'b4'),(7,'b7'),(9,'b9'),(10,'b10'),(11,'b11'),(13,'b13');
+    SELECT t1.id, t1.a, t2.b FROM t1 LEFT JOIN t2 ON t1.id = t2.id ORDER BY t1.id;
+}
+expect {
+    1|a1|
+    2|a2|b2
+    3|a3|b3
+    5|a5|
+    7|a7|b7
+    8|a8|
+    10|a10|b10
+    12|a12|
+}
+
+test merge-left-join-secondary {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, k INTEGER, v TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, k INTEGER, w TEXT);
+    CREATE INDEX t1k ON t1(k);
+    CREATE INDEX t2k ON t2(k);
+    INSERT INTO t1 VALUES (1,5,'L1'),(2,5,'L2'),(3,5,'L3'),(4,2,'L4'),(5,2,'L5'),(6,9,'L6'),(7,NULL,'L7');
+    INSERT INTO t2 VALUES (1,5,'R1'),(2,5,'R2'),(3,2,'R3'),(4,2,'R4'),(5,2,'R5'),(6,7,'R6'),(7,NULL,'R7');
+    SELECT t1.id, t1.k, t2.w FROM t1 LEFT JOIN t2 ON t1.k = t2.k ORDER BY t1.id, t2.w;
+}
+expect {
+    1|5|R1
+    1|5|R2
+    2|5|R1
+    2|5|R2
+    3|5|R1
+    3|5|R2
+    4|2|R3
+    4|2|R4
+    4|2|R5
+    5|2|R3
+    5|2|R4
+    5|2|R5
+    6|9|
+    7||
+}
+
+test merge-order-by-join-key-limit {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES (1,'a1'),(2,'a2'),(3,'a3'),(5,'a5'),(7,'a7'),(8,'a8'),(10,'a10'),(12,'a12');
+    INSERT INTO t2 VALUES (2,'b2'),(3,'b3'),(4,'b4'),(7,'b7'),(9,'b9'),(10,'b10'),(11,'b11'),(13,'b13');
+    SELECT t1.id, t2.b FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY t1.id LIMIT 3;
+}
+expect {
+    2|b2
+    3|b3
+    7|b7
+}
+
+test merge-order-by-join-key-desc {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES (1,'a1'),(2,'a2'),(3,'a3'),(5,'a5'),(7,'a7'),(8,'a8'),(10,'a10'),(12,'a12');
+    INSERT INTO t2 VALUES (2,'b2'),(3,'b3'),(4,'b4'),(7,'b7'),(9,'b9'),(10,'b10'),(11,'b11'),(13,'b13');
+    SELECT t1.id, t2.b FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY t1.id DESC;
+}
+expect {
+    10|b10
+    7|b7
+    3|b3
+    2|b2
+}
+
+test merge-order-by-unrelated-column {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES (1,'a1'),(2,'a2'),(3,'a3'),(5,'a5'),(7,'a7'),(8,'a8'),(10,'a10'),(12,'a12');
+    INSERT INTO t2 VALUES (2,'b2'),(3,'b3'),(4,'b4'),(7,'b7'),(9,'b9'),(10,'b10'),(11,'b11'),(13,'b13');
+    SELECT t1.id, t1.a, t2.b FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY t2.b DESC;
+}
+expect {
+    7|a7|b7
+    3|a3|b3
+    2|a2|b2
+    10|a10|b10
+}
+
+test merge-empty-inner {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES (1,'a1'),(2,'a2'),(3,'a3');
+    SELECT t1.id, t2.b FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY t1.id;
+}
+expect {
+}
+
+test merge-empty-outer {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t2 VALUES (1,'b1'),(2,'b2'),(3,'b3');
+    SELECT t1.id, t2.b FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY t1.id;
+}
+expect {
+}
+
+test merge-empty-both-count {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, b TEXT);
+    SELECT count(*) FROM t1 JOIN t2 ON t1.id = t2.id;
+}
+expect {
+    0
+}
+
+test merge-self-join-mgr-to-pk {
+    CREATE TABLE emp(id INTEGER PRIMARY KEY, mgr INTEGER, name TEXT);
+    CREATE INDEX empmgr ON emp(mgr);
+    INSERT INTO emp VALUES (1,NULL,'root'),(2,1,'a'),(3,1,'b'),(4,2,'c'),(5,2,'d'),(6,3,'e');
+    SELECT e.name, m.name FROM emp e JOIN emp m ON e.mgr = m.id ORDER BY e.id;
+}
+expect {
+    a|root
+    b|root
+    c|a
+    d|a
+    e|b
+}
+
+test merge-self-join-same-indexed-col {
+    CREATE TABLE emp(id INTEGER PRIMARY KEY, mgr INTEGER, name TEXT);
+    CREATE INDEX empmgr ON emp(mgr);
+    INSERT INTO emp VALUES (1,NULL,'root'),(2,1,'a'),(3,1,'b'),(4,2,'c'),(5,2,'d'),(6,3,'e');
+    SELECT x.id, y.id FROM emp x JOIN emp y ON x.mgr = y.mgr AND x.id < y.id ORDER BY x.id, y.id;
+}
+expect {
+    2|3
+    4|5
+}
+
+test merge-inner-residual-filter {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, k INTEGER, v TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, k INTEGER, w TEXT);
+    CREATE INDEX t1k ON t1(k);
+    CREATE INDEX t2k ON t2(k);
+    INSERT INTO t1 VALUES (1,5,'L1'),(2,5,'L2'),(3,5,'L3'),(4,2,'L4'),(5,2,'L5'),(6,9,'L6'),(7,NULL,'L7');
+    INSERT INTO t2 VALUES (1,5,'R1'),(2,5,'R2'),(3,2,'R3'),(4,2,'R4'),(5,2,'R5'),(6,7,'R6'),(7,NULL,'R7');
+    SELECT t1.k, t1.v, t2.w FROM t1 JOIN t2 ON t1.k = t2.k WHERE t2.id > 1 AND t2.w <> 'R4' ORDER BY t1.k, t1.v, t2.w;
+}
+expect {
+    2|L4|R3
+    2|L4|R5
+    2|L5|R3
+    2|L5|R5
+    5|L1|R2
+    5|L2|R2
+    5|L3|R2
+}
+
+test merge-both-sides-filtered {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, k INTEGER, v TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, k INTEGER, w TEXT);
+    CREATE INDEX t1k ON t1(k);
+    CREATE INDEX t2k ON t2(k);
+    INSERT INTO t1 VALUES (1,5,'L1'),(2,5,'L2'),(3,5,'L3'),(4,2,'L4'),(5,2,'L5'),(6,9,'L6'),(7,NULL,'L7');
+    INSERT INTO t2 VALUES (1,5,'R1'),(2,5,'R2'),(3,2,'R3'),(4,2,'R4'),(5,2,'R5'),(6,7,'R6'),(7,NULL,'R7');
+    SELECT t1.k, t1.v, t2.w FROM t1 JOIN t2 ON t1.k = t2.k WHERE t1.v <> 'L2' AND t2.id < 5 ORDER BY t1.k, t1.v, t2.w;
+}
+expect {
+    2|L4|R3
+    2|L4|R4
+    2|L5|R3
+    2|L5|R4
+    5|L1|R1
+    5|L1|R2
+    5|L3|R1
+    5|L3|R2
+}
+
+test merge-groupby-join-key {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, k INTEGER, v TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, k INTEGER, w TEXT);
+    CREATE INDEX t1k ON t1(k);
+    CREATE INDEX t2k ON t2(k);
+    INSERT INTO t1 VALUES (1,5,'L1'),(2,5,'L2'),(3,5,'L3'),(4,2,'L4'),(5,2,'L5'),(6,9,'L6'),(7,NULL,'L7');
+    INSERT INTO t2 VALUES (1,5,'R1'),(2,5,'R2'),(3,2,'R3'),(4,2,'R4'),(5,2,'R5'),(6,7,'R6'),(7,NULL,'R7');
+    SELECT t1.k, count(*), sum(t2.id) FROM t1 JOIN t2 ON t1.k = t2.k GROUP BY t1.k ORDER BY t1.k;
+}
+expect {
+    2|6|24
+    5|6|9
+}
+
+test merge-composite-pk-prefix-dups {
+    CREATE TABLE pairs(a INTEGER, b INTEGER, v TEXT, PRIMARY KEY(a, b));
+    CREATE TABLE singles(a INTEGER PRIMARY KEY, s TEXT);
+    INSERT INTO pairs VALUES (1,1,'p11'),(1,2,'p12'),(2,1,'p21'),(3,1,'p31'),(3,2,'p32'),(3,3,'p33'),(5,1,'p51');
+    INSERT INTO singles VALUES (1,'s1'),(2,'s2'),(3,'s3'),(4,'s4');
+    CREATE TABLE pairs2(a INTEGER, b INTEGER, w TEXT, PRIMARY KEY(a, b));
+    INSERT INTO pairs2 VALUES (1,2,'q12'),(2,1,'q21'),(3,2,'q32'),(3,3,'q33'),(4,1,'q41');
+    SELECT p.a, p.b, q.b FROM pairs p JOIN pairs2 q ON p.a = q.a ORDER BY p.a, p.b, q.b;
+}
+expect {
+    1|1|2
+    1|2|2
+    2|1|1
+    3|1|2
+    3|1|3
+    3|2|2
+    3|2|3
+    3|3|2
+    3|3|3
+}
+
+test merge-real-vs-int-keys-reversed {
+    CREATE TABLE ints(id INTEGER PRIMARY KEY, tag TEXT);
+    CREATE TABLE reals(r REAL, note TEXT);
+    CREATE INDEX realsr ON reals(r);
+    INSERT INTO ints VALUES (1,'i1'),(2,'i2'),(3,'i3'),(4,'i4'),(5,'i5');
+    INSERT INTO reals VALUES (1.0,'r1'),(2.5,'r2'),(3.0,'r3'),(3.5,'r4'),(5.0,'r5'),(6.0,'r6');
+    SELECT reals.r, reals.note, ints.tag FROM reals JOIN ints ON reals.r = ints.id ORDER BY reals.r;
+}
+expect {
+    1.0|r1|i1
+    3.0|r3|i3
+    5.0|r5|i5
+}
+
+test merge-dup-key-at-end-of-inner-index {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE INDEX t1k ON t1(k);
+    CREATE INDEX t2k ON t2(k);
+    INSERT INTO t1 VALUES (1,2);
+    INSERT INTO t2 VALUES (1,2),(2,2);
+    SELECT t1.id, t2.id FROM t1 JOIN t2 ON t1.k = t2.k ORDER BY t1.id, t2.id;
+}
+expect {
+    1|1
+    1|2
+}
+
+test merge-dup-key-at-end-both-sides {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE INDEX t1k ON t1(k);
+    CREATE INDEX t2k ON t2(k);
+    INSERT INTO t1 VALUES (1,1),(2,2),(3,2);
+    INSERT INTO t2 VALUES (1,1),(2,2),(3,2);
+    SELECT t1.id, t2.id FROM t1 JOIN t2 ON t1.k = t2.k ORDER BY t1.id, t2.id;
+}
+expect {
+    1|1
+    2|2
+    2|3
+    3|2
+    3|3
+}
+
+test merge-dup-key-with-inner-rows-after-group {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE INDEX t1k ON t1(k);
+    CREATE INDEX t2k ON t2(k);
+    INSERT INTO t1 VALUES (1,2),(2,9);
+    INSERT INTO t2 VALUES (1,2),(2,2);
+    SELECT t1.id, t2.id FROM t1 JOIN t2 ON t1.k = t2.k ORDER BY t1.id, t2.id;
+}
+expect {
+    1|1
+    1|2
+}
+
+test merge-big-pk-pk-checksum {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INTEGER);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, b INTEGER);
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 500) INSERT INTO t1 SELECT x, x*2 FROM c;
+    WITH RECURSIVE c(x) AS (SELECT 3 UNION ALL SELECT x+1 FROM c WHERE x < 502) INSERT INTO t2 SELECT x, x*3 FROM c;
+    SELECT count(*), sum(t1.a), sum(t2.b) FROM t1 JOIN t2 ON t1.id = t2.id;
+}
+expect {
+    498|250494|375741
+}
+
+test merge-big-dup-keys-checksum {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, k INTEGER, v TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, k INTEGER, w TEXT);
+    CREATE INDEX t1k ON t1(k);
+    CREATE INDEX t2k ON t2(k);
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 500) INSERT INTO t1 SELECT x, x % 50, 'L' || x FROM c;
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 500) INSERT INTO t2 SELECT x, x % 50, 'R' || x FROM c;
+    SELECT count(*), sum(t1.k), sum(t2.id) FROM t1 JOIN t2 ON t1.k = t2.k;
+}
+expect {
+    5000|122500|1252500
+}
+
+test merge-big-three-way-checksum {
+    CREATE TABLE customer(c_id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE orders(o_id INTEGER PRIMARY KEY, custkey INTEGER);
+    CREATE TABLE lineitem(orderkey INTEGER, linenum INTEGER, qty INTEGER, PRIMARY KEY(orderkey, linenum));
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 100) INSERT INTO customer SELECT x, 'c' || x FROM c;
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 400) INSERT INTO orders SELECT x, (x % 100) + 1 FROM c;
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 800) INSERT INTO lineitem SELECT (x + 1) / 2, ((x + 1) % 2) + 1, x FROM c;
+    SELECT count(*), sum(l.qty), sum(cu.c_id) FROM orders o JOIN lineitem l ON o.o_id = l.orderkey JOIN customer cu ON o.custkey = cu.c_id;
+}
+expect {
+    800|320400|40400
+}
+
+test merge-big-three-way-filtered {
+    CREATE TABLE customer(c_id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE orders(o_id INTEGER PRIMARY KEY, custkey INTEGER);
+    CREATE TABLE lineitem(orderkey INTEGER, linenum INTEGER, qty INTEGER, PRIMARY KEY(orderkey, linenum));
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 100) INSERT INTO customer SELECT x, 'c' || x FROM c;
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 400) INSERT INTO orders SELECT x, (x % 100) + 1 FROM c;
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 800) INSERT INTO lineitem SELECT (x + 1) / 2, ((x + 1) % 2) + 1, x FROM c;
+    SELECT count(*), sum(l.qty) FROM orders o JOIN lineitem l ON o.o_id = l.orderkey JOIN customer cu ON o.custkey = cu.c_id WHERE cu.c_id <= 10 AND l.qty > 100;
+}
+expect {
+    62|26109
+}
+
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test merge-plan-pk-pk {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INTEGER);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, b INTEGER);
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 500) INSERT INTO t1 SELECT x, x*2 FROM c;
+    WITH RECURSIVE c(x) AS (SELECT 3 UNION ALL SELECT x+1 FROM c WHERE x < 502) INSERT INTO t2 SELECT x, x*3 FROM c;
+    EXPLAIN QUERY PLAN SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.id = t2.id;
+}
+expect {
+    1|0|0|SCAN t1
+    2|0|0|MERGE JOIN t2 USING INTEGER PRIMARY KEY
+}
+
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test merge-plan-covering-index {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, k INTEGER, v TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, k INTEGER, w TEXT);
+    CREATE INDEX t1k ON t1(k);
+    CREATE INDEX t2k ON t2(k);
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 500) INSERT INTO t1 SELECT x, x % 50, 'L' || x FROM c;
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 500) INSERT INTO t2 SELECT x, x % 50, 'R' || x FROM c;
+    EXPLAIN QUERY PLAN SELECT t1.k, t2.k FROM t1 JOIN t2 ON t1.k = t2.k;
+}
+expect {
+    1|0|0|SCAN t1 USING COVERING INDEX t1k
+    2|0|0|MERGE JOIN t2 USING COVERING INDEX t2k
+}
+
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test merge-plan-noncovering-index {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, k INTEGER, v TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, k INTEGER, w TEXT);
+    CREATE INDEX t1k ON t1(k);
+    CREATE INDEX t2k ON t2(k);
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 500) INSERT INTO t1 SELECT x, x % 50, 'L' || x FROM c;
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 500) INSERT INTO t2 SELECT x, x % 50, 'R' || x FROM c;
+    EXPLAIN QUERY PLAN SELECT t1.v, t2.w FROM t1 JOIN t2 ON t1.k = t2.k;
+}
+expect {
+    1|0|0|SCAN t2 USING INDEX t2k
+    2|0|0|MERGE JOIN t1 USING INDEX t1k
+}
+
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test merge-plan-composite-autoindex {
+    CREATE TABLE customer(c_id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE orders(o_id INTEGER PRIMARY KEY, custkey INTEGER);
+    CREATE TABLE lineitem(orderkey INTEGER, linenum INTEGER, qty INTEGER, PRIMARY KEY(orderkey, linenum));
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 100) INSERT INTO customer SELECT x, 'c' || x FROM c;
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 400) INSERT INTO orders SELECT x, (x % 100) + 1 FROM c;
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 800) INSERT INTO lineitem SELECT (x + 1) / 2, ((x + 1) % 2) + 1, x FROM c;
+    EXPLAIN QUERY PLAN SELECT o.o_id, l.qty, cu.name FROM orders o JOIN lineitem l ON o.o_id = l.orderkey JOIN customer cu ON o.custkey = cu.c_id;
+}
+expect {
+    1|0|0|SCAN orders AS o
+    2|0|0|MERGE JOIN lineitem AS l USING INDEX sqlite_autoindex_lineitem_1
+    3|0|0|SEARCH cu USING INTEGER PRIMARY KEY (rowid=?)
+}

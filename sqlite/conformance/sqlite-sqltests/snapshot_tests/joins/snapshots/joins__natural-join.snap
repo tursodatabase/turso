@@ -14,5 +14,5 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN orders
-`--SEARCH customers USING INTEGER PRIMARY KEY (rowid=?)
+|--SCAN orders USING INDEX idx_orders_customer_id
+`--MERGE JOIN customers USING INTEGER PRIMARY KEY

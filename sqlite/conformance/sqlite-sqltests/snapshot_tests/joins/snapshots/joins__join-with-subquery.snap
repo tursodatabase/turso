@@ -35,5 +35,5 @@ info:
 QUERY PLAN
 |--SCAN recent_orders
 |  `--SCAN orders USING INDEX idx_orders_customer_id
-|--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
+|--MERGE JOIN customers AS c USING INTEGER PRIMARY KEY
 `--USE SORTER FOR ORDER BY

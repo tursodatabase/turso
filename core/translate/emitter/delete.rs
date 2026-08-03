@@ -462,6 +462,9 @@ fn emit_delete_insns<'a>(
         Operation::HashJoin(_) => {
             unreachable!("access through HashJoin is not supported for delete statements")
         }
+        Operation::MergeJoin(_) => {
+            unreachable!("access through MergeJoin is not supported for delete statements")
+        }
         Operation::MultiIndexScan(_) => {
             unreachable!("access through MultiIndexScan is not supported for delete statements")
         }

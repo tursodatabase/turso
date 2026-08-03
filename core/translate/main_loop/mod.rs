@@ -86,6 +86,14 @@ pub struct SemiAntiJoinMetadata {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct MergeJoinMetadata {
+    pub key_regs: usize,
+    pub prev_key_regs: usize,
+    pub eof_reg: usize,
+    pub num_keys: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct LoopLabels {
     pub loop_start: BranchOffset,
     pub next: BranchOffset,

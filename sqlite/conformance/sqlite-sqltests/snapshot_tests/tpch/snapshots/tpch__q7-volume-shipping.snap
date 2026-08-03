@@ -51,8 +51,8 @@ info:
 ---
 QUERY PLAN
 |--SCAN shipping
-|  |--SCAN lineitem
-|  |--SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)
+|  |--SCAN lineitem USING INDEX sqlite_autoindex_lineitem_1
+|  |--MERGE JOIN orders USING INTEGER PRIMARY KEY
 |  |--SEARCH customer USING INTEGER PRIMARY KEY (rowid=?)
 |  |--SEARCH n2 USING INTEGER PRIMARY KEY (rowid=?)
 |  |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)

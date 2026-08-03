@@ -33,7 +33,7 @@ use crate::{
             order::{ColumnTarget, OrderTarget},
         },
         plan::{
-            DmlSafetyReason, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
+            DmlSafetyReason, EphemeralRowidMode, HashJoinOp, IndexMethodQuery, MergeJoinOp,
             NonFromClauseSubquery, QueryDestination, ResultSetColumn, Scan, SeekKeyComponent,
             SubqueryEvalPhase, SubqueryOrigin, SubqueryState, UpdateSetClause, WriteSetPlan,
         },
@@ -2520,6 +2520,21 @@ fn optimize_table_access(
                     Operation::Search(Search::Seek {
                         index: Some(index.clone()),
                         seek_def,
+                    });
+            }
+            AccessMethodParams::MergeJoin {
+                index,
+                keys,
+                key_affinities,
+            } => {
+                for key in keys.iter() {
+                    where_clause[key.where_clause_idx].consumed = true;
+                }
+                table_references.joined_tables_mut()[table_idx].op =
+                    Operation::MergeJoin(MergeJoinOp {
+                        index: index.clone(),
+                        keys: keys.clone(),
+                        key_affinities: key_affinities.clone(),
                     });
             }
             AccessMethodParams::HashJoin {

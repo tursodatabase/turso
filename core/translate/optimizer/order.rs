@@ -314,6 +314,15 @@ pub fn plan_satisfies_order_target(
                     schema,
                 )
             }
+            AccessMethodParams::MergeJoin { index, .. } => btree_access_order_consumed(
+                table_ref,
+                IterationDirection::Forwards,
+                index.as_deref(),
+                &[],
+                &order_target.columns[target_col_idx..],
+                schema,
+                EqualityPrefixScope::ConstantEquality,
+            ),
             _ => return false,
         };
 
@@ -372,6 +381,9 @@ fn access_method_emits_unique_order_prefix(
             constraint_refs,
             consumed_order_terms,
         ),
+        AccessMethodParams::MergeJoin { index, .. } => {
+            access_path_makes_consumed_prefix_unique(index.as_deref(), &[], consumed_order_terms)
+        }
         AccessMethodParams::Subquery { .. }
         | AccessMethodParams::RecursiveCteInput
         | AccessMethodParams::HashJoin { .. }
@@ -676,7 +688,7 @@ fn finalized_scan_subquery_order_consumed(
     }
 }
 
-fn expr_to_column_order(
+pub(super) fn expr_to_column_order(
     expr: &ast::Expr,
     order: SortOrder,
     nulls_order: Option<ast::NullsOrder>,

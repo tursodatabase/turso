@@ -227,6 +227,10 @@ name = "tpc_h_benchmark"
 harness = false
 
 [[bench]]
+name = "merge_join_benchmark"
+harness = false
+
+[[bench]]
 name = "sql_functions"
 harness = false
 required-features = ["bench"]

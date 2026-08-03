@@ -2136,6 +2136,33 @@ impl HashJoinKey {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct MergeJoinKey {
+    pub where_clause_idx: usize,
+    pub inner_side: BinaryExprSide,
+}
+
+impl MergeJoinKey {
+    pub fn get_outer_expr<'a>(&self, where_clause: &'a [WhereTerm]) -> &'a ast::Expr {
+        let where_term = &where_clause[self.where_clause_idx];
+        let Ok(Some((lhs, _, rhs))) = as_binary_components(&where_term.expr) else {
+            panic!("MergeJoinKey: expected a valid binary expression");
+        };
+        if self.inner_side == BinaryExprSide::Lhs {
+            rhs
+        } else {
+            lhs
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MergeJoinOp {
+    pub index: Option<Arc<Index>>,
+    pub keys: Vec<MergeJoinKey>,
+    pub key_affinities: Vec<Affinity>,
+}
+
 /// Hash join semantics. Build = LHS (populates hash table), Probe = RHS (scanned).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashJoinType {
@@ -2260,6 +2287,7 @@ pub enum Operation {
     // This operation scans multiple indexes (one per OR branch) and combines
     // results using RowSet deduplication.
     MultiIndexScan(MultiIndexScanOp),
+    MergeJoin(MergeJoinOp),
 }
 
 impl Operation {
@@ -2290,6 +2318,7 @@ impl Operation {
             Operation::Scan(_) => None,
             Operation::Search(Search::RowidEq { .. }) => None,
             Operation::HashJoin(_) => None,
+            Operation::MergeJoin(MergeJoinOp { index, .. }) => index.as_ref(),
             // Multi-index scan uses multiple indexes; return None as there's no single index
             Operation::MultiIndexScan(_) => None,
         }

@@ -1478,6 +1478,33 @@ pub fn emit_from_clause_subqueries(
                         };
                     format!("HASH JOIN {table_name}")
                 }
+                Operation::MergeJoin(merge) => {
+                    let table_name =
+                        if table_reference.table.get_name() == table_reference.identifier {
+                            table_reference.identifier.clone()
+                        } else {
+                            format!(
+                                "{} AS {}",
+                                table_reference.table.get_name(),
+                                table_reference.identifier
+                            )
+                        };
+                    match &merge.index {
+                        Some(index) => {
+                            if table_reference.utilizes_covering_index() {
+                                format!(
+                                    "MERGE JOIN {table_name} USING COVERING INDEX {}",
+                                    index.name
+                                )
+                            } else {
+                                format!("MERGE JOIN {table_name} USING INDEX {}", index.name)
+                            }
+                        }
+                        None => {
+                            format!("MERGE JOIN {table_name} USING INTEGER PRIMARY KEY")
+                        }
+                    }
+                }
                 Operation::MultiIndexScan(multi_idx) => {
                     let index_names: Vec<&str> = multi_idx
                         .branches
@@ -1672,6 +1699,9 @@ pub fn emit_from_clause_subquery(
                     meta_left_joins: (0..select_plan.joined_tables().len())
                         .map(|_| None)
                         .collect(),
+                    meta_merge_joins: (0..select_plan.joined_tables().len())
+                        .map(|_| None)
+                        .collect(),
                     meta_semi_anti_joins: (0..select_plan.joined_tables().len())
                         .map(|_| None)
                         .collect(),
@@ -1760,6 +1790,9 @@ fn emit_indexed_materialized_subquery(
                 label_main_loop_end: None,
                 meta_group_by: None,
                 meta_left_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
+                meta_merge_joins: (0..select_plan.joined_tables().len())
                     .map(|_| None)
                     .collect(),
                 meta_semi_anti_joins: (0..select_plan.joined_tables().len())
@@ -1857,6 +1890,9 @@ fn emit_materialized_subquery_table(
                 label_main_loop_end: None,
                 meta_group_by: None,
                 meta_left_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
+                meta_merge_joins: (0..select_plan.joined_tables().len())
                     .map(|_| None)
                     .collect(),
                 meta_semi_anti_joins: (0..select_plan.joined_tables().len())

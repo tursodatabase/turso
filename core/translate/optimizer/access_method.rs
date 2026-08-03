@@ -18,8 +18,8 @@ use crate::translate::optimizer::constraints::{
 use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
-    plan_has_outer_scope_dependency, HashJoinKey, HashJoinType, NonFromClauseSubquery,
-    SetOperation, SubqueryState, TableReferences, WhereTerm,
+    plan_has_outer_scope_dependency, HashJoinKey, HashJoinType, MergeJoinKey,
+    NonFromClauseSubquery, SetOperation, SubqueryState, TableReferences, WhereTerm,
 };
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
@@ -38,13 +38,14 @@ use super::{
         estimate_cost_for_scan_or_seek, estimate_index_cost, estimate_rows_per_seek, AnalyzeCtx,
         Cost, IndexInfo,
     },
-    join::JoinPlanningContext,
+    join::{JoinN, JoinPlanningContext},
     multi_index::{
         consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
     },
     order::{
-        btree_access_order_consumed, subquery_intrinsic_order_consumed, ColumnTarget,
-        EqualityPrefixScope, OrderTarget,
+        btree_access_order_consumed, expr_to_column_order, plan_satisfies_order_target,
+        subquery_intrinsic_order_consumed, ColumnTarget, EliminatesSortBy, EqualityPrefixScope,
+        OrderTarget, OrderTargetPurpose,
     },
     AvailableIndexes,
 };
@@ -164,6 +165,11 @@ pub enum AccessMethodParams {
         index: Option<Arc<Index>>,
         affinity: Affinity,
         where_term_idx: usize,
+    },
+    MergeJoin {
+        index: Option<Arc<Index>>,
+        keys: Vec<MergeJoinKey>,
+        key_affinities: Vec<Affinity>,
     },
 }
 
@@ -1381,6 +1387,231 @@ pub fn try_hash_join_access_method(
 
 /// Returns true when the expression is a simple column/rowid reference to the table.
 /// Used to decide if an index seek could replace a hash join.
+fn outer_merge_key_is_order_preserving(
+    expr: &ast::Expr,
+    comparison_affinity: Affinity,
+    table_references: &TableReferences,
+) -> bool {
+    if matches!(comparison_affinity, Affinity::Blob) {
+        return true;
+    }
+    match expr {
+        ast::Expr::RowId { .. } => comparison_affinity.is_numeric(),
+        ast::Expr::Column {
+            table,
+            column,
+            is_rowid_alias,
+            ..
+        } => {
+            if *is_rowid_alias {
+                return comparison_affinity.is_numeric();
+            }
+            let Some(joined_table) = table_references.find_joined_table_by_internal_id(*table)
+            else {
+                return false;
+            };
+            let Some(outer_column) = joined_table.columns().get(*column) else {
+                return false;
+            };
+            outer_column
+                .affinity_with_strict(joined_table.table.is_strict())
+                .index_affinity_ok(comparison_affinity)
+        }
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_merge_join_access_method(
+    lhs: &JoinN,
+    access_methods_arena: &[AccessMethod],
+    joined_tables: &[JoinedTable],
+    rhs_table: &JoinedTable,
+    rhs_table_idx: usize,
+    rhs_constraints: &TableConstraints,
+    lhs_mask: &TableMask,
+    where_clause: &[WhereTerm],
+    table_references: &TableReferences,
+    schema: &Schema,
+    analyze_stats: &AnalyzeStats,
+    input_cardinality: f64,
+    rhs_base_rows: RowCountEstimate,
+    params: &CostModelParams,
+) -> Result<Option<AccessMethod>> {
+    if rhs_table.indexed.is_some() {
+        return Ok(None);
+    }
+    let Some(btree) = rhs_table.btree() else {
+        return Ok(None);
+    };
+    if !btree.has_rowid {
+        return Ok(None);
+    }
+    if rhs_table.join_info.as_ref().is_some_and(|join_info| {
+        join_info.is_outer()
+            || join_info.is_semi_or_anti()
+            || join_info.join_type != crate::translate::plan::JoinType::Inner
+    }) {
+        return Ok(None);
+    }
+    let is_strict = rhs_table.table.is_strict();
+    let columns = rhs_table.columns();
+
+    let mut best: Option<AccessMethod> = None;
+    for candidate in rhs_constraints.candidates.iter() {
+        if let Some(index) = &candidate.index {
+            if index.ephemeral || index.where_clause.is_some() || index.index_method.is_some() {
+                continue;
+            }
+        }
+        let usable = usable_constraints_for_lhs_mask(
+            &rhs_constraints.constraints,
+            &candidate.refs,
+            lhs_mask,
+            rhs_table_idx,
+        );
+        let eq_prefix: Vec<RangeConstraintRef> = usable
+            .into_iter()
+            .take_while(|constraint_ref| constraint_ref.eq.is_some())
+            .collect();
+        if eq_prefix.is_empty() {
+            continue;
+        }
+        let num_keys = eq_prefix.len();
+        let mut keys = Vec::with_capacity(num_keys);
+        let mut key_affinities = Vec::with_capacity(num_keys);
+        let mut target_columns = Vec::new();
+        let mut valid = true;
+        let mut has_join_key = false;
+        for constraint_ref in &eq_prefix {
+            let eq = constraint_ref.eq.as_ref().unwrap();
+            let constraint = &rhs_constraints.constraints[eq.constraint_pos];
+            if candidate.index.is_some() {
+                let Some(table_col_pos) = constraint.table_col_pos else {
+                    valid = false;
+                    break;
+                };
+                let Some(column) = columns.get(table_col_pos) else {
+                    valid = false;
+                    break;
+                };
+                if schema.get_type_def(&column.ty_str, is_strict).is_some() {
+                    valid = false;
+                    break;
+                }
+            }
+            let (_, _, affinity) =
+                constraint.get_constraining_expr(where_clause, Some(table_references));
+            if !outer_merge_key_is_order_preserving(
+                constraint.get_constraining_expr_ref(where_clause),
+                affinity,
+                table_references,
+            ) {
+                valid = false;
+                break;
+            }
+            let (where_clause_idx, constraining_side) = constraint.where_clause_pos;
+            keys.push(MergeJoinKey {
+                where_clause_idx,
+                inner_side: match constraining_side {
+                    BinaryExprSide::Lhs => BinaryExprSide::Rhs,
+                    BinaryExprSide::Rhs => BinaryExprSide::Lhs,
+                },
+            });
+            key_affinities.push(affinity);
+            if !eq.is_const {
+                has_join_key = true;
+                let outer_expr = constraint.get_constraining_expr_ref(where_clause);
+                let Some(mut column_order) = expr_to_column_order(
+                    outer_expr,
+                    constraint_ref.sort_order,
+                    None,
+                    table_references,
+                ) else {
+                    valid = false;
+                    break;
+                };
+                column_order.collation = candidate
+                    .index
+                    .as_ref()
+                    .and_then(|index| index.columns[constraint_ref.index_col_pos].collation)
+                    .unwrap_or_default();
+                target_columns.push(column_order);
+            }
+        }
+        if !valid || !has_join_key {
+            continue;
+        }
+        let target = OrderTarget {
+            columns: target_columns,
+            purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
+        };
+        if !plan_satisfies_order_target(lhs, access_methods_arena, joined_tables, &target, schema) {
+            continue;
+        }
+        let index_info = match candidate.index.as_ref() {
+            Some(index) => IndexInfo {
+                unique: index.unique,
+                covering: rhs_table.index_is_covering(index),
+                column_count: index.columns.len(),
+                rows_per_leaf_page: rows_per_leaf_page_for_index(
+                    index.columns.len(),
+                    rhs_table,
+                    params.rows_per_table_page,
+                ),
+            },
+            None => IndexInfo {
+                unique: true,
+                covering: true,
+                column_count: 1,
+                rows_per_leaf_page: params.rows_per_table_page,
+            },
+        };
+        let analyze_ctx = AnalyzeCtx {
+            rhs_table,
+            index: candidate.index.as_ref(),
+            stats: analyze_stats,
+        };
+        let rows_per_seek = estimate_rows_per_seek(
+            index_info,
+            &rhs_constraints.constraints,
+            &eq_prefix,
+            rhs_base_rows,
+            Some(&analyze_ctx),
+        );
+        let leaf_pages = (*rhs_base_rows / index_info.rows_per_leaf_page).max(1.0);
+        let table_lookup_cost = if index_info.covering {
+            0.0
+        } else {
+            let table_pages = (*rhs_base_rows / params.rows_per_table_page).max(1.0);
+            let selectivity = rows_per_seek / (*rhs_base_rows).max(1.0);
+            input_cardinality * selectivity * table_pages
+        };
+        let cpu_cost = (input_cardinality * 2.0 + *rhs_base_rows) * params.cpu_cost_per_row;
+        let cost = Cost(leaf_pages + table_lookup_cost + cpu_cost);
+        let consumed_where_terms =
+            consumed_where_terms_from_constraint_refs(&rhs_constraints.constraints, &eq_prefix);
+        let method = AccessMethod {
+            cost,
+            estimated_rows_per_outer_row: rows_per_seek,
+            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+            consumed_where_terms,
+            params: AccessMethodParams::MergeJoin {
+                index: candidate.index.clone(),
+                keys,
+                key_affinities,
+            },
+        };
+        if best
+            .as_ref()
+            .is_none_or(|existing| method.cost < existing.cost)
+        {
+            best = Some(method);
+        }
+    }
+    Ok(best)
+}
+
 fn expr_is_simple_column_from_table(expr: &ast::Expr, table_id: TableInternalId) -> bool {
     matches!(
         expr,

@@ -1394,6 +1394,7 @@ fn count_required_cursors_for_simple_select(plan: &SelectPlan) -> usize {
         .iter()
         .map(|t| match &t.op {
             Operation::Scan { .. } => 1,
+            Operation::MergeJoin(merge) => 1 + merge.index.is_some() as usize,
             Operation::Search(search) => match search {
                 Search::RowidEq { .. } => 1,
                 Search::Seek { index, .. } => 1 + index.is_some() as usize,
@@ -1454,6 +1455,7 @@ fn estimate_num_instructions_for_simple_select(select: &SelectPlan) -> usize {
         .map(|t| match &t.op {
             Operation::Scan { .. } => 10,
             Operation::Search(_) => 15,
+            Operation::MergeJoin(_) => 30,
             Operation::IndexMethodQuery(_) => 15,
             Operation::HashJoin(_) => 20,
             // Multi-index scan: scan overhead per branch + deduplication + final rowid fetch
@@ -1705,6 +1707,7 @@ fn estimate_num_labels_for_simple_select(select: &SelectPlan) -> usize {
         .map(|t| match &t.op {
             Operation::Scan { .. } => 3,
             Operation::Search(_) => 3,
+            Operation::MergeJoin(_) => 8,
             Operation::IndexMethodQuery(_) => 3,
             Operation::HashJoin(_) => 3,
             // Multi-index scan needs extra labels for each branch + rowset loop

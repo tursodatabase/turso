@@ -384,6 +384,62 @@ impl InitLoop {
                         }
                     }
                 }
+                Operation::MergeJoin(merge) => {
+                    turso_assert!(
+                        matches!(mode, OperationMode::SELECT),
+                        "merge join is only emitted for SELECT"
+                    );
+                    if let Some(table_cursor_id) = table_cursor_id {
+                        program.emit_insn(Insn::OpenRead {
+                            cursor_id: table_cursor_id,
+                            root_page: table.table.get_root_page()?,
+                            db: table.database_id,
+                        });
+                    }
+                    if let Some(index) = &merge.index {
+                        program.emit_insn(Insn::OpenRead {
+                            cursor_id: index_cursor_id
+                                .expect("index cursor is always opened for an indexed merge join"),
+                            root_page: index.root_page,
+                            db: table.database_id,
+                        });
+                    }
+                    let num_keys = merge.keys.len();
+                    let prev_key_regs = program.alloc_registers(num_keys);
+                    let key_regs = program.alloc_registers(num_keys);
+                    let eof_reg = program.alloc_register();
+                    program.emit_insn(Insn::Null {
+                        dest: prev_key_regs,
+                        dest_end: if num_keys > 1 {
+                            Some(prev_key_regs + num_keys - 1)
+                        } else {
+                            None
+                        },
+                    });
+                    let iteration_cursor_id = index_cursor_id.unwrap_or_else(|| {
+                        table_cursor_id.expect("merge join requires a table or index cursor")
+                    });
+                    let label_rewind_done = program.allocate_label();
+                    program.emit_insn(Insn::Integer {
+                        value: 1,
+                        dest: eof_reg,
+                    });
+                    program.emit_insn(Insn::Rewind {
+                        cursor_id: iteration_cursor_id,
+                        pc_if_empty: label_rewind_done,
+                    });
+                    program.emit_insn(Insn::Integer {
+                        value: 0,
+                        dest: eof_reg,
+                    });
+                    program.preassign_label_to_next_insn(label_rewind_done);
+                    t_ctx.meta_merge_joins[table_index] = Some(MergeJoinMetadata {
+                        key_regs,
+                        prev_key_regs,
+                        eof_reg,
+                        num_keys,
+                    });
+                }
                 Operation::IndexMethodQuery(_) => match mode {
                     OperationMode::SELECT => {
                         if let Some(table_cursor_id) = table_cursor_id {

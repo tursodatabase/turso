@@ -533,6 +533,186 @@ impl OpenLoop {
                         }
                     }
                 }
+                Operation::MergeJoin(merge) => {
+                    let meta = t_ctx.meta_merge_joins[joined_table_index]
+                        .expect("merge join metadata must be initialized before open_loop");
+                    let num_keys = meta.num_keys;
+                    turso_assert_eq!(num_keys, merge.keys.len());
+                    let iteration_cursor_id = index_cursor_id.unwrap_or_else(|| {
+                        table_cursor_id.expect("merge join requires a table or index cursor")
+                    });
+                    let rowid_reg = if merge.index.is_none() {
+                        Some(program.alloc_register())
+                    } else {
+                        None
+                    };
+                    for (i, key) in merge.keys.iter().enumerate() {
+                        let expr = key.get_outer_expr(predicates);
+                        let reg = meta.key_regs + i;
+                        translate_expr_no_constant_opt(
+                            program,
+                            Some(table_references),
+                            expr,
+                            reg,
+                            &t_ctx.resolver,
+                            NoConstantOptReason::RegisterReuse,
+                        )?;
+                        if !expr.is_nonnull(table_references) {
+                            program.emit_insn(Insn::IsNull {
+                                reg,
+                                target_pc: loop_end,
+                            });
+                        }
+                    }
+                    let affinities: String = merge
+                        .keys
+                        .iter()
+                        .zip(merge.key_affinities.iter())
+                        .map(|(key, aff)| {
+                            if aff.expr_needs_no_affinity_change(key.get_outer_expr(predicates)) {
+                                affinity::SQLITE_AFF_NONE
+                            } else {
+                                aff.aff_mask()
+                            }
+                        })
+                        .collect();
+                    if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
+                        program.emit_insn(Insn::Affinity {
+                            start_reg: meta.key_regs,
+                            count: std::num::NonZeroUsize::new(num_keys)
+                                .expect("merge join must have at least one key"),
+                            affinities,
+                        });
+                    }
+                    let key_info: Vec<crate::types::KeyInfo> = (0..num_keys)
+                        .map(|i| crate::types::KeyInfo {
+                            sort_order: merge
+                                .index
+                                .as_ref()
+                                .map(|index| index.columns[i].order)
+                                .unwrap_or(SortOrder::Asc),
+                            collation: merge
+                                .index
+                                .as_ref()
+                                .and_then(|index| index.columns[i].collation)
+                                .unwrap_or_default(),
+                            nulls_order: None,
+                        })
+                        .collect();
+                    program.emit_insn(Insn::Compare {
+                        start_reg_a: meta.prev_key_regs,
+                        start_reg_b: meta.key_regs,
+                        count: num_keys,
+                        key_info,
+                    });
+                    let label_group_restart = program.allocate_label();
+                    let label_advance_setup = program.allocate_label();
+                    let label_advance = program.allocate_label();
+                    let label_set_eof = program.allocate_label();
+                    program.emit_insn(Insn::Jump {
+                        target_pc_lt: label_advance_setup,
+                        target_pc_eq: label_group_restart,
+                        target_pc_gt: label_group_restart,
+                    });
+                    program.preassign_label_to_next_insn(label_group_restart);
+                    program.emit_insn(Insn::Copy {
+                        src_reg: meta.key_regs,
+                        dst_reg: meta.prev_key_regs,
+                        extra_amount: num_keys - 1,
+                    });
+                    program.emit_insn(Insn::SeekGE {
+                        is_index: merge.index.is_some(),
+                        cursor_id: iteration_cursor_id,
+                        start_reg: meta.key_regs,
+                        num_regs: num_keys,
+                        target_pc: label_set_eof,
+                        eq_only: false,
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: loop_start,
+                    });
+                    program.preassign_label_to_next_insn(label_advance_setup);
+                    program.emit_insn(Insn::IfPos {
+                        reg: meta.eof_reg,
+                        target_pc: loop_end,
+                        decrement_by: 0,
+                    });
+                    program.emit_insn(Insn::Copy {
+                        src_reg: meta.key_regs,
+                        dst_reg: meta.prev_key_regs,
+                        extra_amount: num_keys - 1,
+                    });
+                    program.preassign_label_to_next_insn(label_advance);
+                    match rowid_reg {
+                        None => {
+                            program.emit_insn(Insn::IdxGE {
+                                cursor_id: iteration_cursor_id,
+                                start_reg: meta.key_regs,
+                                num_regs: num_keys,
+                                target_pc: loop_start,
+                            });
+                        }
+                        Some(rowid_reg) => {
+                            program.emit_insn(Insn::RowId {
+                                cursor_id: iteration_cursor_id,
+                                dest: rowid_reg,
+                            });
+                            program.emit_insn(Insn::Ge {
+                                lhs: rowid_reg,
+                                rhs: meta.key_regs,
+                                target_pc: loop_start,
+                                flags: CmpInsFlags::default()
+                                    .with_affinity(merge.key_affinities[0]),
+                                collation: None,
+                            });
+                        }
+                    }
+                    program.emit_insn(Insn::Next {
+                        cursor_id: iteration_cursor_id,
+                        pc_if_next: label_advance,
+                    });
+                    program.preassign_label_to_next_insn(label_set_eof);
+                    program.emit_insn(Insn::Integer {
+                        value: 1,
+                        dest: meta.eof_reg,
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: loop_end,
+                    });
+                    program.preassign_label_to_next_insn(loop_start);
+                    match rowid_reg {
+                        None => {
+                            program.emit_insn(Insn::IdxGT {
+                                cursor_id: iteration_cursor_id,
+                                start_reg: meta.key_regs,
+                                num_regs: num_keys,
+                                target_pc: loop_end,
+                            });
+                        }
+                        Some(rowid_reg) => {
+                            program.emit_insn(Insn::RowId {
+                                cursor_id: iteration_cursor_id,
+                                dest: rowid_reg,
+                            });
+                            program.emit_insn(Insn::Gt {
+                                lhs: rowid_reg,
+                                rhs: meta.key_regs,
+                                target_pc: loop_end,
+                                flags: CmpInsFlags::default()
+                                    .with_affinity(merge.key_affinities[0]),
+                                collation: None,
+                            });
+                        }
+                    }
+                    if let (Some(index_cursor_id), Some(table_cursor_id)) =
+                        (index_cursor_id, table_cursor_id)
+                    {
+                        program.emit_insn(Insn::DeferredSeek {
+                            index_cursor_id,
+                            table_cursor_id,
+                        });
+                    }
+                }
                 Operation::HashJoin(hash_join_op) => {
                     HashProbeSetupEmitter::new(
                         program,

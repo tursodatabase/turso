@@ -25,11 +25,11 @@ info:
 QUERY PLAN
 |--SCAN order_stats
 |  `--SCAN orders USING INDEX idx_orders_customer
-`--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
+`--MERGE JOIN customers AS c USING INTEGER PRIMARY KEY
 
 BYTECODE
 addr  opcode                   p1  p2  p3  p4            p5  comment
-   0          Init              0  55   0                 0  Start at 55
+   0          Init              0  76   0                 0  Start at 76
    1          InitCoroutine     1  42   2                 0
    2          Null              0  10  11                 0  r[10..11]=NULL
    3          Integer           0   7   0                 0  r[7]=0; clear group by abort flag
@@ -72,19 +72,40 @@ addr  opcode                   p1  p2  p3  p4            p5  comment
   40  Return                   15   0   0                 0
   41  EndCoroutine              1   0   0                 0
   42  OpenRead                  2   6   0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
-  43  InitCoroutine             1   0   2                 0
-  44    Yield                   1  54   0                 0
-  45    Copy                    4  21   0                 0  r[21]=r[4]
-  46    Le                     21  22  53  Binary         0  if r[21]<=r[22] goto 53
-  47    Copy                    2  23   0                 0  r[23]=r[2]
-  48    SeekRowid               2  23  53                 0  if (r[23]!=cursor 2 for table customers.rowid) goto 53
-  49    Column                  2   1  17                 0  r[17]=customers.name
-  50    Copy                    3  18   0                 0  r[18]=r[3]
-  51    Copy                    4  19   0                 0  r[19]=r[4]
-  52    ResultRow              17   3   0                 0  output=r[17..19]
-  53  Goto                      0  44   0                 0
-  54  Halt                      0   0   0                 0
-  55  Transaction               0   1  11                 0  iDb=0 tx_mode=Read
-  56  Integer                   1  16   0                 0  r[16]=1
-  57  Integer                 500  22   0                 0  r[22]=500
-  58  Goto                      0   1   0                 0
+  43  Null                      0  20   0                 0  r[20]=NULL
+  44  Integer                   1  22   0                 0  r[22]=1
+  45  Rewind                    2  47   0                 0  Rewind table customers
+  46  Integer                   0  22   0                 0  r[22]=0
+  47  InitCoroutine             1   0   2                 0
+  48    Yield                   1  75   0                 0
+  49    Copy                    4  24   0                 0  r[24]=r[4]
+  50    Le                     24  25  74  Binary         0  if r[24]<=r[25] goto 74
+  51    Copy                    2  21   0                 0  r[21]=r[2]
+  52    IsNull                 21  74   0                 0  if (r[21]==NULL) goto 74
+  53    Affinity               21   1   0                 0  r[21..22] = C
+  54    Compare                20  21   1  k(1, Binary)   0  r[20..20]==r[21..21]
+  55    Jump                   59  56  56                 0
+  56    Copy                   21  20   0                 0  r[20]=r[21]
+  57    SeekGE                  2  64  21                 0  key=[21..21]
+  58    Goto                    0  66   0                 0
+  59    IfPos                  22  74   0                 0  r[22]>0 -> r[22]-=0, goto 74
+  60    Copy                   21  20   0                 0  r[20]=r[21]
+  61      RowId                 2  26   0                 0  r[26]=customers.rowid
+  62      Ge                   26  21  66                 0  if r[26]>=r[21] goto 66
+  63    Next                    2  61   0                 0
+  64    Integer                 1  22   0                 0  r[22]=1
+  65    Goto                    0  74   0                 0
+  66      RowId                 2  26   0                 0  r[26]=customers.rowid
+  67      Gt                   26  21  74                 0  if r[26]>r[21] goto 74
+  68      Column                2   1  17                 0  r[17]=customers.name
+  69      Copy                  3  18   0                 0  r[18]=r[3]
+  70      Copy                  4  19   0                 0  r[19]=r[4]
+  71      ResultRow            17   3   0                 0  output=r[17..19]
+  72    Next                    2  66   0                 0
+  73    Integer                 1  22   0                 0  r[22]=1
+  74  Goto                      0  48   0                 0
+  75  Halt                      0   0   0                 0
+  76  Transaction               0   1  11                 0  iDb=0 tx_mode=Read
+  77  Integer                   1  16   0                 0  r[16]=1
+  78  Integer                 500  25   0                 0  r[25]=500
+  79  Goto                      0   1   0                 0

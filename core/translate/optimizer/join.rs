@@ -17,21 +17,24 @@ use crate::{
     schema::Schema,
     stats::AnalyzeStats,
     translate::{
-        expr::{walk_expr, WalkControl},
+        expr::{as_binary_components, walk_expr, WalkControl},
         optimizer::{
             access_method::{
-                estimate_hash_join_cost, try_hash_join_access_method, AccessMethodParams,
-                ResidualConstraintMode,
+                estimate_hash_join_cost, try_hash_join_access_method, try_merge_join_access_method,
+                AccessMethodParams, ResidualConstraintMode,
             },
             cost::{
-                estimate_rows_per_seek, rows_per_leaf_page_for_index, AnalyzeCtx, Cost, IndexInfo,
-                RowCountEstimate,
+                estimate_cost_for_scan_or_seek, estimate_rows_per_seek,
+                rows_per_leaf_page_for_index, AnalyzeCtx, Cost, IndexInfo, RowCountEstimate,
             },
-            order::plan_satisfies_order_target,
+            order::{
+                btree_access_order_consumed, expr_to_column_order, plan_satisfies_order_target,
+                EliminatesSortBy, EqualityPrefixScope, OrderTargetPurpose,
+            },
         },
         plan::{
-            HashJoinKey, HashJoinType, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
-            TableReferences, WhereTerm,
+            HashJoinKey, HashJoinType, IterationDirection, JoinOrderMember, JoinedTable,
+            NonFromClauseSubquery, TableReferences, WhereTerm,
         },
         planner::TableMask,
     },
@@ -307,7 +310,7 @@ pub fn join_lhs_and_rhs<'a>(
             })
         });
 
-        for build_table_idx in lhs_table_numbers {
+        for build_table_idx in &lhs_table_numbers {
             if build_table_idx != last_lhs_table_idx {
                 continue;
             }
@@ -675,6 +678,27 @@ pub fn join_lhs_and_rhs<'a>(
                 }
             }
         }
+
+        if let Some(merge_join_method) = try_merge_join_access_method(
+            lhs,
+            access_methods_arena,
+            joined_tables,
+            rhs_table_reference,
+            rhs_table_idx,
+            rhs_constraints,
+            &lhs_table_numbers,
+            where_clause,
+            table_references,
+            schema,
+            analyze_stats,
+            input_cardinality,
+            rhs_base_rows,
+            params,
+        )? {
+            if merge_join_method.cost < best_access_method.cost {
+                best_access_method = merge_join_method;
+            }
+        }
     }
 
     // Check if there's an index method candidate for this table (e.g., FTS)
@@ -876,6 +900,276 @@ fn build_has_indexable_prior_constraints(
     })
 }
 
+const MAX_INTERESTING_ORDERS: usize = 16;
+
+pub(crate) struct InterestingOrder {
+    pub target: OrderTarget,
+    pub consumer_mask: TableMask,
+    pub provider_table_idx: usize,
+    pub always_relevant: bool,
+}
+
+pub(crate) fn collect_interesting_orders(
+    joined_tables: &[JoinedTable],
+    where_clause: &[WhereTerm],
+    table_references: &TableReferences,
+    maybe_order_target: Option<&OrderTarget>,
+) -> Result<Vec<InterestingOrder>> {
+    let mut orders: Vec<InterestingOrder> = Vec::new();
+    if let Some(order_target) = maybe_order_target {
+        orders.push(InterestingOrder {
+            target: order_target.clone(),
+            consumer_mask: TableMask::default(),
+            provider_table_idx: usize::MAX,
+            always_relevant: true,
+        });
+    }
+    let table_idx_by_id = |table_id: TableInternalId| -> Option<usize> {
+        joined_tables.iter().position(|t| t.internal_id == table_id)
+    };
+    for where_term in where_clause.iter() {
+        if orders.len() >= MAX_INTERESTING_ORDERS {
+            break;
+        }
+        if where_term.consumed || where_term.from_outer_join.is_some() {
+            continue;
+        }
+        let Ok(Some((lhs, op, rhs))) = as_binary_components(&where_term.expr) else {
+            continue;
+        };
+        if !matches!(op.as_ast_operator(), Some(Operator::Equals)) {
+            continue;
+        }
+        for (provider_expr, consumer_expr) in [(lhs, rhs), (rhs, lhs)] {
+            if orders.len() >= MAX_INTERESTING_ORDERS {
+                break;
+            }
+            let Some(provider_col) = expr_to_column_order(
+                provider_expr,
+                turso_parser::ast::SortOrder::Asc,
+                None,
+                table_references,
+            ) else {
+                continue;
+            };
+            let Some(consumer_col) = expr_to_column_order(
+                consumer_expr,
+                turso_parser::ast::SortOrder::Asc,
+                None,
+                table_references,
+            ) else {
+                continue;
+            };
+            if provider_col.table_id == consumer_col.table_id {
+                continue;
+            }
+            let Some(provider_idx) = table_idx_by_id(provider_col.table_id) else {
+                continue;
+            };
+            let Some(consumer_idx) = table_idx_by_id(consumer_col.table_id) else {
+                continue;
+            };
+            let mut consumer_mask = TableMask::default();
+            consumer_mask.set(consumer_idx)?;
+            if let Some(existing) = orders.iter_mut().find(|o| {
+                !o.always_relevant
+                    && o.provider_table_idx == provider_idx
+                    && o.target.columns.len() == 1
+                    && o.target.columns[0] == provider_col
+            }) {
+                existing.consumer_mask.union_with(&consumer_mask)?;
+                continue;
+            }
+            orders.push(InterestingOrder {
+                target: OrderTarget {
+                    columns: vec![provider_col],
+                    purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
+                },
+                consumer_mask,
+                provider_table_idx: provider_idx,
+                always_relevant: false,
+            });
+        }
+    }
+    Ok(orders)
+}
+
+fn order_signature(
+    rel: &JoinN,
+    interesting_orders: &[InterestingOrder],
+    mask: &TableMask,
+    access_methods_arena: &[AccessMethod],
+    joined_tables: &[JoinedTable],
+    schema: &Schema,
+) -> u32 {
+    let mut signature = 0u32;
+    for (i, interesting_order) in interesting_orders.iter().enumerate() {
+        let relevant = interesting_order.always_relevant
+            || !mask.contains_all_set_bits_of(&interesting_order.consumer_mask);
+        if !relevant {
+            continue;
+        }
+        if plan_satisfies_order_target(
+            rel,
+            access_methods_arena,
+            joined_tables,
+            &interesting_order.target,
+            schema,
+        ) {
+            signature |= 1 << i;
+        }
+    }
+    signature
+}
+
+fn insert_memo_variant(
+    memo_entry: &mut HashMap<(usize, u32), JoinN>,
+    last_table_idx: usize,
+    signature: u32,
+    rel: JoinN,
+) {
+    let dominated = memo_entry.iter().any(|(&(last, existing_sig), existing)| {
+        last == last_table_idx
+            && existing.cost <= rel.cost
+            && (signature & existing_sig) == signature
+    });
+    if dominated {
+        return;
+    }
+    memo_entry.retain(|&(last, existing_sig), existing| {
+        !(last == last_table_idx
+            && (existing_sig & signature) == existing_sig
+            && existing.cost >= rel.cost)
+    });
+    memo_entry.insert((last_table_idx, signature), rel);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seed_ordered_single_table_variants(
+    table_idx: usize,
+    joined_tables: &[JoinedTable],
+    interesting_orders: &[InterestingOrder],
+    constraints: &[TableConstraints],
+    base_table_rows: &[RowCountEstimate],
+    initial_input_cardinality: f64,
+    access_methods_arena: &mut Vec<AccessMethod>,
+    memo_entry: &mut HashMap<(usize, u32), JoinN>,
+    schema: &Schema,
+    available_indexes: &AvailableIndexes,
+    params: &CostModelParams,
+) -> Result<()> {
+    let table_ref = &joined_tables[table_idx];
+    if table_ref.btree().is_none() || table_ref.indexed.is_some() {
+        return Ok(());
+    }
+    let mut singleton_mask = TableMask::default();
+    singleton_mask.set(table_idx)?;
+    let base_rows = base_table_rows
+        .get(table_idx)
+        .copied()
+        .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
+    let output_multiplier = constraint_output_multipliers(
+        &constraints[table_idx],
+        &TableMask::default(),
+        singleton_mask.try_clone()?,
+        &[],
+        params,
+    );
+    for interesting_order in interesting_orders.iter() {
+        if interesting_order.provider_table_idx != table_idx {
+            continue;
+        }
+        if singleton_mask.contains_all_set_bits_of(&interesting_order.consumer_mask) {
+            continue;
+        }
+        let target = &interesting_order.target;
+        let Some(indexes) = available_indexes.indexes_for_table(table_ref.internal_id) else {
+            continue;
+        };
+        let mut cheapest: Option<(
+            Cost,
+            crate::sync::Arc<crate::schema::Index>,
+            IterationDirection,
+        )> = None;
+        for index in indexes.iter() {
+            if index.ephemeral || index.where_clause.is_some() || index.index_method.is_some() {
+                continue;
+            }
+            for iter_dir in [IterationDirection::Forwards, IterationDirection::Backwards] {
+                let consumed = btree_access_order_consumed(
+                    table_ref,
+                    iter_dir,
+                    Some(index.as_ref()),
+                    &[],
+                    &target.columns,
+                    schema,
+                    EqualityPrefixScope::ConstantEquality,
+                );
+                if consumed < target.columns.len() {
+                    continue;
+                }
+                let index_info = IndexInfo {
+                    unique: index.unique,
+                    covering: table_ref.index_is_covering(index),
+                    column_count: index.columns.len(),
+                    rows_per_leaf_page: rows_per_leaf_page_for_index(
+                        index.columns.len(),
+                        table_ref,
+                        params.rows_per_table_page,
+                    ),
+                };
+                let cost = estimate_cost_for_scan_or_seek(
+                    Some(index_info),
+                    &constraints[table_idx].constraints,
+                    &[],
+                    initial_input_cardinality,
+                    base_rows,
+                    true,
+                    params,
+                    None,
+                );
+                if cheapest
+                    .as_ref()
+                    .is_none_or(|(existing_cost, _, _)| cost < *existing_cost)
+                {
+                    cheapest = Some((cost, index.clone(), iter_dir));
+                }
+                break;
+            }
+        }
+        let Some((cost, index, iter_dir)) = cheapest else {
+            continue;
+        };
+        let method = AccessMethod {
+            cost,
+            estimated_rows_per_outer_row: *base_rows,
+            residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
+            consumed_where_terms: SmallVec::new(),
+            params: AccessMethodParams::BTreeTable {
+                iter_dir,
+                index: Some(index),
+                constraint_refs: vec![],
+            },
+        };
+        access_methods_arena.push(method);
+        let rel = JoinN {
+            data: vec![(table_idx, access_methods_arena.len() - 1)],
+            output_cardinality: initial_input_cardinality * *base_rows * output_multiplier,
+            cost,
+        };
+        let signature = order_signature(
+            &rel,
+            interesting_orders,
+            &singleton_mask,
+            access_methods_arena,
+            joined_tables,
+            schema,
+        );
+        insert_memo_variant(memo_entry, table_idx, signature, rel);
+    }
+    Ok(())
+}
+
 /// The result of [compute_best_join_order].
 #[derive(Debug)]
 pub struct BestJoinOrderResult {
@@ -1041,13 +1335,27 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // if we find that 'b JOIN a' is better than 'a JOIN b', then we don't need to even try
     // to do 'a JOIN b JOIN c', because we know 'b JOIN a JOIN c' is going to be better.
     // This is due to the commutativity and associativity of inner joins.
-    // Memo table keyed by a subset mask, then by the last table in the join order.
+    // Memo table keyed by a subset mask, then by (last table in the join order, interesting
+    // order signature).
     //
     // We keep multiple plans per subset instead of only the cheapest one. The cheapest
     // subset plan is not always the best foundation for the next join. Keeping variants
     // lets the planner choose a better join order later (e.g. for hash-join chaining).
-    let mut best_plan_memo: HashMap<TableMask, HashMap<usize, JoinN>> =
+    //
+    // The signature part of the key implements interesting orders: a plan that produces
+    // rows in an order that a later merge join (or the query's ORDER BY / GROUP BY) can
+    // use is kept even when a cheaper unordered plan exists for the same subset and last
+    // table. Entries that cost more AND satisfy a subset of another entry's orders are
+    // pruned as dominated.
+    let mut best_plan_memo: HashMap<TableMask, HashMap<(usize, u32), JoinN>> =
         HashMap::with_capacity_and_hasher(2usize.pow(num_tables as u32 - 1), Default::default());
+
+    let interesting_orders = collect_interesting_orders(
+        joined_tables,
+        where_clause,
+        table_references,
+        planning_context.maybe_order_target,
+    )?;
 
     // Dynamic programming base case: calculate the best way to access each single table, as if
     // there were no other tables.
@@ -1084,7 +1392,29 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             schema,
         )?;
         if let Some(rel) = rel {
-            best_plan_memo.entry(mask).or_default().insert(i, rel);
+            let signature = order_signature(
+                &rel,
+                &interesting_orders,
+                &mask,
+                access_methods_arena,
+                joined_tables,
+                schema,
+            );
+            let memo_entry = best_plan_memo.entry(mask.try_clone()?).or_default();
+            insert_memo_variant(memo_entry, i, signature, rel);
+            seed_ordered_single_table_variants(
+                i,
+                joined_tables,
+                &interesting_orders,
+                constraints,
+                base_table_rows,
+                initial_input_cardinality,
+                access_methods_arena,
+                best_plan_memo.get_mut(&mask).unwrap(),
+                schema,
+                available_indexes,
+                params,
+            )?;
         }
     }
     join_order.clear();
@@ -1159,10 +1489,11 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     for subset_size in 2..=num_tables {
         for mask in generate_join_bitmasks(num_tables, subset_size) {
             let mask = mask?;
-            // Keep track of the best way to join this subset of tables per possible last table.
+            // Keep track of the best way to join this subset of tables per possible
+            // (last table, interesting order signature).
             // This preserves alternative join orders that may be more expensive for the subset
             // but enable cheaper joins when adding more tables.
-            let mut best_for_mask_by_last: HashMap<usize, JoinN> = HashMap::default();
+            let mut best_for_mask_by_last: HashMap<(usize, u32), JoinN> = HashMap::default();
             // Also keep track of the best plan for this subset that orders the rows in an
             // Interesting Way (tm), i.e. allows us to eliminate sort operations downstream.
             let mut best_ordered_for_mask: Option<JoinN> = None;
@@ -1201,8 +1532,9 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                 };
 
                 // Stable iteration keeps tie-breaks consistent across runs.
-                let lhs_keys: TableMask = lhs_variants.keys().copied().try_collect()?;
-                for lhs_key in &lhs_keys {
+                let mut lhs_keys: Vec<(usize, u32)> = lhs_variants.keys().copied().collect();
+                lhs_keys.sort_unstable();
+                for lhs_key in lhs_keys {
                     let lhs = &lhs_variants[&lhs_key];
                     // Build a JoinOrder out of the table bitmask under consideration.
                     for table_no in lhs.table_numbers() {
@@ -1282,19 +1614,24 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         continue;
                     }
 
-                    let should_replace = match best_for_mask_by_last.get(&rhs_idx) {
-                        Some(existing) => rel.cost < existing.cost,
-                        None => true,
-                    };
-                    if should_replace {
-                        best_for_mask_by_last.insert(rhs_idx, rel);
-                    }
+                    let signature = order_signature(
+                        &rel,
+                        &interesting_orders,
+                        &mask,
+                        access_methods_arena,
+                        joined_tables,
+                        schema,
+                    );
+                    insert_memo_variant(&mut best_for_mask_by_last, rhs_idx, signature, rel);
                 }
             }
 
             let has_all_tables = mask.count() == num_tables;
             if has_all_tables {
-                for rel in best_for_mask_by_last.into_values() {
+                let mut finished_variants: Vec<((usize, u32), JoinN)> =
+                    best_for_mask_by_last.drain().collect();
+                finished_variants.sort_unstable_by_key(|(key, _)| *key);
+                for (_, rel) in finished_variants {
                     if cost_upper_bound <= rel.cost {
                         continue;
                     }
@@ -1310,6 +1647,13 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         } else {
                             false
                         };
+                    if satisfies_order_target
+                        && best_ordered_plan
+                            .as_ref()
+                            .is_none_or(|plan| rel.cost < plan.cost)
+                    {
+                        best_ordered_plan = Some(rel.clone());
+                    }
                     if best_plan.as_ref().is_none_or(|plan| rel.cost < plan.cost) {
                         best_plan = Some(rel);
                         best_plan_is_also_ordered = satisfies_order_target;
@@ -1317,7 +1661,11 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                 }
                 if let Some(rel) = best_ordered_for_mask.take() {
                     let cost = rel.cost;
-                    if cost_upper_bound > cost {
+                    if cost_upper_bound > cost
+                        && best_ordered_plan
+                            .as_ref()
+                            .is_none_or(|plan| cost < plan.cost)
+                    {
                         best_ordered_plan = Some(rel);
                     }
                 }
