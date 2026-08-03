@@ -875,7 +875,7 @@ Modifiers:
 | Concat         | ✅ Yes    |         |
 | Copy           | ✅ Yes    |         |
 | Count          | ✅ Yes    |         |
-| CreateBTree    | 🚧 Partial| no temp databases |
+| CreateBTree    | ✅ Yes    |         |
 | DecrJumpZero   | ✅ Yes    |         |
 | Delete         | ✅ Yes    |         |
 | Destroy        | ✅ Yes    |         |
@@ -950,13 +950,13 @@ Modifiers:
 | OpenRead       | ✅ Yes    |         |
 | OpenWrite      | ✅ Yes     |         |
 | Or             | ✅ Yes    |         |
-| Pagecount      | 🚧 Partial| no temp databases |
+| Pagecount      | ✅ Yes    |         |
 | Param          | ❌ No     |         |
 | ParseSchema    | ✅ Yes    |         |
 | Permutation    | ❌ No     |         |
 | Prev           | ✅ Yes     |         |
 | Program        | ✅ Yes     |         |
-| ReadCookie     | 🚧 Partial| no temp databases, only user_version supported |
+| ReadCookie     | 🚧 Partial| IncrementalVacuum cookie not supported |
 | Real           | ✅ Yes    |         |
 | RealAffinity   | ✅ Yes    |         |
 | Remainder      | ✅ Yes    |         |
