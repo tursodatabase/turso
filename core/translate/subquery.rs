@@ -726,6 +726,17 @@ fn get_subquery_parser<'a>(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
+                // EXISTS only checks whether a row comes out, so ORDER BY and
+                // DISTINCT cannot change the result and SQLite drops them
+                // (select.c, "dropping superfluous ORDER BY"). Dropping them
+                // here — after the plan is prepared, so name errors in the
+                // ORDER BY still surface — also means their expressions are
+                // never evaluated: an ORDER BY term that would error at
+                // runtime (e.g. an integer overflow) must not fail the query.
+                // LIMIT and OFFSET stay: with DISTINCT gone they count plain
+                // rows, which matches SQLite.
+                plan.order_by.clear();
+                plan.distinctness = crate::translate::plan::Distinctness::NonDistinct;
                 optimize_select_plan(&mut plan, resolver)?;
                 let correlated = select_plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
