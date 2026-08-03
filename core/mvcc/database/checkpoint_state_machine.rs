@@ -1470,7 +1470,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let Some(wal) = &self.pager.wal else {
             panic!("No WAL to checkpoint");
         };
-        match wal.checkpoint(&self.pager, self.mode)? {
+        match wal.checkpoint(&self.pager, self.mode, self.sync_mode)? {
             IOResult::Done(result) => Ok(IOResult::Done(result)),
             IOResult::IO(io) => Ok(IOResult::IO(io)),
         }

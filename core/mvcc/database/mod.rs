@@ -8085,6 +8085,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         CheckpointMode::Truncate {
                             upper_bound_inclusive: None,
                         },
+                        connection.get_sync_mode(),
                     ));
                     if !checkpoint_result.everything_backfilled() {
                         let err = LimboError::Corrupt(
