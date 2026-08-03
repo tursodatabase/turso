@@ -267,16 +267,9 @@ enum ScanRowAction<'hir, 'destination> {
         cursor: usize,
         table: &'destination BTreeTable,
     },
-    WindowProject {
-        block: &'destination super::PhysicalQueryBlock<'hir>,
-        filter: Option<&'hir Expr>,
-        result: RegisterRange,
-        destination: QueryDestination<'destination>,
-        limit: Option<LimitRuntime>,
-        distinct: Option<&'destination DistinctRuntime>,
-    },
-    WindowSortInsert {
-        sorter: &'destination WindowSorter<'hir>,
+    WindowMaterialize {
+        rows: &'destination WindowRows,
+        sorter: Option<&'destination WindowSorter<'hir>>,
     },
 }
 
@@ -289,8 +282,7 @@ impl ScanRowAction<'_, '_> {
             Self::Aggregate { .. }
             | Self::GroupSortInsert { .. }
             | Self::UpdateCandidate { .. }
-            | Self::WindowProject { .. }
-            | Self::WindowSortInsert { .. } => None,
+            | Self::WindowMaterialize { .. } => None,
         }
     }
 }
@@ -324,6 +316,13 @@ struct WindowSorter<'hir> {
     spec: &'hir crate::translate::semantic::hir::WindowSpec,
     source: SourceId,
     source_width: usize,
+}
+
+struct WindowRows {
+    cursor_id: usize,
+    table: Arc<BTreeTable>,
+    source: SourceId,
+    width: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -2228,6 +2227,101 @@ fn open_window_sorter<'document>(
     })
 }
 
+fn open_window_rows(
+    program: &mut ProgramBuilder,
+    source: &PhysicalSource<'_>,
+) -> QueryResult<WindowRows> {
+    let table = ephemeral_table(format!("window_rows_{}", source.id.index()), source.width)?;
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id,
+        is_table: true,
+    });
+    Ok(WindowRows {
+        cursor_id,
+        table,
+        source: source.id,
+        width: source.width,
+    })
+}
+
+fn duplicate_window_rows(program: &mut ProgramBuilder, rows: &WindowRows) -> usize {
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(rows.table.clone()));
+    program.emit_insn(Insn::OpenDup {
+        new_cursor_id: cursor_id,
+        original_cursor_id: rows.cursor_id,
+    });
+    cursor_id
+}
+
+fn bind_window_row<'document>(
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    rows: &WindowRows,
+    cursor_id: usize,
+) -> QueryResult<SourceRuntime> {
+    let columns = RegisterRange::new(program.alloc_registers(rows.width), rows.width);
+    for position in 0..rows.width {
+        program.emit_insn(Insn::Column {
+            cursor_id,
+            column: position,
+            dest: columns.first.0 + position,
+            default: None,
+        });
+    }
+    let rowid = RegisterId(program.alloc_register());
+    program.emit_insn(Insn::RowId {
+        cursor_id,
+        dest: rowid.0,
+    });
+    bindings
+        .replace_source(
+            rows.source,
+            SourceRuntime::Registers {
+                columns,
+                rowid: Some(rowid),
+            },
+        )
+        .map_err(Into::into)
+}
+
+fn emit_window_row_insert<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    ctes: &mut MaterializedCtes,
+    rows: &WindowRows,
+) -> QueryResult<()> {
+    let fields = program.alloc_registers(rows.width);
+    for column in 0..rows.width {
+        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries).emit_into(
+            &Expr::column(rows.source, column),
+            RegisterRange::new(fields + column, 1),
+        )?;
+    }
+    let rowid = program.alloc_register();
+    let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+    ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+        .emit_into(&Expr::rowid(rows.source), RegisterRange::new(rowid, 1))?;
+    let record = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(fields),
+        count: to_u32(rows.width),
+        dest_reg: to_u32(record),
+        index_name: Some(rows.table.name.clone()),
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: rows.cursor_id,
+        key_reg: rowid,
+        record_reg: record,
+        flag: InsertFlags::new().is_ephemeral_table_insert(),
+        table_name: rows.table.name.clone(),
+    });
+    Ok(())
+}
+
 fn emit_window_sort_insert<'document>(
     plan: &PhysicalPlan<'document>,
     program: &mut ProgramBuilder,
@@ -2295,6 +2389,7 @@ fn emit_sorted_window_rows<'document>(
     limit: Option<LimitRuntime>,
     distinct: Option<&DistinctRuntime>,
     sorter: &WindowSorter<'document>,
+    rows: &WindowRows,
 ) -> QueryResult<()> {
     let content = program.alloc_register();
     let pseudo = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
@@ -2354,6 +2449,7 @@ fn emit_sorted_window_rows<'document>(
         destination,
         limit,
         distinct,
+        rows,
     );
     bindings.replace_source(sorter.source, previous)?;
     emission?;
@@ -2365,6 +2461,58 @@ fn emit_sorted_window_rows<'document>(
     program.emit_insn(Insn::Close { cursor_id: pseudo });
     program.emit_insn(Insn::Close {
         cursor_id: sorter.cursor_id,
+    });
+    program.emit_insn(Insn::Close {
+        cursor_id: rows.cursor_id,
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_materialized_window_rows<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    ctes: &mut MaterializedCtes,
+    block: &super::PhysicalQueryBlock<'document>,
+    result: RegisterRange,
+    destination: QueryDestination<'_>,
+    limit: Option<LimitRuntime>,
+    distinct: Option<&DistinctRuntime>,
+    rows: &WindowRows,
+) -> QueryResult<()> {
+    let cursor = duplicate_window_rows(program, rows);
+    let loop_start = program.allocate_label();
+    let cleanup = row_cleanup_label(destination, limit).unwrap_or_else(|| program.allocate_label());
+    program.emit_insn(Insn::Rewind {
+        cursor_id: cursor,
+        pc_if_empty: cleanup,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+    let previous = bind_window_row(program, bindings, rows, cursor)?;
+    let emission = emit_ranking_window_row(
+        plan,
+        program,
+        bindings,
+        ctes,
+        block,
+        None,
+        result,
+        destination,
+        limit,
+        distinct,
+        rows,
+    );
+    bindings.replace_source(rows.source, previous)?;
+    emission?;
+    program.emit_insn(Insn::Next {
+        cursor_id: cursor,
+        pc_if_next: loop_start,
+    });
+    program.preassign_label_to_next_insn(cleanup);
+    program.emit_insn(Insn::Close { cursor_id: cursor });
+    program.emit_insn(Insn::Close {
+        cursor_id: rows.cursor_id,
     });
     Ok(())
 }
@@ -2958,40 +3106,16 @@ fn emit_ranking_window_query<'document>(
             },
         )?;
     }
-    if let Some(spec) = block
+    let source_plan = plan
+        .source(*source)
+        .ok_or(PhysicalQueryError::Invalid("window source is missing"))?;
+    let rows = open_window_rows(program, source_plan)?;
+    let sorter = block
         .window_functions
         .last()
         .and_then(|function| function.call.window.as_ref())
-        .filter(|spec| !spec.partition_by.is_empty() || !spec.order_by.is_empty())
-    {
-        let source_plan = plan
-            .source(*source)
-            .ok_or(PhysicalQueryError::Invalid("window source is missing"))?;
-        let sorter = open_window_sorter(plan, program, source_plan, spec)?;
-        emit_table_scans(
-            plan,
-            program,
-            bindings,
-            ctes,
-            std::slice::from_ref(source),
-            filter,
-            block.hir.from.as_ref(),
-            ScanRowAction::WindowSortInsert { sorter: &sorter },
-        )?;
-        return emit_sorted_window_rows(
-            plan,
-            program,
-            bindings,
-            ctes,
-            block,
-            filter,
-            result,
-            destination,
-            limit,
-            distinct,
-            &sorter,
-        );
-    }
+        .map(|spec| open_window_sorter(plan, program, source_plan, spec))
+        .transpose()?;
     emit_table_scans(
         plan,
         program,
@@ -3000,14 +3124,38 @@ fn emit_ranking_window_query<'document>(
         std::slice::from_ref(source),
         filter,
         block.hir.from.as_ref(),
-        ScanRowAction::WindowProject {
+        ScanRowAction::WindowMaterialize {
+            rows: &rows,
+            sorter: sorter.as_ref(),
+        },
+    )?;
+    if let Some(sorter) = sorter.as_ref() {
+        return emit_sorted_window_rows(
+            plan,
+            program,
+            bindings,
+            ctes,
             block,
-            filter,
+            None,
             result,
             destination,
             limit,
             distinct,
-        },
+            sorter,
+            &rows,
+        );
+    }
+    emit_materialized_window_rows(
+        plan,
+        program,
+        bindings,
+        ctes,
+        block,
+        result,
+        destination,
+        limit,
+        distinct,
+        &rows,
     )
 }
 
@@ -3023,6 +3171,7 @@ fn emit_ranking_window_row<'document>(
     destination: QueryDestination<'_>,
     limit: Option<LimitRuntime>,
     distinct: Option<&DistinctRuntime>,
+    rows: &WindowRows,
 ) -> QueryResult<()> {
     let [source_id] = block.source_order.as_slice() else {
         return Err(PhysicalQueryError::Invalid(
@@ -3071,7 +3220,7 @@ fn emit_ranking_window_row<'document>(
         for function in &block.window_functions {
             if matches!(function.call.function.value(), Func::Agg(_)) {
                 emit_default_aggregate_window(
-                    plan, program, bindings, ctes, function, source, filter,
+                    plan, program, bindings, ctes, function, source, filter, rows,
                 )?;
                 continue;
             }
@@ -3119,6 +3268,7 @@ fn emit_ranking_window_row<'document>(
                     source,
                     filter,
                     outer_rowid,
+                    rows,
                 )?;
                 continue;
             }
@@ -3147,20 +3297,12 @@ fn emit_ranking_window_row<'document>(
                     source,
                     filter,
                     outer_partition,
+                    rows,
                 )?)
             } else {
                 None
             };
-            let inner = open_source(plan, program, bindings, ctes, source)?;
-            let ScanCursor::BTree(inner_cursor) = inner.cursor else {
-                return Err(PhysicalQueryError::Unsupported(
-                    "ranking window over a non-B-tree source",
-                ));
-            };
-            let outer_runtime = bindings.replace_source(
-                *source_id,
-                SourceRuntime::Cursor(super::CursorId(inner.runtime_cursor)),
-            )?;
+            let inner_cursor = duplicate_window_rows(program, rows);
             let value = bindings.window_function(function.id)?.register;
             program.emit_insn(Insn::Integer {
                 value: i64::from(matches!(kind, WindowFunc::Rank | WindowFunc::DenseRank)),
@@ -3199,6 +3341,7 @@ fn emit_ranking_window_row<'document>(
                 pc_if_empty: done,
             });
             program.preassign_label_to_next_insn(loop_start);
+            let outer_runtime = bind_window_row(program, bindings, rows, inner_cursor)?;
             if let Some(filter) = filter {
                 emit_filter(plan, program, bindings, ctes, filter, loop_next)?;
             }
@@ -3518,11 +3661,9 @@ fn emit_ranking_window_row<'document>(
             if let Some(hash_table_id) = distinct_orders {
                 program.emit_insn(Insn::HashClose { hash_table_id });
             }
-            if inner.owned {
-                program.emit_insn(Insn::Close {
-                    cursor_id: inner.cursor.id(),
-                });
-            }
+            program.emit_insn(Insn::Close {
+                cursor_id: inner_cursor,
+            });
             bindings.replace_source(*source_id, outer_runtime)?;
         }
         emit_output_row(
@@ -3555,6 +3696,7 @@ fn emit_ntile_bucket_count<'document>(
     source: &PhysicalSource<'document>,
     filter: Option<&'document Expr>,
     outer_partition: usize,
+    rows: &WindowRows,
 ) -> QueryResult<usize> {
     let argument = function
         .call
@@ -3571,16 +3713,8 @@ fn emit_ntile_bucket_count<'document>(
     let key_count = spec.order_by.len() + 1;
     let first_key = program.alloc_registers(key_count);
     let current_key = program.alloc_registers(key_count);
-    let inner = open_source(plan, program, bindings, ctes, source)?;
-    let ScanCursor::BTree(inner_cursor) = inner.cursor else {
-        return Err(PhysicalQueryError::Unsupported(
-            "ntile over a non-B-tree source",
-        ));
-    };
-    let outer_runtime = bindings.replace_source(
-        source.id,
-        SourceRuntime::Cursor(super::CursorId(inner.runtime_cursor)),
-    )?;
+    let inner_cursor = duplicate_window_rows(program, rows);
+    let mut outer_runtime = None;
     let emission = (|| -> QueryResult<()> {
         let loop_start = program.allocate_label();
         let loop_next = program.allocate_label();
@@ -3591,6 +3725,7 @@ fn emit_ntile_bucket_count<'document>(
             pc_if_empty: done,
         });
         program.preassign_label_to_next_insn(loop_start);
+        outer_runtime = Some(bind_window_row(program, bindings, rows, inner_cursor)?);
         if let Some(filter) = filter {
             emit_filter(plan, program, bindings, ctes, filter, loop_next)?;
         }
@@ -3687,14 +3822,14 @@ fn emit_ntile_bucket_count<'document>(
             pc_if_next: loop_start,
         });
         program.preassign_label_to_next_insn(done);
-        if inner.owned {
-            program.emit_insn(Insn::Close {
-                cursor_id: inner.cursor.id(),
-            });
-        }
+        program.emit_insn(Insn::Close {
+            cursor_id: inner_cursor,
+        });
         Ok(())
     })();
-    bindings.replace_source(source.id, outer_runtime)?;
+    if let Some(outer_runtime) = outer_runtime {
+        bindings.replace_source(source.id, outer_runtime)?;
+    }
     emission?;
 
     program.emit_insn(Insn::Cast {
@@ -3733,6 +3868,7 @@ fn emit_default_aggregate_window<'document>(
     window: &super::PhysicalWindowFunction<'document>,
     source: &PhysicalSource<'document>,
     filter: Option<&'document Expr>,
+    rows: &WindowRows,
 ) -> QueryResult<()> {
     let call = window.call;
     let function = runtime_aggregate_function(call)?;
@@ -3774,16 +3910,8 @@ fn emit_default_aggregate_window<'document>(
             .emit_into(&term.expr, RegisterRange::new(outer_order + position, 1))?;
     }
 
-    let inner = open_source(plan, program, bindings, ctes, source)?;
-    let ScanCursor::BTree(inner_cursor) = inner.cursor else {
-        return Err(PhysicalQueryError::Unsupported(
-            "aggregate window over a non-B-tree source",
-        ));
-    };
-    let outer_runtime = bindings.replace_source(
-        source.id,
-        SourceRuntime::Cursor(super::CursorId(inner.runtime_cursor)),
-    )?;
+    let inner_cursor = duplicate_window_rows(program, rows);
+    let mut outer_runtime = None;
     let emission = (|| -> QueryResult<()> {
         let loop_start = program.allocate_label();
         let loop_next = program.allocate_label();
@@ -3793,6 +3921,7 @@ fn emit_default_aggregate_window<'document>(
             pc_if_empty: done,
         });
         program.preassign_label_to_next_insn(loop_start);
+        outer_runtime = Some(bind_window_row(program, bindings, rows, inner_cursor)?);
         if let Some(filter) = filter {
             emit_filter(plan, program, bindings, ctes, filter, loop_next)?;
         }
@@ -4027,14 +4156,14 @@ fn emit_default_aggregate_window<'document>(
         if let Some(hash_table_id) = distinct {
             program.emit_insn(Insn::HashClose { hash_table_id });
         }
-        if inner.owned {
-            program.emit_insn(Insn::Close {
-                cursor_id: inner.cursor.id(),
-            });
-        }
+        program.emit_insn(Insn::Close {
+            cursor_id: inner_cursor,
+        });
         Ok(())
     })();
-    bindings.replace_source(source.id, outer_runtime)?;
+    if let Some(outer_runtime) = outer_runtime {
+        bindings.replace_source(source.id, outer_runtime)?;
+    }
     emission
 }
 
@@ -4050,6 +4179,7 @@ fn emit_positional_window<'document>(
     source: &PhysicalSource<'document>,
     filter: Option<&'document Expr>,
     outer_rowid: RegisterId,
+    rows: &WindowRows,
 ) -> QueryResult<()> {
     let value = bindings.window_function(function.id)?.register;
     if matches!(kind, WindowFunc::Lag | WindowFunc::Lead) {
@@ -4184,16 +4314,7 @@ fn emit_positional_window<'document>(
         comparators,
     });
 
-    let inner = open_source(plan, program, bindings, ctes, source)?;
-    let ScanCursor::BTree(inner_cursor) = inner.cursor else {
-        return Err(PhysicalQueryError::Unsupported(
-            "navigation window over a non-B-tree source",
-        ));
-    };
-    let outer_runtime = bindings.replace_source(
-        source.id,
-        SourceRuntime::Cursor(super::CursorId(inner.runtime_cursor)),
-    )?;
+    let inner_cursor = duplicate_window_rows(program, rows);
     let scan_start = program.allocate_label();
     let scan_next = program.allocate_label();
     let scan_done = program.allocate_label();
@@ -4202,6 +4323,7 @@ fn emit_positional_window<'document>(
         pc_if_empty: scan_done,
     });
     program.preassign_label_to_next_insn(scan_start);
+    let outer_runtime = bind_window_row(program, bindings, rows, inner_cursor)?;
     if let Some(filter) = filter {
         emit_filter(plan, program, bindings, ctes, filter, scan_next)?;
     }
@@ -4275,11 +4397,9 @@ fn emit_positional_window<'document>(
     });
     program.preassign_label_to_next_insn(scan_done);
     bindings.replace_source(source.id, outer_runtime)?;
-    if inner.owned {
-        program.emit_insn(Insn::Close {
-            cursor_id: inner.cursor.id(),
-        });
-    }
+    program.emit_insn(Insn::Close {
+        cursor_id: inner_cursor,
+    });
 
     let positions = ephemeral_table("window_navigation".to_string(), 1)?;
     let positions_cursor = program.alloc_cursor_id(CursorType::BTreeTable(positions.clone()));
@@ -5812,27 +5932,12 @@ fn emit_scan_action<'document>(
             });
             Ok(())
         }
-        ScanRowAction::WindowProject {
-            block,
-            filter,
-            result,
-            destination,
-            limit,
-            distinct,
-        } => emit_ranking_window_row(
-            plan,
-            program,
-            bindings,
-            ctes,
-            block,
-            filter,
-            result,
-            destination,
-            limit,
-            distinct,
-        ),
-        ScanRowAction::WindowSortInsert { sorter } => {
-            emit_window_sort_insert(plan, program, bindings, ctes, sorter)
+        ScanRowAction::WindowMaterialize { rows, sorter } => {
+            emit_window_row_insert(plan, program, bindings, ctes, rows)?;
+            if let Some(sorter) = sorter {
+                emit_window_sort_insert(plan, program, bindings, ctes, sorter)?;
+            }
+            Ok(())
         }
     }
 }

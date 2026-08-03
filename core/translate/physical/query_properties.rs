@@ -2641,8 +2641,17 @@ fn ranking_windows_rescan_the_bound_hir_source(tc: hegel::TestCase) {
                 )
             })
             .count(),
-        4,
-        "one output scan and one independent rescan per window call"
+        1,
+        "the filtered catalog source is materialized once"
+    );
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::OpenDup { .. }))
+            .count(),
+        3,
+        "each ranking call scans the independent materialized window rows"
     );
     assert_eq!(
         program
@@ -2737,8 +2746,17 @@ fn distribution_windows_use_bound_partition_and_order_inputs(tc: hegel::TestCase
                 )
             })
             .count(),
-        5,
-        "one ordered input scan, one partition rescan per function, and one NTILE bucket scan"
+        1,
+        "the filtered catalog source is materialized once"
+    );
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::OpenDup { .. }))
+            .count(),
+        4,
+        "each function scans the window rows and NTILE has one first-row bucket scan"
     );
     assert!(program
         .insns
@@ -2828,8 +2846,17 @@ fn navigation_windows_materialize_bound_window_order(tc: hegel::TestCase) {
                 )
             })
             .count(),
-        3,
-        "one output scan and one partition materialization per function"
+        1,
+        "the filtered catalog source is materialized once"
+    );
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::OpenDup { .. }))
+            .count(),
+        2,
+        "lag and lead each scan the materialized window rows"
     );
     assert_eq!(
         program
@@ -2917,7 +2944,17 @@ fn positional_value_windows_use_the_bound_default_frame(tc: hegel::TestCase) {
                 )
             })
             .count(),
-        4
+        1,
+        "the filtered catalog source is materialized once"
+    );
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::OpenDup { .. }))
+            .count(),
+        3,
+        "each positional function scans the materialized window rows"
     );
     assert_eq!(
         program
@@ -3008,7 +3045,17 @@ fn aggregate_windows_step_only_the_bound_default_frame(tc: hegel::TestCase) {
                 )
             })
             .count(),
-        4
+        1,
+        "the filtered catalog source is materialized once"
+    );
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::OpenDup { .. }))
+            .count(),
+        3,
+        "each aggregate window scans the materialized window rows"
     );
     assert_eq!(
         program
