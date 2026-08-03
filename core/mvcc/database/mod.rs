@@ -6316,7 +6316,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // txn gets exclusive txn status. check below after the CAS
         if let Some(tx) = self.txs.get(tx_id) {
             let tx = tx.value();
-            if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire) {
+            if self.has_committed_write_tx_newer_than(*tx_id, tx.begin_ts)
+                || tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire)
+            {
                 // Another transaction committed after this transaction's begin timestamp, do not allow exclusive lock.
                 // This mimics regular (non-CONCURRENT) sqlite transaction behavior.
                 return Err(LimboError::Busy);
@@ -6367,7 +6369,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // `CommitState::Initial`.
                 if let Some(tx) = self.txs.get(tx_id) {
                     let tx = tx.value();
-                    if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire) {
+                    if self.has_committed_write_tx_newer_than(*tx_id, tx.begin_ts)
+                        || tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire)
+                    {
                         self.release_exclusive_tx(tx_id);
                         return Err(LimboError::Busy);
                     }
@@ -6379,6 +6383,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 Err(LimboError::Busy)
             }
         }
+    }
+
+    /// Returns true if another write transaction has committed with an end
+    /// timestamp newer than `begin_ts` but has not yet published
+    /// `last_committed_tx_ts`, making it invisible to both the Preparing check
+    /// and the watermark check (#7481). Callers must run this scan before
+    /// loading the watermark: FinalizeCommit publishes the watermark before
+    /// removing the transaction from `txs`, so a committed writer missing from
+    /// the scan is caught by the subsequent watermark load. Read-only
+    /// transactions are excluded because they never publish the watermark.
+    fn has_committed_write_tx_newer_than(&self, tx_id: TxID, begin_ts: u64) -> bool {
+        self.txs.iter().any(|entry| {
+            if *entry.key() == tx_id {
+                return false;
+            }
+            let tx = entry.value();
+            matches!(tx.state.load(), TransactionState::Committed(end_ts) if end_ts > begin_ts)
+                && (tx.header_dirty.load(Ordering::Acquire) || !tx.write_set.lock().is_empty())
+        })
     }
 
     /// Release the exclusive transaction lock if held by the this transaction.
