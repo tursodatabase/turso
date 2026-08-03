@@ -340,21 +340,37 @@ impl Value {
                 // SQLite returns X'hexdigits' for blobs
                 let mut quoted = String::with_capacity(3 + b.len() * 2);
                 quoted.push_str("X'");
-                quoted.push_str(&faster_hex::hex_string_upper(b));
+                quoted.push_str(&hex_string_upper(b));
                 quoted.push('\'');
                 Value::build_text(quoted)
             }
             Value::Text(s) => {
-                let text = sqlite_text_prefix(s.as_str());
-                let mut quoted = String::with_capacity(text.len() + 2);
+                let mut quoted = String::with_capacity(s.as_str().len() + 2);
                 quoted.push('\'');
-                let mut last_end = 0;
-                for i in memchr::memchr_iter(b'\'', text.as_bytes()) {
-                    quoted.push_str(&text[last_end..i]);
-                    quoted.push_str("''");
-                    last_end = i + 1;
+                if s.as_str().len() < SIMD_SEARCH_MIN_HAYSTACK {
+                    // One fused pass: NUL truncation and quote doubling in
+                    // the same loop, so short strings are scanned once.
+                    for c in s.as_str().chars() {
+                        if c == '\0' {
+                            break;
+                        }
+                        if c == '\'' {
+                            quoted.push('\'');
+                        }
+                        quoted.push(c);
+                    }
+                } else {
+                    let text = sqlite_text_prefix(s.as_str());
+                    // Jump between quotes to double with SIMD byte search
+                    // instead of testing every character.
+                    let mut last_end = 0;
+                    for i in memchr::memchr_iter(b'\'', text.as_bytes()) {
+                        quoted.push_str(&text[last_end..i]);
+                        quoted.push_str("''");
+                        last_end = i + 1;
+                    }
+                    quoted.push_str(&text[last_end..]);
                 }
-                quoted.push_str(&text[last_end..]);
                 quoted.push('\'');
                 Value::build_text(quoted)
             }
@@ -613,9 +629,9 @@ impl Value {
         match self {
             Value::Text(_) | Value::Numeric(_) => {
                 let text = self.to_string();
-                Value::build_text(faster_hex::hex_string_upper(text.as_bytes()))
+                Value::build_text(hex_string_upper(text.as_bytes()))
             }
-            Value::Blob(blob_bytes) => Value::build_text(faster_hex::hex_string_upper(blob_bytes)),
+            Value::Blob(blob_bytes) => Value::build_text(hex_string_upper(blob_bytes)),
             Value::Null => Value::build_text(""),
         }
     }
@@ -628,9 +644,10 @@ impl Value {
                     Some(text) => {
                         let input = &text[0..text.find('\0').unwrap_or(text.len())];
                         let mut bytes = crate::alloc::vec![0; input.len() / 2];
-                        match faster_hex::hex_decode(input.as_bytes(), &mut bytes) {
-                            Ok(()) => Value::from_blob(bytes),
-                            Err(_) => Value::Null,
+                        if hex_decode(input.as_bytes(), &mut bytes) {
+                            Value::from_blob(bytes)
+                        } else {
+                            Value::Null
                         }
                     }
                     None => Value::Null,
@@ -1552,6 +1569,47 @@ const GLOB_INFO: PatternInfo = PatternInfo {
 /// Below this haystack size the scalar search wins: `memmem::find`'s per-call
 /// searcher construction costs more than scanning the whole haystack.
 const SIMD_SEARCH_MIN_HAYSTACK: usize = 64;
+
+/// Uppercase hex encoding: scalar nibble lookup for small inputs, where
+/// faster-hex's per-call dispatch and buffer setup cost more than the whole
+/// encode, SIMD above the gate.
+fn hex_string_upper(bytes: &[u8]) -> String {
+    if bytes.len() < SIMD_SEARCH_MIN_HAYSTACK {
+        const LUT: &[u8; 16] = b"0123456789ABCDEF";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for &b in bytes {
+            out.push(LUT[(b >> 4) as usize] as char);
+            out.push(LUT[(b & 0x0f) as usize] as char);
+        }
+        out
+    } else {
+        faster_hex::hex_string_upper(bytes)
+    }
+}
+
+/// Hex decoding of pure (separator-free) input into `out`, which the caller
+/// sizes to `input.len() / 2`. Scalar for small inputs, SIMD above the gate.
+/// Returns false on odd-length input or a non-hex digit, matching
+/// `faster_hex::hex_decode`'s error cases.
+fn hex_decode(input: &[u8], out: &mut [u8]) -> bool {
+    if input.len() >= SIMD_SEARCH_MIN_HAYSTACK {
+        return faster_hex::hex_decode(input, out).is_ok();
+    }
+    if input.len() % 2 != 0 {
+        return false;
+    }
+    for (pair, byte) in input.chunks_exact(2).zip(out.iter_mut()) {
+        let (hi, lo) = (
+            (pair[0] as char).to_digit(16),
+            (pair[1] as char).to_digit(16),
+        );
+        let (Some(hi), Some(lo)) = (hi, lo) else {
+            return false;
+        };
+        *byte = ((hi << 4) | lo) as u8;
+    }
+    true
+}
 
 /// replace() body: SIMD `memmem` scan over large sources, std's searcher for
 /// small ones. Outlined for the same code-size reason as [`find_subslice`].
