@@ -259,3 +259,42 @@ matrix infinite-range-keys {
     WINDOW w AS (ORDER BY k $dir RANGE BETWEEN $soff PRECEDING AND $eoff FOLLOWING)
     ORDER BY k $dir;
 }
+
+# --- Frame offsets use SQLite's strict constant-expression rule. Function
+# calls and current-time keywords are rejected even when their result is
+# deterministic or hidden in a dead CASE arm; arithmetic, CAST, CASE, and IN
+# over literal values remain valid.
+setup offset_expressions {
+    CREATE TABLE toe(k INT);
+    INSERT INTO toe VALUES (1),(2),(3);
+}
+
+@setup offset_expressions
+@var mode { ROWS | GROUPS | RANGE }
+@var offset { abs(-1) | coalesce(NULL, 1) | CAST(CURRENT_DATE AS INTEGER) | CASE WHEN 1 THEN 1 ELSE abs(-1) END }
+matrix rejected-frame-start-offset-expressions {
+    SELECT k, sum(k) OVER (
+        ORDER BY k $mode BETWEEN $offset PRECEDING AND CURRENT ROW
+    )
+    FROM toe ORDER BY k;
+}
+
+@setup offset_expressions
+@var mode { ROWS | GROUPS | RANGE }
+@var offset { abs(-1) | coalesce(NULL, 1) | CAST(CURRENT_TIMESTAMP AS INTEGER) | CASE WHEN 0 THEN abs(-1) ELSE 1 END }
+matrix rejected-frame-end-offset-expressions {
+    SELECT k, sum(k) OVER (
+        ORDER BY k $mode BETWEEN CURRENT ROW AND $offset FOLLOWING
+    )
+    FROM toe ORDER BY k;
+}
+
+@setup offset_expressions
+@var mode { ROWS | GROUPS | RANGE }
+@var offset { 1 + 0 | CAST('1' AS INTEGER) | CASE WHEN 1 THEN 1 ELSE 2 END | 1 IN (1, 2) }
+matrix accepted-frame-offset-expressions {
+    SELECT k,
+           sum(k) OVER (ORDER BY k $mode BETWEEN $offset PRECEDING AND CURRENT ROW),
+           sum(k) OVER (ORDER BY k $mode BETWEEN CURRENT ROW AND $offset FOLLOWING)
+    FROM toe ORDER BY k;
+}

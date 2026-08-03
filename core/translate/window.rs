@@ -885,8 +885,7 @@ fn emit_frame_offset(
     mode: turso_parser::ast::FrameMode,
     pos: FrameBoundPosition,
 ) -> Result<()> {
-    use crate::translate::optimizer::Optimizable;
-    if expr.is_constant(resolver) {
+    if is_constant_frame_offset(expr, resolver)? {
         translate_expr_no_constant_opt(
             program,
             Some(&plan.table_references),
@@ -903,6 +902,35 @@ fn emit_frame_offset(
     }
     emit_window_check_offset(program, reg, mode, pos);
     Ok(())
+}
+
+/// SQLite uses a stricter constant-expression rule for frame offsets than it
+/// uses for normal constant folding. In particular, function calls and the
+/// current-time keywords are rejected even when they are deterministic or sit
+/// in a CASE branch that cannot run.
+fn is_constant_frame_offset(expr: &Expr, resolver: &Resolver<'_>) -> Result<bool> {
+    use crate::translate::optimizer::Optimizable;
+
+    if !expr.is_constant(resolver) {
+        return Ok(false);
+    }
+
+    let mut allowed = true;
+    walk_expr(expr, &mut |node| {
+        if matches!(
+            node,
+            Expr::FunctionCall { .. }
+                | Expr::FunctionCallStar { .. }
+                | Expr::Literal(
+                    Literal::CurrentDate | Literal::CurrentTime | Literal::CurrentTimestamp
+                )
+        ) {
+            allowed = false;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(allowed)
 }
 
 /// Emit a runtime check that the frame-offset register holds a
