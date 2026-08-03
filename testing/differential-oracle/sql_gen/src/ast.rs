@@ -1003,6 +1003,13 @@ pub struct UpdateStmt {
     pub where_clause: Option<Expr>,
     pub conflict: Option<ConflictClause>,
     pub returning: Option<Vec<Expr>>,
+    /// Emit `NOT INDEXED` on the target and every FROM/JOIN table, forcing a
+    /// rowid-order table scan. An `UPDATE ... FROM` where a target row matches
+    /// several source rows uses one of them, and which one depends on the scan
+    /// order the planner picks — Turso favors a covering index, SQLite a table
+    /// scan, so the results differ. Pinning both engines to a table scan makes
+    /// the choice deterministic.
+    pub not_indexed: bool,
 }
 
 impl fmt::Display for UpdateStmt {
@@ -1014,10 +1021,23 @@ impl fmt::Display for UpdateStmt {
         if let Some(conflict) = &self.conflict {
             write!(f, "{conflict}")?;
         }
+        // `NOT INDEXED` follows the (optional) alias on the target and on every
+        // FROM/JOIN table, per the qualified-table-name grammar. It only
+        // applies to real tables: a subquery source (`(SELECT ...)`) cannot
+        // take it, so skip those.
+        let not_indexed = |table: &str| -> &'static str {
+            if self.not_indexed && !table.trim_start().starts_with('(') {
+                " NOT INDEXED"
+            } else {
+                ""
+            }
+        };
+
         write!(f, " {}", self.table)?;
         if let Some(alias) = &self.alias {
             write!(f, " AS {alias}")?;
         }
+        write!(f, "{}", not_indexed(&self.table))?;
         write!(f, " SET ")?;
 
         for (i, (col, val)) in self.sets.iter().enumerate() {
@@ -1032,6 +1052,7 @@ impl fmt::Display for UpdateStmt {
             if let Some(alias) = &from.alias {
                 write!(f, " AS {alias}")?;
             }
+            write!(f, "{}", not_indexed(&from.table))?;
         }
 
         for join in &self.joins {
@@ -1044,6 +1065,7 @@ impl fmt::Display for UpdateStmt {
             if let Some(alias) = &join.alias {
                 write!(f, " AS {alias}")?;
             }
+            write!(f, "{}", not_indexed(&join.table))?;
             if let Some(JoinConstraint::On(expr)) = &join.constraint {
                 write!(f, " ON {expr}")?;
             }
@@ -2391,6 +2413,67 @@ mod tests {
         assert_eq!(
             insert.to_string(),
             "INSERT INTO users (name, age) VALUES ('Alice', 30)"
+        );
+    }
+
+    #[test]
+    fn update_from_not_indexed_display() {
+        let mut ctx = Context::new_with_seed(42);
+        let stmt = UpdateStmt {
+            with_clause: None,
+            table: "t".to_string(),
+            alias: None,
+            sets: vec![(
+                "v".to_string(),
+                Expr::literal(&mut ctx, Literal::Integer(1)),
+            )],
+            from: Some(FromClause {
+                table: "s".to_string(),
+                alias: None,
+            }),
+            joins: vec![JoinClause {
+                join_type: JoinType::Inner,
+                table: "j".to_string(),
+                alias: None,
+                constraint: None,
+            }],
+            where_clause: None,
+            conflict: None,
+            returning: None,
+            not_indexed: true,
+        };
+        assert_eq!(
+            stmt.to_string(),
+            "UPDATE t NOT INDEXED SET v = 1 FROM s NOT INDEXED JOIN j NOT INDEXED"
+        );
+    }
+
+    #[test]
+    fn update_from_not_indexed_skips_subquery_source() {
+        let mut ctx = Context::new_with_seed(42);
+        // NOT INDEXED is not valid on a subquery source, so it must be omitted
+        // there while still applying to the real target table.
+        let stmt = UpdateStmt {
+            with_clause: None,
+            table: "t".to_string(),
+            alias: None,
+            sets: vec![(
+                "v".to_string(),
+                Expr::literal(&mut ctx, Literal::Integer(1)),
+            )],
+            from: Some(FromClause {
+                table: "(SELECT k FROM s)".to_string(),
+                alias: Some("x".to_string()),
+            }),
+            joins: vec![],
+            where_clause: None,
+            conflict: None,
+            returning: None,
+            not_indexed: true,
+        };
+        assert_eq!(
+            stmt.to_string(),
+            "UPDATE t NOT INDEXED SET v = 1 FROM (SELECT k FROM s) AS x"
         );
     }
 

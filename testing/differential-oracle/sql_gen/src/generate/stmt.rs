@@ -269,11 +269,13 @@ pub fn generate_insert<C: Capabilities>(
         return Err(GenError::exhausted("insert", "no columns to insert"));
     }
 
-    // Generate conflict clause
+    // Generate conflict clause. INSERT applies rows in VALUES order, so OR
+    // FAIL's partial result is deterministic and safe to generate.
     let conflict = generate_conflict_clause(
         ctx,
         insert_config.or_replace_probability,
         insert_config.or_ignore_probability,
+        true,
     );
 
     // Generate values (push table into scope for expression generation)
@@ -425,11 +427,14 @@ pub fn generate_update<C: Capabilities>(
     };
 
     ctx.with_table_scope(scope_tables, |ctx| {
-        // Generate conflict clause
+        // Generate conflict clause. OR FAIL is excluded: a multi-row UPDATE
+        // that hits it keeps whichever rows were visited first, and that order
+        // is not guaranteed to match between engines.
         let conflict = generate_conflict_clause(
             ctx,
             update_config.or_replace_probability,
             update_config.or_ignore_probability,
+            false,
         );
 
         // Generate SET clause
@@ -469,6 +474,11 @@ pub fn generate_update<C: Capabilities>(
             where_clause,
             conflict,
             returning,
+            // An UPDATE ... FROM whose join matches a target row against several
+            // source rows uses one of them, chosen by scan order. Force a table
+            // scan on the target and sources so SQLite and Turso pick the same
+            // one. Plain UPDATEs are order-independent and keep their coverage.
+            not_indexed: from_clause.is_some(),
         }))
     })
 }
@@ -649,10 +659,16 @@ fn generate_from_column_ref(
 /// Uses the existing `or_replace_probability` and `or_ignore_probability` from the config,
 /// plus equal weights for Abort, Fail, and Rollback. If neither or_replace nor or_ignore
 /// has any probability, no conflict clause is generated.
+///
+/// `allow_fail` gates OR FAIL. OR FAIL keeps the rows updated before the
+/// conflicting one, so for a multi-row UPDATE the surviving rows depend on the
+/// order rows are visited — which SQLite and Turso need not share. Callers
+/// whose result would then be order-dependent pass `false`.
 fn generate_conflict_clause(
     ctx: &mut Context,
     or_replace_prob: f64,
     or_ignore_prob: f64,
+    allow_fail: bool,
 ) -> Option<ConflictClause> {
     // Total probability of getting any conflict clause
     let total_prob = or_replace_prob + or_ignore_prob;
@@ -670,12 +686,13 @@ fn generate_conflict_clause(
     let replace_w = (or_replace_prob * 100.0) as u32;
     let ignore_w = (or_ignore_prob * 100.0) as u32;
     let other_w = ((replace_w + ignore_w) / 3).max(1);
+    let fail_w = if allow_fail { other_w } else { 0 };
 
     let items = [
         (ConflictClause::Replace, replace_w),
         (ConflictClause::Ignore, ignore_w),
         (ConflictClause::Abort, other_w),
-        (ConflictClause::Fail, other_w),
+        (ConflictClause::Fail, fail_w),
         (ConflictClause::Rollback, other_w),
     ];
 

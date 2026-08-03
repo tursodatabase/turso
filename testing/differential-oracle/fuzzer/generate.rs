@@ -175,13 +175,17 @@ impl SqlGenBackend {
         // Boost UPDATE FROM coverage
         policy.update_config.from_probability = 0.4;
         policy.update_config.returning_probability = 0.2;
-        // An UPDATE FROM self-join can find several source rows for one row
-        // being updated. SQLite allows any one of them to supply the new
-        // values, so Turso may make a different but equally valid choice.
-        // UPDATE FROM with two different tables remains enabled.
+        // An UPDATE ... FROM whose source matches a target row several times
+        // uses one of them, chosen by scan order. For a single source table the
+        // generator forces NOT INDEXED so both engines do a rowid-order table
+        // scan and agree. That does not extend to joins: Turso builds an
+        // ephemeral index to evaluate a JOIN while SQLite scans, so the match
+        // order still differs and NOT INDEXED (which only pins base-table
+        // access) cannot align them. Keep UPDATE FROM to a single real table:
+        // no joins, no self-joins, and no subquery sources.
         policy.update_config.self_join_probability = 0.0;
-        policy.update_config.join_in_from_probability = 0.3;
-        policy.update_config.subquery_from_probability = 0.15;
+        policy.update_config.join_in_from_probability = 0.0;
+        policy.update_config.subquery_from_probability = 0.0;
         policy.update_config.target_alias_probability = 0.2;
         policy.update_config.from_set_reference_probability = 0.5;
         Self { ctx, policy }
