@@ -80,7 +80,7 @@ fn seed_pk_composite_fanout() -> Scenario {
     tx.commit().unwrap();
     Scenario {
         name: "pk_composite_fanout",
-        query: "SELECT count(*), sum(l_q) FROM orders JOIN lineitem ON l_oid = o_id",
+        query: "SELECT count(*), sum(o_v) FROM orders JOIN lineitem ON l_oid = o_id",
         dir,
     }
 }

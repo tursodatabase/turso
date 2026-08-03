@@ -559,7 +559,7 @@ expect {
 }
 
 @skip-if sqlite "query plan explanation output is different in sqlite"
-test merge-plan-noncovering-index {
+test merge-plan-noncovering-index-falls-back {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, k INTEGER, v TEXT);
     CREATE TABLE t2(id INTEGER PRIMARY KEY, k INTEGER, w TEXT);
     CREATE INDEX t1k ON t1(k);
@@ -569,8 +569,22 @@ test merge-plan-noncovering-index {
     EXPLAIN QUERY PLAN SELECT t1.v, t2.w FROM t1 JOIN t2 ON t1.k = t2.k;
 }
 expect {
-    1|0|0|SCAN t2 USING INDEX t2k
-    2|0|0|MERGE JOIN t1 USING INDEX t1k
+    1|0|0|SCAN t1
+    2|0|0|SEARCH t2 USING INDEX t2k (k=?)
+}
+
+test merge-plan-covering-index-both-sides {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, k INTEGER, v TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, k INTEGER, w TEXT);
+    CREATE INDEX t1k ON t1(k);
+    CREATE INDEX t2k ON t2(k);
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 500) INSERT INTO t1 SELECT x, x % 50, 'L' || x FROM c;
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 500) INSERT INTO t2 SELECT x, x % 50, 'R' || x FROM c;
+    EXPLAIN QUERY PLAN SELECT t1.id, t2.id FROM t1 JOIN t2 ON t1.k = t2.k;
+}
+expect {
+    1|0|0|SCAN t1 USING COVERING INDEX t1k
+    2|0|0|MERGE JOIN t2 USING COVERING INDEX t2k
 }
 
 @skip-if sqlite "query plan explanation output is different in sqlite"
@@ -581,10 +595,10 @@ test merge-plan-composite-autoindex {
     WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 100) INSERT INTO customer SELECT x, 'c' || x FROM c;
     WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 400) INSERT INTO orders SELECT x, (x % 100) + 1 FROM c;
     WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 800) INSERT INTO lineitem SELECT (x + 1) / 2, ((x + 1) % 2) + 1, x FROM c;
-    EXPLAIN QUERY PLAN SELECT o.o_id, l.qty, cu.name FROM orders o JOIN lineitem l ON o.o_id = l.orderkey JOIN customer cu ON o.custkey = cu.c_id;
+    EXPLAIN QUERY PLAN SELECT o.o_id, l.linenum, cu.name FROM orders o JOIN lineitem l ON o.o_id = l.orderkey JOIN customer cu ON o.custkey = cu.c_id;
 }
 expect {
     1|0|0|SCAN orders AS o
-    2|0|0|MERGE JOIN lineitem AS l USING INDEX sqlite_autoindex_lineitem_1
+    2|0|0|MERGE JOIN lineitem AS l USING COVERING INDEX sqlite_autoindex_lineitem_1
     3|0|0|SEARCH cu USING INTEGER PRIMARY KEY (rowid=?)
 }

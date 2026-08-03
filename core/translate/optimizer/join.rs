@@ -1095,6 +1095,9 @@ fn seed_ordered_single_table_variants(
             if index.ephemeral || index.where_clause.is_some() || index.index_method.is_some() {
                 continue;
             }
+            if !table_ref.index_is_covering(index) {
+                continue;
+            }
             for iter_dir in [IterationDirection::Forwards, IterationDirection::Backwards] {
                 let consumed = btree_access_order_consumed(
                     table_ref,
@@ -1110,7 +1113,7 @@ fn seed_ordered_single_table_variants(
                 }
                 let index_info = IndexInfo {
                     unique: index.unique,
-                    covering: table_ref.index_is_covering(index),
+                    covering: true,
                     column_count: index.columns.len(),
                     rows_per_leaf_page: rows_per_leaf_page_for_index(
                         index.columns.len(),
@@ -1118,7 +1121,7 @@ fn seed_ordered_single_table_variants(
                         params.rows_per_table_page,
                     ),
                 };
-                let mut cost = estimate_cost_for_scan_or_seek(
+                let cost = estimate_cost_for_scan_or_seek(
                     Some(index_info),
                     &constraints[table_idx].constraints,
                     &[],
@@ -1128,21 +1131,6 @@ fn seed_ordered_single_table_variants(
                     params,
                     None,
                 );
-                if !index_info.covering {
-                    let tree_depth = if *base_rows <= 1.0 {
-                        1.0
-                    } else {
-                        ((*base_rows).ln() / params.rows_per_table_page.ln())
-                            .ceil()
-                            .max(1.0)
-                    };
-                    cost = cost
-                        + Cost(
-                            *base_rows
-                                * (tree_depth * params.cache_reuse_factor
-                                    + params.cpu_cost_per_seek),
-                        );
-                }
                 if cheapest
                     .as_ref()
                     .is_none_or(|(existing_cost, _, _)| cost < *existing_cost)

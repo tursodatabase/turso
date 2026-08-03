@@ -93,6 +93,12 @@ cheaper. Without this, `SELECT * FROM l JOIN r ON l.k = r.k` (both sides indexed
 would memoize only the table scan for `{l}` and the merge join between the two indexes could
 never be discovered.
 
+Seeded ordered variants are limited to covering index scans. Scanning a non-covering index
+just to obtain an ordering pays one table btree lookup per row, which costs more at runtime
+than the sort-free merge saves. Orders that arrive for free (rowid-order table scans, or a
+covering index scan that is competitive on its own) still flow into the memo through the
+regular access-path candidates.
+
 This follows the classic treatment in Database System Concepts §16.4.1: it is not enough to
 store the best join order per subset; the best order per (subset, interesting sort order) must
 be retained.
@@ -115,6 +121,13 @@ For the inner side of a join the planner chooses between:
    Merge join validity also requires that applying the comparison affinity to the outer key
    stream preserves its order (checked via `sqlite3IndexAffinityOk` semantics against the outer
    column's affinity) and that both sides order text under the same collation.
+
+   The inner side must be fetch-free: either the rowid btree itself or an index that covers
+   every column the query reads from that table. Merging through a non-covering index pays one
+   table btree lookup per matched row, which measured slower than the nested loop plans it
+   replaced on TPC-H (the model cannot see that lookups into a small hot btree beat lookups
+   into a large one at equal tree depth), so those candidates are skipped entirely rather than
+   priced.
 
 ### Estimation of cost and cardinalities + a note on table statistics
 

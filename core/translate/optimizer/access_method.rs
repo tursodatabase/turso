@@ -1550,16 +1550,21 @@ pub fn try_merge_join_access_method(
             continue;
         }
         let index_info = match candidate.index.as_ref() {
-            Some(index) => IndexInfo {
-                unique: index.unique,
-                covering: rhs_table.index_is_covering(index),
-                column_count: index.columns.len(),
-                rows_per_leaf_page: rows_per_leaf_page_for_index(
-                    index.columns.len(),
-                    rhs_table,
-                    params.rows_per_table_page,
-                ),
-            },
+            Some(index) => {
+                if !rhs_table.index_is_covering(index) {
+                    continue;
+                }
+                IndexInfo {
+                    unique: index.unique,
+                    covering: true,
+                    column_count: index.columns.len(),
+                    rows_per_leaf_page: rows_per_leaf_page_for_index(
+                        index.columns.len(),
+                        rhs_table,
+                        params.rows_per_table_page,
+                    ),
+                }
+            }
             None => IndexInfo {
                 unique: true,
                 covering: true,
@@ -1580,22 +1585,8 @@ pub fn try_merge_join_access_method(
             Some(&analyze_ctx),
         );
         let leaf_pages = (*rhs_base_rows / index_info.rows_per_leaf_page).max(1.0);
-        let matched_rows_total = input_cardinality * rows_per_seek;
-        let table_lookup_cost = if index_info.covering {
-            0.0
-        } else {
-            let tree_depth = if *rhs_base_rows <= 1.0 {
-                1.0
-            } else {
-                ((*rhs_base_rows).ln() / params.rows_per_table_page.ln())
-                    .ceil()
-                    .max(1.0)
-            };
-            matched_rows_total
-                * (tree_depth * params.cache_reuse_factor + params.cpu_cost_per_seek)
-        };
         let cpu_cost = (input_cardinality * 2.0 + *rhs_base_rows) * params.cpu_cost_per_row;
-        let cost = Cost(leaf_pages + table_lookup_cost + cpu_cost);
+        let cost = Cost(leaf_pages + cpu_cost);
         let consumed_where_terms =
             consumed_where_terms_from_constraint_refs(&rhs_constraints.constraints, &eq_prefix);
         let method = AccessMethod {

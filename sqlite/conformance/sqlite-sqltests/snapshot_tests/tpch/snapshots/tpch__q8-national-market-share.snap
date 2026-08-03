@@ -50,7 +50,7 @@ info:
 QUERY PLAN
 |--SCAN all_nations
 |  |--SCAN orders
-|  |--MERGE JOIN lineitem USING INDEX sqlite_autoindex_lineitem_1
+|  |--SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
 |  |--SEARCH part USING INTEGER PRIMARY KEY (rowid=?)
 |  |--SEARCH customer USING INTEGER PRIMARY KEY (rowid=?)
 |  |--SEARCH n1 USING INTEGER PRIMARY KEY (rowid=?)
