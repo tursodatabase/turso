@@ -137,6 +137,21 @@ impl ConfigRecord {
 }
 
 fn main() -> Result<()> {
+    // Preparing a deeply nested expression recurses once per nesting level,
+    // and debug-build parser frames are large enough that a statement within
+    // Turso's expression depth limit can still blow the default 8 MiB stack.
+    // Run everything on a thread with plenty of stack; statements over the
+    // depth limit still get the parser's clean "expression tree is too large"
+    // error and are skipped. The memory is only committed as it is used.
+    std::thread::Builder::new()
+        .name("fuzzer".to_string())
+        .stack_size(256 * 1024 * 1024)
+        .spawn(fuzzer_main)?
+        .join()
+        .expect("fuzzer thread panicked")
+}
+
+fn fuzzer_main() -> Result<()> {
     // Initialize tracing
     let mut subscriber = tracing_subscriber::fmt().with_env_filter(
         tracing_subscriber::EnvFilter::from_default_env()
