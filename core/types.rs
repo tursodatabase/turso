@@ -25,6 +25,7 @@ use crate::vtab::VirtualTableCursor;
 use crate::{Completion, CompletionError, Result, IO};
 use std::borrow::{Borrow, Cow};
 use std::cell::Cell;
+use std::cell::UnsafeCell;
 use std::cmp::Ordering;
 use std::fmt::{Debug, Display};
 use std::future::Future;
@@ -1156,6 +1157,122 @@ impl<'a> TryFrom<ValueRef<'a>> for &'a str {
     }
 }
 
+/// Remembers where each column starts inside one record, so a statement that
+/// reads several columns of the same row walks the record header once instead
+/// of once per column.
+///
+/// Entry `i` holds the offset of column `i`'s serial type inside the header
+/// section, and the offset of column `i`'s bytes inside the data section. Both
+/// are relative to the two sections [`ValueIterator`] exposes, so a hit costs
+/// two slice offsets and the caller decodes from there as usual. Serial types
+/// are deliberately not stored: re-reading one varint at decode time is cheaper
+/// than making every entry bigger, and entry size is what decides how much of
+/// this survives in L1 on a wide table.
+///
+/// Parsing is incremental. Reading column 3 of a 106-column row parses 4 serial
+/// types, not 106. This matters more than it looks: an earlier attempt at
+/// record header caching (PR #4472) parsed the whole header on first touch,
+/// which made narrow reads of wide tables slower than no cache at all and got
+/// the whole thing reverted an hour after it landed.
+///
+/// The cache is only ever filled for cursors the compiler marked as worth it,
+/// see [`crate::vdbe::PreparedProgram::cursor_wants_record_cache`]. For every
+/// other cursor `entries` stays empty and never allocates.
+#[derive(Debug, Default)]
+pub struct RecordCache {
+    /// `(header offset, data offset)` per column, plus one trailing entry
+    /// marking where parsing stopped. Always starts at `(0, 0)`.
+    ///
+    /// Deliberately `std::vec::Vec` rather than `crate::alloc::Vec`: the latter
+    /// carries an allocator parameter on nightly and has no `const` empty
+    /// constructor, which would cost `ImmutableRecord::from_bin_record` its
+    /// `const fn`. The tradeoff is that these bytes do not show up in
+    /// `TursoAllocator`'s accounting.
+    entries: std::vec::Vec<(u32, u32)>,
+    /// Set when a record is too big for the `u32` offsets above. Such a record
+    /// is read through the uncached path instead of being mis-parsed.
+    oversized: bool,
+}
+
+impl RecordCache {
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            entries: std::vec::Vec::new(),
+            oversized: false,
+        }
+    }
+
+    /// Drops what we know about the current row but keeps the allocation, so a
+    /// scan pays for the `Vec` once rather than once per row.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.oversized = false;
+    }
+
+    /// Parses serial types until column `target`'s position is known, or until
+    /// the header runs out. `header` must be the record's header section, i.e.
+    /// what [`ValueIterator::header_section_ref`] returns for a fresh iterator.
+    pub fn position_of(&mut self, header: &[u8], target: usize) -> Result<ColumnPosition> {
+        if self.oversized {
+            return Ok(ColumnPosition::Unusable);
+        }
+        if self.entries.is_empty() {
+            self.entries.push((0, 0));
+        }
+        // Entry `target + 1` existing is what proves column `target` was parsed
+        // successfully; entry `target` alone can just be where parsing stopped.
+        while self.entries.len() <= target + 1 {
+            let (header_offset, data_offset) = *self
+                .entries
+                .last()
+                .expect("entries is non-empty: a (0, 0) entry is pushed above");
+            let header_offset = header_offset as usize;
+            if header_offset >= header.len() {
+                // Record has fewer columns than the caller asked for.
+                return Ok(ColumnPosition::NoSuchColumn);
+            }
+            let (serial_type, bytes_read) = read_varint(&header[header_offset..])?;
+            let size = get_serial_type_size(serial_type)?;
+            let (Ok(next_header), Ok(next_data)) = (
+                u32::try_from(header_offset + bytes_read),
+                u32::try_from(data_offset as usize + size),
+            ) else {
+                // A record whose sections do not fit in `u32`. Rather than
+                // truncate an offset, disown this record: the caller falls back
+                // to walking the header, which handles any size.
+                self.entries.clear();
+                self.oversized = true;
+                return Ok(ColumnPosition::Unusable);
+            };
+            self.entries.push((next_header, next_data));
+        }
+        let (header_offset, data_offset) = self.entries[target];
+        Ok(ColumnPosition::Found {
+            header_offset: header_offset as usize,
+            data_offset: data_offset as usize,
+        })
+    }
+}
+
+/// What [`RecordCache::position_of`] found. The three cases lead to different
+/// things, and collapsing `Unusable` into `NoSuchColumn` would turn a record
+/// this cache cannot index into a row of NULLs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnPosition {
+    /// Column starts here, relative to the header and data sections.
+    Found {
+        header_offset: usize,
+        data_offset: usize,
+    },
+    /// The record genuinely has no such column, so the caller applies the
+    /// column's DEFAULT exactly as the uncached path does.
+    NoSuchColumn,
+    /// This cache cannot describe this record. Read it the slow way.
+    Unusable,
+}
+
 mod immutable_record {
     use super::*;
 
@@ -1170,6 +1287,20 @@ mod immutable_record {
         //
         // payload is the std::vec::Vec<u8> but in order to use Register which holds ImmutableRecord as a Value - we store std::vec::Vec<u8> as Value::Blob
         payload: Value,
+        // Where each column starts in `payload`. `None` unless the running
+        // statement reads enough columns per row to pay for filling it in; see
+        // `RecordCache`.
+        //
+        // Boxed to keep this struct one word wider rather than four. Records
+        // are created, cloned and moved constantly, and storing the cache
+        // inline doubled `size_of::<ImmutableRecord>()`, which cost time on
+        // reads that never look at the cache at all.
+        //
+        // `UnsafeCell` because column reads take `&self` and there is no point
+        // paying `RefCell`'s runtime borrow flag on the hottest read path in
+        // the engine. Safe for the same reason the `Send`/`Sync` impls below
+        // are: one record is only ever touched by one connection's thread.
+        cache: UnsafeCell<Option<Box<RecordCache>>>,
     }
 
     // SAFETY: all ImmutableRecord instances are intended to be used in a single thread
@@ -1181,6 +1312,10 @@ mod immutable_record {
         fn clone(&self) -> Self {
             Self {
                 payload: self.payload.clone(),
+                // The clone starts cold rather than copying entries. Cloning is
+                // itself a hot path (`record_recycling`), and a clone that is
+                // read column-by-column refills what it needs on first touch.
+                cache: UnsafeCell::new(None),
             }
         }
     }
@@ -1646,6 +1781,7 @@ mod immutable_record {
             payload.try_reserve_exact(payload_capacity)?;
             Ok(Self {
                 payload: Value::Blob(payload),
+                cache: UnsafeCell::new(None),
             })
         }
 
@@ -1660,6 +1796,7 @@ mod immutable_record {
         pub fn from_buf(buf: RecordBuf) -> Self {
             Self {
                 payload: Value::Blob(buf.0),
+                cache: UnsafeCell::new(None),
             }
         }
 
@@ -1670,12 +1807,14 @@ mod immutable_record {
             buf.try_extend(payload.iter().copied())?;
             Ok(Self {
                 payload: Value::Blob(buf),
+                cache: UnsafeCell::new(None),
             })
         }
 
         pub const fn from_bin_record(payload: ValueBlob) -> Self {
             Self {
                 payload: Value::Blob(payload),
+                cache: UnsafeCell::new(None),
             }
         }
 
@@ -1791,6 +1930,7 @@ mod immutable_record {
             writer.assert_finish_capacity();
             Ok(Self {
                 payload: Value::Blob(buf),
+                cache: UnsafeCell::new(None),
             })
         }
 
@@ -1810,8 +1950,11 @@ mod immutable_record {
             }
         }
 
+        /// Private on purpose: every payload mutation has to clear
+        /// [`RecordCache`], so it goes through `invalidate`,
+        /// `start_serialization` or `replace_payload` rather than here.
         #[inline]
-        pub const fn as_blob_mut(&mut self) -> &mut ValueBlob {
+        const fn as_blob_mut(&mut self) -> &mut ValueBlob {
             match &mut self.payload {
                 Value::Blob(b) => b,
                 _ => panic!("payload must be a blob"),
@@ -1826,6 +1969,11 @@ mod immutable_record {
         #[inline]
         #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::RecordCopy)]
         pub fn start_serialization(&mut self, payload: &[u8]) -> Result<()> {
+            // New row in a reused record: what we knew about the old one's
+            // column positions no longer describes these bytes.
+            if let Some(cache) = self.cache.get_mut() {
+                cache.clear();
+            }
             let blob = self.as_blob_mut();
             blob.try_reserve(payload.len())?;
             blob.extend_from_slice(payload);
@@ -1834,7 +1982,47 @@ mod immutable_record {
 
         #[inline]
         pub fn invalidate(&mut self) {
+            if let Some(cache) = self.cache.get_mut() {
+                cache.clear();
+            }
             self.as_blob_mut().clear();
+        }
+
+        /// Replaces this record's bytes with `payload`, keeping the existing
+        /// allocation.
+        ///
+        /// Callers must go through this rather than reaching for the blob
+        /// directly: overwriting the payload behind the record's back would
+        /// leave the column positions in [`RecordCache`] describing bytes that
+        /// are no longer there, and the next column read would decode garbage.
+        pub fn replace_payload(&mut self, payload: &[u8]) -> Result<(), TryReserveError> {
+            if let Some(cache) = self.cache.get_mut() {
+                cache.clear();
+            }
+            let blob = self.as_blob_mut();
+            blob.clear();
+            blob.try_extend(payload.iter().copied())?;
+            Ok(())
+        }
+
+        /// Position of `column` inside this record's header and data sections,
+        /// remembering the walk so the next column on the same row is cheap.
+        ///
+        /// Only call this for cursors the compiler marked as worth caching, see
+        /// [`RecordCache`]; on any other cursor this allocates a `Vec` that the
+        /// row will not read enough columns to pay off.
+        #[inline]
+        pub fn cached_column_position(
+            &self,
+            header: &[u8],
+            column: usize,
+        ) -> Result<ColumnPosition> {
+            // SAFETY: single-threaded per connection, see the Send/Sync impls
+            // above. The returned offsets are plain integers, so no reference
+            // into the cache outlives this call and no aliasing `&mut` exists.
+            let slot = unsafe { &mut *self.cache.get() };
+            let cache = slot.get_or_insert_with(|| Box::new(RecordCache::new()));
+            cache.position_of(header, column)
         }
 
         #[inline]
@@ -4863,5 +5051,201 @@ mod tests {
         for value in values {
             assert_eq!(value.try_clone().unwrap(), value);
         }
+    }
+}
+
+#[cfg(test)]
+mod record_cache_tests {
+    use super::*;
+
+    /// A record whose columns are wide enough apart that offsets are easy to
+    /// reason about: alternating small ints and short strings.
+    fn wide_record(ncols: usize) -> ImmutableRecord {
+        let values: Vec<Value> = (0..ncols)
+            .map(|c| {
+                if c % 2 == 0 {
+                    Value::from_i64(c as i64)
+                } else {
+                    Value::build_text(format!("s{c}"))
+                }
+            })
+            .collect();
+        ImmutableRecord::from_values(values.iter(), ncols).unwrap()
+    }
+
+    fn column_as_string(record: &ImmutableRecord, column: usize) -> Option<String> {
+        let iter = record.iter().unwrap();
+        let header = iter.header_section_ref();
+        let data = iter.data_section_ref();
+        let ColumnPosition::Found {
+            header_offset,
+            data_offset,
+        } = record.cached_column_position(header, column).unwrap()
+        else {
+            return None;
+        };
+        iter.set_header_section(&header[header_offset..]);
+        iter.set_data_section(&data[data_offset..]);
+        let value = iter.into_iter().next().unwrap().unwrap();
+        Some(format!("{:?}", value.to_owned().unwrap()))
+    }
+
+    /// Reading through the cache must agree with reading through the plain
+    /// iterator, for every column, whatever order they are asked for in.
+    #[test]
+    fn cached_reads_match_uncached_reads_in_any_order() {
+        let ncols = 40;
+        let record = wide_record(ncols);
+
+        let expected: Vec<String> = record
+            .iter()
+            .unwrap()
+            .map(|v| format!("{:?}", v.unwrap().to_owned().unwrap()))
+            .collect();
+        assert_eq!(expected.len(), ncols);
+
+        // Jump around: late column first, then an early one, then forwards
+        // again. Each of these exercises a different branch of the incremental
+        // walk (extend, pure hit, extend from where we stopped).
+        let order = [39usize, 0, 17, 1, 38, 17, 5, 39, 2];
+        for &c in &order {
+            assert_eq!(
+                column_as_string(&record, c).as_deref(),
+                Some(expected[c].as_str()),
+                "column {c} read through the cache differs"
+            );
+        }
+
+        // And a full forward sweep, which is the SELECT * shape.
+        for (c, want) in expected.iter().enumerate() {
+            assert_eq!(column_as_string(&record, c).as_deref(), Some(want.as_str()));
+        }
+    }
+
+    /// Asking past the end of a short record reports "no such column" rather
+    /// than reading into the next row's bytes. Callers turn this into the
+    /// column's DEFAULT, which is how ALTER TABLE ADD COLUMN keeps working.
+    #[test]
+    fn reading_past_the_end_of_a_record_reports_no_column() {
+        let record = wide_record(3);
+        assert!(column_as_string(&record, 2).is_some());
+        assert_eq!(column_as_string(&record, 3), None);
+        assert_eq!(column_as_string(&record, 400), None);
+    }
+
+    /// Reusing a record's allocation for a new row must not leave the old row's
+    /// column positions behind. Without this the second row decodes at the
+    /// first row's offsets and silently returns wrong values.
+    #[test]
+    fn reusing_a_record_for_a_new_row_forgets_the_old_positions() {
+        let mut reused = wide_record(20);
+        let second = {
+            let values: Vec<Value> = (0..20)
+                .map(|c| {
+                    if c % 2 == 0 {
+                        Value::build_text(format!("long-text-value-{c}"))
+                    } else {
+                        Value::from_i64(c as i64 * 1000)
+                    }
+                })
+                .collect();
+            ImmutableRecord::from_values(values.iter(), 20).unwrap()
+        };
+
+        // Warm the cache on the first row's layout.
+        for c in 0..20 {
+            assert!(column_as_string(&reused, c).is_some());
+        }
+
+        reused.replace_payload(second.get_payload()).unwrap();
+
+        for c in 0..20 {
+            assert_eq!(
+                column_as_string(&reused, c),
+                column_as_string(&second, c),
+                "column {c} still reads at the previous row's offset"
+            );
+        }
+    }
+
+    /// The b-tree cursor advances a row by invalidating its reusable record and
+    /// then serializing the next cell into the same allocation. Both halves of
+    /// that cycle have to drop the previous row's positions.
+    #[test]
+    fn the_cursor_reuse_cycle_forgets_the_previous_row() {
+        let mut record = wide_record(12);
+        for c in 0..12 {
+            assert!(column_as_string(&record, c).is_some());
+        }
+
+        record.invalidate();
+        assert!(record.is_invalidated());
+
+        // Next row, deliberately a different shape so stale offsets would give
+        // visibly wrong answers rather than accidentally-right ones.
+        let next = {
+            let values: Vec<Value> = (0..12)
+                .map(|c| {
+                    if c % 2 == 0 {
+                        Value::build_text(format!("much-longer-text-{c}"))
+                    } else {
+                        Value::from_i64(c as i64 * 7777)
+                    }
+                })
+                .collect();
+            ImmutableRecord::from_values(values.iter(), 12).unwrap()
+        };
+        record.start_serialization(next.get_payload()).unwrap();
+
+        for c in 0..12 {
+            assert_eq!(
+                column_as_string(&record, c),
+                column_as_string(&next, c),
+                "column {c} still reads at the previous row's offset"
+            );
+        }
+    }
+
+    /// The walk stops at the column asked for. Reading column 3 of a wide row
+    /// must not decode the whole header -- that eager behaviour is what made
+    /// the previous attempt at this slower than no cache at all.
+    #[test]
+    fn parsing_stops_at_the_column_that_was_asked_for() {
+        let record = wide_record(100);
+        let iter = record.iter().unwrap();
+        let header = iter.header_section_ref();
+
+        let mut cache = RecordCache::new();
+        assert!(matches!(
+            cache.position_of(header, 3).unwrap(),
+            ColumnPosition::Found { .. }
+        ));
+        // Entries cover columns 0..=3 plus the trailing "where we stopped" mark.
+        assert_eq!(cache.entries.len(), 5);
+
+        assert!(matches!(
+            cache.position_of(header, 9).unwrap(),
+            ColumnPosition::Found { .. }
+        ));
+        assert_eq!(cache.entries.len(), 11);
+
+        // Going backwards is a pure hit and parses nothing more.
+        assert!(matches!(
+            cache.position_of(header, 2).unwrap(),
+            ColumnPosition::Found { .. }
+        ));
+        assert_eq!(cache.entries.len(), 11);
+    }
+}
+
+#[cfg(test)]
+mod record_size_guard {
+    /// Records are created, cloned and moved on every row of every scan, so
+    /// their size is itself a hot-path cost. Storing the column cache inline
+    /// rather than behind a pointer took this from 40 to 64 bytes and slowed
+    /// down reads that never touch the cache, so the box is load-bearing.
+    #[test]
+    fn the_column_cache_costs_one_word() {
+        assert_eq!(std::mem::size_of::<super::ImmutableRecord>(), 40);
     }
 }

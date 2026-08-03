@@ -17,7 +17,7 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
-use crate::alloc::{TryReserveError, TursoFromIterator};
+use crate::alloc::TryReserveError;
 use crate::translate::plan::BitSet;
 use crate::types::{Extendable, Text, ValueBlob};
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
@@ -284,9 +284,7 @@ impl TryClone for Register {
         match (self, source) {
             (Register::Value(dst), Register::Value(src)) => dst.try_clone_from(src)?,
             (Register::Record(dst), Register::Record(src)) => {
-                let buf = dst.as_blob_mut();
-                buf.clear();
-                buf.try_extend(src.get_payload().iter().copied())?;
+                dst.replace_payload(src.get_payload())?;
             }
             (dst, Register::Value(src)) => {
                 let mut value = Value::Null;
@@ -1519,6 +1517,30 @@ pub struct PreparedProgram {
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
+    /// Cursors whose rows are read often enough, or far enough into the record,
+    /// that remembering where their columns start beats re-walking the header
+    /// per column. Computed once at build time by
+    /// [`crate::vdbe::builder::pick_cursors_worth_caching`].
+    pub cursors_wanting_record_cache: BitSet,
+}
+
+impl PreparedProgram {
+    /// Whether `cursor_id`'s records should fill in a [`crate::types::RecordCache`].
+    ///
+    /// This runs once per `Column` executed, and it is not free. Measured by
+    /// instruction count against a build with this call compiled out to
+    /// `false`, a 10-column `SELECT *` — which the gate turns the cache *off*
+    /// for — pays 1.2% for asking, while the same query pays 0.0% when the
+    /// question is answered at compile time. Reading one column costs nothing
+    /// measurable, so the price scales with columns read per row.
+    ///
+    /// Removing it means answering per cursor rather than per read: let the
+    /// record carry the answer, decided once when its cursor is opened, so the
+    /// read path just looks at the cache slot it already has in hand.
+    #[inline(always)]
+    pub fn cursor_wants_record_cache(&self, cursor_id: usize) -> bool {
+        self.cursors_wanting_record_cache.get(cursor_id)
+    }
 }
 
 #[derive(Clone)]
