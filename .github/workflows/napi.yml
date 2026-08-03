@@ -163,6 +163,20 @@ jobs:
         run: ${{ matrix.settings.build }}
         if: ${{ !matrix.settings.docker }}
         shell: bash
+      # The release profile keeps debug info, which on Linux is embedded in the
+      # .node file itself (~80% of its size). macOS and Windows keep debug info
+      # in separate files, so only Linux needs stripping.
+      - name: Strip debug info
+        if: ${{ contains(matrix.settings.target, 'unknown-linux-gnu') }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(packages/native/turso.*.node sync/packages/native/sync.*.node)
+          # Docker builds run as root, leaving the outputs unwritable for the
+          # runner user, and strip rewrites the file in place.
+          sudo chown "$(id -u):$(id -g)" "${files[@]}"
+          strip "${files[@]}"
+          ls -la "${files[@]}"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
