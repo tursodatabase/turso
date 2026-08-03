@@ -337,12 +337,14 @@ fn rewrite_terminal_expr(
                                 .name
                                 .clone()
                                 .expect("current_window must always have a name here");
+                            let func = window_function.func.clone();
                             window_function.rewritten =
                                 Some(rewrite_expr_referencing_current_window(
                                     aggregates,
                                     window_name,
                                     ctx,
                                     expr,
+                                    &func,
                                 )?);
                         }
                         return Ok(WalkControl::SkipChildren);
@@ -419,6 +421,7 @@ fn rewrite_expr_referencing_current_window(
     window_name: String,
     ctx: &mut WindowSubqueryContext,
     expr: &mut Expr,
+    func: &AccumulatorFunc,
 ) -> crate::Result<RewrittenWindowCall> {
     let filter_over = match expr {
         Expr::FunctionCall {
@@ -428,8 +431,13 @@ fn rewrite_expr_referencing_current_window(
             filter_over,
             ..
         } => {
+            let evaluate_args_after_buffer = window_function_uses_subtypes(func);
             for arg in args.iter_mut() {
-                push_into_source_subquery(arg, aggregates, ctx)?;
+                if evaluate_args_after_buffer {
+                    rewrite_late_window_arg(arg, aggregates, ctx)?;
+                } else {
+                    push_into_source_subquery(arg, aggregates, ctx)?;
+                }
             }
             turso_assert!(
                 order_by.is_empty(),
@@ -450,6 +458,67 @@ fn rewrite_expr_referencing_current_window(
         expr: expr.clone(),
         filter_expr,
     })
+}
+
+/// JSON aggregates inspect their arguments' runtime subtypes. SQLite records
+/// do not carry subtypes, so every argument expression must run after its row
+/// is read back from the window buffer.
+fn window_function_uses_subtypes(window_func: &AccumulatorFunc) -> bool {
+    #[cfg(feature = "json")]
+    {
+        matches!(
+            window_func,
+            AccumulatorFunc::Agg(
+                AggFunc::JsonGroupArray
+                    | AggFunc::JsonbGroupArray
+                    | AggFunc::JsonGroupObject
+                    | AggFunc::JsonbGroupObject
+            )
+        )
+    }
+    #[cfg(not(feature = "json"))]
+    {
+        let _ = window_func;
+        false
+    }
+}
+
+/// Keep a window argument in the window layer while moving the values it reads
+/// into the source subquery. This mirrors SQLite's subtype-aware aggregate
+/// path, including evaluating scalar calls separately for step and inverse.
+fn rewrite_late_window_arg(
+    arg: &mut Expr,
+    aggregates: &mut Vec<Aggregate>,
+    ctx: &mut WindowSubqueryContext,
+) -> Result<()> {
+    walk_expr_mut(arg, &mut |node| {
+        if matches!(
+            node,
+            Expr::FunctionCall { .. } | Expr::FunctionCallStar { .. }
+        ) && aggregates
+            .iter()
+            .any(|aggregate| exprs_are_equivalent(&aggregate.original_expr, node))
+        {
+            rewrite_expr_as_subquery_column(node, ctx, true);
+            return Ok(WalkControl::SkipChildren);
+        }
+        match node {
+            Expr::RowId { .. } | Expr::Column { .. } => {
+                rewrite_expr_as_subquery_column(node, ctx, false);
+                return Ok(WalkControl::SkipChildren);
+            }
+            Expr::SubqueryResult { .. }
+            | Expr::Exists(..)
+            | Expr::InSelect { .. }
+            | Expr::Subquery(..) => {
+                rewrite_expr_as_subquery_column(node, ctx, false);
+                return Ok(WalkControl::SkipChildren);
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
 }
 
 /// Rewrites an expression into a reference to a subquery column. If an
@@ -2957,6 +3026,61 @@ fn emit_filter_skip(
     Ok(label)
 }
 
+/// Read one window-function argument from a buffered row. Most arguments are
+/// a single source column. A few JSON arguments intentionally remain scalar
+/// expressions so their JSON subtype is created after the record buffer; for
+/// those, load and cache every source column the expression reads, then
+/// evaluate the expression into `dest`.
+fn emit_window_arg_from_cursor(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    plan: &SelectPlan,
+    cursor: CursorID,
+    arg: &Expr,
+    dest: usize,
+) -> Result<()> {
+    if let Expr::Column { column, .. } = arg {
+        program.emit_insn(Insn::Column {
+            cursor_id: cursor,
+            column: *column,
+            dest,
+            default: None,
+        });
+    } else {
+        walk_expr(arg, &mut |node| {
+            if let Expr::Column { column, .. } = node {
+                let value_reg = program.alloc_register();
+                program.emit_insn(Insn::Column {
+                    cursor_id: cursor,
+                    column: *column,
+                    dest: value_reg,
+                    default: None,
+                });
+                t_ctx.resolver.cache_expr_reg(
+                    std::borrow::Cow::Owned(node.clone()),
+                    value_reg,
+                    false,
+                    None,
+                );
+                return Ok(WalkControl::SkipChildren);
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        t_ctx.resolver.expr_to_reg_cache_enabled = true;
+        translate_expr(
+            program,
+            Some(&plan.table_references),
+            arg,
+            dest,
+            &t_ctx.resolver,
+        )?;
+    }
+    t_ctx
+        .resolver
+        .cache_expr_reg(std::borrow::Cow::Owned(arg.clone()), dest, false, None);
+    Ok(())
+}
+
 /// Emit the code that adds one row into each function's running total (an
 /// AGGSTEP step), reading that row's argument values from `read_csr` — the
 /// cursor sitting on the row that just joined the frame.
@@ -2979,10 +3103,15 @@ fn emit_function_step(
     plan: &SelectPlan,
     read_csr: CursorID,
 ) -> Result<()> {
-    let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
+    let (acc_start, minmax, csr_current) = {
+        let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
+        (
+            meta.registers.acc_start,
+            meta.minmax.clone(),
+            meta.cursors.csr_current,
+        )
+    };
     let window = plan.window.as_ref().expect("missing window");
-    let acc_start = meta.registers.acc_start;
-    let minmax = meta.minmax.clone();
 
     // Save cache state so the per-arg overrides we push below don't leak
     // out to other parts of the emit pipeline (e.g. emit_return_one_row).
@@ -3015,39 +3144,26 @@ fn emit_function_step(
             _ => unreachable!("window functions are FunctionCall or FunctionCallStar expressions"),
         };
 
-        // Load each Expr::Column arg from the frame cursor into a fresh
-        // reg, then push a cache entry so translate_expr on that same Expr
-        // resolves to the freshly-loaded reg. Args that aren't simple
-        // column refs (rare after the planner rewrite) fall through to
-        // translate_expr's default path.
+        // Load each argument from the frame cursor into a fresh register.
+        // Most arguments are one buffered column; JSON subtype-producing
+        // arguments are evaluated here from their buffered input columns.
+        // Cache entries make the aggregate-step translation reuse those
+        // freshly loaded values.
         let arg_load_start = (!args.is_empty()).then(|| program.alloc_registers(args.len()));
         if let Some(base) = arg_load_start {
             for (j, arg) in args.iter().enumerate() {
-                if let Expr::Column { column, .. } = arg {
-                    // SQLite's slow nth_value() path reads the value from
-                    // each included scan row, but keeps N fixed to the
-                    // current output row (window.c:1679-1683).
-                    let arg_cursor = if window.frame.exclude.is_some()
-                        && j == 1
-                        && matches!(&func.func, AccumulatorFunc::Window(WindowFunc::NthValue))
-                    {
-                        meta.cursors.csr_current
-                    } else {
-                        read_csr
-                    };
-                    program.emit_insn(Insn::Column {
-                        cursor_id: arg_cursor,
-                        column: *column,
-                        dest: base + j,
-                        default: None,
-                    });
-                    t_ctx.resolver.cache_expr_reg(
-                        std::borrow::Cow::Owned(arg.clone()),
-                        base + j,
-                        false,
-                        None,
-                    );
-                }
+                // SQLite's slow nth_value() path reads the value from each
+                // included scan row, but keeps N fixed to the current output
+                // row (window.c:1679-1683).
+                let arg_cursor = if window.frame.exclude.is_some()
+                    && j == 1
+                    && matches!(&func.func, AccumulatorFunc::Window(WindowFunc::NthValue))
+                {
+                    csr_current
+                } else {
+                    read_csr
+                };
+                emit_window_arg_from_cursor(program, t_ctx, plan, arg_cursor, arg, base + j)?;
             }
         }
         t_ctx.resolver.expr_to_reg_cache_enabled = true;
@@ -3168,6 +3284,8 @@ fn emit_function_inverse(
     let csr_start = meta.cursors.csr_start.expect(
         "emit_function_inverse: csr_start must be allocated when any AGGINVERSE is emitted",
     );
+    let initial_cache_len = t_ctx.resolver.expr_to_reg_cache.len();
+    let cache_was_enabled = t_ctx.resolver.expr_to_reg_cache_enabled;
 
     for (i, func) in window.functions.iter().enumerate() {
         let acc_reg = acc_start + i;
@@ -3180,18 +3298,7 @@ fn emit_function_inverse(
         let arg_load_start = (!args.is_empty()).then(|| program.alloc_registers(args.len()));
         if let Some(base) = arg_load_start {
             for (j, arg) in args.iter().enumerate() {
-                let Expr::Column { column, .. } = arg else {
-                    unreachable!(
-                        "window-function args are rewritten to subquery columns by \
-                         push_into_input_subquery; got {arg:?}"
-                    );
-                };
-                program.emit_insn(Insn::Column {
-                    cursor_id: csr_start,
-                    column: *column,
-                    dest: base + j,
-                    default: None,
-                });
+                emit_window_arg_from_cursor(program, t_ctx, plan, csr_start, arg, base + j)?;
             }
         }
 
@@ -3254,6 +3361,8 @@ fn emit_function_inverse(
             }
         }
     }
+    t_ctx.resolver.expr_to_reg_cache.truncate(initial_cache_len);
+    t_ctx.resolver.expr_to_reg_cache_enabled = cache_was_enabled;
     Ok(())
 }
 

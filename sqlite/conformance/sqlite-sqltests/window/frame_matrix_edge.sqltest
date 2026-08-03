@@ -298,3 +298,31 @@ matrix accepted-frame-offset-expressions {
            sum(k) OVER (ORDER BY k $mode BETWEEN CURRENT ROW AND $offset FOLLOWING)
     FROM toe ORDER BY k;
 }
+
+# --- JSON text subtypes must be created after the window record buffer is
+# read. Otherwise json_group_array/object quote nested JSON as ordinary text.
+setup nested_json_values {
+    CREATE TABLE tj(id INT, k INT, j TEXT);
+    INSERT INTO tj VALUES
+        (1,10,json_object('a',1)),
+        (2,10,json_array(2,'x,y')),
+        (3,20,json_quote('p,q')),
+        (4,20,json_object('z',json_array(3,4))),
+        (5,30,'null');
+}
+
+@setup nested_json_values
+@var mode { ROWS | GROUPS | RANGE }
+@var frame { 1 PRECEDING AND CURRENT ROW | 1 FOLLOWING AND 2 FOLLOWING | 2 FOLLOWING AND 2 FOLLOWING }
+@var exclude { | EXCLUDE CURRENT ROW }
+@var json_value { json(j) | j -> '$' | json_extract(j, '$') | iif(id % 2, json(j), 'plain') }
+matrix nested-json-through-moving-frames {
+    SELECT id,
+           json_group_array($json_value) OVER w,
+           json_group_object(id, $json_value) OVER w,
+           json(jsonb_group_array($json_value) OVER w),
+           json(jsonb_group_object(id, $json_value) OVER w)
+    FROM tj
+    WINDOW w AS (ORDER BY k $mode BETWEEN $frame $exclude)
+    ORDER BY id;
+}
