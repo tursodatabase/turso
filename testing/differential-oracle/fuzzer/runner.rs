@@ -480,8 +480,9 @@ impl Fuzzer {
     /// On an oracle failure, dump each engine's full state as reconstructable
     /// SQL (turso-state.sql, sqlite-state.sql). This captures main, temp, and
     /// aux tables with all rows, so a divergence that depends on accumulated
-    /// state can be replayed as a small self-contained script.
-    fn dump_failure_state(&self, schema: &sql_gen::Schema, failing_sql: &str) {
+    /// state can be replayed as a small self-contained script. Returns the
+    /// SQLite-side dump, which the shrinker uses as its replay baseline.
+    fn dump_failure_state(&self, schema: &sql_gen::Schema, failing_sql: &str) -> String {
         let turso_conn = self.turso_conn.clone();
         let turso_query = move |sql: &str, ncols: usize| turso_text_rows(&turso_conn, sql, ncols);
         let turso_dump = build_state_dump(schema, failing_sql, &turso_query);
@@ -489,8 +490,8 @@ impl Fuzzer {
             |sql: &str, ncols: usize| sqlite_text_rows(&self.sqlite_conn, sql, ncols);
         let sqlite_dump = build_state_dump(schema, failing_sql, &sqlite_query);
         for (name, body) in [
-            ("turso-state.sql", turso_dump),
-            ("sqlite-state.sql", sqlite_dump),
+            ("turso-state.sql", turso_dump.as_str()),
+            ("sqlite-state.sql", sqlite_dump.as_str()),
         ] {
             let path = self.out_dir.join(name);
             if let Err(e) = std::fs::write(&path, body) {
@@ -498,6 +499,33 @@ impl Fuzzer {
             } else {
                 tracing::info!("Wrote state dump to {}", path.display());
             }
+        }
+        sqlite_dump
+    }
+
+    /// Minimize the failing statement against the dumped state and write the
+    /// result (state script + minimized statement) to minimized.sql.
+    fn shrink_and_write(&self, state_dump: &str, failing_sql: &str) {
+        match crate::shrink::shrink_statement(state_dump, failing_sql) {
+            Ok(Some(minimized)) => {
+                let path = self.out_dir.join("minimized.sql");
+                let body = format!(
+                    "{}\n-- MINIMIZED STATEMENT:\n{};\n",
+                    minimized.state_sql, minimized.statement
+                );
+                if let Err(e) = std::fs::write(&path, body) {
+                    tracing::warn!("Failed to write {}: {e}", path.display());
+                } else {
+                    tracing::info!(
+                        "Wrote minimized reproduction ({} state lines, {} byte statement) to {}",
+                        minimized.state_sql.lines().count(),
+                        minimized.statement.len(),
+                        path.display()
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("Shrinking failed: {e}"),
         }
     }
 
@@ -627,7 +655,8 @@ impl Fuzzer {
                     if !self.config.verbose {
                         tracing::error!("Failing SQL: {}", stmt.sql);
                     }
-                    self.dump_failure_state(&schema, &stmt.sql);
+                    let state_dump = self.dump_failure_state(&schema, &stmt.sql);
+                    self.shrink_and_write(&state_dump, &stmt.sql);
                     return Err(anyhow::anyhow!("Oracle failure: {reason}"));
                 }
             }
