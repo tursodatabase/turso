@@ -45,6 +45,7 @@ Welcome to Turso database manual!
   - [Full-Text Search](#full-text-search-experimental)
   - [CDC](#cdc-early-preview)
   - [Index Method](#index-method-experimental)
+  - [Page Codecs](#page-codecs-experimental)
   - [Appendix A: Turso Internals](#appendix-a-turso-internals)
     - [Frontend](#frontend)
       - [Parser](#parser)
@@ -1243,6 +1244,52 @@ Each Index Method consists of three traits that work together (for details, see 
 While Index Methods can implement arbitrary logic internally, it's generally recommended to use a B-tree as the underlying storage mechanism. To support this, `tursodb` provides a special `backing_btree` Index Method that other Index Methods can use to create auxiliary tables for storing supporting data.
 
 For more details, see [`toy_vector_sparse_ivf`](../core/index_method/toy_vector_sparse_ivf.rs) implementation.
+
+## Page Codecs (Experimental)
+
+Page codecs lets you transform complete SQLite page images between
+their in-memory and on disk representation. The codec is applied to pages
+stored in both the database file and the WAL. This can be used for formats such
+as application-managed encryption or to support existing SQLite databases encrypted
+with SQLCipher or similar.
+
+The API is experimental. A codec defines a persistent file format, so changing
+its behavior can make existing databases unreadable.
+
+### Codec contract
+
+`PageCodec` implementations must provide:
+
+* `codec_id()`, a stable, non-secret 16-byte identifier for the complete
+  transform configuration. Equivalent codec instances must return the same ID,
+  while configurations that can produce different bytes must return different
+  IDs.
+* `required_reserved_bytes()`, the exact number of bytes the codec owns at the
+  end of every page.
+* `encode_page()` and `decode_page()`, which transform between decoded and
+  persistent page images. The engine supplies separate, equally sized input and
+  output buffers.
+
+`PageCodecContext::page_no` is the one-based SQLite page number.
+`PageCodecContext::location` identifies whether the persistent image is in the
+database file or the WAL. An encoder receives the destination location and a
+decoder receives the source location.
+
+### Page 1 bootstrap
+
+Before page 1 can be decoded, the engine needs its page size and reserved-space
+size. The default `bootstrap_page_info()` reads these from SQLite header bytes
+16–17 and 20. A codec that transforms those bytes must override the method and
+report values that match `required_reserved_bytes()` and the decoded header.
+
+For a complete database and WAL round trip, see
+`page_codec_round_trips_wal_and_checkpointed_database_with_bootstrap_header` in
+[the page codec tests](../core/lib.rs).
+
+External page codecs currently support the in-process WAL, checkpointing,
+`VACUUM`, and `VACUUM INTO`. They do not support MVCC, experimental
+multiprocess WAL, `ATTACH`, or partial sync. Files encoded by a non-identity
+codec are not readable by ordinary SQLite tools without a compatible codec.
 
 ## Appendix A: Turso Internals
 

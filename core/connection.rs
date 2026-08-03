@@ -622,7 +622,7 @@ impl Connection {
                 None,
                 self.db.dialect(),
             )?;
-            let pager = Arc::new(db._init(None)?);
+            let pager = Arc::new(db._init(None, None)?);
             pager.set_initial_page_size(page_size)?;
             return Ok(TempDatabase {
                 db,
@@ -653,7 +653,7 @@ impl Connection {
                 None,
                 self.db.dialect(),
             )?;
-            let pager = Arc::new(db._init(None)?);
+            let pager = Arc::new(db._init(None, None)?);
             pager.set_initial_page_size(page_size)?;
             Ok(TempDatabase {
                 db,
@@ -673,7 +673,7 @@ impl Connection {
                 None,
                 self.db.dialect(),
             )?;
-            let pager = Arc::new(db._init(None)?);
+            let pager = Arc::new(db._init(None, None)?);
             pager.set_initial_page_size(page_size)?;
             Ok(TempDatabase { db, pager })
         }
@@ -690,7 +690,7 @@ impl Connection {
             None,
             self.db.dialect(),
         )?;
-        let pager = Arc::new(db._init(None)?);
+        let pager = Arc::new(db._init(None, None)?);
         pager.set_initial_page_size(self.get_page_size())?;
         Ok(TempDatabase {
             db,
@@ -2645,8 +2645,8 @@ impl Connection {
             return Ok(());
         };
 
-        self.page_size.store(size.get_raw(), Ordering::SeqCst);
         self.pager.load().set_initial_page_size(size)?;
+        self.page_size.store(size.get_raw(), Ordering::SeqCst);
         // MvStore caches a copy of the database header in `global_header`, captured from the
         // pager during bootstrap (before any PRAGMA page_size can run). Propagate the new
         // page size so subsequent transactions and any header lookups see the same value the
@@ -3358,6 +3358,12 @@ impl Connection {
                             "reserved name {alias} is already in use"
                         )));
                     }
+                    if self.pager.load().has_external_page_codec() {
+                        return Err(LimboError::InvalidArgument(
+                            "ATTACH is unsupported for connections using an external page codec"
+                                .to_string(),
+                        ));
+                    }
 
                     let db_opts = DatabaseOpts::new()
                         .with_views(self.db.experimental_views_enabled())
@@ -3408,9 +3414,11 @@ impl Connection {
                     }));
                 }
                 AttachDatabaseState::Init(init) => {
-                    let mut pager = Arc::new(crate::return_if_io!(init
-                        .db
-                        ._init_nonblock(&mut init.init_st, init.encryption_key.as_ref(),)));
+                    let mut pager = Arc::new(crate::return_if_io!(init.db._init_nonblock(
+                        &mut init.init_st,
+                        init.encryption_key.as_ref(),
+                        None,
+                    )));
 
                     if !init.attached_is_fresh {
                         self.reject_initialized_attach_mismatches(&init.alias, &init.db, &pager)?;
@@ -4493,6 +4501,14 @@ impl Connection {
 
     pub fn set_reserved_bytes(&self, reserved_bytes: u8) -> Result<()> {
         let pager = self.pager.load();
+        if let Some(codec) = pager.page_codec_external() {
+            let required_reserved_bytes = codec.required_reserved_bytes();
+            if reserved_bytes != required_reserved_bytes {
+                return Err(LimboError::InvalidArgument(format!(
+                    "page codec requires exactly {required_reserved_bytes} reserved bytes"
+                )));
+            }
+        }
         pager.set_reserved_space_bytes(reserved_bytes);
         Ok(())
     }
@@ -4516,6 +4532,12 @@ impl Connection {
         if pager.is_encryption_ctx_set() {
             return Err(LimboError::InvalidArgument(
                 "cannot reset encryption attributes if already set in the session".to_string(),
+            ));
+        }
+        if pager.has_external_page_codec() {
+            return Err(LimboError::InvalidArgument(
+                "cannot configure built-in encryption while an external page codec is installed"
+                    .to_string(),
             ));
         }
         if self.db.get_mv_store().is_some() {

@@ -162,10 +162,12 @@ pub use io::{
 };
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
+use storage::page_transform::PageTransform;
 pub use storage::{
     buffer_pool::BufferPool,
     database::{DatabaseStorage, IOContext},
     encryption::{CipherMode, EncryptionContext, EncryptionKey},
+    page_transform::{PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation},
     pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
@@ -372,6 +374,7 @@ pub struct OpenOptions {
     flags: OpenFlags,
     db_opts: DatabaseOpts,
     encryption: Option<EncryptionOpts>,
+    page_codec: Option<Arc<dyn PageCodec>>,
     durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     allocator: alloc::DynAllocator,
     /// SQL dialect the database is opened with. The dialect is fixed at open
@@ -390,6 +393,7 @@ impl OpenOptions {
             flags: OpenFlags::default(),
             db_opts: DatabaseOpts::default(),
             encryption: None,
+            page_codec: None,
             durable_storage: None,
             allocator: alloc::DynAllocator::default(),
             dialect,
@@ -421,6 +425,11 @@ impl OpenOptions {
 
     pub fn encryption(mut self, encryption: impl Into<Option<EncryptionOpts>>) -> Self {
         self.encryption = encryption.into();
+        self
+    }
+
+    pub fn page_codec(mut self, page_codec: impl Into<Option<Arc<dyn PageCodec>>>) -> Self {
+        self.page_codec = page_codec.into();
         self
     }
 
@@ -727,6 +736,7 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
 
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
+    page_codec_id: Option<PageCodecId>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -802,6 +812,7 @@ impl Database {
         db_file: Arc<dyn DatabaseStorage>,
         encryption_opts: Option<EncryptionOpts>,
         mv_store_allocator: alloc::DynAllocator,
+        page_codec_id: Option<PageCodecId>,
         dialect: Arc<dyn Dialect>,
     ) -> Result<Self> {
         let path = path.into();
@@ -864,6 +875,7 @@ impl Database {
             encryption_cipher_mode: AtomicCipherMode::new(
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
             ),
+            page_codec_id,
 
             durable_storage: None,
         };
@@ -964,6 +976,29 @@ impl Database {
         // cross-platform helpers/tests can request multiprocess WAL without
         // breaking legacy single-process behavior.
         Ok(flags)
+    }
+
+    fn validate_external_page_codec_options(
+        opts: DatabaseOpts,
+        has_external_page_codec: bool,
+    ) -> Result<()> {
+        if has_external_page_codec && opts.enable_multiprocess_wal {
+            return Err(LimboError::InvalidArgument(
+                "external page codecs are not supported with experimental multiprocess WAL"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_open_options(options: &OpenOptions) -> Result<()> {
+        Self::validate_external_page_codec_options(options.db_opts, options.page_codec.is_some())?;
+        if options.encryption.is_some() && options.page_codec.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "built-in encryption cannot be combined with an external page codec".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(feature = "fs")]
@@ -1075,6 +1110,7 @@ impl Database {
         path: &str,
         encryption_opts: &Option<EncryptionOpts>,
         dialect: &dyn Dialect,
+        page_codec: Option<&dyn PageCodec>,
     ) -> Result<Option<Arc<Database>>> {
         if is_memory_like(path) {
             return Ok(None);
@@ -1101,10 +1137,29 @@ impl Database {
                 "Database is encrypted but no encryption options provided".to_string(),
             ));
         }
+        db.validate_page_codec(page_codec)?;
 
         Self::check_registry_dialect(&db, dialect)?;
 
         Ok(Some(db))
+    }
+
+    fn validate_page_codec(&self, page_codec: Option<&dyn PageCodec>) -> Result<()> {
+        match (self.page_codec_id, page_codec) {
+            (Some(_), None) => Err(LimboError::InvalidArgument(
+                "Database was opened with an external page codec; reopen with a page codec"
+                    .to_string(),
+            )),
+            (None, Some(_)) => Err(LimboError::InvalidArgument(
+                "Database is already open without an external page codec".to_string(),
+            )),
+            (Some(expected), Some(codec)) if expected != codec.codec_id() => {
+                Err(LimboError::InvalidArgument(
+                    "page codec identity does not match the existing database".to_string(),
+                ))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Deprecated convenience shim: prefer [`Database::open`] with
@@ -1146,9 +1201,12 @@ impl Database {
         // Check the registry before opening the file to avoid acquiring a file
         // lock that would conflict with an already-open Database in this process.
         if use_registry {
-            if let Some(db) =
-                Self::lookup_in_registry(path, &options.encryption, options.dialect.as_ref())?
-            {
+            if let Some(db) = Self::lookup_in_registry(
+                path,
+                &options.encryption,
+                options.dialect.as_ref(),
+                options.page_codec.as_deref(),
+            )? {
                 if options.durable_storage.is_some() && db.durable_storage.is_none() {
                     return Err(LimboError::InvalidArgument(
                         "database already open without custom durable storage; \
@@ -1233,6 +1291,7 @@ impl Database {
         // otherwise return the cached default-WAL instance and silently ignore
         // the custom wal_path before open_async runs its own check.
         Self::reject_wal_path_for_registry_open(&options)?;
+        Self::validate_open_options(&options)?;
         if options.storage.is_none() {
             if let Some(db) = Self::resolve_default_storage(&io, path, &mut options, true)? {
                 return Ok(db);
@@ -1271,6 +1330,7 @@ impl Database {
         options: &OpenOptions,
     ) -> Result<IOResult<Arc<Database>>> {
         Self::reject_wal_path_for_registry_open(options)?;
+        Self::validate_open_options(options)?;
         let Some(storage) = options.storage.clone() else {
             return Err(LimboError::InvalidArgument(
                 "OpenOptions::storage is required for Database::open_async".to_string(),
@@ -1310,6 +1370,7 @@ impl Database {
                                         .to_string(),
                                 ));
                             }
+                            db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
                             return Ok(IOResult::Done(db));
                         }
@@ -1345,6 +1406,7 @@ impl Database {
             options.db_opts,
             options.encryption.clone(),
             options.durable_storage.clone(),
+            options.page_codec.clone(),
             options.allocator.clone(),
             options.dialect.clone(),
         );
@@ -1376,6 +1438,7 @@ impl Database {
     /// production code uses the registry-aware [`Database::open`].
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn do_open(io: Arc<dyn IO>, path: &str, mut options: OpenOptions) -> Result<Arc<Database>> {
+        Self::validate_open_options(&options)?;
         if options.storage.is_none() {
             // `use_registry = false`: the raw path never consults the registry,
             // so this only opens the file and never returns a cached Database.
@@ -1403,6 +1466,7 @@ impl Database {
         path: &str,
         options: &OpenOptions,
     ) -> Result<IOResult<Arc<Database>>> {
+        Self::validate_open_options(options)?;
         let Some(storage) = options.storage.clone() else {
             return Err(LimboError::InvalidArgument(
                 "OpenOptions::storage is required for Database::do_open_async".to_string(),
@@ -1418,6 +1482,7 @@ impl Database {
             options.db_opts,
             options.encryption.clone(),
             options.durable_storage.clone(),
+            options.page_codec.clone(),
             options.allocator.clone(),
             options.dialect.clone(),
         )
@@ -1437,9 +1502,16 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+        page_codec: Option<Arc<dyn PageCodec>>,
         allocator: alloc::DynAllocator,
         dialect: Arc<dyn Dialect>,
     ) -> Result<IOResult<Arc<Database>>> {
+        Self::validate_external_page_codec_options(opts, page_codec.is_some())?;
+        if encryption_opts.is_some() && page_codec.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "built-in encryption cannot be combined with an external page codec".to_string(),
+            ));
+        }
         let result = Self::do_open_async_internal(
             state,
             io,
@@ -1450,6 +1522,7 @@ impl Database {
             opts,
             encryption_opts,
             durable_storage,
+            page_codec,
             allocator,
             dialect,
         );
@@ -1470,6 +1543,7 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+        page_codec: Option<Arc<dyn PageCodec>>,
         allocator: alloc::DynAllocator,
         dialect: Arc<dyn Dialect>,
     ) -> Result<IOResult<Arc<Database>>> {
@@ -1498,6 +1572,7 @@ impl Database {
                         db_file.clone(),
                         encryption_opts.clone(),
                         allocator.clone(),
+                        page_codec.as_deref().map(PageCodec::codec_id),
                         dialect.clone(),
                     )?;
                     db.durable_storage.clone_from(&durable_storage);
@@ -1518,7 +1593,11 @@ impl Database {
                         .as_mut()
                         .expect("building_db must be set in Init phase");
                     let mut hv_state = std::mem::take(&mut state.header_validation_state);
-                    let result = db.header_validation(&mut hv_state, state.encryption_key.as_ref());
+                    let result = db.header_validation(
+                        &mut hv_state,
+                        state.encryption_key.as_ref(),
+                        page_codec.as_ref(),
+                    );
                     state.header_validation_state = hv_state;
                     let pager = return_if_io!(result);
 
@@ -1543,8 +1622,12 @@ impl Database {
                     let db = Arc::new(db);
 
                     // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
-                    let conn =
-                        db._connect(false, Some(pager.clone()), state.encryption_key.clone())?;
+                    let conn = db._connect(
+                        false,
+                        Some(pager.clone()),
+                        state.encryption_key.clone(),
+                        page_codec.clone(),
+                    )?;
 
                     // Acquire schema lock and hold it through ReadingHeader and LoadingSchema phases
                     // to ensure schema_version and make_from_btree are atomic
@@ -1681,6 +1764,7 @@ impl Database {
                                 true,
                                 Some(pager.clone()),
                                 state.encryption_key.clone(),
+                                page_codec.clone(),
                             )?);
                         }
                         let conn = state.mvcc_bootstrap_conn.as_ref().expect("created above");
@@ -1712,10 +1796,14 @@ impl Database {
     /// Blocking shim over [`Database::_init_nonblock`], retained for the
     /// synchronous callers (connection setup paths). The open state machine
     /// uses `_init_nonblock` directly so a fresh open never blocks here.
-    pub(crate) fn _init(&self, encryption_key: Option<&EncryptionKey>) -> Result<Pager> {
+    pub(crate) fn _init(
+        &self,
+        encryption_key: Option<&EncryptionKey>,
+        page_codec: Option<Arc<dyn PageCodec>>,
+    ) -> Result<Pager> {
         let mut st = InitState::default();
         self.io
-            .block(|| self._init_nonblock(&mut st, encryption_key))
+            .block(|| self._init_nonblock(&mut st, encryption_key, page_codec.as_ref()))
     }
 
     /// Necessary Pager initialization, so that we are prepared to read from
@@ -1726,14 +1814,20 @@ impl Database {
         &self,
         st: &mut InitState,
         encryption_key: Option<&EncryptionKey>,
+        page_codec: Option<&Arc<dyn PageCodec>>,
     ) -> Result<IOResult<Pager>> {
+        if encryption_key.is_some() && page_codec.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "built-in encryption cannot be combined with an external page codec".to_string(),
+            ));
+        }
         loop {
             match st {
                 InitState::Start => {
                     *st = InitState::InitPager(DbHeaderReadState::default());
                 }
                 InitState::InitPager(hdr_st) => {
-                    let pager = return_if_io!(self.init_pager(None, hdr_st));
+                    let pager = return_if_io!(self.init_pager(None, hdr_st, page_codec));
                     pager.enable_encryption(self.opts.enable_encryption);
 
                     // Set up encryption context BEFORE reading the header page.
@@ -1745,6 +1839,8 @@ impl Database {
                     if let Some(key) = encryption_key {
                         let cipher_mode = self.encryption_cipher_mode.get();
                         pager.set_encryption_context(cipher_mode, key)?;
+                    } else if let Some(codec) = page_codec {
+                        pager.set_page_codec(codec.clone())?;
                     }
 
                     // Start a read transaction before reading page 1 to prevent a concurrent
@@ -1779,6 +1875,48 @@ impl Database {
                     let mode = match HeaderRef::from_pager(pager) {
                         Ok(IOResult::Done(header_ref)) => {
                             let header = header_ref.borrow();
+                            let validate_codec_header = || -> Result<()> {
+                                if self.initialized() {
+                                    let page_transform =
+                                        pager.io_ctx.read().page_transform().clone();
+                                    if let PageTransform::Codec(codec) = page_transform {
+                                        let bootstrap_page_size =
+                                            pager.get_page_size_unchecked().get() as usize;
+                                        let bootstrap_reserved_space =
+                                            pager.get_reserved_space().ok_or_else(|| {
+                                                LimboError::InternalError(
+                                                    "page codec reserved space was not initialized"
+                                                        .to_string(),
+                                                )
+                                            })?;
+                                        let decoded_page_size = header.page_size.get() as usize;
+                                        if decoded_page_size != bootstrap_page_size {
+                                            return Err(LimboError::InvalidArgument(format!(
+                                            "page codec bootstrap page size {bootstrap_page_size} does not match decoded page-1 size {decoded_page_size}"
+                                        )));
+                                        }
+                                        if header.reserved_space != bootstrap_reserved_space {
+                                            return Err(LimboError::InvalidArgument(format!(
+                                            "page codec bootstrap reserved space {bootstrap_reserved_space} does not match decoded page-1 reserved space {}",
+                                            header.reserved_space
+                                        )));
+                                        }
+                                        let required_reserved_space =
+                                            codec.required_reserved_bytes();
+                                        if header.reserved_space != required_reserved_space {
+                                            return Err(LimboError::InvalidArgument(format!(
+                                            "page codec requires exactly {required_reserved_space} reserved bytes, but decoded page 1 provides {}",
+                                            header.reserved_space
+                                        )));
+                                        }
+                                    }
+                                }
+                                Ok(())
+                            };
+                            if let Err(err) = validate_codec_header() {
+                                pager.end_read_tx();
+                                return Err(err);
+                            }
                             if header.vacuum_mode_largest_root_page.get() > 0 {
                                 if header.incremental_vacuum_enabled.get() > 0 {
                                     AutoVacuumMode::Incremental
@@ -1821,6 +1959,7 @@ impl Database {
         &mut self,
         st: &mut HeaderValidationState,
         encryption_key: Option<&EncryptionKey>,
+        page_codec: Option<&Arc<dyn PageCodec>>,
     ) -> Result<IOResult<Arc<Pager>>> {
         loop {
             match st {
@@ -1828,7 +1967,8 @@ impl Database {
                     // `_init` does not modify `open_flags` (the autovacuum
                     // override happens later in `Validate`), so capturing
                     // `is_readonly` across the `_init` yields is stable.
-                    let pager = return_if_io!(self._init_nonblock(init, encryption_key));
+                    let pager =
+                        return_if_io!(self._init_nonblock(init, encryption_key, page_codec));
                     let log_exists =
                         journal_mode::logical_log_exists(std::path::Path::new(&self.path));
                     let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
@@ -1960,6 +2100,12 @@ impl Database {
                     // Determine if we should open in MVCC mode based on the database header version
                     // MVCC is controlled only by the database header (set via PRAGMA journal_mode)
                     let open_mv_store = matches!(read_version, Version::Mvcc);
+                    if open_mv_store && page_codec.is_some() {
+                        return Err(LimboError::InvalidArgument(
+                            "external page codecs are not supported with MVCC databases"
+                                .to_string(),
+                        ));
+                    }
 
                     // MVCC has no cross-process coordination: commit
                     // serialization, the logical-log append offset, and
@@ -2166,6 +2312,12 @@ impl Database {
     /// Rebuild the process-local shared WAL view after a caller restores the
     /// database and WAL files outside the pager.
     pub fn reload_wal_after_external_restore(self: &Arc<Self>) -> Result<()> {
+        if self.page_codec_id.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "reloading a WAL after external restore is not supported with an external page codec"
+                    .to_string(),
+            ));
+        }
         let flags = self.open_flags;
         #[cfg(host_shared_wal)]
         let shared_authority = self.open_shared_wal_coordination_for_open()?;
@@ -2216,7 +2368,7 @@ impl Database {
                 self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
             self.mv_store.store(Some(mv_store.clone()));
-            let mvcc_bootstrap_conn = self._connect(true, None, None)?;
+            let mvcc_bootstrap_conn = self._connect(true, None, None, None)?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
                 Ok(()) => {}
                 Err(LimboError::SchemaUpdated) => {
@@ -2233,7 +2385,7 @@ impl Database {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
-        self._connect(false, None, None)
+        self._connect(false, None, None, None)
     }
 
     /// Connect with an encryption key.
@@ -2243,7 +2395,19 @@ impl Database {
         self: &Arc<Database>,
         encryption_key: Option<EncryptionKey>,
     ) -> Result<Arc<Connection>> {
-        self._connect(false, None, encryption_key)
+        self._connect(false, None, encryption_key, None)
+    }
+
+    /// Connect with an external page codec.
+    ///
+    /// The codec may contain sensitive key material, so it is installed only on
+    /// the pager for this connection and is not cached on the shared `Database`.
+    #[instrument(skip_all, level = Level::DEBUG)]
+    pub fn connect_with_page_codec(
+        self: &Arc<Database>,
+        page_codec: Arc<dyn PageCodec>,
+    ) -> Result<Arc<Connection>> {
+        self._connect(false, None, None, Some(page_codec))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -2252,13 +2416,27 @@ impl Database {
         is_mvcc_bootstrap_connection: bool,
         pager: Option<Arc<Pager>>,
         encryption_key: Option<EncryptionKey>,
+        page_codec: Option<Arc<dyn PageCodec>>,
     ) -> Result<Arc<Connection>> {
+        if self.page_codec_id.is_some() && page_codec.is_none() {
+            return Err(LimboError::InvalidArgument(
+                "database requires an external page codec".to_string(),
+            ));
+        }
+        if self.page_codec_id.is_none() && page_codec.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "database was opened without an external page codec".to_string(),
+            ));
+        }
+        if let Some(page_codec) = page_codec.as_deref() {
+            self.validate_page_codec(Some(page_codec))?;
+        }
         let pager = if let Some(pager) = pager {
             pager
         } else {
             // Pass encryption key to _init so it can set up encryption context
             // before reading page 1. This is required for reopening encrypted databases.
-            Arc::new(self._init(encryption_key.as_ref())?)
+            Arc::new(self._init(encryption_key.as_ref(), page_codec.clone())?)
         };
         let default_cache_size = pager
             .io
@@ -2382,6 +2560,10 @@ impl Database {
                     *st = DbHeaderReadState::Reading { buf, completion: c };
                 }
                 DbHeaderReadState::Reading { buf, completion } => {
+                    if let Some(err) = completion.get_error() {
+                        *st = DbHeaderReadState::Start;
+                        return Err(err.into());
+                    }
                     if !completion.succeeded() {
                         let c = completion.clone();
                         io_yield_one!(c);
@@ -2834,6 +3016,7 @@ impl Database {
         &self,
         requested_page_size: Option<usize>,
         hdr_st: &mut DbHeaderReadState,
+        page_codec: Option<&Arc<dyn PageCodec>>,
     ) -> Result<IOResult<Pager>> {
         let cipher = self.encryption_cipher_mode.get();
 
@@ -2842,13 +3025,45 @@ impl Database {
         // on-disk page size from it.
         let (header_reserved_bytes, header_page_size) = if self.initialized() {
             let buf = return_if_io!(self.read_db_header_buf(hdr_st));
-            let reserved = u8::from_be_bytes(buf.as_slice()[20..21].try_into().unwrap());
-            let ps_raw = u16::from_be_bytes(buf.as_slice()[16..18].try_into().unwrap());
-            let page_size = PageSize::new_from_header_u16(ps_raw)?;
-            (Some(reserved), Some(page_size))
+            if let Some(codec) = page_codec {
+                let header_info = codec.bootstrap_page_info(buf.as_slice())?;
+                let page_size_u32 = u32::try_from(header_info.page_size).map_err(|_| {
+                    LimboError::InvalidArgument(format!(
+                        "page codec reported invalid page size {}",
+                        header_info.page_size
+                    ))
+                })?;
+                let Some(page_size) = PageSize::new(page_size_u32) else {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "page codec reported invalid page size {}",
+                        header_info.page_size
+                    )));
+                };
+                if !page_size.has_valid_reserved_space(header_info.reserved_space) {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "page codec reported invalid reserved space {} for page size {}",
+                        header_info.reserved_space,
+                        page_size.get()
+                    )));
+                }
+                (Some(header_info.reserved_space), Some(page_size))
+            } else {
+                let reserved = u8::from_be_bytes(buf.as_slice()[20..21].try_into().unwrap());
+                let ps_raw = u16::from_be_bytes(buf.as_slice()[16..18].try_into().unwrap());
+                let page_size = PageSize::new_from_header_u16(ps_raw)?;
+                (Some(reserved), Some(page_size))
+            }
         } else {
             (None, None)
         };
+        if let (Some(codec), Some(reserved_bytes)) = (page_codec, header_reserved_bytes) {
+            let required_reserved_bytes = codec.required_reserved_bytes();
+            if reserved_bytes != required_reserved_bytes {
+                return Err(LimboError::InvalidArgument(format!(
+                    "page codec requires exactly {required_reserved_bytes} reserved bytes, but database provides {reserved_bytes}"
+                )));
+            }
+        }
 
         let reserved_bytes = header_reserved_bytes.or_else(|| {
             if !matches!(cipher, CipherMode::None) {
@@ -3402,7 +3617,22 @@ impl Iterator for QueryRunner<'_> {
 
 #[cfg(test)]
 mod database_tests {
-    use super::{is_memory_like, Database};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use super::{is_memory_like, Database, InitState};
+    use crate::storage::encryption::EncryptionKey;
+    use crate::storage::page_transform::{
+        PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation,
+    };
+    use crate::storage::sqlite3_ondisk::DatabaseHeader;
+    use crate::{
+        storage::database::DatabaseFile, CompletionError, Connection, DatabaseOpts,
+        DatabaseStorage, EncryptionOpts, IOResult, LimboError, OpenDbAsyncState, OpenFlags,
+        OpenOptions, PlatformIO, SqliteDialect, IO,
+    };
 
     #[test]
     fn memory_path_classifies_named_memory_databases() {
@@ -3424,5 +3654,1320 @@ mod database_tests {
 
         assert!(io.file_id(&path).is_ok());
         assert!(std::fs::metadata(&path).is_err());
+    }
+
+    #[derive(Debug)]
+    struct IdentityPageCodec;
+
+    impl PageCodec for IdentityPageCodec {
+        fn codec_id(&self) -> PageCodecId {
+            PageCodecId::new(*b"identity-codec--")
+        }
+
+        fn required_reserved_bytes(&self) -> u8 {
+            0
+        }
+
+        fn encode_page(
+            &self,
+            _context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            output.copy_from_slice(input);
+            Ok(())
+        }
+
+        fn decode_page(
+            &self,
+            _context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            output.copy_from_slice(input);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct InvalidHeaderPageCodec {
+        page_size: usize,
+        reserved_space: u8,
+    }
+
+    impl PageCodec for InvalidHeaderPageCodec {
+        fn codec_id(&self) -> PageCodecId {
+            PageCodecId::new(*b"invalid-header-c")
+        }
+
+        fn bootstrap_page_info(
+            &self,
+            _raw_page1_prefix: &[u8],
+        ) -> crate::Result<PageCodecHeaderInfo> {
+            Ok(PageCodecHeaderInfo {
+                page_size: self.page_size,
+                reserved_space: self.reserved_space,
+            })
+        }
+
+        fn required_reserved_bytes(&self) -> u8 {
+            0
+        }
+
+        fn encode_page(
+            &self,
+            _context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            output.copy_from_slice(input);
+            Ok(())
+        }
+
+        fn decode_page(
+            &self,
+            _context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            output.copy_from_slice(input);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct XorPageCodec {
+        mask: u8,
+        reserved_bytes: u8,
+    }
+
+    impl XorPageCodec {
+        fn transform(&self, page: &[u8], output: &mut [u8]) {
+            for (input, output) in page.iter().zip(output) {
+                *output = input ^ self.mask;
+            }
+        }
+    }
+
+    impl PageCodec for XorPageCodec {
+        fn codec_id(&self) -> PageCodecId {
+            let mut id = *b"xor-page-codec--";
+            id[15] = self.mask;
+            id[14] = self.reserved_bytes;
+            PageCodecId::new(id)
+        }
+
+        fn bootstrap_page_info(
+            &self,
+            raw_page1_prefix: &[u8],
+        ) -> crate::Result<PageCodecHeaderInfo> {
+            if raw_page1_prefix.len() < 21 {
+                return Err(LimboError::NotADB);
+            }
+
+            let decoded_magic = raw_page1_prefix[..16]
+                .iter()
+                .map(|byte| byte ^ self.mask)
+                .collect::<Vec<_>>();
+            if decoded_magic.as_slice() != b"SQLite format 3\0" {
+                return Err(LimboError::NotADB);
+            }
+
+            let ps_raw = u16::from_be_bytes([
+                raw_page1_prefix[16] ^ self.mask,
+                raw_page1_prefix[17] ^ self.mask,
+            ]);
+            let page_size = if ps_raw == 1 { 65536 } else { ps_raw as usize };
+            Ok(PageCodecHeaderInfo {
+                page_size,
+                reserved_space: raw_page1_prefix[20] ^ self.mask,
+            })
+        }
+
+        fn required_reserved_bytes(&self) -> u8 {
+            self.reserved_bytes
+        }
+
+        fn encode_page(
+            &self,
+            _context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            self.transform(input, output);
+            Ok(())
+        }
+
+        fn decode_page(
+            &self,
+            _context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            self.transform(input, output);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingPageCodec {
+        inner: XorPageCodec,
+        database_page1_decodes: Arc<AtomicUsize>,
+    }
+
+    impl PageCodec for CountingPageCodec {
+        fn codec_id(&self) -> PageCodecId {
+            self.inner.codec_id()
+        }
+
+        fn bootstrap_page_info(
+            &self,
+            raw_page1_prefix: &[u8],
+        ) -> crate::Result<PageCodecHeaderInfo> {
+            self.inner.bootstrap_page_info(raw_page1_prefix)
+        }
+
+        fn required_reserved_bytes(&self) -> u8 {
+            self.inner.required_reserved_bytes()
+        }
+
+        fn encode_page(
+            &self,
+            context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            self.inner.encode_page(context, input, output)
+        }
+
+        fn decode_page(
+            &self,
+            context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            if context.page_no == DatabaseHeader::PAGE_ID as u32
+                && context.location == PageLocation::Database
+            {
+                self.database_page1_decodes.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.decode_page(context, input, output)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailOncePageCodec {
+        inner: XorPageCodec,
+        fail_decode: Arc<AtomicBool>,
+        fail_context: PageCodecContext,
+    }
+
+    impl PageCodec for FailOncePageCodec {
+        fn codec_id(&self) -> PageCodecId {
+            self.inner.codec_id()
+        }
+
+        fn bootstrap_page_info(
+            &self,
+            raw_page1_prefix: &[u8],
+        ) -> crate::Result<PageCodecHeaderInfo> {
+            self.inner.bootstrap_page_info(raw_page1_prefix)
+        }
+
+        fn required_reserved_bytes(&self) -> u8 {
+            self.inner.required_reserved_bytes()
+        }
+
+        fn encode_page(
+            &self,
+            context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            self.inner.encode_page(context, input, output)
+        }
+
+        fn decode_page(
+            &self,
+            context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            if context == self.fail_context && self.fail_decode.swap(false, Ordering::Relaxed) {
+                return Err(LimboError::InternalError(
+                    "injected page decode failure".into(),
+                ));
+            }
+            self.inner.decode_page(context, input, output)
+        }
+    }
+
+    #[derive(Debug)]
+    struct LocationPageCodec;
+
+    impl LocationPageCodec {
+        const MASK: u8 = 0x6d;
+
+        fn byte_key(page_no: u32, location: PageLocation, offset: usize) -> u8 {
+            // Persisted transforms must not depend on the host pointer width.
+            let page_id_byte = (page_no as u64).to_le_bytes()[offset % std::mem::size_of::<u64>()];
+            let page_id_rotation =
+                ((offset / std::mem::size_of::<u64>()) % (u8::BITS as usize)) as u32;
+            Self::MASK
+                ^ page_id_byte.rotate_left(page_id_rotation)
+                ^ match location {
+                    PageLocation::Database => 0,
+                    PageLocation::Wal => 0xa5,
+                }
+        }
+
+        fn transform(input: &[u8], output: &mut [u8], context: PageCodecContext) {
+            for (offset, (input, output)) in input.iter().zip(output).enumerate() {
+                *output = input ^ Self::byte_key(context.page_no, context.location, offset);
+            }
+        }
+    }
+
+    impl PageCodec for LocationPageCodec {
+        fn codec_id(&self) -> PageCodecId {
+            PageCodecId::new(*b"location-page-co")
+        }
+
+        fn bootstrap_page_info(
+            &self,
+            raw_page1_prefix: &[u8],
+        ) -> crate::Result<PageCodecHeaderInfo> {
+            if raw_page1_prefix.len() < 21 {
+                return Err(LimboError::NotADB);
+            }
+            if !raw_page1_prefix[..16]
+                .iter()
+                .enumerate()
+                .zip(b"SQLite format 3\0")
+                .all(|((offset, encoded), expected)| {
+                    *encoded
+                        ^ Self::byte_key(
+                            DatabaseHeader::PAGE_ID as u32,
+                            PageLocation::Database,
+                            offset,
+                        )
+                        == *expected
+                })
+            {
+                return Err(LimboError::NotADB);
+            }
+
+            let page_size = u16::from_be_bytes([
+                raw_page1_prefix[16]
+                    ^ Self::byte_key(DatabaseHeader::PAGE_ID as u32, PageLocation::Database, 16),
+                raw_page1_prefix[17]
+                    ^ Self::byte_key(DatabaseHeader::PAGE_ID as u32, PageLocation::Database, 17),
+            ]);
+            Ok(PageCodecHeaderInfo {
+                page_size: if page_size == 1 {
+                    65_536
+                } else {
+                    page_size as usize
+                },
+                reserved_space: raw_page1_prefix[20]
+                    ^ Self::byte_key(DatabaseHeader::PAGE_ID as u32, PageLocation::Database, 20),
+            })
+        }
+
+        fn required_reserved_bytes(&self) -> u8 {
+            1
+        }
+
+        fn encode_page(
+            &self,
+            context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            Self::transform(input, output, context);
+            Ok(())
+        }
+
+        fn decode_page(
+            &self,
+            context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            Self::transform(input, output, context);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn location_page_codec_uses_full_page_id() {
+        let input = vec![0; 512];
+        let mut page_one = vec![0; input.len()];
+        let mut page_two_fifty_seven = vec![0; input.len()];
+        LocationPageCodec::transform(
+            &input,
+            &mut page_one,
+            PageCodecContext::new(1, PageLocation::Database),
+        );
+        LocationPageCodec::transform(
+            &input,
+            &mut page_two_fifty_seven,
+            PageCodecContext::new(257, PageLocation::Database),
+        );
+
+        assert_ne!(page_one, page_two_fifty_seven);
+
+        let mut decoded = vec![0; input.len()];
+        LocationPageCodec::transform(
+            &page_two_fifty_seven,
+            &mut decoded,
+            PageCodecContext::new(257, PageLocation::Database),
+        );
+        assert_eq!(decoded, input);
+    }
+
+    #[derive(Debug)]
+    struct XorDefaultBootstrapPageCodec {
+        mask: u8,
+        reserved_bytes: u8,
+    }
+
+    impl XorDefaultBootstrapPageCodec {
+        fn transform(&self, page: &[u8], output: &mut [u8]) {
+            for (input, output) in page.iter().zip(output) {
+                *output = input ^ self.mask;
+            }
+        }
+    }
+
+    impl PageCodec for XorDefaultBootstrapPageCodec {
+        fn codec_id(&self) -> PageCodecId {
+            let mut id = *b"xor-no-probe----";
+            id[15] = self.mask;
+            id[14] = self.reserved_bytes;
+            PageCodecId::new(id)
+        }
+
+        fn required_reserved_bytes(&self) -> u8 {
+            self.reserved_bytes
+        }
+
+        fn encode_page(
+            &self,
+            _context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            self.transform(input, output);
+            Ok(())
+        }
+
+        fn decode_page(
+            &self,
+            _context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            self.transform(input, output);
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "fs")]
+    fn open_with_page_codec_result(
+        io: Arc<dyn IO>,
+        path: &str,
+        codec: Arc<dyn PageCodec>,
+    ) -> crate::Result<Arc<Database>> {
+        open_with_page_codec_with_opts_result(io, path, codec, DatabaseOpts::new())
+    }
+
+    #[cfg(feature = "fs")]
+    fn open_with_page_codec_with_opts_result(
+        io: Arc<dyn IO>,
+        path: &str,
+        codec: Arc<dyn PageCodec>,
+        opts: DatabaseOpts,
+    ) -> crate::Result<Arc<Database>> {
+        let file = io.open_file(path, OpenFlags::Create, true).unwrap();
+        let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(file));
+        let mut state = OpenDbAsyncState::new();
+        let options = OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(db_file)
+            .flags(OpenFlags::Create)
+            .db_opts(opts)
+            .page_codec(codec);
+
+        loop {
+            match Database::open_async(&mut state, io.clone(), path, &options)? {
+                IOResult::Done(db) => return Ok(db),
+                IOResult::IO(completion) => completion.wait(&*io)?,
+            }
+        }
+    }
+
+    #[cfg(feature = "fs")]
+    fn open_with_page_codec(
+        io: Arc<dyn IO>,
+        path: &str,
+        codec: Arc<dyn PageCodec>,
+    ) -> Arc<Database> {
+        open_with_page_codec_result(io, path, codec).unwrap()
+    }
+
+    #[cfg(feature = "fs")]
+    fn count_test_rows(conn: &Arc<Connection>) -> i64 {
+        let mut stmt = conn.prepare("select count(*) from test").unwrap();
+        let mut count = 0;
+        stmt.run_with_row_callback(|row| {
+            count = row.get(0).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        count
+    }
+
+    #[cfg(feature = "fs")]
+    fn passive_checkpoint_busy(conn: &Arc<Connection>) -> crate::Result<i64> {
+        let mut stmt = conn.prepare("PRAGMA wal_checkpoint(PASSIVE)")?;
+        let mut busy = None;
+        stmt.run_with_row_callback(|row| {
+            busy = Some(row.get(0)?);
+            Ok(())
+        })?;
+        busy.ok_or_else(|| {
+            LimboError::InternalError("wal_checkpoint did not return a result row".to_owned())
+        })
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn registry_reuses_cached_database_without_retaining_page_codec() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-registry.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let first_codec: Arc<dyn PageCodec> = Arc::new(IdentityPageCodec);
+        let first_codec_weak = Arc::downgrade(&first_codec);
+        let second_codec: Arc<dyn PageCodec> = Arc::new(IdentityPageCodec);
+
+        let first = open_with_page_codec(io.clone(), path, first_codec);
+        assert!(
+            first_codec_weak.upgrade().is_none(),
+            "cached Database must not retain the page codec"
+        );
+        let second = open_with_page_codec(io, path, second_codec);
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_identity_must_match_cached_database() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-identity.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let first_codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+            mask: 0xa5,
+            reserved_bytes: 1,
+        });
+        let different_codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+            mask: 0x5a,
+            reserved_bytes: 1,
+        });
+
+        let db = open_with_page_codec(io.clone(), path, first_codec);
+
+        let err = match db.connect_with_page_codec(different_codec.clone()) {
+            Ok(_) => panic!("a cached codec-backed database must reject a different codec"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("page codec identity does not match the existing database"));
+
+        let err = open_with_page_codec_result(io, path, different_codec).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("page codec identity does not match the existing database"));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn cached_database_rejects_encryption_and_page_codec() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-encryption-cached.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec: Arc<dyn PageCodec> = Arc::new(IdentityPageCodec);
+        let _db = open_with_page_codec(io.clone(), path, codec.clone());
+
+        let err = Database::open(
+            io,
+            path,
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .flags(OpenFlags::Create)
+                .encryption(EncryptionOpts {
+                    cipher: "aes256gcm".to_string(),
+                    hexkey: "00".repeat(32),
+                })
+                .page_codec(codec),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("built-in encryption cannot be combined with an external page codec"));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn external_page_codec_rejects_multiprocess_wal_before_opening_file() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-multiprocess-wal.db");
+        let path_str = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        let err = Database::open(
+            io,
+            path_str,
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .flags(OpenFlags::Create)
+                .db_opts(DatabaseOpts::new().with_multiprocess_wal(true))
+                .page_codec(Arc::new(IdentityPageCodec) as Arc<dyn PageCodec>),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            LimboError::InvalidArgument(ref message)
+                if message
+                    == "external page codecs are not supported with experimental multiprocess WAL"
+        ));
+        assert!(!path.exists());
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn bypass_registry_page_codec_open_rejects_multiprocess_wal() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-bypass-multiprocess-wal.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let file = io.open_file(path, OpenFlags::Create, true).unwrap();
+        let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(file));
+        let mut state = OpenDbAsyncState::new();
+
+        let options = OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(db_file)
+            .flags(OpenFlags::Create)
+            .db_opts(DatabaseOpts::new().with_multiprocess_wal(true))
+            .page_codec(Arc::new(IdentityPageCodec) as Arc<dyn PageCodec>);
+        let err = match Database::do_open_async(&mut state, io, path, &options) {
+            Err(err) => err,
+            Ok(_) => panic!("multiprocess WAL must reject an external page codec"),
+        };
+
+        assert!(matches!(
+            err,
+            LimboError::InvalidArgument(ref message)
+                if message
+                    == "external page codecs are not supported with experimental multiprocess WAL"
+        ));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn cached_page_codec_database_requires_codec_at_connection_time() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-registry-no-codec.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+            mask: 0xa5,
+            reserved_bytes: 1,
+        });
+        let _db = open_with_page_codec(io.clone(), path, codec.clone());
+        let db = open_with_page_codec(io.clone(), path, codec.clone());
+        let conn = db.connect_with_page_codec(codec).unwrap();
+        conn.execute("create table test(id integer primary key)")
+            .unwrap();
+        drop(conn);
+
+        assert!(
+            Database::open_file_with_flags(
+                io,
+                path,
+                OpenFlags::Create,
+                DatabaseOpts::new(),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .is_err(),
+            "opening without the codec must not reuse a codec-required database"
+        );
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_checkpoint_decodes_database_page1_for_identity() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-checkpoint-identity.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let database_page1_decodes = Arc::new(AtomicUsize::new(0));
+        let codec: Arc<dyn PageCodec> = Arc::new(CountingPageCodec {
+            inner: XorPageCodec {
+                mask: 0x5a,
+                reserved_bytes: 1,
+            },
+            database_page1_decodes: database_page1_decodes.clone(),
+        });
+        let db = open_with_page_codec(io, path, codec.clone());
+        let conn = db.connect_with_page_codec(codec).unwrap();
+        conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
+        conn.execute(
+            "create table test(id integer primary key, value text);
+             insert into test(value) values ('alpha');",
+        )
+        .unwrap();
+        conn.set_sync_mode(crate::SyncMode::Full);
+
+        database_page1_decodes.store(0, Ordering::Relaxed);
+        let checkpoint = conn
+            .checkpoint(crate::storage::wal::CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            })
+            .unwrap();
+
+        assert!(checkpoint.wal_checkpoint_backfilled > 0);
+        assert_eq!(
+            database_page1_decodes.load(Ordering::Relaxed),
+            1,
+            "checkpoint identity must decode database page 1 exactly once"
+        );
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_checkpoint_recovers_after_page1_decode_failure() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-checkpoint-retry.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let fail_database_page1_decode = Arc::new(AtomicBool::new(false));
+        let codec: Arc<dyn PageCodec> = Arc::new(FailOncePageCodec {
+            inner: XorPageCodec {
+                mask: 0x5a,
+                reserved_bytes: 1,
+            },
+            fail_decode: fail_database_page1_decode.clone(),
+            fail_context: PageCodecContext::new(
+                DatabaseHeader::PAGE_ID as u32,
+                PageLocation::Database,
+            ),
+        });
+        let db = open_with_page_codec(io, path, codec.clone());
+        let conn = db.connect_with_page_codec(codec).unwrap();
+        conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
+        conn.execute(
+            "create table test(id integer primary key, value text);
+             insert into test(value) values ('alpha');",
+        )
+        .unwrap();
+        conn.set_sync_mode(crate::SyncMode::Full);
+
+        fail_database_page1_decode.store(true, Ordering::Relaxed);
+        let err = conn
+            .checkpoint(crate::storage::wal::CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            LimboError::CompletionError(CompletionError::PageCodecError { page_idx: 1 })
+        ));
+
+        let checkpoint = conn
+            .checkpoint(crate::storage::wal::CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            })
+            .unwrap();
+        assert!(checkpoint.wal_checkpoint_backfilled > 0);
+        assert_eq!(count_test_rows(&conn), 1);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn pragma_checkpoint_codec_error_releases_checkpoint_lock() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-pragma-checkpoint-retry.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let fail_wal_page2_decode = Arc::new(AtomicBool::new(false));
+        let codec: Arc<dyn PageCodec> = Arc::new(FailOncePageCodec {
+            inner: XorPageCodec {
+                mask: 0x5a,
+                reserved_bytes: 1,
+            },
+            fail_decode: fail_wal_page2_decode.clone(),
+            fail_context: PageCodecContext::new(2, PageLocation::Wal),
+        });
+        let db = open_with_page_codec(io, path, codec.clone());
+        let writer = db.connect_with_page_codec(codec.clone()).unwrap();
+        writer.wal_auto_actions_disable();
+        writer.execute("PRAGMA journal_mode = 'wal'").unwrap();
+        writer
+            .execute(
+                "create table test(id integer primary key, value text);
+                 insert into test(value) values ('alpha');",
+            )
+            .unwrap();
+
+        let pager = writer.get_pager();
+        assert!(
+            pager.wal_pos().1 > 0,
+            "test setup must leave committed WAL frames"
+        );
+        assert_eq!(
+            pager.wal_backfill_frame(),
+            Some(0),
+            "test setup must not checkpoint the WAL before injecting the codec error"
+        );
+        assert!(
+            pager.wal_changed_pages_after(0).unwrap().contains(&2),
+            "test setup must leave page 2 in the WAL"
+        );
+
+        let first = db.connect_with_page_codec(codec.clone()).unwrap();
+        assert!(first.get_pager().has_wal());
+        fail_wal_page2_decode.store(true, Ordering::Relaxed);
+        let first_error = passive_checkpoint_busy(&first).unwrap_err();
+        assert!(matches!(first_error, LimboError::CheckpointFailed(_)));
+        assert!(!fail_wal_page2_decode.load(Ordering::Relaxed));
+
+        let second = db.connect_with_page_codec(codec).unwrap();
+        assert!(second.get_pager().has_wal());
+        let other_connection_retry = passive_checkpoint_busy(&second);
+        let same_connection_retry = passive_checkpoint_busy(&first);
+        assert!(
+            matches!(same_connection_retry, Ok(0)) && matches!(other_connection_retry, Ok(0)),
+            "checkpoint failure must not leave stale state or retain its guard: same connection \
+             returned {same_connection_retry:?}, other connection returned {other_connection_retry:?}"
+        );
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_round_trips_wal_and_checkpointed_database_with_bootstrap_header() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-roundtrip.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+            mask: 0x5a,
+            reserved_bytes: 1,
+        });
+
+        {
+            let db = open_with_page_codec(io.clone(), path, codec.clone());
+            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
+            conn.execute(
+                "create table test(id integer primary key, value text);
+                 insert into test(value) values ('alpha'), ('bravo');",
+            )
+            .unwrap();
+            assert_eq!(count_test_rows(&conn), 2);
+            conn.set_sync_mode(crate::SyncMode::Full);
+            let passive = conn
+                .checkpoint(crate::storage::wal::CheckpointMode::Passive {
+                    upper_bound_inclusive: None,
+                })
+                .unwrap();
+            assert!(
+                passive.wal_checkpoint_backfilled > 0,
+                "PASSIVE checkpoint must backfill codec-transformed pages"
+            );
+            conn.execute("insert into test(value) values ('charlie')")
+                .unwrap();
+            let full = conn
+                .checkpoint(crate::storage::wal::CheckpointMode::Full)
+                .unwrap();
+            assert!(
+                full.wal_checkpoint_backfilled > 0,
+                "FULL checkpoint must backfill codec-transformed pages"
+            );
+            assert_eq!(count_test_rows(&conn), 3);
+        }
+
+        let raw_database = std::fs::read(path).unwrap();
+        assert_ne!(&raw_database[..16], b"SQLite format 3\0");
+
+        let reopened = open_with_page_codec(io, path, codec.clone());
+        let conn = reopened.connect_with_page_codec(codec).unwrap();
+        assert_eq!(count_test_rows(&conn), 3);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_reopens_live_wal_then_checkpointed_database() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-live-wal-recovery.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec: Arc<dyn PageCodec> = Arc::new(LocationPageCodec);
+
+        {
+            let db = open_with_page_codec(io.clone(), path, codec.clone());
+            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
+            conn.execute(
+                "create table test(id integer primary key, value text);
+                 insert into test(value) values ('alpha'), ('bravo'), ('charlie');",
+            )
+            .unwrap();
+            assert_eq!(count_test_rows(&conn), 3);
+        }
+        let wal_path = format!("{path}-wal");
+        assert!(
+            std::fs::metadata(&wal_path).unwrap().len() > 0,
+            "the first reopen must recover committed codec-transformed WAL frames"
+        );
+
+        {
+            let db = open_with_page_codec(io.clone(), path, codec.clone());
+            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            assert_eq!(count_test_rows(&conn), 3);
+            let checkpoint = conn
+                .checkpoint(crate::storage::wal::CheckpointMode::Full)
+                .unwrap();
+            assert!(
+                checkpoint.wal_checkpoint_backfilled > 0,
+                "the recovery checkpoint must backfill codec-transformed WAL frames"
+            );
+        }
+        let db = open_with_page_codec(io, path, codec.clone());
+        let conn = db.connect_with_page_codec(codec).unwrap();
+        assert_eq!(count_test_rows(&conn), 3);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_reopen_requires_recoverable_bootstrap_header() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-no-probe-roundtrip.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec: Arc<dyn PageCodec> = Arc::new(XorDefaultBootstrapPageCodec {
+            mask: 0x3c,
+            reserved_bytes: 1,
+        });
+
+        {
+            let db = open_with_page_codec(io.clone(), path, codec.clone());
+            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            conn.execute(
+                "create table test(id integer primary key, value text);
+                 insert into test(value) values ('alpha'), ('bravo');",
+            )
+            .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+
+        let err = open_with_page_codec_result(io, path, codec).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("page codec reported invalid page size"));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_rejects_mvcc_mode() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-mvcc.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec: Arc<dyn PageCodec> = Arc::new(IdentityPageCodec);
+        let db = open_with_page_codec(io, path, codec.clone());
+        let conn = db.connect_with_page_codec(codec).unwrap();
+
+        let err = conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("external page codecs are not supported with MVCC"));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn plaintext_database_rejects_page_codec_connection() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("plaintext-codec-connection.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+
+        let err = match db.connect_with_page_codec(Arc::new(IdentityPageCodec)) {
+            Ok(_) => panic!("plaintext databases must reject external page codecs"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("database was opened without an external page codec"));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_database_rejects_codecless_connection() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-requires-connection-codec.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = open_with_page_codec(io, path, Arc::new(IdentityPageCodec));
+
+        let err = match db.connect() {
+            Ok(_) => panic!("codec-backed databases must reject codec-less connections"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("database requires an external page codec"));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_reopen_rejects_mismatched_reserved_space() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-reserved-space.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let initial_codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+            mask: 0x5a,
+            reserved_bytes: 1,
+        });
+
+        {
+            let db = open_with_page_codec(io.clone(), path, initial_codec.clone());
+            let conn = db.connect_with_page_codec(initial_codec).unwrap();
+            conn.execute("create table test(id integer primary key)")
+                .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+
+        for required_reserved_bytes in [0, 2] {
+            let codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+                mask: 0x5a,
+                reserved_bytes: required_reserved_bytes,
+            });
+            let err = open_with_page_codec_result(io.clone(), path, codec).unwrap_err();
+            assert!(err.to_string().contains(&format!(
+                "page codec requires exactly {required_reserved_bytes} reserved bytes, but database provides 1"
+            )));
+        }
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_reopen_rejects_invalid_header_layout() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-invalid-header-layout.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        {
+            let db = open_with_page_codec(io.clone(), path, Arc::new(IdentityPageCodec));
+            let conn = db
+                .connect_with_page_codec(Arc::new(IdentityPageCodec))
+                .unwrap();
+            conn.execute("create table test(id integer primary key)")
+                .unwrap();
+            conn.execute("pragma wal_checkpoint(truncate)").unwrap();
+        }
+
+        for (codec, expected_error) in [
+            (
+                InvalidHeaderPageCodec {
+                    page_size: 513,
+                    reserved_space: 0,
+                },
+                "page codec reported invalid page size 513",
+            ),
+            (
+                InvalidHeaderPageCodec {
+                    page_size: 512,
+                    reserved_space: 33,
+                },
+                "page codec reported invalid reserved space 33 for page size 512",
+            ),
+            (
+                InvalidHeaderPageCodec {
+                    page_size: 8192,
+                    reserved_space: 0,
+                },
+                "page codec bootstrap page size 8192 does not match decoded page-1 size 4096",
+            ),
+        ] {
+            let err = open_with_page_codec_result(io.clone(), path, Arc::new(codec)).unwrap_err();
+            assert!(err.to_string().contains(expected_error));
+        }
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_reopen_reports_short_header_read() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-short-header.db");
+        std::fs::write(&path, [0u8]).unwrap();
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        let err = open_with_page_codec_result(io, path, Arc::new(IdentityPageCodec)).unwrap_err();
+        assert!(err.to_string().contains("short read on page 1"));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_and_encryption_cannot_share_pager() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-encryption-conflict.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec: Arc<dyn PageCodec> = Arc::new(IdentityPageCodec);
+        let db = open_with_page_codec(io, path, codec.clone());
+        let encryption_key = EncryptionKey::from_hex_string(&"00".repeat(32)).unwrap();
+        let mut state = InitState::default();
+
+        let err = match db._init_nonblock(&mut state, Some(&encryption_key), Some(&codec)) {
+            Ok(_) => panic!("encryption and an external page codec must not share a pager"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("built-in encryption cannot be combined with an external page codec"));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_connection_rejects_builtin_encryption_settings() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-encryption-settings.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec: Arc<dyn PageCodec> = Arc::new(IdentityPageCodec);
+        let db = open_with_page_codec(io, path, codec.clone());
+        let conn = db.connect_with_page_codec(codec).unwrap();
+
+        let err = conn
+            .set_encryption_key(EncryptionKey::from_hex_string(&"00".repeat(32)).unwrap())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            LimboError::InvalidArgument(message)
+                if message
+                    == "cannot configure built-in encryption while an external page codec is installed"
+        ));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_vacuum_preserves_encoded_database() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-vacuum.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+            mask: 0x4d,
+            reserved_bytes: 1,
+        });
+        let db = open_with_page_codec_with_opts_result(
+            io.clone(),
+            path,
+            codec.clone(),
+            DatabaseOpts::new().with_vacuum(true),
+        )
+        .unwrap();
+        let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+        conn.execute(
+            "create table test(id integer primary key, value text);
+             insert into test(value) values ('alpha'), ('bravo');",
+        )
+        .unwrap();
+        conn.execute("VACUUM").unwrap();
+        assert_eq!(count_test_rows(&conn), 2);
+        drop(conn);
+        drop(db);
+
+        assert_ne!(&std::fs::read(path).unwrap()[..16], b"SQLite format 3\0");
+        let reopened = open_with_page_codec(io, path, codec.clone());
+        let conn = reopened.connect_with_page_codec(codec).unwrap();
+        assert_eq!(count_test_rows(&conn), 2);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_vacuum_into_preserves_encoded_database() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-vacuum-into.db");
+        let output_path = temp_dir.path().join("codec-vacuum-into-copy.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+            mask: 0x4d,
+            reserved_bytes: 1,
+        });
+        let db = open_with_page_codec_with_opts_result(
+            io.clone(),
+            path,
+            codec.clone(),
+            DatabaseOpts::new().with_vacuum(true),
+        )
+        .unwrap();
+        let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+        conn.execute(
+            "create table test(id integer primary key, value text);
+             insert into test(value) values ('secret-value');",
+        )
+        .unwrap();
+        conn.execute(format!("VACUUM INTO '{}'", output_path.display()))
+            .unwrap();
+
+        let raw_output = std::fs::read(&output_path).unwrap();
+        assert_ne!(&raw_output[..16], b"SQLite format 3\0");
+        let output = open_with_page_codec(io, output_path.to_str().unwrap(), codec.clone());
+        let output_conn = output.connect_with_page_codec(codec).unwrap();
+        assert_eq!(count_test_rows(&output_conn), 1);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn location_page_codec_round_trips_wal_checkpoint_and_overflow_pages() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("location-codec.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec: Arc<dyn PageCodec> = Arc::new(LocationPageCodec);
+
+        {
+            let db = open_with_page_codec(io.clone(), path, codec.clone());
+            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            conn.execute(
+                "create table test(id integer primary key, value blob);
+                 insert into test(value) values (zeroblob(12000));
+                 delete from test where id = 1;
+                 insert into test(value)
+                 values (cast(replace(printf('%0*d', 16000, 0), '0', 'x') as blob));",
+            )
+            .unwrap();
+            let checkpoint = conn
+                .checkpoint(crate::storage::wal::CheckpointMode::Full)
+                .unwrap();
+            assert!(checkpoint.wal_checkpoint_backfilled > 0);
+        }
+
+        let raw_database = std::fs::read(path).unwrap();
+        assert_ne!(&raw_database[..16], b"SQLite format 3\0");
+        let reopened = open_with_page_codec(io, path, codec.clone());
+        let conn = reopened.connect_with_page_codec(codec).unwrap();
+        let mut values: Vec<(i64, String)> = Vec::new();
+        conn.prepare("select length(value), hex(substr(value, 1, 8)) from test order by id")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                values.push((row.get(0).unwrap(), row.get(1).unwrap()));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(values, vec![(16_000, "7878787878787878".to_string())]);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_attach_is_rejected() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let main_path = temp_dir.path().join("codec-main.db");
+        let aux_path = temp_dir.path().join("codec-aux.db");
+        let main_path = main_path.to_str().unwrap();
+        let aux_path = aux_path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+            mask: 0x91,
+            reserved_bytes: 1,
+        });
+        let db = open_with_page_codec_with_opts_result(
+            io.clone(),
+            main_path,
+            codec.clone(),
+            DatabaseOpts::new().with_attach(true),
+        )
+        .unwrap();
+        let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+        let err = conn
+            .execute(format!("ATTACH '{aux_path}' AS aux"))
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("ATTACH is unsupported for connections using an external page codec"));
+        assert!(!std::path::Path::new(aux_path).exists());
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_rejects_reserved_space_mutation() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-reserved-space.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+            mask: 0x91,
+            reserved_bytes: 1,
+        });
+        let db = open_with_page_codec(io, path, codec.clone());
+        let conn = db.connect_with_page_codec(codec).unwrap();
+
+        let err = conn.set_reserved_bytes(0).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("page codec requires exactly 1 reserved bytes"));
+        assert_eq!(conn.get_reserved_bytes(), Some(1));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn page_codec_rejects_page_size_incompatible_with_reserved_space() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-page-size.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+            mask: 0x5a,
+            reserved_bytes: 33,
+        });
+
+        {
+            let db = open_with_page_codec(io.clone(), path, codec.clone());
+            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            // 512 - 33 = 479 usable bytes < 480: must be rejected up front,
+            // otherwise the engine creates a database it refuses to reopen.
+            let err = conn.execute("PRAGMA page_size = 512").unwrap_err();
+            assert!(err.to_string().contains("usable bytes"));
+            assert_eq!(conn.get_page_size().get(), 4096);
+            // The database must remain usable at a compatible page size.
+            conn.execute("create table test(id integer primary key, value text)")
+                .unwrap();
+            conn.execute("insert into test(value) values ('alpha')")
+                .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+
+        let reopened = open_with_page_codec(io, path, codec.clone());
+        let conn = reopened.connect_with_page_codec(codec).unwrap();
+        assert_eq!(count_test_rows(&conn), 1);
     }
 }
