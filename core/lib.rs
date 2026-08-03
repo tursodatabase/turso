@@ -3858,7 +3858,8 @@ mod database_tests {
     #[derive(Debug)]
     struct FailOncePageCodec {
         inner: XorPageCodec,
-        fail_database_page1_decode: Arc<AtomicBool>,
+        fail_decode: Arc<AtomicBool>,
+        fail_context: PageCodecContext,
     }
 
     impl PageCodec for FailOncePageCodec {
@@ -3892,14 +3893,9 @@ mod database_tests {
             input: &[u8],
             output: &mut [u8],
         ) -> crate::Result<()> {
-            if context.page_no == DatabaseHeader::PAGE_ID as u32
-                && context.location == PageLocation::Database
-                && self
-                    .fail_database_page1_decode
-                    .swap(false, Ordering::Relaxed)
-            {
+            if context == self.fail_context && self.fail_decode.swap(false, Ordering::Relaxed) {
                 return Err(LimboError::InternalError(
-                    "injected database page-1 decode failure".into(),
+                    "injected page decode failure".into(),
                 ));
             }
             self.inner.decode_page(context, input, output)
@@ -4132,6 +4128,19 @@ mod database_tests {
     }
 
     #[cfg(feature = "fs")]
+    fn passive_checkpoint_busy(conn: &Arc<Connection>) -> crate::Result<i64> {
+        let mut stmt = conn.prepare("PRAGMA wal_checkpoint(PASSIVE)")?;
+        let mut busy = None;
+        stmt.run_with_row_callback(|row| {
+            busy = Some(row.get(0)?);
+            Ok(())
+        })?;
+        busy.ok_or_else(|| {
+            LimboError::InternalError("wal_checkpoint did not return a result row".to_owned())
+        })
+    }
+
+    #[cfg(feature = "fs")]
     #[test]
     fn registry_reuses_cached_database_without_retaining_page_codec() {
         let temp_dir = tempfile::TempDir::new().unwrap();
@@ -4352,7 +4361,11 @@ mod database_tests {
                 mask: 0x5a,
                 reserved_bytes: 1,
             },
-            fail_database_page1_decode: fail_database_page1_decode.clone(),
+            fail_decode: fail_database_page1_decode.clone(),
+            fail_context: PageCodecContext::new(
+                DatabaseHeader::PAGE_ID as u32,
+                PageLocation::Database,
+            ),
         });
         let db = open_with_page_codec(io, path, codec.clone());
         let conn = db.connect_with_page_codec(codec).unwrap();
@@ -4382,6 +4395,66 @@ mod database_tests {
             .unwrap();
         assert!(checkpoint.wal_checkpoint_backfilled > 0);
         assert_eq!(count_test_rows(&conn), 1);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn pragma_checkpoint_codec_error_releases_checkpoint_lock() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("codec-pragma-checkpoint-retry.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let fail_wal_page2_decode = Arc::new(AtomicBool::new(false));
+        let codec: Arc<dyn PageCodec> = Arc::new(FailOncePageCodec {
+            inner: XorPageCodec {
+                mask: 0x5a,
+                reserved_bytes: 1,
+            },
+            fail_decode: fail_wal_page2_decode.clone(),
+            fail_context: PageCodecContext::new(2, PageLocation::Wal),
+        });
+        let db = open_with_page_codec(io, path, codec.clone());
+        let writer = db.connect_with_page_codec(codec.clone()).unwrap();
+        writer.wal_auto_actions_disable();
+        writer.execute("PRAGMA journal_mode = 'wal'").unwrap();
+        writer
+            .execute(
+                "create table test(id integer primary key, value text);
+                 insert into test(value) values ('alpha');",
+            )
+            .unwrap();
+
+        let pager = writer.get_pager();
+        assert!(
+            pager.wal_pos().1 > 0,
+            "test setup must leave committed WAL frames"
+        );
+        assert_eq!(
+            pager.wal_backfill_frame(),
+            Some(0),
+            "test setup must not checkpoint the WAL before injecting the codec error"
+        );
+        assert!(
+            pager.wal_changed_pages_after(0).unwrap().contains(&2),
+            "test setup must leave page 2 in the WAL"
+        );
+
+        let first = db.connect_with_page_codec(codec.clone()).unwrap();
+        assert!(first.get_pager().has_wal());
+        fail_wal_page2_decode.store(true, Ordering::Relaxed);
+        let first_error = passive_checkpoint_busy(&first).unwrap_err();
+        assert!(matches!(first_error, LimboError::CheckpointFailed(_)));
+        assert!(!fail_wal_page2_decode.load(Ordering::Relaxed));
+
+        let second = db.connect_with_page_codec(codec).unwrap();
+        assert!(second.get_pager().has_wal());
+        let other_connection_retry = passive_checkpoint_busy(&second);
+        let same_connection_retry = passive_checkpoint_busy(&first);
+        assert!(
+            matches!(same_connection_retry, Ok(0)) && matches!(other_connection_retry, Ok(0)),
+            "checkpoint failure must not leave stale state or retain its guard: same connection \
+             returned {same_connection_retry:?}, other connection returned {other_connection_retry:?}"
+        );
     }
 
     #[cfg(feature = "fs")]

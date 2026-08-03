@@ -1832,6 +1832,7 @@ impl Program {
                                 "Abort also failed during checkpoint error handling: {abort_err}"
                             );
                         }
+                        pager.cleanup_after_checkpoint_failure();
                         return Err(checkpoint_err);
                     }
                     let err = err.into();
