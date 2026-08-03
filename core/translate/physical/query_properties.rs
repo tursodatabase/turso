@@ -2737,8 +2737,8 @@ fn distribution_windows_use_bound_partition_and_order_inputs(tc: hegel::TestCase
                 )
             })
             .count(),
-        4,
-        "one output scan and one filtered partition rescan per function"
+        5,
+        "one ordered input scan, one partition rescan per function, and one NTILE bucket scan"
     );
     assert!(program
         .insns
@@ -2752,10 +2752,13 @@ fn distribution_windows_use_bound_partition_and_order_inputs(tc: hegel::TestCase
             .count()
             >= 4
     );
-    assert!(program
-        .insns
-        .iter()
-        .any(|(instruction, _)| matches!(instruction, Insn::MustBeInt { .. })));
+    assert!(program.insns.iter().any(|(instruction, _)| matches!(
+        instruction,
+        Insn::Cast {
+            affinity: Affinity::Integer,
+            ..
+        }
+    )));
     assert!(!program
         .insns
         .iter()
@@ -2834,7 +2837,8 @@ fn navigation_windows_materialize_bound_window_order(tc: hegel::TestCase) {
             .iter()
             .filter(|(instruction, _)| matches!(instruction, Insn::SorterOpen { .. }))
             .count(),
-        2
+        3,
+        "one outer window-order sorter and one private ordinal sorter per function"
     );
     assert_eq!(
         program
@@ -2921,7 +2925,8 @@ fn positional_value_windows_use_the_bound_default_frame(tc: hegel::TestCase) {
             .iter()
             .filter(|(instruction, _)| matches!(instruction, Insn::SorterOpen { .. }))
             .count(),
-        3
+        4,
+        "one outer window-order sorter and one private frame sorter per function"
     );
     assert_eq!(
         program

@@ -275,6 +275,9 @@ enum ScanRowAction<'hir, 'destination> {
         limit: Option<LimitRuntime>,
         distinct: Option<&'destination DistinctRuntime>,
     },
+    WindowSortInsert {
+        sorter: &'destination WindowSorter<'hir>,
+    },
 }
 
 impl ScanRowAction<'_, '_> {
@@ -286,7 +289,8 @@ impl ScanRowAction<'_, '_> {
             Self::Aggregate { .. }
             | Self::GroupSortInsert { .. }
             | Self::UpdateCandidate { .. }
-            | Self::WindowProject { .. } => None,
+            | Self::WindowProject { .. }
+            | Self::WindowSortInsert { .. } => None,
         }
     }
 }
@@ -310,6 +314,16 @@ struct GroupSorter<'hir> {
     field_count: usize,
     grouping: &'hir Grouping,
     sources: Vec<GroupSourceLayout>,
+}
+
+struct WindowSorter<'hir> {
+    cursor_id: usize,
+    record: RegisterId,
+    field_count: usize,
+    key_count: usize,
+    spec: &'hir crate::translate::semantic::hir::WindowSpec,
+    source: SourceId,
+    source_width: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -2151,6 +2165,210 @@ fn open_group_sorter<'document>(
     })
 }
 
+fn open_window_sorter<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    source: &PhysicalSource<'document>,
+    spec: &'document crate::translate::semantic::hir::WindowSpec,
+) -> QueryResult<WindowSorter<'document>> {
+    let cursor_id = program.alloc_cursor_id(CursorType::Sorter);
+    // The sorter key is the window's partition and order, followed by rowid
+    // so peers keep their input order. Source values follow as payload and
+    // become the bound outer row while the sorted stream is consumed.
+    let key_count = spec.partition_by.len() + spec.order_by.len() + 1;
+    let mut order_collations_nulls = spec
+        .partition_by
+        .iter()
+        .map(|expression| {
+            (
+                SortOrder::Asc,
+                Some(expression_collation(plan, expression)),
+                None,
+            )
+        })
+        .try_collect::<crate::alloc::Vec<_>>()?;
+    order_collations_nulls.try_extend(spec.order_by.iter().map(|term| {
+        (
+            term.order,
+            term.collation.as_ref().map(|collation| *collation.value()),
+            term.nulls,
+        )
+    }))?;
+    order_collations_nulls.try_push((SortOrder::Asc, Some(CollationSeq::Binary), None))?;
+
+    let mut comparators = spec
+        .partition_by
+        .iter()
+        .map(|expression| {
+            expression_type_fact(plan, expression)
+                .as_ref()
+                .and_then(sort_comparator)
+        })
+        .try_collect::<crate::alloc::Vec<_>>()?;
+    comparators.try_extend(
+        spec.order_by
+            .iter()
+            .map(|term| sort_comparator(&term.type_fact)),
+    )?;
+    comparators.try_push(None)?;
+    program.emit_insn(Insn::SorterOpen {
+        cursor_id,
+        columns: key_count,
+        order_collations_nulls,
+        comparators,
+    });
+    Ok(WindowSorter {
+        cursor_id,
+        record: RegisterId(program.alloc_register()),
+        field_count: key_count + source.width + 1,
+        key_count,
+        spec,
+        source: source.id,
+        source_width: source.width,
+    })
+}
+
+fn emit_window_sort_insert<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    ctes: &mut MaterializedCtes,
+    sorter: &WindowSorter<'document>,
+) -> QueryResult<()> {
+    let fields = program.alloc_registers(sorter.field_count);
+    let mut position = 0;
+    for expression in &sorter.spec.partition_by {
+        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+            .emit_into(expression, RegisterRange::new(fields + position, 1))?;
+        position += 1;
+    }
+    for term in &sorter.spec.order_by {
+        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+            .emit_into(&term.expr, RegisterRange::new(fields + position, 1))?;
+        position += 1;
+    }
+    let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+    ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries).emit_into(
+        &Expr::rowid(sorter.source),
+        RegisterRange::new(fields + position, 1),
+    )?;
+    position += 1;
+    for column in 0..sorter.source_width {
+        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries).emit_into(
+            &Expr::column(sorter.source, column),
+            RegisterRange::new(fields + position, 1),
+        )?;
+        position += 1;
+    }
+    let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+    ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries).emit_into(
+        &Expr::rowid(sorter.source),
+        RegisterRange::new(fields + position, 1),
+    )?;
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(fields),
+        count: to_u32(sorter.field_count),
+        dest_reg: to_u32(sorter.record.0),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::SorterInsert {
+        cursor_id: sorter.cursor_id,
+        record_reg: sorter.record.0,
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_sorted_window_rows<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    ctes: &mut MaterializedCtes,
+    block: &super::PhysicalQueryBlock<'document>,
+    filter: Option<&'document Expr>,
+    result: RegisterRange,
+    destination: QueryDestination<'_>,
+    limit: Option<LimitRuntime>,
+    distinct: Option<&DistinctRuntime>,
+    sorter: &WindowSorter<'document>,
+) -> QueryResult<()> {
+    let content = program.alloc_register();
+    let pseudo = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
+        column_count: sorter.field_count,
+    }));
+    program.emit_insn(Insn::OpenPseudo {
+        cursor_id: pseudo,
+        content_reg: content,
+        num_fields: sorter.field_count,
+    });
+    let loop_start = program.allocate_label();
+    let cleanup = row_cleanup_label(destination, limit).unwrap_or_else(|| program.allocate_label());
+    program.emit_insn(Insn::SorterSort {
+        cursor_id: sorter.cursor_id,
+        pc_if_empty: cleanup,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+    program.emit_insn(Insn::SorterData {
+        cursor_id: sorter.cursor_id,
+        dest_reg: content,
+        pseudo_cursor: pseudo,
+    });
+    let columns = RegisterRange::new(
+        program.alloc_registers(sorter.source_width),
+        sorter.source_width,
+    );
+    for position in 0..sorter.source_width {
+        program.emit_insn(Insn::Column {
+            cursor_id: pseudo,
+            column: sorter.key_count + position,
+            dest: columns.first.0 + position,
+            default: None,
+        });
+    }
+    let rowid = RegisterId(program.alloc_register());
+    program.emit_insn(Insn::Column {
+        cursor_id: pseudo,
+        column: sorter.key_count + sorter.source_width,
+        dest: rowid.0,
+        default: None,
+    });
+    let previous = bindings.replace_source(
+        sorter.source,
+        SourceRuntime::Registers {
+            columns,
+            rowid: Some(rowid),
+        },
+    )?;
+    let emission = emit_ranking_window_row(
+        plan,
+        program,
+        bindings,
+        ctes,
+        block,
+        filter,
+        result,
+        destination,
+        limit,
+        distinct,
+    );
+    bindings.replace_source(sorter.source, previous)?;
+    emission?;
+    program.emit_insn(Insn::SorterNext {
+        cursor_id: sorter.cursor_id,
+        pc_if_next: loop_start,
+    });
+    program.preassign_label_to_next_insn(cleanup);
+    program.emit_insn(Insn::Close { cursor_id: pseudo });
+    program.emit_insn(Insn::Close {
+        cursor_id: sorter.cursor_id,
+    });
+    Ok(())
+}
+
 fn emit_group_sort_insert<'document>(
     plan: &PhysicalPlan<'document>,
     program: &mut ProgramBuilder,
@@ -2740,6 +2958,40 @@ fn emit_ranking_window_query<'document>(
             },
         )?;
     }
+    if let Some(spec) = block
+        .window_functions
+        .last()
+        .and_then(|function| function.call.window.as_ref())
+        .filter(|spec| !spec.partition_by.is_empty() || !spec.order_by.is_empty())
+    {
+        let source_plan = plan
+            .source(*source)
+            .ok_or(PhysicalQueryError::Invalid("window source is missing"))?;
+        let sorter = open_window_sorter(plan, program, source_plan, spec)?;
+        emit_table_scans(
+            plan,
+            program,
+            bindings,
+            ctes,
+            std::slice::from_ref(source),
+            filter,
+            block.hir.from.as_ref(),
+            ScanRowAction::WindowSortInsert { sorter: &sorter },
+        )?;
+        return emit_sorted_window_rows(
+            plan,
+            program,
+            bindings,
+            ctes,
+            block,
+            filter,
+            result,
+            destination,
+            limit,
+            distinct,
+            &sorter,
+        );
+    }
     emit_table_scans(
         plan,
         program,
@@ -2780,31 +3032,40 @@ fn emit_ranking_window_row<'document>(
     let source = plan
         .source(*source_id)
         .ok_or(PhysicalQueryError::Invalid("window source is missing"))?;
-    let SourceRuntime::Cursor(outer_cursor) = bindings.source(*source_id)? else {
-        return Err(PhysicalQueryError::Invalid(
-            "window outer source is not cursor-backed",
-        ));
-    };
-    let outer_columns = RegisterRange::new(program.alloc_registers(source.width), source.width);
-    for position in 0..source.width {
-        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
-        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries).emit_into(
-            &Expr::column(*source_id, position),
-            RegisterRange::new(outer_columns.first.0 + position, 1),
-        )?;
-    }
-    let outer_rowid = RegisterId(program.alloc_register());
-    program.emit_insn(Insn::RowId {
-        cursor_id: outer_cursor.0,
-        dest: outer_rowid.0,
-    });
-    let previous_outer = bindings.replace_source(
-        *source_id,
+    let (outer_rowid, previous_outer) = match bindings.source(*source_id)? {
+        SourceRuntime::Cursor(outer_cursor) => {
+            let outer_columns =
+                RegisterRange::new(program.alloc_registers(source.width), source.width);
+            for position in 0..source.width {
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries).emit_into(
+                    &Expr::column(*source_id, position),
+                    RegisterRange::new(outer_columns.first.0 + position, 1),
+                )?;
+            }
+            let outer_rowid = RegisterId(program.alloc_register());
+            program.emit_insn(Insn::RowId {
+                cursor_id: outer_cursor.0,
+                dest: outer_rowid.0,
+            });
+            let previous = bindings.replace_source(
+                *source_id,
+                SourceRuntime::Registers {
+                    columns: outer_columns,
+                    rowid: Some(outer_rowid),
+                },
+            )?;
+            (outer_rowid, Some(previous))
+        }
         SourceRuntime::Registers {
-            columns: outer_columns,
-            rowid: Some(outer_rowid),
-        },
-    )?;
+            rowid: Some(rowid), ..
+        } => (rowid, None),
+        SourceRuntime::Registers { rowid: None, .. } => {
+            return Err(PhysicalQueryError::Unsupported(
+                "window over a source without rowid",
+            ));
+        }
+    };
 
     let emission = (|| -> QueryResult<()> {
         for function in &block.window_functions {
@@ -3277,7 +3538,9 @@ fn emit_ranking_window_row<'document>(
             distinct,
         )
     })();
-    bindings.replace_source(*source_id, previous_outer)?;
+    if let Some(previous_outer) = previous_outer {
+        bindings.replace_source(*source_id, previous_outer)?;
+    }
     emission
 }
 
@@ -5568,6 +5831,9 @@ fn emit_scan_action<'document>(
             limit,
             distinct,
         ),
+        ScanRowAction::WindowSortInsert { sorter } => {
+            emit_window_sort_insert(plan, program, bindings, ctes, sorter)
+        }
     }
 }
 
