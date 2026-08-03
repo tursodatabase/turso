@@ -2876,42 +2876,17 @@ fn emit_ranking_window_row<'document>(
                     .emit_into(&term.expr, RegisterRange::new(outer_order + position, 1))?;
             }
             let ntile_argument = if matches!(kind, WindowFunc::Ntile) {
-                let argument = function
-                    .call
-                    .arguments
-                    .first()
-                    .ok_or(PhysicalQueryError::Invalid("ntile has no bucket argument"))?;
-                let register = program.alloc_register();
-                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
-                ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
-                    .emit_into(argument, RegisterRange::new(register, 1))?;
-                let invalid = program.allocate_label();
-                let valid = program.allocate_label();
-                program.emit_insn(Insn::MustBeInt {
-                    reg: register,
-                    target_pc: Some(invalid),
-                });
-                let zero = program.alloc_register();
-                program.emit_insn(Insn::Integer {
-                    value: 0,
-                    dest: zero,
-                });
-                program.emit_insn(Insn::Gt {
-                    lhs: register,
-                    rhs: zero,
-                    target_pc: valid,
-                    flags: crate::vdbe::insn::CmpInsFlags::default(),
-                    collation: None,
-                });
-                program.preassign_label_to_next_insn(invalid);
-                program.emit_insn(Insn::Halt {
-                    err_code: crate::error::SQLITE_ERROR,
-                    description: "argument of ntile must be a positive integer".to_string(),
-                    on_error: None,
-                    description_reg: None,
-                });
-                program.preassign_label_to_next_insn(valid);
-                Some(register)
+                Some(emit_ntile_bucket_count(
+                    plan,
+                    program,
+                    bindings,
+                    ctes,
+                    function,
+                    spec,
+                    source,
+                    filter,
+                    outer_partition,
+                )?)
             } else {
                 None
             };
@@ -3304,6 +3279,186 @@ fn emit_ranking_window_row<'document>(
     })();
     bindings.replace_source(*source_id, previous_outer)?;
     emission
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_ntile_bucket_count<'document>(
+    plan: &PhysicalPlan<'document>,
+    program: &mut ProgramBuilder,
+    bindings: &mut RuntimeBindings<'document>,
+    ctes: &mut MaterializedCtes,
+    function: &super::PhysicalWindowFunction<'document>,
+    spec: &'document crate::translate::semantic::hir::WindowSpec,
+    source: &PhysicalSource<'document>,
+    filter: Option<&'document Expr>,
+    outer_partition: usize,
+) -> QueryResult<usize> {
+    let argument = function
+        .call
+        .arguments
+        .first()
+        .ok_or(PhysicalQueryError::Invalid("ntile has no bucket argument"))?;
+    let bucket_count = program.alloc_register();
+    let initialized = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: initialized,
+    });
+
+    let key_count = spec.order_by.len() + 1;
+    let first_key = program.alloc_registers(key_count);
+    let current_key = program.alloc_registers(key_count);
+    let inner = open_source(plan, program, bindings, ctes, source)?;
+    let ScanCursor::BTree(inner_cursor) = inner.cursor else {
+        return Err(PhysicalQueryError::Unsupported(
+            "ntile over a non-B-tree source",
+        ));
+    };
+    let outer_runtime = bindings.replace_source(
+        source.id,
+        SourceRuntime::Cursor(super::CursorId(inner.runtime_cursor)),
+    )?;
+    let emission = (|| -> QueryResult<()> {
+        let loop_start = program.allocate_label();
+        let loop_next = program.allocate_label();
+        let choose = program.allocate_label();
+        let done = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: inner_cursor,
+            pc_if_empty: done,
+        });
+        program.preassign_label_to_next_insn(loop_start);
+        if let Some(filter) = filter {
+            emit_filter(plan, program, bindings, ctes, filter, loop_next)?;
+        }
+        if !spec.partition_by.is_empty() {
+            let inner_partition = program.alloc_registers(spec.partition_by.len());
+            for (position, expression) in spec.partition_by.iter().enumerate() {
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries).emit_into(
+                    expression,
+                    RegisterRange::new(inner_partition + position, 1),
+                )?;
+            }
+            program.emit_insn(Insn::Compare {
+                start_reg_a: outer_partition,
+                start_reg_b: inner_partition,
+                count: spec.partition_by.len(),
+                key_info: spec
+                    .partition_by
+                    .iter()
+                    .map(|expression| KeyInfo {
+                        sort_order: SortOrder::Asc,
+                        collation: expression_collation(plan, expression),
+                        nulls_order: None,
+                    })
+                    .collect(),
+            });
+            let same_partition = program.allocate_label();
+            program.emit_insn(Insn::Jump {
+                target_pc_lt: loop_next,
+                target_pc_eq: same_partition,
+                target_pc_gt: loop_next,
+            });
+            program.preassign_label_to_next_insn(same_partition);
+        }
+
+        for (position, term) in spec.order_by.iter().enumerate() {
+            let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+            ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+                .emit_into(&term.expr, RegisterRange::new(current_key + position, 1))?;
+        }
+        program.emit_insn(Insn::RowId {
+            cursor_id: inner_cursor,
+            dest: current_key + spec.order_by.len(),
+        });
+        program.emit_insn(Insn::IfNot {
+            reg: initialized,
+            target_pc: choose,
+            jump_if_null: true,
+        });
+        let mut key_info = spec
+            .order_by
+            .iter()
+            .map(|term| KeyInfo {
+                sort_order: term.order,
+                collation: term
+                    .collation
+                    .as_ref()
+                    .map_or(CollationSeq::Binary, |collation| *collation.value()),
+                nulls_order: term.nulls,
+            })
+            .try_collect::<crate::alloc::Vec<_>>()?;
+        key_info.try_push(KeyInfo {
+            sort_order: SortOrder::Asc,
+            collation: CollationSeq::Binary,
+            nulls_order: None,
+        })?;
+        program.emit_insn(Insn::Compare {
+            start_reg_a: first_key,
+            start_reg_b: current_key,
+            count: key_count,
+            key_info,
+        });
+        program.emit_insn(Insn::Jump {
+            target_pc_lt: loop_next,
+            target_pc_eq: loop_next,
+            target_pc_gt: choose,
+        });
+        program.preassign_label_to_next_insn(choose);
+        program.emit_insn(Insn::Copy {
+            src_reg: current_key,
+            dst_reg: first_key,
+            extra_amount: key_count - 1,
+        });
+        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries)
+            .emit_into(argument, RegisterRange::new(bucket_count, 1))?;
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: initialized,
+        });
+        program.preassign_label_to_next_insn(loop_next);
+        program.emit_insn(Insn::Next {
+            cursor_id: inner_cursor,
+            pc_if_next: loop_start,
+        });
+        program.preassign_label_to_next_insn(done);
+        if inner.owned {
+            program.emit_insn(Insn::Close {
+                cursor_id: inner.cursor.id(),
+            });
+        }
+        Ok(())
+    })();
+    bindings.replace_source(source.id, outer_runtime)?;
+    emission?;
+
+    program.emit_insn(Insn::Cast {
+        reg: bucket_count,
+        affinity: crate::vdbe::affinity::Affinity::Integer,
+    });
+    let valid = program.allocate_label();
+    let zero = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: zero,
+    });
+    program.emit_insn(Insn::Gt {
+        lhs: bucket_count,
+        rhs: zero,
+        target_pc: valid,
+        flags: crate::vdbe::insn::CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::Halt {
+        err_code: crate::error::SQLITE_ERROR,
+        description: "argument of ntile must be a positive integer".to_string(),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(valid);
+    Ok(bucket_count)
 }
 
 #[allow(clippy::too_many_arguments)]
