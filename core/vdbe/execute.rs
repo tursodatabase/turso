@@ -718,12 +718,30 @@ pub fn op_null(
 }
 
 pub fn op_null_row(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(NullRow { cursor_id }, insn);
+    // NullRow can target a never-opened cursor slot (e.g. a Once-guarded
+    // OpenAutoindex in a loop body that never ran); install a permanently
+    // null placeholder, mirroring SQLite's OP_NullRow.
+    if state.cursors[*cursor_id].is_none() {
+        let (_, cursor_type) = program
+            .cursor_ref
+            .get(*cursor_id)
+            .expect("cursor_id should exist in cursor_ref");
+        turso_assert!(
+            matches!(
+                cursor_type,
+                CursorType::BTreeTable(_) | CursorType::BTreeIndex(_)
+            ),
+            "NullRow on unopened non-btree cursor",
+            { "cursor_id": cursor_id }
+        );
+        state.cursors[*cursor_id] = Some(Cursor::NullRow);
+    }
     state.get_cursor(*cursor_id).set_null_flag(true);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -1875,6 +1893,11 @@ fn op_column_fetch(
             state.registers[dest].set_value(value);
             return Ok(InsnFunctionStepResult::Step);
         }
+        if matches!(cursor, Cursor::NullRow) {
+            tracing::trace!("op_column(null_row placeholder)");
+            state.registers[dest].set_null();
+            return Ok(InsnFunctionStepResult::Step);
+        }
         // Fall back to normal handling
     }
 
@@ -2038,13 +2061,17 @@ pub fn op_column_has_field(
         | CursorType::MaterializedView(_, _) => {
             let cursor_ref =
                 must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "ColumnHasField");
-            let cursor = cursor_ref.as_btree_mut();
-            if cursor.get_null_flag() {
+            if matches!(cursor_ref, Cursor::NullRow) {
                 false
             } else {
-                match return_if_io!(cursor.record()) {
-                    Some(record) => record.column_count() > *column,
-                    None => false,
+                let cursor = cursor_ref.as_btree_mut();
+                if cursor.get_null_flag() {
+                    false
+                } else {
+                    match return_if_io!(cursor.record()) {
+                        Some(record) => record.column_count() > *column,
+                        None => false,
+                    }
                 }
             }
         }
@@ -5212,7 +5239,12 @@ pub fn op_row_id(
             }
             OpRowIdState::GetRowid => {
                 let cursors = &mut state.cursors;
-                if let Some(Cursor::BTree(btree_cursor)) = cursors
+                if let Some(Cursor::NullRow) = cursors
+                    .get_mut(*cursor_id)
+                    .expect("cursor_id should be valid")
+                {
+                    state.registers[*dest].set_null();
+                } else if let Some(Cursor::BTree(btree_cursor)) = cursors
                     .get_mut(*cursor_id)
                     .expect("cursor_id should be valid")
                 {
@@ -5287,6 +5319,7 @@ pub fn op_idx_row_id(
     let rowid = match cursor {
         Cursor::BTree(cursor) => return_if_io!(cursor.rowid()),
         Cursor::IndexMethod(cursor) => return_if_io!(cursor.query_rowid()),
+        Cursor::NullRow => None,
         _ => panic!("unexpected cursor type"),
     };
     match rowid {
@@ -14171,6 +14204,10 @@ pub fn op_open_ephemeral(
             // Fast path: if cursor already has an ephemeral btree, just clear it instead of
             // recreating the entire pager/file/btree. This is important for performance when
             // OpenEphemeral is called repeatedly during statement execution.
+            // A NullRow placeholder is not a real ephemeral btree; drop it.
+            if matches!(state.cursors[cursor_id], Some(Cursor::NullRow)) {
+                state.cursors[cursor_id] = None;
+            }
             if state.cursors[cursor_id].is_some() {
                 *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::ClearExisting;
                 return Ok(InsnFunctionStepResult::Step);

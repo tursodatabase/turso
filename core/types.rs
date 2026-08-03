@@ -3271,6 +3271,9 @@ pub enum Cursor {
     Sorter(Box<Sorter>),
     Virtual(VirtualTableCursor),
     MaterializedView(Box<crate::incremental::cursor::MaterializedViewCursor>),
+    /// Permanently-null placeholder installed by `NullRow` on a
+    /// never-opened cursor slot; all reads yield NULL.
+    NullRow,
 }
 
 impl Debug for Cursor {
@@ -3282,6 +3285,7 @@ impl Debug for Cursor {
             Self::Sorter(..) => f.debug_tuple("Sorter").finish(),
             Self::Virtual(..) => f.debug_tuple("Virtual").finish(),
             Self::MaterializedView(..) => f.debug_tuple("MaterializedView").finish(),
+            Self::NullRow => f.debug_tuple("NullRow").finish(),
         }
     }
 }
@@ -3379,6 +3383,8 @@ impl Cursor {
             // column reads untouched: nullRow is the steady state for pseudo
             // cursors there, and OP_Column keeps routing to the register.
             Self::Pseudo(_) => {}
+            // Permanently null; the flag is a no-op.
+            Self::NullRow => {}
             _ => {
                 mark_unlikely();
                 panic!("set_null_flag on unexpected cursor type");
