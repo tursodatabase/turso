@@ -349,7 +349,9 @@ fn access_method_order_consumed(
         )),
         AccessMethodParams::Subquery { iter_dir } => {
             let Table::FromClauseSubquery(from_clause_subquery) = &table_ref.table else {
-                unreachable!("access_method.params::Subquery must be for a FromClauseSubquery table");
+                unreachable!(
+                    "access_method.params::Subquery must be for a FromClauseSubquery table"
+                );
             };
             Some(subquery_intrinsic_order_consumed(
                 table_ref.internal_id,
