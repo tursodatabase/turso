@@ -510,24 +510,40 @@ pub struct WindowMetadata<'a> {
     /// to their corresponding column indexes in the subquery’s result.
     pub expressions_referencing_subquery: Vec<(&'a Expr, usize)>,
     pub buffer_table_name: String,
-    /// Per-function sorted indexes used by min/max when the frame has a
-    /// moving start. SQLite implements these aggregates without xInverse:
-    /// step inserts `(value, sequence)`, inverse removes the oldest matching
-    /// value, and value reads column 0 from the last index entry.
+    /// For each window function, a sorted index used to compute `min()` or
+    /// `max()` when the frame's start can move (so rows leave the frame as
+    /// it slides). Most aggregates can cheaply undo one row's contribution
+    /// when it leaves, but min/max can't: if you drop the current maximum,
+    /// you have no way to know the next-largest value. So instead of a
+    /// single running value we keep every in-frame value in a sorted index.
+    /// A row joining the frame inserts its value, a row leaving deletes it,
+    /// and the current answer is always the largest (or smallest) value
+    /// still in the index. Each entry is a `(value, sequence)` pair; the
+    /// ever-increasing sequence number keeps equal values apart, so a
+    /// leaving row deletes exactly its own entry. `None` for any function
+    /// that isn't a min/max needing this index.
     pub minmax: Vec<Option<WindowMinMax>>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct WindowMinMax {
     pub cursor: CursorID,
-    /// Three consecutive registers: argument, sequence, packed record.
+    /// The first of three registers in a row, used to build one index
+    /// entry: `[0]` the function argument's value for this row, `[1]` the
+    /// sequence counter (bumped once per row so equal values stay
+    /// distinct), `[2]` those two packed into the record that is inserted
+    /// into the index.
     pub registers: usize,
 }
 
-/// Allocate SQLite's per-function ephemeral index for min/max over a frame
-/// whose start can move. The first key is the aggregate argument; the second
-/// is a monotonically increasing sequence that makes duplicate values unique.
-/// `min` reverses the first key so `Last` returns the minimum for both funcs.
+/// Create the sorted index that a `min()` / `max()` window function uses
+/// when the frame's start can move (see `WindowMetadata::minmax`). The
+/// index sorts on two columns: the argument value, then an
+/// always-increasing sequence number so equal values still get separate
+/// entries. For `max()` the value sorts ascending and for `min()` it sorts
+/// descending, so in both cases the current answer is just the last entry
+/// in the index — one code path serves both. The index is ephemeral: it
+/// exists only for the duration of this query.
 fn allocate_window_minmax(
     program: &mut ProgramBuilder,
     window: &Window,
@@ -601,87 +617,173 @@ fn allocate_window_minmax(
 
 #[derive(Debug, Clone, Copy)]
 pub struct WindowLabels {
-    /// Address of the subroutine for flushing buffered rows
+    /// Address of the flush subroutine — the code that, at the end of each
+    /// partition, finishes off the rows still sitting in the buffer.
     pub flush_buffer: BranchOffset,
-    /// Address of the subroutine that sends the populated result registers
-    /// to the outer query (select-result / order-by sorter insert). Mirrors
-    /// SQLite's `addrGosub` (window.c:1988): every RETURN_ROW site Gosubs
-    /// here, so per-row bookkeeping with a single jump target — SELECT
-    /// DISTINCT's on-conflict label in particular — is emitted exactly once.
+    /// Address of a small shared subroutine that hands one finished row to
+    /// the rest of the query (into the SELECT output, or into the ORDER BY
+    /// sorter). Every place that emits a row (RETURN_ROW) calls this same
+    /// subroutine, so the per-row output logic — for example the duplicate
+    /// check for SELECT DISTINCT — is written once here instead of being
+    /// repeated at every emit site. Mirrors SQLite's `addrGosub`
+    /// (window.c:1988).
     pub row_output: BranchOffset,
-    /// Address of the end of window processing
+    /// Address of the instruction just past all window processing; control
+    /// jumps here once the input rows have run out.
     pub window_processing_end: BranchOffset,
+}
+
+/// One of the three cursors that walk the buffered rows of a partition.
+/// Each main-loop operation drives exactly one of them: AGGSTEP → `End`,
+/// RETURN_ROW → `Current`, AGGINVERSE → `Start`. Used to index per-cursor
+/// state by role so a cursor and its bookkeeping can't be mixed up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameCursor {
+    Start = 0,
+    Current = 1,
+    End = 2,
+}
+
+/// The REPLAY side of peer tracking: for each frame cursor, the start
+/// register of a block holding the ORDER BY values of the peer group (a
+/// run of rows with equal ORDER BY values) that cursor is currently
+/// sitting on. As a cursor walks forward through the
+/// buffered rows, `emit_window_op` compares the next row against its block
+/// to tell when the cursor has crossed into a new group. Three separate
+/// blocks because under RANGE/GROUPS the cursors can each be on a
+/// different group at the same time (needed for percent_rank /
+/// cume_dist).
+///
+/// An entry is `None` when that cursor isn't peer-tracked: always under
+/// ROWS (rows are never compared for peer-equality), and `Start` also
+/// when the frame start can't move (there is no `csr_start`). Indexed by
+/// [`FrameCursor`]. Mirrors SQLite's `s.{start,current,end}.reg`
+/// (window.c:2897-2899). See `source_peer_values` for the INPUT-side
+/// counterpart.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CursorPeerValues([Option<usize>; 3]);
+
+impl core::ops::Index<FrameCursor> for CursorPeerValues {
+    type Output = Option<usize>;
+    fn index(&self, cursor: FrameCursor) -> &Self::Output {
+        &self.0[cursor as usize]
+    }
+}
+
+impl CursorPeerValues {
+    /// The register of each cursor that is peer-tracked, skipping the ones
+    /// that aren't (`None`).
+    fn allocated(&self) -> impl Iterator<Item = usize> {
+        self.0.into_iter().flatten()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct WindowRegisters {
-    /// Stores the ROWID of the last row inserted into the buffer table.
-    /// If NULL, we are before inserting the first row of a new partition.
+    /// The rowid of the last row we inserted into the buffer table. It is
+    /// set to NULL at the start of each partition, so a NULL value here
+    /// means we haven't yet inserted this partition's first row — which is
+    /// how the main loop tells "first row of a new partition" apart from
+    /// every later row.
     pub rowid: usize,
-    /// Start of the register array storing partition key values for the current partition.
+    /// Start of a block of registers holding the PARTITION BY column values
+    /// of the current partition. Comparing the next row's PARTITION BY
+    /// values against these is how we notice that a new partition has
+    /// begun.
     pub partition_start: Option<usize>,
-    /// Start of the register array storing per-function state for window functions.
-    /// Aggregates use `AggStep` to populate their state.
+    /// Start of a block of registers, one per window function, holding that
+    /// function's running total. AGGSTEP folds a row into these as it joins
+    /// the frame; AGGINVERSE takes one back out as it leaves.
     pub acc_start: usize,
-    /// Start of the register array storing per-function outputs. Aggregate windows
-    /// populate these via `AggValue`; window-only functions like ROW_NUMBER()
-    /// keep their running state here.
+    /// Start of a block of registers, one per window function, holding the
+    /// value to output for the current row. For aggregates this is worked
+    /// out from the running total (AggValue). Ranking functions like
+    /// row_number() have no running total and simply keep their value here.
     pub acc_result_start: usize,
-    /// Stores the address to which control returns after all buffered rows are flushed.
+    /// The return address the flush subroutine jumps back to once it has
+    /// finished emptying the buffer.
     pub flush_buffer_return_offset: usize,
-    /// Start of consecutive registers containing column values for the current row
-    /// read from the subquery.
+    /// Start of consecutive registers holding the current row's column
+    /// values, as read from the source subquery.
     pub src_columns_start: usize,
-    /// Start of the register array storing column values that need to be propagated
-    /// from the subquery to the parent query.
+    /// Start of a block of registers holding the column values that have to
+    /// be carried through from the subquery out to the parent query.
     pub result_columns_start: usize,
     /// Start of the register array holding ORDER BY column values for the current row.
     /// These registers are used to detect whether the current row is a "peer"
     /// (i.e., has identical ORDER BY values to the previous row).
     pub new_order_by_columns_start: Option<usize>,
-    /// ORDER BY values of the last source row that began a new peer
-    /// group. `emit_window_step` compares each incoming row against it:
-    /// same peer group means skip the frame ops, otherwise copy the new
-    /// values in. Separate from `peer_end_reg` because that one is
-    /// updated inside the frame ops, which a countdown can skip, whereas
-    /// this must advance on every non-peer source row. Mirrors SQLite's
-    /// `regPeer` (window.c:2896, updated at window.c:2984-2986).
-    pub peer_new_ref: Option<usize>,
-    /// One "peer reference" per frame cursor, each holding the ORDER BY
-    /// values of the peer group that cursor is on. The peer-loop in
-    /// `emit_window_op` compares the next row against it and either loops
-    /// (still the same group) or falls through and updates it (new
-    /// group). `peer_start_reg` is `Some` only for a moving frame start
-    /// (ntile, percent_rank, cume_dist), the only case with a `csr_start`
-    /// to loop. Mirrors SQLite's `s.{start,current,end}.reg`
-    /// (window.c:2897-2899).
-    pub peer_start_reg: Option<usize>,
-    pub peer_current_reg: Option<usize>,
-    pub peer_end_reg: Option<usize>,
-    /// Holds the offset `N` for a `Preceding(_)` or `Following(_)` frame
-    /// start, evaluated once per partition. It counts down via `OP_IfPos`
-    /// to hold an operation back by N rows: `ROWS BETWEEN N PRECEDING AND
-    /// CURRENT ROW` gates AGGINVERSE with it, cume_dist's `1 FOLLOWING`
-    /// gates RETURN_ROW. Mirrors SQLite's `regStart` (window.c:2883).
+    /// The INPUT side of peer tracking: the ORDER BY values of the peer
+    /// group that the source rows coming in are currently in. (A peer group
+    /// is a run of rows with equal ORDER BY values.) The main loop
+    /// (`emit_window_step`) compares each new source row's values
+    /// (`new_order_by_columns_start`) against this, once per row:
+    /// - Equal: the row is in the same group. Under RANGE/GROUPS a whole
+    ///   group is handled at once, so the row is only buffered for now —
+    ///   nothing is added to the totals and no result is emitted yet.
+    /// - Different: a new group has started, so this is overwritten with
+    ///   the new row's values.
+    ///
+    /// Just one register block, because the input is read in one pass.
+    /// Contrast `cursor_peer_values` below, the REPLAY side. Mirrors
+    /// SQLite's `regPeer` (window.c:2896, updated at window.c:2984-2986).
+    pub source_peer_values: Option<usize>,
+    /// The REPLAY side of peer tracking, one entry per frame cursor. See
+    /// [`CursorPeerValues`].
+    pub cursor_peer_values: CursorPeerValues,
+    /// The offset N from a frame whose start is `N PRECEDING` or
+    /// `N FOLLOWING`, worked out once per partition (N can be an
+    /// expression, not just a literal number).
+    ///
+    /// Like `end_offset_reg`, this is a countdown: a start boundary "N rows
+    /// away" means one piece of work has to wait until we have moved N rows
+    /// along. `OP_IfPos` skips that work and ticks the counter down until it
+    /// reaches zero.
+    /// - `ROWS BETWEEN N PRECEDING AND CURRENT ROW` uses it to delay
+    ///   dropping rows off the start of the frame (AGGINVERSE), so the frame
+    ///   first grows to N+1 rows before it starts sliding forward.
+    /// - cume_dist's implicit `1 FOLLOWING` start uses it to delay emitting
+    ///   results (RETURN_ROW).
+    ///
+    /// Mirrors SQLite's `regStart` (window.c:2883).
     pub start_offset_reg: Option<usize>,
-    /// Register holding the runtime-evaluated `N` for frames whose end
-    /// boundary is `Preceding(_)` or `Following(_)`, gating the op that
-    /// must lag the frame end by N rows (pattern-dependent: the
-    /// RETURN_ROW / AGGINVERSE pair under a bounded FOLLOWING end, the
-    /// AGGSTEP under a PRECEDING end). Mirrors SQLite's `regEnd`
-    /// (window.c:2885-2887).
+    /// The offset N from a frame whose end is `N PRECEDING` or
+    /// `N FOLLOWING`, worked out once at run time (N can be an expression,
+    /// not just a literal number).
+    ///
+    /// We process one row at a time, but an end boundary "N rows away"
+    /// means some work for the current row can't be done yet — we have to
+    /// wait until we have moved N rows further along. This register counts
+    /// those N rows down. Which piece of work waits depends on where the
+    /// frame ends:
+    /// - End is `N FOLLOWING` (the frame reaches N rows past the current
+    ///   row): emitting the current row's result, and dropping rows that
+    ///   have fallen off the start of the frame, both wait N rows.
+    /// - End is `N PRECEDING` (the frame stops N rows before the current
+    ///   row): adding a row to the totals waits N rows.
+    ///
+    /// `None` for any other end (CURRENT ROW, UNBOUNDED FOLLOWING), which
+    /// need no waiting. Mirrors SQLite's `regEnd` (window.c:2885-2887).
     pub end_offset_reg: Option<usize>,
-    /// Inclusive rowid bounds of the live frame when an explicit EXCLUDE
-    /// clause selects full-frame rescans. AGGSTEP advances the end bound;
-    /// AGGINVERSE advances the start bound. They begin at 1 and 0 so the
-    /// initial frame is empty.
+    /// The first and last buffer rowid of the frame as it stands right now.
+    /// Only used when the window has an EXCLUDE clause. EXCLUDE means we
+    /// cannot keep a running total as rows come and go, because which rows
+    /// count keeps changing; instead we re-add up the whole frame for every
+    /// output row, and to do that we need to know exactly which rows the
+    /// frame currently spans. AGGSTEP moves the last-rowid forward as rows
+    /// join the frame, AGGINVERSE moves the first-rowid forward as rows
+    /// drop off it. They start at first=1, last=0: with the first rowid
+    /// past the last, the range covers no rows, so the frame starts empty.
     pub frame_start_rowid: Option<usize>,
     pub frame_end_rowid: Option<usize>,
-    /// Return-address register for the `labels.row_output` Gosub. Mirrors
-    /// SQLite's `regGosub` (window.c:2793).
+    /// The register holding the return address for calls to the
+    /// `row_output` subroutine (see `WindowLabels::row_output`): the
+    /// subroutine jumps back to whatever address is stored here when it
+    /// finishes. Mirrors SQLite's `regGosub` (window.c:2793).
     pub row_output_return: usize,
-    /// Two counters tracking the current frame's bounds, used by
-    /// `first_value` / `nth_value` to seek a row by position:
+    /// Two counters tracking where the frame's edges are, so `first_value`
+    /// / `nth_value` can jump straight to a particular row of the frame by
+    /// its position:
     ///
     /// * `+0` — rows that have left the frame (one per AGGINVERSE), i.e.
     ///   the frame start's buffer index minus one.
@@ -697,45 +799,51 @@ pub struct WindowRegisters {
     pub frame_counters: Option<usize>,
 }
 
-/// Cursors on the ephemeral "buffer" B-tree that holds rows of the current
-/// partition. The four cursor roles mirror SQLite's `sqlite3WindowCodeStep`
-/// allocation (`window.c:2834-2837`).
+/// Cursors over the "buffer": a temporary B-tree table, created just for
+/// this query, that holds the rows of the current partition so we can read
+/// them more than once. The four cursor roles mirror SQLite's
+/// `sqlite3WindowCodeStep` allocation (`window.c:2834-2837`).
 #[derive(Debug, Clone, Copy)]
 pub struct WindowCursors {
-    /// Used to `Insert` newly-buffered source rows. Position is implicit
-    /// (advances on each `NewRowid` + `Insert`).
+    /// The cursor used to append each incoming source row to the buffer.
+    /// We never seek it; it simply advances as we `NewRowid` + `Insert` the
+    /// next row.
     pub csr_write: CursorID,
-    /// The row currently being returned to the outer query. `AggValue` fires
-    /// when this advances; result-column propagation reads from here.
+    /// The row currently being sent to the outer query. Each function's
+    /// result for this row is computed just before the cursor moves on,
+    /// and the row's output columns are read from here.
     pub csr_current: CursorID,
-    /// Tracks the frame-end boundary. `AggStep` reads from this cursor's
-    /// current row, then advances it. Under RANGE/GROUPS frames the advance
-    /// loops through peer-equal rows in one go.
+    /// Points at the next row about to join the frame. `AggStep` reads
+    /// that row, adds it to the running totals, then moves the cursor on.
+    /// Under GROUPS/RANGE frames one advance steps over every row with
+    /// equal ORDER BY values (a "peer group") at once.
     pub csr_end: CursorID,
-    /// Tracks the frame-start boundary for windows whose coerced frame
-    /// doesn't start at UNBOUNDED PRECEDING (ntile, percent_rank,
-    /// cume_dist). `AggInverse` reads from this cursor's current row,
-    /// then advances it (peer-loop under GROUPS/RANGE mode). `None` when
-    /// the frame start is UNBOUNDED PRECEDING — the cursor would never
-    /// move so allocation would be wasted. Mirrors SQLite's
-    /// `s.start.csr` (`window.c:2836`).
+    /// Points at the first row still inside the frame — the one
+    /// `AggInverse` drops next as the frame's start moves forward. Only
+    /// allocated when the frame start can move off the first row of the
+    /// partition (ntile, percent_rank, cume_dist); an UNBOUNDED PRECEDING
+    /// start never moves, so there is nothing to track (`None`). Under
+    /// GROUPS/RANGE frames one advance steps over a whole peer group (rows
+    /// with equal ORDER BY values). Mirrors SQLite's `s.start.csr`
+    /// (`window.c:2836`).
     pub csr_start: Option<CursorID>,
-    /// Per-row lookup cursor used at output time by functions whose
-    /// value is computed via `SeekRowid` rather than running aggregator
-    /// state — first_value, nth_value, lag, lead. `OpenDup`'d off
-    /// `csr_current` and only moved by `SeekRowid` at output time, so
-    /// it's independent of the frame-cursor positions. Allocated
-    /// lazily — `None` when no function in the window needs positional
-    /// lookup. Mirrors SQLite's `pWin->csrApp` (`window.c`).
+    /// A separate cursor for functions that read one specific row rather
+    /// than a running total — first_value, nth_value, lag, lead. At output
+    /// time it jumps straight to the wanted row by its rowid (`SeekRowid`).
+    /// It is a duplicate of `csr_current` (`OpenDup`) and only ever moves
+    /// on those jumps, so it never disturbs the three frame cursors.
+    /// Allocated only when some function needs it (`None` otherwise).
+    /// Mirrors SQLite's `pWin->csrApp` (`window.c`).
     pub csr_app: Option<CursorID>,
 }
 
 /// Builds `KeyInfo` entries for the window's ORDER BY columns, populating
-/// each entry's collation from the expression. Used by every peer-equality
-/// `Insn::Compare` site (source-row pre-check + per-cursor peer-loop in
-/// `emit_window_op`); `sort_order` and `nulls_order` are left at their
-/// `Insn::Compare` defaults — the peer check only inspects equality, not
-/// ordering direction.
+/// each entry's collation from the expression. Used everywhere two rows
+/// are compared to see whether they are peers (have equal ORDER BY
+/// values): once on each incoming source row, and once per cursor while
+/// stepping over a group in `emit_window_op`. `sort_order` and
+/// `nulls_order` are left at their `Insn::Compare` defaults — this check
+/// only asks whether the values are equal, not which one sorts first.
 fn build_order_by_key_info(
     window: &Window,
     table_references: &crate::translate::plan::TableReferences,
@@ -812,10 +920,13 @@ fn emit_window_check_offset(
     let label_ok = program.allocate_label();
     let reg_zero = program.alloc_register();
     if mode == FrameMode::Range {
-        // With NUMERIC affinity, numeric text is converted before this
-        // comparison and remains below the empty string. Non-numeric text
-        // and blobs compare at or above it; JUMP_IF_NULL catches NULL.
-        // Those invalid values branch directly to the frame-specific error.
+        // A RANGE offset has to be a number. This checks that indirectly:
+        // comparing with NUMERIC affinity turns a number (or numeric-looking
+        // text) into a number, and in SQLite's type ordering numbers sort
+        // below every string, including the empty string. So a valid
+        // numeric offset is `< ""` and falls through, while real text or a
+        // blob is `>= ""` and jumps to the error; jump_if_null sends NULL
+        // there too.
         let reg_empty = program.alloc_register();
         program.emit_insn(Insn::String8 {
             value: String::new(),
@@ -831,9 +942,10 @@ fn emit_window_check_offset(
             collation: None,
         });
     } else {
-        // ROWS / GROUPS: coerce to integer; route the failure into
-        // the frame-specific Halt so the user sees the SQLite-matching
-        // error instead of the generic "datatype mismatch".
+        // A ROWS / GROUPS offset has to be an integer. MustBeInt converts
+        // it, or jumps to our own Halt if it can't — so the user gets
+        // SQLite's specific frame-offset error rather than a generic
+        // "datatype mismatch".
         program.emit_insn(Insn::MustBeInt {
             reg: offset_reg,
             target_pc: Some(label_halt),
@@ -929,10 +1041,10 @@ impl EmitWindow {
         let cursor_csr_write =
             program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
         let cursor_csr_end = program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
-        // `csr_start` tracks the frame-start cursor for functions whose
-        // coerced frame doesn't start at UNBOUNDED PRECEDING (ntile,
-        // percent_rank, cume_dist). AggInverse fires on this cursor as
-        // the frame shrinks from the left.
+        // `csr_start` follows the start of the frame. Only needed when the
+        // frame start can move off the first row of the partition (ntile,
+        // percent_rank, cume_dist); AggInverse reads from this cursor as
+        // rows drop off the start of the frame.
         let has_moving_start = !matches!(
             window.frame.start,
             crate::translate::plan::FrameBoundary::UnboundedPreceding
@@ -1071,35 +1183,33 @@ impl EmitWindow {
                 src_columns_start: reg_src_columns_start,
                 result_columns_start: reg_col_start,
                 new_order_by_columns_start: alloc_optional_registers(program, order_by_len),
-                // Allocated for RANGE / GROUPS only, like the per-cursor
-                // peer references — under ROWS neither the source-row
-                // pre-check nor the peer-loops run. Mirrors SQLite's
-                // `regPeer` allocation gate at window.c:2892-2896.
-                peer_new_ref: if window.frame.mode != turso_parser::ast::FrameMode::Rows {
+                // Peer tracking only runs under RANGE / GROUPS — under
+                // ROWS a row is never compared against its neighbours to
+                // see if they are peers, so all of these stay `None`.
+                // Mirrors SQLite's `regPeer` allocation gate at
+                // window.c:2892-2896.
+                source_peer_values: if window.frame.mode != turso_parser::ast::FrameMode::Rows {
                     alloc_optional_registers(program, order_by_len)
                 } else {
                     None
                 },
-                peer_start_reg: if has_moving_start
-                    && window.frame.mode != turso_parser::ast::FrameMode::Rows
-                {
-                    alloc_optional_registers(program, order_by_len)
-                } else {
-                    None
-                },
-                // `peer_current_reg` / `peer_end_reg` drive the AGGSTEP /
-                // RETURN_ROW peer-loops, which only run under RANGE / GROUPS
-                // (`b_peer` in `emit_window_op`). Under ROWS they're written
-                // by the seeding step but never read; skip the allocation.
-                peer_current_reg: if window.frame.mode != turso_parser::ast::FrameMode::Rows {
-                    alloc_optional_registers(program, order_by_len)
-                } else {
-                    None
-                },
-                peer_end_reg: if window.frame.mode != turso_parser::ast::FrameMode::Rows {
-                    alloc_optional_registers(program, order_by_len)
-                } else {
-                    None
+                cursor_peer_values: {
+                    let is_peer_tracked = window.frame.mode != turso_parser::ast::FrameMode::Rows;
+                    // Order matters: this allocates registers, so keep it
+                    // Start / Current / End to match `FrameCursor`.
+                    CursorPeerValues([
+                        // Start: only when the frame start can move — that
+                        // is the only case with a `csr_start` to track.
+                        (is_peer_tracked && has_moving_start)
+                            .then(|| alloc_optional_registers(program, order_by_len))
+                            .flatten(),
+                        is_peer_tracked
+                            .then(|| alloc_optional_registers(program, order_by_len))
+                            .flatten(),
+                        is_peer_tracked
+                            .then(|| alloc_optional_registers(program, order_by_len))
+                            .flatten(),
+                    ])
                 },
                 start_offset_reg: match window.frame.start {
                     crate::translate::plan::FrameBoundary::Preceding(_)
@@ -1138,12 +1248,12 @@ impl EmitWindow {
     /// Emits the per-source-row body for window processing.
     ///
     /// This is the Rust port of the main loop in SQLite's
-    /// `sqlite3WindowCodeStep` (`window.c:2786-3037`). The op sequence at
-    /// the tail is one of three patterns keyed on the frame bounds —
-    /// `FOLLOWING` start / `PRECEDING` end / everything else — matching
-    /// SQLite's dispatch at window.c:2987-3037; arms the planner still
-    /// rejects are marked unreachable and gain bodies as the
-    /// corresponding frame support lands.
+    /// `sqlite3WindowCodeStep` (`window.c:2786-3037`). The three
+    /// operations that move the frame forward — adding a row to the
+    /// running totals, emitting a row's result, and removing a row from
+    /// the totals — are emitted in one of three orders, chosen by the
+    /// frame's bounds: a `FOLLOWING` start, a `PRECEDING` end, or anything
+    /// else. This matches SQLite's three cases at window.c:2987-3037.
     ///
     /// Pseudocode for the most common shape (`UNBOUNDED PRECEDING TO
     /// CURRENT ROW`):
@@ -1164,7 +1274,7 @@ impl EmitWindow {
     ///   else:                                       ; SUBSEQUENT ROW
     ///       Insert row into ephemeral via csr_write
     ///       if RANGE/GROUPS and newPeer == prevPeer:
-    ///           Goto loop_end                       ; defer step until peer break
+    ///           Goto loop_end                       ; same group: just buffer, process later
     ///       emit_window_op AGGSTEP        ; advance csr_end through peer rows; AggStep per row
     ///       emit_window_op RETURN_ROW     ; advance csr_current; emit each row
     ///       (emit_window_op AGGINVERSE is a no-op for UNBOUNDED start)
@@ -1198,9 +1308,10 @@ impl EmitWindow {
         emit_flush_buffer_if_new_partition(program, &labels, &registers, window, plan)?;
 
         // `rowid_reg` was NULL'd at partition entry; it stays NULL until the
-        // first Insert of this partition. We use that to dispatch between
-        // the first-row branch (cold-start setup) and the subsequent-row
-        // branch (the steady-state AGGSTEP + RETURN_ROW pair).
+        // first Insert of this partition. That tells the two branches apart:
+        // the first row of a partition needs one-time setup, while every
+        // later row just adds itself to the totals (AGGSTEP) and emits a
+        // result (RETURN_ROW).
         let label_subsequent = program.allocate_label();
         let label_step_end = program.allocate_label();
         program.emit_insn(Insn::NotNull {
@@ -1209,9 +1320,10 @@ impl EmitWindow {
         });
 
         // --- FIRST ROW OF PARTITION ---
-        if let (Some(new_ob), Some(peer_new_ref)) =
-            (registers.new_order_by_columns_start, registers.peer_new_ref)
-        {
+        if let (Some(new_ob), Some(source_peer_values)) = (
+            registers.new_order_by_columns_start,
+            registers.source_peer_values,
+        ) {
             // Seed the source-row peer reference and every per-cursor
             // peer reference with the first row's ORDER BY values.
             // Mirrors SQLite's init at `window.c:2972-2976` (regNewPeer
@@ -1223,19 +1335,12 @@ impl EmitWindow {
             let n = window.order_by.len() - 1;
             program.emit_insn(Insn::Copy {
                 src_reg: new_ob,
-                dst_reg: peer_new_ref,
+                dst_reg: source_peer_values,
                 extra_amount: n,
             });
-            for &peer_reg in [
-                registers.peer_start_reg,
-                registers.peer_current_reg,
-                registers.peer_end_reg,
-            ]
-            .iter()
-            .flatten()
-            {
+            for peer_reg in registers.cursor_peer_values.allocated() {
                 program.emit_insn(Insn::Copy {
-                    src_reg: peer_new_ref,
+                    src_reg: source_peer_values,
                     dst_reg: peer_reg,
                     extra_amount: n,
                 });
@@ -1269,10 +1374,11 @@ impl EmitWindow {
                 dest: frame_counters + 1,
             });
         }
-        // The offset register is reused across partitions, so re-evaluate
-        // here at each partition boundary — a hoisted constant init would
-        // leave the value drifted after the first partition's IfPos
-        // decrements ran. Mirrors SQLite's `regStart` init at `window.c:2942`.
+        // The same register holds the offset for every partition, and the
+        // IfPos delays decrement it as they run. Re-evaluate it here at the
+        // start of each partition: setting it just once up front would
+        // leave the decremented (wrong) value in place from the second
+        // partition on. Mirrors SQLite's `regStart` init at `window.c:2942`.
         if let Some(start_offset_reg) = registers.start_offset_reg {
             let offset_expr = match &window.frame.start {
                 crate::translate::plan::FrameBoundary::Preceding(expr)
@@ -1316,14 +1422,15 @@ impl EmitWindow {
             &src_column_count,
             &buffer_table_name,
         );
-        // Degenerate-frame check (window.c:2950-2961): for non-RANGE
+        // Empty-frame check (window.c:2950-2961): for non-RANGE
         // frames bounded on both sides by the same kind — `N PRECEDING
         // AND M PRECEDING` or `N FOLLOWING AND M FOLLOWING` — the frame
         // is empty for every row whenever the bounds cross (M > N for
         // PRECEDING pairs, M < N for FOLLOWING pairs). Each row then
-        // emits its empty-frame value (aggregates finalize their
-        // never-stepped state, positional lookups yield NULL because the
-        // frame counters stay 0) and the buffer is cleared. Re-Nulling
+        // emits the result an empty frame gives (an aggregate that never
+        // saw a row — sum → NULL, count → 0; first_value / nth_value yield
+        // NULL because the frame counters stay 0) and the buffer is
+        // cleared. Re-Nulling
         // `rowid_reg` sends every subsequent row back through this
         // branch — SQLite gets that re-entry for free because its
         // first-row test is `rowid == 1` and ResetSorter restarts the
@@ -1396,9 +1503,10 @@ impl EmitWindow {
             });
             program.preassign_label_to_next_insn(label_frame_valid);
         }
-        // `N FOLLOWING AND M FOLLOWING`: AGGINVERSE must fire M - N
-        // times behind AGGSTEP, not M times behind RETURN_ROW, so the
-        // start countdown becomes the offset difference
+        // `N FOLLOWING AND M FOLLOWING`: dropping rows off the start
+        // (AGGINVERSE) must lag adding them (AGGSTEP) by M - N rows,
+        // rather than lag emitting the result (RETURN_ROW) by M. So the
+        // start count is set to the difference of the two offsets
         // (window.c:2962-2965).
         if matches!(
             window.frame.start,
@@ -1435,9 +1543,9 @@ impl EmitWindow {
             pc_if_empty: label_unreachable_empty,
         });
         program.preassign_label_to_next_insn(label_unreachable_empty);
-        // First row contributes nothing to xStep here — the drain AGGSTEP
-        // in the flush subroutine processes it once at end-of-partition,
-        // and RETURN_ROW there emits it.
+        // The first row is not added to the totals here. The flush
+        // subroutine adds it once at the end of the partition (AGGSTEP)
+        // and emits it there (RETURN_ROW).
         program.emit_insn(Insn::Goto {
             target_pc: label_step_end,
         });
@@ -1452,38 +1560,43 @@ impl EmitWindow {
             &buffer_table_name,
         );
 
-        // Under RANGE / GROUPS, a row in the same peer group as the last
-        // is only buffered; the frame ops wait until the next group
-        // begins, then AGGSTEP's peer-loop walks all the buffered peers
-        // at once. With no ORDER BY the whole partition is one group, so
-        // every row defers to the flush subroutine. Mirrors SQLite's
-        // `windowIfNewPeer` call at window.c:2984-2986 (an unconditional
-        // jump when there's no ORDER BY, window.c:2076).
+        // Under RANGE / GROUPS, a row with the same ORDER BY values as the
+        // previous one (its peer) is only buffered for now: adding rows to
+        // the totals and emitting results both wait until the next group
+        // begins, and then handle the whole buffered group in one go. With
+        // no ORDER BY the whole partition is a single group, so every row
+        // waits and the end-of-partition flush does the work. Mirrors
+        // SQLite's `windowIfNewPeer` call at window.c:2984-2986 (an
+        // unconditional jump when there's no ORDER BY, window.c:2076).
         if window.frame.mode != turso_parser::ast::FrameMode::Rows {
-            program.add_comment(program.offset(), "skip frame ops when peer of previous row");
+            program.add_comment(
+                program.offset(),
+                "peer of previous row: buffer only, handle at group end",
+            );
             emit_if_new_peer(
                 program,
                 window,
                 &plan.table_references,
                 registers.new_order_by_columns_start,
-                registers.peer_new_ref,
+                registers.source_peer_values,
                 label_step_end,
             )?;
         }
 
-        // The op sequence for this row, picked by frame bounds — one of
-        // SQLite's three `sqlite3WindowCodeStep` patterns
-        // (window.c:2987-3037). `unreachable!` arms are shapes the planner
-        // still rejects; they gain bodies as that frame support lands.
+        // Pick the order to run the three operations in, based on the
+        // frame's bounds — one of SQLite's three `sqlite3WindowCodeStep`
+        // cases (window.c:2987-3037).
         use crate::translate::plan::FrameBoundary;
         let is_range = window.frame.mode == turso_parser::ast::FrameMode::Range;
         let end_is_unbounded = matches!(window.frame.end, FrameBoundary::UnboundedFollowing);
         if matches!(window.frame.start, FrameBoundary::Following(_)) {
-            // Pattern A — `<expr> FOLLOWING` start (window.c:2987-3002).
-            // The frame-end cursor leads the emit point, so AGGSTEP runs
-            // ungated; the end countdown holds RETURN_ROW back by M rows
-            // and the start countdown (rewritten to M - N in the
-            // first-row branch) keeps AGGINVERSE N rows behind that.
+            // Pattern A — the frame starts after the current row (`<expr>
+            // FOLLOWING` start), e.g. `ROWS BETWEEN 1 FOLLOWING AND 3
+            // FOLLOWING` (window.c:2987-3002). Every row is added to the
+            // totals as soon as we reach it (AGGSTEP, no delay). Producing
+            // a row's result waits until we have read M more rows past it
+            // (M = the end offset); dropping rows that have fallen off the
+            // start waits a further N rows (N = the start offset).
             emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None, false)?;
             if !end_is_unbounded {
                 if is_range {
@@ -1537,10 +1650,12 @@ impl EmitWindow {
                 }
             }
         } else if matches!(window.frame.end, FrameBoundary::Preceding(_)) {
-            // Pattern B — `<expr> PRECEDING` end (window.c:3004-3009).
-            // The frame-end cursor trails the emit point: AGGSTEP is
-            // held back by the end countdown while RETURN_ROW runs
-            // ungated on every row.
+            // Pattern B — the frame ends before the current row (`<expr>
+            // PRECEDING` end), e.g. `ROWS BETWEEN UNBOUNDED PRECEDING AND
+            // 2 PRECEDING` (window.c:3004-3009). A row's result can be
+            // produced right away (RETURN_ROW, no delay). Adding rows to
+            // the totals waits M rows (M = the end offset), because the
+            // last row of the frame sits M rows behind the current one.
             emit_window_op(
                 program,
                 t_ctx,
@@ -1550,10 +1665,12 @@ impl EmitWindow {
                 None,
                 false,
             )?;
-            // A RANGE frame with both bounds PRECEDING runs AGGINVERSE
-            // before RETURN_ROW so the frame-start cursor can't overtake
-            // the (already-trailing) frame-end cursor when the two offsets
-            // differ. SQLite's `bRPS` at window.c:3005.
+            // When a RANGE frame has both bounds PRECEDING, drop rows off
+            // the start (AGGINVERSE) before producing the result
+            // (RETURN_ROW). Both cursors already sit behind the current
+            // row; this order stops the start cursor from moving past the
+            // end cursor when the two offsets differ. SQLite's `bRPS` at
+            // window.c:3005.
             let inverse_before_return =
                 is_range && matches!(window.frame.start, FrameBoundary::Preceding(_));
             if inverse_before_return {
@@ -1600,10 +1717,12 @@ impl EmitWindow {
                         label_done,
                     )?;
                 }
-                // A `<expr> FOLLOWING` end holds the RETURN_ROW +
-                // AGGINVERSE pair back by M rows. Unlike the countdowns
-                // inside `emit_window_op`, this gate skips the *pair*
-                // together — SQLite emits it inline at window.c:3028-3034.
+                // A `<expr> FOLLOWING` end delays both producing the
+                // result (RETURN_ROW) and dropping rows off the start
+                // (AGGINVERSE) by M rows. The per-op delays inside
+                // `emit_window_op` hold back one op at a time; this one
+                // skips both together. SQLite emits it inline at
+                // window.c:3028-3034.
                 let label_skip_pair = (!is_range)
                     .then_some(registers.end_offset_reg)
                     .flatten()
@@ -1617,11 +1736,12 @@ impl EmitWindow {
                         label
                     });
                 emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, None, None, false)?;
-                // AGGINVERSE is a structural no-op for UNBOUNDED
-                // PRECEDING starts (`emit_window_op` early-returns,
-                // window.c:2252-2257); for `N PRECEDING` starts the
-                // countdown grows the frame to width N+1 before it
-                // slides (window.c:3032-3033).
+                // AGGINVERSE does nothing for an UNBOUNDED PRECEDING start
+                // — no row ever leaves the frame, so `emit_window_op`
+                // early-returns (window.c:2252-2257). For an `N PRECEDING`
+                // start it holds off until the frame has grown to N+1 rows,
+                // then drops one row for each new row that joins
+                // (window.c:3032-3033).
                 emit_window_op(
                     program,
                     t_ctx,
@@ -1651,11 +1771,12 @@ impl EmitWindow {
     }
 }
 
-/// Compare the ORDER BY values at `reg_new` against the peer reference at
-/// `reg_old`: jump to `target_if_peer` when they're equal, otherwise copy
-/// the new values into the reference and fall through. With no ORDER BY
-/// every row is a peer, so this degenerates to an unconditional jump.
-/// Mirrors SQLite's `windowIfNewPeer` (window.c:2057-2078).
+/// Compare the ORDER BY values at `reg_new` against the remembered ones at
+/// `reg_old`: jump to `target_if_peer` when they're equal (the two rows
+/// are peers), otherwise copy the new values into `reg_old` and fall
+/// through. With no ORDER BY every row counts as a peer, so this becomes
+/// an unconditional jump. Mirrors SQLite's `windowIfNewPeer`
+/// (window.c:2057-2078).
 fn emit_if_new_peer(
     program: &mut ProgramBuilder,
     window: &Window,
@@ -1885,40 +2006,43 @@ fn emit_insert_row_into_buffer(
     });
 }
 
-/// The three frame-cursor operations. Mirrors SQLite's `WINDOW_AGGSTEP`,
-/// `WINDOW_RETURN_ROW`, and `WINDOW_AGGINVERSE` constants in
-/// `window.c:1765-1773`. Each operation reads from one cursor, fires the
-/// per-function callback for it, then advances that cursor.
+/// The three operations that move the frame forward, one step at a time.
+/// Each reads the row a cursor points at, updates every window function
+/// with it, then moves that cursor on. Mirror SQLite's `WINDOW_AGGSTEP`,
+/// `WINDOW_RETURN_ROW`, and `WINDOW_AGGINVERSE` (`window.c:1765-1773`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowOp {
-    /// A row entered the frame at its right edge: read `csr_end`, fire
-    /// each function's xStep, advance `csr_end`.
+    /// A new row has joined the frame. Read it from `csr_end`, add it to
+    /// every function's running total (xStep), then move `csr_end` on.
     AggStep,
-    /// Emit the row at `csr_current` to the outer query, then advance
-    /// `csr_current`. xValue is computed for each function before the
-    /// emit.
+    /// The frame for the current row is complete. Compute every function's
+    /// result for it (xValue) and send the row at `csr_current` to the
+    /// outer query, then move `csr_current` on.
     ReturnRow,
-    /// A row left the frame at its left edge: read `csr_start`, fire
-    /// each function's xInverse, advance `csr_start`. No-op (and never
-    /// emitted) for windows whose frame start is UNBOUNDED PRECEDING.
+    /// A row has dropped out of the frame. Read it from `csr_start`,
+    /// subtract it from every function's running total (xInverse), then
+    /// move `csr_start` on. Never happens when the frame always starts at
+    /// the first row of the partition (UNBOUNDED PRECEDING): no row ever
+    /// leaves, so there is nothing to subtract.
     AggInverse,
 }
 
-/// After which op can the row a cursor just passed be deleted from the
-/// buffer? `None` keeps the whole partition until flush. Deleting early
-/// only frees buffer memory sooner — it never changes results. Mirrors
-/// SQLite's `eDelete` (window.c:2845-2869), applied at the `OP_Delete`
-/// in `emit_window_op`:
+/// Once a row has been used by a given op it can be deleted from the
+/// buffer to free memory sooner. This says after which op that is safe;
+/// `None` means keep every row until flush. Deleting early never changes
+/// results. Mirrors SQLite's `eDelete` (window.c:2845-2869), applied at
+/// the `OP_Delete` in `emit_window_op`:
 ///
 /// - FOLLOWING start, offset provably > 0, non-RANGE → after RETURN_ROW.
-///   The frame start trails the emit point, so an emitted row is done.
+///   The frame starts after the current row, so once a row has been
+///   output it can never fall inside any later row's frame.
 /// - UNBOUNDED PRECEDING start:
 ///   - a `csr_app` function needs every row (`window_cache_frame`) → never.
 ///   - N PRECEDING end, offset provably > 0, non-RANGE → after AGGSTEP.
 ///   - otherwise → after RETURN_ROW.
 /// - CURRENT ROW / N PRECEDING start → after AGGINVERSE. Safe with
-///   first_value / nth_value: only rows behind the frame start are
-///   dropped, and their lookup targets stay within the live frame.
+///   first_value / nth_value: only rows that have already left the frame
+///   are deleted, and those functions only ever look up rows still in it.
 fn window_delete_op(window: &Window) -> Option<WindowOp> {
     use crate::translate::plan::FrameBoundary;
     let is_range = window.frame.mode == turso_parser::ast::FrameMode::Range;
@@ -1942,9 +2066,12 @@ fn window_delete_op(window: &Window) -> Option<WindowOp> {
     }
 }
 
-/// Whether the whole partition must stay buffered until flush because a
-/// function seeks arbitrary buffered rows through `csr_app` at output
-/// time. Mirrors SQLite's `windowCacheFrame` (window.c:2031-2045).
+/// Whether we must keep every row of the partition in the buffer until the
+/// end, rather than deleting rows as the frame moves past them. This is
+/// needed when a function might reach out to any row at output time —
+/// first_value, nth_value, lag and lead all look up a row by position — or
+/// when an EXCLUDE clause forces us to re-scan the frame. Mirrors SQLite's
+/// `windowCacheFrame` (window.c:2031-2045).
 fn window_cache_frame(window: &Window) -> bool {
     window.frame.exclude.is_some()
         || window.functions.iter().any(|f| {
@@ -1960,9 +2087,9 @@ fn window_cache_frame(window: &Window) -> bool {
         })
 }
 
-/// Whether a frame offset is a literal provably greater than zero. Only
-/// gates the buffer-delete optimization in `window_delete_op`: a
-/// `N FOLLOWING` (N > 0) start can drop emitted rows early, a
+/// Whether a frame offset is a literal provably greater than zero. Used
+/// only to decide whether `window_delete_op` may delete rows early: a
+/// `N FOLLOWING` (N > 0) start can delete rows once they are output, a
 /// `0 FOLLOWING` start can't. Returning `false` is always correct — it
 /// just keeps rows until flush — so this only frees memory sooner, never
 /// changes results. Mirrors SQLite's `windowExprGtZero`
@@ -1981,11 +2108,15 @@ fn window_expr_gt_zero(expr: &Expr) -> bool {
     false
 }
 
-/// Finalize every accumulator into its result register ahead of a
-/// RETURN_ROW. first_value / nth_value / lag / lead have no accumulator
-/// value to read — their result registers are written directly inside
-/// `emit_return_one_row` via positional lookup helpers. Mirrors SQLite's
-/// `windowAggFinal(p, 0)` (window.c:1777-1808).
+/// Turn each function's running total into the value to output for the
+/// current row, writing it into that function's result register, just
+/// before the row is emitted (RETURN_ROW). When `finalize` is set the
+/// running total is consumed and cleared (done once at the very end);
+/// otherwise it is read without disturbing it (done per row as the frame
+/// slides). first_value / nth_value / lag / lead are the exception: they
+/// have no running total to read, so their result is filled in separately
+/// — by looking up a specific row — inside `emit_return_one_row`. Mirrors
+/// SQLite's `windowAggFinal(p, 0)` (window.c:1777-1808).
 fn emit_window_agg_final(
     program: &mut ProgramBuilder,
     window: &Window,
@@ -2051,10 +2182,14 @@ fn emit_window_agg_final(
     }
 }
 
-/// Recompute every function over the live frame after applying an explicit
-/// EXCLUDE clause. The streaming cursors maintain inclusive rowid bounds;
-/// rescanning only that range avoids requiring xInverse implementations for
-/// aggregates such as min/max and group_concat.
+/// Recompute every function from scratch over the current frame. Used when
+/// the window has an EXCLUDE clause: because some rows inside the frame are
+/// excluded, we can't keep a simple running total, so for each output row
+/// we re-add the rows the frame currently spans (the
+/// `frame_start_rowid`..`frame_end_rowid` range), skipping the excluded
+/// ones. Re-adding from scratch also sidesteps needing a subtract-a-row
+/// step for aggregates that don't have one, such as min / max and
+/// group_concat.
 fn emit_window_full_scan(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
@@ -2416,20 +2551,23 @@ fn emit_window_range_test(
     Ok(())
 }
 
-/// Emit one of the three frame-cursor operations (AGGSTEP, RETURN_ROW,
-/// AGGINVERSE), mirroring SQLite's `windowCodeOp` (window.c:2229-2376).
+/// Emit one of the three operations that move the frame forward — add a
+/// row to the totals (AGGSTEP), emit a row's result (RETURN_ROW), or
+/// remove a row from the totals (AGGINVERSE). Mirrors SQLite's
+/// `windowCodeOp` (window.c:2229-2376).
 ///
-/// `countdown_reg`: gate the op behind an `OP_IfPos` countdown — skip it
-/// (and decrement) while the register is positive. Used to hold an op
-/// back by N rows: cume_dist gates RETURN_ROW, `ROWS BETWEEN N PRECEDING`
-/// gates AGGINVERSE so the frame reaches width N+1 before it slides.
+/// `countdown_reg`: a register holding a count. While it is positive the
+/// op is skipped and the count is decremented (`OP_IfPos`); the op only
+/// starts firing once the count reaches zero. This delays an op for the
+/// first N rows — cume_dist delays RETURN_ROW, and `ROWS BETWEEN N
+/// PRECEDING` delays AGGINVERSE until the frame has grown to N+1 rows.
 ///
 /// `break_on_eof`: only set at flush time, to exit a RETURN_ROW loop on
 /// EOF instead of falling through.
 ///
-/// Under RANGE / GROUPS one call walks a whole peer group (AGGSTEP steps
-/// it, RETURN_ROW emits it, all at the same accumulated state); under
-/// ROWS one call advances exactly one row.
+/// Under RANGE / GROUPS one call handles a whole peer group at once
+/// (AGGSTEP adds every row in it, RETURN_ROW emits every row in it, all
+/// sharing the same totals); under ROWS one call handles exactly one row.
 fn emit_window_op(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
@@ -2447,16 +2585,16 @@ fn emit_window_op(
     let minmax = meta.minmax.clone();
     let order_by_len = window.order_by.len();
     let frame_mode = window.frame.mode;
-    // bPeer mirrors SQLite's `WindowCodeArg.eFrmType != TK_ROWS` test
-    // (window.c:2247). Under RANGE / GROUPS frames, advances loop through
-    // peer-equal rows; with no ORDER BY every row is peer-equal so the
-    // loop runs to EOF.
+    // Under RANGE / GROUPS frames one advance steps over every row with
+    // equal ORDER BY values (a peer group); with no ORDER BY every row
+    // counts as equal, so it runs to the end of the partition. Mirrors
+    // SQLite's `WindowCodeArg.eFrmType != TK_ROWS` test (window.c:2247).
     let b_peer = frame_mode != turso_parser::ast::FrameMode::Rows;
 
-    // AGGINVERSE is always a structural no-op when the frame starts at
-    // UNBOUNDED PRECEDING — the frame never shrinks from the left.
-    // Mirrors SQLite's early return at window.c:2252-2257, which lets
-    // every caller emit the full op sequence unconditionally.
+    // AGGINVERSE does nothing when the frame starts at UNBOUNDED
+    // PRECEDING: no row ever leaves the frame. Mirrors SQLite's early
+    // return at window.c:2252-2257, which lets every caller emit all three
+    // operations without first checking for this case.
     if matches!(op, WindowOp::AggInverse)
         && matches!(
             window.frame.start,
@@ -2475,13 +2613,19 @@ fn emit_window_op(
     // SQLite's switch at `window.c:2315-2344` plus the reg pickup at
     // `window.c:2317-2336`.
     let (cursor_for_op, peer_ref_reg) = match op {
-        WindowOp::AggStep => (cursors.csr_end, registers.peer_end_reg),
-        WindowOp::ReturnRow => (cursors.csr_current, registers.peer_current_reg),
+        WindowOp::AggStep => (
+            cursors.csr_end,
+            registers.cursor_peer_values[FrameCursor::End],
+        ),
+        WindowOp::ReturnRow => (
+            cursors.csr_current,
+            registers.cursor_peer_values[FrameCursor::Current],
+        ),
         WindowOp::AggInverse => (
             cursors
                 .csr_start
                 .expect("AggInverse can only be emitted when the window has a moving frame start"),
-            registers.peer_start_reg,
+            registers.cursor_peer_values[FrameCursor::Start],
         ),
     };
 
@@ -2622,11 +2766,11 @@ fn emit_window_op(
                 });
             } else {
                 emit_function_step(program, t_ctx, plan, cursors.csr_end)?;
-                // Count the row just stepped into the frame. This runs once
-                // per row in the peer-loop, so after AGGSTEP has walked the
-                // whole peer group the counter holds the frame end's buffer
-                // index — the bound first_value / nth_value seek against.
-                // Mirrors SQLite's `OP_AddImm regApp+1` inside
+                // Count the row just added to the frame. This runs once
+                // for every row stepped, so after AGGSTEP has stepped over
+                // a whole peer group the counter holds the frame end's
+                // position in the buffer — the row first_value / nth_value
+                // seek to. Mirrors SQLite's `OP_AddImm regApp+1` inside
                 // `windowAggStep` (window.c:1726).
                 if let Some(frame_counters) = registers.frame_counters {
                     program.emit_insn(Insn::AddImm {
@@ -2665,7 +2809,7 @@ fn emit_window_op(
         }
     }
 
-    // Delete the row that just left the reachable set (SQLite window.c:2346,
+    // Delete the row we are done with (SQLite window.c:2346,
     // `if( op==p->eDelete ) OP_Delete`), before advancing the cursor past it.
     if window_delete_op(window) == Some(op) {
         program.emit_insn(Insn::Delete {
@@ -2680,7 +2824,8 @@ fn emit_window_op(
     //   - break_on_eof=Some: Next; on EOF fall through to a Goto that
     //     jumps to the caller's break label.
     //   - bPeer=true: Next; on EOF fall through to Goto label_done; else
-    //     fall through to the peer-loop check below.
+    //     fall through to the peer-group check below (is the next row
+    //     still in the same group?).
     //   - bPeer=false, no break_on_eof: Next; on EOF fall through;
     //     no peer check; label_done is the next instruction.
     let label_after_next = program.allocate_label();
@@ -2700,17 +2845,16 @@ fn emit_window_op(
     program.preassign_label_to_next_insn(label_after_next);
 
     if b_peer {
-        // Peer-loop check: keep re-running the op body while the
-        // advanced-to row is a peer of the cursor's current group,
-        // updating the per-cursor reference (`peer_start_reg` /
-        // `peer_current_reg` / `peer_end_reg`) when a new group begins.
-        // The references are per-cursor so start / current / end can be
-        // at different peer groups during flush — required for
-        // percent_rank / cume_dist. Mirrors SQLite's
-        // `windowReadPeerValues` + `windowIfNewPeer` tail
-        // (window.c:2363-2369); with no ORDER BY the check degenerates
-        // to an unconditional loop-back, draining the partition-wide
-        // peer group to EOF.
+        // Keep repeating this operation as long as the row we just moved
+        // to is a peer of the cursor's current group (same ORDER BY
+        // values), so a whole group is handled in one call. When the group
+        // changes, record the new group's values in this cursor's entry of
+        // `cursor_peer_values`. There is one entry per cursor, so the
+        // start / current / end cursors can each be on a different group
+        // during flush — needed for percent_rank / cume_dist. Mirrors
+        // SQLite's `windowReadPeerValues` +
+        // `windowIfNewPeer` tail (window.c:2363-2369); with no ORDER BY the
+        // whole partition is one group, so this just loops to EOF.
         let temp_start = (order_by_len > 0).then(|| {
             let temp_start = program.alloc_registers(order_by_len);
             for (i, (expr, _, _)) in window.order_by.iter().enumerate() {
@@ -2747,21 +2891,6 @@ fn emit_window_op(
     Ok(())
 }
 
-/// Emit per-function xStep / xInverse calls reading from `read_csr`.
-///
-/// Mirrors SQLite's `windowAggStep` (`window.c:1658-1762`): for each
-/// function, each argument is loaded from the cursor's current row into a
-/// fresh register block (SQLite's `p->regArg`), then `AggStep` /
-/// `AggInverse` is emitted referencing that block. Crucially, the load
-/// destinations are *separate* from `src_columns_start` so the source
-/// coroutine's register block (which holds the new-partition row being
-/// processed) isn't trampled while we drain the previous partition.
-///
-/// Argument expressions are pushed into the resolver's expression cache
-/// during the call so `translate_aggregation_step`'s recursive
-/// `translate_expr` resolves each `Expr::Column` to the arg-load register
-/// we just populated, instead of to `src_columns_start`. The cache is
-/// restored on the way out.
 /// Emit the per-row FILTER predicate read used by both `AggStep` (on
 /// `csr_end`, the row entering the frame) and `AggInverse` (on
 /// `csr_start`, the row leaving). Caller is responsible for pinning
@@ -2800,6 +2929,22 @@ fn emit_filter_skip(
     Ok(label)
 }
 
+/// Emit the code that adds one row into each function's running total (an
+/// AGGSTEP step), reading that row's argument values from `read_csr` — the
+/// cursor sitting on the row that just joined the frame.
+///
+/// Mirrors SQLite's `windowAggStep` (`window.c:1658-1762`). For each
+/// function, its argument values are loaded from the cursor's current row
+/// into their own small block of registers, and the aggregate step is
+/// emitted against that block. Those load registers are kept deliberately
+/// apart from `src_columns_start` (where the source loop puts the next
+/// row's columns), so stepping the previous partition here can't overwrite
+/// the first row of the next one.
+///
+/// While emitting, each argument expression is pushed into the resolver's
+/// expression cache, so that when the aggregate-step translation looks up
+/// a column it finds the register we just loaded instead of
+/// `src_columns_start`. The cache is put back to how it was on the way out.
 fn emit_function_step(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
@@ -2817,10 +2962,13 @@ fn emit_function_step(
     let cache_was_enabled = t_ctx.resolver.expr_to_reg_cache_enabled;
 
     for (i, func) in window.functions.iter().enumerate() {
-        // Without EXCLUDE, first_value / nth_value / lag / lead use
-        // positional seeks instead of xStep. An explicit EXCLUDE clause
-        // switches first_value / nth_value to SQLite's slow accumulator
-        // implementations so only included rows are counted.
+        // Normally first_value / nth_value / lag / lead take no part in the
+        // running totals — at output time they just jump straight to the
+        // row they need. But an EXCLUDE clause can punch holes in the
+        // frame, so first_value / nth_value switch to the slower approach
+        // of being stepped row by row, which lets them skip the excluded
+        // rows. (lag / lead ignore the frame entirely, so they are always
+        // looked up directly and never stepped here.)
         let positional = matches!(
             &func.func,
             AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue)
@@ -2968,17 +3116,18 @@ fn emit_function_step(
     Ok(())
 }
 
-/// Emit per-function `AggInverse` calls — the counterpart of
-/// `emit_function_step` for the frame-start side. Mirrors the xInverse
-/// dispatch inside SQLite's `windowAggStep(... bInverse=1, ...)`
-/// (window.c:2329).
+/// Emit the code that takes one row back out of each function's running
+/// total (an AGGINVERSE step), for the row leaving the frame at its start.
+/// This is the mirror image of `emit_function_step`, which adds a row at
+/// the frame's end. Mirrors the inverse path inside SQLite's
+/// `windowAggStep(... bInverse=1, ...)` (window.c:2329).
 ///
-/// For ntile / percent_rank / cume_dist (window functions with a moving
-/// frame start) xInverse just mutates internal state; no arg load is
-/// needed. For aggregates with a moving start (`sum`, `count(arg)`,
-/// `avg`), the leaving row's arg column has to be loaded from
-/// `csr_start` so the runtime can subtract / decrement against it —
-/// mirrors how `emit_function_step` loads from `csr_end` for AggStep.
+/// ntile / percent_rank / cume_dist only track counts, so removing a row
+/// just adjusts an internal counter — there is no argument value to load.
+/// For aggregates over a moving start (`sum`, `count(arg)`, `avg`) we first
+/// load the leaving row's argument value from `csr_start`, so the runtime
+/// knows what to subtract back out — the same way `emit_function_step`
+/// loads from `csr_end` when adding a row.
 fn emit_function_inverse(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
@@ -3018,9 +3167,10 @@ fn emit_function_inverse(
             }
         }
 
-        // A row skipped by FILTER on entry was never AggStep'd, so it
-        // must not be AggInverse'd either — otherwise the accumulator
-        // drifts and `count(*)` underflows.
+        // A row skipped by FILTER when it entered was never added to the
+        // totals (AggStep), so it must not be subtracted (AggInverse)
+        // either — otherwise the running totals go wrong and `count(*)`
+        // would go negative.
         let filter_skip_label = func
             .rewritten
             .as_ref()
@@ -3093,11 +3243,11 @@ fn emit_function_inverse(
 ///   lbl_miss:
 /// ```
 ///
-/// `csr_app` is OpenDup'd off `csr_current` and only seeks at output time, so
-/// it doesn't disturb the frame-cursor positions. The function's result is
-/// written to its cached `acc_result_start + i` register, which the
-/// expression-cache then resolves to when `emit_select_result` reads the
-/// function expression.
+/// `csr_app` is a separate cursor (a duplicate of `csr_current`) used only
+/// for these lookups, so moving it doesn't disturb the three frame
+/// cursors. The result goes into the function's result register
+/// (`acc_result_start + i`); later, when the SELECT output is built, the
+/// expression cache points the function's value at that register.
 fn emit_lag_lead_lookup(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
@@ -3218,14 +3368,10 @@ fn emit_lag_lead_lookup(
     Ok(())
 }
 
-/// Emit one output row's worth of work: populate `result_columns_start` from
-/// `csr_current`, then either send the row to the outer query (no ORDER BY)
-/// or insert it into the order-by sorter. Mirrors SQLite's
-/// `windowReturnOneRow` (`window.c:1816-1990`), restricted to the
-/// streaming code path.
-/// Emit per-output-row positional lookup for every `first_value` /
-/// `nth_value` in the current window. Mirrors SQLite's first_value /
-/// nth_value arms in `windowReturnOneRow` (`window.c:1940-1965`):
+/// Emit the per-output-row lookup for every `first_value` / `nth_value` in
+/// the current window: jump straight to the wanted row of the frame and
+/// read its value. Mirrors SQLite's first_value / nth_value arms in
+/// `windowReturnOneRow` (`window.c:1940-1965`):
 ///
 /// ```text
 ///   reg_result := NULL
@@ -3453,10 +3599,10 @@ fn emit_return_one_row(
     Ok(())
 }
 
-/// Emit the single row-output subroutine that every RETURN_ROW site Gosubs
-/// to: send the populated result registers to the outer query (or the
-/// order-by sorter), applying OFFSET, LIMIT and SELECT DISTINCT
-/// deduplication. This is the window-loop half of what SQLite emits once
+/// Emit the single row-output subroutine that every RETURN_ROW site calls:
+/// send the filled-in result registers on to the outer query (or into the
+/// ORDER BY sorter), applying OFFSET, LIMIT and SELECT DISTINCT
+/// de-duplication. This is the window-loop half of what SQLite emits once
 /// as the `addrGosub` target in `select.c`.
 fn emit_row_output_subroutine(
     program: &mut ProgramBuilder,
@@ -3503,19 +3649,19 @@ fn emit_row_output_subroutine(
     Ok(())
 }
 
-/// Emit the flush subroutine for window processing — the partition-end /
-/// end-of-source code that drains any remaining rows still ahead of the
-/// frame-end cursor and emits all rows still ahead of the current cursor.
+/// Emit the flush subroutine for window processing — the code that runs
+/// at the end of a partition to finish off any rows the frame end hasn't
+/// reached yet and emit every row not yet sent to the outer query.
 ///
 /// This is the Rust port of SQLite's flush block at `window.c:3043-3105`.
-/// The loop shape is one of three patterns keyed on the frame bounds,
-/// matching the main loop's dispatch. The most common shape
+/// The loop shape is one of three patterns, chosen by the frame's bounds
+/// the same way the main loop chooses. The most common shape
 /// (`UNBOUNDED PRECEDING TO CURRENT ROW`, window.c:3085-3094):
 ///
 /// ```text
 ///   Rewind csr_write → if empty, jump to label_empty
 ///   emit_window_op AGGSTEP, break_on_eof=None
-///       ↑ drains the last buffered row whose AggStep was deferred
+///       ↑ adds the last buffered row, whose AggStep was left until now
 ///   addr_loop_start:
 ///   emit_window_op RETURN_ROW, break_on_eof=label_break
 ///   emit_window_op AGGINVERSE (no-op for UNBOUNDED start)
@@ -3564,19 +3710,20 @@ pub fn emit_window_flush(
         pc_if_empty: label_empty,
     });
 
-    // The flush shape is keyed like the main loop's pattern dispatch.
-    // Mirrors SQLite's three flush paths at window.c:3052-3094. Each
-    // branch opens with the drain AGGSTEP: the very last row inserted in
-    // the main loop hasn't had AggStep called against it (under ROWS) or
-    // its peer group might still be incomplete (under RANGE / GROUPS).
+    // The flush uses the same three patterns, chosen by the frame's
+    // bounds, as the main loop. Mirrors SQLite's three flush paths at
+    // window.c:3052-3094. Each
+    // branch opens with a final AGGSTEP: the last row inserted in the main
+    // loop was never added to the totals (under ROWS), or its peer group
+    // might still have been incomplete (under RANGE / GROUPS).
     let window = plan.window.as_ref().expect("missing window");
     use crate::translate::plan::FrameBoundary;
     if matches!(window.frame.end, FrameBoundary::Preceding(_)) {
         // Pattern B flush (window.c:3052-3056): the main loop emitted a
-        // row on every iteration, so exactly one row is still pending —
-        // a single ungated RETURN_ROW, no loop. The drain AGGSTEP keeps
-        // its countdown: rows the frame end never reached must stay
-        // un-stepped.
+        // row on every iteration, so exactly one row is still waiting to
+        // be output — a single RETURN_ROW with no delay and no loop. The
+        // final AGGSTEP keeps its delay count: any rows the frame end
+        // never reached must stay out of the totals.
         emit_window_op(
             program,
             t_ctx,
@@ -3604,7 +3751,7 @@ pub fn emit_window_flush(
         // Pattern A flush (window.c:3057-3084): two-stage loop.
         //
         //   loop_1:
-        //     RETURN_ROW (with IfPos countdown → skips first calls),
+        //     RETURN_ROW (delayed by IfPos → skips the first few calls),
         //                 break_on_eof = label_break
         //     AGGINVERSE,  break_on_eof = label_after_inverse_eof
         //     Goto loop_1
@@ -3614,17 +3761,17 @@ pub fn emit_window_flush(
         //     Goto loop_2
         //   label_break:
         //
-        // Stage-one countdowns depend on the frame end
+        // The stage-one delays depend on the frame end
         // (window.c:3068-3077). With an UNBOUNDED FOLLOWING end the
-        // RETURN_ROW countdown is the start offset — it defers the first
-        // emits so AGGINVERSE fires for the leading groups before their
-        // value is read (cume_dist's `1 FOLLOWING` start), and
-        // AGGINVERSE runs ungated. With a bounded `M FOLLOWING` end the
-        // RETURN_ROW countdown continues the end offset and AGGINVERSE
-        // continues the (rewritten, M - N) start offset — both pick up
-        // whatever the main loop left undrained. After AGGINVERSE
-        // exhausts (csr_start EOF), the second loop drains the remaining
-        // csr_current rows with the now-final accumulator state.
+        // RETURN_ROW delay is the start offset — it holds back the first
+        // few emits so rows drop off the start (AGGINVERSE) before their
+        // result is read (cume_dist's `1 FOLLOWING` start), while
+        // AGGINVERSE itself runs with no delay. With a bounded `M
+        // FOLLOWING` end the RETURN_ROW delay continues the end offset and
+        // AGGINVERSE continues the (rewritten, M - N) start offset — both
+        // pick up whatever the main loop left unfinished. Once AGGINVERSE
+        // runs out of rows (csr_start hits EOF), the second loop emits the
+        // rows that remain, with the totals now final.
         emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None, true)?;
         let (return_row_countdown, agg_inverse_countdown) =
             if window.frame.mode == turso_parser::ast::FrameMode::Range {
@@ -3706,10 +3853,10 @@ pub fn emit_window_flush(
         //
         // One branch serves every non-FOLLOWING start, exactly as
         // SQLite's else-arm does: for UNBOUNDED PRECEDING the AGGINVERSE
-        // is a structural no-op (window.c:2252-2257); for CURRENT ROW
-        // there is no countdown register and csr_start advances in
-        // lockstep; for `N PRECEDING` the countdown grows the frame to
-        // width N+1 before csr_start starts sliding.
+        // does nothing (window.c:2252-2257); for CURRENT ROW there is no
+        // delay count and csr_start moves forward one row for each row
+        // emitted; for `N PRECEDING` the delay count lets the frame grow
+        // to N+1 rows before csr_start starts moving.
         emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None, true)?;
         let label_loop_start = program.allocate_label();
         program.preassign_label_to_next_insn(label_loop_start);

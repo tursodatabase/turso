@@ -73,7 +73,7 @@ addr  opcode                  p1   p2  p3  p4                     p5  comment
   35            MakeRecord     4    4  24                          0  r[24]=mkrec(r[4..7])
   36            NewRowid       3   19   0                          0  r[19]=rowid
   37            Insert         3   24  19  buffer_table_window_0   2  intkey=r[19] data=r[24]
-  38            Goto           0   54   0                          0  ; skip frame ops when peer of previous row
+  38            Goto           0   54   0                          0  ; peer of previous row: buffer only, handle at group end
   39            Column         4    3  25                          0  r[25]=ephemeral(buffer_table_window_0).salary
   40            AggStep        0   25  13  avg                     0  accum=r[13] step(r[25])
   41            Next           4   43   0                          0

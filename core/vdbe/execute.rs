@@ -6122,6 +6122,12 @@ pub fn op_decr_jump_zero(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Add one floating-point value to a running sum using Kahan–Babuška–
+/// Neumaier summation (KBN, referred to throughout the sum/avg code).
+/// Adding many floats the naive way loses low-order bits; KBN keeps a
+/// separate small "error" term (`state.r_err`) that captures the rounding
+/// lost on each addition, so the final total stays far more accurate. This
+/// matches how SQLite sums floating-point values.
 fn apply_kbn_step(acc: &mut Value, r: f64, state: &mut SumAggState) {
     // NaN from Inf + (-Inf) is sticky: once acc is Null, it stays Null.
     // See https://sqlite.org/lang_aggfunc.html ("result is NULL").
@@ -6147,7 +6153,9 @@ fn apply_kbn_step(acc: &mut Value, r: f64, state: &mut SumAggState) {
     *acc = Value::from_f64(t);
 }
 
-// Add a (possibly large) integer to the running sum.
+// Add a (possibly large) integer to the running float sum. An integer big
+// enough to lose precision as a single f64 is split into a high and a low
+// part, each added separately, so no bits are dropped.
 fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
     const THRESHOLD: i64 = 4503599627370496; // 2^52
 
@@ -6924,7 +6932,7 @@ fn op_window_step(
             };
             *counter += 1;
         }
-        // rank() — mirrors SQLite's CallCount-based rankStepFunc.
+        // rank() — mirrors SQLite's rankStepFunc.
         //
         // State (payload):
         //   [0] = current rank value (what AggValue returns; cleared to 0 by
@@ -6962,7 +6970,7 @@ fn op_window_step(
                 *rank = rows_seen;
             }
         }
-        // dense_rank() — mirrors SQLite's CallCount-based dense_rankStepFunc.
+        // dense_rank() — mirrors SQLite's dense_rankStepFunc.
         //
         // State (payload):
         //   [0] = current dense_rank value (never cleared; persists across
@@ -7076,9 +7084,9 @@ fn op_window_step(
         // last_value(expr) — mirrors SQLite's LastValueCtx {pVal, nVal}
         // (window.c:478-497): payload[0] holds the value of the most
         // recently stepped row, payload[1] counts the rows currently in
-        // the frame. xInverse decrements the count as rows leave from
-        // the left and clears the value when the frame empties, so a
-        // sliding frame that drains completely yields NULL.
+        // the frame. xInverse decrements the count as rows leave and
+        // clears the value when the frame empties, so a moving frame that
+        // empties out yields NULL.
         WindowFunc::LastValue => {
             if let Register::Value(Value::Null) = state.registers[acc_reg] {
                 state.registers[acc_reg] =
@@ -7250,14 +7258,15 @@ fn op_window_value(
             }
         }
         WindowFunc::LastValue => {
-            // xValue must not consume the accumulator: under a frame whose
-            // end trails the partition end, the same accumulated value is
-            // read once per emitted row, and a sliding frame reads it
-            // between AggStep calls. Mirrors SQLite's last_valueValueFunc
-            // (window.c:524-529), which copies without clearing. A frame
-            // no row ever entered (empty frames, or every read gated
-            // before the first step) leaves the register at NULL — the
-            // zeroed-context case in SQLite — and yields NULL.
+            // xValue must not consume the accumulator: when the frame end
+            // stops short of the last row of the partition, the same value
+            // is read once for every row output, and a moving frame reads
+            // it between AggStep calls. Mirrors SQLite's last_valueValueFunc
+            // (window.c:524-529), which copies without clearing. If no row
+            // ever entered the frame (an empty frame, or every row skipped
+            // before the first step), the register was never written and is
+            // still NULL, so the result is NULL — the same outcome SQLite
+            // gives for an aggregate context that was never stepped.
             match &state.registers[acc_reg] {
                 Register::Aggregate(AggContext::Builtin(payload)) => payload[0].clone(),
                 Register::Value(Value::Null) => Value::Null,
@@ -7377,9 +7386,9 @@ fn op_window_inverse(
 ) -> Result<InsnFunctionStepResult> {
     match func {
         // percent_rank / cume_dist xInverse — increment nStep, the
-        // count of rows that have left the frame start. Under GROUPS
-        // mode the AGGINVERSE peer-loop fires xInverse once per row of
-        // the leaving group, so a group of size G bumps nStep by G.
+        // count of rows that have dropped off the start of the frame.
+        // Under GROUPS mode AGGINVERSE fires xInverse once for every row
+        // of the group that is leaving, so a group of size G adds G.
         WindowFunc::PercentRank | WindowFunc::CumeDist => {
             let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
             else {
@@ -7436,11 +7445,11 @@ fn op_window_inverse(
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
-        // WINDOWFUNCNOOP functions: their value is computed at output
-        // time via positional lookup, not by accumulating state. They
-        // ride along with the window's csr_start advance but have no
-        // per-row inverse work. Mirrors SQLite's `xInverse = noopValueFunc`
-        // wiring at window.c:591.
+        // first_value / nth_value / lag / lead don't keep a running total
+        // — at output time they just look up the row they need. So when a
+        // row leaves the frame there is nothing to undo: this inverse step
+        // does nothing. Mirrors SQLite wiring these functions' xInverse to
+        // a no-op (window.c:591).
         WindowFunc::FirstValue | WindowFunc::NthValue | WindowFunc::Lag | WindowFunc::Lead => {
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
@@ -7490,9 +7499,9 @@ pub fn op_agg_inverse(
 
 /// Classify an arg for SQLite-style sum/avg dispatch — mirrors
 /// `sqlite3_value_numeric_type` (`vdbeapi.c`), applying numeric
-/// affinity to TEXT/BLOB. Returning the parsed pieces so callers don't
-/// re-parse and so step and inverse stay in lockstep on which KBN
-/// variant (int vs float) handles each row.
+/// affinity to TEXT/BLOB. Returns the parsed pieces so callers don't
+/// re-parse, and so step and inverse agree on which path (integer or
+/// float) handles each row.
 enum NumericArg {
     Integer(i64),
     Float(f64),
@@ -7504,11 +7513,12 @@ fn classify_numeric_arg(v: &Value) -> NumericArg {
         Value::Null => NumericArg::Null,
         Value::Numeric(Numeric::Integer(i)) => NumericArg::Integer(*i),
         Value::Numeric(Numeric::Float(f)) => NumericArg::Float(f64::from(*f)),
-        // Text PureInteger keeps the integer-KBN path so large textual
-        // integers don't lose precision. ValidPrefixOnly ("5abc")
-        // routes through float — partial-prefix integers shouldn't get
-        // exact accumulation. Matches SQLite's `sumStep` numeric-
-        // affinity behavior.
+        // A string that is entirely a valid integer (e.g. "42") is summed
+        // on the exact-integer path, so a large integer written as text
+        // doesn't lose precision. A string that is only a valid number up
+        // to a point (e.g. "5abc") goes through the float path instead —
+        // such partial parses shouldn't get exact integer accumulation.
+        // Matches SQLite's numeric-affinity handling in `sumStep`.
         Value::Text(t) => match try_for_float(t.as_str().as_bytes()) {
             (NumericParseResult::ValidPrefixOnly, ParsedNumber::Integer(i)) => {
                 NumericArg::Float(i as f64)
@@ -7517,8 +7527,8 @@ fn classify_numeric_arg(v: &Value) -> NumericArg {
             (_, ParsedNumber::Float(f)) => NumericArg::Float(f),
             (_, ParsedNumber::None) => NumericArg::Float(0.0),
         },
-        // Blobs always route through the float path even for integer
-        // parses — matches main's `sumStep` blob arm.
+        // A blob is always summed on the float path, even when its bytes
+        // parse as an integer — matches SQLite's blob handling in `sumStep`.
         Value::Blob(b) => match try_for_float(b).1 {
             ParsedNumber::Integer(i) => NumericArg::Float(i as f64),
             ParsedNumber::Float(f) => NumericArg::Float(f),
@@ -7527,8 +7537,11 @@ fn classify_numeric_arg(v: &Value) -> NumericArg {
     }
 }
 
-/// Two-step add for `i64::MIN` keeps the integer-KBN path exact past
-/// 2^53; matches SQLite's `func.c:1875-1880`.
+/// Add `i` to the exact-integer running sum. `i64::MIN` is handled in two
+/// steps because it is the one value whose magnitude doesn't fit back into
+/// an `i64`; splitting it keeps the sum on the exact-integer path (no loss
+/// of precision past 2^53) instead of falling back to floating point.
+/// Matches SQLite's `func.c:1875-1880`.
 fn kbn_step_int_neg(acc: &mut Value, i: i64, state: &mut SumAggState) {
     if i == i64::MIN {
         apply_kbn_step_int(acc, i64::MAX, state);
