@@ -9,14 +9,15 @@ use pg_query::{NodeRef, ParseResult};
 use turso_parser::ast;
 use turso_parser::ast::GroupBy;
 
-/// Result of translating a PostgreSQL statement, which may include
+/// Result of translating a PostgreSQL command, which may include
 /// prerequisite statements (e.g., implicit CREATE SEQUENCE for serial columns).
+#[derive(Debug)]
 pub struct TranslateResult {
-    /// Prerequisite statements that must be executed before the main statement.
+    /// Prerequisite statements that must be executed before the main command.
     /// For example, serial columns generate implicit CREATE SEQUENCE statements.
     pub prereqs: Vec<ast::Stmt>,
-    /// The main translated statement.
-    pub stmt: ast::Stmt,
+    /// The main translated command.
+    pub cmd: ast::Cmd,
 }
 
 /// Translates a PostgreSQL query into Turso's AST
@@ -99,10 +100,16 @@ impl PostgreSQLTranslator {
     /// For statements that may generate prerequisites (e.g., serial columns),
     /// use `translate_with_prereqs` instead.
     pub fn translate(&self, parse_result: &ParseResult) -> Result<ast::Stmt, ParseError> {
-        self.translate_with_prereqs(parse_result).map(|r| r.stmt)
+        let translated = self.translate_with_prereqs(parse_result)?;
+        let ast::Cmd::Stmt(stmt) = translated.cmd else {
+            return Err(ParseError::ParseError(
+                "expected a PostgreSQL statement".to_string(),
+            ));
+        };
+        Ok(stmt)
     }
 
-    /// Translate a PostgreSQL parse result, returning both the main statement
+    /// Translate a PostgreSQL parse result, returning both the main command
     /// and any prerequisite statements (e.g., implicit CREATE SEQUENCE for serial columns).
     pub fn translate_with_prereqs(
         &self,
@@ -116,11 +123,26 @@ impl PostgreSQLTranslator {
 
         // CREATE TABLE is special: serial columns generate prerequisite CREATE SEQUENCE stmts
         if let NodeRef::CreateStmt(create) = &node.0 {
-            return self.translate_create_table_with_prereqs(create);
+            let translated = self.translate_create_table_with_prereqs(create)?;
+            return Ok(TranslateResult {
+                prereqs: translated.prereqs,
+                cmd: translated.cmd,
+            });
         }
 
-        // All other statements have no prerequisites
-        let stmt = match &node.0 {
+        let cmd = match node.0 {
+            NodeRef::ExplainStmt(explain) => self.translate_explain(explain)?,
+            node => ast::Cmd::Stmt(self.translate_node(node)?),
+        };
+
+        Ok(TranslateResult {
+            prereqs: vec![],
+            cmd,
+        })
+    }
+
+    fn translate_node(&self, node: NodeRef<'_>) -> Result<ast::Stmt, ParseError> {
+        Ok(match node {
             NodeRef::SelectStmt(select) => {
                 // Top-level SELECT ... INTO is PG's legacy spelling of
                 // CREATE TABLE AS.
@@ -153,15 +175,29 @@ impl PostgreSQLTranslator {
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "{} is not supported",
-                    node_ref_name(&node.0)
+                    node_ref_name(&node)
                 )))
             }
-        };
-
-        Ok(TranslateResult {
-            prereqs: vec![],
-            stmt,
         })
+    }
+
+    fn translate_explain(
+        &self,
+        explain: &pg_query::protobuf::ExplainStmt,
+    ) -> Result<ast::Cmd, ParseError> {
+        if !explain.options.is_empty() {
+            return Err(ParseError::ParseError(
+                "EXPLAIN options are not supported".to_string(),
+            ));
+        }
+        let query = explain
+            .query
+            .as_ref()
+            .and_then(|query| query.node.as_ref())
+            .ok_or_else(|| ParseError::ParseError("EXPLAIN missing statement".to_string()))?;
+        Ok(ast::Cmd::ExplainQueryPlan(
+            self.translate_node(query.to_ref())?,
+        ))
     }
 
     /// Translate a PostgreSQL CREATE TABLE statement into Turso AST.
@@ -323,7 +359,10 @@ impl PostgreSQLTranslator {
             })
             .collect();
 
-        Ok(TranslateResult { prereqs, stmt })
+        Ok(TranslateResult {
+            prereqs,
+            cmd: ast::Cmd::Stmt(stmt),
+        })
     }
 
     /// Translate a single PG column definition for CREATE TABLE to a Turso AST ColumnDefinition.
@@ -6786,6 +6825,32 @@ mod tests {
             assert!(
                 err.to_string().contains("not supported"),
                 "expected loud error for {sql}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_simple_explain_translates_to_query_plan() {
+        let translator = PostgreSQLTranslator::new();
+        let parsed = crate::parse("EXPLAIN SELECT 1").unwrap();
+        let translated = translator.translate_with_prereqs(&parsed).unwrap();
+        assert!(translated.prereqs.is_empty());
+        assert!(matches!(translated.cmd, ast::Cmd::ExplainQueryPlan(_)));
+    }
+
+    #[test]
+    fn test_explain_options_error() {
+        let translator = PostgreSQLTranslator::new();
+        for sql in [
+            "EXPLAIN ANALYZE SELECT 1",
+            "EXPLAIN (VERBOSE) SELECT 1",
+            "EXPLAIN (COSTS OFF) SELECT 1",
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let err = translator.translate_with_prereqs(&parsed).unwrap_err();
+            assert!(
+                err.to_string().contains("EXPLAIN options"),
+                "expected EXPLAIN option error for {sql}, got: {err}"
             );
         }
     }
