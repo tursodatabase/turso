@@ -1601,7 +1601,7 @@ fn collect_autoindexes(
         if us.is_primary_key && !table.has_rowid {
             continue;
         }
-        let (col_name, _sort) = us.columns.first().unwrap();
+        let col_name = &us.columns.first().unwrap().name;
         let Some((_pos, col)) = table.get_column(col_name) else {
             bail_parse_error!("Column {col_name} not found in table {}", table.name);
         };
