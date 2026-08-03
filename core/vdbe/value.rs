@@ -567,7 +567,7 @@ impl Value {
             if pattern.is_empty() {
                 return Value::from_i64(1);
             }
-            let result = memchr::memmem::find(reg, pattern).map_or(0, |i| i + 1);
+            let result = find_subslice(reg, pattern).map_or(0, |i| i + 1);
             return Value::from_i64(result as i64);
         }
 
@@ -589,7 +589,7 @@ impl Value {
             }
         };
 
-        match memchr::memmem::find(reg.as_bytes(), pattern.as_bytes()) {
+        match find_subslice(reg.as_bytes(), pattern.as_bytes()) {
             Some(byte_pos) => {
                 // Convert byte position to character position (1-indexed)
                 let char_pos = reg[..byte_pos].chars().count() + 1;
@@ -1023,18 +1023,11 @@ impl Value {
                     return Ok(Value::Text(source.clone()));
                 }
 
-                let source = source.as_str();
-                let pattern = pattern.as_str();
-                let replacement = replacement.as_str();
-                let mut result = String::with_capacity(source.len());
-                let mut last_end = 0;
-                for i in memchr::memmem::find_iter(source.as_bytes(), pattern.as_bytes()) {
-                    result.push_str(&source[last_end..i]);
-                    result.push_str(replacement);
-                    last_end = i + pattern.len();
-                }
-                result.push_str(&source[last_end..]);
-                Ok(Value::build_text(result))
+                Ok(Value::build_text(replace_all(
+                    source.as_str(),
+                    pattern.as_str(),
+                    replacement.as_str(),
+                )))
             }
             _ => unreachable!("text cast should never fail"),
         }
@@ -1352,7 +1345,7 @@ impl Value {
             && !pattern[1..pattern.len() - 1].contains(GLOB_CHARS)
         {
             let needle = &pattern[1..pattern.len() - 1];
-            return Ok(memchr::memmem::find(text.as_bytes(), needle.as_bytes()).is_some());
+            return Ok(find_subslice(text.as_bytes(), needle.as_bytes()).is_some());
         }
 
         Ok(pattern_compare(pattern, text, &GLOB_INFO, None) == CompareResult::Match)
@@ -1533,6 +1526,57 @@ const GLOB_INFO: PatternInfo = PatternInfo {
     no_case: false,
 };
 
+/// Below this haystack size the scalar search wins: `memmem::find`'s per-call
+/// searcher construction costs more than scanning the whole haystack.
+const SIMD_SEARCH_MIN_HAYSTACK: usize = 64;
+
+/// replace() body: SIMD `memmem` scan over large sources, std's searcher for
+/// small ones. Outlined for the same code-size reason as [`find_subslice`].
+#[inline(never)]
+fn replace_all(source: &str, pattern: &str, replacement: &str) -> String {
+    if source.len() < SIMD_SEARCH_MIN_HAYSTACK {
+        return source.replace(pattern, replacement);
+    }
+    let mut result = String::with_capacity(source.len());
+    let mut last_end = 0;
+    for i in memchr::memmem::find_iter(source.as_bytes(), pattern.as_bytes()) {
+        result.push_str(&source[last_end..i]);
+        result.push_str(replacement);
+        last_end = i + pattern.len();
+    }
+    result.push_str(&source[last_end..]);
+    result
+}
+
+/// Substring search: SIMD `memmem` for large haystacks, scalar for small.
+///
+/// `#[inline(never)]` keeps the expanded memmem machinery out of the callers,
+/// whose other (non-search) paths otherwise pay for the code bloat.
+#[inline(never)]
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    if haystack.len() < SIMD_SEARCH_MIN_HAYSTACK {
+        // memchr over first-byte candidates; no memmem searcher setup.
+        let last_start = haystack.len() - needle.len();
+        let tail = &needle[1..];
+        let mut start = 0;
+        while let Some(off) = memchr::memchr(needle[0], &haystack[start..last_start + 1]) {
+            let i = start + off;
+            if haystack[i + 1..i + needle.len()] == *tail {
+                return Some(i);
+            }
+            start = i + 1;
+        }
+        return None;
+    }
+    memchr::memmem::find(haystack, needle)
+}
+
 /// ASCII-case-insensitive substring search built on SIMD byte search.
 ///
 /// SQLite's LIKE folds only ASCII letters, so candidate positions are located
@@ -1541,6 +1585,7 @@ const GLOB_INFO: PatternInfo = PatternInfo {
 /// Byte-level matching is equivalent to char-level here: the needle is valid
 /// UTF-8, so its first byte is never a continuation byte and cannot match in
 /// the middle of a multi-byte character.
+#[inline(never)]
 fn contains_ignore_ascii_case(text: &str, needle: &str) -> bool {
     let haystack = text.as_bytes();
     let needle = needle.as_bytes();
