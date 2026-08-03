@@ -448,6 +448,20 @@ impl<'document> RuntimeBindings<'document> {
             .ok_or(RuntimeBindingError::WrongScope("unbound aggregate"))
     }
 
+    pub(crate) fn replace_aggregate(
+        &mut self,
+        aggregate: AggregateId,
+        runtime: AggregateRuntime,
+    ) -> BindingResult<AggregateRuntime> {
+        self.require_aggregate(aggregate)?;
+        self.frames
+            .last_mut()
+            .expect("the root frame always exists")
+            .aggregates
+            .insert(aggregate, runtime)
+            .ok_or(RuntimeBindingError::WrongScope("unbound aggregate"))
+    }
+
     pub(crate) fn bind_window_function(
         &mut self,
         function: WindowFunctionId,

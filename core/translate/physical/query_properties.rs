@@ -3288,6 +3288,97 @@ fn grouped_aggregates_sort_and_rebind_from_frozen_hir(tc: hegel::TestCase) {
     assert!(sorter_sort < steps[0].0 && steps[0].0 < finals[0].0 && finals[0].0 < result);
 }
 
+// Examples:
+// - `lag(sum(value)) OVER (ORDER BY group_key)` must see one finalized `sum`
+//   value per group, not the source rows that were fed into that sum.
+// - `HAVING count(*) >= ?2` removes groups before the surviving group rows are
+//   stored for the window pass.
+// - Moving `group_key` and `value` to different column positions must not
+//   change which SourceId columns and AggregateIds the window row carries.
+#[hegel::test]
+fn grouped_windows_consume_finalized_hir_groups(tc: hegel::TestCase) {
+    let width = usize::from(tc.draw(generators::integers::<u8>().max_value(9))) + 2;
+    let key_position = tc.draw(generators::integers::<usize>().max_value(width - 1));
+    let value_offset = tc.draw(generators::integers::<usize>().max_value(width - 2)) + 1;
+    let value_position = (key_position + value_offset) % width;
+    let columns = (0..width)
+        .map(|position| format!("c{position} INTEGER"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = BTreeTable::from_sql(&format!("CREATE TABLE items({columns})"), 71)
+        .expect("generated table SQL is valid");
+    let mut schema = Schema::new();
+    schema
+        .add_btree_table(Arc::new(table))
+        .expect("items is unique");
+    let symbols = SymbolTable::new();
+    let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let context = SemanticContext::for_main_schema_object(&schema, &symbols, true, dialect);
+    let statement = parse_statement(&format!(
+        "SELECT c{key_position}, sum(c{value_position}), \
+         lag(sum(c{value_position}), 1, -1) OVER (ORDER BY c{key_position}) \
+         FROM items WHERE c{value_position} >= ?1 \
+         GROUP BY c{key_position} HAVING count(*) >= ?2"
+    ));
+    let document = analyze(&context, AnalyzeInput::Statement(&statement))
+        .expect("generated grouped-window query has valid SQL meaning");
+    drop(context);
+    drop(schema);
+    drop(symbols);
+
+    let HirRoot::Query(root) = &document.root else {
+        panic!("the fixture is a SELECT");
+    };
+    let query = &document.queries[root.query.index()];
+    let block = &query.blocks[query.first.index];
+    assert_eq!(
+        block.aggregate_count, 3,
+        "each written sum call and the count keep separate stable IDs"
+    );
+    assert_eq!(block.window_function_count, 1);
+
+    let plan = PhysicalPlan::new(&document).expect("closed grouped-window HIR has a plan");
+    let mut program = program();
+    emit_root_query(&plan, &mut program).expect("grouped windows emit from closed HIR");
+    program
+        .resolve_labels()
+        .expect("all grouped-window branches are closed");
+
+    assert_eq!(
+        program
+            .insns
+            .iter()
+            .filter(|(instruction, _)| matches!(instruction, Insn::OpenRead { root_page: 71, .. }))
+            .count(),
+        1,
+        "the source is scanned once before grouping"
+    );
+    let last_final = program
+        .insns
+        .iter()
+        .rposition(|(instruction, _)| matches!(instruction, Insn::AggFinal { .. }))
+        .expect("each group finalizes its HIR aggregates");
+    let stored_group = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| {
+            matches!(
+                instruction,
+                Insn::Insert { table_name, .. } if table_name.as_str() == "window_rows"
+            )
+        })
+        .expect("the finalized group is stored as a window row");
+    let result = program
+        .insns
+        .iter()
+        .position(|(instruction, _)| matches!(instruction, Insn::ResultRow { .. }))
+        .expect("the window pass emits the final row");
+    assert!(
+        last_final < stored_group && stored_group < result,
+        "aggregation and HAVING finish before the window pass"
+    );
+}
+
 // Examples: `SELECT sum(DISTINCT n), min(s COLLATE NOCASE), group_concat(s),
 // string_agg(s, '|') FROM items` and the same calls under `GROUP BY g`.
 // Every DISTINCT aggregate owns a separate duplicate set, grouped execution

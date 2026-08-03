@@ -20,9 +20,9 @@ use crate::{
     sync::Arc,
     translate::collate::CollationSeq,
     translate::semantic::hir::{
-        Assignment, CteBody, CteId, Expr, From as HirFrom, FunctionCall, Grouping, Join,
-        JoinConstraint, JoinKind, OrderTerm, QueryBlockBody, QueryBlockId, QueryId, RecursiveCte,
-        RecursiveOrderTerm, ResolvedTable, SourceId, SubqueryExpr, TypeFact,
+        AggregateId, Assignment, CteBody, CteId, Expr, From as HirFrom, FunctionCall, Grouping,
+        Join, JoinConstraint, JoinKind, OrderTerm, QueryBlockBody, QueryBlockId, QueryId,
+        RecursiveCte, RecursiveOrderTerm, ResolvedTable, SourceId, SubqueryExpr, TypeFact,
     },
     types::KeyInfo,
     vdbe::{
@@ -319,6 +319,7 @@ struct WindowRows {
     cursor_id: usize,
     table: Arc<BTreeTable>,
     sources: Vec<WindowSourceLayout>,
+    aggregates: Vec<WindowAggregateLayout>,
     width: usize,
 }
 
@@ -328,9 +329,15 @@ struct WindowSourceLayout {
     offset: usize,
 }
 
+struct WindowAggregateLayout {
+    aggregate: AggregateId,
+    offset: usize,
+}
+
 struct BoundWindowRow {
     rowid: RegisterId,
-    previous: Vec<(SourceId, SourceRuntime)>,
+    previous_sources: Vec<(SourceId, SourceRuntime)>,
+    previous_aggregates: Vec<(AggregateId, AggregateRuntime)>,
 }
 
 #[derive(Clone, Copy)]
@@ -2013,6 +2020,7 @@ fn emit_query_block<'document>(
                     destination,
                     limit,
                     distinct.as_ref(),
+                    None,
                 )
             } else if !block.aggregates.is_empty() || grouping.is_some() {
                 emit_ungrouped_aggregate(
@@ -2237,6 +2245,7 @@ fn open_window_rows<'document>(
     plan: &PhysicalPlan<'document>,
     program: &mut ProgramBuilder,
     source_ids: &[SourceId],
+    aggregates: &[PhysicalAggregate<'document>],
 ) -> QueryResult<WindowRows> {
     let mut width = 0;
     let mut sources = Vec::with_capacity(source_ids.len());
@@ -2251,6 +2260,17 @@ fn open_window_rows<'document>(
         });
         width += source.width + 1;
     }
+    let aggregates = aggregates
+        .iter()
+        .map(|aggregate| {
+            let layout = WindowAggregateLayout {
+                aggregate: aggregate.id,
+                offset: width,
+            };
+            width += 1;
+            layout
+        })
+        .collect();
     let table = ephemeral_table("window_rows".to_string(), width)?;
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenEphemeral {
@@ -2261,6 +2281,7 @@ fn open_window_rows<'document>(
         cursor_id,
         table,
         sources,
+        aggregates,
         width,
     })
 }
@@ -2280,7 +2301,7 @@ fn bind_window_row<'document>(
     rows: &WindowRows,
     cursor_id: usize,
 ) -> QueryResult<BoundWindowRow> {
-    let mut previous = Vec::with_capacity(rows.sources.len());
+    let mut previous_sources = Vec::with_capacity(rows.sources.len());
     for source in &rows.sources {
         let columns = RegisterRange::new(program.alloc_registers(source.width), source.width);
         for position in 0..source.width {
@@ -2298,7 +2319,7 @@ fn bind_window_row<'document>(
             dest: source_rowid.0,
             default: None,
         });
-        previous.push((
+        previous_sources.push((
             source.source,
             bindings.replace_source(
                 source.source,
@@ -2309,19 +2330,47 @@ fn bind_window_row<'document>(
             )?,
         ));
     }
+    let mut previous_aggregates = Vec::with_capacity(rows.aggregates.len());
+    for aggregate in &rows.aggregates {
+        let register = RegisterId(program.alloc_register());
+        program.emit_insn(Insn::Column {
+            cursor_id,
+            column: aggregate.offset,
+            dest: register.0,
+            default: None,
+        });
+        previous_aggregates.push((
+            aggregate.aggregate,
+            bindings.replace_aggregate(
+                aggregate.aggregate,
+                AggregateRuntime {
+                    register,
+                    distinct_hash_table: None,
+                    ordered_sorter: None,
+                },
+            )?,
+        ));
+    }
     let rowid = RegisterId(program.alloc_register());
     program.emit_insn(Insn::RowId {
         cursor_id,
         dest: rowid.0,
     });
-    Ok(BoundWindowRow { rowid, previous })
+    Ok(BoundWindowRow {
+        rowid,
+        previous_sources,
+        previous_aggregates,
+    })
 }
 
 fn restore_window_row<'document>(
     bindings: &mut RuntimeBindings<'document>,
     bound: BoundWindowRow,
 ) -> QueryResult<()> {
-    for (source, runtime) in bound.previous.into_iter().rev() {
+    for (aggregate, runtime) in bound.previous_aggregates.into_iter().rev() {
+        bindings.replace_aggregate(aggregate, runtime)?;
+    }
+    for (source, runtime) in bound.previous_sources.into_iter().rev() {
         bindings.replace_source(source, runtime)?;
     }
     Ok(())
@@ -2343,11 +2392,35 @@ fn emit_window_row_insert<'document>(
                 RegisterRange::new(fields + source.offset + column, 1),
             )?;
         }
-        let mut subqueries = QuerySubqueryEmitter { plan, ctes };
-        ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries).emit_into(
-            &Expr::rowid(source.source),
-            RegisterRange::new(fields + source.offset + source.width, 1),
-        )?;
+        let rowid_destination = fields + source.offset + source.width;
+        match bindings.source(source.source)? {
+            SourceRuntime::Registers {
+                rowid: Some(rowid), ..
+            } => program.emit_insn(Insn::Copy {
+                src_reg: rowid.0,
+                dst_reg: rowid_destination,
+                extra_amount: 0,
+            }),
+            SourceRuntime::Registers { rowid: None, .. } => program.emit_insn(Insn::Null {
+                dest: rowid_destination,
+                dest_end: None,
+            }),
+            SourceRuntime::Cursor { .. } => {
+                let mut subqueries = QuerySubqueryEmitter { plan, ctes };
+                ExpressionEmitter::with_subqueries(program, bindings, &mut subqueries).emit_into(
+                    &Expr::rowid(source.source),
+                    RegisterRange::new(rowid_destination, 1),
+                )?;
+            }
+        }
+    }
+    for aggregate in &rows.aggregates {
+        let runtime = bindings.aggregate(aggregate.aggregate)?;
+        program.emit_insn(Insn::Copy {
+            src_reg: runtime.register.0,
+            dst_reg: fields + aggregate.offset,
+            extra_amount: 0,
+        });
     }
     let rowid = program.alloc_register();
     program.emit_insn(Insn::NewRowid {
@@ -2416,6 +2489,15 @@ fn emit_window_sort_insert<'document>(
             &Expr::rowid(source.source),
             RegisterRange::new(fields + position, 1),
         )?;
+        position += 1;
+    }
+    for aggregate in &rows.aggregates {
+        let runtime = bindings.aggregate(aggregate.aggregate)?;
+        program.emit_insn(Insn::Copy {
+            src_reg: runtime.register.0,
+            dst_reg: fields + position,
+            extra_amount: 0,
+        });
         position += 1;
     }
     program.emit_insn(Insn::Copy {
@@ -2501,7 +2583,7 @@ fn emit_sorted_window_rows<'document>(
         dest_reg: content,
         pseudo_cursor: pseudo,
     });
-    let mut previous = Vec::with_capacity(rows.sources.len());
+    let mut previous_sources = Vec::with_capacity(rows.sources.len());
     for source in &rows.sources {
         let columns = RegisterRange::new(program.alloc_registers(source.width), source.width);
         for position in 0..source.width {
@@ -2519,13 +2601,34 @@ fn emit_sorted_window_rows<'document>(
             dest: source_rowid.0,
             default: None,
         });
-        previous.push((
+        previous_sources.push((
             source.source,
             bindings.replace_source(
                 source.source,
                 SourceRuntime::Registers {
                     columns,
                     rowid: Some(source_rowid),
+                },
+            )?,
+        ));
+    }
+    let mut previous_aggregates = Vec::with_capacity(rows.aggregates.len());
+    for aggregate in &rows.aggregates {
+        let register = RegisterId(program.alloc_register());
+        program.emit_insn(Insn::Column {
+            cursor_id: pseudo,
+            column: sorter.key_count + aggregate.offset,
+            dest: register.0,
+            default: None,
+        });
+        previous_aggregates.push((
+            aggregate.aggregate,
+            bindings.replace_aggregate(
+                aggregate.aggregate,
+                AggregateRuntime {
+                    register,
+                    distinct_hash_table: None,
+                    ordered_sorter: None,
                 },
             )?,
         ));
@@ -2537,7 +2640,11 @@ fn emit_sorted_window_rows<'document>(
         dest: rowid.0,
         default: None,
     });
-    let bound = BoundWindowRow { rowid, previous };
+    let bound = BoundWindowRow {
+        rowid,
+        previous_sources,
+        previous_aggregates,
+    };
     let emission = emit_ranking_window_row(
         plan,
         program,
@@ -2712,6 +2819,7 @@ fn emit_grouped_aggregate<'document>(
     destination: QueryDestination<'_>,
     limit: Option<LimitRuntime>,
     distinct: Option<&DistinctRuntime>,
+    window_rows: Option<&WindowRows>,
 ) -> QueryResult<()> {
     let sorter = open_group_sorter(plan, program, block, grouping)?;
     match block.source_order.as_slice() {
@@ -2822,8 +2930,11 @@ fn emit_grouped_aggregate<'document>(
         let step_group = program.allocate_label();
         let output_group = program.allocate_label();
         let skip_output = program.allocate_label();
-        let cleanup =
-            row_cleanup_label(destination, limit).unwrap_or_else(|| program.allocate_label());
+        let cleanup = if window_rows.is_some() {
+            program.allocate_label()
+        } else {
+            row_cleanup_label(destination, limit).unwrap_or_else(|| program.allocate_label())
+        };
 
         program.emit_insn(Insn::SorterSort {
             cursor_id: sorter.cursor_id,
@@ -2960,20 +3071,27 @@ fn emit_grouped_aggregate<'document>(
             )?;
             current_sources.push((representative.source, current));
         }
-        emit_output_expressions(plan, program, bindings, ctes, block.outputs, None, result)?;
-        if let Some(having) = &grouping.having {
-            emit_filter(plan, program, bindings, ctes, having, skip_output)?;
+        if let Some(rows) = window_rows {
+            if let Some(having) = &grouping.having {
+                emit_filter(plan, program, bindings, ctes, having, skip_output)?;
+            }
+            emit_window_row_insert(plan, program, bindings, ctes, rows)?;
+        } else {
+            emit_output_expressions(plan, program, bindings, ctes, block.outputs, None, result)?;
+            if let Some(having) = &grouping.having {
+                emit_filter(plan, program, bindings, ctes, having, skip_output)?;
+            }
+            emit_row_destination(
+                plan,
+                program,
+                bindings,
+                ctes,
+                result,
+                destination,
+                limit,
+                distinct,
+            )?;
         }
-        emit_row_destination(
-            plan,
-            program,
-            bindings,
-            ctes,
-            result,
-            destination,
-            limit,
-            distinct,
-        )?;
         for (source, runtime) in current_sources.into_iter().rev() {
             bindings.replace_source(source, runtime)?;
         }
@@ -3169,11 +3287,6 @@ fn emit_ranking_window_query<'document>(
     limit: Option<LimitRuntime>,
     distinct: Option<&DistinctRuntime>,
 ) -> QueryResult<()> {
-    if !block.aggregates.is_empty() {
-        return Err(PhysicalQueryError::Unsupported(
-            "aggregate and window functions in one query block",
-        ));
-    }
     if block.source_order.is_empty() {
         return Err(PhysicalQueryError::Unsupported(
             "ranking window without a source",
@@ -3208,23 +3321,54 @@ fn emit_ranking_window_query<'document>(
             },
         )?;
     }
-    let rows = open_window_rows(plan, program, &block.source_order)?;
+    let rows = open_window_rows(plan, program, &block.source_order, &block.aggregates)?;
     let sorter = block
         .window_functions
         .last()
         .and_then(|function| function.call.window.as_ref())
         .map(|spec| open_window_sorter(plan, program, &rows, spec))
         .transpose()?;
-    emit_table_scans(
-        plan,
-        program,
-        bindings,
-        ctes,
-        &block.source_order,
-        filter,
-        block.hir.from.as_ref(),
-        ScanRowAction::WindowMaterialize { rows: &rows },
-    )?;
+    if block.aggregates.is_empty() {
+        emit_table_scans(
+            plan,
+            program,
+            bindings,
+            ctes,
+            &block.source_order,
+            filter,
+            block.hir.from.as_ref(),
+            ScanRowAction::WindowMaterialize { rows: &rows },
+        )?;
+    } else {
+        let QueryBlockBody::Select {
+            grouping: Some(grouping),
+            ..
+        } = &block.hir.body
+        else {
+            return Err(PhysicalQueryError::Unsupported(
+                "ungrouped aggregate and window functions in one query block",
+            ));
+        };
+        if grouping.keys.is_empty() {
+            return Err(PhysicalQueryError::Unsupported(
+                "ungrouped aggregate and window functions in one query block",
+            ));
+        }
+        emit_grouped_aggregate(
+            plan,
+            program,
+            bindings,
+            ctes,
+            block,
+            filter,
+            grouping,
+            result,
+            destination,
+            None,
+            None,
+            Some(&rows),
+        )?;
+    }
     if let Some(sorter) = sorter.as_ref() {
         emit_window_sorter_rows(plan, program, bindings, ctes, sorter, &rows)?;
         return emit_sorted_window_rows(
