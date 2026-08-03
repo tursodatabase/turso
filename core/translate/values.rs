@@ -1,8 +1,9 @@
 use crate::translate::emitter::TranslateCtx;
 use crate::translate::expr::{translate_expr_no_constant_opt, NoConstantOptReason};
 use crate::translate::plan::{QueryDestination, SelectPlan};
-use crate::translate::result_row::{emit_columns_to_destination, emit_offset};
-use crate::turso_assert_eq;
+use crate::translate::result_row::{
+    emit_columns_to_destination, emit_offset, emit_result_row_and_limit,
+};
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::{to_u32, IdxInsertFlags, InsertFlags, Insn};
 use crate::vdbe::BranchOffset;
@@ -217,20 +218,8 @@ fn emit_values_to_destination(
                 dest: *result_reg,
             });
         }
-        QueryDestination::RowValueSubqueryResult {
-            result_reg_start,
-            num_regs,
-        } => {
-            turso_assert_eq!(
-                row_len,
-                *num_regs,
-                "row value subqueries must have matching result columns and registers"
-            );
-            program.emit_insn(Insn::Copy {
-                src_reg: start_reg,
-                dst_reg: *result_reg_start,
-                extra_amount: num_regs - 1,
-            });
+        QueryDestination::RowValueSubqueryResult { .. } => {
+            emit_result_row_and_limit(program, plan, start_reg, t_ctx.limit_ctx, Some(end_label))?;
         }
         QueryDestination::RowSet { .. } => {
             unreachable!("RowSet query destination should not be used in values emission")

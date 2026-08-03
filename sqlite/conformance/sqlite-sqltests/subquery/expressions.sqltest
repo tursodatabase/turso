@@ -386,6 +386,13 @@ expect {
 # Subqueries with LIMIT edge cases
 # =============================================================================
 
+test subquery-scalar-values-uses-first-row {
+    SELECT (VALUES(1),(2),(3));
+}
+expect {
+    1
+}
+
 test subquery-limit-zero {
     SELECT * FROM (SELECT 1 UNION SELECT 2 LIMIT 0);
 }
