@@ -1204,6 +1204,7 @@ pub fn translate_alter_table(
                             &btree,
                             source_column_by_schema_idx,
                             layout,
+                            resolver,
                             connection,
                             database_id,
                         );
@@ -1391,6 +1392,7 @@ pub fn translate_alter_table(
                                 None => false,
                             },
                             decl_order,
+                            declared_on_column: true,
                         };
                         btree.foreign_keys.push(Arc::new(fk));
                     }
@@ -1804,7 +1806,10 @@ pub fn translate_alter_table(
                 )));
             };
 
-            if btree.get_column(col_name).is_some() {
+            if btree
+                .get_column(col_name)
+                .is_some_and(|(index, _)| index != column_index)
+            {
                 return Err(LimboError::ParseError(format!(
                     "duplicate column name: \"{col_name}\""
                 )));
@@ -1830,10 +1835,64 @@ pub fn translate_alter_table(
                 ));
             }
 
-            let (rewrites_physical_layout, replacement_column) = match rename {
-                true => (false, None),
+            let (rewrites_physical_layout, collation_changed, replacement_column) = match rename {
+                true => (false, false, None),
                 false => {
                     let replacement_column = Column::try_from(&definition)?;
+                    if !btree.is_strict {
+                        if let Some(col_type) = definition.col_type.as_ref() {
+                            if let Some(td) = resolver
+                                .schema()
+                                .get_type_def_unchecked(&normalize_ident(col_type.name.as_str()))
+                            {
+                                if td.is_domain {
+                                    return Err(LimboError::ParseError(format!(
+                                        "domain type columns require STRICT tables: {table_name}.{col_name}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    if btree.is_strict {
+                        let Some(col_type) = definition.col_type.as_ref() else {
+                            return Err(LimboError::ParseError(format!(
+                                "missing datatype for {table_name}.{col_name}"
+                            )));
+                        };
+                        let type_name = col_type.name.as_str();
+                        let is_builtin = type_name.eq_ignore_ascii_case("INT")
+                            || type_name.eq_ignore_ascii_case("INTEGER")
+                            || type_name.eq_ignore_ascii_case("REAL")
+                            || type_name.eq_ignore_ascii_case("TEXT")
+                            || type_name.eq_ignore_ascii_case("BLOB")
+                            || type_name.eq_ignore_ascii_case("ANY");
+                        if !is_builtin {
+                            match resolver
+                                .schema()
+                                .get_type_def_unchecked(&normalize_ident(type_name))
+                            {
+                                None => {
+                                    return Err(LimboError::ParseError(format!(
+                                        "unknown datatype for {table_name}.{col_name}: \"{type_name}\""
+                                    )));
+                                }
+                                Some(td) if td.user_params().next().is_some() => {
+                                    let provided = match &col_type.size {
+                                        Some(ast::TypeSize::TypeSize(_, _)) => 2,
+                                        Some(ast::TypeSize::MaxSize(_)) => 1,
+                                        None => 0,
+                                    };
+                                    let expected = td.user_params().count();
+                                    if provided != expected {
+                                        return Err(LimboError::ParseError(format!(
+                                            "type \"{type_name}\" requires {expected} parameter(s), got {provided}"
+                                        )));
+                                    }
+                                }
+                                Some(_) => {}
+                            }
+                        }
+                    }
                     let old_column = &btree.columns()[column_index];
                     let becomes_generated =
                         !old_column.is_generated() && replacement_column.is_generated();
@@ -1855,9 +1914,55 @@ pub fn translate_alter_table(
                         != replacement_column.affinity_with_strict(btree.is_strict);
                     let rewrites_physical_layout =
                         becomes_generated || virtuality_changed || affinity_changed;
-                    (rewrites_physical_layout, Some(replacement_column))
+                    let collation_changed =
+                        old_column.collation() != replacement_column.collation();
+                    (
+                        rewrites_physical_layout,
+                        collation_changed,
+                        Some(replacement_column),
+                    )
                 }
             };
+            if !rename && !btree.has_rowid {
+                let alters_pk_column = btree.columns()[column_index].primary_key()
+                    || btree
+                        .primary_key_columns
+                        .iter()
+                        .any(|(name, _)| normalize_ident(name) == normalize_ident(from));
+                if alters_pk_column {
+                    return Err(LimboError::ParseError(
+                        "cannot alter a PRIMARY KEY column of a WITHOUT ROWID table".to_string(),
+                    ));
+                }
+                // The row rewrite and index refill machinery is rowid-based.
+                // Reject instead of leaving the schema claiming a type or
+                // collation the stored rows do not have.
+                if rewrites_physical_layout || collation_changed {
+                    return Err(LimboError::ParseError(
+                        "ALTER COLUMN cannot change the type or collation of a WITHOUT ROWID table column"
+                            .to_string(),
+                    ));
+                }
+            }
+
+            // Changing to a custom type would need the type's encode and
+            // validation rules to run on every stored value, which the row
+            // rewrite does not do. Require an empty table (checked at
+            // runtime), like ADD COLUMN does for CHECK constraints.
+            let changes_to_custom_type = !rename
+                && btree.is_strict
+                && replacement_column.as_ref().is_some_and(|column| {
+                    !column
+                        .ty_str
+                        .eq_ignore_ascii_case(&btree.columns()[column_index].ty_str)
+                        && resolver
+                            .schema()
+                            .resolve_type(&column.ty_str, true)
+                            .ok()
+                            .flatten()
+                            .is_some()
+                });
+
             let clears_autoincrement_sequence = !rename
                 && btree.has_autoincrement
                 && btree.columns()[column_index].is_rowid_alias()
@@ -1906,21 +2011,24 @@ pub fn translate_alter_table(
                 }
             }
 
-            let rewritten_table = if rewrites_physical_layout {
-                let mut table = btree.clone();
-                table.columns_mut()[column_index] =
-                    replacement_column.expect("replacement_column must exist for ALTER COLUMN");
-                table.prepare_generated_columns()?;
-                Some(table)
-            } else {
-                None
+            let altered_table = match replacement_column {
+                Some(replacement_column) => {
+                    let mut table = btree.clone();
+                    table.columns_mut()[column_index] = replacement_column;
+                    table.prepare_generated_columns()?;
+                    Some(table)
+                }
+                None => None,
             };
 
-            // If renaming, rewrite trigger SQL for all triggers that reference this column
-            // We'll collect the triggers to rewrite and update them in sqlite_schema
+            // If the column name changes (RENAME COLUMN, or ALTER COLUMN with a
+            // new name), rewrite trigger SQL for all triggers that reference
+            // this column. We'll collect the triggers to rewrite and update
+            // them in sqlite_schema.
+            let column_name_changed = rename || normalize_ident(from) != normalize_ident(col_name);
             let mut triggers_to_rewrite: Vec<(usize, String, String)> = Vec::new();
             let mut views_to_rewrite: Vec<(usize, String, String)> = Vec::new();
-            if rename {
+            if column_name_changed {
                 // Try to rewrite every trigger's SQL for the column rename.
                 // If the rewritten SQL differs from the original, include it
                 // in the update list. This matches SQLite's approach and avoids
@@ -2204,54 +2312,154 @@ pub fn translate_alter_table(
                 });
             }
 
-            if let Some(rewritten_table) = rewritten_table {
+            if changes_to_custom_type {
+                let check_cursor_id =
+                    program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+                program.emit_insn(Insn::OpenRead {
+                    cursor_id: check_cursor_id,
+                    root_page: original_btree.root_page,
+                    db: database_id,
+                });
+                let skip_error_label = program.allocate_label();
+                program.emit_insn(Insn::Rewind {
+                    cursor_id: check_cursor_id,
+                    pc_if_empty: skip_error_label,
+                });
+                program.emit_insn(Insn::Halt {
+                    err_code: 1,
+                    description: "Cannot change a column to a custom type on a non-empty table"
+                        .to_string(),
+                    on_error: None,
+                    description_reg: None,
+                });
+                program.preassign_label_to_next_insn(skip_error_label);
+            }
+
+            if let Some(altered_table) = altered_table {
                 emit_add_virtual_column_validation(
                     program,
-                    &rewritten_table,
-                    &rewritten_table.columns()[column_index],
+                    &altered_table,
+                    &altered_table.columns()[column_index],
                     &definition.constraints,
                     resolver,
                     connection,
                     database_id,
                 )?;
 
-                let original_columns = original_btree.columns();
-                let source_column_by_schema_idx: Vec<Option<usize>> = rewritten_table
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, column)| {
-                        if column.is_virtual_generated() {
-                            // Virtual columns don't occupy a slot in the rewritten record.
-                            None
-                        } else if original_columns
-                            .get(idx)
-                            .is_some_and(|c| c.is_virtual_generated())
-                        {
-                            // Newly-stored slot (the original column was virtual): no
-                            // source value exists on the old row image — leave NULL.
-                            None
-                        } else {
-                            // The cursor is opened on the original btree, so the logical
-                            // index passed here is mapped to the original physical slot
-                            // by `emit_column_or_rowid` via the original's logical-to-
-                            // physical map. Schema order is preserved by ALTER COLUMN,
-                            // so the rewritten schema_idx also identifies the same
-                            // logical column in the original.
-                            Some(idx)
+                if rewrites_physical_layout {
+                    let original_columns = original_btree.columns();
+                    let source_column_by_schema_idx: Vec<Option<usize>> = altered_table
+                        .columns()
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, column)| {
+                            if column.is_virtual_generated() {
+                                // Virtual columns don't occupy a slot in the rewritten record.
+                                None
+                            } else if original_columns
+                                .get(idx)
+                                .is_some_and(|c| c.is_virtual_generated())
+                            {
+                                // Newly-stored slot (the original column was virtual): no
+                                // source value exists on the old row image — leave NULL.
+                                None
+                            } else {
+                                // The cursor is opened on the original btree, so the logical
+                                // index passed here is mapped to the original physical slot
+                                // by `emit_column_or_rowid` via the original's logical-to-
+                                // physical map. Schema order is preserved by ALTER COLUMN,
+                                // so the rewritten schema_idx also identifies the same
+                                // logical column in the original.
+                                Some(idx)
+                            }
+                        })
+                        .collect();
+                    let layout = altered_table.column_layout()?;
+                    emit_rewrite_table_rows(
+                        program,
+                        original_btree.clone(),
+                        &altered_table,
+                        &source_column_by_schema_idx,
+                        &layout,
+                        resolver,
+                        connection,
+                        database_id,
+                    );
+                }
+
+                // A rewrite changes the stored values of the altered column
+                // and a collation change reorders its comparisons, so every
+                // index that contains those values must be rebuilt from the
+                // new rows or index seeks would keep finding the old values
+                // in the old order. Indexes whose collation was inherited
+                // from the column follow it to the new collation, like a
+                // fresh parse of the schema would.
+                if rewrites_physical_layout || collation_changed {
+                    let from_normalized = normalize_ident(from);
+                    let old_collation = btree.columns()[column_index].collation();
+                    let new_collation_opt = altered_table.columns()[column_index].collation_opt();
+                    let new_collation = altered_table.columns()[column_index].collation();
+                    let refill_indexes: Vec<Arc<crate::schema::Index>> =
+                        resolver.with_schema(database_id, |s| {
+                            let mut refill = Vec::new();
+                            for index in s.get_indices(table_name) {
+                                let direct = index
+                                    .columns
+                                    .iter()
+                                    .any(|ic| ic.pos_in_table == column_index && ic.expr.is_none());
+                                let via_expr = index.columns.iter().any(|ic| {
+                                    ic.expr.as_deref().is_some_and(|expr| {
+                                        check_expr_references_column(expr, &from_normalized)
+                                    })
+                                }) || index.where_clause.as_deref().is_some_and(
+                                    |expr| check_expr_references_column(expr, &from_normalized),
+                                );
+                                if !direct && !via_expr {
+                                    continue;
+                                }
+                                let mut patched = (**index).clone();
+                                let mut collation_patched = false;
+                                for ic in &mut patched.columns {
+                                    if ic.pos_in_table == column_index && ic.expr.is_none() {
+                                        let effective = ic.collation.unwrap_or(
+                                            crate::translate::collate::CollationSeq::Binary,
+                                        );
+                                        if effective == old_collation && effective != new_collation
+                                        {
+                                            ic.collation = new_collation_opt;
+                                            collation_patched = true;
+                                        }
+                                    }
+                                }
+                                if rewrites_physical_layout || collation_patched {
+                                    refill.push(Arc::new(patched));
+                                }
+                            }
+                            refill
+                        });
+                    if !refill_indexes.is_empty() {
+                        if database_uses_mvcc(connection, database_id) {
+                            return Err(LimboError::ParseError(
+                                "ALTER COLUMN cannot change the values or collation of an indexed column in MVCC mode"
+                                    .to_string(),
+                            ));
                         }
-                    })
-                    .collect();
-                let layout = rewritten_table.column_layout()?;
-                emit_rewrite_table_rows(
-                    program,
-                    original_btree.clone(),
-                    &rewritten_table,
-                    &source_column_by_schema_idx,
-                    &layout,
-                    connection,
-                    database_id,
-                );
+                        let altered_table_arc = Arc::new(altered_table.clone());
+                        for index in &refill_indexes {
+                            let index_cursor_id = program.alloc_cursor_index(None, index)?;
+                            crate::translate::index::emit_refill_index(
+                                program,
+                                resolver,
+                                database_id,
+                                &altered_table_arc,
+                                index,
+                                index_cursor_id,
+                                RegisterOrLiteral::Literal(index.root_page),
+                                Some(index.root_page),
+                            )?;
+                        }
+                    }
+                }
             }
 
             if clears_autoincrement_sequence {
@@ -2289,6 +2497,7 @@ fn emit_rewrite_table_rows(
     rewritten_table: &BTreeTable,
     source_column_by_schema_idx: &[Option<usize>],
     layout: &ColumnLayout,
+    resolver: &Resolver,
     connection: &Arc<crate::Connection>,
     database_id: usize,
 ) {
@@ -2297,6 +2506,9 @@ fn emit_rewrite_table_rows(
         rewritten_table.columns().len()
     );
 
+    let type_check_table_ref = rewritten_table.is_strict.then(|| {
+        BTreeTable::type_check_table_ref(&Arc::new(rewritten_table.clone()), resolver.schema())
+    });
     let non_virtual_column_count = layout.num_non_virtual_cols();
     let root_page = rewritten_table.root_page;
     let table_name = rewritten_table.name.clone();
@@ -2324,6 +2536,17 @@ fn emit_rewrite_table_rows(
                 *source_column_idx,
                 layout.to_register(base_dest_reg, schema_idx),
             );
+        }
+
+        // For STRICT tables, coerce each value to the new declared type and
+        // fail on values that cannot be stored under it, like an insert would.
+        if let Some(table_reference) = &type_check_table_ref {
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: base_dest_reg,
+                count: non_virtual_column_count,
+                check_generated: true,
+                table_reference: table_reference.clone(),
+            });
         }
 
         let record = program.alloc_register();
