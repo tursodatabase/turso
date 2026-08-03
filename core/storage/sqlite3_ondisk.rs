@@ -560,6 +560,7 @@ pub fn begin_read_page(
     let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
         let Ok((buf, bytes_read)) = res else {
             page.clear_locked();
+            page.take_shared_page_publisher();
             return None; // IO error already captured in completion
         };
         let buf_len = buf.len();
@@ -569,6 +570,7 @@ pub fn begin_read_page(
             if !allow_empty_read {
                 tracing::error!("short read on page {page_idx}: expected {buf_len} bytes, got 0");
                 page.clear_locked();
+                page.take_shared_page_publisher();
                 return Some(CompletionError::ShortRead {
                     page_idx,
                     expected: buf_len,
@@ -580,6 +582,7 @@ pub fn begin_read_page(
                 "short read on page {page_idx}: expected {buf_len} bytes, got {bytes_read}"
             );
             page.clear_locked();
+            page.take_shared_page_publisher();
             return Some(CompletionError::ShortRead {
                 page_idx,
                 expected: buf_len,
@@ -602,7 +605,7 @@ pub fn begin_read_page(
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn finish_read_page(page_idx: usize, buffer: Arc<Buffer>, page: PageRef) {
     tracing::trace!("finish_read_page(page_idx = {page_idx})");
-    {
+    let publisher = {
         let inner = page.get();
         inner.buffer = Some(buffer);
         page.clear_locked();
@@ -610,6 +613,10 @@ pub fn finish_read_page(page_idx: usize, buffer: Arc<Buffer>, page: PageRef) {
         // we set the wal tag only when reading page from log, or in allocate_page,
         // we clear it here for safety in case page is being re-loaded.
         page.clear_wal_tag();
+        page.take_shared_page_publisher()
+    };
+    if let Some(publisher) = publisher {
+        publisher.publish(page.get_contents().as_ptr());
     }
 }
 
@@ -2217,6 +2224,158 @@ mod tests {
 
     use super::*;
     use rstest::rstest;
+
+    struct ErrorReadFile {
+        inner: Arc<dyn File>,
+    }
+
+    impl File for ErrorReadFile {
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+
+        fn pread(&self, _pos: u64, completion: Completion) -> Result<Completion> {
+            completion.error(CompletionError::IOError(
+                std::io::ErrorKind::Other,
+                "shared page cache test",
+            ));
+            Ok(completion)
+        }
+
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<Buffer>,
+            completion: Completion,
+        ) -> Result<Completion> {
+            self.inner.pwrite(pos, buffer, completion)
+        }
+
+        fn sync(&self, completion: Completion, sync_type: FileSyncType) -> Result<Completion> {
+            self.inner.sync(completion, sync_type)
+        }
+
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+
+        fn truncate(&self, len: u64, completion: Completion) -> Result<Completion> {
+            self.inner.truncate(len, completion)
+        }
+    }
+
+    #[test]
+    fn database_read_error_does_not_publish_shared_cache_bytes() {
+        use crate::{
+            storage::{
+                database::DatabaseFile,
+                pager::Page,
+                shared_page_cache::{
+                    SharedPageCache, SharedPageCacheGeneration, SharedPageVersion,
+                },
+            },
+            MemoryIO, OpenFlags, IO,
+        };
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let inner = io
+            .open_file("read-error.db", OpenFlags::Create, false)
+            .unwrap();
+        let database_file = DatabaseFile::new(Arc::new(ErrorReadFile { inner }));
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool.finalize_with_page_size(512).unwrap();
+        let cache = Arc::new(SharedPageCache::new(64 * 1024));
+        let namespace = cache
+            .new_namespace(Arc::new(SharedPageCacheGeneration::default()))
+            .unwrap();
+        let page = Arc::new(Page::new(1));
+        page.set_shared_page_publisher(Some(namespace.publisher(
+            1,
+            512,
+            SharedPageVersion::Database {
+                checkpoint_epoch: 0,
+            },
+        )));
+
+        let completion = begin_read_page(
+            &database_file,
+            buffer_pool,
+            page.clone(),
+            1,
+            false,
+            &IOContext::default(),
+        )
+        .unwrap();
+        let result = io.wait_for_completion(completion);
+
+        assert!(matches!(
+            result,
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::Other,
+                _
+            )))
+        ));
+        assert_eq!(cache.stats().entries, 0);
+        assert!(page.take_shared_page_publisher().is_none());
+    }
+
+    #[test]
+    fn short_database_read_does_not_publish_shared_cache_bytes() {
+        use crate::{
+            storage::{
+                database::DatabaseFile,
+                pager::Page,
+                shared_page_cache::{
+                    SharedPageCache, SharedPageCacheGeneration, SharedPageVersion,
+                },
+            },
+            MemoryIO, OpenFlags, IO,
+        };
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool.finalize_with_page_size(512).unwrap();
+        let database_file = DatabaseFile::new(
+            io.open_file("short-read.db", OpenFlags::Create, false)
+                .unwrap(),
+        );
+        let cache = Arc::new(SharedPageCache::new(64 * 1024));
+        let namespace = cache
+            .new_namespace(Arc::new(SharedPageCacheGeneration::default()))
+            .unwrap();
+        let page = Arc::new(Page::new(1));
+        page.set_shared_page_publisher(Some(namespace.publisher(
+            1,
+            512,
+            SharedPageVersion::Database {
+                checkpoint_epoch: 0,
+            },
+        )));
+
+        let completion = begin_read_page(
+            &database_file,
+            buffer_pool,
+            page.clone(),
+            1,
+            false,
+            &IOContext::default(),
+        )
+        .unwrap();
+        let result = io.wait_for_completion(completion);
+
+        assert!(matches!(
+            result,
+            Err(LimboError::CompletionError(
+                CompletionError::ShortRead { .. }
+            ))
+        ));
+        assert_eq!(cache.stats().entries, 0);
+        assert!(page.take_shared_page_publisher().is_none());
+    }
 
     #[rstest]
     #[case(&[], SerialType::null(), Value::Null)]

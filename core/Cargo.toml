@@ -121,6 +121,7 @@ aes = { version = "0.8.4" }
 turso_parser = { workspace = true }
 twox-hash = "2.1.1"
 intrusive-collections = "0.9.7"
+lru = { workspace = true }
 roaring = "0.11.2"
 arc-swap = "1.7"
 rustc-hash = "2.0"

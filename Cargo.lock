@@ -7343,6 +7343,7 @@ dependencies = [
  "libloading 0.8.6",
  "libm",
  "loom",
+ "lru",
  "memory-stats",
  "miette",
  "mimalloc",

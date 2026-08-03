@@ -18,6 +18,7 @@ mod query_processing;
 mod query_timeout;
 mod queued_io;
 mod reindex;
+mod shared_page_cache;
 mod statement_metadata;
 mod statement_reset;
 mod stmt_journal;
