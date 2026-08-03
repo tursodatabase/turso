@@ -1118,7 +1118,7 @@ fn seed_ordered_single_table_variants(
                         params.rows_per_table_page,
                     ),
                 };
-                let cost = estimate_cost_for_scan_or_seek(
+                let mut cost = estimate_cost_for_scan_or_seek(
                     Some(index_info),
                     &constraints[table_idx].constraints,
                     &[],
@@ -1128,6 +1128,21 @@ fn seed_ordered_single_table_variants(
                     params,
                     None,
                 );
+                if !index_info.covering {
+                    let tree_depth = if *base_rows <= 1.0 {
+                        1.0
+                    } else {
+                        ((*base_rows).ln() / params.rows_per_table_page.ln())
+                            .ceil()
+                            .max(1.0)
+                    };
+                    cost = cost
+                        + Cost(
+                            *base_rows
+                                * (tree_depth * params.cache_reuse_factor
+                                    + params.cpu_cost_per_seek),
+                        );
+                }
                 if cheapest
                     .as_ref()
                     .is_none_or(|(existing_cost, _, _)| cost < *existing_cost)

@@ -1580,12 +1580,19 @@ pub fn try_merge_join_access_method(
             Some(&analyze_ctx),
         );
         let leaf_pages = (*rhs_base_rows / index_info.rows_per_leaf_page).max(1.0);
+        let matched_rows_total = input_cardinality * rows_per_seek;
         let table_lookup_cost = if index_info.covering {
             0.0
         } else {
-            let table_pages = (*rhs_base_rows / params.rows_per_table_page).max(1.0);
-            let selectivity = rows_per_seek / (*rhs_base_rows).max(1.0);
-            input_cardinality * selectivity * table_pages
+            let tree_depth = if *rhs_base_rows <= 1.0 {
+                1.0
+            } else {
+                ((*rhs_base_rows).ln() / params.rows_per_table_page.ln())
+                    .ceil()
+                    .max(1.0)
+            };
+            matched_rows_total
+                * (tree_depth * params.cache_reuse_factor + params.cpu_cost_per_seek)
         };
         let cpu_cost = (input_cardinality * 2.0 + *rhs_base_rows) * params.cpu_cost_per_row;
         let cost = Cost(leaf_pages + table_lookup_cost + cpu_cost);
