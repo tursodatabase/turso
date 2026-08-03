@@ -851,9 +851,12 @@ impl Value {
             return Value::from_f64(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
         }
 
-        let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}"))
-            .expect("formatted float should always parse successfully")
-            .into();
+        let f: f64 =
+            crate::numeric::round_half_away_from_zero_tie(f, precision).unwrap_or_else(|| {
+                crate::numeric::str_to_f64(format!("{f:.precision$}"))
+                    .expect("formatted float should always parse successfully")
+                    .into()
+            });
 
         Value::from_f64(f)
     }

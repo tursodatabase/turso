@@ -4203,6 +4203,24 @@ mod fuzz_tests {
     }
 
     #[turso_macros::test(mvcc)]
+    pub fn round_ex(db: TempDatabase) {
+        let _ = env_logger::try_init();
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        for query in [
+            "SELECT round(2.25, 1)",
+            "SELECT round(0.125, 2)",
+            "SELECT round(1.125, 2)",
+            "SELECT round(-2.25, 1)",
+            "SELECT round(5e-320, 10)",
+            "SELECT round(1e-300, 30)",
+        ] {
+            helpers::assert_differential(&limbo_conn, &sqlite_conn, query, "");
+        }
+    }
+
+    #[turso_macros::test(mvcc)]
     pub fn math_expression_fuzz_run(db: TempDatabase) {
         let (mut rng, seed) = helpers::init_fuzz_test("math_expression_fuzz_run");
         let g = GrammarGenerator::new();

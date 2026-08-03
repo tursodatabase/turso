@@ -855,6 +855,44 @@ test round-null-precision {
 expect {
 }
 
+test round-exact-tie-away-from-zero {
+    SELECT round(2.25, 1);
+}
+expect {
+    2.3
+}
+
+test round-non-tie-unaffected {
+    SELECT round(2.35, 1);
+}
+expect {
+    2.4
+}
+
+test round-exact-tie-negative {
+    SELECT round(-2.25, 1);
+}
+expect {
+    -2.3
+}
+
+test round-exact-tie-two-decimal {
+    SELECT round(0.125, 2);
+}
+expect {
+    0.13
+}
+
+test round-subnormal-no-panic {
+    SELECT round(5e-320, 10);
+}
+expect {
+    0.0
+}
+expect @js {
+    0
+}
+
 test length-text {
     SELECT length('limbo');
 }
