@@ -83,6 +83,7 @@ impl SqlBackend for RustBackend {
     fn capabilities(&self) -> HashSet<Capability> {
         HashSet::from_iter([
             Capability::Trigger,
+            Capability::Strict,
             Capability::MaterializedViews,
             Capability::CustomTypes,
         ])
