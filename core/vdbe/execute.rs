@@ -6116,9 +6116,15 @@ pub fn seek_internal(
                         IOResult::Done(()) => {}
                         IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
                     }
-                    // the MoveLast variant is only used for SeekOp::LT and SeekOp::LE when the seek condition is always true,
-                    // so we have always found what we were looking for.
-                    return Ok(SeekInternalResult::Found);
+                    // The MoveLast variant is only used for SeekOp::LT and SeekOp::LE when
+                    // the seek condition is true for every row, so the last row satisfies
+                    // it — but an empty table has no row to sit on, and reporting Found
+                    // there would make the scan loop emit one garbage row.
+                    return Ok(if cursor.is_empty() {
+                        SeekInternalResult::NotFound
+                    } else {
+                        SeekInternalResult::Found
+                    });
                 }
             }
         }
