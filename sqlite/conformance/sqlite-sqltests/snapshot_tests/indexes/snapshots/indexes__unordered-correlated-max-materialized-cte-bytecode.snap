@@ -24,7 +24,7 @@ QUERY PLAN
 |--SCAN products
 |--SCAN prices AS p1
 `--CORRELATED SCALAR SUBQUERY 1
-   `--SEARCH p2 USING INDEX ephemeral_subquery_t7 (price<?)
+   `--SEARCH p2 USING INDEX ephemeral_subquery_t4 (price<?)
 
 BYTECODE
 addr  opcode               p1  p2  p3  p4           p5  comment
@@ -53,7 +53,7 @@ addr  opcode               p1  p2  p3  p4           p5  comment
   22      Rewind            2  23   0                0  Rewind  ephemeral()
   23        Column          2   0  15                0  r[15]=ephemeral().price
   24        RowId           2  16   0                0  r[16]=ephemeral().rowid
-  25        MakeRecord     15   2  17                0  r[17]=mkrec(r[15..16]); for ephemeral_subquery_t7
+  25        MakeRecord     15   2  17                0  r[17]=mkrec(r[15..16]); for ephemeral_subquery_t4
   26        IdxInsert       3  17  15                0  key=r[17]
   27      Next              2  23   0                0
   28      Copy              2  18   0                0  r[18]=r[2]
@@ -64,7 +64,7 @@ addr  opcode               p1  p2  p3  p4           p5  comment
   33        IdxLE           3  41  18                0  key=[18..18]
   34        DeferredSeek    3   2   0                0
   35        Column          2   0  11                0  r[11]=ephemeral().price
-  36        Column          3   0  19                0  r[19]=ephemeral(ephemeral_subquery_t7).price
+  36        Column          3   0  19                0  r[19]=ephemeral(ephemeral_subquery_t4).price
   37        RealAffinity   19   0   0                0
   38        AggStep         0  19  13  max(Binary)   0  accum=r[13] step(r[19])
   39        Goto            0  41   0                0

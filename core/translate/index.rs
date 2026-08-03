@@ -1,9 +1,8 @@
-use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
+use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
-use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
-use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
+use crate::schema::{Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
 use crate::sync::Arc;
 use crate::translate::{
     collate::CollationSeq,
@@ -11,10 +10,7 @@ use crate::translate::{
         emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
         OperationMode, Resolver,
     },
-    expr::{
-        bind_and_rewrite_expr, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
-        BindingBehavior, ConditionMetadata, WalkControl,
-    },
+    expr::{translate_condition_expr, translate_expr, ConditionMetadata},
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
 };
@@ -22,10 +18,7 @@ use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
 use crate::vdbe::insn::{to_u32, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEMP_DB_ID};
 use crate::{
-    schema::{
-        is_deterministic_schema_function_call, BTreeTable, Index, IndexColumn, PseudoCursorType,
-        SchemaObjectType,
-    },
+    schema::{BTreeTable, Index, IndexColumn, PseudoCursorType, SchemaObjectType},
     storage::pager::CreateBTreeFlags,
     util::{escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
     vdbe::{
@@ -34,7 +27,7 @@ use crate::{
     },
 };
 use rustc_hash::FxHashMap as HashMap;
-use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
+use turso_parser::ast::{self, Expr, QualifiedName, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
@@ -149,7 +142,7 @@ pub fn translate_create_index(
     if !tbl.has_rowid {
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
     }
-    let columns = resolve_sorted_columns_with_resolver(&tbl, &columns, Some(resolver))?;
+    let columns = crate::translate::bind::bind_index_columns(&tbl, &columns, Some(resolver))?;
 
     // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns
     for col in &columns {
@@ -204,6 +197,13 @@ pub fn translate_create_index(
             })?);
         }
     }
+    // Pre-resolve the WHERE clause's column references to SELF_TABLE form.
+    // Resolution is lenient: names that don't resolve stay as identifiers,
+    // and predicate validation below rejects them.
+    let resolved_where_clause = where_clause.clone().map(|mut wc| {
+        crate::translate::bind::bind_index_schema_expr(&mut wc, &tbl);
+        wc
+    });
     let idx = Arc::new(Index {
         name: idx_name.clone(),
         table_name: tbl.name.clone(),
@@ -212,14 +212,12 @@ pub fn translate_create_index(
         unique,
         ephemeral: false,
         has_rowid: tbl.has_rowid,
-        // store the *original* where clause, because we need to rewrite it
-        // before translating, and it cannot reference a table alias
-        where_clause: where_clause.clone(),
+        where_clause: resolved_where_clause,
         index_method: index_method.clone(),
         on_conflict: None,
     });
 
-    if !idx.validate_where_expr(&table, resolver) {
+    if !crate::translate::bind::validate_partial_index_predicate(&idx, &table) {
         crate::bail_parse_error!(
             "Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:\n {}",
             where_clause
@@ -347,10 +345,16 @@ fn emit_refill_index(
             expression_index_usages: Vec::new(),
             database_id,
             indexed: None,
+            bound_index_method_patterns: Vec::new(),
+            bound_index_expressions: Vec::new(),
         }],
         vec![],
     );
-    let where_clause = idx.bind_where_expr(Some(&mut table_references), resolver);
+    let where_clause = idx
+        .where_clause
+        .as_deref()
+        .map(|expr| crate::translate::bind::bind_schema_expr(expr, table_ref))
+        .transpose()?;
 
     if idx
         .index_method
@@ -875,13 +879,6 @@ fn index_matches_collation(index: &Index, collation: CollationSeq) -> bool {
         .any(|column| column.collation.unwrap_or_default() == collation)
 }
 
-pub fn resolve_sorted_columns(
-    table: &BTreeTable,
-    cols: &[SortedColumn],
-) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
-    resolve_sorted_columns_with_resolver(table, cols, None)
-}
-
 /// SQLite rejects explicit `NULLS FIRST`/`NULLS LAST` wherever an index key
 /// is defined or matched: CREATE INDEX, table PRIMARY KEY/UNIQUE constraints,
 /// and UPSERT conflict targets (see `sqlite3HasExplicitNulls`). Accepting the
@@ -896,219 +893,6 @@ pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
     Ok(())
 }
 
-fn resolve_sorted_columns_with_resolver(
-    table: &BTreeTable,
-    cols: &[SortedColumn],
-    resolver: Option<&Resolver>,
-) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
-    reject_explicit_nulls(cols)?;
-    let mut resolved =
-        <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
-            cols.len(),
-        )?;
-    for sc in cols {
-        let order = sc.order.unwrap_or(SortOrder::Asc);
-        let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref(), resolver)?;
-        // Unwrap parentheses for column resolution (SQLite treats (('col')) same as 'col')
-        let unwrapped_expr = unwrap_parens(base_expr)?;
-        if let Some((pos, column_name, column)) = resolve_index_column(unwrapped_expr, table) {
-            let collation = explicit_collation.or_else(|| column.collation_opt());
-            let expr = match column.generated_type() {
-                GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
-                GeneratedType::NotGenerated => None,
-            };
-            resolved
-                .push_within_capacity(IndexColumn {
-                    name: column_name,
-                    order,
-                    pos_in_table: pos,
-                    collation,
-                    default: column.default.clone(),
-                    expr,
-                })
-                .expect("resolved index columns vector was preallocated to cols.len()");
-            continue;
-        }
-        if !validate_index_expression(unwrapped_expr, table) {
-            crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
-        }
-        resolved
-            .push_within_capacity(IndexColumn {
-                name: sc.expr.to_string(),
-                order,
-                pos_in_table: EXPR_INDEX_SENTINEL,
-                collation: explicit_collation,
-                default: None,
-                expr: Some(sc.expr.clone()),
-            })
-            .expect("resolved index columns vector was preallocated to cols.len()");
-    }
-    Ok(resolved)
-}
-
-/// Extracts collation sequence from an expression if it is a Collate expression.
-/// Given the example: `col1 COLLATE NOCASE` / Expr::Collation(Expr::Id(col1), CollationSeq)
-/// returns (Some(CollationSeq), Expr::Id(col1))
-fn extract_collation<'a>(
-    expr: &'a Expr,
-    resolver: Option<&Resolver>,
-) -> crate::Result<(Option<CollationSeq>, &'a Expr)> {
-    let mut current = expr;
-    let mut coll = None;
-    loop {
-        current = unwrap_parens(current)?;
-        match current {
-            Expr::Collate(inner, seq) => {
-                if coll.is_none() {
-                    let collation = match resolver {
-                        Some(resolver) => resolver.resolve_collation(seq.as_str())?,
-                        None => CollationSeq::new(seq.as_str())?,
-                    };
-                    if collation.is_custom() {
-                        crate::bail_parse_error!("custom collations are not supported in indexes");
-                    }
-                    coll = Some(collation);
-                }
-                current = inner.as_ref();
-            }
-            _ => return Ok((coll, current)),
-        }
-    }
-}
-
-/// For a given Index Expression, attempts to resolve it to a column position in the table.
-/// Returning (position_in_table, column_name, column_reference).
-/// This is needed to support Collated indexes, where the ast node is not simply the column name,
-/// but isn't treated like an arbitrary expression either.
-fn resolve_index_column<'a>(
-    expr: &'a Expr,
-    table: &'a BTreeTable,
-) -> Option<(usize, String, &'a Column)> {
-    let (pos, column) = match expr {
-        Expr::Id(col_name) | Expr::Name(col_name) => table.get_column(col_name.as_str())?,
-        // SQLite interprets single-quoted strings as column names in index expressions
-        // (backwards compatibility quirk). We do the same. The string includes quotes.
-        Expr::Literal(ast::Literal::String(col_name)) => {
-            let unquoted = col_name.trim_matches('\'');
-            table.get_column(unquoted)?
-        }
-        Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-            table.get_column(col.as_str())?
-        }
-        Expr::RowId { .. } => table.get_rowid_alias_column()?,
-        _ => return None,
-    };
-    let column_name = column
-        .name
-        .as_ref()
-        .expect("column name must exist for indexed column")
-        .clone();
-    Some((pos, column_name, column))
-}
-
-/// Validates that an index expression only contains allowed constructs.
-///
-/// https://sqlite.org/expridx.html
-/// There are certain reasonable restrictions on expressions that appear in CREATE INDEX statements:
-/// Expressions in CREATE INDEX statements may only refer to columns of the table being indexed, not to columns in other tables.
-/// Expressions in CREATE INDEX statements may contain function calls, but only to functions whose output is always determined completely by its input parameters
-/// (a.k.a.: deterministic functions). Obviously, functions like random() will not work well in an index. But also functions like sqlite_version(), though they
-/// are constant across any one database connection, are not constant across the life of the underlying database file, and hence may not be used in a CREATE INDEX statement.
-/// Expressions in CREATE INDEX statements may not use subqueries.
-/// Additionally, a standalone string literal is interpreted as a column name (for backwards
-/// compatibility with SQLite), not as a string literal. It is rejected if no such column exists.
-fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
-    // A top-level string literal would have been handled by resolve_index_column().
-    // If we get here with a string literal, it means the column doesn't exist.
-    // (SQLite interprets standalone string literals as column names for backwards compat.)
-    // Note: extract_collation already unwraps parentheses, so we check the unwrapped expr.
-    if matches!(expr, Expr::Literal(ast::Literal::String(_))) {
-        return false;
-    }
-
-    let tbl_norm = normalize_ident(table.name.as_str());
-    let has_col = |name: &str| {
-        let n = normalize_ident(name);
-        table
-            .columns()
-            .iter()
-            .any(|c| c.name.as_ref().is_some_and(|cn| normalize_ident(cn) == n))
-    };
-    let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
-    let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
-        let n = normalize_ident(name);
-        Func::resolve_function(&n, args.len())
-            .is_ok_and(|f| f.is_some_and(|f| is_deterministic_schema_function_call(&f, args)))
-    };
-
-    let mut ok = true;
-    let _ = walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
-        if !ok {
-            return Ok(WalkControl::SkipChildren);
-        }
-        match e {
-            // String literals inside expressions are allowed (e.g., `c0 || 'suffix'`).
-            // Standalone string literals are handled by resolve_index_column() which interprets
-            // them as column names (SQLite backwards compat quirk).
-            Expr::Literal(
-                ast::Literal::CurrentDate
-                | ast::Literal::CurrentTime
-                | ast::Literal::CurrentTimestamp,
-            ) => {
-                ok = false;
-            }
-            Expr::Literal(_) | Expr::RowId { .. } => {}
-            // must be a column of the target table
-            Expr::Id(n) | Expr::Name(n) => {
-                if !has_col(n.as_str()) {
-                    ok = false;
-                }
-            }
-            // Qualified: qualifier must match this index's table, column must exist
-            Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
-                if !is_tbl(ns.as_str()) || !has_col(col.as_str()) {
-                    ok = false;
-                }
-            }
-            Expr::FunctionCall {
-                name, filter_over, ..
-            }
-            | Expr::FunctionCallStar {
-                name, filter_over, ..
-            } => {
-                // reject windowed
-                if filter_over.over_clause.is_some() {
-                    ok = false;
-                } else {
-                    let argc = match e {
-                        Expr::FunctionCall { args, .. } => args.as_slice(),
-                        Expr::FunctionCallStar { .. } => &[] as &[Box<Expr>],
-                        _ => unreachable!(),
-                    };
-                    if !is_deterministic_fn(name.as_str(), argc) {
-                        ok = false;
-                    }
-                }
-            }
-            // Explicitly disallowed constructs
-            Expr::Exists(_)
-            | Expr::InSelect { .. }
-            | Expr::Subquery(_)
-            | Expr::Raise { .. }
-            | Expr::Variable(_) => {
-                ok = false;
-            }
-            _ => {}
-        }
-        Ok(if ok {
-            WalkControl::Continue
-        } else {
-            WalkControl::SkipChildren
-        })
-    });
-    ok
-}
-
 fn emit_index_column_value_from_cursor(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -1119,14 +903,14 @@ fn emit_index_column_value_from_cursor(
     dest_reg: usize,
 ) -> crate::Result<()> {
     if let Some(expr) = &idx_col.expr {
-        let mut expr = expr.as_ref().clone();
-        bind_and_rewrite_expr(
-            &mut expr,
-            Some(table_references),
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
+        // Index expressions are stored pre-resolved to SELF_TABLE form;
+        // point them at this statement's table reference.
+        let table_internal_id = table_references
+            .joined_tables()
+            .first()
+            .expect("index creation has a target table reference")
+            .internal_id;
+        let expr = crate::translate::bind::bind_schema_expr(expr, table_internal_id)?;
         let self_table_context =
             table_references
                 .joined_tables()

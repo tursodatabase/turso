@@ -2,22 +2,18 @@ use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
 use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq, turso_assert_ne};
 use turso_parser::{
-    ast::{self, TableInternalId},
+    ast::{self},
     parser::Parser,
 };
 
-use super::{
-    schema::{validate_check_expr, SQLITE_TABLEID},
-    update::translate_update_for_schema_change,
-};
+use super::{schema::SQLITE_TABLEID, update::translate_update_for_schema_change};
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
-    schema::{CheckConstraint, Column, ColumnLayout, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
+    schema::{CheckConstraint, Column, ColumnLayout, ForeignKey, RESERVED_TABLE_PREFIXES},
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
-        plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
         trigger::create_trigger_to_sql,
     },
     util::{
@@ -758,7 +754,7 @@ fn emit_add_column_check_validation(
             for td in &resolved.chain {
                 for dc in &td.domain_checks {
                     let rewritten =
-                        crate::schema::rewrite_value_to_column(&dc.check, new_column_name);
+                        crate::translate::bind::bind_domain_check(&dc.check, new_column_name);
                     all_checks.push((dc.name.clone(), rewritten));
                 }
             }
@@ -768,9 +764,6 @@ fn emit_add_column_check_validation(
     if all_checks.is_empty() {
         return Ok(());
     }
-
-    let table_name = &btree.name;
-    let col_name_lower = normalize_ident(new_column_name);
 
     // Open the table to check if it has rows.
     let check_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
@@ -788,27 +781,11 @@ fn emit_add_column_check_validation(
 
     // Table has rows -- evaluate each CHECK constraint with the default value substituted.
     for (constraint_name, check_expr) in &all_checks {
-        let mut substituted = *check_expr.clone();
-
-        // Replace references to the new column with the default value expression.
-        let _ = walk_expr_mut(
-            &mut substituted,
-            &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-                match e {
-                    ast::Expr::Id(name) if normalize_ident(name.as_str()) == col_name_lower => {
-                        *e = default_expr.clone();
-                        Ok(WalkControl::SkipChildren)
-                    }
-                    ast::Expr::Qualified(tbl, col)
-                        if normalize_ident(tbl.as_str()) == normalize_ident(table_name)
-                            && normalize_ident(col.as_str()) == col_name_lower =>
-                    {
-                        *e = default_expr.clone();
-                        Ok(WalkControl::SkipChildren)
-                    }
-                    _ => Ok(WalkControl::Continue),
-                }
-            },
+        let substituted = crate::translate::bind::bind_check_column_default(
+            check_expr,
+            &btree.name,
+            new_column_name,
+            &default_expr,
         );
 
         let result_reg = program.alloc_register();
@@ -969,10 +946,14 @@ pub fn translate_alter_table(
                         index.name, indexed_col.pos_in_table
                     )));
                 }
-                // Referenced in expression index
+                // Referenced in expression index. Index expressions store
+                // column references in SELF_TABLE positional form; leftover
+                // identifiers (lenient load) are checked by name.
                 for idx_col in &index.columns {
                     if let Some(expr) = &idx_col.expr {
-                        if check_expr_references_column(expr, &col_normalized) {
+                        if self_table_expr_references_column(expr, dropped_index)
+                            || check_expr_references_column(expr, &col_normalized)
+                        {
                             return Err(LimboError::ParseError(format!(
                                 "error in index {} after drop column: no such column: {column_name}",
                                 index.name
@@ -981,51 +962,8 @@ pub fn translate_alter_table(
                     }
                 }
                 // Referenced in partial index
-                if index.where_clause.is_some() {
-                    let mut table_references = TableReferences::new(
-                        vec![],
-                        vec![OuterQueryReference {
-                            identifier: table_name.to_string(),
-                            internal_id: TableInternalId::from(0),
-                            table: Table::BTree(Arc::new(btree.clone())),
-                            using_dedup_hidden_cols: ColumnMask::default(),
-                            col_used_mask: ColumnUsedMask::default(),
-                            cte_select: None,
-                            cte_explicit_columns: vec![],
-                            cte_id: None,
-                            cte_definition_only: false,
-                            rowid_referenced: false,
-                            scope_depth: 0,
-                        }],
-                    );
-                    let where_copy = index
-                        .bind_where_expr(Some(&mut table_references), resolver)
-                        .ok_or_else(|| {
-                            LimboError::ParseError(
-                                "index where clause unexpectedly missing".to_string(),
-                            )
-                        })?;
-                    let mut column_referenced = false;
-                    walk_expr(
-                        &where_copy,
-                        &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
-                            if let ast::Expr::Column {
-                                table,
-                                column: column_index,
-                                ..
-                            } = e
-                            {
-                                if *table == TableInternalId::from(0)
-                                    && *column_index == dropped_index
-                                {
-                                    column_referenced = true;
-                                    return Ok(WalkControl::SkipChildren);
-                                }
-                            }
-                            Ok(WalkControl::Continue)
-                        },
-                    )?;
-                    if column_referenced {
+                if let Some(where_clause) = &index.where_clause {
+                    if self_table_expr_references_column(where_clause, dropped_index) {
                         return Err(LimboError::ParseError(format!(
                             "cannot drop column \"{column_name}\": indexed"
                         )));
@@ -1042,7 +980,9 @@ pub fn translate_alter_table(
                     continue;
                 }
                 // Table-level constraint: check if it references the dropped column
-                if check_expr_references_column(&check.expr, &col_normalized) {
+                if self_table_expr_references_column(&check.expr, dropped_index)
+                    || check_expr_references_column(&check.expr, &col_normalized)
+                {
                     return Err(LimboError::ParseError(format!(
                         "error in table {table_name} after drop column: no such column: {column_name}"
                     )));
@@ -1148,6 +1088,16 @@ pub fn translate_alter_table(
             }
 
             btree.columns_mut().remove(dropped_index);
+            // Shift SELF_TABLE positional references in surviving CHECK
+            // constraints so the regenerated schema SQL renders the right
+            // column names.
+            for check in &mut btree.check_constraints {
+                crate::translate::bind::shift_schema_expr_after_drop(
+                    &mut check.expr,
+                    dropped_index,
+                    false,
+                )?;
+            }
 
             let sql = escape_sql_string_literal(&btree.to_sql());
 
@@ -1400,7 +1350,12 @@ pub fn translate_alter_table(
                             .iter()
                             .filter_map(|c| c.name.as_deref())
                             .collect();
-                        validate_check_expr(expr, &btree.name, &column_names, resolver)?;
+                        crate::translate::bind::bind_check_constraint(
+                            expr,
+                            &btree.name,
+                            &column_names,
+                            resolver,
+                        )?;
                         btree.check_constraints.push(CheckConstraint::new(
                             constraint.name.as_ref(),
                             expr,
@@ -3347,6 +3302,11 @@ fn apply_one_select_for_column_rename(
             window_clause,
             ..
         } => {
+            crate::translate::bind::validate_column_rename_using_clause(
+                from,
+                target_table_name,
+                old_col_norm,
+            )?;
             let visible_target_qualifiers = merge_target_qualifiers(
                 outer_target_qualifiers,
                 &from_clause_target_qualifiers(from, target_table_name),
@@ -5657,4 +5617,21 @@ fn merge_column_lists(left: &[String], right: &[String]) -> Vec<String> {
         }
     }
     result
+}
+
+/// True if the expression references the given table column position through
+/// a `SELF_TABLE` reference (the pre-resolved form schema expressions are
+/// stored in).
+fn self_table_expr_references_column(expr: &ast::Expr, column_index: usize) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
+        if let ast::Expr::Column { table, column, .. } = e {
+            if table.is_self_table() && *column == column_index {
+                found = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
 }

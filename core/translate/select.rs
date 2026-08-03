@@ -1,22 +1,20 @@
 use super::emitter::{emit_program, TranslateCtx};
 use super::plan::{
     select_star, Distinctness, InSeekSource, JoinOrderMember, NamedWindowBound, NamedWindowDef,
-    Operation, OuterQueryReference, QueryDestination, Search, TableReferences, Window,
+    Operation, QueryDestination, Search, TableReferences, Window,
 };
 use crate::schema::Table;
 use crate::stack::trace_stack;
 use crate::sync::Arc;
-use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{OperationMode, Resolver};
-use crate::translate::expr::{
-    bind_and_rewrite_expr, expr_vector_size, walk_expr, BindingBehavior, WalkControl,
-};
+use crate::translate::expr::{expr_vector_size, walk_expr, WalkControl};
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState};
 use crate::translate::planner::{
-    append_vtab_predicates_to_where_clause, break_predicate_at_and_boundaries, parse_from,
-    parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
+    append_vtab_predicates_to_where_clause, break_predicate_at_and_boundaries,
+    collect_vtab_predicates, fold_join_constraints, parse_where_bound,
+    resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
 use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
@@ -34,19 +32,97 @@ use turso_parser::ast::{self, CompoundSelect, Expr};
 /// SQLite's default SQLITE_MAX_COLUMN is 2000, with a hard upper limit of 32767.
 const SQLITE_MAX_COLUMN: usize = 2000;
 
+/// The output of the binding phase ([super::bind::BindContext]) for a SELECT:
+/// one [TableReferences] per SELECT core (main + compounds, in order) and the
+/// pre-bound expression subqueries keyed by their [ast::Expr::SubqueryResult]
+/// id. All name resolution happened at bind time; planning consumes this
+/// without resolving anything.
+pub struct SelectBinding {
+    pub table_refs: std::vec::IntoIter<TableReferences>,
+    pub bound_subqueries: rustc_hash::FxHashMap<ast::TableInternalId, super::bind::BoundSubquery>,
+    pub compound_order_by: Option<Vec<super::plan::CompoundOrderByKey>>,
+}
+
+/// Per-SELECT-core slice of a [SelectBinding], passed to `prepare_one_select_plan`.
+struct OneSelectBinding<'a> {
+    table_references: TableReferences,
+    bound_subqueries:
+        &'a mut rustc_hash::FxHashMap<ast::TableInternalId, super::bind::BoundSubquery>,
+}
+
+/// Bind a SELECT statement (resolve every table, column, and alias reference)
+/// and then plan it. This is the binder-driven entry point for SELECT
+/// statements: [super::bind::BindContext] performs all name resolution up
+/// front, then CTEs and derived tables are planned from the bound output, and
+/// finally [prepare_select_plan] runs in bound mode (no name resolution during
+/// planning).
+#[turso_macros::trace_stack]
+pub fn bind_prepare_select_plan(
+    mut select: ast::Select,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    query_destination: QueryDestination,
+    connection: &Arc<crate::Connection>,
+) -> Result<Plan> {
+    let bound = super::bind::bind_select_stmt(&mut select, resolver, program)?;
+    prepare_bound_select_plan(
+        select,
+        bound,
+        resolver,
+        program,
+        query_destination,
+        connection,
+    )
+}
+
+/// Plan an already-bound SELECT (the second half of
+/// [bind_prepare_select_plan]).
+#[turso_macros::trace_stack]
+pub fn prepare_bound_select_plan(
+    select: ast::Select,
+    bound: super::bind::BoundSelect,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    query_destination: QueryDestination,
+    connection: &Arc<crate::Connection>,
+) -> Result<Plan> {
+    let (all_table_refs, bound_subqueries, compound_order_by) =
+        crate::translate::planner::plan_bound_select_refs(
+            bound,
+            resolver,
+            program,
+            connection,
+            Vec::new(),
+            &Default::default(),
+        )?;
+    prepare_select_plan(
+        select,
+        resolver,
+        program,
+        SelectBinding {
+            table_refs: all_table_refs.into_iter(),
+            bound_subqueries,
+            compound_order_by,
+        },
+        query_destination,
+        connection,
+    )
+}
+
 #[turso_macros::trace_stack]
 pub fn translate_select(
     select: ast::Select,
+    bound: super::bind::BoundSelect,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    let plan = prepare_select_plan(
+    let plan = prepare_bound_select_plan(
         select,
+        bound,
         resolver,
         program,
-        &[],
         query_destination,
         connection,
     )?;
@@ -164,76 +240,61 @@ pub fn prepare_select_plan(
     select: ast::Select,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
-    outer_query_refs: &[OuterQueryReference],
+    binding: SelectBinding,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
-    prepare_select_plan_from_arms(
-        select.body.select,
-        select.body.compounds,
-        select.with,
-        select.order_by,
-        select.limit,
-        resolver,
-        program,
-        outer_query_refs,
-        query_destination,
-        connection,
-    )
-}
-
-/// Plans a first SELECT arm followed by zero or more compound arms.
-///
-/// Accepting the arms directly lets recursive CTE planning divide a stored
-/// SELECT without allocating temporary compound-arm vectors.
-#[allow(clippy::too_many_arguments)]
-#[turso_macros::trace_stack]
-pub(crate) fn prepare_select_plan_from_arms(
-    first_arm: ast::OneSelect,
-    compound_arms: impl IntoIterator<Item = CompoundSelect>,
-    with: Option<ast::With>,
-    order_by: Vec<ast::SortedColumn>,
-    limit: Option<ast::Limit>,
-    resolver: &Resolver,
-    program: &mut ProgramBuilder,
-    outer_query_refs: &[OuterQueryReference],
-    query_destination: QueryDestination,
-    connection: &Arc<crate::Connection>,
-) -> Result<Plan> {
-    let mut compound_arms = compound_arms.into_iter().peekable();
-    if compound_arms.peek().is_none() {
+    let SelectBinding {
+        mut table_refs,
+        mut bound_subqueries,
+        compound_order_by,
+    } = binding;
+    // The binder built one TableReferences per SELECT core (main
+    // first, then compounds); hand each core its own.
+    macro_rules! next_binding {
+        () => {
+            OneSelectBinding {
+                table_references: table_refs
+                    .next()
+                    .expect("missing table references for select core"),
+                bound_subqueries: &mut bound_subqueries,
+            }
+        };
+    }
+    let compounds = select.body.compounds;
+    if compounds.is_empty() {
+        assert!(
+            compound_order_by.is_none(),
+            "non-compound SELECT cannot have compound ORDER BY binding"
+        );
         return Ok(Plan::Select(Box::new(prepare_one_select_plan(
-            first_arm,
+            select.body.select,
             resolver,
             program,
-            limit,
-            order_by,
-            with,
-            outer_query_refs,
+            select.limit,
+            select.order_by,
+            next_binding!(),
             query_destination,
             connection,
         )?)));
     }
 
-    // The WITH clause applies to every arm, so each arm needs its own copy
-    // while names are resolved.
     let mut last = prepare_one_select_plan(
-        first_arm,
+        select.body.select,
         resolver,
         program,
         None,
         vec![],
-        with.clone(),
-        outer_query_refs,
+        next_binding!(),
         query_destination.clone(),
         connection,
     )?;
 
-    let mut left = Vec::with_capacity(compound_arms.size_hint().0);
+    let mut left = Vec::with_capacity(compounds.len());
     for CompoundSelect {
         select: compound_select,
         operator,
-    } in compound_arms
+    } in compounds
     {
         left.push((last, operator));
         last = prepare_one_select_plan(
@@ -242,15 +303,15 @@ pub(crate) fn prepare_select_plan_from_arms(
             program,
             None,
             vec![],
-            with.clone(),
-            outer_query_refs,
+            next_binding!(),
             query_destination.clone(),
             connection,
         )?;
     }
 
+    // Ensure all subplans have the same number of result columns
     let right_most_num_result_columns = last.result_columns.len();
-    for (plan, operator) in &left {
+    for (plan, operator) in left.iter() {
         if plan.result_columns.len() != right_most_num_result_columns {
             crate::bail_parse_error!(
                 "SELECTs to the left and right of {} do not have the same number of result columns",
@@ -258,22 +319,22 @@ pub(crate) fn prepare_select_plan_from_arms(
             );
         }
     }
-    let (limit, offset) = limit.map_or(Ok((None, None)), |limit| parse_limit(limit, resolver))?;
+    // The binder already resolved LIMIT/OFFSET identifiers.
+    let (limit, offset) = select
+        .limit
+        .map_or((None, None), |l| (Some(l.expr), l.offset));
 
-    // ORDER BY names can come from any arm of a compound SELECT.
-    let all_plans: Vec<&SelectPlan> = left
-        .iter()
-        .map(|(plan, _)| plan)
-        .chain(std::iter::once(&last))
-        .collect();
-    let order_by = resolve_compound_order_by(&order_by, &all_plans)?;
+    assert!(
+        select.order_by.is_empty(),
+        "compound ORDER BY must be consumed during binding"
+    );
 
     Ok(Plan::CompoundSelect {
         left,
         right_most: Box::new(last),
         limit,
         offset,
-        order_by,
+        order_by: compound_order_by,
     })
 }
 
@@ -285,8 +346,7 @@ fn prepare_one_select_plan(
     program: &mut ProgramBuilder,
     limit: Option<ast::Limit>,
     order_by: Vec<ast::SortedColumn>,
-    with: Option<ast::With>,
-    outer_query_refs: &[OuterQueryReference],
+    binding: OneSelectBinding<'_>,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<SelectPlan> {
@@ -307,38 +367,17 @@ fn prepare_one_select_plan(
             let mut where_predicates = vec![];
             let mut vtab_predicates = vec![];
 
-            let mut table_references = TableReferences::new(vec![], outer_query_refs.to_vec());
-
-            if from.is_none() {
-                for column in &columns {
-                    if matches!(column, ResultColumn::Star) {
-                        crate::bail_parse_error!("no tables specified");
-                    }
-                }
-            }
-
-            // Parse the FROM clause into a vec of TableReferences. Fold all the join conditions expressions into the WHERE clause.
-            let preplan_ctes_for_non_from_subqueries = with.is_some()
-                && select_has_non_from_subqueries(
-                    &columns,
-                    where_clause.as_deref(),
-                    group_by.as_ref(),
-                    &window_clause,
-                    &order_by,
-                    limit.as_ref(),
-                );
-            {
-                parse_from(
-                    from,
-                    resolver,
-                    program,
-                    with,
-                    preplan_ctes_for_non_from_subqueries,
-                    &mut where_predicates,
-                    &mut vtab_predicates,
-                    &mut table_references,
-                    connection,
-                )?;
+            let OneSelectBinding {
+                mut table_references,
+                bound_subqueries,
+            } = binding;
+            // The binder already resolved the FROM clause into
+            // TableReferences. Fold the (pre-bound) JOIN ON/USING
+            // constraints into WHERE terms and collect virtual table
+            // argument predicates from the AST.
+            if let Some(ref from_clause) = from {
+                fold_join_constraints(from_clause, &mut table_references, &mut where_predicates)?;
+                collect_vtab_predicates(from_clause, &table_references, &mut vtab_predicates)?;
             }
 
             // Preallocate space for the result columns
@@ -424,24 +463,6 @@ fn prepare_one_select_plan(
                             )
                         })
                         .collect();
-                    for expr in partition_by.iter_mut() {
-                        bind_and_rewrite_expr(
-                            expr,
-                            Some(&mut plan.table_references),
-                            None,
-                            resolver,
-                            BindingBehavior::ResultColumnsNotAllowed,
-                        )?;
-                    }
-                    for (expr, _, _) in order_by.iter_mut() {
-                        bind_and_rewrite_expr(
-                            expr,
-                            Some(&mut plan.table_references),
-                            None,
-                            resolver,
-                            BindingBehavior::ResultColumnsNotAllowed,
-                        )?;
-                    }
                     if let Some(base_name) = window_def.window.base.as_ref() {
                         let base_name = normalize_ident(base_name.as_str());
                         // SQLite chains WINDOW-clause definitions only to an
@@ -578,14 +599,7 @@ fn prepare_one_select_plan(
                                 table.mark_column_used(idx);
                             }
                         }
-                        ResultColumn::Expr(mut expr, maybe_alias) => {
-                            bind_and_rewrite_expr(
-                                &mut expr,
-                                Some(&mut plan.table_references),
-                                None,
-                                resolver,
-                                BindingBehavior::ResultColumnsNotAllowed,
-                            )?;
+                        ResultColumn::Expr(expr, maybe_alias) => {
                             let contains_aggregates = resolve_window_and_aggregate_functions(
                                 &expr,
                                 resolver,
@@ -621,28 +635,19 @@ fn prepare_one_select_plan(
             // Virtual table predicates may depend on column bindings from tables to the right in the join order,
             // so we must wait until the full set of references has been collected.
             {
-                add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, resolver)?;
+                add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan)?;
             }
 
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
-            {
-                parse_where(
-                    where_clause.as_deref(),
-                    &mut plan.table_references,
-                    Some(&plan.result_columns),
-                    &mut plan.where_clause,
-                    resolver,
-                )?;
-            }
+            parse_where_bound(where_clause.as_deref(), &mut plan.where_clause)?;
 
             {
                 trace_stack!("process_group_by");
-                if let Some(mut group_by) = group_by {
+                if let Some(group_by) = group_by {
                     // Process HAVING clause if present
                     let having_predicates = if let Some(having) = group_by.having {
                         Some(process_having_clause(
                             having,
-                            &mut plan.table_references,
                             &plan.result_columns,
                             resolver,
                             &mut aggregate_expressions,
@@ -653,21 +658,6 @@ fn prepare_one_select_plan(
 
                     if !group_by.exprs.is_empty() {
                         // Normal GROUP BY with expressions
-                        for expr in group_by.exprs.iter_mut() {
-                            replace_column_number_with_copy_of_column_expr(
-                                expr,
-                                &plan.result_columns,
-                                "GROUP BY",
-                            )?;
-                            bind_and_rewrite_expr(
-                                expr,
-                                Some(&mut plan.table_references),
-                                Some(&plan.result_columns),
-                                resolver,
-                                BindingBehavior::TryCanonicalColumnsFirst,
-                            )?;
-                        }
-
                         plan.group_by = Some(GroupBy {
                             sort_order: Vec::new(),
                             nulls_order: Vec::new(),
@@ -710,20 +700,7 @@ fn prepare_one_select_plan(
 
             {
                 trace_stack!("process_order_by");
-                for mut o in order_by {
-                    replace_column_number_with_copy_of_column_expr(
-                        &mut o.expr,
-                        &plan.result_columns,
-                        "ORDER BY",
-                    )?;
-
-                    bind_and_rewrite_expr(
-                        &mut o.expr,
-                        Some(&mut plan.table_references),
-                        Some(&plan.result_columns),
-                        resolver,
-                        BindingBehavior::TryResultColumnsFirst,
-                    )?;
+                for o in order_by {
                     let had_agg = resolve_window_and_aggregate_functions(
                         &o.expr,
                         resolver,
@@ -812,17 +789,28 @@ fn prepare_one_select_plan(
                 );
             }
 
-            // Parse the LIMIT/OFFSET clause
-            {
-                (plan.limit, plan.offset) =
-                    limit.map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
-            }
+            // The binder already resolved LIMIT/OFFSET identifiers (with an
+            // empty scope), so no re-binding is needed.
+            (plan.limit, plan.offset) = limit.map_or((None, None), |l| (Some(l.expr), l.offset));
 
             if !windows.is_empty() {
-                plan_windows(program, &mut plan, resolver, connection, &mut windows)?;
+                plan_windows(
+                    program,
+                    &mut plan,
+                    resolver,
+                    connection,
+                    &mut windows,
+                    bound_subqueries,
+                )?;
             }
 
-            plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
+            plan_subqueries_from_select_plan(
+                program,
+                &mut plan,
+                resolver,
+                connection,
+                bound_subqueries,
+            )?;
 
             {
                 trace_stack!("validate_plan");
@@ -856,24 +844,14 @@ fn prepare_one_select_plan(
                 });
             }
 
-            let mut table_references = TableReferences::new(vec![], outer_query_refs.to_vec());
-
-            // Plan CTEs from WITH clause so they're available for subqueries in VALUES
-            plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
-
-            for value_row in values.iter_mut() {
-                for value in value_row.iter_mut() {
-                    // Before binding, we check for unquoted literals. Sqlite throws an error in this case
-                    bind_and_rewrite_expr(
-                        value,
-                        Some(&mut table_references),
-                        None,
-                        resolver,
-                        // Allow sqlite quirk of inserting "double-quoted" literals (which our AST maps as identifiers)
-                        BindingBehavior::TryResultColumnsFirst,
-                    )?;
-                }
-            }
+            // The binder resolved the VALUES expressions, planned the WITH
+            // clause's CTEs, and attached them as definition-only outer refs;
+            // an unplanned (binding-error) CTE stays unplanned until
+            // referenced, matching SQLite's lazy resolution.
+            let OneSelectBinding {
+                mut table_references,
+                bound_subqueries,
+            } = binding;
 
             // Plan subqueries in VALUES expressions
             let mut non_from_clause_subqueries = vec![];
@@ -884,6 +862,7 @@ fn prepare_one_select_plan(
                 &mut values,
                 resolver,
                 connection,
+                bound_subqueries,
             )?;
 
             let plan = SelectPlan {
@@ -1147,223 +1126,12 @@ fn reject_outer_scope_refs_inside_select_plan(
 fn add_vtab_predicates_to_where_clause(
     vtab_predicates: &mut Vec<Expr>,
     plan: &mut SelectPlan,
-    resolver: &Resolver,
 ) -> Result<()> {
     append_vtab_predicates_to_where_clause(
         vtab_predicates,
         &mut plan.table_references,
-        &plan.result_columns,
         &mut plan.where_clause,
-        resolver,
     )
-}
-
-/// Replaces a column number in an ORDER BY or GROUP BY expression with a copy of the column expression.
-/// For example, in SELECT u.first_name, count(1) FROM users u GROUP BY 1 ORDER BY 2,
-/// the column number 1 is replaced with u.first_name and the column number 2 is replaced with count(1).
-///
-/// Per SQLite documentation, only constant integers are treated as column references.
-/// Non-integer numeric literals (floats) are treated as constant expressions.
-fn replace_column_number_with_copy_of_column_expr(
-    order_by_or_group_by_expr: &mut ast::Expr,
-    columns: &[ResultSetColumn],
-    clause_name: &str,
-) -> Result<()> {
-    match order_by_or_group_by_expr {
-        ast::Expr::Collate(inner, _) => {
-            return replace_column_number_with_copy_of_column_expr(inner, columns, clause_name);
-        }
-        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            return replace_column_number_with_copy_of_column_expr(
-                exprs[0].as_mut(),
-                columns,
-                clause_name,
-            );
-        }
-        _ => {}
-    }
-
-    // Extract the numeric literal string, handling both bare integers (e.g. `2`)
-    // and unary-plus integers (e.g. `+2`). In SQLite, `ORDER BY +2` strips the
-    // unary plus and still resolves `2` as a column index reference.
-    let num_str = match order_by_or_group_by_expr {
-        ast::Expr::Literal(ast::Literal::Numeric(num)) => Some(num.clone()),
-        ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
-            if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner.as_ref() {
-                Some(num.clone())
-            } else {
-                None
-            }
-        }
-        ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
-            if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner.as_ref() {
-                if num.parse::<i32>().is_ok() {
-                    crate::bail_parse_error!(
-                        "1st {} term out of range - should be between 1 and {}",
-                        clause_name,
-                        columns.len()
-                    );
-                }
-            }
-            None
-        }
-        _ => None,
-    };
-    if let Some(num) = num_str {
-        // Only treat as column reference if it parses as an integer that fits
-        // a 32-bit int, mirroring SQLite's sqlite3ExprIsInteger. Float
-        // literals like "0.5" and integers past the 32-bit range are valid
-        // constant expressions, not column references.
-        if let Ok(column_number) = num.parse::<i32>() {
-            if column_number <= 0 || column_number as usize > columns.len() {
-                crate::bail_parse_error!(
-                    "1st {} term out of range - should be between 1 and {}",
-                    clause_name,
-                    columns.len()
-                );
-            }
-            let ResultSetColumn { expr, .. } = &columns[column_number as usize - 1];
-            *order_by_or_group_by_expr = expr.clone();
-        }
-        // Otherwise, leave the expression as-is (constant expression, case 3 per SQLite docs)
-    }
-    Ok(())
-}
-
-/// Resolves a compound SELECT ORDER BY expression to a 0-based column index.
-/// ORDER BY in compound selects can reference columns by:
-/// 1. Numeric position (1-based): ORDER BY 1
-/// 2. Column name or alias from any constituent SELECT: ORDER BY name
-fn resolve_compound_order_by_expr(
-    expr: &ast::Expr,
-    all_plans: &[&SelectPlan],
-    term_number: usize,
-) -> Result<(usize, Option<CollationSeq>)> {
-    let num_result_columns = all_plans[0].result_columns.len();
-    match expr {
-        // An explicit COLLATE wraps the column reference. Resolve the inner
-        // reference and carry the collation so it overrides the referenced
-        // column's own collation when the compound result is sorted.
-        ast::Expr::Collate(inner, collation_name) => {
-            let (col_idx, _) = resolve_compound_order_by_expr(inner, all_plans, term_number)?;
-            Ok((col_idx, Some(CollationSeq::new(collation_name.as_str())?)))
-        }
-        // Case 1: Numeric column reference (e.g., ORDER BY 1). As in SQLite's
-        // sqlite3ExprIsInteger, only literals that fit a 32-bit int count as
-        // column positions.
-        ast::Expr::Literal(ast::Literal::Numeric(num)) => {
-            if let Ok(column_number) = num.parse::<i32>() {
-                if column_number <= 0 || column_number as usize > num_result_columns {
-                    crate::bail_parse_error!(
-                        "{} ORDER BY term out of range - should be between 1 and {}",
-                        column_number,
-                        num_result_columns
-                    );
-                }
-                Ok((column_number as usize - 1, None))
-            } else {
-                crate::bail_parse_error!(
-                    "{} ORDER BY term does not match any column in the result set",
-                    ordinal(term_number)
-                );
-            }
-        }
-        // Case 2: Name reference (e.g., ORDER BY name or ORDER BY alias)
-        ast::Expr::Id(name) => {
-            let name_normalized = normalize_ident(name.as_str());
-            // Check aliases and column names across all constituent SELECTs
-            for plan in all_plans {
-                let result_columns = &plan.result_columns;
-                let table_references = &plan.table_references;
-                // Try matching against aliases
-                for (i, rc) in result_columns.iter().enumerate() {
-                    if let Some(alias) = &rc.alias {
-                        if normalize_ident(alias) == name_normalized {
-                            return Ok((i, None));
-                        }
-                    }
-                }
-                // Try matching against column names from the table references
-                for (i, rc) in result_columns.iter().enumerate() {
-                    if let Some(col_name) = rc.name(table_references) {
-                        if normalize_ident(col_name) == name_normalized {
-                            return Ok((i, None));
-                        }
-                    }
-                }
-            }
-            crate::bail_parse_error!(
-                "{} ORDER BY term does not match any column in the result set",
-                ordinal(term_number)
-            );
-        }
-        _ => {
-            crate::bail_parse_error!(
-                "{} ORDER BY term does not match any column in the result set",
-                ordinal(term_number)
-            );
-        }
-    }
-}
-
-fn resolve_compound_order_by(
-    order_by: &[ast::SortedColumn],
-    plans: &[&SelectPlan],
-) -> Result<Option<Vec<super::plan::CompoundOrderByKey>>> {
-    if order_by.is_empty() {
-        return Ok(None);
-    }
-    order_by
-        .iter()
-        .enumerate()
-        .map(|(index, term)| {
-            let (column, collation) = resolve_compound_order_by_expr(&term.expr, plans, index + 1)?;
-            Ok((
-                column,
-                term.order.unwrap_or(ast::SortOrder::Asc),
-                term.nulls,
-                collation,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()
-        .map(Some)
-}
-
-pub(crate) fn resolve_recursive_cte_queue_order(
-    order_by: &[ast::SortedColumn],
-    initial_query: &Plan,
-    recursive_query: &Plan,
-) -> Result<Option<Vec<super::plan::CompoundOrderByKey>>> {
-    fn collect_selects<'a>(plan: &'a Plan, out: &mut Vec<&'a SelectPlan>) {
-        match plan {
-            Plan::Select(plan) => out.push(plan),
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => {
-                out.extend(left.iter().map(|(plan, _)| plan));
-                out.push(right_most);
-            }
-            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {
-                unreachable!("recursive CTE queries must be SELECT plans")
-            }
-        }
-    }
-
-    let mut plans = Vec::new();
-    collect_selects(initial_query, &mut plans);
-    collect_selects(recursive_query, &mut plans);
-    resolve_compound_order_by(order_by, &plans)
-}
-
-fn ordinal(n: usize) -> String {
-    let suffix = match (n % 10, n % 100) {
-        (1, 11) | (2, 12) | (3, 13) => "th",
-        (1, _) => "st",
-        (2, _) => "nd",
-        (3, _) => "rd",
-        _ => "th",
-    };
-    format!("{n}{suffix}")
 }
 
 /// Counts cursors needed to emit a query plan.
@@ -1470,207 +1238,6 @@ fn estimate_num_instructions_for_simple_select(select: &SelectPlan) -> usize {
     let condition_instructions = select.where_clause.len() * 3;
 
     20 + table_instructions + group_by_instructions + order_by_instructions + condition_instructions
-}
-
-fn push_function_tail_exprs<'a>(stack: &mut Vec<&'a Expr>, tail: &'a ast::FunctionTail) {
-    if let Some(filter_expr) = tail.filter_clause.as_deref() {
-        stack.push(filter_expr);
-    }
-
-    let Some(ast::Over::Window(window)) = tail.over_clause.as_ref() else {
-        return;
-    };
-
-    if let Some(frame_clause) = window.frame_clause.as_ref() {
-        if let ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) =
-            &frame_clause.start
-        {
-            stack.push(expr.as_ref());
-        }
-        if let Some(ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr)) =
-            frame_clause.end.as_ref()
-        {
-            stack.push(expr.as_ref());
-        }
-    }
-
-    for sorted in window.order_by.iter().rev() {
-        stack.push(sorted.expr.as_ref());
-    }
-    for part_expr in window.partition_by.iter().rev() {
-        stack.push(part_expr.as_ref());
-    }
-}
-
-fn expr_contains_subquery(expr: &Expr) -> bool {
-    // Iterative traversal avoids stack overflows on deeply nested expression trees
-    // such as very large left-associative AND chains.
-    let mut stack = vec![expr];
-    while let Some(node) = stack.pop() {
-        match node {
-            Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_) => return true,
-            Expr::Between {
-                lhs, start, end, ..
-            } => {
-                stack.push(lhs.as_ref());
-                stack.push(start.as_ref());
-                stack.push(end.as_ref());
-            }
-            Expr::Binary(lhs, _, rhs) => {
-                stack.push(rhs.as_ref());
-                stack.push(lhs.as_ref());
-            }
-            Expr::Case {
-                base,
-                when_then_pairs,
-                else_expr,
-            } => {
-                if let Some(expr) = else_expr.as_deref() {
-                    stack.push(expr);
-                }
-                for (when_expr, then_expr) in when_then_pairs.iter().rev() {
-                    stack.push(then_expr.as_ref());
-                    stack.push(when_expr.as_ref());
-                }
-                if let Some(base_expr) = base.as_deref() {
-                    stack.push(base_expr);
-                }
-            }
-            Expr::Cast { expr, .. }
-            | Expr::Collate(expr, _)
-            | Expr::IsNull(expr)
-            | Expr::NotNull(expr)
-            | Expr::Unary(_, expr) => {
-                stack.push(expr.as_ref());
-            }
-            Expr::FunctionCall {
-                args,
-                order_by,
-                filter_over,
-                ..
-            } => {
-                push_function_tail_exprs(&mut stack, filter_over);
-                for sorted in order_by.iter().rev() {
-                    stack.push(sorted.expr.as_ref());
-                }
-                for arg in args.iter().rev() {
-                    stack.push(arg.as_ref());
-                }
-            }
-            Expr::FunctionCallStar { filter_over, .. } => {
-                push_function_tail_exprs(&mut stack, filter_over);
-            }
-            Expr::InList { lhs, rhs, .. } => {
-                for item in rhs.iter().rev() {
-                    stack.push(item.as_ref());
-                }
-                stack.push(lhs.as_ref());
-            }
-            Expr::InTable { lhs, args, .. } => {
-                for arg in args.iter().rev() {
-                    stack.push(arg.as_ref());
-                }
-                stack.push(lhs.as_ref());
-            }
-            Expr::Like {
-                lhs, rhs, escape, ..
-            } => {
-                if let Some(escape_expr) = escape.as_deref() {
-                    stack.push(escape_expr);
-                }
-                stack.push(rhs.as_ref());
-                stack.push(lhs.as_ref());
-            }
-            Expr::Parenthesized(exprs) => {
-                for expr in exprs.iter().rev() {
-                    stack.push(expr.as_ref());
-                }
-            }
-            Expr::Raise(_, raise_expr) => {
-                if let Some(expr) = raise_expr.as_deref() {
-                    stack.push(expr);
-                }
-            }
-            Expr::SubqueryResult { lhs, .. } => {
-                if let Some(expr) = lhs.as_deref() {
-                    stack.push(expr);
-                }
-            }
-            Expr::Array { .. } | Expr::Subscript { .. } => {
-                unreachable!("Array and Subscript are desugared into function calls by the parser")
-            }
-            Expr::Column { .. }
-            | Expr::DoublyQualified(_, _, _)
-            | Expr::Id(_)
-            | Expr::Literal(_)
-            | Expr::Name(_)
-            | Expr::Qualified(_, _)
-            | Expr::FieldAccess { .. }
-            | Expr::Register(_)
-            | Expr::RowId { .. }
-            | Expr::Variable(_)
-            | Expr::Default => {}
-        }
-    }
-    false
-}
-
-fn select_has_non_from_subqueries(
-    columns: &[ResultColumn],
-    where_clause: Option<&Expr>,
-    group_by: Option<&ast::GroupBy>,
-    window_clause: &[ast::WindowDef],
-    order_by: &[ast::SortedColumn],
-    limit: Option<&ast::Limit>,
-) -> bool {
-    if columns.iter().any(|column| match column {
-        ResultColumn::Expr(expr, _) => expr_contains_subquery(expr),
-        ResultColumn::Star | ResultColumn::TableStar(_) => false,
-    }) {
-        return true;
-    }
-
-    if where_clause.is_some_and(expr_contains_subquery) {
-        return true;
-    }
-
-    if let Some(group_by) = group_by {
-        if group_by.exprs.iter().any(|e| expr_contains_subquery(e))
-            || group_by
-                .having
-                .as_deref()
-                .is_some_and(expr_contains_subquery)
-        {
-            return true;
-        }
-    }
-
-    if window_clause.iter().any(|w| {
-        w.window
-            .partition_by
-            .iter()
-            .any(|e| expr_contains_subquery(e))
-            || w.window
-                .order_by
-                .iter()
-                .any(|s| expr_contains_subquery(&s.expr))
-    }) {
-        return true;
-    }
-
-    if order_by.iter().any(|s| expr_contains_subquery(&s.expr)) {
-        return true;
-    }
-
-    if let Some(limit) = limit {
-        if expr_contains_subquery(&limit.expr)
-            || limit.offset.as_deref().is_some_and(expr_contains_subquery)
-        {
-            return true;
-        }
-    }
-
-    false
 }
 
 /// Estimates jump labels needed to emit a query plan.
@@ -1786,7 +1353,6 @@ pub fn emit_simple_count(
 
 fn process_having_clause(
     having: Box<ast::Expr>,
-    table_references: &mut TableReferences,
     result_columns: &[ResultSetColumn],
     resolver: &Resolver,
     aggregate_expressions: &mut Vec<super::plan::Aggregate>,
@@ -1804,13 +1370,6 @@ fn process_having_clause(
     }
 
     for expr in predicates.iter_mut() {
-        bind_and_rewrite_expr(
-            expr,
-            Some(table_references),
-            Some(result_columns),
-            resolver,
-            BindingBehavior::TryResultColumnsFirst,
-        )?;
         resolve_window_and_aggregate_functions(
             expr,
             resolver,

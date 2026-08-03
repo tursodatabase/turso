@@ -339,9 +339,9 @@ pub(super) fn choose_best_btree_candidate(
             .as_ref()
             .and_then(|idx| idx.where_clause.as_ref())
         {
-            Some(where_expr) => {
+            Some(_) => {
                 let selectivity = super::constraints::estimate_partial_index_where_selectivity(
-                    where_expr.as_ref(),
+                    candidate.index.as_ref().unwrap(),
                     rhs_table,
                     schema,
                     available_indexes,

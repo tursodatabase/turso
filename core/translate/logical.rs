@@ -594,24 +594,48 @@ impl<'a> LogicalPlanBuilder<'a> {
     fn build_select_table(&mut self, table: &ast::SelectTable) -> Result<LogicalPlan> {
         match table {
             ast::SelectTable::Table(name, alias, _indexed) => {
-                let table_name = Self::name_to_string(&name.name);
-                // Check if it's a CTE reference
-                if let Some(cte_plan) = self.ctes.get(&table_name) {
-                    return Ok(LogicalPlan::CTERef(CTERef {
-                        name: table_name.clone(),
-                        schema: cte_plan.schema().clone(),
-                    }));
-                }
-
-                // Regular table scan
                 let table_alias = alias.as_ref().map(|a| Self::name_to_string(a.name()));
-                let table_schema = self.get_table_schema(&table_name, table_alias.as_deref())?;
-                Ok(LogicalPlan::TableScan(TableScan {
-                    table_name,
-                    alias: table_alias,
-                    schema: table_schema,
-                    projection: None,
-                }))
+                match crate::translate::bind::bind_logical_source(
+                    name,
+                    self.ctes.keys().map(String::as_str),
+                    self.schema,
+                )? {
+                    crate::translate::bind::BoundLogicalSource::CommonTableExpression { name } => {
+                        let cte_plan = self
+                            .ctes
+                            .get(&name)
+                            .expect("bound CTE name must identify a visible CTE");
+                        Ok(LogicalPlan::CTERef(CTERef {
+                            name,
+                            schema: cte_plan.schema().clone(),
+                        }))
+                    }
+                    crate::translate::bind::BoundLogicalSource::Table {
+                        database,
+                        name,
+                        table,
+                    } => {
+                        let columns = table
+                            .columns()
+                            .iter()
+                            .filter_map(|column| {
+                                column.name.as_ref().map(|name| ColumnInfo {
+                                    name: name.clone(),
+                                    ty: column.ty(),
+                                    database: database.clone(),
+                                    table: Some(table.get_name().to_string()),
+                                    table_alias: table_alias.clone(),
+                                })
+                            })
+                            .collect();
+                        Ok(LogicalPlan::TableScan(TableScan {
+                            table_name: name,
+                            alias: table_alias,
+                            schema: Arc::new(LogicalSchema::new(columns)),
+                            projection: None,
+                        }))
+                    }
+                }
             }
             ast::SelectTable::Select(subquery, _alias) => self.build_select(subquery),
             ast::SelectTable::TableCall(_, _, _) => Err(LimboError::ParseError(
@@ -1614,25 +1638,29 @@ impl<'a> LogicalPlanBuilder<'a> {
     }
 
     // Build expression from AST
-    fn build_expr(&mut self, expr: &ast::Expr, _schema: &SchemaRef) -> Result<LogicalExpr> {
+    fn build_expr(&mut self, expr: &ast::Expr, schema: &SchemaRef) -> Result<LogicalExpr> {
         match expr {
-            ast::Expr::Id(name) => Ok(LogicalExpr::Column(Column::new(Self::name_to_string(name)))),
-
-            ast::Expr::DoublyQualified(db, table, col) => {
-                Ok(LogicalExpr::Column(Column::with_table(
-                    Self::name_to_string(col),
-                    format!(
-                        "{}.{}",
-                        Self::name_to_string(db),
-                        Self::name_to_string(table)
-                    ),
-                )))
+            ast::Expr::Id(_)
+            | ast::Expr::Name(_)
+            | ast::Expr::Qualified(_, _)
+            | ast::Expr::DoublyQualified(_, _, _) => {
+                let bound = crate::translate::bind::bind_logical_column(
+                    expr,
+                    schema.columns.iter().map(|column| {
+                        crate::translate::bind::LogicalScopeColumn {
+                            name: &column.name,
+                            database: column.database.as_deref(),
+                            table: column.table.as_deref(),
+                            table_alias: column.table_alias.as_deref(),
+                        }
+                    }),
+                )?
+                .expect("column expression matched above");
+                Ok(LogicalExpr::Column(Column {
+                    name: bound.name,
+                    table: bound.table,
+                }))
             }
-
-            ast::Expr::Qualified(table, col) => Ok(LogicalExpr::Column(Column::with_table(
-                Self::name_to_string(col),
-                Self::name_to_string(table),
-            ))),
 
             ast::Expr::Literal(lit) => Ok(LogicalExpr::Literal(Self::build_literal(lit)?)),
 
@@ -1640,7 +1668,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 // Special case: IS NULL and IS NOT NULL
                 if matches!(op, ast::Operator::Is | ast::Operator::IsNot) {
                     if let ast::Expr::Literal(ast::Literal::Null) = rhs.as_ref() {
-                        let expr = Box::new(self.build_expr(lhs, _schema)?);
+                        let expr = Box::new(self.build_expr(lhs, schema)?);
                         return Ok(LogicalExpr::IsNull {
                             expr,
                             negated: matches!(op, ast::Operator::IsNot),
@@ -1648,8 +1676,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                     }
                 }
 
-                let left = Box::new(self.build_expr(lhs, _schema)?);
-                let right = Box::new(self.build_expr(rhs, _schema)?);
+                let left = Box::new(self.build_expr(lhs, schema)?);
+                let right = Box::new(self.build_expr(rhs, schema)?);
                 Ok(LogicalExpr::BinaryExpr {
                     left,
                     op: *op,
@@ -1658,7 +1686,7 @@ impl<'a> LogicalPlanBuilder<'a> {
             }
 
             ast::Expr::Unary(op, expr) => {
-                let inner = Box::new(self.build_expr(expr, _schema)?);
+                let inner = Box::new(self.build_expr(expr, schema)?);
                 Ok(LogicalExpr::UnaryExpr {
                     op: *op,
                     expr: inner,
@@ -1687,7 +1715,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                     let distinct = distinctness.is_some();
                     let arg_exprs = args
                         .iter()
-                        .map(|e| self.build_expr(e, _schema))
+                        .map(|e| self.build_expr(e, schema))
                         .collect::<Result<Vec<_>>>()?;
                     Ok(LogicalExpr::AggregateFunction {
                         fun: agg_fun,
@@ -1698,7 +1726,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                     // Regular scalar function
                     let arg_exprs = args
                         .iter()
-                        .map(|e| self.build_expr(e, _schema))
+                        .map(|e| self.build_expr(e, schema))
                         .collect::<Result<Vec<_>>>()?;
                     Ok(LogicalExpr::ScalarFunction {
                         fun: func_name,
@@ -1706,6 +1734,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                     })
                 }
             }
+
+            ast::Expr::BoundCustomTypeFunction { call, .. } => self.build_expr(call, schema),
 
             ast::Expr::FunctionCallStar { name, .. } => {
                 // Handle COUNT(*) and similar
@@ -1724,7 +1754,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                     if func.needs_star_expansion() {
                         // Expand * to all columns as alternating key-value pairs
                         let mut args = Vec::new();
-                        for col in &_schema.columns {
+                        for col in &schema.columns {
                             // Add column name as string literal
                             args.push(LogicalExpr::Literal(crate::types::Value::Text(
                                 col.name.clone().into(),
@@ -1754,7 +1784,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 else_expr,
             } => {
                 let case_expr = if let Some(e) = base {
-                    Some(Box::new(self.build_expr(e, _schema)?))
+                    Some(Box::new(self.build_expr(e, schema)?))
                 } else {
                     None
                 };
@@ -1763,14 +1793,14 @@ impl<'a> LogicalPlanBuilder<'a> {
                     .iter()
                     .map(|(when, then)| {
                         Ok((
-                            self.build_expr(when, _schema)?,
-                            self.build_expr(then, _schema)?,
+                            self.build_expr(when, schema)?,
+                            self.build_expr(then, schema)?,
                         ))
                     })
                     .collect::<Result<Vec<_>>>()?;
 
                 let else_result = if let Some(e) = else_expr {
-                    Some(Box::new(self.build_expr(e, _schema)?))
+                    Some(Box::new(self.build_expr(e, schema)?))
                 } else {
                     None
                 };
@@ -1783,10 +1813,10 @@ impl<'a> LogicalPlanBuilder<'a> {
             }
 
             ast::Expr::InList { lhs, not, rhs } => {
-                let expr = Box::new(self.build_expr(lhs, _schema)?);
+                let expr = Box::new(self.build_expr(lhs, schema)?);
                 let list = rhs
                     .iter()
-                    .map(|e| self.build_expr(e, _schema))
+                    .map(|e| self.build_expr(e, schema))
                     .collect::<Result<Vec<_>>>()?;
                 Ok(LogicalExpr::InList {
                     expr,
@@ -1796,7 +1826,7 @@ impl<'a> LogicalPlanBuilder<'a> {
             }
 
             ast::Expr::InSelect { lhs, not, rhs } => {
-                let expr = Box::new(self.build_expr(lhs, _schema)?);
+                let expr = Box::new(self.build_expr(lhs, schema)?);
                 let subquery = Arc::new(self.build_select(rhs)?);
                 Ok(LogicalExpr::InSubquery {
                     expr,
@@ -1819,7 +1849,7 @@ impl<'a> LogicalPlanBuilder<'a> {
             }
 
             ast::Expr::IsNull(lhs) => {
-                let expr = Box::new(self.build_expr(lhs, _schema)?);
+                let expr = Box::new(self.build_expr(lhs, schema)?);
                 Ok(LogicalExpr::IsNull {
                     expr,
                     negated: false,
@@ -1827,7 +1857,7 @@ impl<'a> LogicalPlanBuilder<'a> {
             }
 
             ast::Expr::NotNull(lhs) => {
-                let expr = Box::new(self.build_expr(lhs, _schema)?);
+                let expr = Box::new(self.build_expr(lhs, schema)?);
                 Ok(LogicalExpr::IsNull {
                     expr,
                     negated: true,
@@ -1840,9 +1870,9 @@ impl<'a> LogicalPlanBuilder<'a> {
                 start,
                 end,
             } => {
-                let expr = Box::new(self.build_expr(lhs, _schema)?);
-                let low = Box::new(self.build_expr(start, _schema)?);
-                let high = Box::new(self.build_expr(end, _schema)?);
+                let expr = Box::new(self.build_expr(lhs, schema)?);
+                let low = Box::new(self.build_expr(start, schema)?);
+                let high = Box::new(self.build_expr(end, schema)?);
                 Ok(LogicalExpr::Between {
                     expr,
                     low,
@@ -1858,8 +1888,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                 rhs,
                 escape,
             } => {
-                let expr = Box::new(self.build_expr(lhs, _schema)?);
-                let pattern = Box::new(self.build_expr(rhs, _schema)?);
+                let expr = Box::new(self.build_expr(lhs, schema)?);
+                let pattern = Box::new(self.build_expr(rhs, schema)?);
                 let escape_char = escape.as_ref().and_then(|e| {
                     if let ast::Expr::Literal(ast::Literal::String(s)) = e.as_ref() {
                         s.chars().next()
@@ -1881,11 +1911,11 @@ impl<'a> LogicalPlanBuilder<'a> {
                 turso_assert_ne!(exprs.len(), 0);
                 // Multiple expressions in parentheses is unusual but handle it
                 // by building the first one (SQLite behavior)
-                self.build_expr(&exprs[0], _schema)
+                self.build_expr(&exprs[0], schema)
             }
 
             ast::Expr::Cast { expr, type_name } => {
-                let inner = self.build_expr(expr, _schema)?;
+                let inner = self.build_expr(expr, schema)?;
                 Ok(LogicalExpr::Cast {
                     expr: Box::new(inner),
                     type_name: type_name.clone(),
@@ -1984,6 +2014,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 // Also check if any arguments contain aggregates (for nested functions like HEX(SUM(...)))
                 args.iter().any(|arg| Self::expr_has_aggregate(arg))
             }
+            ast::Expr::BoundCustomTypeFunction { call, .. } => Self::expr_has_aggregate(call),
             ast::Expr::FunctionCallStar { name, .. } => {
                 // FunctionCallStar always has 0 args
                 Self::parse_aggregate_function(&Self::name_to_string(name), 0).is_some()
@@ -2266,43 +2297,12 @@ impl<'a> LogicalPlanBuilder<'a> {
             ast::Expr::Id(name) => Self::name_to_string(name),
             ast::Expr::Qualified(_, col) => Self::name_to_string(col),
             ast::Expr::FunctionCall { name, .. } => Self::name_to_string(name),
+            ast::Expr::BoundCustomTypeFunction { call, .. } => Self::expr_to_column_name(call),
             ast::Expr::FunctionCallStar { name, .. } => {
                 format!("{}(*)", Self::name_to_string(name))
             }
             _ => "expr".to_string(),
         }
-    }
-
-    // Get table schema
-    fn get_table_schema(&self, table_name: &str, alias: Option<&str>) -> Result<SchemaRef> {
-        // Look up table in schema
-        let table = self
-            .schema
-            .get_table(table_name)
-            .ok_or_else(|| LimboError::ParseError(format!("Table '{table_name}' not found")))?;
-
-        // Parse table_name which might be "db.table" for attached databases
-        let (database, actual_table) = if table_name.contains('.') {
-            let parts: Vec<&str> = table_name.splitn(2, '.').collect();
-            (Some(parts[0].to_string()), parts[1].to_string())
-        } else {
-            (None, table_name.to_string())
-        };
-
-        let mut columns = Vec::new();
-        for col in table.columns() {
-            if let Some(ref name) = col.name {
-                columns.push(ColumnInfo {
-                    name: name.clone(),
-                    ty: col.ty(),
-                    database: database.clone(),
-                    table: Some(actual_table.clone()),
-                    table_alias: alias.map(|s| s.to_string()),
-                });
-            }
-        }
-
-        Ok(Arc::new(LogicalSchema::new(columns)))
     }
 
     // Infer expression type

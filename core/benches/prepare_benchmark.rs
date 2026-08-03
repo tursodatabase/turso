@@ -25,7 +25,10 @@ static ALLOC: AllocProfiler<MiMalloc> = AllocProfiler::new(MiMalloc);
 
 #[cfg(not(feature = "codspeed"))]
 fn main() {
-    divan::Divan::default().sample_count(50).main();
+    divan::Divan::default()
+        .config_with_args()
+        .sample_count(50)
+        .main();
 }
 
 #[cfg(feature = "codspeed")]

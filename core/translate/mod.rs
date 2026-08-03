@@ -11,6 +11,7 @@ pub(crate) mod aggregation;
 pub(crate) mod alter;
 pub(crate) mod analyze;
 pub(crate) mod attach;
+pub(crate) mod bind;
 pub(crate) mod collate;
 mod compound_select;
 pub(crate) mod delete;
@@ -147,6 +148,10 @@ pub fn translate(
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
 // statements, we would have to return a program builder instead
 /// Translate SQL statement into bytecode program.
+///
+/// SELECT, DELETE, and UPDATE bind (resolve every table, column, and alias
+/// reference) at the top of their match arms, then hand the bound output to
+/// their translate functions — no binding happens during planning.
 #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
 pub fn translate_inner(
     stmt: ast::Stmt,
@@ -293,12 +298,12 @@ pub fn translate_inner(
         }
         ast::Stmt::Delete {
             tbl_name,
-            where_clause,
-            limit,
-            returning,
             indexed,
+            mut where_clause,
+            limit,
+            mut returning,
             order_by,
-            with,
+            mut with,
         } => {
             if !order_by.is_empty() {
                 bail_parse_error!("ORDER BY clause is not supported in DELETE");
@@ -308,14 +313,22 @@ pub fn translate_inner(
                     "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
                 );
             }
-            translate_delete(
+            let binding = bind::bind_delete_stmt(
                 &tbl_name,
+                indexed,
+                &mut where_clause,
+                &mut returning,
+                &mut with,
+                resolver,
+                program,
+                connection,
+            )?;
+            translate_delete(
+                binding,
                 resolver,
                 where_clause,
                 limit,
                 returning,
-                indexed,
-                with,
                 program,
                 connection,
             )?
@@ -402,22 +415,26 @@ pub fn translate_inner(
             savepoint_name,
         } => translate_rollback(program, tx_name, savepoint_name)?,
         ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
-        ast::Stmt::Select(select) => {
+        ast::Stmt::Select(mut select) => {
+            let bound = bind::bind_select_stmt(&mut select, resolver, program)?;
             translate_select(
                 select,
+                bound,
                 resolver,
                 program,
                 plan::QueryDestination::ResultRows,
                 connection,
             )?;
         }
-        ast::Stmt::Update(update) => {
+        ast::Stmt::Update(mut update) => {
             if update.where_clause.is_none() && connection.get_dml_require_where() {
                 bail_parse_error!(
                     "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
                 );
             }
-            translate_update(update, resolver, program, connection)?
+            let binding =
+                bind::bind_update_stmt(&mut update, resolver, program, connection, false)?;
+            translate_update(update, binding, resolver, program, connection)?
         }
         ast::Stmt::Vacuum { name, into } => {
             vacuum::translate_vacuum(program, name.as_ref(), into.as_deref(), connection.clone())?

@@ -9,10 +9,7 @@ use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::{BootstrapState, CheckpointStateMachine, TxID};
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
-use crate::schema::{
-    render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
-    SQLITE_SEQUENCE_TABLE_NAME,
-};
+use crate::schema::{Schema, Table, SCHEMA_TABLE_NAME, SQLITE_SEQUENCE_TABLE_NAME};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
@@ -29,13 +26,13 @@ use crate::types::{
     IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
-    escape_sql_string_literal, normalize_ident, rename_identifiers,
-    rename_identifiers_scoped_when_clause, rewrite_check_expr_table_refs,
-    rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
-    rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
-    rewrite_inline_col_fk_target_if_needed, rewrite_trigger_cmd_column_refs,
-    rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
-    trigger_still_references_renamed_column, trim_ascii_whitespace, RewrittenView,
+    escape_sql_string_literal, normalize_ident, rename_identifiers_scoped_when_clause,
+    rewrite_check_expr_table_refs, rewrite_column_level_fk_parent_columns_if_needed,
+    rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
+    rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
+    rewrite_trigger_cmd_column_refs, rewrite_trigger_cmd_table_refs,
+    rewrite_view_sql_for_column_rename, trigger_still_references_renamed_column,
+    trim_ascii_whitespace, RewrittenView,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -10092,7 +10089,7 @@ pub fn op_function(
                                 }
 
                                 for column in &mut columns {
-                                    rename_identifiers(
+                                    crate::translate::bind::rename_schema_expr_identifiers(
                                         column.expr.as_mut(),
                                         &rename_from,
                                         column_def.col_name.as_str(),
@@ -10100,7 +10097,7 @@ pub fn op_function(
                                 }
 
                                 if let Some(ref mut wc) = where_clause {
-                                    rename_identifiers(
+                                    crate::translate::bind::rename_schema_expr_identifiers(
                                         wc,
                                         &rename_from,
                                         column_def.col_name.as_str(),
@@ -10222,7 +10219,7 @@ pub fn op_function(
                                                 );
                                             }
                                             ast::TableConstraint::Check(ref mut expr) => {
-                                                rename_identifiers(
+                                                crate::translate::bind::rename_schema_expr_identifiers(
                                                     expr,
                                                     &rename_from,
                                                     column_def.col_name.as_str(),
@@ -15194,7 +15191,17 @@ pub fn op_drop_column(
                 .is_none_or(|col| normalize_ident(col) != normalize_ident(&col_name))
         });
 
-        btree.shift_generated_column_indices_after_drop(*column_index)?;
+        crate::translate::bind::shift_generated_columns_after_drop(btree, *column_index)?;
+        // Shift SELF_TABLE positional references in surviving CHECK
+        // constraints (constraints referencing the dropped column itself were
+        // rejected during translation).
+        for check in &mut btree.check_constraints {
+            crate::translate::bind::shift_schema_expr_after_drop(
+                &mut check.expr,
+                *column_index,
+                false,
+            )?;
+        }
         Ok(())
     })??;
 
@@ -15222,26 +15229,7 @@ pub fn op_drop_column(
         if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
             for index in indexes {
                 let index = Arc::get_mut(index).expect("this should be the only strong reference");
-                for index_column in index.columns.iter_mut() {
-                    if index_column.pos_in_table != EXPR_INDEX_SENTINEL
-                        && index_column.pos_in_table > *column_index
-                    {
-                        index_column.pos_in_table -= 1;
-                    }
-                    if let Some(ref mut expr) = index_column.expr {
-                        crate::translate::expr::walk_expr_mut(expr, &mut |e| {
-                            if let ast::Expr::Column {
-                                table, column: c, ..
-                            } = e
-                            {
-                                if table.is_self_table() && *c > *column_index {
-                                    *c -= 1;
-                                }
-                            }
-                            Ok(crate::translate::expr::WalkControl::Continue)
-                        })?;
-                    }
-                }
+                crate::translate::bind::shift_index_after_drop(index, *column_index)?;
             }
         }
         Ok(())
@@ -15422,21 +15410,44 @@ pub fn op_alter_column(
             .expect("btree column should be named")
             .clone();
 
-        // Update this table's indexes that reference the old column.
+        // Update this table's indexes that reference the old column. Index
+        // expressions store column references in SELF_TABLE positional form,
+        // which is unaffected by a rename — only leftover raw identifiers
+        // (lenient schema load) and the display name need updating.
         if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
+            let mut renamed_columns = btree.columns().to_vec();
+            if *rename {
+                if let Some(col) = renamed_columns.get_mut(*column_index) {
+                    col.name = Some(new_name.clone());
+                }
+            }
             for idx in idxs {
                 let idx = Arc::make_mut(idx);
                 for ic in &mut idx.columns {
                     if let Some(expr) = &mut ic.expr {
-                        rename_identifiers(expr.as_mut(), &old_column_name, &new_name);
-                        ic.name = expr.to_string();
+                        crate::translate::bind::rename_schema_expr_identifiers(
+                            expr.as_mut(),
+                            &old_column_name,
+                            &new_name,
+                        );
+                        if ic.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL {
+                            ic.name =
+                                crate::translate::bind::render_schema_expr(expr, &renamed_columns)?;
+                        } else if ic.name.eq_ignore_ascii_case(&existing_column_name) {
+                            ic.name.clone_from(&new_name);
+                        }
                     } else if ic.name.eq_ignore_ascii_case(&existing_column_name) {
                         ic.name.clone_from(&new_name);
                     }
                 }
-                // Update partial index WHERE clause column references
+                // Update leftover raw identifiers in the partial index WHERE
+                // clause (SELF_TABLE references survive renames unchanged).
                 if let Some(ref mut wc) = idx.where_clause {
-                    rename_identifiers(wc, &old_column_name, &new_name);
+                    crate::translate::bind::rename_schema_expr_identifiers(
+                        wc,
+                        &old_column_name,
+                        &new_name,
+                    );
                 }
             }
         }
@@ -15457,7 +15468,7 @@ pub fn op_alter_column(
                 let cols_view = btree.columns();
                 if let Some(new_sql) = cols_view[i]
                     .generated_expr()
-                    .map(|expr| render_gencol_expr_sql_with_new_names(expr, cols_view))
+                    .map(|expr| crate::translate::bind::render_schema_expr(expr, cols_view))
                     .transpose()?
                 {
                     btree.columns_mut()[i].set_generated_original_sql(new_sql)
@@ -15488,7 +15499,11 @@ pub fn op_alter_column(
         // Update CHECK constraint expressions to reference the new column name
         let old_col_normalized = normalize_ident(&old_column_name);
         for check in &mut btree.check_constraints {
-            rename_identifiers(&mut check.expr, &old_col_normalized, &new_name);
+            crate::translate::bind::rename_schema_expr_identifiers(
+                &mut check.expr,
+                &old_col_normalized,
+                &new_name,
+            );
             if let Some(ref mut col) = check.column {
                 if col.eq_ignore_ascii_case(&old_column_name) {
                     col.clone_from(&new_name);

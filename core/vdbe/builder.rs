@@ -218,7 +218,6 @@ pub struct ProgramBuilder {
     /// Stack of CTE names currently being planned. Used to detect circular
     /// references in non-recursive CTEs and to prevent fallthrough to schema
     /// resolution for same-named tables/views.
-    ctes_being_defined: Vec<String>,
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     pub table_reference_counter: TableRefIdCounter,
@@ -277,21 +276,6 @@ pub struct ProgramBuilder {
     next_cte_id: usize,
     /// Counter for subquery numbering in EXPLAIN QUERY PLAN output.
     next_subquery_eqp_id: usize,
-    /// Write-context for union-typed columns: tells `union_value('tag', val)`
-    /// which union TypeDef to resolve the tag against.
-    ///
-    /// Unlike read-path functions (`union_tag(col)`, `union_extract(col, 'tag')`)
-    /// which resolve the union type from the column expression they operate on,
-    /// `union_value()` constructs a *new* value — the SQL syntax doesn't reference
-    /// the target column, so the type must come from the INSERT/UPDATE/UPSERT context.
-    ///
-    /// This follows the same save/restore pattern as `id_register_overrides`
-    /// (ENCODE/DECODE context).
-    /// Callers must save with `.take()`, set the new value, translate the expression,
-    /// then restore the saved value. For nested unions (union-in-union), the
-    /// `UnionValueFunc` handler in expr.rs saves/restores this to the inner union
-    /// type before translating the value argument.
-    pub(crate) target_union_type: Option<Arc<crate::schema::TypeDef>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -693,9 +677,7 @@ impl ProgramBuilder {
             subquery_result_regs: HashMap::default(),
             next_cte_id: 0,
             materialized_ctes: HashMap::default(),
-            ctes_being_defined: Vec::new(),
             next_subquery_eqp_id: 1,
-            target_union_type: None,
         }
     }
 
@@ -731,58 +713,6 @@ impl ProgramBuilder {
     /// Register a materialized CTE so that subsequent references can share it via OpenDup.
     pub fn register_materialized_cte(&mut self, cte_id: usize, info: MaterializedCteInfo) {
         self.materialized_ctes.insert(cte_id, info);
-    }
-
-    /// Mark a CTE name as currently being planned. While on the stack,
-    /// `parse_table` will reject references to this name with "circular
-    /// reference" instead of falling through to schema resolution.
-    pub fn push_cte_being_defined(&mut self, name: String) {
-        self.ctes_being_defined.push(name);
-    }
-
-    /// Remove the most recently pushed CTE name after planning completes.
-    pub fn pop_cte_being_defined(&mut self) {
-        self.ctes_being_defined.pop();
-    }
-
-    /// Check whether a name refers to a CTE currently being planned.
-    pub fn is_cte_being_defined(&self, name: &str) -> bool {
-        self.ctes_being_defined.iter().any(|n| n == name)
-    }
-
-    /// Hide CTEs being defined whose names an inner WITH clause redefines:
-    /// the inner definitions shadow the outer names for that lexical scope,
-    /// so references to them are not circular. Returns the hidden names for
-    /// [Self::unmask_shadowed_ctes_being_defined].
-    pub fn mask_shadowed_ctes_being_defined(&mut self, shadowing_names: &[String]) -> Vec<String> {
-        let mut masked = Vec::new();
-        self.ctes_being_defined.retain(|name| {
-            if shadowing_names.contains(name) {
-                masked.push(name.clone());
-                false
-            } else {
-                true
-            }
-        });
-        masked
-    }
-
-    /// Restore names hidden by [Self::mask_shadowed_ctes_being_defined] when
-    /// their shadowing scope ends. Membership is all that matters for the
-    /// circular-reference check, so restore order is irrelevant.
-    pub fn unmask_shadowed_ctes_being_defined(&mut self, masked: Vec<String>) {
-        self.ctes_being_defined.extend(masked);
-    }
-
-    /// Temporarily take the CTE-being-defined stack (e.g. during view
-    /// expansion, which should not see CTE context from the caller).
-    pub fn take_ctes_being_defined(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.ctes_being_defined)
-    }
-
-    /// Restore the CTE-being-defined stack after a context-isolated expansion.
-    pub fn restore_ctes_being_defined(&mut self, saved: Vec<String>) {
-        self.ctes_being_defined = saved;
     }
 
     pub const fn set_resolve_type(&mut self, resolve_type: ResolveType) {

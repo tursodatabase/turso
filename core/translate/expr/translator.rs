@@ -649,10 +649,97 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::DoublyQualified(_, _, _) => {
-            crate::bail_parse_error!("DoublyQualified should have been rewritten in optimizer")
+            crate::bail_parse_error!("unbound qualified column reached expression translation")
         }
         ast::Expr::Exists(_) => {
             crate::bail_parse_error!("EXISTS is not supported in this position")
+        }
+        ast::Expr::BoundCustomTypeFunction { call, resolution } => {
+            let ast::Expr::FunctionCall { args, .. } = call.as_ref() else {
+                return Err(crate::LimboError::InternalError(
+                    "bound custom-type function does not wrap a function call".to_string(),
+                ));
+            };
+            match resolution {
+                ast::CustomTypeFunctionResolution::UnionValue { tag_index, .. } => {
+                    let [_tag, value] = args.as_slice() else {
+                        return Err(crate::LimboError::InternalError(
+                            "bound union_value call has invalid arity".to_string(),
+                        ));
+                    };
+                    let value_register = program.alloc_register();
+                    translate_expr(program, referenced_tables, value, value_register, resolver)?;
+                    program.emit_insn(Insn::UnionPack {
+                        tag_index: *tag_index,
+                        value_reg: value_register,
+                        dest: target_register,
+                    });
+                    Ok(target_register)
+                }
+                ast::CustomTypeFunctionResolution::UnionTag { tag_names } => {
+                    let [source] = args.as_slice() else {
+                        return Err(crate::LimboError::InternalError(
+                            "bound union_tag call has invalid arity".to_string(),
+                        ));
+                    };
+                    let source_register = program.alloc_register();
+                    translate_expr(
+                        program,
+                        referenced_tables,
+                        source,
+                        source_register,
+                        resolver,
+                    )?;
+                    program.emit_insn(Insn::UnionTag {
+                        src_reg: source_register,
+                        dest: target_register,
+                        tag_names: Arc::clone(tag_names),
+                    });
+                    Ok(target_register)
+                }
+                ast::CustomTypeFunctionResolution::UnionExtract { tag_index, .. } => {
+                    let [source, _tag] = args.as_slice() else {
+                        return Err(crate::LimboError::InternalError(
+                            "bound union_extract call has invalid arity".to_string(),
+                        ));
+                    };
+                    let source_register = program.alloc_register();
+                    translate_expr(
+                        program,
+                        referenced_tables,
+                        source,
+                        source_register,
+                        resolver,
+                    )?;
+                    program.emit_insn(Insn::UnionExtract {
+                        src_reg: source_register,
+                        expected_tag: *tag_index,
+                        dest: target_register,
+                    });
+                    Ok(target_register)
+                }
+                ast::CustomTypeFunctionResolution::StructExtract { field_index, .. } => {
+                    let [source, _field] = args.as_slice() else {
+                        return Err(crate::LimboError::InternalError(
+                            "bound struct_extract call has invalid arity".to_string(),
+                        ));
+                    };
+                    let source_register = program.alloc_register();
+                    translate_expr(
+                        program,
+                        referenced_tables,
+                        source,
+                        source_register,
+                        resolver,
+                    )?;
+                    program.emit_insn(Insn::StructField {
+                        src_reg: source_register,
+                        field_index: *field_index,
+                        dest: target_register,
+                    });
+                    Ok(target_register)
+                }
+            }
         }
         ast::Expr::FunctionCall {
             name,
@@ -1882,100 +1969,19 @@ pub fn translate_expr(
                                 MakeArray
                             )
                         }
-                        ScalarFunc::UnionValueFunc => {
-                            let args = expect_arguments_exact!(args, 2, srf);
-                            let tag_name = extract_string_literal(&args[0])?;
-                            // union_value('tag', val): resolve the tag against the
-                            // target column's union type. The target is set by
-                            // INSERT/UPDATE/UPSERT before translating the value.
-                            let Some(ref union_td) = program.target_union_type else {
-                                return Err(crate::LimboError::ParseError(
-                                    "union_value() can only be used in INSERT/UPDATE targeting a union-typed column".to_string()
-                                ));
-                            };
-                            let Some((tag_index, variant)) = union_td.find_union_variant(&tag_name)
-                            else {
-                                return Err(crate::LimboError::ParseError(format!(
-                                    "unknown variant '{}' in union type '{}'",
-                                    tag_name, union_td.name
-                                )));
-                            };
-                            // If the variant's type is itself a union, set
-                            // target_union_type so nested union_value() resolves
-                            // against the inner union type, not the outer one.
-                            let inner_union_td = resolver
-                                .schema()
-                                .get_type_def_unchecked(&variant.type_name)
-                                .filter(|td| td.is_union())
-                                .cloned();
-                            let prev = program.target_union_type.take();
-                            program.target_union_type = inner_union_td;
-                            let value_reg = program.alloc_register();
-                            let result = translate_expr(
-                                program,
-                                referenced_tables,
-                                &args[1],
-                                value_reg,
-                                resolver,
-                            );
-                            program.target_union_type = prev;
-                            result?;
-                            program.emit_insn(Insn::UnionPack {
-                                tag_index,
-                                value_reg,
-                                dest: target_register,
-                            });
-                            Ok(target_register)
-                        }
-                        ScalarFunc::UnionTagFunc => {
-                            // union_tag(col): resolve col's union type for index→name lookup.
-                            let args = expect_arguments_exact!(args, 1, srf);
-                            let td =
-                                resolve_union_from_column(&args[0], referenced_tables, resolver);
-                            let tag_names = td
-                                .as_ref()
-                                .and_then(|td| td.union_def())
-                                .map(|ud| Arc::clone(&ud.tag_names))
-                                .unwrap_or_else(|| Arc::from(Vec::<String>::new()));
-                            translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
-                                [src_reg <- 0],
-                                Insn::UnionTag { src_reg, dest: target_register, tag_names })
-                        }
-                        ScalarFunc::UnionExtractFunc => {
-                            let args = expect_arguments_exact!(args, 2, srf);
-                            let tag_name = extract_string_literal(&args[1])?;
-                            // union_extract(col, 'tag'): resolve col's union type for name→index.
-                            let td =
-                                resolve_union_from_column(&args[0], referenced_tables, resolver);
-                            let tag_index = td
-                                .as_ref()
-                                .and_then(|td| td.resolve_union_tag_index(&tag_name))
-                                .ok_or_else(|| {
-                                    crate::LimboError::ParseError(format!(
-                                        "cannot resolve union variant '{tag_name}' for union_extract"
-                                    ))
-                                })?;
-                            translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
-                                [src_reg <- 0],
-                                Insn::UnionExtract { src_reg, expected_tag: tag_index, dest: target_register })
-                        }
-                        ScalarFunc::StructExtractFunc => {
-                            let args = expect_arguments_exact!(args, 2, srf);
-                            let field_name = extract_string_literal(&args[1])?;
-                            let td =
-                                resolve_struct_from_expr(&args[0], referenced_tables, resolver);
-                            let (field_index, _) = td
-                                .as_ref()
-                                .and_then(|td| td.find_struct_field(&field_name))
-                                .ok_or_else(|| {
-                                    crate::LimboError::ParseError(format!(
-                                        "cannot resolve struct field '{field_name}' for struct_extract"
-                                    ))
-                                })?;
-                            translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
-                                [src_reg <- 0],
-                                Insn::StructField { src_reg, field_index, dest: target_register })
-                        }
+                        ScalarFunc::UnionValueFunc => Err(crate::LimboError::InternalError(
+                            "unbound union_value call reached expression translation".to_string(),
+                        )),
+                        ScalarFunc::UnionTagFunc => Err(crate::LimboError::InternalError(
+                            "unbound union_tag call reached expression translation".to_string(),
+                        )),
+                        ScalarFunc::UnionExtractFunc => Err(crate::LimboError::InternalError(
+                            "unbound union_extract call reached expression translation".to_string(),
+                        )),
+                        ScalarFunc::StructExtractFunc => Err(crate::LimboError::InternalError(
+                            "unbound struct_extract call reached expression translation"
+                                .to_string(),
+                        )),
                         ScalarFunc::NextVal | ScalarFunc::SetVal => translate_sequence_function(
                             program,
                             args,
@@ -2202,7 +2208,8 @@ pub fn translate_expr(
             }
         }
         ast::Expr::Id(id) => {
-            // Check for custom type expression overrides (e.g. `value` placeholder)
+            // Custom type expressions use synthetic parameter identifiers whose
+            // register binding only exists while their bytecode is emitted.
             if let Some(&reg) = program.id_register_overrides.get(id.as_str()) {
                 program.emit_insn(Insn::Copy {
                     src_reg: reg,
@@ -2211,15 +2218,7 @@ pub fn translate_expr(
                 });
                 return Ok(target_register);
             }
-            if !resolver.dqs_dml.is_enabled() {
-                crate::bail_parse_error!("no such column: {}", id.as_str());
-            }
-            // DQS enabled: treat double-quoted identifiers as string literals (SQLite compatibility)
-            program.emit_insn(Insn::String8 {
-                value: id.as_str().to_string(),
-                dest: target_register,
-            });
-            Ok(target_register)
+            crate::bail_parse_error!("unbound identifier reached expression translation: {}", id)
         }
         ast::Expr::Column {
             database: _,
@@ -2868,72 +2867,34 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::Qualified(_, _) => {
-            unreachable!("Qualified should be resolved to a Column before translation")
+            crate::bail_parse_error!("unbound qualified column reached expression translation")
         }
-        ast::Expr::FieldAccess {
-            base,
-            field,
-            resolved,
-        } => {
+        ast::Expr::FieldAccess { base, resolved, .. } => {
             let base_reg = program.alloc_register();
             translate_expr(program, referenced_tables, base, base_reg, resolver)?;
 
-            // Fast path: if the field was resolved during binding, emit directly.
-            if let Some(resolution) = resolved {
-                match resolution {
-                    ast::FieldAccessResolution::StructField { field_index } => {
-                        program.emit_insn(Insn::StructField {
-                            src_reg: base_reg,
-                            field_index: *field_index,
-                            dest: target_register,
-                        });
-                        return Ok(target_register);
-                    }
-                    ast::FieldAccessResolution::UnionVariant { tag_index } => {
-                        program.emit_insn(Insn::UnionExtract {
-                            src_reg: base_reg,
-                            expected_tag: *tag_index,
-                            dest: target_register,
-                        });
-                        return Ok(target_register);
-                    }
+            let Some(resolution) = resolved else {
+                return Err(crate::LimboError::InternalError(
+                    "unbound field access reached expression translation".to_string(),
+                ));
+            };
+            match resolution {
+                ast::FieldAccessResolution::StructField { field_index } => {
+                    program.emit_insn(Insn::StructField {
+                        src_reg: base_reg,
+                        field_index: *field_index,
+                        dest: target_register,
+                    });
+                }
+                ast::FieldAccessResolution::UnionVariant { tag_index } => {
+                    program.emit_insn(Insn::UnionExtract {
+                        src_reg: base_reg,
+                        expected_tag: *tag_index,
+                        dest: target_register,
+                    });
                 }
             }
-
-            // Slow path: recursively resolve the base expression's output type,
-            // then look up the field/variant in that type.
-            let td = resolve_expr_output_type(base, referenced_tables, resolver)?;
-            let field_name = normalize_ident(field.as_str());
-
-            if let Some((idx, _)) = td.find_struct_field(&field_name) {
-                program.emit_insn(Insn::StructField {
-                    src_reg: base_reg,
-                    field_index: idx,
-                    dest: target_register,
-                });
-                return Ok(target_register);
-            } else if let Some(tag_index) = td.resolve_union_tag_index(&field_name) {
-                program.emit_insn(Insn::UnionExtract {
-                    src_reg: base_reg,
-                    expected_tag: tag_index,
-                    dest: target_register,
-                });
-                return Ok(target_register);
-            } else if td.is_struct() {
-                crate::bail_parse_error!(
-                    "no such field '{}' in struct type '{}'",
-                    field_name,
-                    td.name
-                );
-            } else if td.is_union() {
-                crate::bail_parse_error!(
-                    "no such variant '{}' in union type '{}'",
-                    field_name,
-                    td.name
-                );
-            } else {
-                crate::bail_parse_error!("type '{}' is not a struct or union type", td.name);
-            }
+            Ok(target_register)
         }
         ast::Expr::Raise(resolve_type, msg_expr) => {
             let in_trigger = program.trigger.is_some();

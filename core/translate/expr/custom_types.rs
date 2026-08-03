@@ -329,7 +329,7 @@ pub(super) fn find_custom_type_operator(
 /// 1. Clone the expression from `idx_col.expr`
 /// 2. Build the initial `column_regs` mapping (before decode)
 ///
-/// The expression is resolved via `resolve_gencol_expr_columns` and custom-type
+/// The expression is resolved by the generated-column binder and custom-type
 /// columns are decoded in-place in `column_regs`.
 pub(crate) fn emit_dml_expr_index_value(
     program: &mut ProgramBuilder,
@@ -340,7 +340,7 @@ pub(crate) fn emit_dml_expr_index_value(
     table: &Arc<BTreeTable>,
     dest_reg: usize,
 ) -> Result<()> {
-    crate::schema::resolve_gencol_expr_columns(&mut expr, columns)?;
+    crate::translate::bind::bind_generated_column_expr(&mut expr, columns)?;
 
     let is_strict = table.is_strict;
     for (i, col) in columns.iter().enumerate() {

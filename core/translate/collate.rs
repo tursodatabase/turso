@@ -874,6 +874,8 @@ mod tests {
             join_info: None,
             table,
             indexed: None,
+            bound_index_method_patterns: Vec::new(),
+            bound_index_expressions: Vec::new(),
         });
 
         table_references
@@ -918,6 +920,8 @@ mod tests {
                 None,
             ))),
             indexed: None,
+            bound_index_method_patterns: Vec::new(),
+            bound_index_expressions: Vec::new(),
         });
         // Right table t2(id=2)
         let columns = vec![Column::new(
@@ -953,6 +957,8 @@ mod tests {
                 None,
             ))),
             indexed: None,
+            bound_index_method_patterns: Vec::new(),
+            bound_index_expressions: Vec::new(),
         });
         table_references
     }
@@ -992,6 +998,8 @@ mod tests {
             internal_id: TableInternalId::from(1),
             join_info: None,
             indexed: None,
+            bound_index_method_patterns: Vec::new(),
+            bound_index_expressions: Vec::new(),
             table: Table::BTree(Arc::new(BTreeTable::new(
                 0,
                 "bar".to_string(),

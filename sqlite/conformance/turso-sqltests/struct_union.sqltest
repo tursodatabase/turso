@@ -1266,6 +1266,64 @@ expect error {
     unknown variant 'red' in union type 'direction'
 }
 
+test union-value-multi-row-values-binds-each-destination {
+    CREATE TYPE direction AS UNION(north INTEGER, south INTEGER);
+    CREATE TYPE color AS UNION(red TEXT, blue TEXT);
+    CREATE TABLE t_multi(id INT PRIMARY KEY, dir direction, col color) STRICT;
+    INSERT INTO t_multi VALUES
+        (1, union_value('north', 10), union_value('red', 'crimson')),
+        (2, union_value('south', 20), union_value('blue', 'navy'));
+    SELECT id, union_tag(dir), union_tag(col) FROM t_multi ORDER BY id;
+}
+expect {
+    1|north|red
+    2|south|blue
+}
+
+test union-value-insert-select-binds-result-destinations {
+    CREATE TYPE direction AS UNION(north INTEGER, south INTEGER);
+    CREATE TYPE color AS UNION(red TEXT, blue TEXT);
+    CREATE TABLE source(id INT, dir_value INT, color_value TEXT);
+    INSERT INTO source VALUES (1, 10, 'crimson'), (2, 20, 'navy');
+    CREATE TABLE destination(id INT PRIMARY KEY, dir direction, col color) STRICT;
+    INSERT INTO destination
+        SELECT id,
+               union_value('north', dir_value),
+               union_value('red', color_value)
+        FROM source;
+    SELECT id, union_tag(dir), union_tag(col) FROM destination ORDER BY id;
+}
+expect {
+    1|north|red
+    2|north|red
+}
+
+test union-value-row-update-binds-each-destination {
+    CREATE TYPE direction AS UNION(north INTEGER, south INTEGER);
+    CREATE TYPE color AS UNION(red TEXT, blue TEXT);
+    CREATE TABLE t_multi(id INT PRIMARY KEY, dir direction, col color) STRICT;
+    INSERT INTO t_multi VALUES (1, union_value('north', 10), union_value('red', 'crimson'));
+    UPDATE t_multi
+       SET (dir, col) = (union_value('south', 20), union_value('blue', 'navy'))
+     WHERE id = 1;
+    SELECT union_tag(dir), union_tag(col) FROM t_multi;
+}
+expect {
+    south|blue
+}
+
+test union-value-upsert-update-binds-set-destination {
+    CREATE TYPE direction AS UNION(north INTEGER, south INTEGER);
+    CREATE TABLE t(id INT PRIMARY KEY, dir direction) STRICT;
+    INSERT INTO t VALUES (1, union_value('north', 10));
+    INSERT INTO t VALUES (1, union_value('north', 20))
+        ON CONFLICT(id) DO UPDATE SET dir = union_value('south', 30);
+    SELECT union_tag(dir), union_extract(dir, 'south') FROM t;
+}
+expect {
+    south|30
+}
+
 # ============================================================================
 # Nested UNION (union-in-union)
 # ============================================================================

@@ -8,13 +8,8 @@ use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
-use crate::translate::emitter::Resolver;
-use crate::translate::expr::{
-    bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
-};
-use crate::translate::index::{
-    reject_explicit_nulls, resolve_index_method_parameters, resolve_sorted_columns,
-};
+use crate::translate::expr::{walk_expr, WalkControl};
+use crate::translate::index::{reject_explicit_nulls, resolve_index_method_parameters};
 use crate::translate::planner::ROWID_STRS;
 use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -149,7 +144,7 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
+use crate::translate::plan::{BitSet, ColumnMask, Plan};
 use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, UnparsedFromSqlIndex,
 };
@@ -163,7 +158,7 @@ use std::sync::OnceLock;
 use tracing::trace;
 use turso_parser::ast::{
     self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, ResolveType, SortOrder,
-    TableInternalId, TypeOperator,
+    TypeOperator,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -207,20 +202,6 @@ struct SequenceMetadata {
 }
 
 use crate::util::quote_identifier as quote_ident;
-
-/// Recursively rewrite `Expr::Id("value")` (case-insensitive) to `Expr::Id(col_name)`.
-pub fn rewrite_value_to_column(expr: &ast::Expr, col_name: &str) -> Box<ast::Expr> {
-    let mut cloned = expr.clone();
-    let _ = walk_expr_mut(&mut cloned, &mut |e| {
-        if let ast::Expr::Id(name) = e {
-            if name.as_str().eq_ignore_ascii_case("value") {
-                *e = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
-            }
-        }
-        Ok(WalkControl::Continue)
-    });
-    Box::new(cloned)
-}
 
 /// Field definition within a StructDef.
 #[derive(Debug, Clone)]
@@ -3144,8 +3125,13 @@ impl CheckConstraint {
     }
 
     /// Returns the SQL representation of this CHECK constraint (e.g. `CHECK(x > 0)`).
-    pub fn sql(&self) -> String {
-        format!("CHECK({})", self.expr)
+    /// `columns` renders `SELF_TABLE` positional references back to the current
+    /// column names.
+    pub fn sql(&self, columns: &[Column]) -> String {
+        match crate::translate::bind::render_schema_expr(&self.expr, columns) {
+            Ok(rendered) => format!("CHECK({rendered})"),
+            Err(_) => format!("CHECK({})", self.expr),
+        }
     }
 }
 
@@ -3195,7 +3181,7 @@ impl GeneratedColGraph {
                 continue;
             };
             let mut direct = BitSet::default();
-            collect_column_dependencies_of_gencol(expr, columns, &mut direct);
+            crate::translate::bind::bind_generated_column_dependencies(expr, columns, &mut direct)?;
             if direct.get(j) {
                 bail_parse_error!(
                     "generated column \"{}\" cannot reference itself",
@@ -3494,7 +3480,7 @@ impl BTreeTable {
                     notnull_cols.try_push(col_idx)?;
                 }
                 for (i, dc) in td.domain_checks.iter().enumerate() {
-                    let rewritten = rewrite_value_to_column(&dc.check, &col_name);
+                    let rewritten = crate::translate::bind::bind_domain_check(&dc.check, &col_name);
                     let name = dc
                         .name
                         .clone()
@@ -3632,7 +3618,7 @@ impl BTreeTable {
                         sql.push_str(&Name::exact(name.clone()).as_ident());
                         sql.push(' ');
                     }
-                    sql.push_str(&check_constraint.sql());
+                    sql.push_str(&check_constraint.sql(&self.columns));
                 }
             }
         }
@@ -3706,7 +3692,7 @@ impl BTreeTable {
                 sql.push_str(&Name::exact(name.clone()).as_ident());
                 sql.push(' ');
             }
-            sql.push_str(&check_constraint.sql());
+            sql.push_str(&check_constraint.sql(&self.columns));
         }
 
         // Add table-level UNIQUE constraints
@@ -3825,49 +3811,20 @@ impl BTreeTable {
             for i in 0..guard.len() {
                 if guard[i].is_virtual_generated() {
                     let mut expr = guard[i].generated_expr().cloned().unwrap();
-                    resolve_gencol_expr_columns(&mut expr, &guard)?;
+                    crate::translate::bind::bind_generated_column_expr(&mut expr, &guard)?;
                     *guard[i].generated_expr_mut().unwrap() = expr;
                 }
             }
         }
+        // CHECK constraint expressions are resolved to the same SELF_TABLE
+        // positional form. Lenient: unknown names stay as identifiers and
+        // surface when the constraint is evaluated.
+        let mut checks = std::mem::replace(&mut self.check_constraints, TursoAllocExt::new());
+        for check in &mut checks {
+            crate::translate::bind::bind_index_schema_expr(&mut check.expr, self);
+        }
+        self.check_constraints = checks;
         self.column_graph()?;
-        Ok(())
-    }
-
-    pub fn shift_generated_column_indices_after_drop(
-        &mut self,
-        dropped_index: usize,
-    ) -> Result<()> {
-        if !self.has_virtual_columns {
-            return Ok(());
-        }
-
-        for column in &mut self.columns {
-            let Some(expr) = column.generated_expr_mut() else {
-                continue;
-            };
-
-            walk_expr_mut(expr, &mut |e| match e {
-                Expr::Column {
-                    table,
-                    column,
-                    is_rowid_alias: _,
-                    ..
-                } if table.is_self_table() => {
-                    if *column == dropped_index {
-                        return Err(LimboError::InternalError(
-                            "dropped column remained referenced by generated column".to_string(),
-                        ));
-                    }
-                    if *column > dropped_index {
-                        *column -= 1;
-                    }
-                    Ok(WalkControl::Continue)
-                }
-                _ => Ok(WalkControl::Continue),
-            })?;
-        }
-
         Ok(())
     }
 
@@ -4078,93 +4035,6 @@ pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> H
     });
 
     refs
-}
-
-fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &mut BitSet) {
-    let _ = walk_expr(expr, &mut |e| {
-        match e {
-            Expr::Column { table, column, .. } if table.is_self_table() => {
-                out.set(*column)?;
-            }
-            Expr::Id(name) | Expr::Name(name) => {
-                if let Some(idx) = find_column_index_by_name(columns, name.as_str()) {
-                    out.set(idx)?;
-                }
-            }
-            Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-                if let Some(idx) = find_column_index_by_name(columns, col.as_str()) {
-                    out.set(idx)?;
-                }
-            }
-            Expr::Subquery(_)
-            | Expr::Exists(_)
-            | Expr::InTable { .. }
-            | Expr::SubqueryResult { .. } => {
-                unreachable!("generated columns cannot contain subqueries")
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    });
-}
-
-fn find_column_index_by_name(columns: &[Column], col_name: &str) -> Option<usize> {
-    columns.iter().enumerate().find_map(|(i, col)| {
-        col.name
-            .as_ref()
-            .filter(|name| name.eq_ignore_ascii_case(col_name))
-            .map(|_| i)
-    })
-}
-
-/// Resolve [Expr::Id] / [Expr::Qualified] / [Expr::DoublyQualified] in a generated column
-/// or partial-index expression to `Expr::Column { table: SELF_TABLE, column: idx }`.
-pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -> Result<()> {
-    walk_expr_mut(gencol_expr, &mut |e| match e {
-        Expr::Id(name) | Expr::Qualified(_, name) | Expr::DoublyQualified(_, _, name) => {
-            let col_name = normalize_ident(name.as_str());
-            let (idx, col) = columns
-                .iter()
-                .enumerate()
-                .find(|(_, c)| {
-                    c.name
-                        .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(&col_name))
-                })
-                .ok_or_else(|| LimboError::ParseError(format!("no such column: {col_name}")))?;
-            *e = Expr::Column {
-                database: None,
-                table: TableInternalId::SELF_TABLE,
-                column: idx,
-                is_rowid_alias: col.is_rowid_alias(),
-            };
-            Ok(WalkControl::Continue)
-        }
-        _ => Ok(WalkControl::Continue),
-    })?;
-    Ok(())
-}
-
-/// Re-render the SQL text of a generated-column expression using current column names. The input
-/// AST may have been previously resolved into `Expr::Column { table: SELF_TABLE, column: idx, .. }`
-/// nodes; we replace each such self-table reference with a fresh `Expr::Id(<col-name>)` before
-/// stringifying so the result round-trips through the parser, even if a referenced column was
-/// renamed since the original `original_sql` was captured.
-pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) -> Result<String> {
-    let mut clone = expr.clone();
-    walk_expr_mut(&mut clone, &mut |e| -> Result<WalkControl> {
-        if let Expr::Column { table, column, .. } = e {
-            if table.is_self_table() {
-                if let Some(col) = columns.get(*column) {
-                    if let Some(name) = col.name.as_ref() {
-                        *e = Expr::Id(Name::exact(name.clone()));
-                    }
-                }
-            }
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(clone.to_string())
 }
 
 pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
@@ -5734,7 +5604,8 @@ impl Index {
                 ..
             })) => {
                 let index_name = normalize_ident(idx_name.name.as_str());
-                let index_columns = resolve_sorted_columns(table, &columns)?;
+                let index_columns =
+                    crate::translate::bind::bind_index_columns(table, &columns, None)?;
                 if let Some(using) = using {
                     if where_clause.is_some() {
                         bail_parse_error!("custom index module do not support partial indices");
@@ -5766,6 +5637,10 @@ impl Index {
                         on_conflict: None,
                     })
                 } else {
+                    let where_clause = where_clause.map(|mut wc| {
+                        crate::translate::bind::bind_index_schema_expr(&mut wc, table);
+                        wc
+                    });
                     Ok(Index {
                         name: index_name,
                         table_name: normalize_ident(tbl_name.as_str()),
@@ -5914,119 +5789,17 @@ impl Index {
     }
 
     /// Given an expression, return the position in the index if it matches an expression index column.
-    /// Expression index matching is textual (after binding), so the caller should normalize the query
-    /// expression to resemble the stored index expression (e.g. unqualified column names).
+    /// Index expressions are stored with column references pre-resolved to `SELF_TABLE` form.
+    /// The binder rebases them to each query table id before planning. Generated-column-backed
+    /// index columns also carry
+    /// an expression (the column's defining expression) but are matched by column position, not here.
     pub fn expression_to_index_pos(&self, expr: &Expr) -> Option<usize> {
         self.columns.iter().position(|c| {
-            c.expr
-                .as_ref()
-                .is_some_and(|e| exprs_are_equivalent(e, expr))
-        })
-    }
-
-    /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
-    /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table, _resolver: &Resolver) -> bool {
-        let Some(where_clause) = &self.where_clause else {
-            return true;
-        };
-
-        let tbl_norm = self.table_name.as_str();
-        let has_col = |name: &str| {
-            table.columns().iter().any(|c| {
-                c.name
+            c.pos_in_table == EXPR_INDEX_SENTINEL
+                && c.expr
                     .as_ref()
-                    .is_some_and(|cn| cn.eq_ignore_ascii_case(name))
-            })
-        };
-        let is_tbl = |ns: &str| normalize_ident(ns) == tbl_norm;
-        let is_deterministic_fn = |name: &str, argc: usize| {
-            let n = normalize_ident(name);
-            Func::resolve_function(&n, argc).is_ok_and(|f| f.is_some_and(|f| f.is_deterministic()))
-        };
-
-        let mut ok = true;
-        let _ = walk_expr(where_clause.as_ref(), &mut |e: &Expr| -> crate::Result<
-            WalkControl,
-        > {
-            if !ok {
-                return Ok(WalkControl::SkipChildren);
-            }
-            match e {
-                Expr::Literal(_) | Expr::RowId { .. } => {}
-                // Unqualified identifier: must be a column of the target table or ROWID
-                Expr::Id(n) => {
-                    let n = n.as_str();
-                    if !ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(n)) && !has_col(n) {
-                        ok = false;
-                    }
-                }
-                // Qualified: qualifier must match this index's table; column must exist
-                Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
-                    if !is_tbl(ns.as_str()) || !has_col(col.as_str()) {
-                        ok = false;
-                    }
-                }
-                Expr::FunctionCall {
-                    name, filter_over, ..
-                }
-                | Expr::FunctionCallStar {
-                    name, filter_over, ..
-                } => {
-                    // reject windowed
-                    if filter_over.over_clause.is_some() {
-                        ok = false;
-                    } else {
-                        let argc = match e {
-                            Expr::FunctionCall { args, .. } => args.len(),
-                            Expr::FunctionCallStar { .. } => 0,
-                            _ => unreachable!(),
-                        };
-                        // Reject non-deterministic functions. Function arguments can reference
-                        // columns of the indexed table (e.g., LENGTH(t0.c0)), which will be
-                        // validated by the Expr::Id and Expr::Qualified cases during the walk.
-                        if !is_deterministic_fn(name.as_str(), argc) {
-                            ok = false;
-                        }
-                    }
-                }
-                // Explicitly disallowed constructs
-                Expr::Exists(_)
-                | Expr::InSelect { .. }
-                | Expr::Subquery(_)
-                | Expr::Raise { .. }
-                | Expr::Variable(_) => {
-                    ok = false;
-                }
-                _ => {}
-            }
-            Ok(if ok {
-                WalkControl::Continue
-            } else {
-                WalkControl::SkipChildren
-            })
-        });
-        ok
-    }
-
-    pub fn bind_where_expr(
-        &self,
-        table_refs: Option<&mut TableReferences>,
-        resolver: &Resolver,
-    ) -> Option<ast::Expr> {
-        let Some(where_clause) = &self.where_clause else {
-            return None;
-        };
-        let mut expr = where_clause.clone();
-        bind_and_rewrite_expr(
-            &mut expr,
-            table_refs,
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )
-        .ok()?;
-        Some(*expr)
+                    .is_some_and(|e| exprs_are_equivalent(e, expr))
+        })
     }
 }
 

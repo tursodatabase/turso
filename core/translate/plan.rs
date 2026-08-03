@@ -9,7 +9,7 @@ use crate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::UpdateRowSource,
         expr::{as_binary_components, expr_data_type, get_expr_affinity, StorageClassMask},
-        expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
+        expression_index::single_table_column_usage,
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
     },
@@ -1179,7 +1179,7 @@ pub struct JoinedTable {
     pub column_use_counts: Vec<usize>,
     /// Expressions referencing this table that may be satisfied by an expression index.
     ///
-    /// Each entry stores the normalized expression text and the columns it
+    /// Each entry stores the bound query expression and the columns it
     /// needs. During covering checks we ask: does an index contain this
     /// expression? If yes, all columns that *only* feed this expression can be
     /// removed from the required-column set.
@@ -1188,6 +1188,33 @@ pub struct JoinedTable {
     pub database_id: usize,
     /// INDEXED BY / NOT INDEXED hint from the SQL statement.
     pub indexed: Option<ast::Indexed>,
+    /// Custom index-method patterns resolved to this table's internal id.
+    /// The optimizer only matches these bound expressions; it never resolves
+    /// names from an index method's raw SQL pattern.
+    pub bound_index_method_patterns: Vec<BoundIndexMethodPattern>,
+    /// Schema index expressions rebound to this table reference during binding.
+    pub bound_index_expressions: Vec<BoundIndexExpressions>,
+}
+
+/// A custom index-method query pattern after name resolution.
+///
+/// The binder removes the pattern's FROM clause after validating it and keeps
+/// only the expressions the optimizer compares with the query plan.
+#[derive(Debug, Clone)]
+pub struct BoundIndexMethodPattern {
+    pub index_name: String,
+    pub pattern_idx: usize,
+    pub columns: Vec<ast::ResultColumn>,
+    pub where_clause: Option<Box<ast::Expr>>,
+    pub order_by: Vec<ast::SortedColumn>,
+    pub limit: Option<ast::Limit>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundIndexExpressions {
+    pub index_name: String,
+    pub columns: Vec<Option<Box<ast::Expr>>>,
+    pub where_clause: Option<Box<ast::Expr>>,
 }
 
 impl JoinedTable {
@@ -1229,15 +1256,6 @@ pub struct OuterQueryReference {
     /// i.e., if the subquery depends on tables T and U,
     /// then both T and U need to be in scope for the subquery to be evaluated.
     pub col_used_mask: ColumnUsedMask,
-    /// Original CTE SELECT AST for re-planning. When a CTE is referenced
-    /// multiple times, each reference needs a fresh plan with unique
-    /// internal_ids to avoid cursor key collisions.
-    pub cte_select: Option<ast::Select>,
-    /// Explicit column names from WITH t(a, b) AS (...) syntax.
-    pub cte_explicit_columns: Vec<String>,
-    /// CTE ID if this is a CTE reference. Used to track CTE reference counts
-    /// for materialization decisions.
-    pub cte_id: Option<usize>,
     /// When true, this entry is only for CTE definition lookup in subquery
     /// FROM clauses, not for column resolution. This is set when the CTE
     /// has been consumed by a FROM clause (with or without an alias), so
@@ -1254,6 +1272,25 @@ pub struct OuterQueryReference {
 }
 
 impl OuterQueryReference {
+    /// A definition-only entry: it lets a subquery's FROM clause find a CTE
+    /// by name, but its columns are not visible for column resolution.
+    pub fn cte_definition_only(
+        identifier: String,
+        internal_id: TableInternalId,
+        table: Table,
+    ) -> Self {
+        Self {
+            identifier,
+            internal_id,
+            table,
+            using_dedup_hidden_cols: ColumnMask::default(),
+            col_used_mask: ColumnUsedMask::default(),
+            cte_definition_only: true,
+            rowid_referenced: false,
+            scope_depth: 0,
+        }
+    }
+
     /// Returns the columns of the table that this outer query reference refers to.
     pub fn columns(&self) -> &[Column] {
         self.table.columns()
@@ -1378,20 +1415,19 @@ impl TableReferences {
         let Some((table_id, columns_mask)) = single_table_column_usage(expr) else {
             return;
         };
-        let Some(table_ref) = self
+        if !self
             .joined_tables()
             .iter()
-            .find(|t| t.internal_id == table_id)
-        else {
+            .any(|table| table.internal_id == table_id)
+        {
             return;
-        };
-        let normalized = normalize_expr_for_index_matching(expr, table_ref, self);
+        }
         if let Some(table_ref_mut) = self
             .joined_tables_mut()
             .iter_mut()
             .find(|t| t.internal_id == table_id)
         {
-            table_ref_mut.register_expression_index_usage(normalized, columns_mask);
+            table_ref_mut.register_expression_index_usage(expr.clone(), columns_mask);
         }
     }
 
@@ -1482,21 +1518,6 @@ impl TableReferences {
         self.outer_query_refs
             .iter()
             .find(|t| t.identifier == identifier)
-    }
-
-    /// Marks the pre-planned [OuterQueryReference] with the given identifier as
-    /// "CTE definition only". This prevents it from being used for column
-    /// resolution while still allowing CTE definition lookup in subquery FROM
-    /// clauses. Called when a CTE is consumed by a FROM clause, since column
-    /// resolution is then handled by the joined_table entry instead.
-    pub fn mark_outer_query_ref_cte_definition_only(&mut self, identifier: &str) {
-        if let Some(outer_ref) = self
-            .outer_query_refs
-            .iter_mut()
-            .find(|t| t.identifier == identifier)
-        {
-            outer_ref.cte_definition_only = true;
-        }
     }
 
     /// Returns `(internal_id, &Table)` for the table with the given identifier.
@@ -2088,9 +2109,9 @@ impl<T> TryFrom<u128> for BitSet<T> {
 
 #[derive(Clone, Debug)]
 pub struct ExpressionIndexUsage {
-    /// Normalized (non-bound) ast of the expression as stored on an index column.
+    /// Query expression with column references resolved by the binder.
     /// Example: `lower(name)` for INDEX ON t(lower(name)).
-    pub normalized_expr: Box<ast::Expr>,
+    pub bound_expr: Box<ast::Expr>,
     /// Columns required to compute the expression. Helps decide whether using
     /// the expression value from the index fully covers those column reads.
     pub columns_mask: ColumnUsedMask,
@@ -2476,6 +2497,8 @@ impl JoinedTable {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            bound_index_method_patterns: Vec::new(),
+            bound_index_expressions: Vec::new(),
         })
     }
 
@@ -2522,6 +2545,8 @@ impl JoinedTable {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            bound_index_method_patterns: Vec::new(),
+            bound_index_expressions: Vec::new(),
         })
     }
 
@@ -2554,11 +2579,36 @@ impl JoinedTable {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            bound_index_method_patterns: Vec::new(),
+            bound_index_expressions: Vec::new(),
         })
     }
 
     pub fn columns(&self) -> &[Column] {
         self.table.columns()
+    }
+
+    pub fn bound_index_expressions(&self, index: &Index) -> Option<&BoundIndexExpressions> {
+        self.bound_index_expressions
+            .iter()
+            .find(|bound| bound.index_name == index.name)
+    }
+
+    pub fn bound_expression_index_pos(&self, index: &Index, expr: &ast::Expr) -> Option<usize> {
+        self.bound_index_expressions(index)?
+            .columns
+            .iter()
+            .enumerate()
+            .position(|(position, candidate)| {
+                index.columns[position].pos_in_table == crate::schema::EXPR_INDEX_SENTINEL
+                    && candidate
+                        .as_deref()
+                        .is_some_and(|candidate| exprs_are_equivalent(candidate, expr))
+            })
+    }
+
+    pub fn bound_partial_index_where(&self, index: &Index) -> Option<&ast::Expr> {
+        self.bound_index_expressions(index)?.where_clause.as_deref()
     }
 
     /// Mark a column as used in the query.
@@ -2583,7 +2633,7 @@ impl JoinedTable {
     /// covered by expression keys.
     pub fn register_expression_index_usage(
         &mut self,
-        normalized_expr: ast::Expr,
+        bound_expr: ast::Expr,
         columns_mask: ColumnUsedMask,
     ) {
         if columns_mask.is_empty() {
@@ -2592,12 +2642,12 @@ impl JoinedTable {
         if self
             .expression_index_usages
             .iter()
-            .any(|usage| exprs_are_equivalent(&usage.normalized_expr, &normalized_expr))
+            .any(|usage| exprs_are_equivalent(&usage.bound_expr, &bound_expr))
         {
             return;
         }
         self.expression_index_usages.push(ExpressionIndexUsage {
-            normalized_expr: Box::new(normalized_expr),
+            bound_expr: Box::new(bound_expr),
             columns_mask,
         });
     }
@@ -2619,8 +2669,8 @@ impl JoinedTable {
             //   SELECT lower(name) FROM t;
             // Column `name` is not otherwise needed, so we can rely on the
             // expression value from the index and drop the table cursor.
-            if index
-                .expression_to_index_pos(&usage.normalized_expr)
+            if self
+                .bound_expression_index_pos(index, &usage.bound_expr)
                 .is_some()
             {
                 any_covered = true;

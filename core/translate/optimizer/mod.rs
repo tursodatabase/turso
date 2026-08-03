@@ -33,15 +33,16 @@ use crate::{
             order::{ColumnTarget, OrderTarget},
         },
         plan::{
-            DmlSafetyReason, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
-            NonFromClauseSubquery, QueryDestination, ResultSetColumn, Scan, SeekKeyComponent,
-            SubqueryEvalPhase, SubqueryOrigin, SubqueryState, UpdateSetClause, WriteSetPlan,
+            BoundIndexMethodPattern, DmlSafetyReason, EphemeralRowidMode, HashJoinOp,
+            IndexMethodQuery, NonFromClauseSubquery, QueryDestination, ResultSetColumn, Scan,
+            SeekKeyComponent, SubqueryEvalPhase, SubqueryOrigin, SubqueryState, UpdateSetClause,
+            WriteSetPlan,
         },
         trigger_exec::has_triggers_including_temp,
     },
     types::SeekOp,
     util::{
-        count_fts_column_args, exprs_are_equivalent, simple_bind_expr, try_capture_parameters,
+        count_fts_column_args, exprs_are_equivalent, try_capture_parameters,
         try_capture_parameters_column_agnostic, try_substitute_parameters,
     },
     vdbe::{
@@ -227,8 +228,7 @@ struct IndexMethodPatternMatch {
 /// Try to match an index method pattern against a query's clauses.
 #[allow(clippy::too_many_arguments)]
 fn try_match_index_method_pattern(
-    pattern: &ast::Select,
-    table: &JoinedTable,
+    pattern: &BoundIndexMethodPattern,
     query_where_terms: &[WhereTerm],
     order_by: &[(
         Box<ast::Expr>,
@@ -237,75 +237,9 @@ fn try_match_index_method_pattern(
     )],
     limit: &Option<Box<Expr>>,
     offset: &Option<Box<Expr>>,
-    pattern_idx: usize,
-    soft_bind_errors: bool,
 ) -> Option<IndexMethodPatternMatch> {
-    let mut pattern = pattern.clone();
-    if pattern.with.is_some() || !pattern.body.compounds.is_empty() {
-        return None;
-    }
-
-    let ast::OneSelect::Select {
-        columns,
-        from: Some(ast::FromClause { select, joins }),
-        distinctness: None,
-        where_clause: ref mut pattern_where_clause,
-        group_by: None,
-        window_clause,
-    } = &mut pattern.body.select
-    else {
-        if soft_bind_errors {
-            return None;
-        }
-        panic!("unexpected select pattern body");
-    };
-
-    if !window_clause.is_empty() || !joins.is_empty() {
-        return None;
-    }
-
-    let ast::SelectTable::Table(name, _, _) = select.as_ref() else {
-        if soft_bind_errors {
-            return None;
-        }
-        panic!("unexpected from clause");
-    };
-
-    // Bind expressions to this table
-    for column in columns.iter_mut() {
-        if let ast::ResultColumn::Expr(e, _) = column {
-            if soft_bind_errors {
-                if simple_bind_expr(table, &[], e).is_err() {
-                    return None;
-                }
-            } else {
-                simple_bind_expr(table, &[], e).ok()?;
-            }
-        }
-    }
-    for column in pattern.order_by.iter_mut() {
-        if soft_bind_errors {
-            if simple_bind_expr(table, columns, &mut column.expr).is_err() {
-                return None;
-            }
-        } else {
-            simple_bind_expr(table, columns, &mut column.expr).ok()?;
-        }
-    }
-    if let Some(pattern_where) = pattern_where_clause {
-        if soft_bind_errors {
-            if simple_bind_expr(table, columns, pattern_where).is_err() {
-                return None;
-            }
-        } else {
-            simple_bind_expr(table, columns, pattern_where).ok()?;
-        }
-    }
-
-    if name.name.as_str() != table.table.get_name() {
-        return None;
-    }
-
+    let columns = &pattern.columns;
+    let pattern_where_clause = pattern.where_clause.as_deref();
     let pattern_has_order_by = !pattern.order_by.is_empty();
     let pattern_has_limit = pattern.limit.is_some();
 
@@ -404,7 +338,7 @@ fn try_match_index_method_pattern(
     }
 
     Some(IndexMethodPatternMatch {
-        pattern_idx,
+        pattern_idx: pattern.pattern_idx,
         parameters,
         where_covered: where_query_covered,
         pattern_has_order_by,
@@ -481,19 +415,14 @@ fn collect_index_method_candidates(
                 continue;
             }
 
-            let definition = module.definition();
-            for (pattern_idx, pattern) in definition.patterns.iter().enumerate() {
-                // Use shared helper for pattern matching
-                let Some(pattern_match) = try_match_index_method_pattern(
-                    pattern,
-                    table,
-                    where_clause,
-                    order_by,
-                    limit,
-                    offset,
-                    pattern_idx,
-                    true, // continue on binding failures
-                ) else {
+            for pattern in table
+                .bound_index_method_patterns
+                .iter()
+                .filter(|pattern| pattern.index_name.eq_ignore_ascii_case(&index.name))
+            {
+                let Some(pattern_match) =
+                    try_match_index_method_pattern(pattern, where_clause, order_by, limit, offset)
+                else {
                     continue;
                 };
 
@@ -1092,8 +1021,7 @@ fn update_write_set_reason(
         let affected_cols = btree_table.columns_affected_by_update(&updated_cols)?;
         for c in index.columns.iter() {
             if let Some(ref expr) = c.expr {
-                let expr_idx_cols_mask =
-                    expression_index_column_usage(expr.as_ref(), table_ref, resolver)?;
+                let expr_idx_cols_mask = expression_index_column_usage(expr.as_ref())?;
                 if expr_idx_cols_mask
                     .iter()
                     .any(|cidx| affected_cols.get(cidx))
@@ -1483,24 +1411,20 @@ fn optimize_table_access_with_custom_modules(
         return Ok(false);
     };
     for index in indexes {
-        let Some(module) = &index.index_method else {
+        if index.index_method.is_none() {
             continue;
-        };
+        }
         if index.is_backing_btree_index() {
             continue;
         }
-        let definition = module.definition();
-        for (pattern_idx, pattern) in definition.patterns.iter().enumerate() {
-            let Some(pattern_match) = try_match_index_method_pattern(
-                pattern,
-                table,
-                where_query,
-                order_by,
-                limit,
-                offset,
-                pattern_idx,
-                false, // panic on binding failures
-            ) else {
+        for pattern in table
+            .bound_index_method_patterns
+            .iter()
+            .filter(|pattern| pattern.index_name.eq_ignore_ascii_case(&index.name))
+        {
+            let Some(pattern_match) =
+                try_match_index_method_pattern(pattern, where_query, order_by, limit, offset)
+            else {
                 continue;
             };
 
@@ -2999,6 +2923,7 @@ impl Optimizable for ast::Expr {
             }
             Expr::Exists(..) => false,
             Expr::FunctionCall { .. } => false,
+            Expr::BoundCustomTypeFunction { .. } => false,
             Expr::FunctionCallStar { .. } => false,
             Expr::Id(..) => panic!("Do not call is_nonnull before Id has been rewritten as Column"),
             Expr::Column {
@@ -3111,6 +3036,7 @@ impl Optimizable for ast::Expr {
                 };
                 func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
             }
+            Expr::BoundCustomTypeFunction { call, .. } => call.is_constant(resolver),
             Expr::FunctionCallStar { .. } => false,
             Expr::Id(_) => true,
             Expr::Column { .. } => false,

@@ -3076,6 +3076,8 @@ mod tests {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            bound_index_method_patterns: Vec::new(),
+            bound_index_expressions: Vec::new(),
         });
         available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
 
@@ -3172,6 +3174,8 @@ mod tests {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            bound_index_method_patterns: Vec::new(),
+            bound_index_expressions: Vec::new(),
         });
         available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
 
@@ -3285,6 +3289,8 @@ mod tests {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            bound_index_method_patterns: Vec::new(),
+            bound_index_expressions: Vec::new(),
         });
         available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
 
@@ -3478,6 +3484,8 @@ mod tests {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            bound_index_method_patterns: Vec::new(),
+            bound_index_expressions: Vec::new(),
         }
     }
 

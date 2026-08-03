@@ -80,6 +80,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             }
             1
         }
+        Expr::BoundCustomTypeFunction { call, .. } => expr_vector_size(call)?,
         Expr::FunctionCallStar { .. } => 1,
         Expr::Id(_) => 1,
         Expr::Column { .. } => 1,

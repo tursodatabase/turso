@@ -1,0 +1,20 @@
+@database :memory:
+
+test alias-qualified-column-resolves {
+    CREATE TABLE t(x INT);
+    INSERT INTO t VALUES(1);
+    SELECT u.x FROM t AS u;
+}
+expect {
+    1
+}
+
+# Both engines reject the base name once aliased; the message differs
+# (SQLite: "no such column: t.x", Turso: "no such table: t").
+test base-name-hidden-when-aliased {
+    CREATE TABLE t(x INT);
+    INSERT INTO t VALUES(1);
+    SELECT t.x FROM t AS u;
+}
+expect error {
+}

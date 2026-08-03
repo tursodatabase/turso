@@ -4,7 +4,6 @@ use crate::{
     schema::{FromClauseSubquery, Index, Schema},
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
-        expression_index::normalize_expr_for_index_matching,
         optimizer::access_method::AccessMethodParams,
         optimizer::constraints::RangeConstraintRef,
         plan::{
@@ -750,26 +749,25 @@ fn expr_to_column_order(
 
 fn target_matches_index_column(
     target_col: &ColumnOrder,
-    idx_col: &crate::schema::IndexColumn,
+    index: &Index,
+    index_column: usize,
     table_ref: &JoinedTable,
 ) -> bool {
     if target_col.table_id != table_ref.internal_id {
         return false;
     }
+    let idx_col = &index.columns[index_column];
     match (&target_col.target, &idx_col.expr) {
         (ColumnTarget::Column(col_no), None) => idx_col.pos_in_table == *col_no,
-        (ColumnTarget::Expr(expr), Some(idx_expr)) => {
+        (ColumnTarget::Expr(expr), Some(_))
+            if idx_col.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL =>
+        {
             let target_expr = unsafe { &**expr };
-            if exprs_are_equivalent(target_expr, idx_expr) {
-                return true;
-            }
-            // Expression indexes are compared against the normalized form that
-            // was stored in the schema. A query may write the same expression in
-            // a slightly different but equivalent way, so normalize before the
-            // final comparison.
-            let refs = TableReferences::new(vec![table_ref.clone()], Vec::new());
-            let normalized = normalize_expr_for_index_matching(target_expr, table_ref, &refs);
-            exprs_are_equivalent(&normalized, idx_expr)
+            table_ref
+                .bound_index_expressions(index)
+                .and_then(|bound| bound.columns.get(index_column))
+                .and_then(|expr| expr.as_deref())
+                .is_some_and(|index_expr| exprs_are_equivalent(target_expr, index_expr))
         }
         _ => false,
     }
@@ -850,7 +848,7 @@ pub(super) fn btree_access_order_consumed(
                     // remaining suffix. If the ORDER BY / GROUP BY also mentions
                     // the same column with the same collation, that target term
                     // is satisfied trivially and can be consumed here too.
-                    if target_matches_index_column(target_col, idx_col, table_ref) {
+                    if target_matches_index_column(target_col, index, idx_pos, table_ref) {
                         let same_collation =
                             target_col.collation == idx_col.collation.unwrap_or_default();
                         if !same_collation {
@@ -862,7 +860,7 @@ pub(super) fn btree_access_order_consumed(
                     continue;
                 }
 
-                if !target_matches_index_column(target_col, idx_col, table_ref) {
+                if !target_matches_index_column(target_col, index, idx_pos, table_ref) {
                     break;
                 }
 

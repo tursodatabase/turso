@@ -17,7 +17,7 @@ use crate::{
     translate::{
         display::format_eqp_detail,
         emitter::{
-            check_expr_references_columns, delete::emit_fk_child_decrement_on_delete,
+            check_expr_references_updated_columns, delete::emit_fk_child_decrement_on_delete,
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_cdc_patch_record, emit_check_constraints, emit_index_column_value_new_image,
             emit_index_column_value_old_image, emit_make_record, emit_program_for_select,
@@ -178,6 +178,8 @@ pub fn emit_program_for_update(
                 expression_index_usages: Vec::new(),
                 database_id: MAIN_DB_ID,
                 indexed: None,
+                bound_index_method_patterns: Vec::new(),
+                bound_index_expressions: Vec::new(),
             }],
             vec![],
         );
@@ -187,9 +189,6 @@ pub fn emit_program_for_update(
             table: target_table.table.clone(),
             using_dedup_hidden_cols: ColumnMask::default(),
             col_used_mask: target_table.col_used_mask.try_clone()?,
-            cte_select: None,
-            cte_explicit_columns: vec![],
-            cte_id: None,
             cte_definition_only: false,
             rowid_referenced: false,
             scope_depth: 0,
@@ -448,7 +447,6 @@ pub fn emit_program_for_update(
         &all_index_cursors,
         target_table_cursor_id,
         target_table,
-        resolver,
         returning_buffer.as_ref(),
         &mut update_subqueries,
     )?;
@@ -840,17 +838,6 @@ fn emit_update_column_values<'a>(
                         program,
                         self_table_context.as_ref(),
                         |program, _| {
-                            // Save/restore target_union_type so union_value() resolves tags
-                            // against this column's union type. See ProgramBuilder::target_union_type.
-                            let union_td = t_ctx
-                                .resolver
-                                .schema
-                                .get_type_def_unchecked(&table_column.ty_str)
-                                .filter(|td| td.is_union())
-                                .cloned();
-                            let prev_union = program.target_union_type.take();
-                            program.target_union_type = union_td;
-
                             // Columns with custom type encode must not have their
                             // SET expressions hoisted as constants. See the doc
                             // comment on NoConstantOptReason::CustomTypeEncode.
@@ -881,7 +868,6 @@ fn emit_update_column_values<'a>(
                                     &t_ctx.resolver,
                                 )
                             };
-                            program.target_union_type = prev_union;
                             translate_result?;
                             if table_column.notnull() && !skip_notnull_checks {
                                 let notnull_conflict = if program.flags.has_statement_conflict() {
@@ -1045,7 +1031,6 @@ fn emit_update_insns<'a>(
     all_index_cursors: &[(Arc<Index>, usize)],
     target_table_cursor_id: usize,
     target_table: Arc<JoinedTable>,
-    resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
 ) -> crate::Result<()> {
@@ -1719,7 +1704,14 @@ fn emit_update_insns<'a>(
             let relevant_checks: Vec<CheckConstraint> = btree_table
                 .check_constraints
                 .iter()
-                .filter(|cc| check_expr_references_columns(&cc.expr, &updated_col_names))
+                .filter(|cc| {
+                    check_expr_references_updated_columns(
+                        &cc.expr,
+                        |idx| affected_columns.get(idx),
+                        &updated_col_names,
+                        updates_rowid,
+                    )
+                })
                 .cloned()
                 .collect();
 
@@ -1779,11 +1771,10 @@ fn emit_update_insns<'a>(
     let mut seen_replace = false;
     for (index, (idx_cursor_id, record_reg)) in indexes_to_update.iter().zip(index_cursors) {
         let (old_satisfies_where, new_satisfies_where) = if index.where_clause.is_some() {
-            // This means that we need to bind the column references to a copy of the index Expr,
-            // so we can emit Insn::Column instructions and refer to the old values.
-            let where_clause = index
-                .bind_where_expr(Some(table_references), resolver)
-                .expect("where clause to exist");
+            let where_clause = target_table
+                .bound_partial_index_where(index)
+                .expect("binder provided the partial-index predicate")
+                .clone();
             let old_satisfied_reg = program.alloc_register();
             translate_expr_no_constant_opt(
                 program,
@@ -1794,10 +1785,8 @@ fn emit_update_insns<'a>(
                 NoConstantOptReason::RegisterReuse,
             )?;
 
-            // Evaluate the partial index predicate against the NEW row image.
-            // We use emit_dml_expr_index_value which properly sets up SelfTableContext::ForDML,
-            // allowing resolve_union_from_column to find type definitions for custom type
-            // functions like union_tag() in the WHERE clause.
+            // Evaluate the partial index predicate against the NEW row image using the
+            // DML self-table register mapping.
             let new_where_expr = index
                 .where_clause
                 .as_ref()
