@@ -85,7 +85,7 @@ fn seed_pk_composite_fanout() -> Scenario {
     }
 }
 
-fn seed_secondary_index_dups() -> Scenario {
+fn seed_secondary_index_unique_outer() -> Scenario {
     let (dir, conn) = create_db_with_schema(
         "CREATE TABLE l(id INTEGER PRIMARY KEY, k INT);
          CREATE TABLE r(id INTEGER PRIMARY KEY, k INT);",
@@ -95,20 +95,50 @@ fn seed_secondary_index_dups() -> Scenario {
         let mut insert_l = tx.prepare("INSERT INTO l(id, k) VALUES (?1, ?2)").unwrap();
         let mut insert_r = tx.prepare("INSERT INTO r(id, k) VALUES (?1, ?2)").unwrap();
         for id in 1..=100_000i64 {
-            let k = (id - 1) % 25_000 + 1;
-            insert_l.execute((id, k)).unwrap();
+            insert_l.execute((id, id * 2)).unwrap();
+            let k = ((id - 1) % 25_000 + 1) * 2;
             insert_r.execute((id, k)).unwrap();
         }
     }
     tx.commit().unwrap();
     conn.execute_batch(
-        "CREATE INDEX idx_l_k ON l(k);
+        "CREATE UNIQUE INDEX idx_l_k ON l(k);
          CREATE INDEX idx_r_k ON r(k);",
     )
     .unwrap();
     Scenario {
-        name: "secondary_index_dups",
+        name: "secondary_index_unique_outer",
         query: "SELECT count(*) FROM l JOIN r ON l.k = r.k",
+        dir,
+    }
+}
+
+fn seed_group_stream_limit() -> Scenario {
+    let (dir, conn) = create_db_with_schema(
+        "CREATE TABLE orders(o_id INTEGER PRIMARY KEY, o_v INT);
+         CREATE TABLE lineitem(l_oid INT, l_ln INT, l_q INT, PRIMARY KEY(l_oid, l_ln));",
+    );
+    let tx = conn.unchecked_transaction().unwrap();
+    {
+        let mut insert_order = tx
+            .prepare("INSERT INTO orders(o_id, o_v) VALUES (?1, ?2)")
+            .unwrap();
+        let mut insert_line = tx
+            .prepare("INSERT INTO lineitem(l_oid, l_ln, l_q) VALUES (?1, ?2, ?3)")
+            .unwrap();
+        for o_id in 1..=50_000i64 {
+            insert_order.execute((o_id, o_id % 100)).unwrap();
+            for l_ln in 1..=4i64 {
+                insert_line
+                    .execute((o_id, l_ln, (o_id + l_ln) % 50))
+                    .unwrap();
+            }
+        }
+    }
+    tx.commit().unwrap();
+    Scenario {
+        name: "group_stream_limit",
+        query: "SELECT o_id, count(*) FROM orders JOIN lineitem ON l_oid = o_id GROUP BY o_id ORDER BY o_id LIMIT 100",
         dir,
     }
 }
@@ -178,8 +208,9 @@ fn bench_merge_join(criterion: &mut Criterion) {
     let scenarios = [
         seed_pk_pk_join(),
         seed_pk_composite_fanout(),
-        seed_secondary_index_dups(),
+        seed_secondary_index_unique_outer(),
         seed_three_way_chain(),
+        seed_group_stream_limit(),
     ];
 
     for scenario in &scenarios {

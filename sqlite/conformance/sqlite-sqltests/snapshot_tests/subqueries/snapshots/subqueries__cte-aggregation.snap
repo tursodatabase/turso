@@ -28,4 +28,4 @@ info:
 QUERY PLAN
 |--SCAN category_stats AS cs
 |  `--SCAN products USING INDEX idx_products_category
-`--MERGE JOIN categories AS c USING INTEGER PRIMARY KEY
+`--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)

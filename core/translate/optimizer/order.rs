@@ -273,57 +273,13 @@ pub fn plan_satisfies_order_target(
         }
 
         // Check if this table has an access method that provides the right ordering.
-        let consumed = match &access_method.params {
-            AccessMethodParams::BTreeTable {
-                iter_dir,
-                index: index_opt,
-                constraint_refs,
-            } => btree_access_order_consumed(
-                table_ref,
-                *iter_dir,
-                index_opt.as_deref(),
-                constraint_refs,
-                &order_target.columns[target_col_idx..],
-                schema,
-                EqualityPrefixScope::ConstantEquality,
-            ),
-            AccessMethodParams::MaterializedSubquery {
-                index,
-                constraint_refs,
-                iter_dir,
-            } => btree_access_order_consumed(
-                table_ref,
-                *iter_dir,
-                Some(index.as_ref()),
-                constraint_refs,
-                &order_target.columns[target_col_idx..],
-                schema,
-                EqualityPrefixScope::ConstantEquality,
-            ),
-            AccessMethodParams::Subquery { iter_dir } => {
-                let Table::FromClauseSubquery(from_clause_subquery) = &table_ref.table else {
-                    unreachable!(
-                        "access_method.params::Subquery must be for a FromClauseSubquery table"
-                    );
-                };
-                subquery_intrinsic_order_consumed(
-                    table_ref.internal_id,
-                    from_clause_subquery,
-                    *iter_dir,
-                    &order_target.columns[target_col_idx..],
-                    schema,
-                )
-            }
-            AccessMethodParams::MergeJoin { index, .. } => btree_access_order_consumed(
-                table_ref,
-                IterationDirection::Forwards,
-                index.as_deref(),
-                &[],
-                &order_target.columns[target_col_idx..],
-                schema,
-                EqualityPrefixScope::ConstantEquality,
-            ),
-            _ => return false,
+        let Some(consumed) = access_method_order_consumed(
+            access_method,
+            table_ref,
+            &order_target.columns[target_col_idx..],
+            schema,
+        ) else {
+            return false;
         };
 
         if consumed == 0 {
@@ -354,6 +310,123 @@ pub fn plan_satisfies_order_target(
         {
             return false;
         }
+    }
+    target_col_idx == num_cols_in_order_target
+}
+
+fn access_method_order_consumed(
+    access_method: &AccessMethod,
+    table_ref: &JoinedTable,
+    remaining_target: &[ColumnOrder],
+    schema: &Schema,
+) -> Option<usize> {
+    match &access_method.params {
+        AccessMethodParams::BTreeTable {
+            iter_dir,
+            index: index_opt,
+            constraint_refs,
+        } => Some(btree_access_order_consumed(
+            table_ref,
+            *iter_dir,
+            index_opt.as_deref(),
+            constraint_refs,
+            remaining_target,
+            schema,
+            EqualityPrefixScope::ConstantEquality,
+        )),
+        AccessMethodParams::MaterializedSubquery {
+            index,
+            constraint_refs,
+            iter_dir,
+        } => Some(btree_access_order_consumed(
+            table_ref,
+            *iter_dir,
+            Some(index.as_ref()),
+            constraint_refs,
+            remaining_target,
+            schema,
+            EqualityPrefixScope::ConstantEquality,
+        )),
+        AccessMethodParams::Subquery { iter_dir } => {
+            let Table::FromClauseSubquery(from_clause_subquery) = &table_ref.table else {
+                unreachable!("access_method.params::Subquery must be for a FromClauseSubquery table");
+            };
+            Some(subquery_intrinsic_order_consumed(
+                table_ref.internal_id,
+                from_clause_subquery,
+                *iter_dir,
+                remaining_target,
+                schema,
+            ))
+        }
+        AccessMethodParams::MergeJoin { index, .. } => Some(btree_access_order_consumed(
+            table_ref,
+            IterationDirection::Forwards,
+            index.as_deref(),
+            &[],
+            remaining_target,
+            schema,
+            EqualityPrefixScope::ConstantEquality,
+        )),
+        _ => None,
+    }
+}
+
+pub(super) fn plan_provides_target_keys_uniquely(
+    plan: &JoinN,
+    access_methods_arena: &[AccessMethod],
+    joined_tables: &[JoinedTable],
+    order_target: &OrderTarget,
+    schema: &Schema,
+) -> bool {
+    for (_, access_method_index) in plan.data.iter() {
+        let access_method = &access_methods_arena[*access_method_index];
+        if let AccessMethodParams::HashJoin { join_type, .. } = &access_method.params {
+            if matches!(join_type, HashJoinType::LeftOuter | HashJoinType::FullOuter) {
+                return false;
+            }
+        }
+    }
+
+    let mut target_col_idx = 0;
+    let num_cols_in_order_target = order_target.columns.len();
+    for (table_index, access_method_index) in plan.data.iter() {
+        let access_method = &access_methods_arena[*access_method_index];
+        let table_ref = &joined_tables[*table_index];
+
+        if target_col_idx == num_cols_in_order_target {
+            if !access_method_emits_unique_order_prefix(access_method, 0) {
+                return false;
+            }
+            continue;
+        }
+
+        if table_ref
+            .join_info
+            .as_ref()
+            .is_some_and(|join_info| join_info.is_outer())
+            && order_target.columns[target_col_idx..]
+                .iter()
+                .any(|target_col| target_col.table_id == table_ref.internal_id)
+        {
+            return false;
+        }
+
+        let Some(consumed) = access_method_order_consumed(
+            access_method,
+            table_ref,
+            &order_target.columns[target_col_idx..],
+            schema,
+        ) else {
+            return false;
+        };
+        if consumed == 0 {
+            return false;
+        }
+        if !access_method_emits_unique_order_prefix(access_method, consumed) {
+            return false;
+        }
+        target_col_idx += consumed;
     }
     target_col_idx == num_cols_in_order_target
 }

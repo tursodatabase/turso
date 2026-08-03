@@ -43,7 +43,7 @@ use super::{
         consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
     },
     order::{
-        btree_access_order_consumed, expr_to_column_order, plan_satisfies_order_target,
+        btree_access_order_consumed, expr_to_column_order, plan_provides_target_keys_uniquely,
         subquery_intrinsic_order_consumed, ColumnTarget, EliminatesSortBy, EqualityPrefixScope,
         OrderTarget, OrderTargetPurpose,
     },
@@ -1546,7 +1546,13 @@ pub fn try_merge_join_access_method(
             columns: target_columns,
             purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
         };
-        if !plan_satisfies_order_target(lhs, access_methods_arena, joined_tables, &target, schema) {
+        if !plan_provides_target_keys_uniquely(
+            lhs,
+            access_methods_arena,
+            joined_tables,
+            &target,
+            schema,
+        ) {
             continue;
         }
         let index_info = match candidate.index.as_ref() {
