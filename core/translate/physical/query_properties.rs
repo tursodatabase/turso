@@ -2686,7 +2686,8 @@ fn ranking_windows_rescan_the_bound_hir_source(tc: hegel::TestCase) {
 
 // Examples:
 // - `percent_rank() OVER (PARTITION BY g ORDER BY value)` divides the number
-//   of earlier rows by `partition_size - 1`, returning zero for one-row groups.
+//   of earlier rows by `partition_size - 1`, returning real `0.0` for one-row
+//   groups instead of an integer zero.
 // - `cume_dist() OVER (PARTITION BY g ORDER BY value DESC NULLS FIRST)` puts
 //   the NULL peer group first and includes every peer in the numerator.
 // - `ntile(4) OVER (PARTITION BY g ORDER BY value)` puts the extra rows in the
@@ -2759,6 +2760,19 @@ fn distribution_windows_use_bound_partition_and_order_inputs(tc: hegel::TestCase
             .count(),
         5,
         "the sorter and each function scan the rows, with one extra NTILE bucket scan"
+    );
+    assert!(
+        program.insns.windows(3).any(|instructions| {
+            matches!(
+                (&instructions[0].0, &instructions[1].0, &instructions[2].0),
+                (
+                    Insn::AddImm { value: -1, .. },
+                    Insn::RealAffinity { .. },
+                    Insn::If { .. }
+                )
+            )
+        }),
+        "percent_rank becomes real before the singleton shortcut"
     );
     assert!(program
         .insns

@@ -3756,6 +3756,7 @@ fn emit_ranking_window_row<'document>(
                     });
                     let divide = program.allocate_label();
                     let calculated = program.allocate_label();
+                    program.emit_insn(Insn::RealAffinity { register: value.0 });
                     program.emit_insn(Insn::If {
                         reg: denominator,
                         target_pc: divide,
@@ -3765,7 +3766,6 @@ fn emit_ranking_window_row<'document>(
                         target_pc: calculated,
                     });
                     program.preassign_label_to_next_insn(divide);
-                    program.emit_insn(Insn::RealAffinity { register: value.0 });
                     program.emit_insn(Insn::Divide {
                         lhs: value.0,
                         rhs: denominator,
