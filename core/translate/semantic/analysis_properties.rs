@@ -1343,6 +1343,49 @@ fn where_aliases_copy_the_bound_output_expression(tc: hegel::TestCase) {
     assert_eq!(filter_column, output_column);
 }
 
+// Examples:
+// - `percent_rank() FILTER (WHERE c0 > 0) OVER (ORDER BY c0)` is rejected
+//   because built-in window functions do not own aggregate input state.
+// - `lag(c0) FILTER (WHERE c0 > 0) OVER (ORDER BY c0)` is rejected for the
+//   same reason even though it accepts a value argument.
+// - `sum(c0) FILTER (WHERE c0 > 0) OVER (ORDER BY c0)` remains valid because
+//   an aggregate window may filter the rows fed to its accumulator.
+#[hegel::test]
+fn filter_is_only_bound_to_aggregate_window_functions(tc: hegel::TestCase) {
+    let builtins = [
+        "row_number()",
+        "rank()",
+        "dense_rank()",
+        "percent_rank()",
+        "cume_dist()",
+        "ntile(2)",
+        "lag(c0)",
+        "lead(c0)",
+    ];
+    let builtin = builtins[tc.draw(generators::integers::<usize>().max_value(builtins.len() - 1))];
+    let aggregates = ["sum(c0)", "count(*)", "min(c0)", "max(c0)"];
+    let aggregate =
+        aggregates[tc.draw(generators::integers::<usize>().max_value(aggregates.len() - 1))];
+    let schema = schema_with_items(1);
+    let symbols = SymbolTable::new();
+    let context = semantic_context(&schema, &symbols);
+
+    let rejected = parse_statement(&format!(
+        "SELECT {builtin} FILTER (WHERE c0 > 0) OVER (ORDER BY c0) FROM items"
+    ));
+    let error = analyze(&context, AnalyzeInput::Statement(&rejected))
+        .expect_err("FILTER on a built-in window function is invalid");
+    assert!(error
+        .to_string()
+        .contains("FILTER clause may only be used with aggregate window functions"));
+
+    let accepted = parse_statement(&format!(
+        "SELECT {aggregate} FILTER (WHERE c0 > 0) OVER (ORDER BY c0) FROM items"
+    ));
+    analyze(&context, AnalyzeInput::Statement(&accepted))
+        .expect("FILTER on an aggregate window function is valid");
+}
+
 // Examples: `SELECT c0 FROM items ORDER BY sum(c0)` is an aggregate misuse,
 // while `SELECT count(*) FROM items ORDER BY sum(c0)` and
 // `SELECT c0 FROM items GROUP BY c0 ORDER BY sum(c0)` are aggregate queries.

@@ -1568,6 +1568,11 @@ impl Analyzer<'_, '_> {
         if tail.over_clause.is_some() && !aggregate && !window_only {
             crate::bail_parse_error!("{}() may not be used as a window function", function_name);
         }
+        if tail.filter_clause.is_some() && window_only {
+            crate::bail_parse_error!(
+                "FILTER clause may only be used with aggregate window functions"
+            );
+        }
         if tail.filter_clause.is_some() && !aggregate && !window_only {
             crate::bail_parse_error!(
                 "FILTER may not be used with non-aggregate {}()",
