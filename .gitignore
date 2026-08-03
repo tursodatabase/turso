@@ -16,6 +16,7 @@
 # Python
 *.egg-info/
 .hypothesis/
+.hegel/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/

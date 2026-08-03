@@ -392,7 +392,7 @@ pub enum FtsFunc {
     /// fts_match(col1, col2, ..., query): returns true if document matches query
     /// Used in WHERE clause for filtering rows by FTS match
     Match,
-    /// fts_highlight(text, query, before_tag, after_tag): returns text with matching terms highlighted
+    /// fts_highlight(text..., before_tag, after_tag, query): highlights matching terms
     /// Wraps matching query terms in the text with before_tag and after_tag markers
     Highlight,
 }
@@ -405,9 +405,8 @@ impl FtsFunc {
 
     pub fn arities(&self) -> &'static [i32] {
         match self {
-            Self::Highlight => &[4],
-            // Score and Match take variable columns + query
-            Self::Score | Self::Match => &[-1],
+            // All FTS functions accept a variable number of leading columns.
+            Self::Score | Self::Match | Self::Highlight => &[-1],
         }
     }
 }
@@ -532,60 +531,6 @@ impl WindowFunc {
                 | Self::PercentRank
                 | Self::CumeDist
         )
-    }
-
-    /// The hardcoded frame this built-in evaluates over, overriding any
-    /// user-written FRAME clause.
-    /// - `Some(frame)` = even if the user provides an explicit frame, it's ignored in favor of this hardcoded frame.
-    /// - `None` = the function honors the user's frame, falling back to Frame::default() when user hasn't specified one.
-    ///
-    /// This is taken from SQLite's `sqlite3WindowUpdate` table at `window.c:699-708`.
-    pub fn coerced_frame(&self) -> Option<crate::translate::plan::Frame> {
-        use crate::translate::plan::{Frame, FrameBoundary};
-        use turso_parser::ast::{Expr, FrameMode, Literal};
-        match self {
-            // Lag shares row_number's streaming frame even though its lookup
-            // can point forward (negative offset): SQLite emits a row as soon
-            // as the row after it is buffered, so a forward lookup past that
-            // one row misses and yields the default — behavior we match by
-            // using the same frame rather than caching the whole partition.
-            Self::RowNumber | Self::Lag => Some(Frame {
-                mode: FrameMode::Rows,
-                start: FrameBoundary::UnboundedPreceding,
-                end: FrameBoundary::CurrentRow,
-            }),
-            Self::Rank | Self::DenseRank => Some(Frame {
-                mode: FrameMode::Range,
-                start: FrameBoundary::UnboundedPreceding,
-                end: FrameBoundary::CurrentRow,
-            }),
-            Self::PercentRank => Some(Frame {
-                mode: FrameMode::Groups,
-                start: FrameBoundary::CurrentRow,
-                end: FrameBoundary::UnboundedFollowing,
-            }),
-            Self::CumeDist => Some(Frame {
-                mode: FrameMode::Groups,
-                start: FrameBoundary::Following(Box::new(Expr::Literal(Literal::Numeric(
-                    "1".to_string(),
-                )))),
-                end: FrameBoundary::UnboundedFollowing,
-            }),
-            Self::Ntile => Some(Frame {
-                mode: FrameMode::Rows,
-                start: FrameBoundary::CurrentRow,
-                end: FrameBoundary::UnboundedFollowing,
-            }),
-            Self::Lead => Some(Frame {
-                mode: FrameMode::Rows,
-                start: FrameBoundary::UnboundedPreceding,
-                end: FrameBoundary::UnboundedFollowing,
-            }),
-            Self::FirstValue | Self::LastValue | Self::NthValue => None,
-            Self::External(_) => unreachable!(
-                "WindowFunc::External is not constructible: ExtFunc has no Window variant"
-            ),
-        }
     }
 }
 

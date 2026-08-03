@@ -33,6 +33,7 @@ pub mod mvcc;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
 pub mod schema;
+mod schema_expr;
 pub mod skiplist;
 pub mod state_machine;
 pub mod storage;

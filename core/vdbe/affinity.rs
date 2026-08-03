@@ -328,10 +328,6 @@ impl Affinity {
                 Literal::Blob(_) => true,
                 _ => false,
             },
-            Expr::Column {
-                is_rowid_alias: true,
-                ..
-            } => self.is_numeric(),
             _ => false,
         }
     }

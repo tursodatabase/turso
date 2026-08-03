@@ -31,6 +31,10 @@ use std::fmt::{self, Display, Formatter};
 // The state table has 5 columns: operator_id, zset_id, element_id, value, weight
 const OPERATOR_COLUMNS: usize = 5;
 
+fn incremental_input_name(position: usize) -> String {
+    format!("__turso_incremental_input_{position}")
+}
+
 /// State machine for writing rows to simple materialized views (table-only, no index)
 #[derive(Debug, Default)]
 pub enum WriteRowView {
@@ -1622,11 +1626,10 @@ impl DbspCompiler {
         // Convert LogicalExpr to AST Expr with proper column resolution
         let ast_expr = Self::logical_to_ast_expr_with_schema(expr, input_schema)?;
 
-        // Extract column names from schema for CompiledExpression::compile
-        let input_column_names: Vec<String> = input_schema
-            .columns
-            .iter()
-            .map(|col| col.name.clone())
+        // Use position-derived names so duplicate SQL column names remain
+        // unambiguous without putting runtime registers in parser syntax.
+        let input_column_names: Vec<String> = (0..input_schema.columns.len())
+            .map(incremental_input_name)
             .collect();
 
         // For all expressions (simple or complex), use CompiledExpression::compile
@@ -1678,8 +1681,7 @@ impl DbspCompiler {
                             col.name, col.table
                         ))
                     })?;
-                // Return a Register expression with the correct index
-                Ok(ast::Expr::Register(idx))
+                Ok(ast::Expr::Id(ast::Name::exact(incremental_input_name(idx))))
             }
             LogicalExpr::Literal(val) => {
                 let lit = match val {
@@ -1688,8 +1690,7 @@ impl DbspCompiler {
                         ast::Literal::Numeric(f64::from(*f).to_string())
                     }
                     Value::Text(t) => {
-                        // Add quotes for string literals as translate_expr expects them
-                        // Also escape any single quotes in the string
+                        // Preserve SQL string-literal quoting and escaping.
                         let escaped = t.to_string().replace('\'', "''");
                         ast::Literal::String(format!("'{escaped}'"))
                     }

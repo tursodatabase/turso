@@ -10,32 +10,83 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SCAN sqlite_schema
+
 
 BYTECODE
-addr  opcode        p1  p2  p3  p4                  p5  comment
-   0  Init           0  20   0                       0  Start at 20
-   1  OpenWrite      0   1   0                       0  root=1; iDb=0
-   2  Rewind         0  17   0                       0  Rewind table sqlite_schema
-   3    Column       0   1   2                       0  r[2]=sqlite_schema.name
-   4    Ne           2   3  16  NoCase               0  if r[2]!=r[3] goto 16
-   5    Column       0   0   5                       0  r[5]=sqlite_schema.type
-   6    Ne           5   6  16  Binary               0  if r[5]!=r[6] goto 16
-   7    RowId        0   7   0                       0  r[7]=sqlite_schema.rowid
-   8    IsNull       7  17   0                       0  if (r[7]==NULL) goto 17
-   9    Column       0   0   8                       0  r[8]=sqlite_schema.type
-  10    Column       0   1   9                       0  r[9]=sqlite_schema.name
-  11    Column       0   2  10                       0  r[10]=sqlite_schema.tbl_name
-  12    Column       0   3  11                       0  r[11]=sqlite_schema.rootpage
-  13    Affinity     8   5   0                       0  r[8..13] = B, B, B, D, B
-  14    MakeRecord   8   5  13                       0  r[13]=mkrec(r[8..12])
-  15    Insert       0  13   7  sqlite_schema        8  intkey=r[7] data=r[13]
-  16  Next           0   3   0                       0
-  17  SetCookie      0   1   3                       0
-  18  DropColumn     0   0   0                       0  drop_column(t, 1)
-  19  Halt           0   0   0                       0
-  20  Transaction    0   2   2                       0  iDb=0 tx_mode=Write
-  21  String8        0   3   0  t                    0  r[3]='t'
-  22  String8        0   6   0  table                0  r[6]='table'
-  23  String8        0  12   0  CREATE TABLE t (a)   0  r[12]='CREATE TABLE t (a)'
-  24  Goto           0   1   0                       0
+addr  opcode          p1  p2  p3  p4                   p5  comment
+   0  Init             0  74   0                        0  Start at 74
+   1  Null             0   1   0                        0  r[1]=NULL
+   2  OpenWrite        0   1   0                        0  root=1; iDb=0
+   3  Rewind           0  21   0                        0  Rewind  sqlite_schema
+   4    Column         0   1  17                        0  r[17]=sqlite_schema.name
+   5    Affinity      17   1   0                        0  r[17..18] = B
+   6    String8        0  18   0  t                     0  r[18]='t'
+   7    Integer        1  16   0                        0  r[16]=1
+   8    Eq            17  18  10  NoCase                0  if r[17]==r[18] goto 10
+   9    ZeroOrNull    17  16  18                        0  ((r[17]=NULL)|(r[18]=NULL)) ? r[16]=NULL : r[16]=0
+  10    Column         0   0  20                        0  r[20]=sqlite_schema.type
+  11    Affinity      20   1   0                        0  r[20..21] = B
+  12    String8        0  21   0  table                 0  r[21]='table'
+  13    Integer        1  19   0                        0  r[19]=1
+  14    Eq            20  21  16                        0  if r[20]==r[21] goto 16
+  15    ZeroOrNull    20  19  21                        0  ((r[20]=NULL)|(r[21]=NULL)) ? r[19]=NULL : r[19]=0
+  16    And           19  16  15                        0  r[15]=(r[16] && r[19])
+  17    IfNot         15  20   1                        0  if !r[15] goto 20
+  18    RowId          0   2   0                        0  r[2]=sqlite_schema.rowid
+  19    RowSetAdd      1   2   0                        0
+  20  Next             0   4   0                        0
+  21    RowSetRead     1  70   2                        0
+  22    NotExists      0  69   2                        0
+  23    Copy           2   3   0                        0  r[3]=r[2]
+  24    Column         0   0   9                        0  r[9]=sqlite_schema.type
+  25    Affinity       9   1   0                        0  r[9..10] = B
+  26    Copy           9   4   0                        0  r[4]=r[9]
+  27    Column         0   1  10                        0  r[10]=sqlite_schema.name
+  28    Affinity      10   1   0                        0  r[10..11] = B
+  29    Copy          10   5   0                        0  r[5]=r[10]
+  30    Column         0   2  11                        0  r[11]=sqlite_schema.tbl_name
+  31    Affinity      11   1   0                        0  r[11..12] = B
+  32    Copy          11   6   0                        0  r[6]=r[11]
+  33    Column         0   3  12                        0  r[12]=sqlite_schema.rootpage
+  34    Affinity      12   1   0                        0  r[12..13] = D
+  35    Copy          12   7   0                        0  r[7]=r[12]
+  36    Column         0   4  13                        0  r[13]=sqlite_schema.sql
+  37    Affinity      13   1   0                        0  r[13..14] = B
+  38    Copy          13   8   0                        0  r[8]=r[13]
+  39    String8        0  22   0  CREATE TABLE t (a)    0  r[22]='CREATE TABLE t (a)'
+  40    Copy          22   8   0                        0  r[8]=r[22]
+  41    Affinity       4   1   0                        0  r[4..5] = B
+  42    Affinity       5   1   0                        0  r[5..6] = B
+  43    Affinity       6   1   0                        0  r[6..7] = B
+  44    Affinity       7   1   0                        0  r[7..8] = D
+  45    Affinity       8   1   0                        0  r[8..9] = B
+  46    NotExists      0  69   2                        0
+  47    MustBeInt      3   0   0                        0
+  48    Eq             3   2  51                        0  if r[3]==r[2] goto 51
+  49    NotExists      0  51   3                        0
+  50    Halt        1555   0   0  sqlite_schema.rowid   0
+  51    SeekRowid      0   2  69                        0  if (r[2]!=cursor 0.rowid) goto 69
+  52    Affinity       4   1   0                        0  r[4..5] = B
+  53    Copy           4  23   0                        0  r[23]=r[4]
+  54    Affinity       5   1   0                        0  r[5..6] = B
+  55    Copy           5  24   0                        0  r[24]=r[5]
+  56    Affinity       6   1   0                        0  r[6..7] = B
+  57    Copy           6  25   0                        0  r[25]=r[6]
+  58    Affinity       7   1   0                        0  r[7..8] = D
+  59    Copy           7  26   0                        0  r[26]=r[7]
+  60    Affinity       8   1   0                        0  r[8..9] = B
+  61    Copy           8  27   0                        0  r[27]=r[8]
+  62    MakeRecord    23   5  14                        0  r[14]=mkrec(r[23..27]); for sqlite_schema
+  63    Eq             2   3  65                        0  if r[2]==r[3] goto 65
+  64    Delete         0   0   0  sqlite_schema         0
+  65    Eq             2   3  68                        0  if r[2]==r[3] goto 68
+  66    Insert         0  14   3  sqlite_schema        11  intkey=r[3] data=r[14]
+  67    Goto           0  69   0                        0
+  68    Insert         0  14   3  sqlite_schema         8  intkey=r[3] data=r[14]
+  69  Goto             0  21   0                        0
+  70  Close            0   0   0                        0
+  71  SetCookie        0   1   3                        0
+  72  DropColumn       0   0   0                        0  drop_column(t, 1)
+  73  Halt             0   0   0                        0
+  74  Transaction      0   2   2                        0  iDb=0 tx_mode=Write
+  75  Goto             0   1   0                        0

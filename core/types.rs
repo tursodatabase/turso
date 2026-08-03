@@ -2472,14 +2472,12 @@ where
     );
     let (l, r) = (l.take(column_info.len()), r.take(column_info.len()));
     for (i, (l, r)) in l.zip(r).enumerate() {
-        let column_order = column_info[i].sort_order;
-        let collation = column_info[i].collation;
-        let cmp = compare_immutable_single(l, r, collation);
+        let key = &column_info[i];
+        let l = l.as_value_ref();
+        let r = r.as_value_ref();
+        let cmp = compare_immutable_single(&l, &r, key.collation);
         if !cmp.is_eq() {
-            return match column_order {
-                SortOrder::Asc => cmp,
-                SortOrder::Desc => cmp.reverse(),
-            };
+            return cmp_with_sort(cmp, &l, &r, key);
         }
     }
     std::cmp::Ordering::Equal
@@ -2495,7 +2493,7 @@ where
     E1: Iterator<Item = Result<V>>,
     E2: Iterator<Item = Result<V>>,
 {
-    for col_info in column_info.iter() {
+    for key in column_info.iter() {
         let l = match l.next() {
             Some(v) => v,
             None => break,
@@ -2504,14 +2502,13 @@ where
             Some(v) => v,
             None => break,
         };
-        let column_order = col_info.sort_order;
-        let collation = col_info.collation;
-        let cmp = compare_immutable_single(l?, r?, collation);
+        let l = l?;
+        let r = r?;
+        let l_ref = l.as_value_ref();
+        let r_ref = r.as_value_ref();
+        let cmp = compare_immutable_single(&l_ref, &r_ref, key.collation);
         if !cmp.is_eq() {
-            return match column_order {
-                SortOrder::Asc => Ok(cmp),
-                SortOrder::Desc => Ok(cmp.reverse()),
-            };
+            return Ok(cmp_with_sort(cmp, &l_ref, &r_ref, key));
         }
     }
     Ok(std::cmp::Ordering::Equal)
@@ -3656,6 +3653,29 @@ mod tests {
     use super::*;
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
+    use turso_parser::ast::NullsOrder;
+
+    #[test]
+    fn immutable_comparison_honors_explicit_null_order() {
+        let null = [Value::Null];
+        let one = [Value::from_i64(1)];
+        for (sort_order, nulls_order, expected) in [
+            (SortOrder::Asc, NullsOrder::First, Ordering::Less),
+            (SortOrder::Asc, NullsOrder::Last, Ordering::Greater),
+            (SortOrder::Desc, NullsOrder::First, Ordering::Less),
+            (SortOrder::Desc, NullsOrder::Last, Ordering::Greater),
+        ] {
+            let key_info = [KeyInfo {
+                sort_order,
+                collation: CollationSeq::Binary,
+                nulls_order: Some(nulls_order),
+            }];
+            assert_eq!(
+                compare_immutable(null.iter(), one.iter(), &key_info),
+                expected
+            );
+        }
+    }
 
     fn assert_integer_conversions<T>(in_range: &[(i64, T)], out_of_range: &[i64])
     where

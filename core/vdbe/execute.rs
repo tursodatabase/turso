@@ -10,8 +10,7 @@ use crate::mvcc::database::{BootstrapState, CheckpointStateMachine, TxID};
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{
-    render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
-    SQLITE_SEQUENCE_TABLE_NAME,
+    Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME, SQLITE_SEQUENCE_TABLE_NAME,
 };
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
@@ -60,7 +59,7 @@ use crate::{
     connection::Row,
     get_cursor, info, is_attached_db,
     storage::wal::CheckpointResult,
-    turso_assert,
+    turso_assert, turso_assert_eq,
     types::{AggContext, Cursor, ExternalAggState, SeekKey, SeekOp, SumAggState, Value, ValueType},
     util::{cast_real_to_integer, checked_cast_text_to_numeric},
     vdbe::{
@@ -4282,19 +4281,20 @@ pub fn op_transaction_inner(
                     }
                 }
                 if is_top_level_statement
-                    && is_main_db
                     && auto_commit
                     && state.auto_txn_cleanup == TxnCleanup::None
                 {
-                    let active_root_statements = program
-                        .connection
-                        .n_active_root_statements
-                        .load(Ordering::SeqCst);
-                    if active_root_statements > 1 {
+                    let joined_implicit_main_transaction = is_main_db
+                        && program
+                            .connection
+                            .n_active_root_statements
+                            .load(Ordering::SeqCst)
+                            > 1;
+                    if is_secondary_db || joined_implicit_main_transaction {
                         // A sibling statement opened the implicit transaction
-                        // before this statement joined it. Mark this statement
-                        // so the last remaining sibling can close the
-                        // transaction.
+                        // before this statement joined it, or this statement
+                        // opened an attached-only transaction. Mark the root so
+                        // Halt commits it (or the last sibling closes it).
                         state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                     }
                 }
@@ -12966,7 +12966,7 @@ pub fn op_sequence_begin_inner_tx(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         SequenceBeginInnerTx {
@@ -12978,6 +12978,7 @@ pub fn op_sequence_begin_inner_tx(
     );
 
     let conn = program.connection.clone();
+    let pager = program.get_pager_from_database_index(db)?;
     let Some(mv_store) = conn.mv_store_for_db(*db) else {
         // WAL mode: no inner tx needed. The WAL single-writer lock
         // already serializes writes across processes.
@@ -13040,7 +13041,7 @@ pub fn op_sequence_commit_inner_tx(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         SequenceCommitInnerTx {
@@ -13069,6 +13070,7 @@ pub fn op_sequence_commit_inner_tx(
     }
 
     let conn = program.connection.clone();
+    let pager = program.get_pager_from_database_index(db)?;
     let mv_store = conn.mv_store_for_db(*db).ok_or_else(|| {
         LimboError::InternalError(
             "SequenceCommitInnerTx: no MV store for db but path was Wrapped".to_string(),
@@ -13195,14 +13197,12 @@ pub fn op_close(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Close { cursor_id }, insn);
+    invalidate_deferred_seeks_for_cursor(state, *cursor_id);
     let cursors = &mut state.cursors;
     cursors
         .get_mut(*cursor_id)
         .expect("cursor_id should be valid")
         .take();
-    if let Some(deferred_seek) = state.deferred_seeks.get_mut(*cursor_id) {
-        deferred_seek.take();
-    }
     state.ephemeral_temp_files.remove(cursor_id);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -15035,7 +15035,6 @@ pub fn op_rename_table(
             Table::Virtual(vtab) => {
                 Arc::make_mut(vtab).name.clone_from(&normalized_to);
             }
-            _ => panic!("only btree and virtual tables can be renamed"),
         }
 
         #[cfg(feature = "conn_raw_api")]
@@ -15194,7 +15193,7 @@ pub fn op_drop_column(
                 .is_none_or(|col| normalize_ident(col) != normalize_ident(&col_name))
         });
 
-        btree.shift_generated_column_indices_after_drop(*column_index)?;
+        btree.validate_generated_columns_after_drop(&column_name)?;
         Ok(())
     })??;
 
@@ -15215,9 +15214,8 @@ pub fn op_drop_column(
         Ok(())
     })?;
 
-    // Shift left pos_in_table in all indexes, and self-table placeholders in generated column
-    // expressions, to account for the dropped column. For example, if the dropped column had index
-    // 2, then anything that was indexed on column 3 or higher should be decremented by 1.
+    // Shift index column positions to account for the dropped column. Stored
+    // expression syntax keeps names and therefore needs no runtime rewrite.
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
             for index in indexes {
@@ -15227,19 +15225,6 @@ pub fn op_drop_column(
                         && index_column.pos_in_table > *column_index
                     {
                         index_column.pos_in_table -= 1;
-                    }
-                    if let Some(ref mut expr) = index_column.expr {
-                        crate::translate::expr::walk_expr_mut(expr, &mut |e| {
-                            if let ast::Expr::Column {
-                                table, column: c, ..
-                            } = e
-                            {
-                                if table.is_self_table() && *c > *column_index {
-                                    *c -= 1;
-                                }
-                            }
-                            Ok(crate::translate::expr::WalkControl::Continue)
-                        })?;
                     }
                 }
             }
@@ -15327,6 +15312,7 @@ pub fn op_alter_column(
             column_index,
             definition,
             rename,
+            renamed_generated_expressions,
         },
         insn
     );
@@ -15451,17 +15437,18 @@ pub fn op_alter_column(
         if *rename {
             btree.columns_mut()[*column_index].name = Some(new_name.clone());
 
-            // Refresh the cached sql in generated columns
-            let column_count = btree.columns().len();
-            for i in 0..column_count {
-                let cols_view = btree.columns();
-                if let Some(new_sql) = cols_view[i]
-                    .generated_expr()
-                    .map(|expr| render_gencol_expr_sql_with_new_names(expr, cols_view))
-                    .transpose()?
-                {
-                    btree.columns_mut()[i].set_generated_original_sql(new_sql)
-                }
+            turso_assert_eq!(renamed_generated_expressions.len(), btree.columns().len());
+            for (position, expression) in renamed_generated_expressions.iter().enumerate() {
+                let Some(expression) = expression else {
+                    continue;
+                };
+                let sql = expression.to_string();
+                let column = &mut btree.columns_mut()[position];
+                *column
+                    .generated_expr_mut()
+                    .expect("renamed generated expression must keep its owner") =
+                    expression.as_ref().clone();
+                column.set_generated_original_sql(sql);
             }
         } else {
             btree.columns_mut()[*column_index] = new_column.clone();

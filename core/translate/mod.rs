@@ -7,66 +7,51 @@
 //! a SELECT statement will be translated into a sequence of instructions that
 //! will read rows from the database and filter them according to a WHERE clause.
 
-pub(crate) mod aggregation;
 pub(crate) mod alter;
 pub(crate) mod analyze;
 pub(crate) mod attach;
 pub(crate) mod collate;
-mod compound_select;
-pub(crate) mod delete;
-pub(crate) mod display;
 pub(crate) mod emitter;
 pub(crate) mod expr;
-pub(crate) mod expression_index;
-pub(crate) mod fkeys;
-pub(crate) mod group_by;
 pub(crate) mod index;
-pub(crate) mod insert;
 pub(crate) mod integrity_check;
 pub(crate) mod logical;
-pub(crate) mod main_loop;
-pub(crate) mod optimizer;
-pub(crate) mod order_by;
+pub(crate) mod physical;
 pub(crate) mod plan;
-pub(crate) mod planner;
 pub(crate) mod pragma;
-pub(crate) mod recursive_cte;
-pub(crate) mod result_row;
+pub(crate) mod result;
 pub(crate) mod rollback;
 pub(crate) mod schema;
-pub(crate) mod select;
+pub(crate) mod semantic;
+mod semantic_prepare;
 pub(crate) mod sequence;
 pub(crate) mod stmt_journal;
-pub(crate) mod subquery;
 pub(crate) mod transaction;
 pub(crate) mod trigger;
-pub(crate) mod trigger_exec;
 pub(crate) mod update;
-pub(crate) mod upsert;
 pub(crate) mod vacuum;
-mod values;
 pub(crate) mod view;
-mod window;
 
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
-use crate::translate::delete::translate_delete;
-use crate::translate::emitter::Resolver;
+use crate::translate::emitter::DdlContext;
+use crate::translate::physical::{emit_root_with_context, PhysicalPlan};
+use crate::translate::result::ResultSetColumn;
+use crate::translate::semantic::{
+    analyze, context::DmlPolicy, context::SemanticContext, hir, AnalyzeInput,
+};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
 use alter::translate_alter_table;
 use analyze::translate_analyze;
 use index::{translate_create_index, translate_drop_index, translate_optimize, translate_reindex};
-use insert::translate_insert;
 use rollback::{translate_release, translate_rollback, translate_savepoint};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
-use select::translate_select;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
 use turso_parser::ast;
-use update::translate_update;
 
 #[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
@@ -106,7 +91,75 @@ pub fn translate(
     program.set_mvcc_enabled(connection.mvcc_enabled());
 
     program.prologue();
-    let mut resolver = Resolver::new(
+    match &stmt {
+        ast::Stmt::Select(_)
+        | ast::Stmt::Insert { .. }
+        | ast::Stmt::Update(_)
+        | ast::Stmt::Delete { .. } => {
+            translate_semantic_root(schema, &stmt, &mut program, &connection, syms, origin)?;
+        }
+        // There can be no nesting with pragma, so lift it up here
+        ast::Stmt::Pragma { name, body } => {
+            let ddl_context = new_ddl_context(schema, &connection, syms, origin);
+            pragma::translate_pragma(
+                &ddl_context,
+                name,
+                body.clone(),
+                pager,
+                connection.clone(),
+                &mut program,
+            )?;
+        }
+        _ => {
+            let mut ddl_context = new_ddl_context(schema, &connection, syms, origin);
+            translate_inner(stmt, &mut ddl_context, &mut program, &connection, input)?;
+        }
+    };
+
+    program.epilogue(schema);
+
+    program.build(connection, change_cnt_on, input)
+}
+
+fn translate_semantic_root(
+    schema: &Schema,
+    stmt: &ast::Stmt,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    syms: &SymbolTable,
+    origin: crate::statement::StatementOrigin,
+) -> Result<()> {
+    let is_write = matches!(
+        stmt,
+        ast::Stmt::Insert { .. } | ast::Stmt::Update(_) | ast::Stmt::Delete { .. }
+    );
+    if is_write && connection.get_query_only() {
+        bail_parse_error!("attempt to write a readonly database");
+    }
+    match stmt {
+        ast::Stmt::Update(update)
+            if update.where_clause.is_none() && connection.get_dml_require_where() =>
+        {
+            bail_parse_error!(
+                "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+            );
+        }
+        ast::Stmt::Delete {
+            where_clause: None, ..
+        } if connection.get_dml_require_where() => {
+            bail_parse_error!(
+                "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+            );
+        }
+        _ => {}
+    }
+
+    let dialect = if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
+        Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
+    } else {
+        connection.dialect()
+    };
+    let context = SemanticContext::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
@@ -114,34 +167,300 @@ pub fn translate(
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        // Engine-generated helper statements are always SQLite text and
-        // must resolve functions with SQLite semantics regardless of the
-        // database's dialect — the same invariant as unmarked schema rows.
+        dialect,
+    )
+    .with_dml_policy(DmlPolicy::new(
+        connection.is_nested_stmt(),
+        connection.is_mvcc_bootstrap_connection(),
+        false,
+        connection.check_constraints_ignored(),
+        connection.foreign_keys_enabled(),
+    ))
+    .with_capture_data_changes(program.capture_data_changes_info().clone());
+    let document = analyze(&context, AnalyzeInput::Statement(stmt))?;
+    set_semantic_conflict_policy(program, &document);
+    set_semantic_statement_journal_flags(program, &document)?;
+    set_semantic_result_columns(program, &document);
+    set_semantic_transactions(program, &document, is_write)?;
+    let triggers = semantic_prepare::prepare_triggers(&context, &document, program, connection)?;
+    let plan = PhysicalPlan::new(&document)
+        .map_err(|error| crate::LimboError::InternalError(error.to_string()))?;
+    emit_root_with_context(
+        &plan,
+        program,
+        &physical::RootRuntimeInputs::default(),
+        &triggers,
+    )
+    .map_err(|error| crate::LimboError::InternalError(error.to_string()))?;
+    Ok(())
+}
+
+fn new_ddl_context<'a>(
+    schema: &'a Schema,
+    connection: &'a Arc<Connection>,
+    syms: &'a SymbolTable,
+    origin: crate::statement::StatementOrigin,
+) -> DdlContext<'a> {
+    DdlContext::new(
+        schema,
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        syms,
+        connection.experimental_custom_types_enabled(),
         if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
             Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
         } else {
             connection.dialect()
         },
-    );
+    )
+}
 
-    match stmt {
-        // There can be no nesting with pragma, so lift it up here
-        ast::Stmt::Pragma { name, body } => {
-            pragma::translate_pragma(
-                &resolver,
-                &name,
-                body,
-                pager,
-                connection.clone(),
-                &mut program,
-            )?;
+fn semantic_outputs(document: &hir::HirDocument) -> Option<&[hir::Output]> {
+    match &document.root {
+        hir::HirRoot::Query(root) => {
+            let query = document.query(root.query)?;
+            Some(&document.query_block(query.first)?.outputs)
         }
-        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
+        hir::HirRoot::Insert(insert) => insert
+            .returning
+            .as_ref()
+            .map(|returning| returning.outputs.as_slice()),
+        hir::HirRoot::Update(update) => update
+            .returning
+            .as_ref()
+            .map(|returning| returning.outputs.as_slice()),
+        hir::HirRoot::Delete(delete) => delete
+            .returning
+            .as_ref()
+            .map(|returning| returning.outputs.as_slice()),
+        hir::HirRoot::TriggerPredicate(_) | hir::HirRoot::SchemaExpressions(_) => None,
+    }
+}
+
+fn set_semantic_result_columns(program: &mut ProgramBuilder, document: &hir::HirDocument) {
+    let Some(outputs) = semantic_outputs(document) else {
+        return;
     };
+    program.result_columns = outputs
+        .iter()
+        .map(|output| ResultSetColumn::from_hir(output, document))
+        .collect();
+}
 
-    program.epilogue(schema);
+pub(super) fn set_semantic_transactions(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+    is_write: bool,
+) -> Result<()> {
+    let write_database = match &document.root {
+        hir::HirRoot::Insert(insert) => Some(insert.target),
+        hir::HirRoot::Update(update) => Some(update.target),
+        hir::HirRoot::Delete(delete) => Some(delete.target),
+        hir::HirRoot::Query(_)
+        | hir::HirRoot::TriggerPredicate(_)
+        | hir::HirRoot::SchemaExpressions(_) => None,
+    }
+    .and_then(|source| document.source(source))
+    .and_then(|source| match &source.kind {
+        hir::SourceKind::Table(table) | hir::SourceKind::Pseudo { table, .. } => table.database(),
+        _ => None,
+    });
 
-    program.build(connection, change_cnt_on, input)
+    for source in &document.sources {
+        let database = match &source.kind {
+            hir::SourceKind::Table(table)
+            | hir::SourceKind::TableFunction { table, .. }
+            | hir::SourceKind::Pseudo { table, .. } => table.database(),
+            hir::SourceKind::SchemaExpression
+            | hir::SourceKind::Cte(_)
+            | hir::SourceKind::Derived(_)
+            | hir::SourceKind::RecursiveInput(_) => None,
+        };
+        let Some(database) = database else {
+            continue;
+        };
+        let cookie = document
+            .databases
+            .iter()
+            .find(|snapshot| snapshot.database == database)
+            .map(|snapshot| snapshot.schema_version)
+            .ok_or_else(|| {
+                crate::LimboError::InternalError(format!(
+                    "HIR source database {} has no schema snapshot",
+                    database.index()
+                ))
+            })?;
+        if is_write && write_database == Some(database) {
+            program.begin_write_on_database(database.index(), cookie)?;
+        } else {
+            program.begin_read_on_database(database.index(), cookie)?;
+        }
+    }
+    if let Some(cdc) = &document.cdc {
+        let database = cdc
+            .table
+            .database()
+            .ok_or_else(|| {
+                crate::LimboError::InternalError("HIR CDC table has no database".to_string())
+            })?
+            .index();
+        let cookie = document
+            .databases
+            .iter()
+            .find(|snapshot| snapshot.database.index() == database)
+            .map(|snapshot| snapshot.schema_version)
+            .ok_or_else(|| {
+                crate::LimboError::InternalError("HIR CDC database has no snapshot".to_string())
+            })?;
+        program.begin_write_on_database(database, cookie)?;
+    }
+    Ok(())
+}
+
+fn set_semantic_conflict_policy(program: &mut ProgramBuilder, document: &hir::HirDocument) {
+    let conflict = match &document.root {
+        hir::HirRoot::Insert(root) => root.conflict,
+        hir::HirRoot::Update(root) => root.conflict,
+        hir::HirRoot::Delete(_)
+        | hir::HirRoot::Query(_)
+        | hir::HirRoot::TriggerPredicate(_)
+        | hir::HirRoot::SchemaExpressions(_) => None,
+    };
+    program.flags.set_has_statement_conflict(conflict.is_some());
+    if let Some(conflict) = conflict {
+        program.set_resolve_type(conflict);
+    }
+}
+
+pub(super) fn set_semantic_statement_journal_flags(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+) -> Result<()> {
+    let target = match &document.root {
+        hir::HirRoot::Insert(root) => root.target,
+        hir::HirRoot::Update(root) => root.target,
+        hir::HirRoot::Delete(root) => root.target,
+        hir::HirRoot::Query(_)
+        | hir::HirRoot::TriggerPredicate(_)
+        | hir::HirRoot::SchemaExpressions(_) => return Ok(()),
+    };
+    let source = document.source(target).ok_or_else(|| {
+        crate::LimboError::InternalError("HIR DML target source is missing".to_string())
+    })?;
+    let hir::SourceKind::Table(resolved) = &source.kind else {
+        return Ok(());
+    };
+    let Some(table) = resolved.value().btree() else {
+        return Ok(());
+    };
+    let index_modes = source
+        .index_expressions
+        .iter()
+        .map(|index| (index.index.value().on_conflict, index.index.value().unique))
+        .collect::<Vec<_>>();
+
+    match &document.root {
+        hir::HirRoot::Insert(root) => {
+            let multiple_rows = match &root.source {
+                hir::InsertSource::Values(rows) => rows.len() > 1,
+                hir::InsertSource::Query(_) => true,
+                hir::InsertSource::DefaultValues => false,
+            };
+            let has_triggers = !root.triggers.is_empty();
+            let has_foreign_keys =
+                !root.foreign_keys.outgoing.is_empty() || !root.foreign_keys.incoming.is_empty();
+            let has_upsert_do_update = root
+                .upserts
+                .iter()
+                .any(|upsert| matches!(upsert.action, hir::UpsertAction::Update { .. }));
+            let has_unique = table
+                .columns()
+                .iter()
+                .any(crate::schema::Column::is_rowid_alias)
+                || index_modes.iter().any(|(_, unique)| *unique);
+            let has_not_null = table
+                .columns()
+                .iter()
+                .any(|column| column.notnull() && !column.is_rowid_alias());
+            let statement_conflict = root.conflict.unwrap_or(ast::ResolveType::Abort);
+            let any_replace = stmt_journal::any_effective_replace(
+                root.conflict.is_some(),
+                statement_conflict,
+                table.rowid_alias_conflict_clause,
+                index_modes.iter().map(|(conflict, _)| *conflict),
+            );
+            if !multiple_rows
+                && !has_triggers
+                && !any_replace
+                && root.upserts.is_empty()
+                && root.autoincrement.is_none()
+            {
+                program.set_multi_write(false);
+            }
+            let may_abort = has_triggers
+                || has_foreign_keys
+                || (root.autoincrement.is_some() && multiple_rows)
+                || has_upsert_do_update
+                || stmt_journal::constraint_may_abort(
+                    root.conflict.is_some(),
+                    statement_conflict,
+                    table.rowid_alias_conflict_clause,
+                    index_modes.into_iter(),
+                    has_not_null,
+                    !table.check_constraints.is_empty(),
+                    has_unique,
+                );
+            program.set_may_abort(may_abort);
+        }
+        hir::HirRoot::Update(root) => {
+            let has_triggers = !root.triggers.is_empty();
+            let has_foreign_keys =
+                !root.foreign_keys.outgoing.is_empty() || !root.foreign_keys.incoming.is_empty();
+            let has_not_null = root.assignments.iter().any(|assignment| {
+                assignment.columns.iter().any(|column| match column {
+                    hir::TargetColumn::Column(position) => table
+                        .columns()
+                        .get(*position)
+                        .is_some_and(|column| column.notnull() && !column.is_rowid_alias()),
+                    hir::TargetColumn::RowId => false,
+                })
+            });
+            let has_unique = index_modes.iter().any(|(_, unique)| *unique)
+                || root.assignments.iter().any(|assignment| {
+                    assignment.columns.iter().any(|column| match column {
+                        hir::TargetColumn::RowId => true,
+                        hir::TargetColumn::Column(position) => table
+                            .columns()
+                            .get(*position)
+                            .is_some_and(crate::schema::Column::is_rowid_alias),
+                    })
+                });
+            let statement_conflict = root.conflict.unwrap_or(ast::ResolveType::Abort);
+            let may_abort = has_triggers
+                || has_foreign_keys
+                || stmt_journal::constraint_may_abort(
+                    root.conflict.is_some(),
+                    statement_conflict,
+                    table.rowid_alias_conflict_clause,
+                    index_modes.into_iter(),
+                    has_not_null,
+                    !table.check_constraints.is_empty(),
+                    has_unique,
+                );
+            program.set_may_abort(may_abort);
+        }
+        hir::HirRoot::Delete(root) => {
+            let has_triggers = !root.triggers.is_empty();
+            let has_foreign_keys =
+                !root.foreign_keys.outgoing.is_empty() || !root.foreign_keys.incoming.is_empty();
+            program.set_may_abort(has_triggers || has_foreign_keys);
+        }
+        hir::HirRoot::Query(_)
+        | hir::HirRoot::TriggerPredicate(_)
+        | hir::HirRoot::SchemaExpressions(_) => unreachable!(),
+    }
+    Ok(())
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
@@ -150,7 +469,7 @@ pub fn translate(
 #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
 pub fn translate_inner(
     stmt: ast::Stmt,
-    resolver: &mut Resolver,
+    ddl_context: &mut DdlContext,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
@@ -189,26 +508,31 @@ pub fn translate_inner(
         bail_parse_error!("Cannot execute write statement in query_only mode")
     }
 
-    let is_select = matches!(stmt, ast::Stmt::Select { .. });
     let is_dml = matches!(
         stmt,
         ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }
     );
-
     match stmt {
         ast::Stmt::AlterTable(alter) => {
-            translate_alter_table(alter, resolver, program, connection, input)?;
+            translate_alter_table(alter, ddl_context, program, connection, input)?;
         }
-        ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
+        ast::Stmt::Analyze { name } => translate_analyze(name, ddl_context, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
-            attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
+            attach::translate_attach(
+                &expr,
+                ddl_context,
+                &db_name,
+                &key,
+                program,
+                connection.clone(),
+            )?;
         }
-        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
+        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, ddl_context, program)?,
         ast::Stmt::Commit { name } => {
-            translate_tx_commit(name, resolver.schema(), resolver, program)?
+            translate_tx_commit(name, ddl_context.schema(), ddl_context, program)?
         }
         ast::Stmt::CreateIndex { .. } => {
-            translate_create_index(program, connection, resolver, stmt)?;
+            translate_create_index(program, connection, ddl_context, stmt)?;
         }
         ast::Stmt::CreateTable {
             temporary,
@@ -217,7 +541,7 @@ pub fn translate_inner(
             body,
         } => translate_create_table(
             tbl_name,
-            resolver,
+            ddl_context,
             temporary,
             if_not_exists,
             body,
@@ -250,7 +574,7 @@ pub fn translate_inner(
             );
             trigger::translate_create_trigger(
                 trigger_name,
-                resolver,
+                ddl_context,
                 temporary,
                 if_not_exists,
                 time,
@@ -269,7 +593,7 @@ pub fn translate_inner(
             ..
         } => view::translate_create_view(
             &view_name,
-            resolver,
+            ddl_context,
             &select,
             &columns,
             if_not_exists,
@@ -282,63 +606,45 @@ pub fn translate_inner(
             ..
         } => view::translate_create_materialized_view(
             &view_name,
-            resolver,
+            ddl_context,
             &select,
             if_not_exists,
             connection.clone(),
             program,
         )?,
         ast::Stmt::CreateVirtualTable(vtab) => {
-            translate_create_virtual_table(vtab, resolver, program, connection)?
+            translate_create_virtual_table(vtab, ddl_context, program, connection)?
         }
-        ast::Stmt::Delete {
-            tbl_name,
-            where_clause,
-            limit,
-            returning,
-            indexed,
-            order_by,
-            with,
-        } => {
-            if !order_by.is_empty() {
-                bail_parse_error!("ORDER BY clause is not supported in DELETE");
-            }
-            if where_clause.is_none() && connection.get_dml_require_where() {
-                bail_parse_error!(
-                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
-                );
-            }
-            translate_delete(
-                &tbl_name,
-                resolver,
-                where_clause,
-                limit,
-                returning,
-                indexed,
-                with,
-                program,
-                connection,
-            )?
-        }
+        statement @ (ast::Stmt::Select(_)
+        | ast::Stmt::Insert { .. }
+        | ast::Stmt::Update(_)
+        | ast::Stmt::Delete { .. }) => translate_semantic_root(
+            ddl_context.schema(),
+            &statement,
+            program,
+            connection,
+            ddl_context.symbol_table,
+            crate::statement::StatementOrigin::Root,
+        )?,
         ast::Stmt::Detach { name } => {
-            attach::translate_detach(&name, resolver, program, connection.clone())?
+            attach::translate_detach(&name, ddl_context, program, connection.clone())?
         }
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
-        } => translate_drop_index(&idx_name, resolver, if_exists, program)?,
+        } => translate_drop_index(&idx_name, ddl_context, if_exists, program)?,
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
-        } => translate_drop_table(tbl_name, resolver, if_exists, program, connection)?,
+        } => translate_drop_table(tbl_name, ddl_context, if_exists, program, connection)?,
         ast::Stmt::DropTrigger {
             if_exists,
             trigger_name,
-        } => trigger::translate_drop_trigger(resolver, &trigger_name, if_exists, program)?,
+        } => trigger::translate_drop_trigger(ddl_context, &trigger_name, if_exists, program)?,
         ast::Stmt::DropView {
             if_exists,
             view_name,
-        } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
+        } => view::translate_drop_view(ddl_context, &view_name, if_exists, program)?,
         ast::Stmt::CreateType {
             if_not_exists,
             type_name,
@@ -347,7 +653,7 @@ pub fn translate_inner(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?
+            schema::translate_create_type(&type_name, &body, if_not_exists, ddl_context, program)?
         }
         ast::Stmt::CreateDomain {
             if_not_exists,
@@ -367,7 +673,7 @@ pub fn translate_inner(
                 &constraints,
                 default,
                 if_not_exists,
-                resolver,
+                ddl_context,
                 program,
             )?
         }
@@ -378,7 +684,7 @@ pub fn translate_inner(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_drop_type(&type_name, if_exists, false, resolver, program)?
+            schema::translate_drop_type(&type_name, if_exists, false, ddl_context, program)?
         }
         ast::Stmt::DropDomain {
             if_exists,
@@ -387,14 +693,14 @@ pub fn translate_inner(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_drop_type(&domain_name, if_exists, true, resolver, program)?
+            schema::translate_drop_type(&domain_name, if_exists, true, ddl_context, program)?
         }
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
-        ast::Stmt::Reindex { name } => translate_reindex(name, resolver, program, connection)?,
+        ast::Stmt::Reindex { name } => translate_reindex(name, ddl_context, program, connection)?,
         ast::Stmt::Optimize { idx_name } => {
-            translate_optimize(idx_name, resolver, program, connection)?
+            translate_optimize(idx_name, ddl_context, program, connection)?
         }
         ast::Stmt::Release { name } => translate_release(program, name)?,
         ast::Stmt::Rollback {
@@ -402,44 +708,9 @@ pub fn translate_inner(
             savepoint_name,
         } => translate_rollback(program, tx_name, savepoint_name)?,
         ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
-        ast::Stmt::Select(select) => {
-            translate_select(
-                select,
-                resolver,
-                program,
-                plan::QueryDestination::ResultRows,
-                connection,
-            )?;
-        }
-        ast::Stmt::Update(update) => {
-            if update.where_clause.is_none() && connection.get_dml_require_where() {
-                bail_parse_error!(
-                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
-                );
-            }
-            translate_update(update, resolver, program, connection)?
-        }
         ast::Stmt::Vacuum { name, into } => {
             vacuum::translate_vacuum(program, name.as_ref(), into.as_deref(), connection.clone())?
         }
-        ast::Stmt::Insert {
-            with,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-        } => translate_insert(
-            resolver,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-            with,
-            program,
-            connection,
-        )?,
         ast::Stmt::CreateSequence {
             if_not_exists,
             seq_name,
@@ -457,7 +728,7 @@ pub fn translate_inner(
                 &min_value,
                 &max_value,
                 cycle,
-                resolver,
+                ddl_context,
                 program,
             )?;
         }
@@ -465,7 +736,7 @@ pub fn translate_inner(
             if_exists,
             seq_name,
         } => {
-            sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
+            sequence::translate_drop_sequence(&seq_name, if_exists, ddl_context, program)?;
         }
     };
 
@@ -479,11 +750,6 @@ pub fn translate_inner(
         } else {
             program.begin_write_operation()?;
         }
-    }
-
-    // Indicate read operations so that in the epilogue we can emit the correct type of transaction
-    if is_select && !program.table_references.is_empty() {
-        program.begin_read_operation()?;
     }
 
     Ok(())
@@ -536,6 +802,105 @@ mod tests {
     use crate::vdbe::insn::Insn;
     use crate::Database;
     use crate::SqliteDialect;
+
+    #[test]
+    fn semantic_prepare_adapter_owns_root_metadata_and_emission() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = db.connect().unwrap();
+        let schema = db.schema.lock().clone();
+        let mut parser = turso_parser::parser::Parser::new(b"SELECT 1 AS answer");
+        let ast::Cmd::Stmt(statement) = parser.next().unwrap().unwrap() else {
+            panic!("expected a statement");
+        };
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 32, 2));
+        program.prologue();
+        translate_semantic_root(
+            &schema,
+            &statement,
+            &mut program,
+            &connection,
+            &SymbolTable::new(),
+            crate::statement::StatementOrigin::Root,
+        )
+        .unwrap();
+        program.epilogue(&schema);
+        let built = program
+            .build(connection, false, "SELECT 1 AS answer")
+            .unwrap();
+
+        assert_eq!(built.result_columns.len(), 1);
+        assert_eq!(built.result_columns[0].name, "answer");
+        assert!(built
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::ResultRow { count: 1, .. })));
+    }
+
+    #[test]
+    fn semantic_prepare_adapter_executes_trigger_programs_with_old_and_new_rows() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE items(a INTEGER, b INTEGER);
+                 CREATE TABLE audit(kind TEXT, a INTEGER, b INTEGER);
+                 CREATE TRIGGER skip_negative BEFORE INSERT ON items
+                   WHEN NEW.a < 0 BEGIN SELECT RAISE(IGNORE); END;
+                 CREATE TRIGGER log_insert AFTER INSERT ON items BEGIN
+                   INSERT INTO audit VALUES('insert', NEW.a, NEW.b);
+                 END;",
+            )
+            .unwrap();
+
+        let schema = db.schema.lock().clone();
+        let sql = "INSERT INTO items VALUES(-1, 9), (2, 3)";
+        let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+        let ast::Cmd::Stmt(statement) = parser.next().unwrap().unwrap() else {
+            panic!("expected a statement");
+        };
+        let mut builder =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 32, 2));
+        builder.prologue();
+        translate_semantic_root(
+            &schema,
+            &statement,
+            &mut builder,
+            &connection,
+            &SymbolTable::new(),
+            crate::statement::StatementOrigin::Root,
+        )
+        .unwrap();
+        builder.epilogue(&schema);
+        let program = builder.build(connection.clone(), true, sql).unwrap();
+        assert!(program.insns.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::Program {
+                program: crate::vdbe::insn::Subprogram::PreparedProgram(_),
+                ..
+            }
+        )));
+        crate::Statement::new(
+            program,
+            connection.pager.load().clone(),
+            QueryMode::Normal,
+            0,
+        )
+        .run_ignore_rows()
+        .unwrap();
+
+        let mut audit = connection
+            .query("SELECT kind, a, b FROM audit")
+            .unwrap()
+            .unwrap();
+        let rows = audit.run_collect_rows().unwrap();
+        assert_eq!(rows.len(), 1, "unexpected audit rows: {rows:?}");
+        assert_eq!(rows[0][0].to_string(), "insert");
+        assert_eq!(rows[0][1].to_string(), "2");
+        assert_eq!(rows[0][2].to_string(), "3");
+    }
 
     /// Verify that REGEXP produces the correct error when no regexp function is registered.
     #[test]

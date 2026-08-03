@@ -18496,6 +18496,10 @@ fn test_autoincrement_in_attached_mvcc_database() {
         conn.execute("INSERT INTO aux.t(val) VALUES ('a')").unwrap();
         conn.execute("INSERT INTO aux.t(val) VALUES ('b')").unwrap();
         conn.execute("INSERT INTO aux.t(val) VALUES ('c')").unwrap();
+        assert!(
+            conn.next_attached_mv_tx().is_none(),
+            "autocommit INSERTs must finish the attached MVCC transaction"
+        );
 
         // Checkpoint the attached db
         conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();

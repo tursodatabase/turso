@@ -1,7 +1,12 @@
 use crate::function::{Func, ScalarFunc};
 use crate::translate::{
-    emitter::Resolver,
-    expr::{sanitize_string, translate_expr},
+    emitter::DdlContext,
+    expr::sanitize_string,
+    physical::{
+        emit_root_schema_expression_into, PhysicalPlan, RegisterRange, RootRuntimeInputs,
+        SourceRuntime,
+    },
+    semantic::{context::SemanticContext, hir::HirRoot, schema_expr::analyze_scalar_syntax},
     ProgramBuilder, ProgramBuilderOpts,
 };
 use crate::util::normalize_ident;
@@ -9,10 +14,46 @@ use crate::vdbe::insn::Insn;
 use crate::{sync::Arc, Connection, Result};
 use turso_parser::ast::{Expr, Literal};
 
+fn emit_scalar(
+    syntax: &Expr,
+    target: usize,
+    ddl_context: &DdlContext,
+    connection: &Connection,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    let context = SemanticContext::new(
+        ddl_context.schema(),
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        ddl_context.symbol_table,
+        connection.experimental_custom_types_enabled(),
+        connection.get_dqs_dml().into(),
+        connection.dialect(),
+    );
+    let analyzed = analyze_scalar_syntax(&context, crate::MAIN_DB_ID, syntax)?;
+    let plan = PhysicalPlan::new(&analyzed.document)
+        .map_err(|error| crate::LimboError::InternalError(error.to_string()))?;
+    let root = match &analyzed.document.root {
+        HirRoot::SchemaExpressions(root) => root,
+        _ => unreachable!("scalar analysis returns a schema-expression root"),
+    };
+    let mut inputs = RootRuntimeInputs::default();
+    inputs.bind_source(
+        root.source,
+        SourceRuntime::Registers {
+            columns: RegisterRange::new(0, 0),
+            rowid: None,
+        },
+    );
+    emit_root_schema_expression_into(&plan, program, &inputs, 0, target)
+        .map_err(|error| crate::LimboError::InternalError(error.to_string()))
+}
+
 /// Translate ATTACH statement
 pub fn translate_attach(
     expr: &Expr,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     db_name: &Expr,
     key: &Option<Box<Expr>>,
     program: &mut ProgramBuilder,
@@ -56,7 +97,7 @@ pub fn translate_attach(
             });
         }
         _ => {
-            translate_expr(program, None, expr, arg_reg, resolver)?;
+            emit_scalar(expr, arg_reg, ddl_context, &connection, program)?;
         }
     }
 
@@ -87,13 +128,13 @@ pub fn translate_attach(
             });
         }
         _ => {
-            translate_expr(program, None, db_name, arg_reg + 1, resolver)?;
+            emit_scalar(db_name, arg_reg + 1, ddl_context, &connection, program)?;
         }
     }
 
     // Load key argument (NULL if not provided)
     if let Some(key_expr) = key {
-        translate_expr(program, None, key_expr, arg_reg + 2, resolver)?;
+        emit_scalar(key_expr, arg_reg + 2, ddl_context, &connection, program)?;
     } else {
         program.emit_insn(Insn::Null {
             dest: arg_reg + 2,
@@ -118,7 +159,7 @@ pub fn translate_attach(
 /// Translate DETACH statement
 pub fn translate_detach(
     expr: &Expr,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     program: &mut ProgramBuilder,
     connection: Arc<Connection>,
 ) -> Result<()> {
@@ -159,7 +200,7 @@ pub fn translate_detach(
             });
         }
         _ => {
-            translate_expr(program, None, expr, arg_reg, resolver)?;
+            emit_scalar(expr, arg_reg, ddl_context, &connection, program)?;
         }
     }
 

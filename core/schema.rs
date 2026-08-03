@@ -8,18 +8,13 @@ use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
-use crate::translate::emitter::Resolver;
-use crate::translate::expr::{
-    bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
-};
+use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::index::{
     reject_explicit_nulls, resolve_index_method_parameters, resolve_sorted_columns,
 };
-use crate::translate::planner::ROWID_STRS;
 use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::CursorID;
 use crate::{turso_assert, turso_debug_assert};
 use smallvec::SmallVec;
 use turso_macros::AtomicEnum;
@@ -149,7 +144,7 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
+use crate::translate::plan::{BitSet, ColumnMask};
 use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, UnparsedFromSqlIndex,
 };
@@ -163,7 +158,7 @@ use std::sync::OnceLock;
 use tracing::trace;
 use turso_parser::ast::{
     self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, ResolveType, SortOrder,
-    TableInternalId, TypeOperator,
+    TypeOperator,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -178,6 +173,8 @@ pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
+/// Valid aliases for the implicit row identifier of a rowid table.
+pub const ROWID_STRS: [&str; 3] = ["rowid", "_rowid_", "oid"];
 pub const SEQ_BACKING_TABLE_PREFIX: &str = "__turso_internal_seq_";
 // Prefix for the hidden sequence *name* owned by an AUTOINCREMENT table.
 // This is not itself a table name. Its physical backing table is still named
@@ -228,6 +225,7 @@ pub struct StructFieldDef {
     pub name: String,
     pub base_affinity: Affinity,
     pub type_name: String,
+    pub array_dimensions: u32,
 }
 
 /// Definition for a STRUCT composite type.
@@ -243,6 +241,7 @@ pub struct UnionVariantDef {
     pub tag_index: u8,
     pub base_affinity: Affinity,
     pub type_name: String,
+    pub array_dimensions: u32,
 }
 
 /// Definition for a UNION discriminated union type.
@@ -453,6 +452,7 @@ impl TypeDef {
                         name: f.name.to_string(),
                         base_affinity: Affinity::affinity(&f.field_type.name),
                         type_name: f.field_type.name.clone(),
+                        array_dimensions: f.field_type.array_dimensions,
                     })
                     .try_collect()?;
                 Self {
@@ -482,6 +482,7 @@ impl TypeDef {
                         tag_index: i as u8,
                         base_affinity: Affinity::affinity(&f.field_type.name),
                         type_name: f.field_type.name.clone(),
+                        array_dimensions: f.field_type.array_dimensions,
                     })
                     .try_collect()?;
                 Self {
@@ -2709,32 +2710,6 @@ impl TryClone for BTreeTable {
     }
 }
 
-impl TryClone for FromClauseSubquery {
-    type Error = TryReserveError;
-
-    fn try_clone(&self) -> Result<Self, Self::Error> {
-        Ok(Self {
-            name: self.name.clone(),
-            plan: self.plan.clone(),
-            columns: self.columns.try_clone()?,
-            result_columns_start_reg: self.result_columns_start_reg,
-            materialized_cursor_id: self.materialized_cursor_id,
-            cte: self.cte,
-        })
-    }
-}
-
-impl TryClone for RecursiveCteInput {
-    type Error = TryReserveError;
-
-    fn try_clone(&self) -> Result<Self, Self::Error> {
-        Ok(Self {
-            name: self.name.clone(),
-            columns: self.columns.try_clone()?,
-        })
-    }
-}
-
 impl TryClone for Table {
     type Error = TryReserveError;
 
@@ -2742,12 +2717,6 @@ impl TryClone for Table {
         Ok(match self {
             Table::BTree(table) => Table::BTree(Arc::new(table.as_ref().try_clone()?)),
             Table::Virtual(table) => Table::Virtual(Arc::new(table.as_ref().try_clone()?)),
-            Table::FromClauseSubquery(from_clause_subquery) => {
-                Table::FromClauseSubquery(Arc::new(from_clause_subquery.as_ref().try_clone()?))
-            }
-            Table::RecursiveCteInput(input) => {
-                Table::RecursiveCteInput(Arc::new(input.as_ref().try_clone()?))
-            }
         })
     }
 }
@@ -2871,12 +2840,6 @@ impl ColumnLayout {
             Table::Virtual(vtable) => Ok(Self::Identity {
                 column_count: vtable.as_ref().columns.len(),
             }),
-            Table::FromClauseSubquery(subquery) => Ok(Self::Identity {
-                column_count: subquery.columns.len(),
-            }),
-            Table::RecursiveCteInput(input) => Ok(Self::Identity {
-                column_count: input.columns.len(),
-            }),
         }
     }
 
@@ -2983,8 +2946,6 @@ impl ColumnLayout {
 pub enum Table {
     BTree(Arc<BTreeTable>),
     Virtual(Arc<VirtualTable>),
-    FromClauseSubquery(Arc<FromClauseSubquery>),
-    RecursiveCteInput(Arc<RecursiveCteInput>),
 }
 
 impl Table {
@@ -2994,12 +2955,6 @@ impl Table {
             Table::Virtual(_) => Err(crate::LimboError::InternalError(
                 "Virtual tables do not have a root page".to_string(),
             )),
-            Table::FromClauseSubquery(_) => Err(crate::LimboError::InternalError(
-                "FROM clause subqueries do not have a root page".to_string(),
-            )),
-            Table::RecursiveCteInput(_) => Err(crate::LimboError::InternalError(
-                "recursive CTE inputs do not have a root page".to_string(),
-            )),
         }
     }
 
@@ -3007,8 +2962,6 @@ impl Table {
         match self {
             Self::BTree(table) => &table.name,
             Self::Virtual(table) => &table.name,
-            Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.name,
-            Self::RecursiveCteInput(input) => &input.name,
         }
     }
 
@@ -3016,10 +2969,6 @@ impl Table {
         match self {
             Self::BTree(table) => table.columns.get(index),
             Self::Virtual(table) => table.columns.get(index),
-            Self::FromClauseSubquery(from_clause_subquery) => {
-                from_clause_subquery.columns.get(index)
-            }
-            Self::RecursiveCteInput(input) => input.columns.get(index),
         }
     }
 
@@ -3032,20 +2981,6 @@ impl Table {
                     .as_ref()
                     .is_some_and(|n| n.eq_ignore_ascii_case(name))
             }),
-            Self::FromClauseSubquery(from_clause_subquery) => from_clause_subquery
-                .columns
-                .iter()
-                .enumerate()
-                .find(|(_, col)| {
-                    col.name
-                        .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(name))
-                }),
-            Self::RecursiveCteInput(input) => input.columns.iter().enumerate().find(|(_, col)| {
-                col.name
-                    .as_ref()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
-            }),
         }
     }
 
@@ -3053,8 +2988,6 @@ impl Table {
         match self {
             Self::BTree(table) => &table.columns,
             Self::Virtual(table) => &table.columns,
-            Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.columns,
-            Self::RecursiveCteInput(input) => &input.columns,
         }
     }
 
@@ -3062,8 +2995,6 @@ impl Table {
         match self {
             Self::BTree(table) => table.is_strict,
             Self::Virtual(_) => false,
-            Self::FromClauseSubquery(_) => false,
-            Self::RecursiveCteInput(_) => false,
         }
     }
 
@@ -3071,8 +3002,6 @@ impl Table {
         match self {
             Self::BTree(table) => Some(table.clone()),
             Self::Virtual(_) => None,
-            Self::FromClauseSubquery(_) => None,
-            Self::RecursiveCteInput(_) => None,
         }
     }
 
@@ -3089,8 +3018,6 @@ impl Table {
         match self {
             Self::BTree(table) => Some(table),
             Self::Virtual(_) => None,
-            Self::FromClauseSubquery(_) => None,
-            Self::RecursiveCteInput(_) => None,
         }
     }
 
@@ -3820,55 +3747,26 @@ impl BTreeTable {
     }
 
     pub fn prepare_generated_columns(&mut self) -> Result<()> {
-        {
-            let mut guard = self.columns_mut();
-            for i in 0..guard.len() {
-                if guard[i].is_virtual_generated() {
-                    let mut expr = guard[i].generated_expr().cloned().unwrap();
-                    resolve_gencol_expr_columns(&mut expr, &guard)?;
-                    *guard[i].generated_expr_mut().unwrap() = expr;
-                }
-            }
-        }
         self.column_graph()?;
         Ok(())
     }
 
-    pub fn shift_generated_column_indices_after_drop(
-        &mut self,
-        dropped_index: usize,
-    ) -> Result<()> {
+    pub fn validate_generated_columns_after_drop(&mut self, dropped_name: &str) -> Result<()> {
         if !self.has_virtual_columns {
             return Ok(());
         }
 
-        for column in &mut self.columns {
-            let Some(expr) = column.generated_expr_mut() else {
+        for column in &self.columns {
+            let Some(expr) = column.generated_expr() else {
                 continue;
             };
-
-            walk_expr_mut(expr, &mut |e| match e {
-                Expr::Column {
-                    table,
-                    column,
-                    is_rowid_alias: _,
-                    ..
-                } if table.is_self_table() => {
-                    if *column == dropped_index {
-                        return Err(LimboError::InternalError(
-                            "dropped column remained referenced by generated column".to_string(),
-                        ));
-                    }
-                    if *column > dropped_index {
-                        *column -= 1;
-                    }
-                    Ok(WalkControl::Continue)
-                }
-                _ => Ok(WalkControl::Continue),
-            })?;
+            if collect_column_refs(expr).contains(&normalize_ident(dropped_name)) {
+                return Err(LimboError::InternalError(
+                    "dropped column remained referenced by generated column".to_string(),
+                ));
+            }
         }
-
-        Ok(())
+        self.prepare_generated_columns()
     }
 
     fn column_graph(&self) -> Result<&GeneratedColGraph> {
@@ -3970,87 +3868,7 @@ impl PseudoCursorType {
     }
 }
 
-/// A derived table from a FROM clause subquery.
-#[derive(Debug, Clone)]
-pub struct FromClauseSubquery {
-    /// The name of the derived table; uses the alias if available.
-    pub name: String,
-    /// The query plan for the derived table. Can be either a simple SelectPlan
-    /// or a compound select (UNION/INTERSECT/EXCEPT).
-    pub plan: Box<Plan>,
-    /// The columns of the derived table.
-    pub columns: Vec<Column>,
-    /// The start register for the result columns of the derived table;
-    /// must be set before data is read from it.
-    pub result_columns_start_reg: Option<usize>,
-    /// The table cursor backing a materialized EphemeralTable representation of
-    /// this subquery, if one was emitted.
-    pub materialized_cursor_id: Option<CursorID>,
-    /// CTE-specific materialization metadata, when this FROM-subquery is a CTE
-    /// reference rather than an inline derived table.
-    pub cte: Option<FromClauseSubqueryCteMetadata>,
-}
-
-/// The one-row table read by the recursive part of a recursive CTE.
-#[derive(Debug, Clone)]
-pub struct RecursiveCteInput {
-    pub name: String,
-    pub columns: Vec<Column>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct FromClauseSubqueryCteMetadata {
-    /// Identity shared by all references to the same CTE definition.
-    pub id: usize,
-    /// True when more than one read in the same query tree can reuse one
-    /// materialized result for this CTE.
-    pub shared_materialization: bool,
-    /// True for explicit WITH ... AS MATERIALIZED.
-    pub materialize_hint: bool,
-}
-
-impl FromClauseSubquery {
-    pub fn cte_id(&self) -> Option<usize> {
-        self.cte.map(|cte| cte.id)
-    }
-
-    pub fn materialize_hint(&self) -> bool {
-        self.cte.is_some_and(|cte| cte.materialize_hint)
-    }
-
-    pub fn shared_materialization(&self) -> bool {
-        self.cte.is_some_and(|cte| cte.shared_materialization)
-    }
-
-    pub fn set_shared_materialization(&mut self, shared: bool) {
-        if let Some(cte) = &mut self.cte {
-            cte.shared_materialization = shared;
-        }
-    }
-
-    /// Shared CTE references and explicit MATERIALIZED hints both force a
-    /// table-backed materialization that can be scanned or probed later.
-    pub fn requires_table_materialization(&self) -> bool {
-        self.shared_materialization() || self.materialize_hint()
-    }
-
-    /// Only simple single-reference SELECT subqueries can safely use their
-    /// synthesized seek index as the storage target directly. Compound
-    /// subqueries still need table-backed storage so their set-operation
-    /// semantics are preserved before any later SEARCH shape is chosen.
-    pub fn supports_direct_index_materialization(&self) -> bool {
-        matches!(self.plan.as_ref(), Plan::Select(_)) && !self.requires_table_materialization()
-    }
-}
-
 fn collect_column_refs(expr: &Expr) -> HashSet<String> {
-    collect_column_dependencies_of_expr(expr, &[])
-}
-
-/// Extract all column name references from an expression as a set.
-/// `columns` is used to resolve pre-resolved `Expr::Column { SELF_TABLE }` back to names.
-//TODO all this usage of [normalize_ident] should be replaced with a proper [Identifier] domain type.
-pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> HashSet<String> {
     let mut refs = HashSet::default();
 
     let _ = walk_expr(expr, &mut |e| match e {
@@ -4062,18 +3880,7 @@ pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> H
             refs.insert(normalize_ident(col.as_str()));
             Ok(WalkControl::Continue)
         }
-        Expr::Column { table, column, .. } if table.is_self_table() => {
-            if let Some(col) = columns.get(*column) {
-                if let Some(name) = &col.name {
-                    refs.insert(normalize_ident(name));
-                }
-            }
-            Ok(WalkControl::Continue)
-        }
-        Expr::Subquery(_)
-        | Expr::Exists(_)
-        | Expr::InTable { .. }
-        | Expr::SubqueryResult { .. } => Ok(WalkControl::SkipChildren),
+        Expr::Subquery(_) | Expr::Exists(_) | Expr::InTable { .. } => Ok(WalkControl::SkipChildren),
         _ => Ok(WalkControl::Continue),
     });
 
@@ -4083,9 +3890,6 @@ pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> H
 fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &mut BitSet) {
     let _ = walk_expr(expr, &mut |e| {
         match e {
-            Expr::Column { table, column, .. } if table.is_self_table() => {
-                out.set(*column)?;
-            }
             Expr::Id(name) | Expr::Name(name) => {
                 if let Some(idx) = find_column_index_by_name(columns, name.as_str()) {
                     out.set(idx)?;
@@ -4096,10 +3900,7 @@ fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &
                     out.set(idx)?;
                 }
             }
-            Expr::Subquery(_)
-            | Expr::Exists(_)
-            | Expr::InTable { .. }
-            | Expr::SubqueryResult { .. } => {
+            Expr::Subquery(_) | Expr::Exists(_) | Expr::InTable { .. } => {
                 unreachable!("generated columns cannot contain subqueries")
             }
             _ => {}
@@ -4117,54 +3918,9 @@ fn find_column_index_by_name(columns: &[Column], col_name: &str) -> Option<usize
     })
 }
 
-/// Resolve [Expr::Id] / [Expr::Qualified] / [Expr::DoublyQualified] in a generated column
-/// or partial-index expression to `Expr::Column { table: SELF_TABLE, column: idx }`.
-pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -> Result<()> {
-    walk_expr_mut(gencol_expr, &mut |e| match e {
-        Expr::Id(name) | Expr::Qualified(_, name) | Expr::DoublyQualified(_, _, name) => {
-            let col_name = normalize_ident(name.as_str());
-            let (idx, col) = columns
-                .iter()
-                .enumerate()
-                .find(|(_, c)| {
-                    c.name
-                        .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(&col_name))
-                })
-                .ok_or_else(|| LimboError::ParseError(format!("no such column: {col_name}")))?;
-            *e = Expr::Column {
-                database: None,
-                table: TableInternalId::SELF_TABLE,
-                column: idx,
-                is_rowid_alias: col.is_rowid_alias(),
-            };
-            Ok(WalkControl::Continue)
-        }
-        _ => Ok(WalkControl::Continue),
-    })?;
-    Ok(())
-}
-
-/// Re-render the SQL text of a generated-column expression using current column names. The input
-/// AST may have been previously resolved into `Expr::Column { table: SELF_TABLE, column: idx, .. }`
-/// nodes; we replace each such self-table reference with a fresh `Expr::Id(<col-name>)` before
-/// stringifying so the result round-trips through the parser, even if a referenced column was
-/// renamed since the original `original_sql` was captured.
-pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) -> Result<String> {
-    let mut clone = expr.clone();
-    walk_expr_mut(&mut clone, &mut |e| -> Result<WalkControl> {
-        if let Expr::Column { table, column, .. } = e {
-            if table.is_self_table() {
-                if let Some(col) = columns.get(*column) {
-                    if let Some(name) = col.name.as_ref() {
-                        *e = Expr::Id(Name::exact(name.clone()));
-                    }
-                }
-            }
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(clone.to_string())
+/// Re-render a generated-column expression after its syntax names were updated.
+pub fn render_gencol_expr_sql_with_new_names(expr: &Expr) -> String {
+    expr.to_string()
 }
 
 pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
@@ -4904,6 +4660,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         }
     }
 
+    let has_virtual_columns = cols.iter().any(|column| column.is_virtual_generated());
+    let logical_to_physical_map =
+        BTreeTable::build_logical_to_physical_map(&cols, &primary_key_columns, has_rowid);
     let mut table = BTreeTable {
         root_page,
         name: table_name,
@@ -4956,8 +4715,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         },
         check_constraints,
         rowid_alias_conflict_clause,
-        has_virtual_columns: false,
-        logical_to_physical_map: vec![],
+        has_virtual_columns,
+        logical_to_physical_map,
         column_dependencies: Default::default(),
     };
     table.prepare_generated_columns()?;
@@ -5155,9 +4914,8 @@ pub struct ColDef {
 
 #[derive(Debug, Clone)]
 pub enum GeneratedType {
-    /// `resolved` holds the expression with column references resolved to
-    /// `Expr::Column { table: SELF_TABLE }` for use at compile time.
-    /// `original_sql` preserves the original SQL text for `to_sql()` round-tripping.
+    /// `expr` remains parser syntax; semantic analysis resolves it into HIR.
+    /// `original_sql` preserves the SQL text for `to_sql()` round-tripping.
     Virtual {
         expr: Box<Expr>,
         original_sql: String,
@@ -5926,7 +5684,7 @@ impl Index {
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table, _resolver: &Resolver) -> bool {
+    pub fn validate_where_expr(&self, table: &Table) -> bool {
         let Some(where_clause) = &self.where_clause else {
             return true;
         };
@@ -5953,7 +5711,7 @@ impl Index {
                 return Ok(WalkControl::SkipChildren);
             }
             match e {
-                Expr::Literal(_) | Expr::RowId { .. } => {}
+                Expr::Literal(_) => {}
                 // Unqualified identifier: must be a column of the target table or ROWID
                 Expr::Id(n) => {
                     let n = n.as_str();
@@ -6007,26 +5765,6 @@ impl Index {
             })
         });
         ok
-    }
-
-    pub fn bind_where_expr(
-        &self,
-        table_refs: Option<&mut TableReferences>,
-        resolver: &Resolver,
-    ) -> Option<ast::Expr> {
-        let Some(where_clause) = &self.where_clause else {
-            return None;
-        };
-        let mut expr = where_clause.clone();
-        bind_and_rewrite_expr(
-            &mut expr,
-            table_refs,
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )
-        .ok()?;
-        Some(*expr)
     }
 }
 

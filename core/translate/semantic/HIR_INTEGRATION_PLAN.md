@@ -1,0 +1,258 @@
+# HIR integration plan
+
+Status: complete.
+
+## Goal
+
+`semantic::analyze` is the only module that turns parser syntax into resolved
+SQL meaning. Physical planning and bytecode emission consume the resulting
+`HirDocument`; they do not inspect parser names or perform live catalog
+resolution.
+
+The parser AST remains syntax-only. HIR is the only resolved expression
+language. Runtime locations such as cursors, registers, result slots, and
+subprograms are mapped from `SourceId`, `OutputId`, and `QueryId` by physical
+planning and emission; they are never written into parser or HIR expressions.
+
+Prepare performance is measured after the replacement works and passes its
+correctness gates. Clone and lookup optimizations are out of scope unless they
+are required for correctness or to keep the verification suite viable.
+
+This plan covers normal VDBE prepare and stored schema programs. The
+experimental DBSP materialized-view compiler keeps its own logical IR and name
+analysis. It is an independent consumer, is never used as a fallback from the
+semantic path, and no longer stores runtime bindings in parser expressions.
+
+## Required dependency direction
+
+```text
+parser AST + SemanticContext
+    -> semantic::analyze
+    -> closed HirDocument
+    -> physical plan carrying hir::Expr
+    -> VDBE emission with scoped runtime bindings
+```
+
+The HIR path never receives `Resolver`. Any physical catalog facts are read by
+resolved identity from the same immutable snapshot used by analysis. DDL and
+control statements use a separate catalog context because their live catalog
+operations are not SQL binding.
+
+## Migration checklist
+
+### 1. Compile and test the real semantic module
+
+- [x] Include the complete `translate::semantic` module instead of compiling
+      selected files through the property-test shim.
+- [x] Promote stored `SchemaExpr` support out of `cfg(test)`.
+- [x] Reject bound or runtime parser expressions as invalid analyzer input.
+- [x] Run existing scope, HIR, CTE, DML, trigger, and stored-expression
+      properties through the real module tree.
+- [x] Add properties at the `semantic::analyze` interface.
+
+### 2. Close correctness-critical HIR facts
+
+- [x] Use one meaningful catalog snapshot for semantic analysis and physical
+      planning, including per-database schema versions.
+- [x] Record lexical query parents and exact captured source dependencies.
+- [x] Validate that resolved catalog objects belong to the document snapshot.
+- [x] Validate that every required generated, default, CHECK, index, and type
+      program is present.
+- [x] Capture the resolved trigger and foreign-key facts needed by DML
+      compilation so lowering does not search schemas by name.
+
+### 3. Plan and emit HIR directly
+
+- [x] Physical plans carry `hir::Expr`; do not add a duplicate `PlanExpr`.
+- [x] Map `SourceId` to physical sources and cursors in scoped runtime state.
+- [x] Map `OutputId` to projection/result locations in scoped runtime state.
+- [x] Map `QueryId` to subquery plans and destinations in scoped runtime state.
+- [x] Stored schema-expression batches form closed HIR roots with an explicit
+      positional `SourceId` input and a catalog-free physical entrypoint.
+- [x] CREATE INDEX and REINDEX resolve partial predicates and expression keys
+      into one closed HIR batch, then bind only their scan cursor at emission.
+- [x] Express index-method coverage, window inputs, unnesting, and consumed
+      predicates as physical metadata instead of synthetic expressions.
+- [x] Prove with a poisoned catalog that planning and emission cannot resolve
+      tables, functions, collations, or types by name.
+
+### 4. Switch complete roots
+
+- [x] SELECT, compound queries, subqueries, CTEs, recursive CTEs, aggregates,
+      and windows.
+  - [x] Basic SELECT/VALUES scans, inner joins, derived sources, ordinary CTEs,
+        correlated scalar/EXISTS/IN subqueries, UNION ALL, DISTINCT, ORDER BY,
+        and LIMIT/OFFSET emit directly from HIR.
+  - [x] Aggregate and window calls have stable block-local HIR identities;
+        physical plans borrow the original calls and runtime bindings map the
+        identities to registers.
+  - [x] Ungrouped `sum`, `total`, `avg`, `count(expr)`, and `count(*)` emit
+        directly from HIR, including WHERE and aggregate FILTER inputs.
+  - [x] Grouped core aggregates emit from frozen HIR grouping type/collation
+        facts and preserve source and aggregate identities through sorter
+        materialization.
+  - [x] DISTINCT, comparison-based, custom, and external aggregates carry
+        independent runtime state from their frozen HIR calls.
+  - [x] Aggregate argument ORDER BY uses one sorter per stable AggregateId;
+        grouped queries reopen and drain that sorter per group before AggFinal.
+  - [x] Binary `UNION`, `INTERSECT`, and `EXCEPT` use temporary set indexes
+        whose equality collations come from the left HIR outputs.
+  - [x] Mixed and multi-arm duplicate-removing compounds preserve SQLite's
+        left-to-right set boundaries, including trailing UNION ALL duplicates.
+  - [x] Compound scalar and EXISTS subqueries materialize behind QueryId and
+        read exactly the first row or existence bit after every arm is closed.
+  - [x] LEFT JOIN preserves the separate HIR join constraint and WHERE phases
+        and null-extends the right SourceId only when no join match exists.
+  - [x] `row_number`, `rank`, and `dense_rank` execute over one resolved B-tree
+        source using stable WindowFunctionId bindings. The correctness-first
+        implementation rescans the frozen HIR source for each output row.
+  - [x] `percent_rank`, `cume_dist`, and `ntile` derive filtered partition size,
+        peer position, and validated arguments from the same frozen HIR rescan.
+  - [x] `lag` and `lead` materialize each filtered HIR partition in resolved
+        window order and seek an ordinal without parser-expression rewrites.
+  - [x] `first_value`, `last_value`, and `nth_value` use the bound default RANGE
+        frame, including peer ends and positive-N validation.
+  - [x] Aggregate window calls step their resolved arguments and FILTER over
+        the bound default RANGE frame and finalize through WindowFunctionId.
+  - [x] Window execution, RIGHT/FULL OUTER JOIN, and the remaining compound
+        combinations.
+  - [x] Recursive CTE seeds and arms feed a frozen-HIR priority queue, bind
+        occurrence-local recursive inputs, and apply UNION seen-row equality.
+  - [x] Table-function arguments and hidden-column inputs emit from frozen HIR.
+  - [x] Two-source RIGHT and FULL joins preserve the original HIR sides and
+        evaluate WHERE only after unmatched rows are null-extended.
+  - [x] CREATE TABLE AS derives its columns and materializes rows from one
+        closed HIR document without invoking the legacy SELECT planner.
+- [x] UPDATE and DELETE, including FROM, RETURNING, triggers, and foreign keys.
+  - [x] A catalog-free root dispatcher emits simple rowid B-tree DELETE directly
+        from closed HIR and rejects every unimplemented write obligation before
+        opening the write cursor.
+  - [x] Simple rowid B-tree UPDATE uses a stable HIR rowid set, evaluates
+        assignments against OLD, and rebuilds the complete NEW row through the
+        shared row-image layer.
+  - [x] Ordinary, expression, partial, and UNIQUE secondary indexes preserve
+        SQLite's prepare-before-write mutation order through one shared HIR
+        index layer.
+  - [x] RETURNING reads OLD before DELETE and the complete written NEW row
+        after UPDATE, using the same HIR runtime bindings as the write.
+  - [x] UPDATE FROM evaluates predicates and assignments while target and FROM
+        SourceIds are live, then materializes one stable value row per target
+        rowid before the write phase.
+  - [x] UPDATE FROM freezes FROM-derived ORDER BY values with each candidate,
+        applies LIMIT/OFFSET to that closed candidate set, and carries only the
+        selected target rowids and assignment values into the write phase.
+  - [x] Correlated scalar and EXISTS subqueries in UPDATE predicates and
+        assignments, and DELETE predicates, share the query layer's QueryId
+        destinations and CTE lifetime rules.
+  - [x] UPDATE and DELETE ORDER BY/LIMIT freeze selected rowids from HIR before
+        the first mutation, so sorting, OFFSET, and LIMIT cannot observe their
+        own writes.
+  - [x] UPDATE child-key changes remove deferred OLD violations and validate
+        the complete NEW row through frozen parent table/index identities.
+  - [x] Triggers and foreign keys.
+- [x] INSERT, VALUES, INSERT SELECT, UPSERT, excluded, defaults, and RETURNING.
+  - [x] VALUES and DEFAULT VALUES build supplied fields, frozen defaults, and
+        generated columns through the shared row-image layer for simple rowid
+        B-tree targets.
+  - [x] CHECK and UNIQUE constraints run against the complete frozen-HIR row
+        before any mutation.
+  - [x] Explicit rowid and INTEGER PRIMARY KEY inputs share one generated or
+        validated table-key path with pre-write uniqueness checks.
+  - [x] Default NOT NULL enforcement and STRICT built-in type checks run on the
+        complete NEW row before any mutation.
+  - [x] INSERT SELECT materializes direct HIR query output before opening the
+        target write loop, including safe self-inserts.
+  - [x] RETURNING projects the written NEW HIR row after INSERT.
+  - [x] ABORT, FAIL, ROLLBACK, and IGNORE route NOT NULL, CHECK, rowid, and
+        UNIQUE failures before mutation using the statement or index policy.
+  - [x] UPSERT DO NOTHING routes resolved rowid, UNIQUE-index, and catch-all
+        conflict targets around the complete row write.
+  - [x] UPSERT DO UPDATE keeps the conflicting target and completed excluded
+        row as separate SourceId bindings, rebuilds generated/constraint/index
+        programs under ABORT semantics, and returns the written NEW row.
+  - [x] UPSERT DO UPDATE keeps the conflicting OLD rowid separate from an
+        assigned NEW rowid or INTEGER PRIMARY KEY alias, probes the NEW key,
+        restores OLD, and writes every index and RETURNING value from NEW.
+  - [x] INSERT OR REPLACE deletes all OLD index entries and the conflicting
+        row before the NEW write for rowid and UNIQUE conflicts; NOT NULL uses
+        its frozen default and falls back to ABORT when the default is NULL.
+  - [x] AUTOINCREMENT freezes the resolved sqlite_sequence table in HIR and
+        maintains its high-water mark without a catalog lookup during emission.
+  - [x] INSERT probes frozen rowid or UNIQUE parent identities for child keys,
+        accepts NEW self-references, and repairs deferred counters when a new
+        parent key satisfies existing child rows.
+  - [x] VALUES and UPSERT expressions use the same subquery-capable physical
+        HIR expression boundary as query roots.
+- [x] Trigger commands and predicates with explicit OLD/NEW runtime bindings.
+- [x] Generated columns, defaults, CHECK constraints, expression and partial
+      indexes, and custom-type schema programs.
+  - [x] Generated/default reads and generated/default DML row construction use
+        only frozen HIR expressions, including logical-to-physical record
+        mapping for virtual columns.
+  - [x] CHECK constraints plus ordinary, expression, partial, and UNIQUE index
+        programs execute only from frozen HIR metadata.
+  - [x] DDL index rebuilds use the same closed stored-expression HIR boundary;
+        partial predicates run before expression keys for excluded rows.
+  - [x] Integrity and quick checks analyze CHECK, generated-column, partial,
+        and expression-index programs into one closed HIR batch per table.
+
+One syntax root uses exactly one semantic implementation. Falling back after a
+semantic error is forbidden because it would hide analyzer defects.
+
+- [x] Both top-level `translate` and nested `translate_inner` route SELECT,
+      INSERT, UPDATE, and DELETE directly to the semantic root; the old DML
+      entrypoints are no longer executable prepare paths.
+- [x] ALTER TABLE's generated sqlite_schema UPDATE uses the same HIR root and
+      physical UPDATE emitter, including the post-update DDL hook and CDC text.
+
+### 5. Delete the old representation
+
+- [x] Delete the unreachable legacy DELETE, INSERT, and UPSERT translators
+      after both root dispatchers switch to HIR; keep no compatibility fallback.
+- [x] Remove every production use of `bind_and_rewrite_expr` and
+      `BindingBehavior`, then delete `expr/binding.rs`.
+- [x] Remove optimizer, index, integrity-check, stored-expression, DML, UPSERT,
+      RETURNING, and trigger mini-binders.
+- [x] Remove semantic lookup methods and fields from `Resolver`; keep physical
+      emission state in an emission context and DDL catalog work in a DDL
+      context.
+- [x] Remove parser `Expr::Column`, `Expr::RowId`, `Expr::SubqueryResult`,
+      `FieldAccess.resolved`, `FieldAccessResolution`, `SELF_TABLE`, and
+      binding-owned `TableInternalId` uses.
+- [x] Replace incremental compilation's `Expr::Register` with stable,
+      position-derived syntax names and remove the runtime variant from the
+      parser AST.
+- [x] Remove AST mutation that replaces trigger, UPSERT, window, index-method,
+      or subquery expressions with execution locations.
+
+## Correctness gates
+
+- Every successful analysis validates as a closed HIR document.
+- Analysis does not mutate parser input.
+- Equivalent syntax and catalog snapshots produce equivalent HIR meaning.
+- Invalid SQL returns a SQL error, never a panic or unexplained internal error.
+- Every valid generated HIR document can be physically planned and emitted.
+- Planning and emission work when all name-resolution operations are poisoned.
+- Temporary old/new comparison checks resolved facts, errors, and execution
+  results; it is never enabled in normal prepare.
+- SQLite differential coverage includes aliases, rowid, joins, correlation,
+  CTEs, DML, UPSERT, triggers, and stored expressions.
+- Hegel-generated SQL, structured catalog/HIR, trigger-runtime, and
+  stored-expression cases run without panics or invalid HIR.
+
+## Mechanical deletion gates
+
+Before declaring the migration complete, these searches must find no
+production use in the migrated paths:
+
+```text
+rg "bind_and_rewrite_expr|BindingBehavior" core --glob '*.rs'
+rg "ast::Expr::(Column|RowId|SubqueryResult|Register)" core sqlite/parser --glob '*.rs'
+rg "SELF_TABLE|FieldAccessResolution|TableInternalId" core sqlite/parser --glob '*.rs'
+rg "translate_expr" core --glob '*.rs'
+rg "\\bResolver\\b|new_resolver" core/translate --glob '*.rs' --glob '!**/*properties.rs'
+```
+
+All gates above return no production matches. `DdlContext` remains for live DDL
+catalog operations, and `schema_expr` remains the independent positional IR for
+persisted expressions before they are instantiated into closed HIR.

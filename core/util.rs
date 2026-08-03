@@ -3,12 +3,11 @@ use crate::numeric::StrToF64;
 use crate::schema::ColDef;
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
-use crate::translate::plan::{BitSet, JoinedTable, TableReferences};
-use crate::translate::planner::{parse_row_id, TableMask};
+use crate::translate::plan::BitSet;
 use crate::types::IOResult;
 use crate::IO;
 use crate::{
-    schema::{Column, Schema, Table, Type},
+    schema::{Column, Schema, Type},
     types::{Value, ValueType},
     LimboError, OpenFlags, Result, Statement, SymbolTable,
 };
@@ -424,88 +423,6 @@ pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
     }
 }
 
-/// Returns true if every Column/RowId table reference in `expr` is contained
-/// in `allowed`. Constants (no table refs) pass.
-pub(crate) fn expr_tables_subset_of(
-    expr: &Expr,
-    table_references: &TableReferences,
-    allowed: &TableMask,
-) -> bool {
-    let mut ok = true;
-    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
-        match e {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                if let Some(idx) = table_references
-                    .joined_tables()
-                    .iter()
-                    .position(|t| t.internal_id == *table)
-                {
-                    if !allowed.get(idx) {
-                        ok = false;
-                        return Ok(WalkControl::SkipChildren);
-                    }
-                }
-                // Outer query references are already in scope — allow them.
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    });
-    ok
-}
-
-/// bind AST identifiers to either Column or Rowid if possible
-pub fn simple_bind_expr(
-    joined_table: &JoinedTable,
-    result_columns: &[ast::ResultColumn],
-    expr: &mut ast::Expr,
-) -> Result<()> {
-    let internal_id = joined_table.internal_id;
-    walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
-        #[allow(clippy::single_match)]
-        match expr {
-            Expr::Id(id) => {
-                for result_column in result_columns.iter() {
-                    if let ast::ResultColumn::Expr(result, Some(ast::As::As(alias))) = result_column
-                    {
-                        if alias.as_str().eq_ignore_ascii_case(id.as_str()) {
-                            *expr = *result.clone();
-                            return Ok(WalkControl::Continue);
-                        }
-                    }
-                }
-                let col_idx = joined_table.columns().iter().position(|c| {
-                    c.name
-                        .as_ref()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(id.as_str()))
-                });
-                if let Some(col_idx) = col_idx {
-                    let col = joined_table.table.columns().get(col_idx).unwrap();
-                    *expr = ast::Expr::Column {
-                        database: None,
-                        table: internal_id,
-                        column: col_idx,
-                        is_rowid_alias: col.is_rowid_alias(),
-                    };
-                } else {
-                    // only if we haven't found a match, check for explicit rowid reference
-                    let is_btree_table = matches!(joined_table.table, Table::BTree(_));
-                    if is_btree_table {
-                        if let Some(rowid) =
-                            parse_row_id(&normalize_ident(id.as_str()), internal_id, || false)?
-                        {
-                            *expr = rowid;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(())
-}
-
 pub fn try_substitute_parameters(
     pattern: &Expr,
     parameters: &HashMap<i32, Expr>,
@@ -600,10 +517,7 @@ pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i3
             captured.insert(var, expr.clone());
             Some(captured)
         }
-        (
-            Expr::Id(_) | Expr::Name(_) | Expr::Column { .. },
-            Expr::Id(_) | Expr::Name(_) | Expr::Column { .. },
-        ) => {
+        (Expr::Id(_) | Expr::Name(_), Expr::Id(_) | Expr::Name(_)) => {
             if pattern == query {
                 Some(captured)
             } else {
@@ -912,20 +826,6 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                     .zip(rhs2.iter())
                     .all(|(a, b)| exprs_are_equivalent(a, b))
         }
-        (
-            Expr::Column {
-                database: db1,
-                is_rowid_alias: r1,
-                table: tbl_1,
-                column: col_1,
-            },
-            Expr::Column {
-                database: db2,
-                is_rowid_alias: r2,
-                table: tbl_2,
-                column: col_2,
-            },
-        ) => tbl_1 == tbl_2 && col_1 == col_2 && db1 == db2 && r1 == r2,
         // fall back to naive equality check
         _ => expr1 == expr2,
     }

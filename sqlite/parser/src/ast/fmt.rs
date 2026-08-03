@@ -6,47 +6,8 @@ use crate::token::TokenType;
 use crate::token::TokenType::*;
 use crate::Result;
 
-use crate::ast::TableInternalId;
-
 /// Context to be used in ToSqlString
-pub trait ToSqlContext {
-    /// Given an id, get the table name
-    /// First Option indicates whether the table exists
-    ///
-    /// Currently not considering aliases
-    fn get_table_name(&self, _id: TableInternalId) -> Option<&str> {
-        None
-    }
-
-    /// Given a table id and a column index, get the column name
-    /// First Option indicates whether the column exists
-    /// Second Option indicates whether the column has a name
-    fn get_column_name(&self, _table_id: TableInternalId, _col_idx: usize) -> Option<Option<&str>> {
-        None
-    }
-
-    // help function to handle missing table/column names
-    fn get_table_and_column_names(
-        &self,
-        table_id: TableInternalId,
-        col_idx: usize,
-    ) -> (String, String) {
-        let table_name = self
-            .get_table_name(table_id)
-            .map(|s| s.to_owned())
-            .unwrap_or_else(|| format!("t{}", table_id.0));
-
-        let column_name = self
-            .get_column_name(table_id, col_idx)
-            .map(|opt| {
-                opt.map(|s| s.to_owned())
-                    .unwrap_or_else(|| format!("c{col_idx}"))
-            })
-            .unwrap_or_else(|| format!("c{col_idx}"));
-
-        (table_name, column_name)
-    }
-}
+pub trait ToSqlContext {}
 
 pub struct WriteTokenStream<'a, T: Write> {
     write: &'a mut T,
@@ -908,10 +869,6 @@ impl ToTokens for Expr {
         context: &C,
     ) -> Result<(), S::Error> {
         match self {
-            Self::SubqueryResult { .. } => {
-                // FIXME: what to put here? This is a highly "artificial" AST node that has no meaning when stringified.
-                Ok(())
-            }
             Self::Between {
                 lhs,
                 not,
@@ -931,11 +888,6 @@ impl ToTokens for Expr {
                 lhs.to_tokens(s, context)?;
                 op.to_tokens(s, context)?;
                 rhs.to_tokens(s, context)
-            }
-            Self::Register(reg) => {
-                // This is for internal use only, not part of SQL syntax
-                // Use a special notation that won't conflict with SQL
-                s.append(TK_VARIABLE, Some(&format!("$r{reg}")))
             }
             Self::Case {
                 base,
@@ -1029,12 +981,6 @@ impl ToTokens for Expr {
                 Ok(())
             }
             Self::Id(id) => id.to_tokens(s, context),
-            Self::Column { table, column, .. } => {
-                let (tbl_name, col_name) = context.get_table_and_column_names(*table, *column);
-                s.append(TK_ID, Some(tbl_name.as_ref()))?;
-                s.append(TK_DOT, None)?;
-                s.append(TK_ID, Some(col_name.as_ref()))
-            }
             Self::InList { lhs, not, rhs } => {
                 lhs.to_tokens(s, context)?;
                 if *not {
@@ -1130,7 +1076,6 @@ impl ToTokens for Expr {
                 }
                 s.append(TK_RP, None)
             }
-            Self::RowId { .. } => Ok(()),
             Self::Subquery(query) => {
                 s.append(TK_LP, None)?;
                 query.to_tokens(s, context)?;

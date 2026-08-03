@@ -7334,6 +7334,7 @@ dependencies = [
  "fastbloom",
  "getrandom 0.2.15",
  "getrandom 0.3.2",
+ "hegeltest",
  "hex",
  "icu_collator",
  "icu_locale",

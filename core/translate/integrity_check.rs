@@ -1,15 +1,17 @@
-use crate::translate::expr::emit_table_column;
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::SelfTableContext;
 use crate::{
     schema::{GeneratedType, Index, Schema, Table, EXPR_INDEX_SENTINEL},
     translate::{
-        emitter::Resolver,
-        expr::{
-            bind_and_rewrite_expr, translate_condition_expr, translate_expr_no_constant_opt,
-            BindingBehavior, ConditionMetadata, NoConstantOptReason,
+        emitter::DdlContext,
+        physical::{
+            emit_root_schema_expression_into, CursorId, PhysicalPlan, RootRuntimeInputs,
+            SourceRuntime,
         },
-        plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
+        semantic::{
+            context::SemanticContext,
+            hir::HirRoot,
+            schema_expr::{analyze_table_schema_syntax, SchemaSyntaxInput},
+        },
     },
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
@@ -17,7 +19,6 @@ use crate::{
     },
     HashSet,
 };
-use turso_parser::ast;
 
 /// Maximum number of errors to report with integrity check. If we exceed this number we will
 /// short circuit the procedure and return early to not waste time. SQLite uses 100 as default.
@@ -27,14 +28,14 @@ enum BoundIndexColumn {
     Column(usize),
     /// The affiniy is `Some` when the index column refers to a virtual generated column
     /// (the affinity is the column's declared type).
-    Expr(Box<ast::Expr>, Option<Affinity>),
+    Expr(usize, Option<Affinity>),
 }
 
 struct BoundIntegrityIndex {
     index: crate::sync::Arc<Index>,
     cursor_id: usize,
     expected_count_reg: usize,
-    where_expr: Option<ast::Expr>,
+    where_expr: Option<usize>,
     columns: Vec<BoundIndexColumn>,
     unique_nullable: Vec<bool>,
 }
@@ -43,7 +44,7 @@ struct BoundIntegrityIndex {
 pub fn translate_integrity_check(
     schema: &Schema,
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     database_id: usize,
     max_errors: usize,
     connection: &std::sync::Arc<crate::Connection>,
@@ -51,7 +52,7 @@ pub fn translate_integrity_check(
     translate_integrity_check_impl(
         schema,
         program,
-        resolver,
+        ddl_context,
         database_id,
         max_errors,
         false,
@@ -63,7 +64,7 @@ pub fn translate_integrity_check(
 pub fn translate_quick_check(
     schema: &Schema,
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     database_id: usize,
     max_errors: usize,
     connection: &std::sync::Arc<crate::Connection>,
@@ -71,7 +72,7 @@ pub fn translate_quick_check(
     translate_integrity_check_impl(
         schema,
         program,
-        resolver,
+        ddl_context,
         database_id,
         max_errors,
         true,
@@ -133,26 +134,10 @@ fn emit_row_missing_from_index_error(
     emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
 }
 
-fn bind_expr_for_table(
-    expr: &ast::Expr,
-    table_references: &mut TableReferences,
-    resolver: &Resolver,
-) -> crate::Result<ast::Expr> {
-    let mut out = expr.clone();
-    bind_and_rewrite_expr(
-        &mut out,
-        Some(table_references),
-        None,
-        resolver,
-        BindingBehavior::ResultColumnsNotAllowed,
-    )?;
-    Ok(out)
-}
-
 fn translate_integrity_check_impl(
     schema: &Schema,
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    ddl_context: &DdlContext,
     database_id: usize,
     max_errors: usize,
     quick: bool,
@@ -265,25 +250,7 @@ fn translate_integrity_check_impl(
             db: database_id,
         });
 
-        let mut table_references = TableReferences::new(
-            vec![JoinedTable {
-                op: Operation::Scan(Scan::BTreeTable {
-                    iter_dir: IterationDirection::Forwards,
-                    index: None,
-                }),
-                table: Table::BTree(btree_table.clone()),
-                identifier: btree_table.name.clone(),
-                internal_id: table_ref_id,
-                join_info: None,
-                col_used_mask: ColumnUsedMask::default(),
-                column_use_counts: Vec::new(),
-                expression_index_usages: Vec::new(),
-                database_id,
-                indexed: None,
-            }],
-            vec![],
-        );
-
+        let mut syntax = Vec::new();
         let mut bound_indexes = Vec::new();
         if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
             for index in indexes {
@@ -301,28 +268,52 @@ fn translate_integrity_check_impl(
                 let expected_count_reg = program.alloc_register();
                 program.emit_int(0, expected_count_reg);
 
-                let mut where_expr = None;
-                if let Some(pred) = index.where_clause.as_deref() {
-                    where_expr = Some(bind_expr_for_table(pred, &mut table_references, resolver)?);
-                }
+                let where_expr = index.where_clause.as_deref().map(|predicate| {
+                    let position = syntax.len();
+                    syntax.push(SchemaSyntaxInput {
+                        syntax: predicate,
+                        profile: crate::schema_expr::SchemaExprProfile::PartialIndexPredicate,
+                        owner_column: None,
+                    });
+                    position
+                });
 
                 let mut columns = Vec::with_capacity(index.columns.len());
                 let mut unique_nullable = Vec::with_capacity(index.columns.len());
                 for col in &index.columns {
-                    if let Some(expr) = col.expr.as_deref() {
-                        let affinity = if col.pos_in_table != EXPR_INDEX_SENTINEL {
-                            Some(btree_table.columns()[col.pos_in_table].affinity())
-                        } else {
-                            // expression indexes don't apply affinity from the basae table
-                            None
-                        };
-                        columns.push(BoundIndexColumn::Expr(
-                            Box::new(bind_expr_for_table(expr, &mut table_references, resolver)?),
-                            affinity,
-                        ));
+                    if col.pos_in_table == EXPR_INDEX_SENTINEL {
+                        let expr = col.expr.as_deref().ok_or_else(|| {
+                            crate::LimboError::InternalError(format!(
+                                "expression index {} has no expression",
+                                index.name
+                            ))
+                        })?;
+                        let position = syntax.len();
+                        syntax.push(SchemaSyntaxInput {
+                            syntax: expr,
+                            profile: crate::schema_expr::SchemaExprProfile::IndexKey,
+                            owner_column: None,
+                        });
+                        columns.push(BoundIndexColumn::Expr(position, None));
                         unique_nullable.push(true);
                     } else {
-                        columns.push(BoundIndexColumn::Column(col.pos_in_table));
+                        match btree_table.columns()[col.pos_in_table].generated_type() {
+                            GeneratedType::Virtual { expr, .. } => {
+                                let position = syntax.len();
+                                syntax.push(SchemaSyntaxInput {
+                                    syntax: expr,
+                                    profile: crate::schema_expr::SchemaExprProfile::GeneratedColumn,
+                                    owner_column: Some(col.pos_in_table),
+                                });
+                                columns.push(BoundIndexColumn::Expr(
+                                    position,
+                                    Some(btree_table.columns()[col.pos_in_table].affinity()),
+                                ));
+                            }
+                            GeneratedType::NotGenerated => {
+                                columns.push(BoundIndexColumn::Column(col.pos_in_table));
+                            }
+                        }
                         unique_nullable.push(!btree_table.columns()[col.pos_in_table].notnull());
                     }
                 }
@@ -340,11 +331,15 @@ fn translate_integrity_check_impl(
 
         let mut bound_checks = Vec::with_capacity(btree_table.check_constraints.len());
         for check in &btree_table.check_constraints {
-            bound_checks.push(bind_expr_for_table(
-                &check.expr,
-                &mut table_references,
-                resolver,
-            )?);
+            let position = syntax.len();
+            syntax.push(SchemaSyntaxInput {
+                syntax: &check.expr,
+                profile: crate::schema_expr::SchemaExprProfile::Check {
+                    strict_types: btree_table.is_strict,
+                },
+                owner_column: None,
+            });
+            bound_checks.push(position);
         }
 
         let not_null_columns: Vec<(BoundIndexColumn, String)> = btree_table
@@ -356,17 +351,51 @@ fn translate_integrity_check_impl(
                 let name = col.name.clone().unwrap_or_else(|| format!("column{idx}"));
                 match col.generated_type() {
                     GeneratedType::Virtual { expr, .. } => {
-                        let bound =
-                            bind_expr_for_table(expr, &mut table_references, resolver).ok()?;
-                        Some((
-                            BoundIndexColumn::Expr(Box::new(bound), Some(col.affinity())),
-                            name,
-                        ))
+                        let position = syntax.len();
+                        syntax.push(SchemaSyntaxInput {
+                            syntax: expr,
+                            profile: crate::schema_expr::SchemaExprProfile::GeneratedColumn,
+                            owner_column: Some(idx),
+                        });
+                        Some((BoundIndexColumn::Expr(position, Some(col.affinity())), name))
                     }
                     GeneratedType::NotGenerated => Some((BoundIndexColumn::Column(idx), name)),
                 }
             })
             .collect();
+
+        let main_schema = if database_id == crate::MAIN_DB_ID {
+            schema
+        } else {
+            ddl_context.schema()
+        };
+        let context = SemanticContext::new(
+            main_schema,
+            connection.database_schemas(),
+            &connection.temp.database,
+            connection.attached_databases(),
+            ddl_context.symbol_table,
+            connection.experimental_custom_types_enabled(),
+            connection.get_dqs_dml().into(),
+            connection.dialect(),
+        );
+        let analyzed = analyze_table_schema_syntax(
+            &context,
+            database_id,
+            crate::sync::Arc::new(Table::BTree(btree_table.clone())),
+            &syntax,
+        )?;
+        let plan = PhysicalPlan::new(&analyzed.document)
+            .map_err(|error| crate::LimboError::InternalError(error.to_string()))?;
+        let root = match &analyzed.document.root {
+            HirRoot::SchemaExpressions(root) => root,
+            _ => unreachable!("stored schema analysis returns a schema-expression root"),
+        };
+        let mut runtime_inputs = RootRuntimeInputs::default();
+        runtime_inputs.bind_source(
+            root.source,
+            SourceRuntime::Cursor(CursorId(table_cursor_id)),
+        );
 
         let row_number_reg = program.alloc_register();
         program.emit_int(0, row_number_reg);
@@ -391,28 +420,15 @@ fn translate_integrity_check_impl(
                 BoundIndexColumn::Column(idx) => {
                     program.emit_column_or_rowid(table_cursor_id, *idx, col_value_reg);
                 }
-                BoundIndexColumn::Expr(expr, _affinity) => {
-                    let self_table_context = table_references.joined_tables().first().map(|jt| {
-                        SelfTableContext::ForSelect {
-                            table_ref_id: jt.internal_id,
-                            referenced_tables: table_references.clone(),
-                        }
-                    });
-                    resolver.with_self_table_context(
+                BoundIndexColumn::Expr(expression_index, _affinity) => {
+                    emit_root_schema_expression_into(
+                        &plan,
                         program,
-                        self_table_context.as_ref(),
-                        |program, _| {
-                            translate_expr_no_constant_opt(
-                                program,
-                                Some(&table_references),
-                                expr,
-                                col_value_reg,
-                                resolver,
-                                NoConstantOptReason::RegisterReuse,
-                            )?;
-                            Ok(())
-                        },
-                    )?;
+                        &runtime_inputs,
+                        *expression_index,
+                        col_value_reg,
+                    )
+                    .map_err(|error| crate::LimboError::InternalError(error.to_string()))?;
                 }
             }
 
@@ -429,21 +445,21 @@ fn translate_integrity_check_impl(
             program.preassign_label_to_next_insn(not_null_ok);
         }
 
-        for check_expr in &bound_checks {
+        for expression_index in &bound_checks {
             let check_ok = program.allocate_label();
             // Evaluate the CHECK expression into a register, then branch.
             // A CHECK constraint passes when the result is TRUE *or* NULL
             // (only explicit FALSE/0 is a violation), so we use
             // jump_if_null: true to treat NULL as passing.
             let check_reg = program.alloc_register();
-            translate_expr_no_constant_opt(
+            emit_root_schema_expression_into(
+                &plan,
                 program,
-                Some(&table_references),
-                check_expr,
+                &runtime_inputs,
+                *expression_index,
                 check_reg,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
+            )
+            .map_err(|error| crate::LimboError::InternalError(error.to_string()))?;
             program.emit_insn(Insn::If {
                 reg: check_reg,
                 target_pc: check_ok,
@@ -460,24 +476,22 @@ fn translate_integrity_check_impl(
         for bound_index in &bound_indexes {
             let skip_current_index = program.allocate_label();
 
-            if let Some(where_expr) = bound_index.where_expr.as_ref() {
+            if let Some(expression_index) = bound_index.where_expr {
                 let where_failed = skip_current_index;
-                let where_true_fallthrough = program.allocate_label();
-                translate_condition_expr(
+                let predicate_register = program.alloc_register();
+                emit_root_schema_expression_into(
+                    &plan,
                     program,
-                    &table_references,
-                    where_expr,
-                    ConditionMetadata {
-                        // For partial indexes, rows that evaluate predicate to FALSE/NULL
-                        // are not part of the index and must be skipped.
-                        jump_if_condition_is_true: false,
-                        jump_target_when_true: where_true_fallthrough,
-                        jump_target_when_false: where_failed,
-                        jump_target_when_null: where_failed,
-                    },
-                    resolver,
-                )?;
-                program.preassign_label_to_next_insn(where_true_fallthrough);
+                    &runtime_inputs,
+                    expression_index,
+                    predicate_register,
+                )
+                .map_err(|error| crate::LimboError::InternalError(error.to_string()))?;
+                program.emit_insn(Insn::IfNot {
+                    reg: predicate_register,
+                    target_pc: where_failed,
+                    jump_if_null: true,
+                });
             }
 
             // Count rows that are expected to appear in this index. For partial
@@ -492,41 +506,17 @@ fn translate_integrity_check_impl(
                 let target = key_start_reg + i;
                 match col {
                     BoundIndexColumn::Column(pos) => {
-                        emit_table_column(
-                            program,
-                            table_cursor_id,
-                            table_ref_id,
-                            &table_references,
-                            &btree_table.columns()[*pos],
-                            *pos,
-                            target,
-                            resolver,
-                        )?;
+                        program.emit_column_or_rowid(table_cursor_id, *pos, target);
                     }
-                    BoundIndexColumn::Expr(expr, affinity) => {
-                        let self_table_context =
-                            table_references.joined_tables().first().map(|jt| {
-                                SelfTableContext::ForSelect {
-                                    table_ref_id: jt.internal_id,
-                                    referenced_tables: table_references.clone(),
-                                }
-                            });
-
-                        resolver.with_self_table_context(
+                    BoundIndexColumn::Expr(expression_index, affinity) => {
+                        emit_root_schema_expression_into(
+                            &plan,
                             program,
-                            self_table_context.as_ref(),
-                            |program, _| {
-                                translate_expr_no_constant_opt(
-                                    program,
-                                    Some(&table_references),
-                                    expr,
-                                    target,
-                                    resolver,
-                                    NoConstantOptReason::RegisterReuse,
-                                )?;
-                                Ok(())
-                            },
-                        )?;
+                            &runtime_inputs,
+                            *expression_index,
+                            target,
+                        )
+                        .map_err(|error| crate::LimboError::InternalError(error.to_string()))?;
                         if let Some(aff) = affinity {
                             program.emit_column_affinity(target, *aff);
                         }

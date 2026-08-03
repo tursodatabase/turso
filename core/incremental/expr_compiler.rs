@@ -6,85 +6,24 @@ use crate::numeric::Numeric;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
-use crate::translate::emitter::{DoubleQuotedDml, Resolver};
-use crate::translate::expr::translate_expr;
+use crate::translate::{
+    physical::{
+        emit_root_schema_expression_into, PhysicalPlan, RegisterRange, RootRuntimeInputs,
+        SourceRuntime,
+    },
+    semantic::{
+        context::SemanticContext,
+        hir::HirRoot,
+        schema_expr::{analyze_positional_scalar_syntax, SchemaExprInput},
+    },
+};
 use crate::types::Text;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::Insn;
 use crate::vdbe::{Program, ProgramState, Register};
+use crate::SymbolTable;
 use crate::{Connection, QueryMode, Result, Value};
-use crate::{DatabaseCatalog, RwLock, SymbolTable};
-use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{Expr, Literal, Operator};
-
-// Transform an expression to replace column references with Register expressions Why do we want to
-// do this?
-//
-// Imagine you have a view like:
-//
-// create materialized view hex(count(*) + 2). translate_expr will usually try to find match names
-// to either literals or columns. But "count(*)" is not a column in any sqlite table.
-//
-// We *could* theoretically have a table-representation of every DBSP-step, but it is a lot simpler
-// to just pass registers as parameters to the VDBE expression, and teach translate_expr to
-// recognize those.
-//
-// But because the expression compiler will not generate those register inputs, we have to
-// transform the expression.
-fn transform_expr_for_dbsp(expr: &Expr, input_column_names: &[String]) -> Expr {
-    match expr {
-        // Transform column references (represented as Id) to Register expressions
-        Expr::Id(name) => {
-            // Check if this is a column name from our input
-            if let Some(idx) = input_column_names
-                .iter()
-                .position(|col| col == name.as_str())
-            {
-                // Replace with a Register expression
-                Expr::Register(idx)
-            } else {
-                // Not a column reference, keep as is
-                expr.clone()
-            }
-        }
-        // Recursively transform nested expressions
-        Expr::Binary(lhs, op, rhs) => Expr::Binary(
-            Box::new(transform_expr_for_dbsp(lhs, input_column_names)),
-            *op,
-            Box::new(transform_expr_for_dbsp(rhs, input_column_names)),
-        ),
-        Expr::Unary(op, operand) => Expr::Unary(
-            *op,
-            Box::new(transform_expr_for_dbsp(operand, input_column_names)),
-        ),
-        Expr::FunctionCall {
-            name,
-            distinctness,
-            args,
-            order_by,
-            within_group,
-            filter_over,
-        } => Expr::FunctionCall {
-            name: name.clone(),
-            distinctness: *distinctness,
-            args: args
-                .iter()
-                .map(|arg| Box::new(transform_expr_for_dbsp(arg, input_column_names)))
-                .collect(),
-            order_by: order_by.clone(),
-            within_group: within_group.clone(),
-            filter_over: filter_over.clone(),
-        },
-        Expr::Parenthesized(exprs) => Expr::Parenthesized(
-            exprs
-                .iter()
-                .map(|e| Box::new(transform_expr_for_dbsp(e, input_column_names)))
-                .collect(),
-        ),
-        // For other expression types, keep as is
-        _ => expr.clone(),
-    }
-}
 
 /// Enum to represent either a trivial or compiled expression
 #[derive(Clone)]
@@ -200,12 +139,11 @@ impl CompiledExpression {
         input_column_names: &[String],
     ) -> Option<TrivialExpression> {
         match expr {
-            // Column reference or register
+            // Positional inputs use unique syntax names supplied by the caller.
             Expr::Id(name) => input_column_names
                 .iter()
                 .position(|col| col == name.as_str())
                 .map(TrivialExpression::Column),
-            Expr::Register(idx) => Some(TrivialExpression::Column(*idx)),
 
             // Immediate values
             Expr::Literal(lit) => {
@@ -317,32 +255,49 @@ impl CompiledExpression {
         // Allocate a temp register for computation
         let temp_result_register = builder.alloc_register();
 
-        // Transform the expression to replace column references with Register expressions
-        let transformed_expr = transform_expr_for_dbsp(expr, input_column_names);
-
-        // Create a resolver for translate_expr
-        let database_schemas = RwLock::new(HashMap::default());
-        let temp_database = RwLock::new(None);
-        let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let resolver = Resolver::new(
+        let context = SemanticContext::new(
             schema,
-            &database_schemas,
-            &temp_database,
-            &attached_databases,
+            connection.database_schemas(),
+            &connection.temp.database,
+            connection.attached_databases(),
             syms,
-            true,
-            DoubleQuotedDml::Enabled,
-            std::sync::Arc::new(crate::dialect::SqliteDialect),
+            connection.experimental_custom_types_enabled(),
+            connection.get_dqs_dml().into(),
+            connection.dialect(),
         );
-
-        // Translate the transformed expression to bytecode
-        translate_expr(
+        let inputs = input_column_names
+            .iter()
+            .map(|name| SchemaExprInput {
+                name: name.clone(),
+                declared_type: None,
+                array_dimensions: 0,
+                type_fact: None,
+            })
+            .collect::<Vec<_>>();
+        let analyzed =
+            analyze_positional_scalar_syntax(&context, crate::MAIN_DB_ID, expr, &inputs)?;
+        let plan = PhysicalPlan::new(&analyzed.document)
+            .map_err(|error| crate::LimboError::InternalError(error.to_string()))?;
+        let root = match &analyzed.document.root {
+            HirRoot::SchemaExpressions(root) => root,
+            _ => unreachable!("incremental scalar analysis returns a schema-expression root"),
+        };
+        let mut runtime_inputs = RootRuntimeInputs::default();
+        runtime_inputs.bind_source(
+            root.source,
+            SourceRuntime::Registers {
+                columns: RegisterRange::new(0, input_count),
+                rowid: None,
+            },
+        );
+        emit_root_schema_expression_into(
+            &plan,
             &mut builder,
-            None, // No table references needed for pure expressions
-            &transformed_expr,
+            &runtime_inputs,
+            0,
             temp_result_register,
-            &resolver,
-        )?;
+        )
+        .map_err(|error| crate::LimboError::InternalError(error.to_string()))?;
 
         // Copy the result to register 0 for return
         builder.emit_insn(Insn::Copy {
