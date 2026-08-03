@@ -709,8 +709,8 @@ fn emit_delete_row_common(
         for (index, index_cursor_id) in indexes_to_delete {
             let skip_delete_label = if index.where_clause.is_some() {
                 let where_copy = index
-                    .bind_where_expr(Some(table_references), resolver)
-                    .expect("where clause to exist");
+                    .bind_where_expr(Some(table_references), resolver)?
+                    .expect("index.where_clause was checked to be Some above");
                 let skip_label = program.allocate_label();
                 let reg = program.alloc_register();
                 translate_expr_no_constant_opt(

@@ -350,7 +350,7 @@ fn emit_refill_index(
         }],
         vec![],
     );
-    let where_clause = idx.bind_where_expr(Some(&mut table_references), resolver);
+    let where_clause = idx.bind_where_expr(Some(&mut table_references), resolver)?;
 
     if idx
         .index_method
