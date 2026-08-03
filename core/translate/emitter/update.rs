@@ -569,13 +569,16 @@ fn emit_notnull_constraint_check(
                     NoConstantOptReason::RegisterReuse,
                 )?;
                 program.preassign_label_to_next_insn(continue_label);
-            } else {
-                program.emit_insn(Insn::HaltIfNull {
-                    target_reg,
-                    err_code: SQLITE_CONSTRAINT_NOTNULL,
-                    description: description(),
-                });
             }
+            // The value must still satisfy NOT NULL, whether it is the original
+            // (non-null) value or the substituted default: a column may declare
+            // DEFAULT (NULL), so substituting the default does not resolve the
+            // violation and SQLite aborts.
+            program.emit_insn(Insn::HaltIfNull {
+                target_reg,
+                err_code: SQLITE_CONSTRAINT_NOTNULL,
+                description: description(),
+            });
         }
         _ => {
             program.emit_insn(Insn::HaltIfNull {
