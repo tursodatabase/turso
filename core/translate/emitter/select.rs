@@ -990,6 +990,7 @@ fn build_materialized_build_input_plan(
         non_from_clause_subqueries: plan.non_from_clause_subqueries.clone(),
         input_cardinality_hint: None,
         estimated_output_rows: None,
+        estimated_cost: None,
         simple_aggregate: None,
         phantom_params: vec![],
     };

@@ -35,8 +35,8 @@ use super::{
         usable_constraints_for_join_order, usable_constraints_for_lhs_mask, TableConstraints,
     },
     cost::{
-        estimate_cost_for_scan_or_seek, estimate_index_cost, estimate_rows_per_seek, AnalyzeCtx,
-        Cost, IndexInfo,
+        estimate_btree_depth, estimate_cost_for_scan_or_seek, estimate_index_cost,
+        estimate_rows_per_seek, AnalyzeCtx, Cost, IndexInfo,
     },
     join::JoinPlanningContext,
     multi_index::{
@@ -535,13 +535,7 @@ pub(super) fn choose_best_in_seek_candidate(
     };
 
     let base = *base_row_count;
-    let tree_depth = if base <= 1.0 {
-        1.0
-    } else {
-        (base.ln() / params.rows_per_table_page.ln())
-            .ceil()
-            .max(1.0)
-    };
+    let tree_depth = estimate_btree_depth(base, params.rows_per_table_page);
     let mut best_in_seek = None;
     let mut best_in_seek_cost = best_cost;
 
@@ -1476,16 +1470,19 @@ fn find_best_access_method_for_subquery(
         params,
         None,
     );
+    let subquery_cost = subquery.plan.estimated_cost().unwrap_or(0.0);
     let coroutine_reexecution_overhead =
         Cost((input_cardinality - 1.0).max(0.0) * *base_row_count * params.cpu_cost_per_seek);
-    let coroutine_cost = coroutine_scan_cost + coroutine_reexecution_overhead;
+    let coroutine_cost = coroutine_scan_cost
+        + coroutine_reexecution_overhead
+        + Cost(input_cardinality * subquery_cost);
     let table_materialization_required = subquery.requires_table_materialization();
     let can_direct_materialize_index = subquery.supports_direct_index_materialization();
     let scan_cost = if table_materialization_required {
         // Explicit MATERIALIZED hints and shared CTEs already produce a table-backed
         // row source. Scanning them behaves like rescanning cached rows, not rerunning
         // a coroutine body for each outer probe.
-        coroutine_scan_cost
+        coroutine_scan_cost + Cost(subquery_cost)
     } else {
         // The generic scan model treats repeated probes like cached rescans of a
         // row source. A coroutine-backed subquery is slightly more expensive: each
@@ -1690,7 +1687,7 @@ fn find_best_access_method_for_subquery(
         input_cardinality * params.cpu_cost_per_seek
             + input_cardinality * estimated_rows_per_outer_row * params.cpu_cost_per_row,
     );
-    let total_cost = seek_setup_cost + seek_cost;
+    let total_cost = Cost(subquery_cost) + seek_setup_cost + seek_cost;
 
     if total_cost >= scan_cost + order_satisfiability_bonus {
         return Ok(Some(AccessMethod {

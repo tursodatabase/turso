@@ -98,6 +98,15 @@ fn estimate_scan_cost(base_row_count: f64, num_scans: f64, params: &CostModelPar
     Cost(io_cost + cpu_cost)
 }
 
+/// Estimate how many B-tree levels an index search reads.
+pub(super) fn estimate_btree_depth(row_count: f64, rows_per_page: f64) -> f64 {
+    if row_count <= 1.0 {
+        1.0
+    } else {
+        (row_count.ln() / rows_per_page.ln()).ceil().max(1.0)
+    }
+}
+
 /// Estimate IO and CPU cost for index-based access.
 ///
 /// This properly separates the number of B-tree seeks from the number of rows
@@ -350,13 +359,7 @@ pub fn estimate_cost_for_scan_or_seek(
 ) -> Cost {
     let base_row_count = *base_row_count;
 
-    let tree_depth = if base_row_count <= 1.0 {
-        1.0
-    } else {
-        (base_row_count.ln() / params.rows_per_table_page.ln())
-            .ceil()
-            .max(1.0)
-    };
+    let tree_depth = estimate_btree_depth(base_row_count, params.rows_per_table_page);
 
     let Some(index_info) = index_info else {
         // Full table scan (no index)

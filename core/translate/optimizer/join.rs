@@ -17,7 +17,7 @@ use crate::{
     schema::Schema,
     stats::AnalyzeStats,
     translate::{
-        expr::{walk_expr, WalkControl},
+        expr::{expr_references_subquery_id, walk_expr, WalkControl},
         optimizer::{
             access_method::{
                 estimate_hash_join_cost, try_hash_join_access_method, AccessMethodParams,
@@ -31,7 +31,7 @@ use crate::{
         },
         plan::{
             HashJoinKey, HashJoinType, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
-            TableReferences, WhereTerm,
+            SubqueryState, TableReferences, WhereTerm,
         },
         planner::TableMask,
     },
@@ -59,11 +59,15 @@ impl<'a> JoinPlanningContext<'a> {
 // This is a safety limit, not a cost tuning parameter.
 const MAX_MATERIALIZED_BUILD_ROWS: f64 = 200_000.0;
 
+/// Estimate how much the remaining `WHERE` terms cut the row count.
+///
+/// Some callers skip a term because they need the count before that term runs.
 fn constraint_output_multipliers(
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
     rhs_self_mask: TableMask,
     consumed_where_terms: &[usize],
+    skipped_where_terms: &[usize],
     params: &CostModelParams,
 ) -> f64 {
     let mut multiplier = 1.0;
@@ -89,6 +93,7 @@ fn constraint_output_multipliers(
             || constraint.lhs_mask == rhs_self_mask
             || constraint.lhs_mask.is_empty())
             && !consumed_where_terms.contains(&constraint.where_clause_pos.0)
+            && !skipped_where_terms.contains(&constraint.where_clause_pos.0)
     }) {
         multiplier *= constraint.selectivity;
 
@@ -113,6 +118,81 @@ fn constraint_output_multipliers(
     multiplier
 }
 
+/// Count calls to each subquery when all of its outer tables have been read.
+#[allow(clippy::too_many_arguments)]
+fn count_subquery_calls_after_join(
+    subqueries: &[NonFromClauseSubquery],
+    joined_tables: &[JoinedTable],
+    prior_tables: &TableMask,
+    new_table_number: usize,
+    outer_rows: f64,
+    method: &AccessMethod,
+    new_table_constraints: &TableConstraints,
+    new_table_mask: TableMask,
+    where_clause: &[WhereTerm],
+    params: &CostModelParams,
+) -> SmallVec<[(TableInternalId, f64); 2]> {
+    let mut current_tables = prior_tables.clone();
+    current_tables
+        .set(new_table_number)
+        .expect("the joined table count was checked before join planning");
+
+    let rows_before_filters = outer_rows * method.estimated_rows_per_outer_row;
+    let mut subquery_calls = SmallVec::new();
+
+    for subquery in subqueries.iter().filter(|subquery| subquery.correlated) {
+        let SubqueryState::Unevaluated {
+            plan: Some(inner_plan),
+        } = &subquery.state
+        else {
+            continue;
+        };
+        let mut required_tables = TableMask::default();
+        for table_id in inner_plan.used_outer_query_ref_ids() {
+            let Some(table_number) = joined_tables
+                .iter()
+                .position(|table| table.internal_id == table_id)
+            else {
+                continue;
+            };
+            required_tables
+                .set(table_number)
+                .expect("the joined table count was checked before join planning");
+        }
+        if required_tables.is_empty()
+            || !current_tables.contains_all_set_bits_of(&required_tables)
+            || prior_tables.contains_all_set_bits_of(&required_tables)
+        {
+            continue;
+        }
+
+        let skipped_where_terms: SmallVec<[usize; 2]> = where_clause
+            .iter()
+            .enumerate()
+            .filter_map(|(index, term)| {
+                expr_references_subquery_id(&term.expr, subquery.internal_id).then_some(index)
+            })
+            .collect();
+        let rows = match method.residual_constraints {
+            ResidualConstraintMode::ApplyUnconsumed => {
+                let multiplier = constraint_output_multipliers(
+                    new_table_constraints,
+                    prior_tables,
+                    new_table_mask.clone(),
+                    &method.consumed_where_terms,
+                    &skipped_where_terms,
+                    params,
+                );
+                rows_before_filters * multiplier
+            }
+            ResidualConstraintMode::None => rows_before_filters,
+        };
+        subquery_calls.push((subquery.internal_id, rows.max(1.0)));
+    }
+
+    subquery_calls
+}
+
 /// Represents an n-ary join, anywhere from 1 table to N tables.
 #[derive(Debug, Clone)]
 pub struct JoinN {
@@ -122,6 +202,8 @@ pub struct JoinN {
     pub output_cardinality: f64,
     /// Estimated execution cost of this N-ary join.
     pub cost: Cost,
+    /// Expected calls to correlated subqueries that can now run.
+    pub subquery_calls: SmallVec<[(TableInternalId, f64); 2]>,
 }
 
 impl JoinN {
@@ -199,6 +281,11 @@ pub fn join_lhs_and_rhs<'a>(
         return Ok(None);
     };
 
+    let lhs_mask = match lhs {
+        Some(lhs) => lhs.table_numbers().try_collect()?,
+        None => TableMask::default(),
+    };
+
     // Check if this access method will trigger ephemeral index creation.
     if let AccessMethodParams::BTreeTable {
         index: None,
@@ -207,22 +294,15 @@ pub fn join_lhs_and_rhs<'a>(
     } = &method.params
     {
         if constraint_refs.is_empty() {
-            // Check if there are usable constraints that will create an ephemeral index
-            let lhs_mask_for_ephemeral: TableMask = match lhs {
-                Some(l) => l.table_numbers().try_collect()?,
-                None => TableMask::default(),
-            };
-            let has_usable_constraints = rhs_constraints.constraints.iter().any(|c| {
-                c.usable
-                    && c.table_col_pos.is_some()
-                    && lhs_mask_for_ephemeral.contains_all_set_bits_of(&c.lhs_mask)
+            let has_usable_constraints = rhs_constraints.constraints.iter().any(|constraint| {
+                constraint.usable
+                    && constraint.table_col_pos.is_some()
+                    && lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask)
             });
 
             if has_usable_constraints && lhs.is_some() {
-                // Add ephemeral index build cost: scan the table once to build the index
-                // This is similar to the build phase of a hash join
-                let ephemeral_build_cost = *rhs_base_rows * 0.003;
-                method.cost = method.cost + Cost(ephemeral_build_cost);
+                let build_cost = *rhs_base_rows * params.cpu_cost_per_row;
+                method.cost = method.cost + Cost(build_cost);
             }
         }
     }
@@ -232,11 +312,6 @@ pub fn join_lhs_and_rhs<'a>(
     let mut best_access_method = method;
 
     // Reuse for hash cost and output cardinality computation
-    let lhs_mask = match lhs {
-        Some(l) => l.table_numbers().try_collect()?,
-        None => TableMask::default(),
-    };
-
     // Self-constraints are conditions comparing columns within the same table
     // (e.g., t.col1 < t.col2). Include them in selectivity since they filter rows.
     let rhs_self_mask = {
@@ -752,8 +827,9 @@ pub fn join_lhs_and_rhs<'a>(
     let unconsumed_constraint_multiplier = constraint_output_multipliers(
         rhs_constraints,
         &lhs_mask,
-        rhs_self_mask,
+        rhs_self_mask.clone(),
         &best_access_method.consumed_where_terms,
+        &[],
         params,
     );
     let residual_multiplier = match best_access_method.residual_constraints {
@@ -762,6 +838,21 @@ pub fn join_lhs_and_rhs<'a>(
     };
     let output_cardinality =
         input_cardinality * best_access_method.estimated_rows_per_outer_row * residual_multiplier;
+    let mut subquery_calls = lhs
+        .map(|lhs| lhs.subquery_calls.clone())
+        .unwrap_or_default();
+    subquery_calls.extend(count_subquery_calls_after_join(
+        subqueries,
+        joined_tables,
+        &lhs_mask,
+        rhs_table_number,
+        input_cardinality,
+        &best_access_method,
+        rhs_constraints,
+        rhs_self_mask,
+        where_clause,
+        params,
+    ));
 
     access_methods_arena.push(best_access_method);
 
@@ -773,6 +864,7 @@ pub fn join_lhs_and_rhs<'a>(
         data: best_access_methods,
         output_cardinality,
         cost,
+        subquery_calls,
     }))
 }
 

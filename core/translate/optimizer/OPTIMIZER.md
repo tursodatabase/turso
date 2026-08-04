@@ -23,6 +23,10 @@ Query optimization is obviously an important part of any SQL-based database engi
 6. `order.rs`
    - Determines if sort operations can be eliminated based on the chosen access methods and join order
 
+7. `unnest.rs`
+   - Changes a correlated subquery into a join when both forms give the same rows
+   - Leaves all other forms as subqueries
+
 ## Join reordering and optimal index selection
 
 **The goals of query optimization are at least the following:**
@@ -44,17 +48,22 @@ i.e. straight from the 70s! The DP algorithm is explained below.
 
 ### Current high level flow of the optimizer
 
-1. **SQL rewriting**
+1. **Choose how to run correlated subqueries**
+   - Keep the query as written as one choice.
+   - Make a second choice by changing supported `EXISTS`, `IN`, and subqueries that return one aggregate value into joins.
+   - Plan both choices and keep the one with the lower cost.
+   - On equal cost, keep the join because it avoids one subquery call per outer row.
+2. **SQL rewriting**
   - Rewrite certain SQL expressions to another form (not a lot currently; e.g. rewrite BETWEEN as two comparisons)
   - Eliminate constant conditions: e.g. `WHERE 1` is removed, `WHERE 0` short-circuits the whole query because it is trivially false.
-2. **Check whether there is an "interesting order"** that we should consider when evaluating indexes and join orders
+3. **Check whether there is an "interesting order"** that we should consider when evaluating indexes and join orders
     - Is there a GROUP BY? an ORDER BY? Both?
-3. **Convert WHERE clause conjucts to Constraints**
+4. **Convert WHERE clause conjucts to Constraints**
     - E.g. in `WHERE t.x = 5`, the expression `5` _constrains_  table `t` to values of `x` that are exactly `5`.
     - E.g. in `Where t.x = u.x`, the expression `u.x` constrains `t`, AND `t.x` constrains `u`.
     - Per table, each constraint has an estimated _selectivity_ (how much it filters the result set); this affects join order calculations, see the paragraph on _Estimation_  below.
     - Per table, constraints are also analyzed for whether one or multiple of them can be used as an index seek key to avoid a full scan.
-4. **Compute the best join order using a dynamic programming algorithm:**
+5. **Compute the best join order using a dynamic programming algorithm:**
   - `n` = number of tables considered
   - `n=1`: find the lowest _cost_ way to access each single table, given the constraints of the query. Memoize the result.
   - `n=2`: for each table found in the `n=1` step, find the best way to join that table with each other table. Memoize the result.
@@ -76,7 +85,7 @@ i.e. straight from the 70s! The DP algorithm is explained below.
     - If it is now worse than the best sorted plan, then choose the sorted plan as the best plan for the query.
       - This allows us to eliminate a sorting operation.
     - If the best overall plan is still best even with the sorting penalty, then keep it. A sorting operation is later applied to sort the rows according to the desired order.
-5. **Mutate the plan's `join_order` and `Operation`s to match the computed best plan.**
+6. **Mutate the plan's `join_order` and `Operation`s to match the computed best plan.**
 
 ### Estimation of cost and cardinalities + a note on table statistics
 

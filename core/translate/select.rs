@@ -391,6 +391,7 @@ fn prepare_one_select_plan(
                 non_from_clause_subqueries: vec![],
                 input_cardinality_hint: None,
                 estimated_output_rows: None,
+                estimated_cost: None,
                 simple_aggregate: None,
                 phantom_params: vec![],
             };
@@ -930,6 +931,7 @@ fn prepare_one_select_plan(
                 non_from_clause_subqueries,
                 input_cardinality_hint: None,
                 estimated_output_rows: None,
+                estimated_cost: None,
                 simple_aggregate: None,
                 phantom_params: vec![],
             };
