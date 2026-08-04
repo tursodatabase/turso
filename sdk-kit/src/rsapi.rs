@@ -226,7 +226,18 @@ impl CApiPageCodec {
                 "page codec pointer must be not null".to_string(),
             ));
         }
-        let raw = unsafe { *codec };
+        let raw = unsafe {
+            c::turso_page_codec_v1_t {
+                abi_version: (*codec).abi_version,
+                ctx: (*codec).ctx,
+                reserved_space: (*codec).reserved_space,
+                codec_id: (*codec).codec_id,
+                destroy: (*codec).destroy,
+                probe_header: (*codec).probe_header,
+                decode_page: (*codec).decode_page,
+                encode_page: (*codec).encode_page,
+            }
+        };
         if raw.abi_version != 1 {
             return Err(TursoError::Misuse(format!(
                 "unsupported page codec ABI version {}",
@@ -1801,6 +1812,7 @@ impl TursoStatement {
 
 #[cfg(test)]
 mod tests {
+    use super::{c, CApiPageCodec};
     use crate::{
         rsapi::{
             OpenFlags, TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode,
@@ -1808,7 +1820,11 @@ mod tests {
         },
         IoBackend,
     };
-    use std::sync::Arc;
+    use std::{
+        ffi::{c_char, c_void},
+        mem::MaybeUninit,
+        sync::Arc,
+    };
     use turso_core::{
         LimboError, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, Value,
     };
@@ -1824,6 +1840,39 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+        }
+    }
+
+    #[test]
+    fn capi_page_codec_does_not_read_c_struct_padding() {
+        unsafe extern "C" fn transform(
+            _ctx: *mut c_void,
+            _page_no: u32,
+            _location: c::turso_codec_location_t,
+            _input: *const u8,
+            _input_len: usize,
+            _output: *mut u8,
+            _output_len: usize,
+            _error: *mut *const c_char,
+        ) -> i32 {
+            0
+        }
+
+        let mut codec = MaybeUninit::<c::turso_page_codec_v1_t>::uninit();
+        let codec = codec.as_mut_ptr();
+        unsafe {
+            std::ptr::addr_of_mut!((*codec).abi_version).write(1);
+            std::ptr::addr_of_mut!((*codec).ctx).write(std::ptr::null_mut());
+            std::ptr::addr_of_mut!((*codec).reserved_space).write(16);
+            std::ptr::addr_of_mut!((*codec).codec_id).write([1; 16]);
+            std::ptr::addr_of_mut!((*codec).destroy).write(None);
+            std::ptr::addr_of_mut!((*codec).probe_header).write(None);
+            std::ptr::addr_of_mut!((*codec).decode_page).write(Some(transform));
+            std::ptr::addr_of_mut!((*codec).encode_page).write(Some(transform));
+
+            let codec = CApiPageCodec::from_capi(codec).unwrap();
+            assert_eq!(codec.inner.raw.codec_id, [1; 16]);
+            assert_eq!(codec.inner.raw.reserved_space, 16);
         }
     }
 

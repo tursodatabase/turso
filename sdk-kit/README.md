@@ -23,7 +23,7 @@ Codec rules:
 - `probe_header` may inspect the raw first 512 bytes and report page size/reserved bytes before Turso parses page 1;
 - `decode_page` and `encode_page` receive a page number and location (`DATABASE` or `WAL`) and must write exactly one page to the output buffer;
 - `codec_id` must be a stable, non-secret identifier for the codec configuration and must change whenever the page transform could produce different bytes;
-- the callback context and function pointers must remain valid until `turso_database_deinit`;
+- the callback context and function pointers must remain valid until the codec `destroy` callback is invoked;
 - callback failures are surfaced as database open/read/write errors.
 
 Language bindings can expose this generic surface by wrapping `turso_page_codec_v1_t`
