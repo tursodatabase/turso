@@ -159,6 +159,7 @@ use super::{Program, ProgramState, Register};
 
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
+use crate::vdbe::builder::CursorTypeExt;
 use crate::{bail_constraint_error, must_be_btree_cursor, MvStore, Pager, Result};
 
 type MvccCheckpointStateMachine = CheckpointStateMachine<MvccClock, DynAllocator>;
@@ -2146,29 +2147,19 @@ fn op_column_range_fetch(
     dest: usize,
     defaults: &[Option<Value>],
 ) -> Result<InsnFunctionStepResult> {
-    let count = defaults.len();
-
-    //TODO bail out here, this should never be emitted.
-    
-    // MaterializedView cursors (and any other cursor kind that reads columns
-    // through its own column-at-a-time API) get the single-column fetch per
-    // column. Emission never fuses those cursors, so this is a correctness
-    // fallback, not a fast path.
-    if matches!(state.get_cursor(cursor_id), Cursor::MaterializedView(_)) {
-        return op_column_range_fetch_per_column(
-            program,
-            state,
-            cursor_id,
-            start_column,
-            dest,
-            defaults,
-        );
-    }
-
     let (_, cursor_type) = program
         .cursor_ref
         .get(cursor_id)
         .expect("cursor_id should exist in cursor_ref");
+
+    if !cursor_type.accepts_column_range_fusing() {
+        crate::bail_parse_error!(
+            "ColumnRange called with unsupported cursor {:?}",
+            state.get_cursor(cursor_id)
+        )
+    }
+
+    let count = defaults.len();
     match cursor_type {
         CursorType::BTreeTable(_)
         | CursorType::BTreeIndex(_)

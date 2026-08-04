@@ -1082,7 +1082,6 @@ impl ProgramBuilder {
         dest: usize,
         default: Option<Value>,
     ) {
-
         if self.column_run_fusable(cursor_id) {
             if let Some((prev_insn, _)) = self.insns.last_mut() {
                 match prev_insn {
@@ -1133,15 +1132,10 @@ impl ProgramBuilder {
     }
 
     fn column_run_fusable(&self, cursor_id: CursorID) -> bool {
-        matches!(
-            self.cursor_ref.get(cursor_id).map(|(_, t)| t),
-            Some(
-                CursorType::BTreeTable(_)
-                    | CursorType::BTreeIndex(_)
-                    | CursorType::Pseudo(_)
-                    | CursorType::Sorter
-            )
-        )
+        self.cursor_ref
+            .get(cursor_id)
+            .map(|(_, cursor_type)| cursor_type.accepts_column_range_fusing())
+            .unwrap_or(false)
     }
 
     /// Emit an instruction that should not start or extend a constant span on its own.
@@ -2129,5 +2123,21 @@ impl ProgramBuilder {
         let prepare_context = PrepareContext::from_connection(&connection);
         let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
+    }
+}
+
+pub(crate) trait CursorTypeExt {
+    fn accepts_column_range_fusing(&self) -> bool;
+}
+
+impl CursorTypeExt for CursorType {
+    fn accepts_column_range_fusing(&self) -> bool {
+        matches!(
+            self,
+            CursorType::BTreeTable(_)
+                | CursorType::BTreeIndex(_)
+                | CursorType::Pseudo(_)
+                | CursorType::Sorter
+        )
     }
 }
