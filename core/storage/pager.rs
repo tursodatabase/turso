@@ -4351,13 +4351,11 @@ impl Pager {
                         "WaitSync expects at most one in-flight fsync completion"
                     );
                     let pending = self.commit_info.read().completions.first().cloned();
+                    let need_fsync =
+                        !self.commit_info.read().prepared_frames.is_empty() || wal.is_dirty();
                     let sync_c = match pending {
                         Some(c) => Some(c),
-                        // Skip the fsync when the WAL is not dirty (no frames
-                        // appended since the last successful fsync).
-                        // NORMAL mode skips fsync on WAL commit (but still
-                        // fsyncs on checkpoint and wal restart).
-                        None if sync_mode == SyncMode::Full && wal.is_dirty() => {
+                        None if sync_mode == SyncMode::Full && need_fsync => {
                             let sync_c = wal.sync(self.get_sync_type())?;
                             self.commit_info.write().completions.push(sync_c.clone());
                             Some(sync_c)

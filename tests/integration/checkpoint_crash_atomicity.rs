@@ -1,5 +1,6 @@
-//! Regression test for issue #7952: checkpoint backfill must be crash-atomic
-//! under `PRAGMA synchronous=NORMAL`.
+//! Regression tests for issue #7952: checkpoint backfill must be crash-atomic
+//! under `PRAGMA synchronous=NORMAL`, and the checkpoint's own WAL fsync must
+//! not rob a following `synchronous=FULL` commit of its commit fsync.
 //!
 //! Under NORMAL, commits do not fsync the WAL. If a checkpoint then backfills
 //! those committed-but-not-durable frames into the database file without first
@@ -7,6 +8,13 @@
 //! *some* of the backfilled DB pages while WAL recovery drops the unsynced
 //! frames — recovering a torn database that matches no committed prefix, and
 //! that `PRAGMA integrity_check` reports as "ok".
+//!
+//! Under FULL, every commit must be on stable storage by the time COMMIT
+//! returns. The commit fsync used to be gated on the WAL dirty flag alone,
+//! which is only raised after a commit finishes and which a checkpoint's WAL
+//! fsync clears — so the first commit of a fresh WAL generation (a new
+//! database, or right after a WAL-resetting checkpoint) was acknowledged
+//! without any fsync covering its frames.
 //!
 //! The crash model here is a test-side IO substrate: every write is volatile
 //! until the file it targets is fsynced; at the simulated power-loss point the
@@ -148,6 +156,29 @@ impl CrashSimIo {
 
     fn take_crash_snapshot(&self) -> Option<CrashSnapshot> {
         self.state.snapshot.lock().unwrap().take()
+    }
+
+    /// The disk image a power loss right now would leave behind in the
+    /// strictest legal outcome: fsync-covered bytes only, every unsynced
+    /// write in every file lost.
+    fn durable_disk_snapshot(&self) -> HashMap<String, Vec<u8>> {
+        self.state
+            .files
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, shadow)| (path.clone(), shadow.lock().unwrap().durable.clone()))
+            .collect()
+    }
+
+    /// True when `path` has writes not yet covered by a successful fsync.
+    fn has_unsynced_writes(&self, path: &str) -> bool {
+        self.state
+            .files
+            .lock()
+            .unwrap()
+            .get(path)
+            .is_some_and(|shadow| !shadow.lock().unwrap().unsynced.is_empty())
     }
 }
 
@@ -434,4 +465,103 @@ fn checkpoint_backfill_crash_under_synchronous_normal_recovers_committed_prefix(
 #[test]
 fn checkpoint_backfill_crash_under_synchronous_full_control() -> anyhow::Result<()> {
     run_checkpoint_crash_scenario("FULL")
+}
+
+/// Simulates a power loss at this exact moment (every unsynced write in every
+/// file is lost) and recovers the surviving image with a fresh database.
+/// Returns the tempdir alongside the connection to keep the files alive.
+fn crash_now_and_recover(
+    io: &CrashSimIo,
+    db_path_sim: &str,
+) -> anyhow::Result<(tempfile::TempDir, Arc<turso_core::Connection>)> {
+    let files = io.durable_disk_snapshot();
+    let dir = tempfile::TempDir::new()?;
+    let db_path = dir.path().join("recovered.db");
+    std::fs::write(
+        &db_path,
+        files
+            .get(db_path_sim)
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+    )?;
+    if let Some(wal) = files.get(&format!("{db_path_sim}-wal")) {
+        std::fs::write(dir.path().join("recovered.db-wal"), wal)?;
+    }
+    let recovered_db = Database::open_file(
+        Arc::new(turso_core::PlatformIO::new()?),
+        db_path.to_str().unwrap(),
+        Arc::new(SqliteDialect),
+    )?;
+    let recovered = recovered_db.connect()?;
+    Ok((dir, recovered))
+}
+
+/// Under `synchronous=FULL`, a commit that follows a WAL-resetting checkpoint
+/// must fsync the WAL before COMMIT returns. The checkpoint's own WAL fsync
+/// clears the WAL dirty flag, so a commit fsync gated on that flag alone is
+/// silently skipped and a power loss right after the acknowledged COMMIT
+/// loses it.
+#[test]
+fn full_commit_right_after_truncate_checkpoint_survives_power_loss() -> anyhow::Result<()> {
+    let db_path_sim = "full-commit-after-truncate-checkpoint.db";
+    let io = Arc::new(CrashSimIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path_sim,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect()?;
+    conn.execute("PRAGMA synchronous=FULL")?;
+    conn.execute("CREATE TABLE t(x)")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    // The commit under test: the first commit into the reset WAL.
+    conn.execute("INSERT INTO t VALUES (2)")?;
+
+    let (_dir, recovered) = crash_now_and_recover(&io, db_path_sim)?;
+    let rows = query_rows(&recovered, "SELECT x FROM t ORDER BY x")?;
+    assert_eq!(
+        rows,
+        vec!["1".to_string(), "2".to_string()],
+        "a synchronous=FULL commit was acknowledged but did not survive a \
+         power loss immediately after COMMIT returned"
+    );
+    Ok(())
+}
+
+/// The same gate for the very first commit of a brand-new database: nothing
+/// has raised the WAL dirty flag yet, so before the fix the commit returned
+/// with all of its frames still unsynced.
+///
+/// This asserts WAL durability only, not crash recovery: the database file
+/// itself is created by writes that are not fsynced before the commit is
+/// acknowledged, and a WAL sitting next to a zero-length database file is
+/// ignored on open (SQLite behaves the same). Closing that bootstrap gap is
+/// separate work; this test pins down the commit fsync.
+#[test]
+fn first_full_commit_on_fresh_database_fsyncs_the_wal() -> anyhow::Result<()> {
+    let db_path_sim = "first-full-commit-on-fresh-database.db";
+    let io = Arc::new(CrashSimIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path_sim,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect()?;
+    conn.execute("PRAGMA synchronous=FULL")?;
+    conn.execute("CREATE TABLE t(x)")?;
+
+    assert!(
+        !io.has_unsynced_writes(&format!("{db_path_sim}-wal")),
+        "the first synchronous=FULL commit of a fresh database returned \
+         with unsynced WAL frames"
+    );
+    Ok(())
 }
