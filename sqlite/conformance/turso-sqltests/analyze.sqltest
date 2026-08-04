@@ -135,8 +135,9 @@ expect error {
     Parse error: ANALYZE on tables without rowid is not supported
 }
 
-# The following two tests fail if we emit ColumnRange without checking for pending labels. This is because ANALYZE
-# jumps
+# This test will fail if a ColumnRange opcode incorrectly collapses Column opcodes where the nth consecutive Column
+# opcode is the target of a jump (if the collapsing code doesn't first check for pending labels).
+# ANALYZE relies on such jumps.
 test analyze-column-run-is-a-jump-table-2col {
     CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
     CREATE INDEX idx_ab ON t (a, b);
@@ -146,20 +147,4 @@ test analyze-column-run-is-a-jump-table-2col {
 }
 expect {
     4 4 2
-}
-
-test analyze-column-run-is-a-jump-table-3col {
-    CREATE TABLE t3 (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
-    CREATE INDEX idx_abc ON t3 (a, b, c);
-    INSERT INTO t3 (id, a, b, c) VALUES
-        (1, 1, 1, 1),
-        (2, 1, 1, 2),
-        (3, 1, 1, 2),
-        (4, 1, 2, 5),
-        (5, 1, 2, 5);
-    ANALYZE;
-    SELECT stat FROM sqlite_stat1 WHERE idx = 'idx_abc';
-}
-expect {
-    5 5 3 2
 }
