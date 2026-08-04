@@ -628,14 +628,8 @@ pub fn insn_to_row(
                             table.columns().get(column).and_then(|v| v.name.as_ref())
                         }
                         CursorType::BTreeIndex(index) => index.columns.get(column).map(|c| &c.name),
-                        CursorType::MaterializedView(table, _) => {
-                            table.columns().get(column).and_then(|v| v.name.as_ref())
-                        }
-                        CursorType::Pseudo(_) | CursorType::Sorter | CursorType::IndexMethod(..) => {
+                        _ => {
                             None
-                        }
-                        CursorType::VirtualTable(v) => {
-                            v.columns.get(column).and_then(|c| c.name.as_ref())
                         }
                     };
                     name.map_or_else(|| format!("column {column}"), |name| name.to_string())

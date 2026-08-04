@@ -2243,53 +2243,13 @@ fn op_column_range_fetch(
                         crate::bail_parse_error!("pseudo-cursor column out of range for record");
                     }
                 }
-                _ => {
-                    for reg in dest_regs {
-                        reg.set_null();
-                    }
+                other => {
+                    crate::bail_parse_error!("non-register register in pseudo-record ({other:?})")
                 }
             }
         }
-        CursorType::IndexMethod(..) => {
-            return op_column_range_fetch_per_column(
-                program,
-                state,
-                cursor_id,
-                start_column,
-                dest,
-                defaults,
-            );
-        }
-        CursorType::VirtualTable(_) => {
-            panic!("Insn:ColumnRange on virtual table cursor, use Insn:VColumn instead");
-        }
-    }
-    Ok(InsnFunctionStepResult::Step)
-}
-
-/// Correctness fallback for cursor kinds without a shared record payload:
-/// runs the single-column fetch for each column of the range. Any IO yield is
-/// propagated with nothing persisted; on re-invoke, columns before the yield
-/// are re-fetched into the same registers with identical values.
-fn op_column_range_fetch_per_column(
-    program: &Program,
-    state: &mut ProgramState,
-    cursor_id: usize,
-    start_column: usize,
-    dest: usize,
-    defaults: &[Option<Value>],
-) -> Result<InsnFunctionStepResult> {
-    for (i, default) in defaults.iter().enumerate() {
-        let result = op_column_fetch(
-            program,
-            state,
-            cursor_id,
-            start_column + i,
-            dest + i,
-            default,
-        )?;
-        if !matches!(result, InsnFunctionStepResult::Step) {
-            return Ok(result);
+        other => {
+            panic!("unexpected cursor type in op_column_range_fetch body ({other:?})")
         }
     }
     Ok(InsnFunctionStepResult::Step)
