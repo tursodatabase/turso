@@ -2179,18 +2179,14 @@ fn op_column_range_fetch(
 
                 let record_result = return_if_io!(cursor.record());
                 let Some(record) = record_result else {
-                    // Cursor is not positioned on a valid row (e.g., empty
-                    // table). Return NULL, not the columns' default values;
-                    // DEFAULT handling below is for when the record exists but
-                    // has fewer columns than expected.
                     for reg in &mut state.registers[dest..dest + count] {
                         reg.set_null();
                     }
                     return Ok(InsnFunctionStepResult::Step);
                 };
 
-                let mut payload_iterator = record.iter()?;
-                payload_iterator
+                record
+                    .iter()?
                     .fill_n_into_registers(start_column, &mut state.registers[dest..dest + count])?
             };
             if filled < count {
@@ -2205,12 +2201,7 @@ fn op_column_range_fetch(
             }
         }
         CursorType::Sorter => {
-            let record = {
-                let cursor = state.get_cursor(cursor_id);
-                let cursor = cursor.as_sorter_mut();
-                cursor.record().cloned()
-            };
-            if let Some(record) = record {
+            if let Some(record) = get_cursor!(state, cursor_id).as_sorter_mut().record() {
                 let mut payload_iterator = record.iter()?;
                 let filled = payload_iterator.fill_n_into_registers(
                     start_column,
@@ -2229,12 +2220,7 @@ fn op_column_range_fetch(
             }
         }
         CursorType::Pseudo(_) => {
-            let content_reg = crate::get_cursor!(state, cursor_id)
-                .as_pseudo_mut()
-                .content_reg();
-            // The record is read while decoding into the destination
-            // registers, so the content register must lie outside the
-            // destination range.
+            let content_reg = get_cursor!(state, cursor_id).as_pseudo_mut().content_reg();
             if content_reg >= dest && content_reg < dest + count {
                 return Err(LimboError::InternalError(format!(
                     "ColumnRange: pseudo-cursor content register {content_reg} must not overlap destination registers {dest}..{}",
@@ -2250,24 +2236,11 @@ fn op_column_range_fetch(
             };
             match content {
                 Register::Record(record) => {
-                    // Decode straight into the registers; going through owned
-                    // Values would allocate for every TEXT/BLOB column on
-                    // every row.
-                    let mut payload_iterator = record.iter()?;
-                    let filled = payload_iterator.fill_n_into_registers(start_column, dest_regs)?;
+                    let filled = record
+                        .iter()?
+                        .fill_n_into_registers(start_column, dest_regs)?;
                     if filled < count {
-                        // A pseudo cursor is opened with num_fields matching
-                        // the record built for it, so every emitted column
-                        // index is in range. NULL on a missing column matches
-                        // the b-tree arm.
-                        turso_debug_assert!(
-                            false,
-                            "pseudo-cursor column out of range for record",
-                            { "start_column": start_column, "filled": filled }
-                        );
-                        for reg in &mut dest_regs[filled..] {
-                            reg.set_null();
-                        }
+                        crate::bail_parse_error!("pseudo-cursor column out of range for record");
                     }
                 }
                 _ => {
