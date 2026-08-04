@@ -1833,16 +1833,16 @@ pub fn op_column_range(
     )
 }
 
-/// What a Column-family instruction fetches once the cursor is positioned:
-/// a single column, or a run of consecutive columns that shares one record
-/// header walk.
+/// What a Column-family instruction fetches once the cursor is positioned.
 #[derive(Clone, Copy)]
 enum ColumnFetch<'a> {
+    /// A single column.
     Single {
         column: usize,
         dest: usize,
         default: &'a Option<Value>,
     },
+    /// A range of consecutive columns to be copied to consecutive destination registers.
     Range {
         start_column: usize,
         dest: usize,
