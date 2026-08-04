@@ -34,9 +34,7 @@ unsafe impl TypedData for Database {
     }
 
     fn data_type() -> &'static DataType {
-        static DATA_TYPE: DataType = data_type_builder!(Database, "database")
-            .free_immediately()
-            .build();
+        static DATA_TYPE: DataType = data_type_builder!(Database, "database").build();
         &DATA_TYPE
     }
 }
