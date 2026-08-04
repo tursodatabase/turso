@@ -765,7 +765,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
 
-    unnest::unnest_exists_subqueries(plan)?;
+    unnest::rewrite_correlated_subqueries(plan, resolver)?;
     // EXISTS only needs 1 row. Add LIMIT 1 to surviving (non-unnested) EXISTS
     // subqueries. This is done here rather than in the subquery planner so that
     // unnesting sees the plan without an artificial LIMIT.
