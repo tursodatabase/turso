@@ -610,6 +610,231 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     );
 }
 
+/// Manual Truncate-vs-Passive GC metrics harness (SkipMap slots vs live versions).
+///
+/// Run with:
+/// ```console
+/// cargo test -p turso_core --lib debug_gc_metrics_truncate_vs_passive -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "manual GC metrics debug harness"]
+fn debug_gc_metrics_truncate_vs_passive() {
+    fn sample_line(
+        mode: &str,
+        step: usize,
+        updates: usize,
+        snap: &crate::mvcc::database::GcDebugSnapshot,
+    ) {
+        println!(
+            "{mode},step={step},updates={updates},\
+             rows_slots={},rows_empty={},rows_versions={},\
+             index_slots={},index_empty={},index_versions={},\
+             live_approx={},live_at_last_gc={},\
+             lwm={},durable_max={},\
+             log_offset={},log_size={},txs={},\
+             min_reader=({},{}),backfill=({},{})",
+            snap.rows_slots,
+            snap.rows_empty_slots,
+            snap.rows_versions,
+            snap.index_slots,
+            snap.index_empty_slots,
+            snap.index_versions,
+            snap.live_version_count_approx,
+            snap.live_versions_at_last_gc,
+            snap.lwm,
+            snap.durable_txid_max,
+            snap.logical_log_offset,
+            snap.logical_log_size,
+            snap.active_txs,
+            snap.min_reader_mark.checkpoint_seq,
+            snap.min_reader_mark.frame,
+            snap.backfill_floor.checkpoint_seq,
+            snap.backfill_floor.frame,
+        );
+    }
+
+    /// UPDATE-heavy workload under a pinned reader; checkpoints driven by a
+    /// separate connection (server-like), auto-checkpoint disabled.
+    fn run_mode(passive: bool, keys: usize, rounds: usize, updates_per_round: usize) {
+        let mode = if passive { "passive" } else { "truncate" };
+        let db = if passive {
+            MvccTestDbNoConn::new_with_random_db_passive()
+        } else {
+            MvccTestDbNoConn::new_with_random_db()
+        };
+        let mv = db.get_mvcc_store();
+        let bootstrap = db.connect();
+        bootstrap
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
+            .unwrap();
+        // Disable auto-checkpoint; drive checkpoints explicitly like turso-server.
+        bootstrap
+            .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        // Keep inline GC on so live_approx can drop between checkpoints.
+        bootstrap.execute("PRAGMA mvcc_gc_threshold = 64").unwrap();
+
+        bootstrap.execute("BEGIN CONCURRENT").unwrap();
+        for i in 0..keys {
+            bootstrap
+                .execute(format!("INSERT INTO t VALUES ({i}, 'seed')"))
+                .unwrap();
+        }
+        bootstrap.execute("COMMIT").unwrap();
+        // Materialize the seed so subsequent Passive/Truncate behavior is about updates.
+        let ckpt = if passive { "PASSIVE" } else { "TRUNCATE" };
+        let _ = bootstrap.execute(format!("PRAGMA wal_checkpoint({ckpt})"));
+
+        let reader = db.connect();
+        reader.execute("BEGIN CONCURRENT").unwrap();
+        // Keep the txn live for the whole run (pins LWM).
+        reader.execute("SELECT count(*) FROM t").unwrap();
+
+        let writer = db.connect();
+        let checkpointer = db.connect();
+
+        println!("# mode={mode} keys={keys} rounds={rounds} updates_per_round={updates_per_round}");
+        sample_line(mode, 0, 0, &mv.debug_gc_snapshot());
+
+        let mut updates = 0usize;
+        for step in 1..=rounds {
+            writer.execute("BEGIN CONCURRENT").unwrap();
+            for u in 0..updates_per_round {
+                let id = (updates + u) % keys;
+                writer
+                    .execute(format!("UPDATE t SET data = 'r{step}_{u}' WHERE id = {id}"))
+                    .unwrap();
+            }
+            writer.execute("COMMIT").unwrap();
+            updates += updates_per_round;
+
+            let ckpt_res = checkpointer.execute(format!("PRAGMA wal_checkpoint({ckpt})"));
+            let ckpt_status = match &ckpt_res {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("err:{e}"),
+            };
+            let snap = mv.debug_gc_snapshot();
+            println!(
+                "{mode},step={step},updates={updates},ckpt={ckpt_status},\
+                 rows_slots={},rows_empty={},rows_versions={},\
+                 live_approx={},lwm={},durable_max={},\
+                 log_offset={},log_size={},txs={},\
+                 min_reader=({},{}),backfill=({},{})",
+                snap.rows_slots,
+                snap.rows_empty_slots,
+                snap.rows_versions,
+                snap.live_version_count_approx,
+                snap.lwm,
+                snap.durable_txid_max,
+                snap.logical_log_offset,
+                snap.logical_log_size,
+                snap.active_txs,
+                snap.min_reader_mark.checkpoint_seq,
+                snap.min_reader_mark.frame,
+                snap.backfill_floor.checkpoint_seq,
+                snap.backfill_floor.frame,
+            );
+        }
+
+        reader.execute("COMMIT").unwrap();
+        // One more checkpoint after the pin drops — Truncate should be able to
+        // clear slots; Passive still only GC-in-place.
+        let _ = checkpointer.execute(format!("PRAGMA wal_checkpoint({ckpt})"));
+        sample_line(mode, rounds + 1, updates, &mv.debug_gc_snapshot());
+    }
+
+    /// Same UPDATE load, but no pinned reader — isolates empty-slot retention
+    /// after Passive Rule 3 clears sole-survivor chains.
+    fn run_mode_unpinned(passive: bool, keys: usize, rounds: usize, updates_per_round: usize) {
+        let mode = if passive {
+            "passive_unpinned"
+        } else {
+            "truncate_unpinned"
+        };
+        let db = if passive {
+            MvccTestDbNoConn::new_with_random_db_passive()
+        } else {
+            MvccTestDbNoConn::new_with_random_db()
+        };
+        let mv = db.get_mvcc_store();
+        let bootstrap = db.connect();
+        bootstrap
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
+            .unwrap();
+        bootstrap
+            .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        bootstrap.execute("PRAGMA mvcc_gc_threshold = 64").unwrap();
+
+        bootstrap.execute("BEGIN CONCURRENT").unwrap();
+        for i in 0..keys {
+            bootstrap
+                .execute(format!("INSERT INTO t VALUES ({i}, 'seed')"))
+                .unwrap();
+        }
+        bootstrap.execute("COMMIT").unwrap();
+        let ckpt = if passive { "PASSIVE" } else { "TRUNCATE" };
+        let _ = bootstrap.execute(format!("PRAGMA wal_checkpoint({ckpt})"));
+
+        let writer = db.connect();
+        let checkpointer = db.connect();
+        println!("# mode={mode} keys={keys} rounds={rounds} updates_per_round={updates_per_round}");
+        sample_line(mode, 0, 0, &mv.debug_gc_snapshot());
+
+        let mut updates = 0usize;
+        for step in 1..=rounds {
+            writer.execute("BEGIN CONCURRENT").unwrap();
+            for u in 0..updates_per_round {
+                let id = (updates + u) % keys;
+                writer
+                    .execute(format!("UPDATE t SET data = 'r{step}_{u}' WHERE id = {id}"))
+                    .unwrap();
+            }
+            writer.execute("COMMIT").unwrap();
+            updates += updates_per_round;
+
+            let ckpt_res = checkpointer.execute(format!("PRAGMA wal_checkpoint({ckpt})"));
+            let ckpt_status = match &ckpt_res {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("err:{e}"),
+            };
+            let snap = mv.debug_gc_snapshot();
+            let (wal_seq, wal_max) = checkpointer.pager.load().wal_pos();
+            let wal_bf = checkpointer.pager.load().wal_backfill_frame().unwrap_or(0);
+            println!(
+                "{mode},step={step},updates={updates},ckpt={ckpt_status},\
+                 rows_slots={},rows_empty={},rows_versions={},\
+                 live_approx={},lwm={},durable_max={},\
+                 log_offset={},log_size={},txs={},\
+                 min_reader=({},{}),backfill=({},{}),\
+                 wal_pos=({wal_seq},{wal_max}),wal_nbackfill={wal_bf}",
+                snap.rows_slots,
+                snap.rows_empty_slots,
+                snap.rows_versions,
+                snap.live_version_count_approx,
+                snap.lwm,
+                snap.durable_txid_max,
+                snap.logical_log_offset,
+                snap.logical_log_size,
+                snap.active_txs,
+                snap.min_reader_mark.checkpoint_seq,
+                snap.min_reader_mark.frame,
+                snap.backfill_floor.checkpoint_seq,
+                snap.backfill_floor.frame,
+            );
+        }
+    }
+
+    const KEYS: usize = 200;
+    const ROUNDS: usize = 5;
+    const UPDATES_PER_ROUND: usize = 50;
+    // Unpinned + pinned reader loads.
+    run_mode_unpinned(false, KEYS, ROUNDS, UPDATES_PER_ROUND);
+    run_mode_unpinned(true, KEYS, ROUNDS, UPDATES_PER_ROUND);
+    run_mode(false, KEYS, ROUNDS, UPDATES_PER_ROUND);
+    run_mode(true, KEYS, ROUNDS, UPDATES_PER_ROUND);
+}
+
 /// Passive checkpoint may run btree writes while a pinned reader is active.
 #[test]
 fn mvcc_passive_checkpoint_busy_under_pinned_reader_no_corruption() {

@@ -3937,6 +3937,30 @@ impl RootEntry {
     }
 }
 
+/// SkipMap / GC counters for debugging (see [`MvStore::debug_gc_snapshot`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcDebugSnapshot {
+    /// `rows` SkipMap entry count (includes empty chains left by non-slot-removing GC).
+    pub rows_slots: usize,
+    pub rows_empty_slots: usize,
+    /// Sum of table version-chain lengths.
+    pub rows_versions: usize,
+    /// Sum of per-index SkipMap entry counts.
+    pub index_slots: usize,
+    pub index_empty_slots: usize,
+    pub index_versions: usize,
+    pub live_version_count_approx: usize,
+    pub live_versions_at_last_gc: usize,
+    pub lwm: u64,
+    pub durable_txid_max: u64,
+    pub logical_log_offset: u64,
+    pub logical_log_size: u64,
+    pub active_txs: usize,
+    /// Passive GC floor: `compute_min_reader_mark().min(backfill_floor)`.
+    pub min_reader_mark: WalPos,
+    pub backfill_floor: WalPos,
+}
+
 /// A multi-version concurrency control database.
 #[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
@@ -6990,6 +7014,53 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// `live_version_count_approx` field) — never use for correctness decisions.
     pub fn live_version_count_approx(&self) -> usize {
         self.live_version_count_approx.load(Ordering::Relaxed)
+    }
+
+    /// Point-in-time SkipMap / GC counters for debugging. Walks every chain; not
+    /// for hot paths. Contrasts `rows.len()` (slots, including empty) with
+    /// summed chain lengths and [`Self::live_version_count_approx`].
+    pub fn debug_gc_snapshot(&self) -> GcDebugSnapshot {
+        let mut rows_empty_slots = 0;
+        let mut rows_versions = 0;
+        for entry in self.rows.iter() {
+            let n = entry.value().read().len();
+            rows_versions += n;
+            if n == 0 {
+                rows_empty_slots += 1;
+            }
+        }
+
+        let mut index_slots = 0;
+        let mut index_empty_slots = 0;
+        let mut index_versions = 0;
+        for index in self.index_rows.iter() {
+            for entry in index.value().iter() {
+                index_slots += 1;
+                let n = entry.value().read().len();
+                index_versions += n;
+                if n == 0 {
+                    index_empty_slots += 1;
+                }
+            }
+        }
+
+        GcDebugSnapshot {
+            rows_slots: self.rows.len(),
+            rows_empty_slots,
+            rows_versions,
+            index_slots,
+            index_empty_slots,
+            index_versions,
+            live_version_count_approx: self.live_version_count_approx(),
+            live_versions_at_last_gc: self.live_versions_at_last_gc.load(Ordering::Relaxed),
+            lwm: self.compute_lwm(),
+            durable_txid_max: self.durable_txid_max.load(Ordering::SeqCst),
+            logical_log_offset: self.logical_log_offset(),
+            logical_log_size: self.get_logical_log_file().size().unwrap_or(0),
+            active_txs: self.txs.len(),
+            min_reader_mark: self.compute_min_reader_mark(),
+            backfill_floor: *self.backfill_floor.read(),
+        }
     }
 
     /// Saturating decrement of the live-version heuristic. The counter is
