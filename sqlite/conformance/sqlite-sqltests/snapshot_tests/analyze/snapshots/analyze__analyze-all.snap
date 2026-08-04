@@ -102,82 +102,82 @@ addr  opcode       p1   p2   p3  p4                                             
   87      Delete    1    0    0  sqlite_stat1                                      0
   88    Next        1   84    0                                                    0
   89  Next          1   84    0                                                    0
-  90  OpenRead      6    9    0  k(5,B,B,B,B,B)                                    0  =inventory, root=9, iDb=0
-  91  OpenRead      7   10    0  k(4,B,B,B)                                        0  =idx_inventory_location, root=10, iDb=0
-  92  Integer       3   49    0                                                    0  r[49]=3
+  90  OpenRead      6    6    0  k(5,B,B,B,B,B)                                    0  =orders, root=6, iDb=0
+  91  OpenRead      7    8    0  k(2,B)                                            0  =idx_orders_status, root=8, iDb=0
+  92  Integer       1   49    0                                                    0  r[49]=1
   93  Function      0   49   48  stat_init                                         0  r[48]=func(r[49])
-  94  Rewind        7  119    0                                                    0  Rewind  idx_inventory_location
+  94  Rewind        7  111    0                                                    0  Rewind  idx_orders_status
   95  Integer       0   49    0                                                    0  r[49]=0
-  96  Goto          0  108    0                                                    0
+  96  Goto          0  102    0                                                    0
   97    Integer     0   49    0                                                    0  r[49]=0
-  98    Column      7    0   53                                                    0  r[53]=idx_inventory_location.warehouse_id
-  99    Ne         53   50  108                                                    0  if r[53]!=r[50] goto 108
+  98    Column      7    0   51                                                    0  r[51]=idx_orders_status.status
+  99    Ne         51   50  102                                                    0  if r[51]!=r[50] goto 102
  100    Integer     1   49    0                                                    0  r[49]=1
- 101    Column      7    1   53                                                    0  r[53]=idx_inventory_location.product_id
- 102    Ne         53   51  109                                                    0  if r[53]!=r[51] goto 109
- 103    Integer     2   49    0                                                    0  r[49]=2
- 104    Column      7    2   53                                                    0  r[53]=idx_inventory_location.bin_location
- 105    Ne         53   52  110                                                    0  if r[53]!=r[52] goto 110
- 106    Integer     3   49    0                                                    0  r[49]=3
- 107    Goto        0  111    0                                                    0
- 108    Column      7    0   50                                                    0  r[50]=idx_inventory_location.warehouse_id
- 109    Column      7    1   51                                                    0  r[51]=idx_inventory_location.product_id
- 110    Column      7    2   52                                                    0  r[52]=idx_inventory_location.bin_location
- 111    Function    0   48   48  stat_push                                         0  r[48]=func(r[48..49])
- 112  Next          7   97    0                                                    0
- 113  Function      0   48   54  stat_get                                          0  r[54]=func(r[48])
- 114  IsNull       54  119    0                                                    0  if (r[54]==NULL) goto 119
- 115  Copy         54   57    0                                                    0  r[57]=r[54]
- 116  MakeRecord   55    3   58                                                    0  r[58]=mkrec(r[55..57])
- 117  NewRowid      1   59    0                                                    0  r[59]=rowid
- 118  Insert        1   58   59  sqlite_stat1                                      0  intkey=r[59] data=r[58]
- 119  Rewind        1  126    0                                                    0  Rewind  sqlite_stat1
- 120      Column    1    0   60                                                    0  r[60]=sqlite_stat1.tbl
- 121      Ne       60   61  125                                                    0  if r[60]!=r[61] goto 125
- 122      RowId     1   62    0                                                    0  r[62]=sqlite_stat1.rowid
- 123      Delete    1    0    0  sqlite_stat1                                      0
- 124    Next        1  120    0                                                    0
- 125  Next          1  120    0                                                    0
- 126  OpenRead      8    6    0  k(5,B,B,B,B,B)                                    0  =orders, root=6, iDb=0
- 127  OpenRead      9    8    0  k(2,B)                                            0  =idx_orders_status, root=8, iDb=0
- 128  Integer       1   65    0                                                    0  r[65]=1
- 129  Function      0   65   64  stat_init                                         0  r[64]=func(r[65])
- 130  Rewind        9  147    0                                                    0  Rewind  idx_orders_status
- 131  Integer       0   65    0                                                    0  r[65]=0
- 132  Goto          0  138    0                                                    0
- 133    Integer     0   65    0                                                    0  r[65]=0
- 134    Column      9    0   67                                                    0  r[67]=idx_orders_status.status
- 135    Ne         67   66  138                                                    0  if r[67]!=r[66] goto 138
- 136    Integer     1   65    0                                                    0  r[65]=1
- 137    Goto        0  139    0                                                    0
- 138    Column      9    0   66                                                    0  r[66]=idx_orders_status.status
- 139    Function    0   64   64  stat_push                                         0  r[64]=func(r[64..65])
- 140  Next          9  133    0                                                    0
- 141  Function      0   64   68  stat_get                                          0  r[68]=func(r[64])
- 142  IsNull       68  147    0                                                    0  if (r[68]==NULL) goto 147
- 143  Copy         68   71    0                                                    0  r[71]=r[68]
- 144  MakeRecord   69    3   72                                                    0  r[72]=mkrec(r[69..71])
- 145  NewRowid      1   73    0                                                    0  r[73]=rowid
- 146  Insert        1   72   73  sqlite_stat1                                      0  intkey=r[73] data=r[72]
- 147  OpenRead     10    7    0  k(3,B,B)                                          0  =idx_orders_customer_date, root=7, iDb=0
- 148  Integer       2   75    0                                                    0  r[75]=2
- 149  Function      0   75   74  stat_init                                         0  r[74]=func(r[75])
- 150  Rewind       10  171    0                                                    0  Rewind  idx_orders_customer_date
- 151  Integer       0   75    0                                                    0  r[75]=0
- 152  Goto          0  161    0                                                    0
- 153    Integer     0   75    0                                                    0  r[75]=0
- 154    Column     10    0   78                                                    0  r[78]=idx_orders_customer_date.customer_id
- 155    Ne         78   76  161                                                    0  if r[78]!=r[76] goto 161
- 156    Integer     1   75    0                                                    0  r[75]=1
- 157    Column     10    1   78                                                    0  r[78]=idx_orders_customer_date.order_date
- 158    Ne         78   77  162                                                    0  if r[78]!=r[77] goto 162
- 159    Integer     2   75    0                                                    0  r[75]=2
- 160    Goto        0  163    0                                                    0
- 161    Column     10    0   76                                                    0  r[76]=idx_orders_customer_date.customer_id
- 162    Column     10    1   77                                                    0  r[77]=idx_orders_customer_date.order_date
- 163    Function    0   74   74  stat_push                                         0  r[74]=func(r[74..75])
- 164  Next         10  153    0                                                    0
- 165  Function      0   74   79  stat_get                                          0  r[79]=func(r[74])
+ 101    Goto        0  103    0                                                    0
+ 102    Column      7    0   50                                                    0  r[50]=idx_orders_status.status
+ 103    Function    0   48   48  stat_push                                         0  r[48]=func(r[48..49])
+ 104  Next          7   97    0                                                    0
+ 105  Function      0   48   52  stat_get                                          0  r[52]=func(r[48])
+ 106  IsNull       52  111    0                                                    0  if (r[52]==NULL) goto 111
+ 107  Copy         52   55    0                                                    0  r[55]=r[52]
+ 108  MakeRecord   53    3   56                                                    0  r[56]=mkrec(r[53..55])
+ 109  NewRowid      1   57    0                                                    0  r[57]=rowid
+ 110  Insert        1   56   57  sqlite_stat1                                      0  intkey=r[57] data=r[56]
+ 111  OpenRead      8    7    0  k(3,B,B)                                          0  =idx_orders_customer_date, root=7, iDb=0
+ 112  Integer       2   59    0                                                    0  r[59]=2
+ 113  Function      0   59   58  stat_init                                         0  r[58]=func(r[59])
+ 114  Rewind        8  135    0                                                    0  Rewind  idx_orders_customer_date
+ 115  Integer       0   59    0                                                    0  r[59]=0
+ 116  Goto          0  125    0                                                    0
+ 117    Integer     0   59    0                                                    0  r[59]=0
+ 118    Column      8    0   62                                                    0  r[62]=idx_orders_customer_date.customer_id
+ 119    Ne         62   60  125                                                    0  if r[62]!=r[60] goto 125
+ 120    Integer     1   59    0                                                    0  r[59]=1
+ 121    Column      8    1   62                                                    0  r[62]=idx_orders_customer_date.order_date
+ 122    Ne         62   61  126                                                    0  if r[62]!=r[61] goto 126
+ 123    Integer     2   59    0                                                    0  r[59]=2
+ 124    Goto        0  127    0                                                    0
+ 125    Column      8    0   60                                                    0  r[60]=idx_orders_customer_date.customer_id
+ 126    Column      8    1   61                                                    0  r[61]=idx_orders_customer_date.order_date
+ 127    Function    0   58   58  stat_push                                         0  r[58]=func(r[58..59])
+ 128  Next          8  117    0                                                    0
+ 129  Function      0   58   63  stat_get                                          0  r[63]=func(r[58])
+ 130  IsNull       63  135    0                                                    0  if (r[63]==NULL) goto 135
+ 131  Copy         63   66    0                                                    0  r[66]=r[63]
+ 132  MakeRecord   64    3   67                                                    0  r[67]=mkrec(r[64..66])
+ 133  NewRowid      1   68    0                                                    0  r[68]=rowid
+ 134  Insert        1   67   68  sqlite_stat1                                      0  intkey=r[68] data=r[67]
+ 135  Rewind        1  142    0                                                    0  Rewind  sqlite_stat1
+ 136      Column    1    0   69                                                    0  r[69]=sqlite_stat1.tbl
+ 137      Ne       69   70  141                                                    0  if r[69]!=r[70] goto 141
+ 138      RowId     1   71    0                                                    0  r[71]=sqlite_stat1.rowid
+ 139      Delete    1    0    0  sqlite_stat1                                      0
+ 140    Next        1  136    0                                                    0
+ 141  Next          1  136    0                                                    0
+ 142  OpenRead      9    9    0  k(5,B,B,B,B,B)                                    0  =inventory, root=9, iDb=0
+ 143  OpenRead     10   10    0  k(4,B,B,B)                                        0  =idx_inventory_location, root=10, iDb=0
+ 144  Integer       3   74    0                                                    0  r[74]=3
+ 145  Function      0   74   73  stat_init                                         0  r[73]=func(r[74])
+ 146  Rewind       10  171    0                                                    0  Rewind  idx_inventory_location
+ 147  Integer       0   74    0                                                    0  r[74]=0
+ 148  Goto          0  160    0                                                    0
+ 149    Integer     0   74    0                                                    0  r[74]=0
+ 150    Column     10    0   78                                                    0  r[78]=idx_inventory_location.warehouse_id
+ 151    Ne         78   75  160                                                    0  if r[78]!=r[75] goto 160
+ 152    Integer     1   74    0                                                    0  r[74]=1
+ 153    Column     10    1   78                                                    0  r[78]=idx_inventory_location.product_id
+ 154    Ne         78   76  161                                                    0  if r[78]!=r[76] goto 161
+ 155    Integer     2   74    0                                                    0  r[74]=2
+ 156    Column     10    2   78                                                    0  r[78]=idx_inventory_location.bin_location
+ 157    Ne         78   77  162                                                    0  if r[78]!=r[77] goto 162
+ 158    Integer     3   74    0                                                    0  r[74]=3
+ 159    Goto        0  163    0                                                    0
+ 160    Column     10    0   75                                                    0  r[75]=idx_inventory_location.warehouse_id
+ 161    Column     10    1   76                                                    0  r[76]=idx_inventory_location.product_id
+ 162    Column     10    2   77                                                    0  r[77]=idx_inventory_location.bin_location
+ 163    Function    0   73   73  stat_push                                         0  r[73]=func(r[73..74])
+ 164  Next         10  149    0                                                    0
+ 165  Function      0   73   79  stat_get                                          0  r[79]=func(r[73])
  166  IsNull       79  171    0                                                    0  if (r[79]==NULL) goto 171
  167  Copy         79   82    0                                                    0  r[82]=r[79]
  168  MakeRecord   80    3   83                                                    0  r[83]=mkrec(r[80..82])
@@ -193,14 +193,14 @@ addr  opcode       p1   p2   p3  p4                                             
  178  String8       0   30    0  idx_products_category                             0  r[30]='idx_products_category'
  179  String8       0   39    0  products                                          0  r[39]='products'
  180  String8       0   40    0  idx_products_sku                                  0  r[40]='idx_products_sku'
- 181  String8       0   45    0  inventory                                         0  r[45]='inventory'
- 182  String8       0   47    0  inventory                                         0  r[47]='inventory'
- 183  String8       0   55    0  inventory                                         0  r[55]='inventory'
- 184  String8       0   56    0  idx_inventory_location                            0  r[56]='idx_inventory_location'
- 185  String8       0   61    0  orders                                            0  r[61]='orders'
- 186  String8       0   63    0  orders                                            0  r[63]='orders'
- 187  String8       0   69    0  orders                                            0  r[69]='orders'
- 188  String8       0   70    0  idx_orders_status                                 0  r[70]='idx_orders_status'
- 189  String8       0   80    0  orders                                            0  r[80]='orders'
- 190  String8       0   81    0  idx_orders_customer_date                          0  r[81]='idx_orders_customer_date'
+ 181  String8       0   45    0  orders                                            0  r[45]='orders'
+ 182  String8       0   47    0  orders                                            0  r[47]='orders'
+ 183  String8       0   53    0  orders                                            0  r[53]='orders'
+ 184  String8       0   54    0  idx_orders_status                                 0  r[54]='idx_orders_status'
+ 185  String8       0   64    0  orders                                            0  r[64]='orders'
+ 186  String8       0   65    0  idx_orders_customer_date                          0  r[65]='idx_orders_customer_date'
+ 187  String8       0   70    0  inventory                                         0  r[70]='inventory'
+ 188  String8       0   72    0  inventory                                         0  r[72]='inventory'
+ 189  String8       0   80    0  inventory                                         0  r[80]='inventory'
+ 190  String8       0   81    0  idx_inventory_location                            0  r[81]='idx_inventory_location'
  191  Goto          0    1    0                                                    0

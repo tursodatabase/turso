@@ -73,7 +73,7 @@ addr  opcode                  p1   p2  p3  p4                     p5  comment
   35            MakeRecord     4    4  24                          0  r[24]=mkrec(r[4..7])
   36            NewRowid       3   19   0                          0  r[19]=rowid
   37            Insert         3   24  19  buffer_table_window_0   2  intkey=r[19] data=r[24]
-  38            Goto           0   53   0                          0
+  38            Goto           0   53   0                          0  ; peer of previous row: buffer only, handle at group end
   39            Column         4    3  25                          0  r[25]=ephemeral(buffer_table_window_0).salary
   40            AggStep        0   25  13  avg                     0  accum=r[13] step(r[25])
   41            Next           4   43   0                          0
@@ -146,7 +146,7 @@ addr  opcode                  p1   p2  p3  p4                     p5  comment
  108        Yield              1  129   0                          0
  109        Copy              27   58   0                          0  r[58]=r[27]
  110        NotNull           56  118   0                          0  r[56]!=NULL -> goto 118
- 111        Null               0   49  49                          0  r[49..49]=NULL; initialize per-cursor peer-reference registers for new partition
+ 111        Null               0   49  49                          0  r[49..49]=NULL; reset accumulator registers
  112        MakeRecord        27    6  60                          0  r[60]=mkrec(r[27..32])
  113        NewRowid           8   56   0                          0  r[56]=rowid
  114        Insert             8   60  56  buffer_table_window_0   2  intkey=r[56] data=r[60]
