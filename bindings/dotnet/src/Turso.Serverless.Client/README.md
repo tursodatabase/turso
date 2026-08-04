@@ -2,7 +2,7 @@
 
 Serverless database driver for [Turso Cloud](https://docs.turso.tech) using only `HttpClient` — the .NET counterpart of [`@tursodatabase/serverless`](https://www.npmjs.com/package/@tursodatabase/serverless). Connects to a database over the SQL over HTTP protocol with streaming cursor support.
 
-Unlike the `Turso` and `Turso.Data.Sqlite` packages, this is a pure managed HTTP client — it has no native component.
+Unlike the `Turso` and `Turso.Data.Sqlite.Provider` packages, this is a pure managed HTTP client — it has no native component.
 
 ## Getting started
 

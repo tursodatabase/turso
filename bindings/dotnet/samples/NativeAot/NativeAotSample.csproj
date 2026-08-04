@@ -10,8 +10,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Turso.Data.Sqlite" Version="$(Version)" />
-    <PackageReference Include="Turso.Data.Sqlite.NativeAot.$(RuntimeIdentifier)"
+    <PackageReference Include="Turso.Data.Sqlite.Provider" Version="$(Version)" />
+    <PackageReference Include="Turso.Data.NativeAot.$(RuntimeIdentifier)"
                       Version="$(Version)"
                       PrivateAssets="all"
                       Condition="'$(PublishAot)' == 'true' and '$(TursoUseStaticNativeLibrary)' == 'true' and '$(RuntimeIdentifier)' != ''" />
