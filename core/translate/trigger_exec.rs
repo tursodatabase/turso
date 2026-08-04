@@ -822,7 +822,19 @@ pub fn get_triggers_including_temp(
                 })
                 .collect()
         });
-        triggers.extend(temp_triggers);
+        // TEMP triggers fire before the table's own triggers, and among
+        // themselves in creation order. SQLite builds its trigger list by
+        // walking the temp schema's trigger hash — which iterates newest
+        // first — and prepending each hit onto the table's own list
+        // (sqlite3TriggerList in trigger.c), so the temp group nets out
+        // oldest-first at the front. Mirror that exactly: push each temp
+        // trigger onto the front in the same newest-first walk. The order is
+        // observable whenever one trigger's changes feed another.
+        let mut list: std::collections::VecDeque<Arc<Trigger>> = triggers.into();
+        for trigger in temp_triggers {
+            list.push_front(trigger);
+        }
+        triggers = list.into();
     }
     triggers
 }
