@@ -1447,6 +1447,12 @@ impl TableReferences {
         &self.outer_query_refs
     }
 
+    /// Remove outer references after an optimizer rewrite has removed every
+    /// expression that uses them.
+    pub(crate) fn clear_outer_query_refs(&mut self) {
+        self.outer_query_refs.clear();
+    }
+
     /// Returns an immutable reference to the [OuterQueryReference] with the given internal ID.
     pub fn find_outer_query_ref_by_internal_id(
         &self,

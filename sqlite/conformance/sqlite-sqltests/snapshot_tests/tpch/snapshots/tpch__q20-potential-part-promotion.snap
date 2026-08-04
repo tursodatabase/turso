@@ -54,8 +54,9 @@ QUERY PLAN
 |  |--LIST SUBQUERY 2
 |  |  `--SCAN part
 |  |--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=?)
-|  `--CORRELATED SCALAR SUBQUERY 3
-|     `--SCAN lineitem
+|  `--SEARCH scalar_subquery_t7 USING INDEX ephemeral_subquery_t7 (correlation_key_0=? AND correlation_key_1=?)
+|     |--SCAN lineitem
+|     `--USE SORTER FOR GROUP BY
 |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
 |--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
 `--USE SORTER FOR ORDER BY

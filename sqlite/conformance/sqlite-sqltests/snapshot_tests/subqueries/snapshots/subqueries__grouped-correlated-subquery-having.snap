@@ -19,68 +19,104 @@ info:
 ---
 QUERY PLAN
 |--SCAN grouped_values AS gv USING INDEX idx_grouped_values_grp
-`--CORRELATED SCALAR SUBQUERY 1
-   `--SEARCH gv2 USING INDEX idx_grouped_values_grp (grp=?)
+`--SEARCH scalar_subquery_t2 USING INDEX ephemeral_subquery_t2 (correlation_key_0=?) LEFT-JOIN
+   `--SCAN grouped_values AS gv2 USING INDEX idx_grouped_values_grp
 
 BYTECODE
-addr  opcode                    p1  p2  p3  p4            p5  comment
-   0            Init             0  58   0                 0  Start at 58
-   1            Null             0   9   0                 0  r[9]=NULL
-   2            Integer          0   6   0                 0  r[6]=0; clear group by abort flag
-   3            Null             0   7   0                 0  r[7]=NULL; initialize group by comparison registers to NULL
-   4            Gosub           13  54   0                 0  ; go to clear accumulator subroutine
-   5            OpenRead         0   2   0  k(3,B,B)       0  table=grouped_values, root=2, iDb=0
-   6            OpenRead         1   3   0  k(2,B)         0  index=idx_grouped_values_grp, root=3, iDb=0
-   7            Rewind           1  22   0                 0  Rewind index idx_grouped_values_grp
-   8              DeferredSeek   1   0   0                 0
-   9              Column         1   0  11                 0  r[11]=idx_grouped_values_grp.grp
-  10              Column         0   1  12                 0  r[12]=grouped_values.val
-  11              Compare        7  11   1  k(1, Binary)   0  r[7..7]==r[11..11]
-  12              Jump          13  17  13                 0  ; start new group if comparison is not equal
-  13              Gosub          4  26   0                 0  ; check if ended group had data, and output if so
-  14              Move          11   7   1                 0  r[7..7]=r[11..11]
-  15              IfPos          6  57   0                 0  r[6]>0 -> r[6]-=0, goto 57; check abort flag
-  16              Gosub         13  54   0                 0  ; goto clear accumulator subroutine
-  17              AggStep        0  12   9  sum            0  accum=r[9] step(r[12])
-  18              If             5  20   0                 0  if r[5] goto 20; don't emit group columns if continuing existing group
-  19              Column         1   0   8                 0  r[8]=idx_grouped_values_grp.grp
-  20              Integer        1   5   0                 0  r[5]=1; indicate data in accumulator
-  21            Next             1   8   0                 0
-  22            Gosub            4  26   0                 0  ; emit row for final group
-  23            Goto             0  57   0                 0  ; group by finished
-  24            Integer          1   6   0                 0  r[6]=1
-  25          Return             4   0   0                 0
-  26          IfPos              5  28   0                 0  r[5]>0 -> r[5]-=0, goto 28; output group by row subroutine start
-  27        Return               4   0   0                 0
-  28        AggFinal             0   9   0  sum            0  accum=r[9]
-  29        BeginSubrtn         14   0   0                 0  r[14]=NULL
-  30        Null                 0   1   0                 0  r[1]=NULL
-  31        Null                 0  16   0                 0  r[16]=NULL
-  32        Integer              1  17   0                 0  r[17]=1; LIMIT counter
-  33        IfNot               17  44   0                 0  if !r[17] goto 44
-  34        OpenRead             2   2   0  k(3,B,B)       0  table=grouped_values, root=2, iDb=0
-  35        OpenRead             3   3   0  k(2,B)         0  index=idx_grouped_values_grp, root=3, iDb=0
-  36        Copy                 8  18   0                 0  r[18]=r[8]
-  37        IsNull              18  44   0                 0  if (r[18]==NULL) goto 44
-  38        SeekGE               3  44  18                 0  key=[18..18]
-  39          IdxGT              3  44  18                 0  key=[18..18]
-  40          DeferredSeek       3   2   0                 0
-  41          Column             2   1  19                 0  r[19]=grouped_values.val
-  42          AggStep            0  19  16  max(Binary)    0  accum=r[16] step(r[19])
-  43        Next                 3  39   0                 0
-  44        AggFinal             0  16   0  max            0  accum=r[16]
-  45        Copy                16  15   0                 0  r[15]=r[16]
-  46        Copy                15   1   0                 0  r[1]=r[15]
-  47      Return                14   0   1                 0
-  48      Copy                   1  20   0                 0  r[20]=r[1]
-  49      IsNull                20  27   0                 0  if (r[20]==NULL) goto 27
-  50      Copy                   8   2   0                 0  r[2]=r[8]
-  51      Copy                   9   3   0                 0  r[3]=r[9]
-  52      ResultRow              2   2   0                 0  output=r[2..3]
-  53    Return                   4   0   0                 0
-  54    Null                     0   8   9                 0  r[8..9]=NULL; clear accumulator subroutine start
-  55    Integer                  0   5   0                 0  r[5]=0
-  56  Return                    13   0   0                 0
-  57  Halt                       0   0   0                 0
-  58  Transaction                0   1   2                 0  iDb=0 tx_mode=Read
-  59  Goto                       0   1   0                 0
+addr  opcode                          p1  p2  p3  p4            p5  comment
+   0                  Init             0  94   0                 0  Start at 94
+   1                  OpenEphemeral    0   0   0                 0  cursor=0 is_table=false
+   2                  Null             0  11   0                 0  r[11]=NULL
+   3                  Integer          0   8   0                 0  r[8]=0; clear group by abort flag
+   4                  Null             0   9   0                 0  r[9]=NULL; initialize group by comparison registers to NULL
+   5                  Gosub           15  38   0                 0  ; go to clear accumulator subroutine
+   6                  OpenRead         1   2   0  k(3,B,B)       0  table=grouped_values, root=2, iDb=0
+   7                  OpenRead         2   3   0  k(2,B)         0  index=idx_grouped_values_grp, root=3, iDb=0
+   8                  Rewind           2  23   0                 0  Rewind index idx_grouped_values_grp
+   9                    DeferredSeek   2   1   0                 0
+  10                    Column         2   0  13                 0  r[13]=idx_grouped_values_grp.grp
+  11                    Column         1   1  14                 0  r[14]=grouped_values.val
+  12                    Compare        9  13   1  k(1, Binary)   0  r[9..9]==r[13..13]
+  13                    Jump          14  18  14                 0  ; start new group if comparison is not equal
+  14                    Gosub          6  27   0                 0  ; check if ended group had data, and output if so
+  15                    Move          13   9   1                 0  r[9..9]=r[13..13]
+  16                    IfPos          8  41   0                 0  r[8]>0 -> r[8]-=0, goto 41; check abort flag
+  17                    Gosub         15  38   0                 0  ; goto clear accumulator subroutine
+  18                    AggStep        0  14  11  max(Binary)    0  accum=r[11] step(r[14])
+  19                    If             7  21   0                 0  if r[7] goto 21; don't emit group columns if continuing existing group
+  20                    Column         2   0  10                 0  r[10]=idx_grouped_values_grp.grp
+  21                    Integer        1   7   0                 0  r[7]=1; indicate data in accumulator
+  22                  Next             2   9   0                 0
+  23                  Gosub            6  27   0                 0  ; emit row for final group
+  24                  Goto             0  41   0                 0  ; group by finished
+  25                  Integer          1   8   0                 0  r[8]=1
+  26                Return             6   0   0                 0
+  27                IfPos              7  29   0                 0  r[7]>0 -> r[7]-=0, goto 29; output group by row subroutine start
+  28              Return               6   0   0                 0
+  29              AggFinal             0  11   0  max            0  accum=r[11]
+  30              Copy                11   4   0                 0  r[4]=r[11]
+  31              Copy                10   5   0                 0  r[5]=r[10]
+  32              Copy                 5  17   0                 0  r[17]=r[5]
+  33              Copy                 4  18   0                 0  r[18]=r[4]
+  34              Sequence             0  19   0                 0
+  35              MakeRecord          17   3  16                 0  r[16]=mkrec(r[17..19]); for ephemeral_subquery_t2
+  36              IdxInsert            0  16   0                 8  key=r[16]
+  37            Return                 6   0   0                 0
+  38            Null                   0  10  11                 0  r[10..11]=NULL; clear accumulator subroutine start
+  39            Integer                0   7   0                 0  r[7]=0
+  40          Return                  15   0   0                 0
+  41          Null                     0  28   0                 0  r[28]=NULL
+  42          Integer                  0  24   0                 0  r[24]=0; clear group by abort flag
+  43          Null                     0  25   0                 0  r[25]=NULL; initialize group by comparison registers to NULL
+  44          Gosub                   33  90   0                 0  ; go to clear accumulator subroutine
+  45          OpenRead                 3   2   0  k(3,B,B)       0  table=grouped_values, root=2, iDb=0
+  46          OpenRead                 4   3   0  k(2,B)         0  index=idx_grouped_values_grp, root=3, iDb=0
+  47          Rewind                   4  77   0                 0  Rewind index idx_grouped_values_grp
+  48            DeferredSeek           4   3   0                 0
+  49            Integer                0  34   0                 0  r[34]=0
+  50            Column                 4   0  35                 0  r[35]=idx_grouped_values_grp.grp
+  51            IsNull                35  72   0                 0  if (r[35]==NULL) goto 72
+  52            SeekGE                 0  72  35                 0  key=[35..35]
+  53              IdxGT                0  72  35                 0  key=[35..35]
+  54              Column               0   1   2                 0  r[2]=ephemeral(ephemeral_subquery_t2).MAX(gv2.val)
+  55              Column               0   0   3                 0  r[3]=ephemeral(ephemeral_subquery_t2).correlation_key_0
+  56              Integer              1  34   0                 0  r[34]=1
+  57              Column               4   0  30                 0  r[30]=idx_grouped_values_grp.grp
+  58              Column               0   1  31                 0  r[31]=ephemeral(ephemeral_subquery_t2).MAX(gv2.val)
+  59              Column               3   1  32                 0  r[32]=grouped_values.val
+  60              Compare             25  30   1  k(1, Binary)   0  r[25..25]==r[30..30]
+  61              Jump                62  66  62                 0  ; start new group if comparison is not equal
+  62              Gosub               22  81   0                 0  ; check if ended group had data, and output if so
+  63              Move                30  25   1                 0  r[25..25]=r[30..30]
+  64              IfPos               24  93   0                 0  r[24]>0 -> r[24]-=0, goto 93; check abort flag
+  65              Gosub               33  90   0                 0  ; goto clear accumulator subroutine
+  66              AggStep              0  32  28  sum            0  accum=r[28] step(r[32])
+  67              If                  23  70   0                 0  if r[23] goto 70; don't emit group columns if continuing existing group
+  68              Column               4   0  26                 0  r[26]=idx_grouped_values_grp.grp
+  69              Column               0   1  27                 0  r[27]=ephemeral(ephemeral_subquery_t2).MAX(gv2.val)
+  70              Integer              1  23   0                 0  r[23]=1; indicate data in accumulator
+  71            Next                   0  53   0                 0
+  72            IfPos                 34  76   0                 0  r[34]>0 -> r[34]-=0, goto 76
+  73            NullRow                0   0   0                 0  Set cursor 0 to a (pseudo) NULL row
+  74            Null                   0   2   3                 0  r[2..3]=NULL
+  75            Goto                   0  56   0                 0
+  76          Next                     4  48   0                 0
+  77          Gosub                   22  81   0                 0  ; emit row for final group
+  78          Goto                     0  93   0                 0  ; group by finished
+  79          Integer                  1  24   0                 0  r[24]=1
+  80        Return                    22   0   0                 0
+  81        IfPos                     23  83   0                 0  r[23]>0 -> r[23]-=0, goto 83; output group by row subroutine start
+  82      Return                      22   0   0                 0
+  83      AggFinal                     0  28   0  sum            0  accum=r[28]
+  84      Copy                        27  36   0                 0  r[36]=r[27]
+  85      IsNull                      36  82   0                 0  if (r[36]==NULL) goto 82
+  86      Copy                        26  20   0                 0  r[20]=r[26]
+  87      Copy                        28  21   0                 0  r[21]=r[28]
+  88      ResultRow                   20   2   0                 0  output=r[20..21]
+  89    Return                        22   0   0                 0
+  90    Null                           0  26  28                 0  r[26..28]=NULL; clear accumulator subroutine start
+  91    Integer                        0  23   0                 0  r[23]=0
+  92  Return                          33   0   0                 0
+  93  Halt                             0   0   0                 0
+  94  Transaction                      0   1   2                 0  iDb=0 tx_mode=Read
+  95  Goto                             0   1   0                 0
