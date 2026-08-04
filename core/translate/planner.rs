@@ -1743,8 +1743,13 @@ fn parse_table(
     let regular_view =
         resolver.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
     if let Some(view) = regular_view {
-        // Views are essentially query aliases, so just Expand the view as a subquery
-        view.process()?;
+        // Views are essentially query aliases, so just Expand the view as a subquery.
+        // A view whose body references itself (directly or transitively) is
+        // circularly defined; the in-progress set is tracked per-translation.
+        if program.is_view_being_expanded(database_id, &view.name) {
+            crate::bail_parse_error!("view {} is circularly defined", view.name);
+        }
+        program.push_view_being_expanded(database_id, view.name.clone());
         let mut view_select = view.select_stmt.clone();
         if let ast::OneSelect::Select {
             ref mut columns, ..
@@ -1781,7 +1786,7 @@ fn parse_table(
             connection,
         );
         program.restore_ctes_being_defined(saved_ctes);
-        view.done();
+        program.pop_view_being_expanded();
         return result;
     }
 
