@@ -884,18 +884,78 @@ fn mvcc_passive_checkpoint_publishes_backfill_and_reclaims_versions() {
         wal_bf > 0,
         "passive checkpoint must publish nbackfills, got wal_nbackfill={wal_bf}, snap={snap:?}"
     );
-    // Currents stay (SkipMap cover for concurrent Passive); superseded history + empty slots go.
-    assert!(
-        snap.rows_versions <= 51 && snap.rows_empty_slots == 0,
-        "passive Finalize keeps currents, drains empty slots: {snap:?}"
-    );
+    // Passive Finalize keeps currents (SkipMap cover) but drains empty slots /
+    // superseded history. Write-buffer reads can prefer B-tree for sole
+    // materialized currents without unlinking them.
     assert_eq!(
-        snap.rows_versions, snap.rows_slots,
-        "no empty slots after Passive Finalize unlink: {snap:?}"
+        snap.rows_empty_slots, 0,
+        "passive Finalize must drain empty SkipMap slots: {snap:?}"
     );
     assert_eq!(
         snap.backfill_floor.frame, wal_bf,
         "backfill_floor must track published nbackfills: {snap:?}"
+    );
+
+    // Full Rule 3 reclaim of currents requires a blocking Truncate Finalize.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let after_truncate = mv.debug_gc_snapshot();
+    assert_eq!(
+        after_truncate.rows_versions, 0,
+        "truncate Finalize must reclaim SkipMap versions: {after_truncate:?}"
+    );
+    assert_eq!(
+        after_truncate.rows_slots, 0,
+        "truncate Finalize must unlink SkipMap slots: {after_truncate:?}"
+    );
+}
+
+/// Regression test for why Rule 3 (see the `gc_version_chain` doc comment) must stay
+/// off for every Passive GC path: a reader whose snapshot predates a write must never
+/// observe that write while its transaction is still open, even with a single table
+/// and no index involved (ruling out table/index publish skew as the cause). If Rule 3
+/// were ever turned on for Passive without also fixing the underlying B-tree-fallthrough
+/// isolation gap, this test would fail with `after == [2000]` instead of `[1000]`.
+#[test]
+fn passive_reader_snapshot_survives_later_write_after_row_versions_gc() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv = db.get_mvcc_store();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, bal INTEGER NOT NULL)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1000)").unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    // Seed via an actual PASSIVE checkpoint (not TRUNCATE, which always runs the
+    // blocking protocol regardless of `experimental_mvcc_passive_checkpoint`): this
+    // materializes row 1 into the B-tree and runs Passive Finalize GC on it.
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    assert!(
+        mv.debug_gc_snapshot().rows_versions > 0,
+        "row 1's current version must survive Passive Finalize (Rule 3 off)"
+    );
+
+    // Reader opens a snapshot BEFORE any further write.
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let before = get_rows(&reader, "SELECT bal FROM t WHERE id = 1");
+    assert_eq!(before, vec![vec![Value::from_i64(1000)]]);
+
+    // Writer updates + immediately passive-checkpoints (threshold=0 => on commit).
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    writer
+        .execute("UPDATE t SET bal = 2000 WHERE id = 1")
+        .unwrap();
+
+    // Reader re-reads the SAME row within its ALREADY-OPEN snapshot: must still see 1000.
+    let after = get_rows(&reader, "SELECT bal FROM t WHERE id = 1");
+    reader.execute("COMMIT").unwrap();
+
+    assert_eq!(
+        after, before,
+        "reader's snapshot must not change mid-transaction"
     );
 }
 
@@ -20462,4 +20522,49 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
         "blocking_checkpoint_lock must be released after checkpoint returns"
     );
     mv_store.blocking_checkpoint_lock.unlock();
+}
+
+/// Documents *why* Rule 3 (drop the sole current version once it's in the B-tree) is
+/// safe for blocking Truncate but not for Passive: acquiring `blocking_checkpoint_lock`
+/// for write cannot succeed while any MVCC transaction — even a read-only one — is
+/// still open, because `begin_tx` holds the read side of that same lock for the
+/// transaction's entire lifetime. So a second Truncate can never physically overwrite a
+/// row while an earlier reader might still rely on Rule 3 having dropped that row's
+/// prior SkipMap anchor. Passive never takes this lock around its write phase (that
+/// exclusion is exactly the throughput it exists to avoid), so it has no equivalent
+/// guarantee — see `passive_reader_snapshot_survives_later_write_after_row_versions_gc` and the
+/// `gc_version_chain` doc comment.
+#[test]
+fn truncate_checkpoint_is_busy_while_a_reader_transaction_is_open() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, bal INTEGER NOT NULL)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1000)").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        get_rows(&reader, "SELECT bal FROM t WHERE id = 1"),
+        vec![vec![Value::from_i64(1000)]]
+    );
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer
+        .execute("UPDATE t SET bal = 2000 WHERE id = 1")
+        .unwrap();
+    writer.execute("COMMIT").unwrap();
+    assert!(
+        matches!(
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE)"),
+            Err(LimboError::Busy)
+        ),
+        "a second Truncate must not be able to run while the earlier reader transaction is open"
+    );
+
+    reader.execute("COMMIT").unwrap();
+    // Now that the reader is gone, Truncate can proceed.
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 }

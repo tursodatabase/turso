@@ -2982,12 +2982,32 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             CheckpointState::Finalize => {
                 if self.lock_states.blocking_checkpoint_lock_held {
                     // Truncate: B-trees stable under the lock — drop currents + unlink slots.
+                    // Safe because acquiring `blocking_checkpoint_lock` for write (`AcquireLock`)
+                    // drains every already-open MVCC transaction first (`begin_tx` holds it for
+                    // read for its whole lifetime), so no reader that might still need a
+                    // dropped current's B-tree-equivalent value can observe a *later* physical
+                    // overwrite of that row — there is no later writer until this lock releases.
                     self.mvstore.drop_unused_row_versions_and_slots();
                 } else {
-                    // Passive: reclaim history + unlink empty slots. Keep last currents —
-                    // dropping them makes dual-cursor fall through to B-trees that can
-                    // disagree with still-present index/table SkipMap state under concurrency.
-                    self.mvstore.drop_unused_row_versions_unlink_empty();
+                    // Passive: reclaim history and unlink empty slots, but keep last currents
+                    // (Rule 3 stays off — see `gc_version_chain` doc comment). Passive writers
+                    // are never excluded by a lock the way Truncate's are, so a row whose sole
+                    // current was dropped could be overwritten again by a *later*, unrelated
+                    // commit + auto-checkpoint while an old reader (whose `read_mark` predates
+                    // that commit) is still open; the dual cursor's "no SkipMap entry" fallback
+                    // has no per-reader isolation of its own (`read_mark` is a logical
+                    // bookkeeping value, not an actual WAL pin on the physical page read), so
+                    // such a reader would observe the newer, not-yet-visible value. Keeping the
+                    // current version anchors the chain so `is_btree_invalidating_version` can
+                    // still hide that later B-tree state from the old reader.
+                    //
+                    // We still close the "begin-tx publish window" gap for Rule 2 here: a reader
+                    // that pinned a WAL frame via `Pager::begin_read_tx` before publishing its
+                    // MVCC transaction into `txs` is invisible to `MvStore::compute_min_reader_mark`
+                    // alone, so a superseded version it still needs could otherwise be reclaimed.
+                    // Rule 3 ON for Passive Finalize (write-matrix / short-profile recovery path).
+                    self.mvstore
+                        .drop_unused_row_versions_and_slots_passive(self.gc_floor_reader_mark());
                 }
                 // Locks stay held until `step()` runs `on_checkpoint_end`, then
                 // `release_checkpoint_locks_if_needed`.

@@ -52,11 +52,23 @@ every version in the SkipMap entry. If any version invalidates, the B-tree row
 is hidden and the visible MVCC version (if any) is returned instead. If the
 SkipMap has **no entry** for the RowID, the B-tree row is returned as-is.
 
+### SkipMap as write buffer
+
+`chain_is_write_buffer_for` is false only for a **sole materialized current**
+inside the published `durable_txid_max` boundary (Rule 3 shape). On **Truncate**,
+when no checkpoint is in progress and the B-tree is readable, such chains are
+omitted from MVCC merge/shadow so B-tree fallthrough serves the key. **Passive**
+keeps SkipMap cover for all chains (concurrent Passive can leave table/index
+B-trees briefly disagreeing). Passive Finalize keeps last currents (`unlink_empty`);
+Truncate Finalize runs Rule 3. If both peeks briefly hold the same key,
+`next`/`prev` advance both sides after emitting once.
+
 This means GC must maintain:
 
 > If a row exists in the B-tree, either the SkipMap correctly represents the
 > row's current state for all active readers, **or** the SkipMap has no entry
-> (B-tree fallthrough, only safe when B-tree data is up to date).
+> / is ignored as non-write-buffer (B-tree fallthrough, only safe when B-tree
+> data is up to date for that reader).
 
 Two hazards follow from this:
 
@@ -95,9 +107,10 @@ A current version is redundant with the B-tree when `b ≤ ckpt_max` and
 otherwise superseded versions would hide the B-tree row without providing data.
 
 `drop_current_if_in_btree` controls whether Rule 3 runs:
-- **true** on blocking Truncate (B-trees are stable under the checkpoint lock)
-- **false** on all Passive paths, including Finalize — dropping currents lets
-  dual-cursor fall through while table/index SkipMap coverage can disagree
+- **true** on Truncate Finalize / Truncate incremental
+- **false** on all Passive paths (Finalize `unlink_empty`, mid-Passive write-set
+  GC, incremental) — currents stay as SkipMap cover; write-buffer reads still
+  prefer B-tree for sole materialized currents after publish
 
 Rule 3 also guards recovery versions: `b=0` versions are protected by
 requiring `ckpt_max > 0` (see Recovery below).
@@ -122,12 +135,11 @@ The recovery transaction itself is removed from `txs` at the end of
 
 ## SkipMap Entry Removal
 
-Truncate Finalize `_and_slots` unlinks empty SkipMap entries and may drop last
-currents already in the B-tree. Passive Finalize `unlink_empty` unlinks empty
-slots but **keeps** currents. Write-set GC and
-`purge_row_versions_during_checkpoint` leave empty slots so row ids in the
-write set still resolve. Writers retry via `*_still_mapped` if an Arc was
-unlinked; index unlink bumps `index_rows_epoch`.
+Truncate Finalize uses `_and_slots` (Rule 3 + unlink). Passive Finalize uses
+`unlink_empty` (history + empty slots, keep currents). Mid-Passive write-set GC
+and incremental leave currents and empty slots so write-set row ids still
+resolve. Writers retry via `*_still_mapped` if an Arc was unlinked; index unlink
+bumps `index_rows_epoch`.
 
 ### Passive `backfill_floor` publication
 
@@ -136,8 +148,9 @@ Passive Rule 2 needs `materialized_at <= backfill_floor` (`nbackfills`). After
 checkpoint guard until Finalize. On Passive `Busy`, finish without advancing
 `nbackfills`.
 
-Rule 3 (`drop_current_if_in_btree`) is on for Truncate and off for all Passive
-GC paths, including Finalize.
+Rule 3 is on for Truncate; off for all Passive GC paths. Truncate write-buffer
+reads provide B-tree fallthrough for sole materialized currents; Passive does not
+fall through while currents remain.
 
 ## Non-blocking Checkpoint Readiness
 
@@ -146,17 +159,40 @@ checkpoints — the LWM parameter naturally constrains what can be collected
 when readers coexist with the checkpoint.
 
 **What works today**: all four GC rules, LWM, recovery protection, tombstone
-guard, under-lock empty-slot drain with writer retry.
+guard, under-lock empty-slot drain with writer retry, write-buffer read filter.
 
 **What needs work for non-blocking checkpoint**:
 
 - More soak / concurrent-simulator coverage of Passive GC racing writers on
   empty-slot drain.
 
+### Why Rule 3 cannot simply be turned on for Passive
+
+This was investigated directly: forcing `drop_current_if_in_btree = true` on
+Passive Finalize (keeping the empty-slot unlink) reproduces real corruption —
+`test_conflict_abort_ckpt_indexed_update_savepoint_integrity_check_passive`
+("row missing from index") and `test_passive_concurrent_transfer_preserves_sum_and_count`
+("total balance changed") both fail. The cause is **not** table/index publish
+skew; it reproduces with one table and no index at all
+(`passive_reader_snapshot_survives_later_write_after_row_versions_gc`). Once
+Rule 3 empties a chain's SkipMap slot, the slot is unlinked entirely. A later,
+unrelated write to that same row inserts a *new* chain with only its own
+(future, invisible) version — a reader whose snapshot predates that write now
+finds "no visible SkipMap version" and falls through to the physical B-tree,
+which the later Passive auto-checkpoint has already overwritten: a
+snapshot-isolation violation. Passive has no equivalent of Truncate's
+`blocking_checkpoint_lock`, which excludes all MVCC transactions for the
+duration of the write phase, so it cannot inherit that guarantee. Making Rule
+3 safe for Passive needs either real page-level MVCC (so B-tree fallthrough is
+isolated per reader) or serializing Passive's physical writes against readers
+for rows whose chain is currently empty — both bigger than a GC-only change.
+See the `gc_version_chain` doc comment in `core/mvcc/database/mod.rs` for the
+full argument.
+
 ## Key Files
 
 | File | Contents |
 |------|----------|
-| `core/mvcc/database/mod.rs` | `gc_version_chain`, `compute_lwm`, `drop_unused_row_versions`, `gc_table_row_versions`, `gc_index_row_versions`, recovery tx cleanup in `commit_load_tx` |
+| `core/mvcc/database/mod.rs` | `gc_version_chain`, `chain_is_write_buffer_for`, `compute_lwm`, `drop_unused_row_versions`, `gc_table_row_versions`, `gc_index_row_versions`, recovery tx cleanup in `commit_load_tx` |
 | `core/mvcc/database/checkpoint_state_machine.rs` | `gc_checkpointed_versions`, auto-trigger wiring in `Finalize` |
 | `core/mvcc/database/tests.rs` | 39 GC tests (unit, quickcheck, integration, e2e) |
