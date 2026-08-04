@@ -503,10 +503,19 @@ impl Fuzzer {
         sqlite_dump
     }
 
-    /// Minimize the failing statement against the dumped state and write the
-    /// result (state script + minimized statement) to minimized.sql.
-    fn shrink_and_write(&self, state_dump: &str, failing_sql: &str) {
-        match crate::shrink::shrink_statement(state_dump, failing_sql) {
+    /// Minimize the failing statement against the dumped state — or against
+    /// the run's executed statements when the divergence needs the history —
+    /// and write the result (state script + minimized statement) to
+    /// minimized.sql.
+    fn shrink_and_write(&self, state_dump: &str, executed_sql: &[String], failing_sql: &str) {
+        // The executed statements double as a replay script. Skip comment
+        // lines (skipped/warning markers) the runner interleaves.
+        let history: String = executed_sql
+            .iter()
+            .filter(|s| !s.trim_start().starts_with("--"))
+            .map(|s| format!("{s};\n"))
+            .collect();
+        match crate::shrink::shrink_statement(state_dump, &history, failing_sql) {
             Ok(Some(minimized)) => {
                 let path = self.out_dir.join("minimized.sql");
                 let body = format!(
@@ -656,7 +665,7 @@ impl Fuzzer {
                         tracing::error!("Failing SQL: {}", stmt.sql);
                     }
                     let state_dump = self.dump_failure_state(&schema, &stmt.sql);
-                    self.shrink_and_write(&state_dump, &stmt.sql);
+                    self.shrink_and_write(&state_dump, executed_sql, &stmt.sql);
                     return Err(anyhow::anyhow!("Oracle failure: {reason}"));
                 }
             }

@@ -1012,15 +1012,39 @@ pub struct Minimized {
 }
 
 /// Minimize `failing_sql` — and then the state script it needs — against the
-/// state in `state_sql`. Returns None when the divergence does not reproduce
-/// on the rebuilt state (nothing trustworthy to shrink against).
-pub fn shrink_statement(state_sql: &str, failing_sql: &str) -> Result<Option<Minimized>> {
-    let baseline = {
+/// state in `state_sql`, falling back to `history_sql` (the run's executed
+/// statements) when the divergence needs the statement history rather than
+/// just the final data. Returns None when neither replay reproduces it.
+///
+/// The fallback matters for history-dependent bugs: a wrong trigger firing
+/// order, for example, leaves a table whose *contents* replay cleanly from a
+/// dump, so the dump-based baseline shows no divergence — but replaying the
+/// statements that built the table hits the divergence again. The ddmin pass
+/// then deletes every history line the divergence does not need.
+pub fn shrink_statement(
+    state_sql: &str,
+    history_sql: &str,
+    failing_sql: &str,
+) -> Result<Option<Minimized>> {
+    let mut state_sql = state_sql;
+    let mut baseline = {
         let pair = EnginePair::build(state_sql)?;
         pair.classify(failing_sql)
     };
+    if baseline.is_none() {
+        let pair = EnginePair::build(history_sql)?;
+        baseline = pair.classify(failing_sql);
+        if baseline.is_some() {
+            tracing::info!(
+                "Divergence needs the statement history; shrinking against it instead of the state dump"
+            );
+            state_sql = history_sql;
+        }
+    }
     let Some(original) = baseline else {
-        tracing::info!("Shrink skipped: divergence does not reproduce on rebuilt state");
+        tracing::info!(
+            "Shrink skipped: divergence reproduces on neither the rebuilt state nor the statement history"
+        );
         return Ok(None);
     };
     tracing::info!(
@@ -1168,7 +1192,7 @@ mod tests {
         // Same statement behaves identically on both engines, so there is
         // nothing to shrink against.
         let state = "CREATE TABLE t(x);\nINSERT INTO t VALUES (1);\n";
-        let out = shrink_statement(state, "SELECT x + 1 FROM t").unwrap();
+        let out = shrink_statement(state, state, "SELECT x + 1 FROM t").unwrap();
         assert!(out.is_none());
     }
 
