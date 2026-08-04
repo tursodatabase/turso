@@ -1476,6 +1476,44 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         }
     }
 
+    /// Advance shared `nbackfills` after MVCC's WAL backfill (+ DB sync when enabled).
+    ///
+    /// The pager checkpoint path publishes this in `CheckpointPhase::PublishBackfill`.
+    /// MVCC drives `wal.checkpoint` directly and previously synced the DB without publishing,
+    /// so Passive left `nbackfills` at 0 forever — `backfill_floor` never advanced and Passive
+    /// GC Rules 2/3 could not reclaim stamped versions (SkipMap grew without bound).
+    ///
+    /// Truncate/Restart must not publish here: `wal.checkpoint` already restarted the log
+    /// (max_frame/nbackfills reset to 0) before SyncDbFile runs, and the pager Truncate path
+    /// similarly skips PublishBackfill in favor of WAL truncate.
+    fn publish_wal_backfill_if_needed(&mut self) {
+        if self.mode.should_restart_log() {
+            if let Some(result) = self.checkpoint_result.as_mut() {
+                result.release_guard();
+            }
+            return;
+        }
+        let Some(result) = self.checkpoint_result.as_mut() else {
+            return;
+        };
+        if result.wal_checkpoint_backfilled == 0 {
+            // No frames copied: drop the checkpoint guard if WAL held it for a no-op Passive.
+            result.release_guard();
+            return;
+        }
+        let max_frame = result.wal_total_backfilled;
+        let Some(wal) = self.pager.wal.as_ref() else {
+            panic!("No WAL to publish backfill");
+        };
+        tracing::debug!(
+            max_frame,
+            backfilled = result.wal_checkpoint_backfilled,
+            "publishing WAL backfill after MVCC checkpoint"
+        );
+        wal.publish_backfill(max_frame);
+        result.release_guard();
+    }
+
     fn has_unpublished_schema_changes(&self) -> bool {
         let schema = self.connection.db.schema.lock();
         if !schema.dropped_root_pages.is_empty() {
@@ -1771,13 +1809,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         materialized_frame,
                         snapshot_ts,
                     );
-                    MvStore::<Clock, A>::gc_version_chain(
+                    let dropped = MvStore::<Clock, A>::gc_version_chain(
                         &mut versions,
                         lwm,
                         ckpt_max,
                         self.mvstore.experimental_mvcc_passive_checkpoint,
                         min_reader_mark,
                     );
+                    self.mvstore.dec_live_version_count_approx(dropped);
                     versions.is_empty()
                 };
                 if is_now_empty && remove_empty_slots {
@@ -1848,13 +1887,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         materialized_frame,
                         snapshot_ts,
                     );
-                    MvStore::<Clock, A>::gc_version_chain(
+                    let dropped = MvStore::<Clock, A>::gc_version_chain(
                         &mut versions,
                         lwm,
                         ckpt_max,
                         self.mvstore.experimental_mvcc_passive_checkpoint,
                         min_reader_mark,
                     );
+                    self.mvstore.dec_live_version_count_approx(dropped);
                     versions.is_empty()
                 };
                 if is_now_empty && remove_empty_slots {
@@ -2831,23 +2871,50 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
 
             CheckpointState::CheckpointWal => {
-                tracing::debug!("Performing TRUNCATE checkpoint on WAL");
-                match self.checkpoint_wal()? {
-                    IOResult::Done(result) => {
+                tracing::debug!("Performing checkpoint on WAL");
+                match self.checkpoint_wal() {
+                    Ok(IOResult::Done(result)) => {
                         self.checkpoint_result = Some(result);
                         self.state = CheckpointState::SyncDbFile;
                         Ok(TransitionResult::Continue)
                     }
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                    Ok(IOResult::IO(io)) => Ok(TransitionResult::Io(io)),
+                    // Passive WAL backfill needs exclusive read-mark 0. A reader that began when
+                    // max_frame == nbackfills holds that slot as DbFile and correctly Busy-blocks
+                    // backfill. MVCC publish + logical-log truncate can still complete; frames
+                    // remain in the WAL until a later Passive pass. Skipping publish_backfill keeps
+                    // backfill_floor honest so Passive GC will not reclaim un-backfilled versions.
+                    Err(crate::LimboError::Busy)
+                        if matches!(self.mode, CheckpointMode::Passive { .. }) =>
+                    {
+                        tracing::debug!(
+                            "Passive WAL checkpoint Busy under pinned DbFile reader; continuing without backfill"
+                        );
+                        let (max_frame, nbackfills) = self
+                            .pager
+                            .wal
+                            .as_ref()
+                            .map(|wal| (wal.get_max_frame_in_wal(), wal.backfill_frame()))
+                            .unwrap_or((0, 0));
+                        self.checkpoint_result =
+                            Some(CheckpointResult::new(max_frame, nbackfills, 0));
+                        self.state = CheckpointState::TruncateLogicalLog;
+                        Ok(TransitionResult::Continue)
+                    }
+                    Err(e) => Err(e),
                 }
             }
 
             CheckpointState::SyncDbFile => {
-                // Fsync database file before truncating WAL.
+                // Fsync database file before truncating WAL / publishing nbackfills.
                 // This ensures durability: if we crash after WAL truncation but before DB fsync,
-                // the checkpointed data would be lost.
+                // the checkpointed data would be lost. Publishing nbackfills (below) must not
+                // race ahead of that durable DB content — same ordering as pager PublishBackfill.
                 if self.sync_mode == SyncMode::Off {
                     tracing::debug!("Skipping fsync of database file (synchronous=off)");
+                    // sync=off already accepts durability risk; still publish so Passive GC's
+                    // backfill_floor can advance with the frames already copied to the DB file.
+                    self.publish_wal_backfill_if_needed();
                     self.state = CheckpointState::TruncateLogicalLog;
                     return Ok(TransitionResult::Continue);
                 }
@@ -2859,12 +2926,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
                 // Only sync if we actually backfilled any frames
                 if checkpoint_result.wal_checkpoint_backfilled == 0 {
+                    checkpoint_result.release_guard();
                     self.state = CheckpointState::TruncateLogicalLog;
                     return Ok(TransitionResult::Continue);
                 }
 
                 // Check if we already sent the sync
                 if checkpoint_result.db_sync_sent {
+                    self.publish_wal_backfill_if_needed();
                     self.state = CheckpointState::TruncateLogicalLog;
                     return Ok(TransitionResult::Continue);
                 }

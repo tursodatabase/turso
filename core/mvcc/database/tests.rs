@@ -835,6 +835,58 @@ fn debug_gc_metrics_truncate_vs_passive() {
     run_mode(true, KEYS, ROUNDS, UPDATES_PER_ROUND);
 }
 
+/// Passive checkpoint must publish WAL `nbackfills` so `backfill_floor` advances and
+/// Passive GC can reclaim materialized version chains (otherwise SkipMap versions grow
+/// without bound while Truncate drains to zero).
+#[test]
+fn mvcc_passive_checkpoint_publishes_backfill_and_reclaims_versions() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv = db.get_mvcc_store();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1").unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    for i in 0..50 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'seed')"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+    let after_seed = mv.debug_gc_snapshot();
+    assert!(
+        after_seed.backfill_floor.frame > 0 || after_seed.rows_versions == 0,
+        "passive seed checkpoint must advance backfill_floor or reclaim seed versions: {after_seed:?}"
+    );
+
+    for round in 0..5 {
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        for i in 0..50 {
+            conn.execute(format!("UPDATE t SET data = 'r{round}' WHERE id = {i}"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    }
+
+    let snap = mv.debug_gc_snapshot();
+    let wal_bf = conn.pager.load().wal_backfill_frame().unwrap_or(0);
+    assert!(
+        wal_bf > 0,
+        "passive checkpoint must publish nbackfills, got wal_nbackfill={wal_bf}, snap={snap:?}"
+    );
+    assert_eq!(
+        snap.rows_versions, 0,
+        "passive GC must reclaim materialized chains once backfill_floor advances: {snap:?}"
+    );
+    assert_eq!(
+        snap.backfill_floor.frame, wal_bf,
+        "backfill_floor must track published nbackfills: {snap:?}"
+    );
+}
+
 /// Passive checkpoint may run btree writes while a pinned reader is active.
 #[test]
 fn mvcc_passive_checkpoint_busy_under_pinned_reader_no_corruption() {

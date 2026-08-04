@@ -121,15 +121,26 @@ The recovery transaction itself is removed from `txs` at the end of
 After GC empties a version chain, the SkipMap entry is handled differently
 depending on the GC path:
 
-- **Checkpoint-time GC** (`gc_checkpointed_versions`): removes empty entries
-  using a re-check-under-lock pattern. This is a TOCTOU gap (a writer could
-  insert between the lock release and `remove()`), but safe under the current
-  **blocking** checkpoint — no concurrent writers exist.
+- **Blocking Truncate checkpoint** (`drop_unused_row_versions_and_slots` /
+  `gc_checkpointed_*` under the blocking lock): removes empty entries.
+- **Passive checkpoint / background GC**: leaves empty entries in place (lazy
+  removal). This avoids a TOCTOU race with concurrent writers. Empty entries are
+  reused by `get_or_insert_with` on subsequent inserts, and cleaned up by a later
+  blocking Truncate.
 
-- **Background GC** (`gc_table_row_versions`, `gc_index_row_versions`): leaves
-  empty entries in place (lazy removal). This avoids the TOCTOU race entirely.
-  Empty entries are reused by `get_or_insert_with` on subsequent inserts, and
-  cleaned up by the next checkpoint-time GC pass.
+### Passive `backfill_floor` publication
+
+Passive GC Rules 2/3 reclaim a materialized version only once
+`materialized_at <= backfill_floor`, where `backfill_floor` tracks the shared WAL
+`nbackfills` published after frames are copied into the DB file (and synced,
+unless `synchronous=off`). MVCC drives `wal.checkpoint` directly, so it must
+call `wal.publish_backfill` after that sync — the same step the pager's
+`PublishBackfill` phase performs. Without it, `nbackfills` stays at 0, Passive GC
+never reclaims stamped chains, and the SkipMap grows without bound.
+
+When Passive WAL backfill returns `Busy` (a DbFile reader holds read-mark 0),
+MVCC still finishes publish + logical-log truncate and leaves `nbackfills`
+unchanged so the GC floor stays honest.
 
 ## Non-blocking Checkpoint Readiness
 
