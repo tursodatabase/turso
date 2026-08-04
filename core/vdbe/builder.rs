@@ -1071,18 +1071,9 @@ impl ProgramBuilder {
         self.insns.push((insn, self.insns.len()));
     }
 
-    /// Emits a Column instruction, fusing it into an immediately preceding
-    /// Column/ColumnRange on the same cursor when both the column index and
-    /// the destination register are exactly consecutive. The fused ColumnRange
-    /// walks the record header once for the whole run instead of once per
-    /// column.
-    ///
-    /// Fusion is skipped when a label has been anchored to the previous
-    /// instruction: `preassign_label_to_next_insn` promises a jump target at
-    /// the *next* instruction, so this Column must exist as a separate
-    /// instruction for that jump to land on. A label anchored even earlier is
-    /// fine — a jump onto the head of a run executes the whole run, exactly
-    /// like falling through the unfused Column sequence..
+    /// Emits a `Column` or `ColumnRange` opcode, fusing it into an immediately preceding `Column`
+    /// or `ColumnRange` on the same cursor when both the column index and the destination register
+    /// are exactly consecutive and no label is set to target the current opcode.
     fn emit_column_maybe_fused(
         &mut self,
         cursor_id: CursorID,
