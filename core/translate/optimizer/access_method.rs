@@ -290,7 +290,8 @@ pub(super) fn choose_best_btree_candidate(
                     IterationDirection::Forwards,
                     candidate.index.as_deref(),
                     &usable_constraint_refs,
-                    &order_target.columns,
+                    order_target,
+                    0,
                     schema,
                     EqualityPrefixScope::AnyEquality,
                 ) == order_target.columns.len();
@@ -299,7 +300,8 @@ pub(super) fn choose_best_btree_candidate(
                     IterationDirection::Backwards,
                     candidate.index.as_deref(),
                     &usable_constraint_refs,
-                    &order_target.columns,
+                    order_target,
+                    0,
                     schema,
                     EqualityPrefixScope::AnyEquality,
                 ) == order_target.columns.len();
@@ -1597,6 +1599,7 @@ fn find_best_access_method_for_subquery(
                 constraint_vec_pos: *orig_idx,
                 index_col_pos,
                 sort_order: SortOrder::Asc,
+                nulls_order: ast::NullsOrder::First,
             }
         })
         .collect();
@@ -1728,6 +1731,7 @@ fn materialized_subquery_ephemeral_index(
             .push_within_capacity(IndexColumn {
                 name: column.name.clone().unwrap_or_default(),
                 order: SortOrder::Asc,
+                nulls_order: None,
                 pos_in_table: col_pos,
                 collation: column.collation_opt(),
                 default: column.default.clone(),
@@ -1744,6 +1748,7 @@ fn materialized_subquery_ephemeral_index(
             .push_within_capacity(IndexColumn {
                 name: column.name.clone().unwrap_or_default(),
                 order: SortOrder::Asc,
+                nulls_order: None,
                 pos_in_table: col_pos,
                 collation: column.collation_opt(),
                 default: column.default.clone(),
@@ -1793,7 +1798,8 @@ fn materialized_subquery_order_properties(
         IterationDirection::Forwards,
         Some(index.as_ref()),
         constraint_refs,
-        &order_target.columns,
+        order_target,
+        0,
         schema,
         EqualityPrefixScope::AnyEquality,
     ) == order_target.columns.len();
@@ -1802,7 +1808,8 @@ fn materialized_subquery_order_properties(
         IterationDirection::Backwards,
         Some(index.as_ref()),
         constraint_refs,
-        &order_target.columns,
+        order_target,
+        0,
         schema,
         EqualityPrefixScope::AnyEquality,
     ) == order_target.columns.len();

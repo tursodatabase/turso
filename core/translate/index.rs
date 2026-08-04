@@ -443,7 +443,7 @@ fn emit_refill_index(
         let order_collations_nulls = idx
             .columns
             .iter()
-            .map(|c| (c.order, c.collation, None))
+            .map(|c| (c.order, c.collation, c.nulls_order))
             .try_collect()?;
         program.emit_insn(Insn::SorterOpen {
             cursor_id: sorter_cursor_id,
@@ -882,11 +882,6 @@ pub fn resolve_sorted_columns(
     resolve_sorted_columns_with_resolver(table, cols, None)
 }
 
-/// SQLite rejects explicit `NULLS FIRST`/`NULLS LAST` wherever an index key
-/// is defined or matched: CREATE INDEX, table PRIMARY KEY/UNIQUE constraints,
-/// and UPSERT conflict targets (see `sqlite3HasExplicitNulls`). Accepting the
-/// clause in schema definitions would store SQL in `sqlite_schema` that
-/// SQLite refuses to load ("malformed database schema").
 pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
     for sc in cols {
         if let Some(nulls) = sc.nulls {
@@ -901,13 +896,13 @@ fn resolve_sorted_columns_with_resolver(
     cols: &[SortedColumn],
     resolver: Option<&Resolver>,
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
-    reject_explicit_nulls(cols)?;
     let mut resolved =
         <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
             cols.len(),
         )?;
     for sc in cols {
         let order = sc.order.unwrap_or(SortOrder::Asc);
+        let nulls = sc.nulls;
         let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref(), resolver)?;
         // Unwrap parentheses for column resolution (SQLite treats (('col')) same as 'col')
         let unwrapped_expr = unwrap_parens(base_expr)?;
@@ -921,6 +916,7 @@ fn resolve_sorted_columns_with_resolver(
                 .push_within_capacity(IndexColumn {
                     name: column_name,
                     order,
+                    nulls_order: nulls,
                     pos_in_table: pos,
                     collation,
                     default: column.default.clone(),
@@ -936,6 +932,7 @@ fn resolve_sorted_columns_with_resolver(
             .push_within_capacity(IndexColumn {
                 name: sc.expr.to_string(),
                 order,
+                nulls_order: nulls,
                 pos_in_table: EXPR_INDEX_SENTINEL,
                 collation: explicit_collation,
                 default: None,

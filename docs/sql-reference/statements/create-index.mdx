@@ -12,7 +12,7 @@ Create an index on a table to improve query performance for lookups, joins, and 
 
 ```sql
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] [schema-name.]index-name
-    ON table-name (column-or-expr [COLLATE collation-name] [ASC|DESC], ...)
+    ON table-name (column-or-expr [COLLATE collation-name] [ASC|DESC] [NULLS FIRST|NULLS LAST], ...)
     [WHERE filter-expression];
 ```
 
@@ -32,6 +32,7 @@ CREATE [UNIQUE] INDEX [IF NOT EXISTS] [schema-name.]index-name
 | `column-or-expr` | A column name or an expression to include in the index. Multiple entries are separated by commas. |
 | `COLLATE collation-name` | An optional collation sequence applied to the indexed column (e.g. `NOCASE`). |
 | `ASC` / `DESC` | Sort direction for the indexed column. Default is `ASC`. |
+| `NULLS FIRST` / `NULLS LAST` | Where NULL values are stored relative to non-NULL values in the index. Defaults to `NULLS FIRST` for `ASC` columns and `NULLS LAST` for `DESC` columns. See [NULL Ordering](#nulls-first-last). |
 | `WHERE filter-expression` | An optional filter that creates a partial index. Only rows matching the expression are included in the index. |
 
 ## Column Indexes
@@ -47,6 +48,35 @@ CREATE INDEX idx_orders_customer_date ON orders (customer_id, order_date DESC);
 ```
 
 A composite index is useful when queries filter or sort by multiple columns. The order of columns matters -- an index on `(a, b)` can accelerate queries filtering on `a` alone, but not queries filtering only on `b`.
+
+## NULL Ordering {#nulls-first-last}
+
+<Info>
+**Turso Extension**: SQLite rejects `NULLS FIRST` and `NULLS LAST` in index definitions. Turso supports them fully.
+</Info>
+
+Each indexed column may declare where its NULL values are stored relative to non-NULL values. By default an `ASC` column stores NULLs before all values and a `DESC` column stores them after, matching the defaults of `ORDER BY`. `NULLS FIRST` and `NULLS LAST` override that placement without changing how non-NULL values are ordered.
+
+```sql
+-- Store rows with a NULL due date at the end of the index
+CREATE INDEX idx_tasks_due ON tasks (due_date ASC NULLS LAST);
+```
+
+The main benefit is sorting: a query whose `ORDER BY` asks for the same direction and NULL placement as the index (or the exact reverse of both, which the planner satisfies by scanning the index backward) reads rows straight from the index with no sort step.
+
+```sql
+-- Both of these use idx_tasks_due without sorting:
+SELECT * FROM tasks ORDER BY due_date ASC NULLS LAST;
+SELECT * FROM tasks ORDER BY due_date DESC NULLS FIRST;
+```
+
+The declared placement also lets range scans and `min()`/`max()` lookups skip over the NULL block no matter which end of the index it lives at.
+
+NULL placement does not affect uniqueness: NULL values are still considered distinct from each other in a `UNIQUE` index.
+
+<Warning>
+A database whose schema uses `NULLS FIRST` or `NULLS LAST` in an index, `PRIMARY KEY`, or `UNIQUE` definition cannot be opened by stock SQLite, because SQLite fails to parse the stored schema. Use this feature only for databases that stay on Turso.
+</Warning>
 
 ## UNIQUE Indexes
 

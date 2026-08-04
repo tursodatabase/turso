@@ -1206,7 +1206,7 @@ mod tests {
         MAIN_DB_ID,
     };
     use std::{collections::VecDeque, sync::Arc};
-    use turso_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
+    use turso_parser::ast::{self, Expr, Operator, TableInternalId};
 
     struct TestColumn {
         name: String,
@@ -1614,24 +1614,7 @@ mod tests {
                 name: "idx_item_id_kind".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
-                columns: crate::alloc::vec![
-                    IndexColumn {
-                        name: "id".to_string(),
-                        order: SortOrder::Asc,
-                        pos_in_table: 0,
-                        collation: None,
-                        default: None,
-                        expr: None,
-                    },
-                    IndexColumn {
-                        name: "kind".to_string(),
-                        order: SortOrder::Asc,
-                        pos_in_table: 1,
-                        collation: None,
-                        default: None,
-                        expr: None,
-                    },
-                ],
+                columns: IndexColumn::new_many(vec!["id", "kind"]),
                 unique: false,
                 ephemeral: false,
                 root_page: 2,

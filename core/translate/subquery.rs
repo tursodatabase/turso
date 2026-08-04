@@ -971,6 +971,7 @@ fn get_subquery_parser<'a>(
                         Ok::<_, crate::LimboError>(IndexColumn {
                             name: c.name(table_references).unwrap_or("").to_string(),
                             order: SortOrder::Asc,
+                            nulls_order: None,
                             pos_in_table: i,
                             collation: lhs_collations[i].or(rhs_collation),
                             default: None,

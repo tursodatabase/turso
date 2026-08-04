@@ -37,8 +37,8 @@ COLLATE collation-name
 ### Table Constraints
 
 ```sql
-PRIMARY KEY (column-name [, column-name ...])
-UNIQUE (column-name [, column-name ...])
+PRIMARY KEY (column-name [ASC | DESC] [NULLS FIRST | NULLS LAST] [, ...])
+UNIQUE (column-name [ASC | DESC] [NULLS FIRST | NULLS LAST] [, ...])
 CHECK (expression)
 FOREIGN KEY (column-name [, column-name ...]) REFERENCES foreign-table [(column-name [, column-name ...])] [foreign-key-actions]
 ```
@@ -236,6 +236,39 @@ CREATE TABLE assignments (
     UNIQUE (employee_id, project_id)
 );
 ```
+
+### Sort Order and NULL Placement in Table Constraints
+
+<Info>
+**Turso Extension**: SQLite rejects `NULLS FIRST` and `NULLS LAST` in `PRIMARY KEY` and `UNIQUE` definitions. Turso supports them fully.
+</Info>
+
+Each column in a table-level `PRIMARY KEY` or `UNIQUE` constraint may declare a sort direction and a NULL placement for the automatic index that enforces the constraint. These work exactly like they do in [CREATE INDEX](/docs/sql-reference/statements/create-index#nulls-first-last): the placement decides where NULLs are stored in the index, and an `ORDER BY` that asks for the same ordering can read from the index without a sort step.
+
+```sql
+CREATE TABLE tasks (
+    project TEXT,
+    due_date TEXT,
+    title TEXT,
+    UNIQUE (project, due_date ASC NULLS LAST)
+);
+
+-- Served by the automatic index with no sort step:
+SELECT * FROM tasks WHERE project = 'launch' ORDER BY due_date ASC NULLS LAST;
+```
+
+NULL placement never changes what the constraint allows: a `UNIQUE` constraint still treats NULLs as distinct from each other, and a `PRIMARY KEY` still follows the usual NULL rules for its table type.
+
+The clause is accepted but has no effect where the key can never hold a NULL:
+
+- `PRIMARY KEY (id)` where `id` is an `INTEGER` column still makes the column a rowid alias, exactly as without the clause. The rowid is never NULL and no index is created.
+- The `PRIMARY KEY` of a `WITHOUT ROWID` table enforces `NOT NULL` on its columns.
+
+On an ordinary rowid table, a non-`INTEGER` `PRIMARY KEY` does allow NULLs (a long-standing SQLite quirk), so the declared placement is visible there.
+
+<Warning>
+A database whose schema uses `NULLS FIRST` or `NULLS LAST` cannot be opened by stock SQLite, because SQLite fails to parse the stored schema. Use this feature only for databases that stay on Turso.
+</Warning>
 
 ### Table-Level CHECK
 

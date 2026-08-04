@@ -1,4 +1,4 @@
-use crate::schema::Table;
+use crate::schema::{impl_effective_nulls_order, IndexColumn, Table};
 use crate::turso_assert_greater_than_or_equal;
 use crate::{
     schema::{FromClauseSubquery, Index, Schema},
@@ -42,6 +42,8 @@ pub struct ColumnOrder {
     pub collation: CollationSeq,
     pub nulls_order: Option<ast::NullsOrder>,
 }
+
+impl_effective_nulls_order!(ColumnOrder);
 
 #[derive(Debug, PartialEq, Clone)]
 /// If an [OrderTarget] is satisfied, then [EliminatesSort] describes which part
@@ -283,7 +285,8 @@ pub fn plan_satisfies_order_target(
                 *iter_dir,
                 index_opt.as_deref(),
                 constraint_refs,
-                &order_target.columns[target_col_idx..],
+                order_target,
+                target_col_idx,
                 schema,
                 EqualityPrefixScope::ConstantEquality,
             ),
@@ -296,7 +299,8 @@ pub fn plan_satisfies_order_target(
                 *iter_dir,
                 Some(index.as_ref()),
                 constraint_refs,
-                &order_target.columns[target_col_idx..],
+                order_target,
+                target_col_idx,
                 schema,
                 EqualityPrefixScope::ConstantEquality,
             ),
@@ -554,17 +558,11 @@ fn match_intrinsic_order(
             return 0;
         }
         // If the target requests an explicit NULLS ordering, the intrinsic
-        // order must provide the same. When the intrinsic order has no explicit
-        // NULLS (None), it follows the default (ASC → NULLS FIRST,
-        // DESC → NULLS LAST), so only a matching explicit request is compatible.
-        if let Some(target_nulls) = target_col.nulls_order {
-            let intrinsic_nulls = intrinsic_col.nulls_order.unwrap_or(match expected_order {
-                SortOrder::Asc => ast::NullsOrder::First,
-                SortOrder::Desc => ast::NullsOrder::Last,
-            });
-            if intrinsic_nulls != target_nulls {
-                return 0;
-            }
+        // order must provide the same.
+        let requested_nulls = target_col.effective_nulls_order();
+        let intrinsic_nulls = intrinsic_col.effective_nulls_order_when_iterated(iter_dir);
+        if requested_nulls != intrinsic_nulls {
+            return 0;
         }
     }
     target_len
@@ -656,7 +654,11 @@ fn finalized_scan_subquery_order_consumed(
             effective_iter_dir,
             index.as_deref(),
             &[],
-            &mapped_target,
+            &OrderTarget {
+                columns: mapped_target,
+                purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
+            },
+            0,
             schema,
             EqualityPrefixScope::ConstantEquality,
         ),
@@ -750,7 +752,7 @@ fn expr_to_column_order(
 
 fn target_matches_index_column(
     target_col: &ColumnOrder,
-    idx_col: &crate::schema::IndexColumn,
+    idx_col: &IndexColumn,
     table_ref: &JoinedTable,
 ) -> bool {
     if target_col.table_id != table_ref.internal_id {
@@ -784,16 +786,19 @@ fn target_matches_index_column(
 /// [`EqualityPrefixScope`] because candidate scoring may skip any equality
 /// prefix in the chosen seek key, while final global ordering proof may only
 /// skip prefixes that are constant across all output rows.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn btree_access_order_consumed(
     table_ref: &JoinedTable,
     iter_dir: IterationDirection,
     index: Option<&Index>,
     constraint_refs: &[RangeConstraintRef],
-    order_target: &[ColumnOrder],
+    order_target: &OrderTarget,
+    start_col: usize,
     schema: &Schema,
     equality_prefix_scope: EqualityPrefixScope,
 ) -> usize {
-    let Some(first_target_col) = order_target.first() else {
+    let target_columns = &order_target.columns[start_col..];
+    let Some(first_target_col) = target_columns.first() else {
         return 0;
     };
 
@@ -831,8 +836,8 @@ pub(super) fn btree_access_order_consumed(
         Some(index) => {
             let mut col_idx = 0;
             let mut idx_pos = 0;
-            while col_idx < order_target.len() && idx_pos < index.columns.len() {
-                let target_col = &order_target[col_idx];
+            while col_idx < target_columns.len() && idx_pos < index.columns.len() {
+                let target_col = &target_columns[col_idx];
                 if target_col.table_id != table_ref.internal_id {
                     break;
                 }
@@ -893,17 +898,17 @@ pub(super) fn btree_access_order_consumed(
                     break;
                 }
 
-                // An index scan delivers NULLs in a fixed position:
-                //   Forward scan  → NULLs first  (B-tree stores NULLs at start)
-                //   Reverse scan  → NULLs last
-                // If the query explicitly requests a different NULLS order,
-                // the index cannot satisfy it and we must fall back to a sorter.
-                if let Some(requested_nulls) = target_col.nulls_order {
-                    let default_nulls = match target_col.order {
-                        SortOrder::Asc => ast::NullsOrder::First,
-                        SortOrder::Desc => ast::NullsOrder::Last,
-                    };
-                    if requested_nulls != default_nulls {
+                // An index scan delivers NULLs in a known position: by
+                // default NULLs come first on a forward scan and last on a
+                // reverse scan, and an explicit NULLS FIRST/LAST on the index
+                // column flips that. If the scan delivers NULLs in a different
+                // position than the query requests, the index cannot satisfy
+                // the ordering and we must fall back to a sorter. MIN/MAX skip
+                // NULLs entirely, so for them the position does not matter.
+                if !order_target.is_extremum() {
+                    let requested_nulls = target_col.effective_nulls_order();
+                    let effective_nulls = idx_col.effective_nulls_order_when_iterated(iter_dir);
+                    if requested_nulls != effective_nulls {
                         break;
                     }
                 }
@@ -914,8 +919,8 @@ pub(super) fn btree_access_order_consumed(
 
             // SQLite-style rowid tables keep equal secondary-index keys ordered
             // by rowid. That implicit suffix can satisfy one extra ORDER BY term.
-            if col_idx < order_target.len() && idx_pos == index.columns.len() && index.has_rowid {
-                let target_col = &order_target[col_idx];
+            if col_idx < target_columns.len() && idx_pos == index.columns.len() && index.has_rowid {
+                let target_col = &target_columns[col_idx];
                 let rowid_matches = match target_col.target {
                     ColumnTarget::RowId => true,
                     ColumnTarget::Column(col_no) => {

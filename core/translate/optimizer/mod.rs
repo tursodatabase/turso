@@ -2353,6 +2353,7 @@ fn optimize_table_access(
                                 constraint_vec_pos: *orig_idx, // index in the original constraints vec
                                 index_col_pos,
                                 sort_order: SortOrder::Asc,
+                                nulls_order: ast::NullsOrder::First,
                             }
                         })
                         .collect();
@@ -3269,6 +3270,7 @@ fn ephemeral_index_build(
             IndexColumn {
                 name: c.name.clone().unwrap(),
                 order: SortOrder::Asc,
+                nulls_order: None,
                 pos_in_table: i,
                 collation: c.collation_opt(),
                 default: c.default.clone(),
@@ -3416,11 +3418,7 @@ fn build_seek_def(
 
     // pop last key as we will do some form of range search
     let last = key.pop().unwrap();
-    let has_upper_bound_only = last.upper_bound.is_some() && last.lower_bound.is_none();
-    let upper_bound_is_lt_or_le = matches!(
-        last.upper_bound.as_ref().map(|(op, _, _)| op),
-        Some(ast::Operator::Less | ast::Operator::LessEquals)
-    );
+    let stored_nulls = last.nulls_order;
     // after that all key components must be equality constraints
     turso_debug_assert!(key.iter().all(|k| k.eq.is_some()));
 
@@ -3428,18 +3426,19 @@ fn build_seek_def(
     let apply_null_boundaries = |start: &mut SeekKey, end: &mut SeekKey| {
         // Sometimes we must add an extra NULL to the key on purpose.
         // We do this so scans over composite indexes match SQLite exactly.
-        let start_is_prefix_only = matches!(start.last_component, SeekKeyComponent::None);
-        let start_has_range_component = matches!(start.last_component, SeekKeyComponent::Expr(_));
-        let end_is_prefix_only = matches!(end.last_component, SeekKeyComponent::None);
-        let end_has_range_component = matches!(end.last_component, SeekKeyComponent::Expr(_));
-        let start_is_forward_ge = matches!(start.op, SeekOp::GE { .. })
-            && matches!(iter_dir, IterationDirection::Forwards);
-        let start_is_backward_le = matches!(start.op, SeekOp::LE { .. })
-            && matches!(iter_dir, IterationDirection::Backwards);
-        let end_is_forward_gt =
-            matches!(end.op, SeekOp::GT) && matches!(iter_dir, IterationDirection::Forwards);
-        let end_is_backward_lt =
-            matches!(end.op, SeekOp::LT) && matches!(iter_dir, IterationDirection::Backwards);
+        //
+        // A range with only one bound leaves the other side of the scan
+        // without a key: the scan just runs until the prefix stops matching.
+        // That is a problem when the NULLs of the range column live on that
+        // side, because the scan would walk into them, and a comparison like
+        // c2<=999 must not return NULL rows. So we add the NULL key on that
+        // side: as a start key it makes the scan begin right after the NULLs,
+        // as an end key it makes the scan stop right before them. Which side
+        // the NULLs live on depends on the column: before all values with
+        // NULLS FIRST, after all values with NULLS LAST.
+        if !has_prefix {
+            return;
+        }
         // 1) Choose a better starting point.
         //
         // Example:
@@ -3452,28 +3451,19 @@ fn build_seek_def(
         // - use start key [c1='a', NULL]
         // - change start op from GE to GT
         // - for backward scans in the symmetric shape, change LE to LT
-        //
-        // We only do this for "< / <=" ranges that do not also have a lower bound.
-        if has_prefix
-            && start_is_prefix_only
-            && end_has_range_component
-            && start_is_forward_ge
-            && has_upper_bound_only
-            && upper_bound_is_lt_or_le
-        {
-            start.last_component = SeekKeyComponent::Null;
-            start.op = SeekOp::GT;
-        } else if has_prefix
-            && start_is_prefix_only
-            && end_has_range_component
-            && start_is_backward_le
-            && has_upper_bound_only
-            && upper_bound_is_lt_or_le
-        {
-            start.last_component = SeekKeyComponent::Null;
-            start.op = SeekOp::LT;
+        if matches!(start.last_component, SeekKeyComponent::None) {
+            match (iter_dir, stored_nulls) {
+                (IterationDirection::Forwards, ast::NullsOrder::First) => {
+                    start.last_component = SeekKeyComponent::Null;
+                    start.op = SeekOp::GT;
+                }
+                (IterationDirection::Backwards, ast::NullsOrder::Last) => {
+                    start.last_component = SeekKeyComponent::Null;
+                    start.op = SeekOp::LT;
+                }
+                _ => {}
+            }
         }
-
         // 2) Choose a better stopping point.
         //
         // Example:
@@ -3485,26 +3475,18 @@ fn build_seek_def(
         // - use stop key [c1='a', NULL]
         // - change end op from GT to GE
         // - for backward scans, change LT to LE
-        //
-        // Same limit as above: only "< / <=" ranges with no lower bound.
-        if has_prefix
-            && end_is_prefix_only
-            && start_has_range_component
-            && end_is_forward_gt
-            && has_upper_bound_only
-            && upper_bound_is_lt_or_le
-        {
-            end.last_component = SeekKeyComponent::Null;
-            end.op = SeekOp::GE { eq_only: false };
-        } else if has_prefix
-            && end_is_prefix_only
-            && start_has_range_component
-            && end_is_backward_lt
-            && has_upper_bound_only
-            && upper_bound_is_lt_or_le
-        {
-            end.last_component = SeekKeyComponent::Null;
-            end.op = SeekOp::LE { eq_only: false };
+        if matches!(end.last_component, SeekKeyComponent::None) {
+            match (iter_dir, stored_nulls) {
+                (IterationDirection::Forwards, ast::NullsOrder::Last) => {
+                    end.last_component = SeekKeyComponent::Null;
+                    end.op = SeekOp::GE { eq_only: false };
+                }
+                (IterationDirection::Backwards, ast::NullsOrder::First) => {
+                    end.last_component = SeekKeyComponent::Null;
+                    end.op = SeekOp::LE { eq_only: false };
+                }
+                _ => {}
+            }
         }
     };
 

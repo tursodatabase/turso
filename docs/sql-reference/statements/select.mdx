@@ -316,20 +316,22 @@ SELECT name, salary * 12 AS annual FROM employees ORDER BY annual DESC;
 
 ### NULLS FIRST / NULLS LAST
 
-Controls where NULL values appear in the sorted result.
+Controls where NULL values appear in the sorted result. NULL sorts as smaller than every other value, so by default NULLs come first in ascending order and last in descending order.
 
 ```sql
--- NULLs at the end (default for ASC is NULLS LAST, for DESC is NULLS FIRST)
+-- Move NULLs to the end (overrides the ASC default of NULLS FIRST)
 SELECT * FROM employees ORDER BY manager_id ASC NULLS LAST;
 
--- NULLs at the beginning
+-- Move NULLs to the beginning (overrides the DESC default of NULLS LAST)
 SELECT * FROM employees ORDER BY manager_id DESC NULLS FIRST;
 ```
 
 | Direction | Default NULL Placement |
 |-----------|----------------------|
-| ASC | NULLS LAST |
-| DESC | NULLS FIRST |
+| ASC | NULLS FIRST |
+| DESC | NULLS LAST |
+
+An index whose columns are declared with a matching NULL placement can return rows in the requested order directly, letting the query skip the sort step. See [NULL ordering in indexes](/docs/sql-reference/statements/create-index#nulls-first-last).
 
 ## LIMIT and OFFSET
 

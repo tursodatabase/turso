@@ -12,9 +12,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
     bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
-use crate::translate::index::{
-    reject_explicit_nulls, resolve_index_method_parameters, resolve_sorted_columns,
-};
+use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
 use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -162,8 +160,8 @@ use std::collections::VecDeque;
 use std::sync::OnceLock;
 use tracing::trace;
 use turso_parser::ast::{
-    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, ResolveType, SortOrder,
-    TableInternalId, TypeOperator,
+    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, NullsOrder, RefAct, ResolveType,
+    SortOrder, TableInternalId, TypeOperator,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -3124,6 +3122,7 @@ pub struct UniqueSetColumn {
     pub name: String,
     pub sort_order: SortOrder,
     pub collation: Option<CollationSeq>,
+    pub nulls_order: Option<NullsOrder>,
 }
 
 #[derive(Clone, Debug)]
@@ -4447,8 +4446,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     if *auto_increment {
                         has_autoincrement = true;
                     }
-                    reject_explicit_nulls(columns)?;
-
                     let mut pk_unique_set_columns = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
                         let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
@@ -4466,6 +4463,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             name: col_name.clone(),
                             sort_order,
                             collation,
+                            nulls_order: column.nulls,
                         })?;
                         primary_key_columns.try_push((col_name, sort_order))?;
                     }
@@ -4479,7 +4477,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     conflict_clause,
                 } = &c.constraint
                 {
-                    reject_explicit_nulls(columns)?;
                     let mut unique_columns = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
                         let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
@@ -4496,6 +4493,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             name: col_name,
                             sort_order: column.order.unwrap_or(SortOrder::Asc),
                             collation,
+                            nulls_order: column.nulls,
                         })?;
                     }
                     let unique_set = UniqueSet {
@@ -4683,6 +4681,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     name: name.clone(),
                                     sort_order: order,
                                     collation: None,
+                                    nulls_order: None,
                                 }]?,
                                 is_primary_key: true,
                                 conflict_clause: *conflict_clause,
@@ -4710,6 +4709,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     name: name.clone(),
                                     sort_order: order,
                                     collation: None,
+                                    nulls_order: None,
                                 }]?,
                                 is_primary_key: false,
                                 conflict_clause: *conflict,
@@ -5674,6 +5674,7 @@ pub struct Index {
 pub struct IndexColumn {
     pub name: String,
     pub order: SortOrder,
+    pub nulls_order: Option<NullsOrder>,
     /// the position of the column in the source table.
     /// for example:
     /// CREATE TABLE t (a,b,c)
@@ -5686,12 +5687,42 @@ pub struct IndexColumn {
     pub expr: Option<Box<Expr>>,
 }
 
+macro_rules! impl_effective_nulls_order {
+    ($ty:ty) => {
+        impl $ty {
+            pub fn effective_nulls_order_when_iterated(
+                &self,
+                iter_dir: $crate::translate::plan::IterationDirection,
+            ) -> turso_parser::ast::NullsOrder {
+                match iter_dir {
+                    $crate::translate::plan::IterationDirection::Forwards => {
+                        self.effective_nulls_order()
+                    }
+                    $crate::translate::plan::IterationDirection::Backwards => {
+                        self.effective_nulls_order().reverse()
+                    }
+                }
+            }
+
+            pub fn effective_nulls_order(&self) -> turso_parser::ast::NullsOrder {
+                self.nulls_order
+                    .unwrap_or_else(|| turso_parser::ast::NullsOrder::default_for(self.order))
+            }
+        }
+    };
+}
+
+pub(crate) use impl_effective_nulls_order;
+
+impl_effective_nulls_order!(IndexColumn);
+
 impl IndexColumn {
     /// Returns a default column with the given name and position.
     pub fn new(name: impl ToString, pos_in_table: usize) -> Self {
         Self {
             name: name.to_string(),
             order: SortOrder::Asc,
+            nulls_order: None,
             pos_in_table,
             collation: None,
             default: None,
@@ -5712,6 +5743,7 @@ impl IndexColumn {
             .map(|(i, name)| Self {
                 name: name.to_string(),
                 order: SortOrder::Asc,
+                nulls_order: None,
                 pos_in_table: i,
                 collation: None,
                 default: None,
@@ -5831,6 +5863,7 @@ impl Index {
                 .push_within_capacity(IndexColumn {
                     name: normalize_ident(col_name),
                     order: *order,
+                    nulls_order: constraint_columns.get(i).and_then(|c| c.nulls_order),
                     pos_in_table,
                     collation: constraint_columns
                         .get(i)
@@ -5884,6 +5917,7 @@ impl Index {
                 .push_within_capacity(IndexColumn {
                     name: normalize_ident(col.name.as_ref().unwrap()),
                     order: *sort_order,
+                    nulls_order: constraint_columns.get(i).and_then(|c| c.nulls_order),
                     pos_in_table,
                     collation: constraint_columns
                         .get(i)
