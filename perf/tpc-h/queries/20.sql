@@ -1,5 +1,4 @@
--- LIMBO_SKIP: query 20 is slow as hell in both Turso and Sqlite
-
+-- SQLITE_SKIP: this query takes more than 30 seconds
 
 select
 	s_name,
