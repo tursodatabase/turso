@@ -135,7 +135,12 @@ pack-nativeaot-static:
 	dotnet pack -c Release ./src/Turso.Data.Sqlite.NativeAot/Turso.Data.Sqlite.NativeAot.csproj -p:NativeAotRid=osx-x64
 	dotnet pack -c Release ./src/Turso.Data.Sqlite.NativeAot/Turso.Data.Sqlite.NativeAot.csproj -p:NativeAotRid=osx-arm64
 
+pack-runtime:
+	dotnet pack -c Release ./src/Turso.Raw/Turso.Raw.csproj
+	dotnet pack -c Release ./src/Turso.Data/Turso.Data.csproj
+
 pack:
+	$(MAKE) pack-runtime
 	dotnet pack -c Release ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
 	dotnet pack -c Release ./src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj
 	$(MAKE) pack-nativeaot-static

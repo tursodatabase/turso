@@ -8,7 +8,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>Turso.Data.Sqlite</RootNamespace>
 
-    <PackageId>Turso.Data.Sqlite</PackageId>
+    <PackageId>Turso.Data.Sqlite.Provider</PackageId>
     <Title>Turso SQLite-compatible ADO.NET Provider</Title>
     <Description>SQLite-compatible ADO.NET facade for Turso, intended to ease migration from Microsoft.Data.Sqlite.</Description>
     <Authors>Turso authors</Authors>
@@ -20,18 +20,14 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);1591</NoWarn>
-    <RequireNativeAssetsForPack>true</RequireNativeAssetsForPack>
-    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);AddProjectReferencesToPackage</TargetsForTfmSpecificBuildOutput>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\Turso.Raw\Turso.Raw.csproj" PrivateAssets="all" />
-    <ProjectReference Include="..\Turso.Data\Turso.Data.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\Turso.Data\Turso.Data.csproj" />
   </ItemGroup>
 
   <ItemGroup>
     <None Include="..\..\Readme.md" Pack="true" PackagePath="README.md" />
-    <None Include="buildTransitive\Turso.Data.Sqlite.targets" Pack="true" PackagePath="buildTransitive\Turso.Data.Sqlite.targets" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(Configuration)'=='Release'">
@@ -232,42 +228,10 @@
     </None>
   </ItemGroup>
 
-  <Target Name="AddProjectReferencesToPackage">
-    <ItemGroup>
-      <BuildOutputInPackage Include="$(OutputPath)Turso.Raw.dll"
-                            Condition="Exists('$(OutputPath)Turso.Raw.dll')" />
-      <BuildOutputInPackage Include="$(OutputPath)Turso.Raw.xml"
-                            Condition="Exists('$(OutputPath)Turso.Raw.xml')" />
-      <BuildOutputInPackage Include="$(OutputPath)Turso.Data.dll"
-                            Condition="Exists('$(OutputPath)Turso.Data.dll')" />
-      <BuildOutputInPackage Include="$(OutputPath)Turso.Data.xml"
-                            Condition="Exists('$(OutputPath)Turso.Data.xml')" />
-    </ItemGroup>
-  </Target>
+  <ItemGroup>
+    <None Update="..\..\rs_compiled\**\*">
+      <Pack>false</Pack>
+    </None>
+  </ItemGroup>
 
-  <Target Name="ValidateNativeAssetsForPack" BeforeTargets="Pack"
-          Condition="'$(Configuration)'=='Release' and '$(RequireNativeAssetsForPack)'=='true'">
-    <Error Condition="!Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release\turso_sdk_kit.dll') and !Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release-official\turso_sdk_kit.dll')"
-           Text="Missing win-x64 native asset. Build turso_sdk_kit.dll before packing Turso.Data.Sqlite." />
-    <Error Condition="!Exists('..\..\rs_compiled\aarch64-pc-windows-msvc\release\turso_sdk_kit.dll') and !Exists('..\..\rs_compiled\aarch64-pc-windows-msvc\release-official\turso_sdk_kit.dll')"
-           Text="Missing win-arm64 native asset. Build turso_sdk_kit.dll before packing Turso.Data.Sqlite." />
-    <Error Condition="!Exists('..\..\rs_compiled\x86_64-unknown-linux-gnu\release\libturso_sdk_kit.so') and !Exists('..\..\rs_compiled\x86_64-unknown-linux-gnu\release-official\libturso_sdk_kit.so')"
-           Text="Missing linux-x64 native asset. Build libturso_sdk_kit.so before packing Turso.Data.Sqlite." />
-    <Error Condition="!Exists('..\..\rs_compiled\aarch64-unknown-linux-gnu\release\libturso_sdk_kit.so') and !Exists('..\..\rs_compiled\aarch64-unknown-linux-gnu\release-official\libturso_sdk_kit.so')"
-           Text="Missing linux-arm64 native asset. Build libturso_sdk_kit.so before packing Turso.Data.Sqlite." />
-    <Error Condition="!Exists('..\..\rs_compiled\aarch64-linux-android\release\libturso_sdk_kit.so') and !Exists('..\..\rs_compiled\aarch64-linux-android\release-official\libturso_sdk_kit.so')"
-           Text="Missing android-arm64 native asset. Build libturso_sdk_kit.so before packing Turso.Data.Sqlite." />
-    <Error Condition="!Exists('..\..\rs_compiled\armv7-linux-androideabi\release\libturso_sdk_kit.so') and !Exists('..\..\rs_compiled\armv7-linux-androideabi\release-official\libturso_sdk_kit.so')"
-           Text="Missing android-arm native asset. Build libturso_sdk_kit.so before packing Turso.Data.Sqlite." />
-    <Error Condition="!Exists('..\..\rs_compiled\x86_64-linux-android\release\libturso_sdk_kit.so') and !Exists('..\..\rs_compiled\x86_64-linux-android\release-official\libturso_sdk_kit.so')"
-           Text="Missing android-x64 native asset. Build libturso_sdk_kit.so before packing Turso.Data.Sqlite." />
-    <Error Condition="!Exists('..\..\rs_compiled\i686-linux-android\release\libturso_sdk_kit.so') and !Exists('..\..\rs_compiled\i686-linux-android\release-official\libturso_sdk_kit.so')"
-           Text="Missing android-x86 native asset. Build libturso_sdk_kit.so before packing Turso.Data.Sqlite." />
-    <Error Condition="!Exists('..\..\rs_compiled\x86_64-apple-darwin\release\libturso_sdk_kit.dylib') and !Exists('..\..\rs_compiled\x86_64-apple-darwin\release-official\libturso_sdk_kit.dylib')"
-           Text="Missing osx-x64 native asset. Build libturso_sdk_kit.dylib before packing Turso.Data.Sqlite." />
-    <Error Condition="!Exists('..\..\rs_compiled\aarch64-apple-darwin\release\libturso_sdk_kit.dylib') and !Exists('..\..\rs_compiled\aarch64-apple-darwin\release-official\libturso_sdk_kit.dylib')"
-           Text="Missing osx-arm64 native asset. Build libturso_sdk_kit.dylib before packing Turso.Data.Sqlite." />
-    <Error Condition="!Exists('..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\Info.plist')"
-           Text="Missing iOS framework asset. Build libturso_sdk_kit.xcframework before packing Turso.Data.Sqlite." />
-  </Target>
 </Project>
