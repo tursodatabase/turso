@@ -1852,13 +1852,13 @@ enum ColumnFetch<'a> {
 
 impl ColumnFetch<'_> {
     /// Writes NULL to every destination register of this fetch.
-    fn set_null_dests(&self, state: &mut ProgramState) {
+    fn write_null_regs(&self, state: &mut ProgramState) {
         match *self {
             ColumnFetch::Single { dest, .. } => state.registers[dest].set_null(),
             ColumnFetch::Range { dest, defaults, .. } => {
-                for reg in &mut state.registers[dest..dest + defaults.len()] {
-                    reg.set_null();
-                }
+                state.registers[dest..dest + defaults.len()]
+                    .iter_mut()
+                    .for_each(|reg| reg.set_null());
             }
         }
     }
@@ -1884,8 +1884,6 @@ impl ColumnFetch<'_> {
     }
 }
 
-/// Shared driver for Column and ColumnRange: resolves any pending deferred
-/// seek through the resumable `OpColumnState` machine, then runs the fetch.
 #[inline(always)]
 fn op_column_impl(
     program: &Program,
@@ -1928,7 +1926,7 @@ fn op_column_impl(
                         _ => panic!("unexpected cursor type"),
                     }
                 }) else {
-                    fetch.set_null_dests(state);
+                    fetch.write_null_regs(state);
                     break 'outer;
                 };
                 *state.active_op_state.column() = OpColumnState::Seek {
@@ -1979,9 +1977,7 @@ fn op_column_impl(
     Ok(InsnFunctionStepResult::Step)
 }
 
-/// Fetches one column of the cursor's current row into a register. Returns
-/// `Step` on completion; any IO is propagated without persisting state, so
-/// callers can safely re-invoke after the completion finishes.
+/// Fetches one column of the cursor's current row into a register.
 fn op_column_fetch(
     program: &Program,
     state: &mut ProgramState,
@@ -2054,7 +2050,6 @@ fn op_column_fetch(
                 };
             };
 
-            // DEFAULT handling
             apply_column_default(default, &mut state.registers[dest])?;
         }
         CursorType::Sorter => {
@@ -2124,9 +2119,6 @@ fn op_column_fetch(
     Ok(InsnFunctionStepResult::Step)
 }
 
-/// Applies a Column default to the register of a column missing from a short
-/// record: the default value when present, NULL otherwise. Reuses the
-/// register's existing TEXT/BLOB allocation like the record decode path does.
 fn apply_column_default(default: &Option<Value>, reg: &mut Register) -> Result<()> {
     let Some(default) = default else {
         reg.set_null();
@@ -2146,13 +2138,6 @@ fn apply_column_default(default: &Option<Value>, reg: &mut Register) -> Result<(
     Ok(())
 }
 
-/// Fetches `defaults.len()` consecutive columns of the cursor's current row
-/// into consecutive registers starting at `dest`, walking the record header
-/// exactly once. Returns `Step` on completion; any IO is propagated without
-/// persisting state, so callers can safely re-invoke after the completion
-/// finishes (destination registers written before a yield are rewritten with
-/// identical values on re-entry, since the cursor does not move within one
-/// instruction).
 fn op_column_range_fetch(
     program: &Program,
     state: &mut ProgramState,
@@ -2163,6 +2148,8 @@ fn op_column_range_fetch(
 ) -> Result<InsnFunctionStepResult> {
     let count = defaults.len();
 
+    //TODO bail out here, this should never be emitted.
+    
     // MaterializedView cursors (and any other cursor kind that reads columns
     // through its own column-at-a-time API) get the single-column fetch per
     // column. Emission never fuses those cursors, so this is a correctness
