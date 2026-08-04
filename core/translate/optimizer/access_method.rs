@@ -1145,7 +1145,7 @@ pub fn try_hash_join_access_method(
     probe_table_idx: usize,
     build_constraints: &TableConstraints,
     probe_constraints: &TableConstraints,
-    where_clause: &mut [WhereTerm],
+    where_clause: &[WhereTerm],
     build_cardinality: f64,
     probe_cardinality: f64,
     probe_multiplier: f64,
