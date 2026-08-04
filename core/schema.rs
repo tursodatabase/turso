@@ -6017,24 +6017,70 @@ impl Index {
         ok
     }
 
+    /// Bind a copy of this index's WHERE clause against the given table references.
+    ///
+    /// Returns `Ok(None)` when the index has no WHERE clause. Binding errors are
+    /// propagated, never swallowed: callers must not treat `None` as "binding failed".
+    ///
+    /// The predicate may qualify columns with the table's real name
+    /// (e.g. `CREATE INDEX i ON t(a) WHERE t.b > 0`), while the DML statement
+    /// may refer to that table only under an alias (e.g. `UPDATE t AS z ...`).
+    /// Rewrite such qualifiers to the identifier the statement uses, so the
+    /// predicate always resolves against the index's own table, like in SQLite.
     pub fn bind_where_expr(
         &self,
         table_refs: Option<&mut TableReferences>,
         resolver: &Resolver,
-    ) -> Option<ast::Expr> {
+    ) -> crate::Result<Option<ast::Expr>> {
         let Some(where_clause) = &self.where_clause else {
-            return None;
+            return Ok(None);
         };
         let mut expr = where_clause.clone();
+        let target_identifier = table_refs.as_deref().and_then(|refs| {
+            // Only a real b-tree table can be the DML target that owns this index.
+            // A CTE or subquery sharing the table's name (e.g. `WITH t AS ...
+            // UPDATE t ...`) must not be picked, so match on b-tree identity.
+            let mut matches = refs
+                .joined_tables()
+                .iter()
+                .map(|jt| (&jt.identifier, &jt.table))
+                .chain(
+                    refs.outer_query_refs()
+                        .iter()
+                        .map(|r| (&r.identifier, &r.table)),
+                )
+                .filter(|(_, table)| {
+                    table
+                        .btree()
+                        .is_some_and(|bt| normalize_ident(&bt.name) == self.table_name)
+                })
+                .map(|(identifier, _)| identifier);
+            let target = matches.next().cloned();
+            assert!(
+                matches.next().is_none(),
+                "multiple table references match the table of partial index {}",
+                self.name
+            );
+            target
+        });
+        if let Some(identifier) = target_identifier {
+            walk_expr_mut(&mut expr, &mut |e: &mut Expr| {
+                if let Expr::Qualified(ns, _) | Expr::DoublyQualified(_, ns, _) = e {
+                    if normalize_ident(ns.as_str()) == self.table_name {
+                        *ns = Name::exact(identifier.clone());
+                    }
+                }
+                Ok(WalkControl::Continue)
+            })?;
+        }
         bind_and_rewrite_expr(
             &mut expr,
             table_refs,
             None,
             resolver,
             BindingBehavior::ResultColumnsNotAllowed,
-        )
-        .ok()?;
-        Some(*expr)
+        )?;
+        Ok(Some(*expr))
     }
 }
 

@@ -1782,8 +1782,8 @@ fn emit_update_insns<'a>(
             // This means that we need to bind the column references to a copy of the index Expr,
             // so we can emit Insn::Column instructions and refer to the old values.
             let where_clause = index
-                .bind_where_expr(Some(table_references), resolver)
-                .expect("where clause to exist");
+                .bind_where_expr(Some(table_references), resolver)?
+                .expect("index.where_clause was checked to be Some above");
             let old_satisfied_reg = program.alloc_register();
             translate_expr_no_constant_opt(
                 program,

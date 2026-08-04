@@ -1466,3 +1466,87 @@ expect {
 snapshot-eqp partial-index-multi-index-or-rejects-unproven-partial-index-eqp {
     SELECT a, b, c FROM indexed_items WHERE a = 2 OR c = 3 ORDER BY b, c;
 }
+
+setup partial_index_qualified_where_alias_schema {
+    CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INTEGER, active INTEGER);
+    CREATE INDEX idx_active_amount ON orders(amount) WHERE orders.active = 1;
+    INSERT INTO orders VALUES (1, 10, 1), (2, 20, 0), (3, 30, 1);
+}
+
+@setup partial_index_qualified_where_alias_schema
+@cross-check-integrity
+test partial-index-qualified-where-update-aliased-table {
+    UPDATE orders AS o SET amount = amount + 100;
+    SELECT id, amount, active FROM orders ORDER BY id;
+}
+expect {
+    1|110|1
+    2|120|0
+    3|130|1
+}
+
+@setup partial_index_qualified_where_alias_schema
+@cross-check-integrity
+test partial-index-qualified-where-update-aliased-table-moves-rows-in-and-out-of-index {
+    UPDATE orders AS o SET active = 1 - active;
+    SELECT id, amount, active FROM orders ORDER BY id;
+}
+expect {
+    1|10|0
+    2|20|1
+    3|30|0
+}
+
+@setup partial_index_qualified_where_alias_schema
+@cross-check-integrity
+test partial-index-qualified-where-delete-from-aliased-table {
+    DELETE FROM orders AS o WHERE o.amount > 15;
+    SELECT id, amount, active FROM orders ORDER BY id;
+}
+expect {
+    1|10|1
+}
+
+@cross-check-integrity
+test partial-index-qualified-where-update-from-with-aliased-target {
+    CREATE TABLE src_totals (a INTEGER, b INTEGER);
+    CREATE TABLE deltas (a INTEGER, b INTEGER);
+    CREATE INDEX src_totals_positive_b ON src_totals(a) WHERE src_totals.b > 0;
+    INSERT INTO src_totals VALUES (1, 1), (2, 5), (3, 1);
+    INSERT INTO deltas VALUES (1, 100), (3, 100);
+    UPDATE src_totals AS z SET b = -z.b FROM deltas WHERE z.a = deltas.a;
+    SELECT a, b FROM src_totals ORDER BY a;
+    SELECT a FROM src_totals INDEXED BY src_totals_positive_b WHERE a > -1000 AND b > 0 ORDER BY a;
+}
+expect {
+    1|-1
+    2|5
+    3|-1
+    2
+}
+
+@cross-check-integrity
+test partial-index-qualified-where-upsert-with-aliased-target {
+    CREATE TABLE v (k INTEGER PRIMARY KEY, c INTEGER, d INTEGER);
+    CREATE INDEX v_positive_d ON v(c) WHERE v.d > 0;
+    INSERT INTO v VALUES (1, 10, 1);
+    INSERT INTO v AS z VALUES (1, 20, -1) ON CONFLICT(k) DO UPDATE SET d = -5;
+    SELECT k, c, d FROM v ORDER BY k;
+    SELECT count(*) FROM v INDEXED BY v_positive_d WHERE c > -1000 AND d > 0;
+}
+expect {
+    1|10|-5
+    0
+}
+
+@cross-check-integrity
+test partial-index-qualified-where-update-with-cte-named-like-target {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    CREATE INDEX t_positive_b ON t(a) WHERE t.b > 0;
+    INSERT INTO t VALUES (1, 1);
+    WITH t(x) AS (SELECT 2) UPDATE t SET a = 5 WHERE b > 0;
+    SELECT a, b FROM t;
+}
+expect {
+    5|1
+}
