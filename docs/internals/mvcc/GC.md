@@ -66,8 +66,8 @@ Two hazards follow from this:
   data loss — the superseded version's `end` timestamp still invalidates the
   B-tree row, but there's no MVCC version to serve reads.
 
-These are guarded by Rule 2's tombstone guard and Rule 3's sole-survivor
-condition respectively.
+These are guarded by Rule 2's tombstone guard and Rule 3's
+`drop_current_if_in_btree` gate respectively.
 
 ## Rule Details
 
@@ -88,12 +88,16 @@ thing hiding a stale B-tree row. Removal is only safe when:
 Pending inserts (`begin=TxID`) do not count as committed current — they might
 roll back.
 
-### Rule 3: Sole Survivor
+### Rule 3: Drop current if already in B-tree
 
 A current version is redundant with the B-tree when `b ≤ ckpt_max` and
-`b < lwm`. But we only remove it when it's the **sole** remaining version in
-the chain. If superseded versions remain, removing the current version would
-leave orphaned invalidators that hide the B-tree row without providing data.
+`b < lwm`. We only remove it when it is the **last** version in the chain —
+otherwise superseded versions would hide the B-tree row without providing data.
+
+`drop_current_if_in_btree` controls whether Rule 3 runs:
+- **true** on blocking Truncate (B-trees are stable under the checkpoint lock)
+- **false** on all Passive paths, including Finalize — dropping currents lets
+  dual-cursor fall through while table/index SkipMap coverage can disagree
 
 Rule 3 also guards recovery versions: `b=0` versions are protected by
 requiring `ckpt_max > 0` (see Recovery below).
@@ -118,29 +122,22 @@ The recovery transaction itself is removed from `txs` at the end of
 
 ## SkipMap Entry Removal
 
-After GC empties a version chain, the SkipMap entry is handled differently
-depending on the GC path:
-
-- **Blocking Truncate checkpoint** (`drop_unused_row_versions_and_slots` /
-  `gc_checkpointed_*` under the blocking lock): removes empty entries.
-- **Passive checkpoint / background GC**: leaves empty entries in place (lazy
-  removal). This avoids a TOCTOU race with concurrent writers. Empty entries are
-  reused by `get_or_insert_with` on subsequent inserts, and cleaned up by a later
-  blocking Truncate.
+Truncate Finalize `_and_slots` unlinks empty SkipMap entries and may drop last
+currents already in the B-tree. Passive Finalize `unlink_empty` unlinks empty
+slots but **keeps** currents. Write-set GC and
+`purge_row_versions_during_checkpoint` leave empty slots so row ids in the
+write set still resolve. Writers retry via `*_still_mapped` if an Arc was
+unlinked; index unlink bumps `index_rows_epoch`.
 
 ### Passive `backfill_floor` publication
 
-Passive GC Rules 2/3 reclaim a materialized version only once
-`materialized_at <= backfill_floor`, where `backfill_floor` tracks the shared WAL
-`nbackfills` published after frames are copied into the DB file (and synced,
-unless `synchronous=off`). MVCC drives `wal.checkpoint` directly, so it must
-call `wal.publish_backfill` after that sync — the same step the pager's
-`PublishBackfill` phase performs. Without it, `nbackfills` stays at 0, Passive GC
-never reclaims stamped chains, and the SkipMap grows without bound.
+Passive Rule 2 needs `materialized_at <= backfill_floor` (`nbackfills`). After
+`wal.checkpoint` + DB sync, MVCC calls `wal.publish_backfill` and keeps the
+checkpoint guard until Finalize. On Passive `Busy`, finish without advancing
+`nbackfills`.
 
-When Passive WAL backfill returns `Busy` (a DbFile reader holds read-mark 0),
-MVCC still finishes publish + logical-log truncate and leaves `nbackfills`
-unchanged so the GC floor stays honest.
+Rule 3 (`drop_current_if_in_btree`) is on for Truncate and off for all Passive
+GC paths, including Finalize.
 
 ## Non-blocking Checkpoint Readiness
 
@@ -148,16 +145,13 @@ The GC rules are designed to work with both blocking and non-blocking
 checkpoints — the LWM parameter naturally constrains what can be collected
 when readers coexist with the checkpoint.
 
-**What works today**: all four GC rules, LWM computation, recovery version
-protection, tombstone guard, lazy removal in background GC.
+**What works today**: all four GC rules, LWM, recovery protection, tombstone
+guard, under-lock empty-slot drain with writer retry.
 
 **What needs work for non-blocking checkpoint**:
 
-- **Checkpoint-time entry removal**: the re-check-under-lock pattern in
-  `gc_checkpointed_versions` has a TOCTOU gap. Under non-blocking checkpoint,
-  concurrent writers could lose inserted versions. Fix: either hold the write
-  lock across the emptiness check and `remove()`, or switch to lazy removal
-  (same as background GC).
+- More soak / concurrent-simulator coverage of Passive GC racing writers on
+  empty-slot drain.
 
 ## Key Files
 
