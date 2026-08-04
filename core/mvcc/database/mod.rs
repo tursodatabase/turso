@@ -7209,26 +7209,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.drop_unused_row_versions_inner(true, true, WalPos::STAGED)
     }
 
-    /// Passive Finalize: reclaim history and unlink empty SkipMap slots, but keep
-    /// last currents (Rule 3 stays off — see the module doc comment on why Passive
-    /// cannot safely drop a chain's only remaining version).
-    ///
-    /// `reader_mark_floor` must be the *pager-level* reader floor
-    /// ([`crate::mvcc::database::checkpoint_state_machine::CheckpointStateMachine::gc_floor_reader_mark`]),
-    /// not just [`Self::compute_min_reader_mark`]. A reader that has pinned a WAL
-    /// read frame via `Pager::begin_read_tx` but has not yet published its MVCC
-    /// transaction into `self.txs` (the begin-tx publish window) is invisible to
-    /// `compute_min_reader_mark` alone; without the pager floor Rule 2 could reclaim
-    /// a superseded version this reader still needs.
+    /// Drop old versions and empty SkipMap slots, but keep the latest copy of each
+    /// row (Rule 3 off). Passive Finalize uses this. `reader_mark_floor` should
+    /// include pager-held readers, not only `txs`.
     pub fn drop_unused_row_versions_unlink_empty_at(&self, reader_mark_floor: WalPos) -> usize {
         self.drop_unused_row_versions_inner(true, false, reader_mark_floor)
-    }
-
-    /// Passive Finalize: reclaim history, unlink empty SkipMap slots, **and** drop last
-    /// currents already in the B-tree (Rule 3 ON). Uses pager `reader_mark_floor` so
-    /// Rule 2 respects begin-tx publish-window readers.
-    pub fn drop_unused_row_versions_and_slots_passive(&self, reader_mark_floor: WalPos) -> usize {
-        self.drop_unused_row_versions_inner(true, true, reader_mark_floor)
     }
 
     /// Incremental GC on the commit path: reclaim up to `max_chains` table chains
@@ -7640,44 +7625,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ///
     /// Rule 1: aborted garbage (begin=None, end=None) — always remove.
     /// Rule 2: superseded (end=Timestamp(e)) — remove once no reader can see it,
-    ///         unless it's a tombstone (no committed current version) whose
-    ///         deletion hasn't been checkpointed, or a B-tree-resident version
-    ///         (flagged, or with a checkpointed insert: begin <= ckpt_max)
-    ///         whose physical delete/overwrite hasn't been checkpointed.
-    /// Rule 3: last remaining current version (end=None) — remove only when
+    ///         unless it's a tombstone (no committed current) whose delete isn't
+    ///         checkpointed yet, or a B-tree-resident version whose physical
+    ///         delete/overwrite hasn't been checkpointed.
+    /// Rule 3: last remaining current (end=None) — remove only when
     ///         `drop_current_if_in_btree` is true and the B-tree already has it.
     ///
     /// Passive gates Rule 2 on `materialized_at` + `min_reader_mark`. Blocking
     /// Truncate uses `ckpt_max` instead.
     ///
-    /// `drop_current_if_in_btree` (Rule 3) is true only for **blocking Truncate**
-    /// (Finalize / incremental), never for any Passive path (Finalize, mid-Passive
-    /// write-set, incremental). This is not a narrower "table vs index can briefly
-    /// disagree" problem — it holds even for a single table with no index. Once Rule
-    /// 3 empties a chain's slot, the dual cursor's fallback for "no SkipMap entry"
-    /// (`query_btree_version_is_valid` / `index_chain_invalidates_btree`) trusts the
-    /// physical B-tree unconditionally, with no per-reader check at all: `read_mark`
-    /// is a logical bookkeeping timestamp, not an actual pin on the underlying page
-    /// read (`MvStore::begin_tx` only records `WalPos::from_pair(pager.wal_pos())`,
-    /// it never calls `Pager::begin_read_tx`). So if any later, unrelated commit
-    /// updates that same row and gets checkpointed again — trivial under Passive's
-    /// auto-checkpoint-per-commit — a reader whose transaction is still open from
-    /// before that commit sees the new, not-yet-visible value: a snapshot-isolation
-    /// violation, proven with a single table and no index
-    /// (`passive_reader_snapshot_survives_later_write_after_row_versions_gc`).
-    ///
-    /// Blocking Truncate does not have this hole because acquiring
-    /// `blocking_checkpoint_lock` for write (`CheckpointState::AcquireLock`) cannot
-    /// succeed while any MVCC transaction is open (`begin_tx` holds it for read for
-    /// the transaction's entire lifetime): every reader that could have relied on a
-    /// just-dropped current's B-tree-equivalent value has already finished before
-    /// this checkpoint's writes land, so no reader is ever exposed to a later
-    /// physical overwrite of that row. Passive intentionally never takes that lock
-    /// around its write phase (that exclusion is exactly the throughput it exists to
-    /// avoid), so it cannot inherit this guarantee. Enabling Rule 3 for Passive would
-    /// need either real page-level MVCC (so "trust the B-tree" is actually isolated
-    /// per reader) or serializing Passive's B-tree writes against active readers for
-    /// rows with an empty chain — both larger changes than this GC pass.
+    /// Leaving Rule 3 off keeps a SkipMap copy so an older reader cannot fall
+    /// through to a B-tree page a later checkpoint already rewrote. Truncate can
+    /// turn it on under the blocking lock (no open MVCC txs). Callers set
+    /// `drop_current_if_in_btree` when they want Rule 3.
     fn gc_version_chain(
         versions: &mut RowVersionChain<A>,
         lwm: u64,
