@@ -3765,6 +3765,7 @@ mod tests {
             true,
             DoubleQuotedDml::Enabled,
             crate::sync::Arc::new(crate::dialect::SqliteDialect),
+            &None,
         )
     }
 

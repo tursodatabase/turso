@@ -4448,12 +4448,71 @@ fn pg_fk_action_to_string(action: &str) -> Option<String> {
     }
 }
 
-/// Deparse a simple default expression from PG protobuf into a SQL string.
-/// Only handles simple literals for now.
-/// Extracted SET statement: `SET name = value`
+/// Represents a parsed SET statement from the PostgreSQL protocol.
 pub struct PgSetStmt {
     pub name: String,
-    pub value: String,
+    pub values: Vec<PgSetValue>,
+}
+
+#[derive(Clone)]
+pub enum PgSetValue {
+    Identifier(String),
+    StringLiteral(String),
+    Number(String),
+    Bool(bool),
+    RawSql(String),
+    Null,
+}
+
+impl PgSetValue {
+    fn from_node(node: &pg_query::protobuf::Node) -> Option<Self> {
+        use pg_query::protobuf::{a_const::Val, node::Node};
+
+        match &node.node {
+            Some(Node::Integer(i)) => Some(Self::Number(i.ival.to_string())),
+            Some(Node::Float(f)) => Some(Self::Number(f.fval.clone())),
+            Some(Node::String(s)) => Some(Self::Identifier(s.sval.clone())),
+            Some(Node::AConst(a_const)) => {
+                if a_const.isnull {
+                    return Some(Self::Null);
+                }
+
+                match a_const.val.as_ref()? {
+                    Val::Ival(i) => Some(Self::Number(i.ival.to_string())),
+                    Val::Fval(f) => Some(Self::Number(f.fval.clone())),
+                    Val::Sval(s) => Some(Self::StringLiteral(s.sval.clone())),
+                    Val::Boolval(b) => Some(Self::Bool(b.boolval)),
+                    Val::Bsval(_) => deparse_default_expr(node).map(Self::RawSql),
+                }
+            }
+            _ => deparse_default_expr(node).map(Self::RawSql),
+        }
+    }
+
+    pub fn to_sql_string(&self) -> String {
+        match self {
+            PgSetValue::Identifier(value) => value.clone(),
+            PgSetValue::StringLiteral(value) => format!("'{}'", value.replace('\'', "''")),
+            PgSetValue::Number(value) => value.clone(),
+            PgSetValue::Bool(value) => {
+                if *value {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }
+            }
+            PgSetValue::Null => "NULL".to_string(),
+            PgSetValue::RawSql(value) => value.clone(),
+        }
+    }
+
+    pub fn as_search_path_name(&self) -> Option<&str> {
+        match self {
+            PgSetValue::Identifier(value) => Some(value),
+            PgSetValue::StringLiteral(value) => Some(value),
+            _ => None,
+        }
+    }
 }
 
 /// Extracted SHOW statement: `SHOW name`
@@ -4482,11 +4541,15 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
     }
 
     // Extract the value from args
-    let value = set_stmt.args.first().and_then(deparse_default_expr)?;
+    let values = set_stmt
+        .args
+        .iter()
+        .map(PgSetValue::from_node)
+        .collect::<Option<Vec<_>>>()?;
 
     Some(PgSetStmt {
         name: set_stmt.name.clone(),
-        value,
+        values,
     })
 }
 

@@ -8,11 +8,11 @@ Sorted by implementation difficulty.
 2. **PREPARE / EXECUTE / DEALLOCATE** — wire protocol already handles this; just need the SQL syntax to not error
 3. **GRANT/REVOKE** — parse + ignore (single-user system, just don't error)
 4. **More PG system functions** — still missing: `current_setting`, `current_schemas(bool)`, a real `pg_get_expr` (currently a NULL stub), and the regexp functions (`extensions/regexp` is not linked into tursopg); session information functions and the `string_agg` family already resolve
-5. **SET search_path** — intercept in try_prepare_pg, store on connection, use in table resolution
-
+5. ~~**SET search_path**~~ — intercept in try_prepare_pg, store on connection, use in table resolution
+∑
 ## Easy (a day or two)
 
-6. ~~**CREATE TABLE AS / SELECT INTO**~~ — DONE (translates to `CREATE TABLE ... AS SELECT`; WITH NO DATA supported, explicit column list rejected)
+6. **CREATE TABLE AS / SELECT INTO** — translate to `CREATE TABLE ... AS SELECT` which Turso already supports
 7. **ALTER COLUMN SET/DROP DEFAULT, SET/DROP NOT NULL** — Turso's ALTER TABLE is limited but these map to SQLite operations
 8. **CONCURRENTLY on CREATE INDEX** — just ignore the keyword (SQLite doesn't do concurrent DDL anyway)
 9. **COPY ... FROM/TO with simple CSV** — implement as INSERT loop or SELECT output (not the wire protocol COPY)

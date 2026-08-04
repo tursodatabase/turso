@@ -110,7 +110,7 @@ use tracing::instrument;
 use turso_macros::AtomicEnum;
 use turso_parser::{ast, ast::Cmd};
 
-pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
+pub use connection::{resolve_ext_path, Connection, PrepareOptions, Row, StepResult, SymbolTable};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 #[cfg(feature = "simulator")]
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};
