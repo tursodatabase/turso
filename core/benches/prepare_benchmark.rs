@@ -15,7 +15,7 @@
 //! Run with:
 //!   cargo bench --bench prepare_benchmark
 
-use divan::{black_box, AllocProfiler, Bencher};
+use divan::{AllocProfiler, Bencher, black_box};
 use mimalloc::MiMalloc;
 use std::sync::Arc;
 use turso_core::{Connection, Database, MemoryIO, SqliteDialect, StepResult};
@@ -25,7 +25,12 @@ static ALLOC: AllocProfiler<MiMalloc> = AllocProfiler::new(MiMalloc);
 
 #[cfg(not(feature = "codspeed"))]
 fn main() {
-    divan::Divan::default().sample_count(50).main();
+    // config_with_args() applies CLI filters and flags on top of the defaults;
+    // without it every command-line argument is silently ignored.
+    divan::Divan::default()
+        .sample_count(50)
+        .config_with_args()
+        .main();
 }
 
 #[cfg(feature = "codspeed")]
