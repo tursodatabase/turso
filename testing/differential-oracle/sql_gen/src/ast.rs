@@ -1651,6 +1651,7 @@ impl Expr {
         args: Vec<Expr>,
         partition_by: Vec<Expr>,
         order_by: Vec<(Expr, OrderDirection)>,
+        frame: Option<WindowFrame>,
     ) -> Self {
         ctx.record(ExprKind::WindowFunction);
         Expr::WindowFunction(Box::new(WindowFunctionExpr {
@@ -1658,6 +1659,7 @@ impl Expr {
             args,
             partition_by,
             order_by,
+            frame,
         }))
     }
 
@@ -2068,11 +2070,86 @@ pub struct InSubqueryExpr {
 // Stub expression types (not yet generated)
 // =============================================================================
 
-/// A window function expression: `func(args) OVER (PARTITION BY ... ORDER BY ...)`.
-///
-/// Restricted to the planner-coerced frame set — no user-specified
-/// `ROWS`/`RANGE`/`GROUPS` clauses or `EXCLUDE` clauses, matching what
-/// the engine currently accepts.
+/// Window frame mode emitted by the SQL generator.
+#[derive(Debug, Clone, Copy)]
+pub enum WindowFrameMode {
+    Rows,
+    Groups,
+    Range,
+}
+
+impl fmt::Display for WindowFrameMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rows => write!(f, "ROWS"),
+            Self::Groups => write!(f, "GROUPS"),
+            Self::Range => write!(f, "RANGE"),
+        }
+    }
+}
+
+/// One boundary of a generated window frame.
+#[derive(Debug, Clone, Copy)]
+pub enum WindowFrameBoundary {
+    UnboundedPreceding,
+    Preceding(u64),
+    CurrentRow,
+    Following(u64),
+    UnboundedFollowing,
+}
+
+impl fmt::Display for WindowFrameBoundary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnboundedPreceding => write!(f, "UNBOUNDED PRECEDING"),
+            Self::Preceding(offset) => write!(f, "{offset} PRECEDING"),
+            Self::CurrentRow => write!(f, "CURRENT ROW"),
+            Self::Following(offset) => write!(f, "{offset} FOLLOWING"),
+            Self::UnboundedFollowing => write!(f, "UNBOUNDED FOLLOWING"),
+        }
+    }
+}
+
+/// Rows omitted from a generated window frame before aggregate evaluation.
+#[derive(Debug, Clone, Copy)]
+pub enum WindowFrameExclude {
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
+}
+
+impl fmt::Display for WindowFrameExclude {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoOthers => write!(f, "NO OTHERS"),
+            Self::CurrentRow => write!(f, "CURRENT ROW"),
+            Self::Group => write!(f, "GROUP"),
+            Self::Ties => write!(f, "TIES"),
+        }
+    }
+}
+
+/// A generated `ROWS`/`GROUPS`/`RANGE BETWEEN ... AND ...` clause.
+#[derive(Debug, Clone, Copy)]
+pub struct WindowFrame {
+    pub mode: WindowFrameMode,
+    pub start: WindowFrameBoundary,
+    pub end: WindowFrameBoundary,
+    pub exclude: Option<WindowFrameExclude>,
+}
+
+impl fmt::Display for WindowFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} BETWEEN {} AND {}", self.mode, self.start, self.end)?;
+        if let Some(exclude) = self.exclude {
+            write!(f, " EXCLUDE {exclude}")?;
+        }
+        Ok(())
+    }
+}
+
+/// A window function expression: `func(args) OVER (...)`.
 #[derive(Debug, Clone)]
 pub struct WindowFunctionExpr {
     pub name: String,
@@ -2081,6 +2158,8 @@ pub struct WindowFunctionExpr {
     pub partition_by: Vec<Expr>,
     /// Optional list of order-by expressions with direction.
     pub order_by: Vec<(Expr, OrderDirection)>,
+    /// Optional explicit frame clause.
+    pub frame: Option<WindowFrame>,
 }
 
 impl fmt::Display for WindowFunctionExpr {
@@ -2115,6 +2194,13 @@ impl fmt::Display for WindowFunctionExpr {
                 }
                 write!(f, "{e} {dir}")?;
             }
+            first_clause = false;
+        }
+        if let Some(frame) = self.frame {
+            if !first_clause {
+                write!(f, " ")?;
+            }
+            write!(f, "{frame}")?;
         }
         write!(f, ")")
     }

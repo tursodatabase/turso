@@ -6,7 +6,7 @@
 use anyhow::Result;
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
-use sql_gen::{Full, Policy, SqlGen, StmtKind};
+use sql_gen::{Full, Policy, SqlGen, StmtKind, WindowFramePolicy};
 
 /// Output of SQL generation with metadata needed by the oracle.
 #[derive(Debug, Clone)]
@@ -71,6 +71,9 @@ impl SqlGenBackend {
             );
         policy.select_config.require_order_by_with_limit = true;
         policy.select_config.window_function_probability = window_function_probability;
+        if window_function_probability > 0.0 {
+            policy.select_config.window_frame_policy = WindowFramePolicy::Exclude;
+        }
         // Disable expression values for inserts, enable conflict clauses for updates
         policy.insert_config.expression_value_probability = 0.0;
         policy.insert_config.or_replace_probability = 0.0;

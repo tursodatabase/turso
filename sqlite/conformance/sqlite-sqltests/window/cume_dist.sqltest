@@ -745,3 +745,50 @@ expect @js {
     2|3|0.5
     2|4|1
 }
+
+# A user frame with EXCLUDE must also be dropped by the built-in
+# frame override (sqlite3WindowUpdate replaces eExclude too).
+setup exclude_vals {
+    CREATE TABLE ex(v);
+    INSERT INTO ex VALUES (1),(2),(2),(4);
+}
+
+@setup exclude_vals
+test cume-dist-exclude-ties-overridden {
+    SELECT cume_dist() OVER
+        (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES)
+    FROM ex;
+}
+expect {
+    0.25
+    0.75
+    0.75
+    1.0
+}
+expect @js {
+    0.25
+    0.75
+    0.75
+    1
+}
+
+# Named-window chaining: w2 AS (w1 ORDER BY v) inherits w1's
+# PARTITION BY (sqlite3WindowChain, window.c:1276).
+test cume-dist-named-window-chain {
+    CREATE TABLE ch(g, v);
+    INSERT INTO ch VALUES (1,1),(1,2),(2,3),(2,4);
+    SELECT cume_dist() OVER w2 FROM ch
+    WINDOW w1 AS (PARTITION BY g), w2 AS (w1 ORDER BY v);
+}
+expect {
+    0.5
+    1.0
+    0.5
+    1.0
+}
+expect @js {
+    0.5
+    1
+    0.5
+    1
+}

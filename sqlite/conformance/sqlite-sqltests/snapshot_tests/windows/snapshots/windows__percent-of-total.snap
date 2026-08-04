@@ -61,7 +61,7 @@ addr  opcode                  p1   p2  p3  p4                     p5  comment
   34            MakeRecord     3    4  23                          0  r[23]=mkrec(r[3..6])
   35            NewRowid       3   18   0                          0  r[18]=rowid
   36            Insert         3   23  18  buffer_table_window_1   2  intkey=r[18] data=r[23]
-  37            Goto           0   53   0                          0
+  37            Goto           0   53   0                          0  ; peer of previous row: buffer only, handle at group end
   38            Column         4    3  24                          0  r[24]=ephemeral(buffer_table_window_1).salary
   39            AggStep        0   24  12  sum                     0  accum=r[12] step(r[24])
   40            Next           4   42   0                          0
@@ -124,7 +124,7 @@ addr  opcode                  p1   p2  p3  p4                     p5  comment
   97        MakeRecord         7    5  43                          0  r[43]=mkrec(r[7..11])
   98        NewRowid           6   39   0                          0  r[39]=rowid
   99        Insert             6   43  39  buffer_table_window_0   2  intkey=r[39] data=r[43]
- 100        Goto               0  117   0                          0
+ 100        Goto               0  117   0                          0  ; peer of previous row: buffer only, handle at group end
  101        Column             7    3  44                          0  r[44]=ephemeral(buffer_table_window_0).salary
  102        AggStep            0   44  32  sum                     0  accum=r[32] step(r[44])
  103        Next               7  105   0                          0

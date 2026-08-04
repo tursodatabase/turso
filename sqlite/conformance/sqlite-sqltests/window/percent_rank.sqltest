@@ -673,3 +673,45 @@ expect @js {
     2|3|0
     2|4|1
 }
+
+# A user frame with EXCLUDE must also be dropped by the built-in
+# frame override (sqlite3WindowUpdate replaces eExclude too).
+setup exclude_vals {
+    CREATE TABLE ex(v);
+    INSERT INTO ex VALUES (1),(2),(2),(4);
+}
+
+@setup exclude_vals
+test percent-rank-exclude-current-overridden {
+    SELECT printf('%.4f', percent_rank() OVER
+        (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+         EXCLUDE CURRENT ROW))
+    FROM ex;
+}
+expect {
+    0.0000
+    0.3333
+    0.3333
+    1.0000
+}
+
+# Named-window chaining: w2 AS (w1 ORDER BY v) inherits w1's
+# PARTITION BY (sqlite3WindowChain, window.c:1276).
+test percent-rank-named-window-chain {
+    CREATE TABLE ch(g, v);
+    INSERT INTO ch VALUES (1,1),(1,2),(2,3),(2,4);
+    SELECT percent_rank() OVER w2 FROM ch
+    WINDOW w1 AS (PARTITION BY g), w2 AS (w1 ORDER BY v);
+}
+expect {
+    0.0
+    1.0
+    0.0
+    1.0
+}
+expect @js {
+    0
+    1
+    0
+    1
+}

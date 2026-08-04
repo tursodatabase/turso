@@ -27,8 +27,7 @@ use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
 use turso_parser::ast::{
-    self, Expr, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder,
-    SubqueryType,
+    self, Expr, FrameBound, FrameClause, FrameMode, ResolveType, SortOrder, SubqueryType,
 };
 
 use turso_parser::ast::TableInternalId;
@@ -3153,9 +3152,6 @@ impl Window {
 
     /// Build a `Window` from an inline `OVER (...)` AST node
     pub fn new_unnamed(ast: &ast::Window, frame: Frame) -> Result<Self> {
-        if !Self::is_default_frame_spec(&ast.frame_clause) {
-            crate::bail_parse_error!("Custom frame specifications are not supported yet");
-        }
         Ok(Window {
             name: None,
             partition_by: ast.partition_by.iter().map(|arg| *arg.clone()).collect(),
@@ -3176,19 +3172,6 @@ impl Window {
         })
     }
 
-    /// Build an unnamed window from partition/order expressions inherited from
-    /// a named base window.
-    pub fn from_unnamed_bound(bound: NamedWindowBound, frame: Frame) -> Self {
-        Window {
-            name: None,
-            partition_by: bound.partition_by,
-            deduplicated_partition_by_len: None,
-            order_by: bound.order_by,
-            frame,
-            functions: vec![],
-        }
-    }
-
     /// Build a `Window` from a previously-bound named definition plus a
     /// resolved frame.
     pub fn from_named_bound(name: String, bound: NamedWindowBound, frame: Frame) -> Self {
@@ -3207,10 +3190,13 @@ impl Window {
     /// clause matches AND the coerced frames agree — see SQLite's invariant
     /// at `window.c:1679`.
     pub fn is_equivalent(&self, ast: &ast::Window, frame: &Frame) -> bool {
+        // The effective frames must agree exactly (mode, bounds including
+        // offset expressions, EXCLUDE). Two occurrences of the same OVER
+        // clause then share one Window; a window that is NOT merged here
+        // spawns its own subquery layer, and only the layer that owns a
+        // function's rewrite pass populates `WindowFunction::rewritten` —
+        // a duplicate layer would emit against un-rewritten expressions.
         if &self.frame != frame {
-            return false;
-        }
-        if !Self::is_default_frame_spec(&ast.frame_clause) {
             return false;
         }
 
@@ -3238,53 +3224,101 @@ impl Window {
                     && *nulls_a == col_b.nulls
             })
     }
+}
 
-    pub fn is_equivalent_to_bound(&self, bound: &NamedWindowBound, frame: &Frame) -> bool {
-        if &self.frame != frame || self.partition_by.len() != bound.partition_by.len() {
-            return false;
-        }
-        if !self
-            .partition_by
-            .iter()
-            .zip(&bound.partition_by)
-            .all(|(a, b)| exprs_are_equivalent(a, b))
-        {
-            return false;
-        }
-        if self.order_by.len() != bound.order_by.len() {
-            return false;
-        }
-        self.order_by.iter().zip(&bound.order_by).all(
-            |((expr_a, order_a, nulls_a), (expr_b, order_b, nulls_b))| {
-                exprs_are_equivalent(expr_a, expr_b) && order_a == order_b && nulls_a == nulls_b
-            },
-        )
+/// Convert a parsed `FRAME` clause into the planner's `Frame`.
+/// Returns `Ok(None)` when the user wrote no FRAME clause, `Ok(Some(frame))`
+/// for an accepted clause, `Err` for shapes SQLite rejects.
+/// Validation rules ported from `sqlite3WindowCreate` (`window.c:1179-1250`)
+/// and the parser-level guard at `window.c:680-684`.
+pub fn validate_frame_clause(
+    clause: &Option<FrameClause>,
+    order_by_len: usize,
+) -> Result<Option<Frame>> {
+    let Some(clause) = clause else {
+        return Ok(None);
+    };
+    let FrameClause {
+        mode,
+        start,
+        end,
+        exclude,
+    } = clause;
+
+    let start_bound = translate_frame_bound(start, /* is_start = */ true)?;
+    let end_bound = match end {
+        Some(b) => translate_frame_bound(b, /* is_start = */ false)?,
+        // No END clause means CURRENT ROW per SQL standard.
+        None => FrameBoundary::CurrentRow,
+    };
+
+    // Combinations that can never describe a real frame (start past
+    // the end, etc.). SQLite rejects the same set at
+    // `window.c:1217-1221`.
+    let illegal = matches!(
+        (&start_bound, &end_bound),
+        (FrameBoundary::UnboundedFollowing, _)
+            | (_, FrameBoundary::UnboundedPreceding)
+            | (FrameBoundary::CurrentRow, FrameBoundary::Preceding(_))
+            | (FrameBoundary::Following(_), FrameBoundary::Preceding(_))
+            | (FrameBoundary::Following(_), FrameBoundary::CurrentRow)
+    );
+    if illegal {
+        crate::bail_parse_error!("unsupported frame specification");
     }
 
-    pub(crate) fn is_default_frame_spec(frame: &Option<FrameClause>) -> bool {
-        if let Some(frame_clause) = frame {
-            let FrameClause {
-                mode,
-                start,
-                end,
-                exclude,
-            } = frame_clause;
-            if *mode != FrameMode::Range {
-                return false;
-            }
-            if *start != FrameBound::UnboundedPreceding {
-                return false;
-            }
-            if *end != Some(FrameBound::CurrentRow) {
-                return false;
-            }
-            if let Some(exclude) = exclude {
-                if *exclude != FrameExclude::NoOthers {
-                    return false;
-                }
-            }
+    // RANGE with an N PRECEDING/FOLLOWING bound does arithmetic on the
+    // ORDER BY value, so it needs exactly one ORDER BY column. SQLite
+    // enforces the same rule at `window.c:680-684`.
+    if *mode == FrameMode::Range
+        && (matches!(
+            &start_bound,
+            FrameBoundary::Preceding(_) | FrameBoundary::Following(_)
+        ) || matches!(
+            &end_bound,
+            FrameBoundary::Preceding(_) | FrameBoundary::Following(_)
+        ))
+        && order_by_len != 1
+    {
+        crate::bail_parse_error!(
+            "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression"
+        );
+    }
+
+    Ok(Some(Frame {
+        mode: *mode,
+        start: start_bound,
+        end: end_bound,
+        exclude: exclude.clone(),
+    }))
+}
+
+/// Convert a parser-level `FrameBound` to the planner's `FrameBoundary`,
+/// cloning any offset expression out of the AST for the emit code to
+/// evaluate.
+fn translate_frame_bound(bound: &FrameBound, is_start: bool) -> Result<FrameBoundary> {
+    // The parser enforces start/end orientation: TK_PRECEDING is only
+    // emitted as a start bound, TK_FOLLOWING only as an end bound
+    // (parser.rs: `frame_start_bound` / `frame_end_bound`). Mirrors
+    // SQLite's parser-level guarantee at window.c:1213-1215.
+    match bound {
+        FrameBound::CurrentRow => Ok(FrameBoundary::CurrentRow),
+        FrameBound::UnboundedPreceding => {
+            debug_assert!(
+                is_start,
+                "parser only emits UNBOUNDED PRECEDING as a start bound"
+            );
+            Ok(FrameBoundary::UnboundedPreceding)
         }
-        true
+        FrameBound::UnboundedFollowing => {
+            debug_assert!(
+                !is_start,
+                "parser only emits UNBOUNDED FOLLOWING as an end bound"
+            );
+            Ok(FrameBoundary::UnboundedFollowing)
+        }
+        FrameBound::Preceding(expr) => Ok(FrameBoundary::Preceding(expr.clone())),
+        FrameBound::Following(expr) => Ok(FrameBoundary::Following(expr.clone())),
     }
 }
 
@@ -3302,8 +3336,15 @@ impl Window {
 #[derive(Debug, Clone)]
 pub struct NamedWindowDef {
     pub name: String,
+    /// User-written FRAME clause preserved so a function attaching by
+    /// `Over::Name` can compute its effective frame from it.
+    pub user_frame_clause: Option<FrameClause>,
+    /// The bound PARTITION BY / ORDER BY expressions. The first function
+    /// to attach takes them (leaving `None`); any later function under a
+    /// different coerced frame copies them back from a resolved `Window`.
+    /// They live here, rather than inside the frame, so taking them
+    /// doesn't disturb `user_frame_clause`.
     pub bound: Option<NamedWindowBound>,
-    pub has_frame_clause: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3332,6 +3373,15 @@ pub struct Frame {
     pub mode: ast::FrameMode,
     pub start: FrameBoundary,
     pub end: FrameBoundary,
+    /// The EXCLUDE clause the user wrote, or `None` if they wrote none.
+    ///
+    /// `Some(NoOthers)` (an explicit `EXCLUDE NO OTHERS`) excludes
+    /// nothing, so it returns the same rows as `None`. We keep the two
+    /// apart anyway: like SQLite, any EXCLUDE clause — even NO OTHERS —
+    /// switches the window to the slower path that recomputes each
+    /// function over the whole frame per output row. Only `None` gets the
+    /// fast streaming path.
+    pub exclude: Option<ast::FrameExclude>,
 }
 
 impl Default for Frame {
@@ -3340,6 +3390,7 @@ impl Default for Frame {
             mode: ast::FrameMode::Range,
             start: FrameBoundary::UnboundedPreceding,
             end: FrameBoundary::CurrentRow,
+            exclude: None,
         }
     }
 }

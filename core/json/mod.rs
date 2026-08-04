@@ -80,6 +80,25 @@ pub fn convert_dbtype_to_raw_jsonb(data: &Value, strict: Conv) -> crate::Result<
     Ok(json.data())
 }
 
+/// Return the encoded length of the raw JSONB element beginning at `cursor`.
+///
+/// Aggregate JSON payloads keep an unfinalized one-byte array/object header
+/// followed by complete JSONB elements. Window xInverse uses this boundary to
+/// remove the oldest array value or object key/value pair without reparsing
+/// textual JSON.
+pub(crate) fn raw_jsonb_element_len(data: &[u8], cursor: usize) -> crate::Result<usize> {
+    let (header, header_len) = JsonbHeader::from_slice(cursor, data)?;
+    let element_len = header_len
+        .checked_add(header.payload_size())
+        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+    let end = cursor
+        .checked_add(element_len)
+        .filter(|end| *end <= data.len())
+        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+    debug_assert_eq!(end - cursor, element_len);
+    Ok(element_len)
+}
+
 pub fn json_from_raw_bytes_agg(data: &[u8], raw: bool) -> crate::Result<Value> {
     let mut json = Jsonb::from_raw_data(data)?;
     let el_type = json.element_type()?;

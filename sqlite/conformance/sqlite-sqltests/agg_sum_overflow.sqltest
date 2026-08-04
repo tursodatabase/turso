@@ -1,0 +1,70 @@
+@database :memory:
+
+# sum() integer-overflow semantics (sumStep/sumFinalize, func.c): an
+# integer add that overflows switches the accumulator to the approximate
+# Kahan-Babuška path and remembers the overflow; the error surfaces at
+# finalize only if every input was an integer. Any float input makes the
+# result a float approximation and forgives the overflow — per the
+# documented contract, "integer overflow" applies to all-integer sums
+# only.
+
+setup ints {
+    CREATE TABLE t(v INT);
+    INSERT INTO t VALUES (9223372036854775807),(1);
+}
+
+@setup ints
+test sum-all-int-overflow-errors {
+    SELECT sum(v) FROM t;
+}
+expect error {
+}
+
+setup int_overflow_then_float {
+    CREATE TABLE t(v);
+    INSERT INTO t VALUES (9223372036854775807),(1),(1.5);
+}
+
+# The overflow happens on the second value, the float arrives after —
+# the result must be approximate, not an error.
+@setup int_overflow_then_float
+test sum-overflow-forgiven-by-later-float {
+    SELECT typeof(sum(v)), printf('%.6e', sum(v)) FROM t;
+}
+expect {
+    real|9.223372e+18
+}
+
+setup float_then_int_overflow {
+    CREATE TABLE t(v);
+    INSERT INTO t VALUES (1.5),(9223372036854775807),(9223372036854775807);
+}
+
+# With a float first the sum is approximate from the start; huge integer
+# steps never touch the exact path, so no error either.
+@setup float_then_int_overflow
+test sum-float-first-never-int-overflows {
+    SELECT typeof(sum(v)), printf('%.6e', sum(v)) FROM t;
+}
+expect {
+    real|1.844674e+19
+}
+
+# total() never raises integer overflow regardless of input mix.
+@setup ints
+test total-never-errors-on-overflow {
+    SELECT typeof(total(v)), printf('%.6e', total(v)) FROM t;
+}
+expect {
+    real|9.223372e+18
+}
+
+# avg() shares sum's accumulator but never raises the overflow error
+# either (avgFinalize, func.c).
+@setup ints
+test avg-never-errors-on-overflow {
+    SELECT typeof(avg(v)), printf('%.6e', avg(v)) FROM t;
+}
+expect {
+    real|4.611686e+18
+}

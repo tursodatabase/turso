@@ -151,7 +151,8 @@ use crate::{
     json::json_from_raw_bytes_agg, json::json_insert, json::json_object, json::json_patch,
     json::json_quote, json::json_remove, json::json_replace, json::json_set, json::json_type,
     json::jsonb, json::jsonb_array, json::jsonb_extract, json::jsonb_insert, json::jsonb_object,
-    json::jsonb_patch, json::jsonb_remove, json::jsonb_replace, json::jsonb_set, json::Conv,
+    json::jsonb_patch, json::jsonb_remove, json::jsonb_replace, json::jsonb_set,
+    json::raw_jsonb_element_len, json::Conv,
 };
 
 use super::{Program, ProgramState, Register};
@@ -1022,10 +1023,16 @@ pub fn op_comparison(
 
     match (lhs_value, rhs_value) {
         (Value::Null, _) | (_, Value::Null) => {
-            let should_jump = match (null_eq, op) {
-                (true, ComparisonOp::Eq) => lhs_value == rhs_value,
-                (true, ComparisonOp::Ne) => lhs_value != rhs_value,
-                _ => jump_if_null,
+            let should_jump = if null_eq {
+                // SQLITE_NULLEQ makes comparison two-valued and orders a
+                // single NULL below every non-NULL value. Although normal
+                // expression translation only uses it with Eq/Ne, RANGE
+                // boundary tests use it with relational operators so that
+                // NULL peer groups compare consistently.
+                let order = compare_immutable_single(lhs_value, rhs_value, collation);
+                comparison_matches_order(op, order)
+            } else {
+                jump_if_null
             };
             take_jump_if!(should_jump);
         }
@@ -6169,6 +6176,12 @@ pub fn op_decr_jump_zero(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Add one floating-point value to a running sum using Kahan–Babuška–
+/// Neumaier summation (KBN, referred to throughout the sum/avg code).
+/// Adding many floats the naive way loses low-order bits; KBN keeps a
+/// separate small "error" term (`state.r_err`) that captures the rounding
+/// lost on each addition, so the final total stays far more accurate. This
+/// matches how SQLite sums floating-point values.
 fn apply_kbn_step(acc: &mut Value, r: f64, state: &mut SumAggState) {
     // NaN from Inf + (-Inf) is sticky: once acc is Null, it stays Null.
     // See https://sqlite.org/lang_aggfunc.html ("result is NULL").
@@ -6194,7 +6207,9 @@ fn apply_kbn_step(acc: &mut Value, r: f64, state: &mut SumAggState) {
     *acc = Value::from_f64(t);
 }
 
-// Add a (possibly large) integer to the running sum.
+// Add a (possibly large) integer to the running float sum. An integer big
+// enough to lose precision as a single f64 is split into a high and a low
+// part, each added separately, so no bits are dropped.
 fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
     const THRESHOLD: i64 = 4503599627370496; // 2^52
 
@@ -6209,14 +6224,36 @@ fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
     }
 }
 
+/// Switch sum() from its exact integer total to the floating-point
+/// total, seeding it with the integer sum so far. A large integer can't
+/// fit in a double exactly, so split it into a high part (the value) and
+/// a low part (the running error term) and lose no bits. Mirrors
+/// SQLite's `kahanBabuskaNeumaierInit` (func.c).
+fn kbn_init_from_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
+    const THRESHOLD: i64 = 4503599627370496; // 2^52
+
+    if i <= -THRESHOLD || i >= THRESHOLD {
+        let i_sm = i % 16384;
+        *acc = Value::from_f64((i - i_sm) as f64);
+        state.r_err = i_sm as f64;
+    } else {
+        *acc = Value::from_f64(i as f64);
+        state.r_err = 0.0;
+    }
+}
+
 /// Initialize aggregate payload with default values.
 /// Payload layout by aggregate type:
 /// - Count/Count0: [Integer(0)]
-/// - Sum: [Null, Float(0.0), Integer(0), Integer(0)]  // acc, r_err, approx, ovrfl
-/// - Total: [Float(0.0), Float(0.0), Integer(0), Integer(0)]  // same but starts at 0.0
+/// - Sum: [Null, Float(0.0), Integer(0), Integer(0), Integer(0)]
+///   // acc, r_err, approx, ovrfl, count
+/// - Total: [Float(0.0), Float(0.0), Integer(0), Integer(0), Integer(0)]
+///   // same but starts at 0.0
 /// - Avg: [Float(0.0), Float(0.0), Integer(0)]  // sum, r_err, count - uses KBN like SUM
 /// - Min/Max: [Null]
-/// - GroupConcat/StringAgg: [Null] (becomes Text on first non-null value)
+/// - GroupConcat/StringAgg:
+///   [Null|Text, Integer(count), Integer(first separator length),
+///   Blob(varying inter-string separator lengths)]
 /// - JsonGroupObject/JsonbGroupObject: [Blob([])]
 /// - JsonGroupArray/JsonbGroupArray: [Blob([])]
 fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> Result<()> {
@@ -6232,6 +6269,7 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
             payload.push(Value::from_f64(0.0));
             payload.push(Value::from_i64(0));
             payload.push(Value::from_i64(0));
+            payload.push(Value::from_i64(0));
         }
         AggFunc::Avg => {
             payload.push(Value::from_f64(0.0));
@@ -6240,8 +6278,14 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
         }
         AggFunc::Min | AggFunc::Max => payload.push(Value::Null),
         AggFunc::GroupConcat | AggFunc::StringAgg => {
-            // Use Null as sentinel to distinguish "no values yet" from "accumulated empty string"
+            // Use Null as sentinel to distinguish "no values yet" from an
+            // accumulated empty string. SQLite normally remembers one
+            // separator length and only materializes the per-separator queue
+            // if the length changes.
             payload.push(Value::Null);
+            payload.push(Value::from_i64(0));
+            payload.push(Value::from_i64(0));
+            payload.push(Value::Blob(crate::alloc::vec![]));
         }
         AggFunc::External(_) => {
             mark_unlikely();
@@ -6293,13 +6337,16 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
 /// - **Count**: `[count: Integer]` - increments if arg is not NULL
 /// - **Count0**: `[count: Integer]` - always increments (COUNT(*))
 /// - **Avg**: `[sum: Float, r_err: Float, count: Integer]` - uses KBN compensation like SUM
-/// - **Sum/Total**: `[acc, r_err: Float, approx: Integer, ovrfl: Integer]`
+/// - **Sum/Total**:
+///   `[acc, r_err: Float, approx: Integer, ovrfl: Integer, count: Integer]`
 ///   - `acc`: running sum (Null/Integer/Float depending on inputs)
 ///   - `r_err`: Kahan-Babuška-Neumaier compensation term for floating-point precision
 ///   - `approx`: 1 if result is approximate (float arithmetic used)
 ///   - `ovrfl`: 1 if integer overflow occurred (Total promotes to float, Sum errors)
 /// - **Min/Max**: `[current_extreme: Value]` - tracks min/max seen so far
-/// - **GroupConcat/StringAgg**: `[accumulated: Null|Text]` - Null until first value, then Text
+/// - **GroupConcat/StringAgg**:
+///   `[accumulated: Null|Text, count: Integer, first_separator_len: Integer,
+///     separator_lengths: Blob]`
 /// - **JsonGroup***: `[raw_jsonb: Blob]` - accumulated raw JSONB bytes
 /// - **ArrayAgg/Mode/PercentileCont/PercentileDisc**: buffer every input value by growing the
 ///   payload `Vec` (one push per row); the leading slots hold a running count and, for the
@@ -6363,41 +6410,20 @@ fn update_agg_payload(
                 r_err,
                 ..Default::default()
             };
-            match arg {
-                Value::Numeric(Numeric::Integer(i)) => {
-                    apply_kbn_step_int(sum_val, *i, &mut sum_state);
-                }
-                Value::Numeric(Numeric::Float(f)) => {
-                    apply_kbn_step(sum_val, f64::from(*f), &mut sum_state);
-                }
-                Value::Text(t) => {
-                    let (parse_result, parsed_number) = try_for_float(t.as_str().as_bytes());
-                    match parsed_number {
-                        ParsedNumber::Integer(i) => {
-                            if matches!(parse_result, NumericParseResult::ValidPrefixOnly) {
-                                apply_kbn_step(sum_val, i as f64, &mut sum_state);
-                            } else {
-                                apply_kbn_step_int(sum_val, i, &mut sum_state);
-                            }
-                        }
-                        ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
-                        ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
-                    }
-                }
-                Value::Blob(b) => match try_for_float(b).1 {
-                    ParsedNumber::Integer(i) => apply_kbn_step(sum_val, i as f64, &mut sum_state),
-                    ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
-                    ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
-                },
-                _ => unreachable!(),
+            match classify_numeric_arg(arg) {
+                NumericArg::Integer(i) => apply_kbn_step_int(sum_val, i, &mut sum_state),
+                NumericArg::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
+                NumericArg::Null => unreachable!("NULL early-returned above"),
             }
             *r_err_val = Value::from_f64(sum_state.r_err);
             *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
         }
         AggFunc::Sum | AggFunc::Total => {
             // invariant as per init_agg_payload: payload[0] is acc (Null/Integer/Float),
-            // payload[1] is Float (r_err), payload[2] is Integer (approx), payload[3] is Integer (ovrfl)
-            let [acc, r_err_val, approx_val, ovrfl_val, ..] = payload.as_mut_slice() else {
+            // payload[1] is Float (r_err), payload[2] is Integer (approx),
+            // payload[3] is Integer (ovrfl), payload[4] is Integer (count)
+            let [acc, r_err_val, approx_val, ovrfl_val, count_val, ..] = payload.as_mut_slice()
+            else {
                 return Err(LimboError::InternalError(
                     "Sum/Total: payload too short".to_string(),
                 ));
@@ -6415,11 +6441,20 @@ fn update_agg_payload(
                     "Sum/Total: payload[3] is not an integer".to_string(),
                 ));
             };
+            let Value::Numeric(Numeric::Integer(count)) = count_val else {
+                mark_unlikely();
+                return Err(LimboError::InternalError(
+                    "Sum/Total: payload[4] is not an integer".to_string(),
+                ));
+            };
             let mut sum_state = SumAggState {
                 r_err: r_err_f,
                 approx: *approx_i != 0,
                 ovrfl: *ovrfl_i != 0,
             };
+            if !matches!(arg, Value::Null) {
+                *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+            }
             if matches!(*acc, Value::Null) && sum_state.approx {
                 return Ok(());
             }
@@ -6432,16 +6467,16 @@ fn update_agg_payload(
                     Value::Numeric(Numeric::Integer(acc_i)) => match acc_i.checked_add(*i) {
                         Some(sum) => *acc_i = sum,
                         None => {
-                            if matches!(func, AggFunc::Total) {
-                                let acc_f = *acc_i as f64;
-                                *acc = Value::from_f64(acc_f);
-                                sum_state.approx = true;
-                                sum_state.ovrfl = true;
-                                apply_kbn_step_int(acc, *i, &mut sum_state);
-                            } else {
-                                mark_unlikely();
-                                return Err(LimboError::IntegerOverflow);
-                            }
+                            // The integer total overflowed i64. Switch to
+                            // the floating-point total and remember the
+                            // overflow: sum() reports it at the end unless
+                            // a later float clears it, and total() never
+                            // reports it. Mirrors sumStep (func.c:1838-1846).
+                            let prev = *acc_i;
+                            sum_state.approx = true;
+                            sum_state.ovrfl = true;
+                            kbn_init_from_int(acc, prev, &mut sum_state);
+                            apply_kbn_step_int(acc, *i, &mut sum_state);
                         }
                     },
                     Value::Numeric(Numeric::Float(_)) => {
@@ -6455,12 +6490,21 @@ fn update_agg_payload(
                         sum_state.approx = true;
                     }
                     Value::Numeric(Numeric::Integer(i)) => {
-                        *acc = Value::from_f64(*i as f64);
+                        // First float, after an all-integer run. Switch to
+                        // the floating-point total, seeding it from the
+                        // exact integer sum so far (func.c:1834-1836).
+                        let prev = *i;
                         sum_state.approx = true;
+                        kbn_init_from_int(acc, prev, &mut sum_state);
                         apply_kbn_step(acc, f64::from(*f), &mut sum_state);
                     }
                     Value::Numeric(Numeric::Float(_)) => {
+                        // Already a floating-point total. A float input
+                        // clears any earlier integer-overflow flag: the
+                        // result is a float approximation regardless, so
+                        // there's nothing to report (func.c:1852).
                         sum_state.approx = true;
+                        sum_state.ovrfl = false;
                         apply_kbn_step(acc, f64::from(*f), &mut sum_state);
                     }
                     _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
@@ -6509,18 +6553,76 @@ fn update_agg_payload(
             if matches!(arg, Value::Null) {
                 return Ok(());
             }
-            let acc = &mut payload[0];
-            if matches!(acc, Value::Null) {
+            let [acc, count_slot, first_separator_len_slot, separator_lengths_slot, ..] =
+                payload.as_mut_slice()
+            else {
+                unreachable!("GroupConcat payload is initialized with four slots");
+            };
+            let Value::Numeric(Numeric::Integer(count)) = count_slot else {
+                unreachable!("GroupConcat count slot is Integer");
+            };
+            let Value::Numeric(Numeric::Integer(first_separator_len)) = first_separator_len_slot
+            else {
+                unreachable!("GroupConcat first separator length is Integer");
+            };
+            let Value::Blob(separator_lengths) = separator_lengths_slot else {
+                unreachable!("GroupConcat separator queue is Blob");
+            };
+            let first_term = matches!(acc, Value::Null);
+            if first_term {
                 // Start an empty Text accumulator; append below without an
                 // intermediate String for Text inputs.
                 *acc = Value::build_text(String::new());
+            }
+
+            let delimiter = match maybe_arg2 {
+                Some(delimiter) => delimiter,
+                None => &Value::build_text(","),
+            };
+            if first_term {
+                let mut rendered = Value::build_text(String::new());
+                rendered.exec_group_concat(delimiter)?;
+                let Value::Text(rendered) = rendered else {
+                    unreachable!("GroupConcat rendering target is Text");
+                };
+                *first_separator_len = i64::try_from(rendered.as_str().len())
+                    .map_err(|_| LimboError::IntegerOverflow)?;
             } else {
-                match maybe_arg2 {
-                    Some(delimiter) => acc.exec_group_concat(delimiter)?,
-                    None => acc.exec_group_concat(&Value::build_text(","))?,
+                let before_separator = match acc {
+                    Value::Text(text) => text.as_str().len(),
+                    _ => unreachable!("GroupConcat accumulator is Text after initialization"),
+                };
+                acc.exec_group_concat(delimiter)?;
+                let after_separator = match acc {
+                    Value::Text(text) => text.as_str().len(),
+                    _ => unreachable!("GroupConcat accumulator is Text after its first value"),
+                };
+                let separator_len = after_separator
+                    .checked_sub(before_separator)
+                    .expect("appending a separator cannot shrink GroupConcat");
+                let separator_len =
+                    i64::try_from(separator_len).map_err(|_| LimboError::IntegerOverflow)?;
+                if separator_len != *first_separator_len || !separator_lengths.is_empty() {
+                    let count = usize::try_from(*count).map_err(|_| LimboError::IntegerOverflow)?;
+                    if separator_lengths.is_empty() {
+                        let prior_separator_count = count.saturating_sub(1);
+                        separator_lengths.try_reserve(
+                            count
+                                .checked_mul(std::mem::size_of::<i64>())
+                                .ok_or(LimboError::IntegerOverflow)?,
+                        )?;
+                        let bytes = first_separator_len.to_be_bytes();
+                        for _ in 0..prior_separator_count {
+                            separator_lengths.extend_from_slice(&bytes);
+                        }
+                    } else {
+                        separator_lengths.try_reserve(std::mem::size_of::<i64>())?;
+                    }
+                    separator_lengths.extend_from_slice(&separator_len.to_be_bytes());
                 }
             }
             acc.exec_group_concat(arg)?;
+            *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
         }
         AggFunc::External(_) => {
             mark_unlikely();
@@ -6638,19 +6740,39 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
             }
         }
         AggFunc::Sum => {
+            let Value::Numeric(Numeric::Integer(count)) = &payload[4] else {
+                unreachable!("Sum count slot is Integer per init_agg_payload");
+            };
+            if *count == 0 {
+                return Ok(Value::Null);
+            }
             let acc = &payload[0];
             let approx = payload[2].as_int().unwrap_or(0) != 0;
             let ovrfl = payload[3].as_int().unwrap_or(0) != 0;
             let r_err = payload[1].to_float_or_zero();
+            // An all-integer sum that overflowed and was never cleared by
+            // a float is reported here, at the end — not when it happened.
+            // The frame may have shrunk back into range since, but SQLite
+            // still reports it (sumFinalize). This check comes before the
+            // NULL-accumulator (NaN) case below, matching SQLite's order.
+            if approx && ovrfl {
+                mark_unlikely();
+                return Err(LimboError::IntegerOverflow);
+            }
             match acc {
                 Value::Null => Value::Null,
-                Value::Numeric(Numeric::Integer(i)) if !approx && !ovrfl => Value::from_i64(*i),
-                Value::Numeric(Numeric::Float(f)) => Value::from_f64(f64::from(*f) + r_err),
+                Value::Numeric(Numeric::Integer(i)) if !approx => Value::from_i64(*i),
+                // An infinite error term can't be added back meaningfully,
+                // so return the total alone (sumFinalize's overflow guard).
+                Value::Numeric(Numeric::Float(f)) if r_err.is_finite() => {
+                    Value::from_f64(f64::from(*f) + r_err)
+                }
+                Value::Numeric(Numeric::Float(f)) => Value::from_f64(f64::from(*f)),
                 _ => Value::from_f64(acc.to_float_or_zero() + r_err),
             }
         }
         AggFunc::Total => {
-            // Payload: [acc, r_err, approx, ovrfl]
+            // Payload: [acc, r_err, approx, ovrfl, count]
             let acc = &payload[0];
             let approx = payload[2].as_int().unwrap_or(0) != 0;
             let r_err = payload[1].to_float_or_zero();
@@ -6864,7 +6986,7 @@ fn op_window_step(
             };
             *counter += 1;
         }
-        // rank() — mirrors SQLite's CallCount-based rankStepFunc.
+        // rank() — mirrors SQLite's rankStepFunc.
         //
         // State (payload):
         //   [0] = current rank value (what AggValue returns; cleared to 0 by
@@ -6902,7 +7024,7 @@ fn op_window_step(
                 *rank = rows_seen;
             }
         }
-        // dense_rank() — mirrors SQLite's CallCount-based dense_rankStepFunc.
+        // dense_rank() — mirrors SQLite's dense_rankStepFunc.
         //
         // State (payload):
         //   [0] = current dense_rank value (never cleared; persists across
@@ -6933,15 +7055,99 @@ fn op_window_step(
             };
             *pending = 1;
         }
-        // last_value(expr) — captures the argument value of every source row,
-        // so payload[0] always holds the value of the most recently stepped
-        // row. With our default RANGE frame, AggValue is called once per
-        // peer-group flush, so the captured value at that moment is the value
-        // of the last row of the just-finished peer group.
+        // first_value / nth_value are normally computed by a positional
+        // seek at output time and never stepped. They reach this xStep
+        // only in the EXCLUDE path, which rescans the frame per output row
+        // and feeds each included row through here. Payload: [0] the
+        // captured value, [1] a "captured yet?" flag, so a captured NULL
+        // stays distinct from an empty frame.
+        WindowFunc::FirstValue => {
+            if let Register::Value(Value::Null) = state.registers[acc_reg] {
+                state.registers[acc_reg] =
+                    Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![
+                        Value::Null,
+                        Value::from_i64(0),
+                    ]?));
+            }
+            let [arg_slot, acc_slot] = state
+                .registers
+                .get_disjoint_mut([arg_reg, acc_reg])
+                .map_err(|_| {
+                    LimboError::InternalError(format!(
+                        "first_value: argument register {arg_reg} and accumulator register {acc_reg} must be distinct"
+                    ))
+                })?;
+            let Register::Aggregate(AggContext::Builtin(payload)) = acc_slot else {
+                unreachable!("first_value accumulator must be a Builtin payload");
+            };
+            let Value::Numeric(Numeric::Integer(seen)) = &payload[1] else {
+                unreachable!("first_value seen flag must be Integer");
+            };
+            if *seen == 0 {
+                payload[0].try_clone_from(arg_slot.get_value())?;
+                payload[1] = Value::from_i64(1);
+            }
+        }
+        // Only reached in the EXCLUDE rescan, like first_value above. Each
+        // included row bumps the 1-based position in [1]; the argument is
+        // captured into [0] when the position reaches N. N is re-validated
+        // per row, matching SQLite.
+        WindowFunc::NthValue => {
+            if !coerce_register_to_integer(state, arg_reg + 1) {
+                return Err(LimboError::InvalidArgument(
+                    "second argument to nth_value must be a positive integer".into(),
+                ));
+            }
+            let Value::Numeric(Numeric::Integer(n)) = state.registers[arg_reg + 1].get_value()
+            else {
+                unreachable!("coerce_register_to_integer must store an Integer");
+            };
+            let n = *n;
+            if n <= 0 {
+                return Err(LimboError::InvalidArgument(
+                    "second argument to nth_value must be a positive integer".into(),
+                ));
+            }
+            if let Register::Value(Value::Null) = state.registers[acc_reg] {
+                state.registers[acc_reg] =
+                    Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![
+                        Value::Null,
+                        Value::from_i64(0),
+                    ]?));
+            }
+            let [arg_slot, acc_slot] = state
+                .registers
+                .get_disjoint_mut([arg_reg, acc_reg])
+                .map_err(|_| {
+                    LimboError::InternalError(format!(
+                        "nth_value: argument register {arg_reg} and accumulator register {acc_reg} must be distinct"
+                    ))
+                })?;
+            let Register::Aggregate(AggContext::Builtin(payload)) = acc_slot else {
+                unreachable!("nth_value accumulator must be a Builtin payload");
+            };
+            let Value::Numeric(Numeric::Integer(step)) = &payload[1] else {
+                unreachable!("nth_value step count must be Integer");
+            };
+            let step = step.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+            payload[1] = Value::from_i64(step);
+            if step == n {
+                payload[0].try_clone_from(arg_slot.get_value())?;
+            }
+        }
+        // last_value(expr) — mirrors SQLite's LastValueCtx {pVal, nVal}
+        // (window.c:478-497): payload[0] holds the value of the most
+        // recently stepped row, payload[1] counts the rows currently in
+        // the frame. xInverse decrements the count as rows leave and
+        // clears the value when the frame empties, so a moving frame that
+        // empties out yields NULL.
         WindowFunc::LastValue => {
             if let Register::Value(Value::Null) = state.registers[acc_reg] {
                 state.registers[acc_reg] =
-                    Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![Value::Null]?));
+                    Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![
+                        Value::Null,
+                        Value::from_i64(0),
+                    ]?));
             }
             let [arg_slot, acc_slot] = state
                 .registers
@@ -6955,6 +7161,10 @@ fn op_window_step(
                 unreachable!("last_value accumulator must be a Builtin payload");
             };
             payload[0].try_clone_from(arg_slot.get_value())?;
+            let Value::Numeric(Numeric::Integer(count)) = &mut payload[1] else {
+                unreachable!("last_value frame-row count must be Integer");
+            };
+            *count += 1;
         }
         // percent_rank() / cume_dist() — mirror SQLite's CallCount-based
         // percent_rankStepFunc / cume_distStepFunc (window.c:328, :373).
@@ -7086,30 +7296,40 @@ fn op_window_value(
             }
             Value::from_i64(*value_slot)
         }
-        WindowFunc::FirstValue => {
-            // Keep the saved value because every later row in this partition
-            // may need the same answer.
-            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
-            else {
-                return Err(LimboError::InternalError(format!(
-                    "{func} accumulator in unexpected register state: {:?}",
-                    state.registers[acc_reg]
-                )));
-            };
-            payload[0].clone()
+        WindowFunc::FirstValue | WindowFunc::NthValue => {
+            // Also EXCLUDE-only: streaming reads these by positional seek.
+            // The rescan rebuilds the accumulator for each output row; here
+            // we just read the captured value without consuming it. An
+            // empty included set leaves the register NULL.
+            match &state.registers[acc_reg] {
+                Register::Aggregate(AggContext::Builtin(payload)) => payload[0].clone(),
+                Register::Value(Value::Null) => Value::Null,
+                other => {
+                    return Err(LimboError::InternalError(format!(
+                        "{func} accumulator in unexpected register state: {other:?}"
+                    )));
+                }
+            }
         }
         WindowFunc::LastValue => {
-            // last_value's slot is overwritten by the next AggStep anyway,
-            // so we can take ownership here and save a clone per peer-group
-            // flush (notable for Text / Blob args).
-            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
-            else {
-                return Err(LimboError::InternalError(format!(
-                    "last_value accumulator in unexpected register state: {:?}",
-                    state.registers[acc_reg]
-                )));
-            };
-            std::mem::replace(&mut payload[0], Value::Null)
+            // xValue must not consume the accumulator: when the frame end
+            // stops short of the last row of the partition, the same value
+            // is read once for every row output, and a moving frame reads
+            // it between AggStep calls. Mirrors SQLite's last_valueValueFunc
+            // (window.c:524-529), which copies without clearing. If no row
+            // ever entered the frame (an empty frame, or every row skipped
+            // before the first step), the register was never written and is
+            // still NULL, so the result is NULL — the same outcome SQLite
+            // gives for an aggregate context that was never stepped.
+            match &state.registers[acc_reg] {
+                Register::Aggregate(AggContext::Builtin(payload)) => payload[0].clone(),
+                Register::Value(Value::Null) => Value::Null,
+                other => {
+                    return Err(LimboError::InternalError(format!(
+                        "last_value accumulator in unexpected register state: {other:?}"
+                    )));
+                }
+            }
         }
         // percent_rank() — mirrors SQLite's percent_rankValueFunc
         // (window.c:352). The value is (rows in earlier peer groups) /
@@ -7220,9 +7440,9 @@ fn op_window_inverse(
 ) -> Result<InsnFunctionStepResult> {
     match func {
         // percent_rank / cume_dist xInverse — increment nStep, the
-        // count of rows that have left the frame start. Under GROUPS
-        // mode the AGGINVERSE peer-loop fires xInverse once per row of
-        // the leaving group, so a group of size G bumps nStep by G.
+        // count of rows that have dropped off the start of the frame.
+        // Under GROUPS mode AGGINVERSE fires xInverse once for every row
+        // of the group that is leaving, so a group of size G adds G.
         WindowFunc::PercentRank | WindowFunc::CumeDist => {
             let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
             else {
@@ -7256,6 +7476,38 @@ fn op_window_inverse(
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
+        // last_value's xInverse — a row left the frame from the left;
+        // when none remain the captured value is cleared so xValue
+        // yields NULL. Mirrors SQLite's last_valueInvFunc
+        // (window.c:505-522).
+        WindowFunc::LastValue => {
+            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            else {
+                return Err(LimboError::InternalError(format!(
+                    "last_value accumulator in unexpected register state at inverse: {:?}",
+                    state.registers[acc_reg]
+                )));
+            };
+            let Value::Numeric(Numeric::Integer(count)) = &mut payload[1] else {
+                unreachable!("last_value frame-row count must be Integer");
+            };
+            debug_assert!(*count > 0, "last_value xInverse without matching xStep");
+            *count -= 1;
+            if *count == 0 {
+                payload[0] = Value::Null;
+            }
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        // first_value / nth_value / lag / lead don't keep a running total
+        // — at output time they just look up the row they need. So when a
+        // row leaves the frame there is nothing to undo: this inverse step
+        // does nothing. Mirrors SQLite wiring these functions' xInverse to
+        // a no-op (window.c:591).
+        WindowFunc::FirstValue | WindowFunc::NthValue | WindowFunc::Lag | WindowFunc::Lead => {
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
         _ => unreachable!("AggInverse fired for {func} but no inverse arm is wired"),
     }
 }
@@ -7280,15 +7532,310 @@ pub fn op_agg_inverse(
     if let AccumulatorFunc::Window(win_func) = func {
         return op_window_inverse(state, *acc_reg, *col, win_func);
     }
+    let func = func.expect_agg();
 
-    // Aggregate window functions all carry RANGE UNBOUNDED PRECEDING TO
-    // CURRENT ROW as their coerced frame, so the frame start never moves
-    // and AggInverse is never emitted for them. Reaching this arm is a
-    // planner bug.
-    unreachable!(
-        "AggInverse fired for aggregate {} but no inverse arm is wired",
-        func.expect_agg()
-    );
+    // Run xInverse to undo a prior xStep when a row leaves the frame
+    // from the left. min/max are handled separately using SQLite's
+    // sorted-index strategy.
+    let arg = state.registers[*col].get_value().clone();
+    let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
+        return Err(LimboError::InternalError(format!(
+            "AggInverse: acc_reg {} not initialized — xStep should have run first",
+            *acc_reg
+        )));
+    };
+    let payload = agg.payload_mut();
+    inverse_agg_payload(func, arg, payload)?;
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Classify an arg for SQLite-style sum/avg dispatch — mirrors
+/// `sqlite3_value_numeric_type` (`vdbeapi.c`), applying numeric
+/// affinity to TEXT/BLOB. Returns the parsed pieces so callers don't
+/// re-parse, and so step and inverse agree on which path (integer or
+/// float) handles each row.
+enum NumericArg {
+    Integer(i64),
+    Float(f64),
+    Null,
+}
+
+fn classify_numeric_arg(v: &Value) -> NumericArg {
+    match v {
+        Value::Null => NumericArg::Null,
+        Value::Numeric(Numeric::Integer(i)) => NumericArg::Integer(*i),
+        Value::Numeric(Numeric::Float(f)) => NumericArg::Float(f64::from(*f)),
+        // A string that is entirely a valid integer (e.g. "42") is summed
+        // on the exact-integer path, so a large integer written as text
+        // doesn't lose precision. A string that is only a valid number up
+        // to a point (e.g. "5abc") goes through the float path instead —
+        // such partial parses shouldn't get exact integer accumulation.
+        // Matches SQLite's numeric-affinity handling in `sumStep`.
+        Value::Text(t) => match try_for_float(t.as_str().as_bytes()) {
+            (NumericParseResult::ValidPrefixOnly, ParsedNumber::Integer(i)) => {
+                NumericArg::Float(i as f64)
+            }
+            (_, ParsedNumber::Integer(i)) => NumericArg::Integer(i),
+            (_, ParsedNumber::Float(f)) => NumericArg::Float(f),
+            (_, ParsedNumber::None) => NumericArg::Float(0.0),
+        },
+        // A blob is always summed on the float path, even when its bytes
+        // parse as an integer — matches SQLite's blob handling in `sumStep`.
+        Value::Blob(b) => match try_for_float(b).1 {
+            ParsedNumber::Integer(i) => NumericArg::Float(i as f64),
+            ParsedNumber::Float(f) => NumericArg::Float(f),
+            ParsedNumber::None => NumericArg::Float(0.0),
+        },
+    }
+}
+
+/// Add `i` to the exact-integer running sum. `i64::MIN` is handled in two
+/// steps because it is the one value whose magnitude doesn't fit back into
+/// an `i64`; splitting it keeps the sum on the exact-integer path (no loss
+/// of precision past 2^53) instead of falling back to floating point.
+/// Matches SQLite's `func.c:1875-1880`.
+fn kbn_step_int_neg(acc: &mut Value, i: i64, state: &mut SumAggState) {
+    if i == i64::MIN {
+        apply_kbn_step_int(acc, i64::MAX, state);
+        apply_kbn_step_int(acc, 1, state);
+    } else {
+        apply_kbn_step_int(acc, -i, state);
+    }
+}
+
+/// Subtract the contribution of a single row from the aggregate state,
+/// undoing a previous `update_agg_payload` call. Mirrors SQLite's
+/// xInverse implementations at `func.c:1859-1986`.
+fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Result<()> {
+    match func {
+        AggFunc::Count => {
+            if !matches!(arg, Value::Null) {
+                let Value::Numeric(Numeric::Integer(i)) = &mut payload[0] else {
+                    unreachable!("Count payload is Integer per init_agg_payload");
+                };
+                // Matches SQLite's `assert(p->n>0)` at `func.c:1976` —
+                // every xInverse is paired with a prior xStep for the
+                // same arg, so the counter can never fall below zero.
+                debug_assert!(*i > 0, "Count xInverse without matching xStep");
+                *i -= 1;
+            }
+        }
+        AggFunc::Count0 => {
+            let Value::Numeric(Numeric::Integer(i)) = &mut payload[0] else {
+                unreachable!("Count(*) payload is Integer per init_agg_payload");
+            };
+            debug_assert!(*i > 0, "Count(*) xInverse without matching xStep");
+            *i -= 1;
+        }
+        AggFunc::Sum | AggFunc::Total => {
+            let parsed = classify_numeric_arg(&arg);
+            if matches!(parsed, NumericArg::Null) {
+                return Ok(());
+            }
+            let [acc, r_err_val, approx_val, ovrfl_val, count_val, ..] = payload else {
+                unreachable!(
+                    "Sum/Total payload has acc/r_err/approx/ovrfl/count per init_agg_payload"
+                );
+            };
+            let Value::Numeric(Numeric::Integer(approx_i)) = approx_val else {
+                unreachable!("Sum/Total approx slot is Integer per init_agg_payload");
+            };
+            let Value::Numeric(Numeric::Integer(count)) = count_val else {
+                unreachable!("Sum/Total count slot is Integer per init_agg_payload");
+            };
+            debug_assert!(*count > 0, "Sum/Total xInverse without matching xStep");
+            *count -= 1;
+            let r_err = r_err_val.to_float_or_zero();
+            let ovrfl = matches!(ovrfl_val, Value::Numeric(Numeric::Integer(n)) if *n != 0);
+            let mut sum_state = SumAggState {
+                r_err,
+                approx: true,
+                ovrfl,
+            };
+            // Undo a row's contribution with an exact integer subtract,
+            // but only while the total is still an exact integer (sum()
+            // with no float yet; total() never qualifies, it starts as a
+            // float). If that subtract overflows i64, switch to the
+            // floating-point total and remember the overflow, just like
+            // the step path — so sum() still reports it at the end.
+            // Mirrors sumInverse (func.c). We only take this branch for
+            // integer args; a float here is impossible, since a float
+            // step would already have switched away from the exact total.
+            if *approx_i == 0 {
+                if let Value::Numeric(Numeric::Integer(acc_i)) = acc {
+                    if let NumericArg::Integer(sub) = parsed {
+                        match acc_i.checked_sub(sub) {
+                            Some(x) => {
+                                *acc_i = x;
+                                return Ok(());
+                            }
+                            None => {
+                                let prev = *acc_i;
+                                sum_state.ovrfl = true;
+                                kbn_init_from_int(acc, prev, &mut sum_state);
+                                kbn_step_int_neg(acc, sub, &mut sum_state);
+                                *approx_val = Value::from_i64(1);
+                                *r_err_val = Value::from_f64(sum_state.r_err);
+                                *ovrfl_val = Value::from_i64(sum_state.ovrfl as i64);
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+            match parsed {
+                NumericArg::Integer(i) => kbn_step_int_neg(acc, i, &mut sum_state),
+                NumericArg::Float(f) => apply_kbn_step(acc, -f, &mut sum_state),
+                NumericArg::Null => unreachable!("Null was early-returned above"),
+            }
+            *r_err_val = Value::from_f64(sum_state.r_err);
+            *ovrfl_val = Value::from_i64(sum_state.ovrfl as i64);
+        }
+        AggFunc::Avg => {
+            let parsed = classify_numeric_arg(&arg);
+            if matches!(parsed, NumericArg::Null) {
+                return Ok(());
+            }
+            let [sum_val, r_err_val, count_val, ..] = payload else {
+                unreachable!("Avg payload has sum/r_err/count per init_agg_payload");
+            };
+            let r_err = r_err_val.to_float_or_zero();
+            let Value::Numeric(Numeric::Integer(count)) = count_val else {
+                unreachable!("Avg count slot is Integer per init_agg_payload");
+            };
+            debug_assert!(*count > 0, "Avg xInverse without matching xStep");
+            let mut sum_state = SumAggState {
+                r_err,
+                ..Default::default()
+            };
+            match parsed {
+                NumericArg::Integer(i) => kbn_step_int_neg(sum_val, i, &mut sum_state),
+                NumericArg::Float(f) => apply_kbn_step(sum_val, -f, &mut sum_state),
+                NumericArg::Null => unreachable!("Null was early-returned above"),
+            }
+            *r_err_val = Value::from_f64(sum_state.r_err);
+            *count -= 1;
+        }
+        AggFunc::GroupConcat | AggFunc::StringAgg => {
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
+            let [acc, count_slot, first_separator_len_slot, separator_lengths_slot, ..] = payload
+            else {
+                unreachable!("GroupConcat payload is initialized with four slots");
+            };
+            let Value::Numeric(Numeric::Integer(count)) = count_slot else {
+                unreachable!("GroupConcat count slot is Integer");
+            };
+            let Value::Numeric(Numeric::Integer(first_separator_len)) = first_separator_len_slot
+            else {
+                unreachable!("GroupConcat first separator length is Integer");
+            };
+            let Value::Blob(separator_lengths) = separator_lengths_slot else {
+                unreachable!("GroupConcat separator queue is Blob");
+            };
+            debug_assert!(*count > 0, "GroupConcat xInverse without matching xStep");
+            let old_count = usize::try_from(*count)
+                .map_err(|_| LimboError::InternalError("negative GroupConcat count".into()))?;
+            let expected_separator_bytes = old_count
+                .saturating_sub(1)
+                .checked_mul(std::mem::size_of::<i64>())
+                .ok_or(LimboError::IntegerOverflow)?;
+            if !separator_lengths.is_empty() && separator_lengths.len() != expected_separator_bytes
+            {
+                return Err(LimboError::InternalError(format!(
+                    "GroupConcat separator queue has {} bytes for {old_count} values",
+                    separator_lengths.len()
+                )));
+            }
+
+            let mut rendered = Value::build_text(String::new());
+            rendered.exec_group_concat(&arg)?;
+            let Value::Text(rendered) = rendered else {
+                unreachable!("GroupConcat rendering target is Text");
+            };
+            let value_len = rendered.as_str().len();
+
+            *count -= 1;
+            let separator_len = if !separator_lengths.is_empty() && *count > 0 {
+                let bytes: [u8; std::mem::size_of::<i64>()] = separator_lengths
+                    [..std::mem::size_of::<i64>()]
+                    .try_into()
+                    .expect("separator queue length checked above");
+                separator_lengths.drain(..std::mem::size_of::<i64>());
+                usize::try_from(i64::from_be_bytes(bytes))
+                    .map_err(|_| LimboError::IntegerOverflow)?
+            } else if separator_lengths.is_empty() {
+                usize::try_from(*first_separator_len).map_err(|_| {
+                    LimboError::InternalError("negative GroupConcat separator length".into())
+                })?
+            } else {
+                0
+            };
+            let remove_len = value_len
+                .checked_add(separator_len)
+                .ok_or(LimboError::IntegerOverflow)?;
+            let Value::Text(text) = acc else {
+                unreachable!("GroupConcat accumulator is Text after a non-NULL xStep");
+            };
+            let accumulated_len = text.as_str().len();
+            if remove_len < accumulated_len && !text.as_str().is_char_boundary(remove_len) {
+                return Err(LimboError::InternalError(format!(
+                    "GroupConcat xInverse removes {remove_len} bytes from {accumulated_len}"
+                )));
+            }
+            if remove_len >= accumulated_len {
+                *acc = Value::Null;
+                separator_lengths.clear();
+            } else {
+                text.value.to_mut().drain(..remove_len);
+            }
+        }
+        AggFunc::Min
+        | AggFunc::Max
+        | AggFunc::ArrayAgg
+        | AggFunc::Mode
+        | AggFunc::PercentileCont
+        | AggFunc::PercentileDisc => {
+            // Aggregates without an xInverse are rejected for moving-start
+            // frames, so reaching this arm is a planner regression.
+            unreachable!("planner should reject moving-start frame over non-invertible {func}");
+        }
+        AggFunc::External(_) => {
+            unreachable!("planner rejects moving-start frames over external aggregates");
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupObject
+        | AggFunc::JsonbGroupObject
+        | AggFunc::JsonGroupArray
+        | AggFunc::JsonbGroupArray => {
+            let Value::Blob(data) = &mut payload[0] else {
+                unreachable!("JSON group accumulator payload is Blob");
+            };
+            let expected_container =
+                if matches!(func, AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject) {
+                    12
+                } else {
+                    11
+                };
+            if data.first().map(|header| header & 0x0f) != Some(expected_container) {
+                return Err(LimboError::InternalError(
+                    "JSON group xInverse found an invalid accumulator header".into(),
+                ));
+            }
+            let element_count = if expected_container == 12 { 2 } else { 1 };
+            let mut end = 1usize;
+            for _ in 0..element_count {
+                end = end
+                    .checked_add(raw_jsonb_element_len(data, end)?)
+                    .ok_or(LimboError::IntegerOverflow)?;
+            }
+            data.drain(1..end);
+        }
+    }
+    Ok(())
 }
 
 pub fn op_agg_step(
@@ -12398,7 +12945,7 @@ pub fn op_reset_sorter(
     let cursor = state.get_cursor(*cursor_id);
 
     match cursor_type {
-        CursorType::BTreeTable(_) => {
+        CursorType::BTreeTable(_) | CursorType::BTreeIndex(_) => {
             let cursor = cursor.as_btree_mut();
             return_if_io!(cursor.clear_btree());
         }
@@ -18313,11 +18860,12 @@ mod tests {
     fn test_init_agg_payload_sum() {
         let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::Sum, &mut payload).unwrap();
-        assert_eq!(payload.len(), 4);
+        assert_eq!(payload.len(), 5);
         assert_eq!(payload[0], Value::Null); // acc
         assert_eq!(payload[1], Value::from_f64(0.0)); // r_err
         assert_eq!(payload[2], Value::from_i64(0)); // approx
         assert_eq!(payload[3], Value::from_i64(0)); // ovrfl
+        assert_eq!(payload[4], Value::from_i64(0)); // count
     }
 
     #[test]
@@ -18367,6 +18915,7 @@ mod tests {
             Value::from_f64(0.0),
             Value::from_i64(0),
             Value::from_i64(0),
+            Value::from_i64(0),
         ];
         update_agg_payload(
             &AggFunc::Sum,
@@ -18398,6 +18947,7 @@ mod tests {
             Value::from_f64(0.0),
             Value::from_i64(0),
             Value::from_i64(0),
+            Value::from_i64(1),
         ];
         update_agg_payload(
             &AggFunc::Sum,

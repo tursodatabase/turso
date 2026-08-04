@@ -4,7 +4,8 @@ use crate::SqlGen;
 use crate::ast::{
     BinOp, CompoundOperator, CompoundSelectArm, CteDefinition, CteMaterialization, Expr,
     FromClause, GroupByClause, JoinClause, JoinConstraint, JoinType, Literal, NullsOrder,
-    OrderByItem, OrderDirection, SelectColumn, SelectStmt, WithClause,
+    OrderByItem, OrderDirection, SelectColumn, SelectStmt, WindowFrame, WindowFrameBoundary,
+    WindowFrameExclude, WindowFrameMode, WithClause,
 };
 use crate::capabilities::Capabilities;
 use crate::context::Context;
@@ -13,7 +14,7 @@ use crate::functions::{AGGREGATE_FUNCTIONS, FunctionCategory};
 use crate::generate::expr::generate_condition;
 use crate::generate::expr::generate_expr;
 use crate::generate::literal::generate_literal;
-use crate::policy::SelectConfig;
+use crate::policy::{SelectConfig, WindowFramePolicy};
 use crate::schema::{ColumnDef, DataType, Table};
 use crate::trace::Origin;
 use sql_gen_macros::trace_gen;
@@ -649,7 +650,7 @@ fn generate_select_columns<C: Capabilities>(
                 // (or in ORDER BY of the same SELECT). We don't recurse: the
                 // window function call itself is the projection.
                 let expr = if window_prob > 0.0 && ctx.gen_bool_with_prob(window_prob) {
-                    generate_window_function(ctx)?
+                    generate_window_function(ctx, select_config.window_frame_policy)?
                 } else {
                     let e = generate_expr(generator, ctx, 0)?;
                     // When restricting mixed aggregates and there is no GROUP BY,
@@ -692,6 +693,18 @@ const BUILTIN_WINDOW_FUNCS: &[(&str, WindowFnArity)] = &[
     ("nth_value", WindowFnArity::NthValue),
 ];
 
+const AGGREGATE_WINDOW_FUNCS: &[(&str, WindowFnArity)] = &[
+    ("sum", WindowFnArity::OneArg),
+    ("total", WindowFnArity::OneArg),
+    ("count", WindowFnArity::OneArg),
+    ("avg", WindowFnArity::OneArg),
+    ("min", WindowFnArity::OneArg),
+    ("max", WindowFnArity::OneArg),
+    ("group_concat", WindowFnArity::Concat),
+    ("string_agg", WindowFnArity::Concat),
+    ("json_group_array", WindowFnArity::OneArg),
+];
+
 #[derive(Clone, Copy)]
 enum WindowFnArity {
     ZeroArg,
@@ -699,17 +712,26 @@ enum WindowFnArity {
     Ntile,
     NthValue,
     LagLead,
+    Concat,
 }
 
-/// Generate a `func(...) OVER (...)` projection. Mirrors the grammar at
-/// `window.c:600-708` — only built-in functions and the
-/// planner-coerced frames (no user `ROWS`/`RANGE`/`GROUPS` clauses,
-/// since the engine rejects those).
-fn generate_window_function(ctx: &mut Context) -> Result<Expr, GenError> {
-    // Pick a function.
+/// Generate a `func(...) OVER (...)` projection within the configured
+/// window-frame feature set.
+fn generate_window_function(
+    ctx: &mut Context,
+    frame_policy: WindowFramePolicy,
+) -> Result<Expr, GenError> {
+    let with_explicit_frame =
+        !matches!(frame_policy, WindowFramePolicy::CoercedOnly) && ctx.gen_bool();
+    let functions = if with_explicit_frame {
+        AGGREGATE_WINDOW_FUNCS
+    } else {
+        BUILTIN_WINDOW_FUNCS
+    };
     let (name, arity) = *ctx
-        .choose(BUILTIN_WINDOW_FUNCS)
-        .expect("BUILTIN_WINDOW_FUNCS is non-empty");
+        .choose(functions)
+        .expect("window function sets are non-empty");
+    let frame = with_explicit_frame.then(|| generate_window_frame(ctx, frame_policy));
 
     // Pick a typed column for value args (lag/lead/first_value/etc).
     // We restrict to columns the current scope sees; window functions
@@ -747,13 +769,31 @@ fn generate_window_function(ctx: &mut Context) -> Result<Expr, GenError> {
             }
             a
         }
+        WindowFnArity::Concat => vec![arg_col, pick_scoped_column_ref(ctx)?],
     };
 
     // Build the OVER clause: 0-2 PARTITION BY exprs, 0-2 ORDER BY
     // exprs with the same direction. Columns picked from the SELECT
     // scope so they're always valid.
     let n_part = ctx.gen_range_inclusive(0, 2);
-    let n_ord = ctx.gen_range_inclusive(0, 2);
+    let range_has_offset = frame.is_some_and(|frame| {
+        matches!(frame.mode, WindowFrameMode::Range)
+            && matches!(
+                (frame.start, frame.end),
+                (
+                    WindowFrameBoundary::Preceding(_) | WindowFrameBoundary::Following(_),
+                    _
+                ) | (
+                    _,
+                    WindowFrameBoundary::Preceding(_) | WindowFrameBoundary::Following(_)
+                )
+            )
+    });
+    let n_ord = if range_has_offset {
+        1
+    } else {
+        ctx.gen_range_inclusive(0, 2)
+    };
     let partition_by: Vec<Expr> = (0..n_part)
         .map(|_| pick_scoped_column_ref(ctx))
         .collect::<Result<_, _>>()?;
@@ -770,7 +810,7 @@ fn generate_window_function(ctx: &mut Context) -> Result<Expr, GenError> {
     // between SQLite and Turso (e.g. percent_rank = 1/3). Wrap them in
     // `printf('%.4f', ...)` so the textual comparison agrees while
     // still exercising the same semantics.
-    let win = Expr::window_function(ctx, name.to_string(), args, partition_by, order_by);
+    let win = Expr::window_function(ctx, name.to_string(), args, partition_by, order_by, frame);
     if matches!(name, "percent_rank" | "cume_dist") {
         let fmt_str = Expr::literal(ctx, Literal::Text("%.4f".to_string()));
         Ok(Expr::function_call(
@@ -780,6 +820,122 @@ fn generate_window_function(ctx: &mut Context) -> Result<Expr, GenError> {
         ))
     } else {
         Ok(win)
+    }
+}
+
+/// Generate an explicit frame within the configured feature set.
+fn generate_window_frame(ctx: &mut Context, frame_policy: WindowFramePolicy) -> WindowFrame {
+    match frame_policy {
+        WindowFramePolicy::CoercedOnly => {
+            unreachable!("coerced-only policy does not generate explicit frames")
+        }
+        WindowFramePolicy::Rows => generate_offset_frame(ctx, WindowFrameMode::Rows),
+        WindowFramePolicy::GroupsAndOffsetFreeRange => match ctx.gen_range(3) {
+            0 => generate_offset_frame(ctx, WindowFrameMode::Rows),
+            1 => generate_offset_frame(ctx, WindowFrameMode::Groups),
+            2 => generate_offset_free_range_frame(ctx),
+            _ => unreachable!("range is limited to three frame modes"),
+        },
+        WindowFramePolicy::RangeOffsets => match ctx.gen_range(3) {
+            0 => generate_offset_frame(ctx, WindowFrameMode::Rows),
+            1 => generate_offset_frame(ctx, WindowFrameMode::Groups),
+            2 => generate_offset_frame(ctx, WindowFrameMode::Range),
+            _ => unreachable!("range is limited to three frame modes"),
+        },
+        WindowFramePolicy::Exclude => {
+            let mut frame = match ctx.gen_range(3) {
+                0 => generate_offset_frame(ctx, WindowFrameMode::Rows),
+                1 => generate_offset_frame(ctx, WindowFrameMode::Groups),
+                2 => generate_offset_frame(ctx, WindowFrameMode::Range),
+                _ => unreachable!("range is limited to three frame modes"),
+            };
+            // Retain unexcluded frames so the latest policy continues to
+            // exercise xInverse in addition to the full-scan EXCLUDE path.
+            frame.exclude = if ctx.gen_bool() {
+                None
+            } else {
+                Some(match ctx.gen_range(4) {
+                    0 => WindowFrameExclude::NoOthers,
+                    1 => WindowFrameExclude::CurrentRow,
+                    2 => WindowFrameExclude::Group,
+                    3 => WindowFrameExclude::Ties,
+                    _ => unreachable!("range is limited to four exclusion variants"),
+                })
+            };
+            frame
+        }
+    }
+}
+
+/// Generate one of the structurally valid boundary combinations for a
+/// frame mode that supports integer offsets.
+/// The two offsets are deliberately independent so same-kind pairs also
+/// exercise frames that are empty for every row.
+fn generate_offset_frame(ctx: &mut Context, mode: WindowFrameMode) -> WindowFrame {
+    let start_offset = ctx.gen_range_inclusive(0, 4) as u64;
+    let end_offset = ctx.gen_range_inclusive(0, 4) as u64;
+    use WindowFrameBoundary as Boundary;
+    let (start, end) = match ctx.gen_range(13) {
+        0 => (
+            Boundary::UnboundedPreceding,
+            Boundary::Preceding(end_offset),
+        ),
+        1 => (Boundary::UnboundedPreceding, Boundary::CurrentRow),
+        2 => (
+            Boundary::UnboundedPreceding,
+            Boundary::Following(end_offset),
+        ),
+        3 => (Boundary::UnboundedPreceding, Boundary::UnboundedFollowing),
+        4 => (
+            Boundary::Preceding(start_offset),
+            Boundary::Preceding(end_offset),
+        ),
+        5 => (Boundary::Preceding(start_offset), Boundary::CurrentRow),
+        6 => (
+            Boundary::Preceding(start_offset),
+            Boundary::Following(end_offset),
+        ),
+        7 => (
+            Boundary::Preceding(start_offset),
+            Boundary::UnboundedFollowing,
+        ),
+        8 => (Boundary::CurrentRow, Boundary::CurrentRow),
+        9 => (Boundary::CurrentRow, Boundary::Following(end_offset)),
+        10 => (Boundary::CurrentRow, Boundary::UnboundedFollowing),
+        11 => (
+            Boundary::Following(start_offset),
+            Boundary::Following(end_offset),
+        ),
+        12 => (
+            Boundary::Following(start_offset),
+            Boundary::UnboundedFollowing,
+        ),
+        _ => unreachable!("range is limited to 13 offset frame shapes"),
+    };
+    WindowFrame {
+        mode,
+        start,
+        end,
+        exclude: None,
+    }
+}
+
+/// Generate one of the four structurally valid RANGE frames without a
+/// numeric PRECEDING/FOLLOWING offset.
+fn generate_offset_free_range_frame(ctx: &mut Context) -> WindowFrame {
+    use WindowFrameBoundary as Boundary;
+    let (start, end) = match ctx.gen_range(4) {
+        0 => (Boundary::UnboundedPreceding, Boundary::CurrentRow),
+        1 => (Boundary::UnboundedPreceding, Boundary::UnboundedFollowing),
+        2 => (Boundary::CurrentRow, Boundary::CurrentRow),
+        3 => (Boundary::CurrentRow, Boundary::UnboundedFollowing),
+        _ => unreachable!("range is limited to four offset-free RANGE shapes"),
+    };
+    WindowFrame {
+        mode: WindowFrameMode::Range,
+        start,
+        end,
+        exclude: None,
     }
 }
 
@@ -1551,6 +1707,280 @@ mod tests {
         let sql = stmt.unwrap().to_string();
         assert!(sql.starts_with("SELECT"));
         assert!(sql.contains("FROM users"));
+    }
+
+    #[test]
+    fn test_rows_window_frame_policy_generates_aggregate_frames() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            select_star_weight: 0,
+            column_list_weight: 0,
+            expression_list_weight: 1,
+            expression_count_range: 1..=1,
+            group_by_probability: 0.0,
+            cte_probability: 0.0,
+            compound_probability: 0.0,
+            window_function_probability: 1.0,
+            window_frame_policy: WindowFramePolicy::Rows,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("v", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        let mut generated_rows_frame = false;
+        for seed in 0..100 {
+            let mut ctx = Context::new_with_seed(seed);
+            let select = generate_select_impl(&generator, &mut ctx, SelectMode::Full).unwrap();
+            let sql = select.to_string();
+            if sql.contains(" ROWS BETWEEN ") {
+                assert!(
+                    [
+                        "sum(",
+                        "total(",
+                        "count(",
+                        "avg(",
+                        "min(",
+                        "max(",
+                        "group_concat(",
+                        "string_agg(",
+                        "json_group_array(",
+                    ]
+                    .iter()
+                    .any(|name| sql.contains(name)),
+                    "explicit frames must be attached to supported sliding aggregates: {sql}"
+                );
+                generated_rows_frame = true;
+                break;
+            }
+        }
+        assert!(
+            generated_rows_frame,
+            "ROWS policy should generate an explicit frame"
+        );
+    }
+
+    #[test]
+    fn test_groups_and_range_window_frame_policy_generates_supported_modes() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            select_star_weight: 0,
+            column_list_weight: 0,
+            expression_list_weight: 1,
+            expression_count_range: 1..=1,
+            group_by_probability: 0.0,
+            cte_probability: 0.0,
+            compound_probability: 0.0,
+            window_function_probability: 1.0,
+            window_frame_policy: WindowFramePolicy::GroupsAndOffsetFreeRange,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("v", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut saw_rows = false;
+        let mut saw_groups = false;
+        let mut saw_range = false;
+
+        for seed in 0..500 {
+            let mut ctx = Context::new_with_seed(seed);
+            let select = generate_select_impl(&generator, &mut ctx, SelectMode::Full).unwrap();
+            let sql = select.to_string();
+            let has_explicit_frame = [
+                (" ROWS BETWEEN ", &mut saw_rows),
+                (" GROUPS BETWEEN ", &mut saw_groups),
+                (" RANGE BETWEEN ", &mut saw_range),
+            ]
+            .into_iter()
+            .fold(false, |found, (needle, seen)| {
+                if sql.contains(needle) {
+                    *seen = true;
+                    true
+                } else {
+                    found
+                }
+            });
+            if has_explicit_frame {
+                assert!(
+                    [
+                        "sum(",
+                        "total(",
+                        "count(",
+                        "avg(",
+                        "min(",
+                        "max(",
+                        "group_concat(",
+                        "string_agg(",
+                        "json_group_array(",
+                    ]
+                    .iter()
+                    .any(|name| sql.contains(name)),
+                    "explicit frames must be attached to supported sliding aggregates: {sql}"
+                );
+            }
+            if saw_rows && saw_groups && saw_range {
+                break;
+            }
+        }
+
+        assert!(saw_rows, "phase-2 policy should retain ROWS generation");
+        assert!(saw_groups, "phase-2 policy should generate GROUPS frames");
+        assert!(
+            saw_range,
+            "phase-2 policy should generate offset-free RANGE frames"
+        );
+    }
+
+    #[test]
+    fn test_range_offset_policy_generates_ordered_numeric_range_frames() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            select_star_weight: 0,
+            column_list_weight: 0,
+            expression_list_weight: 1,
+            expression_count_range: 1..=1,
+            group_by_probability: 0.0,
+            cte_probability: 0.0,
+            compound_probability: 0.0,
+            window_function_probability: 1.0,
+            window_frame_policy: WindowFramePolicy::RangeOffsets,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("v", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        for seed in 0..500 {
+            let mut ctx = Context::new_with_seed(seed);
+            let select = generate_select_impl(&generator, &mut ctx, SelectMode::Full).unwrap();
+            let sql = select.to_string();
+            let is_offset_range = sql.contains(" RANGE BETWEEN ")
+                && (sql.contains(" PRECEDING") || sql.contains(" FOLLOWING"));
+            if is_offset_range {
+                assert!(
+                    sql.contains("ORDER BY "),
+                    "RANGE offsets require exactly one ORDER BY expression: {sql}"
+                );
+                assert!(
+                    [
+                        "sum(",
+                        "total(",
+                        "count(",
+                        "avg(",
+                        "min(",
+                        "max(",
+                        "group_concat(",
+                        "string_agg(",
+                        "json_group_array(",
+                    ]
+                    .iter()
+                    .any(|name| sql.contains(name)),
+                    "explicit frames must be attached to supported sliding aggregates: {sql}"
+                );
+                return;
+            }
+        }
+        panic!("RANGE-offset policy should generate a numeric RANGE boundary");
+    }
+
+    #[test]
+    fn test_exclude_policy_generates_all_variants() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            select_star_weight: 0,
+            column_list_weight: 0,
+            expression_list_weight: 1,
+            expression_count_range: 1..=1,
+            group_by_probability: 0.0,
+            cte_probability: 0.0,
+            compound_probability: 0.0,
+            window_function_probability: 1.0,
+            window_frame_policy: WindowFramePolicy::Exclude,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("v", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut saw_no_others = false;
+        let mut saw_current_row = false;
+        let mut saw_group = false;
+        let mut saw_ties = false;
+        let mut saw_offset_range = false;
+        let mut saw_unexcluded_removable_prefix = false;
+
+        for seed in 0..2000 {
+            let mut ctx = Context::new_with_seed(seed);
+            let select = generate_select_impl(&generator, &mut ctx, SelectMode::Full).unwrap();
+            let sql = select.to_string();
+
+            saw_no_others |= sql.contains(" EXCLUDE NO OTHERS");
+            saw_current_row |= sql.contains(" EXCLUDE CURRENT ROW");
+            saw_group |= sql.contains(" EXCLUDE GROUP");
+            saw_ties |= sql.contains(" EXCLUDE TIES");
+
+            let is_offset_range = sql.contains(" RANGE BETWEEN ")
+                && (sql.contains(" PRECEDING") || sql.contains(" FOLLOWING"));
+            if is_offset_range && sql.contains(" EXCLUDE ") {
+                assert!(
+                    sql.contains("ORDER BY "),
+                    "RANGE offsets require exactly one ORDER BY expression: {sql}"
+                );
+                saw_offset_range = true;
+            }
+            saw_unexcluded_removable_prefix |= sql.contains(" BETWEEN ")
+                && !sql.contains("BETWEEN UNBOUNDED PRECEDING")
+                && !sql.contains(" EXCLUDE ")
+                && [
+                    "min(",
+                    "max(",
+                    "group_concat(",
+                    "string_agg(",
+                    "json_group_array(",
+                ]
+                .iter()
+                .any(|name| sql.contains(name));
+
+            if saw_no_others
+                && saw_current_row
+                && saw_group
+                && saw_ties
+                && saw_offset_range
+                && saw_unexcluded_removable_prefix
+            {
+                return;
+            }
+        }
+
+        panic!(
+            "EXCLUDE policy coverage incomplete: no_others={saw_no_others}, \
+             current_row={saw_current_row}, group={saw_group}, ties={saw_ties}, \
+             offset_range={saw_offset_range}, \
+             unexcluded_removable_prefix={saw_unexcluded_removable_prefix}"
+        );
     }
 
     #[test]
