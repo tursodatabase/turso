@@ -2981,18 +2981,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
             CheckpointState::Finalize => {
                 if self.lock_states.blocking_checkpoint_lock_held {
-                    tracing::debug!("Releasing blocking checkpoint lock");
                     // Truncate: B-trees stable under the lock — drop currents + unlink slots.
                     self.mvstore.drop_unused_row_versions_and_slots();
-                    self.checkpoint_lock.unlock();
-                    self.lock_states.blocking_checkpoint_lock_held = false;
                 } else {
                     // Passive: reclaim history + unlink empty slots. Keep last currents —
                     // dropping them makes dual-cursor fall through to B-trees that can
                     // disagree with still-present index/table SkipMap state under concurrency.
                     self.mvstore.drop_unused_row_versions_unlink_empty();
                 }
-                // Locks stay held until `step()` runs `on_checkpoint_end`.
+                // Locks stay held until `step()` runs `on_checkpoint_end`, then
+                // `release_checkpoint_locks_if_needed`.
                 self.finalize(&())?;
                 Ok(TransitionResult::Done(
                     self.checkpoint_result.take().ok_or_else(|| {
