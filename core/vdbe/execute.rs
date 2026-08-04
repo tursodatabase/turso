@@ -1787,12 +1787,49 @@ pub fn op_column(
         },
         insn
     );
+    op_column_impl(
+        program,
+        state,
+        *cursor_id,
+        *column,
+        *dest,
+        std::slice::from_ref(default),
+    )
+}
+
+pub fn op_column_range(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        ColumnRange {
+            cursor_id,
+            start_column,
+            dest,
+            defaults,
+        },
+        insn
+    );
+    op_column_impl(program, state, *cursor_id, *start_column, *dest, defaults)
+}
+
+#[inline(always)]
+fn op_column_impl(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    column: usize,
+    dest: usize,
+    defaults: &[Option<Value>],
+) -> Result<InsnFunctionStepResult> {
     // Fast path: no deferred seek pending and no suspended state machine. The
     // column fetch either completes or yields IO with nothing persisted, so the
     // op-state slot (enum write + drop on clear) is bypassed entirely. On IO
     // resume the slot is still idle and this path re-executes.
-    if state.active_op_state.is_idle() && state.deferred_seeks[*cursor_id].is_none() {
-        let result = op_column_fetch(program, state, *cursor_id, *column, *dest, default)?;
+    if state.active_op_state.is_idle() && state.deferred_seeks[cursor_id].is_none() {
+        let result = op_column_fetch(program, state, cursor_id, column, dest, defaults)?;
         if matches!(result, InsnFunctionStepResult::Step) {
             state.pc += 1;
         }
@@ -1801,7 +1838,7 @@ pub fn op_column(
     'outer: loop {
         match *state.active_op_state.column() {
             OpColumnState::Start => {
-                if let Some(deferred) = state.deferred_seeks[*cursor_id].take() {
+                if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
                     *state.active_op_state.column() = OpColumnState::Rowid {
                         index_cursor_id: deferred.index_cursor_id,
                         table_cursor_id: deferred.table_cursor_id,
@@ -1822,7 +1859,9 @@ pub fn op_column(
                         _ => panic!("unexpected cursor type"),
                     }
                 }) else {
-                    state.registers[*dest].set_null();
+                    for reg in &mut state.registers[dest..dest + defaults.len()] {
+                        reg.set_null();
+                    }
                     break 'outer;
                 };
                 *state.active_op_state.column() = OpColumnState::Seek {
@@ -1857,7 +1896,7 @@ pub fn op_column(
                 *state.active_op_state.column() = OpColumnState::GetColumn;
             }
             OpColumnState::GetColumn => {
-                let result = op_column_fetch(program, state, *cursor_id, *column, *dest, default)?;
+                let result = op_column_fetch(program, state, cursor_id, column, dest, defaults)?;
                 if !matches!(result, InsnFunctionStepResult::Step) {
                     // IO yield: the slot stays at GetColumn so the resume
                     // re-enters this arm.
@@ -1873,10 +1912,21 @@ pub fn op_column(
     Ok(InsnFunctionStepResult::Step)
 }
 
-/// Fetches one column of the cursor's current row into a register. Returns
-/// `Step` on completion; any IO is propagated without persisting state, so
-/// callers can safely re-invoke after the completion finishes.
 fn op_column_fetch(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    column: usize,
+    dest: usize,
+    defaults: &[Option<Value>],
+) -> Result<InsnFunctionStepResult> {
+    match defaults {
+        [default] => op_single_column_fetch(program, state, cursor_id, column, dest, default),
+        _ => op_column_range_fetch(program, state, cursor_id, column, dest, defaults),
+    }
+}
+
+fn op_single_column_fetch(
     program: &Program,
     state: &mut ProgramState,
     cursor_id: usize,
@@ -1949,21 +1999,7 @@ fn op_column_fetch(
             };
 
             // DEFAULT handling
-            let Some(ref default) = default else {
-                state.registers[dest].set_null();
-                return Ok(InsnFunctionStepResult::Step);
-            };
-            match (default, &mut state.registers[dest]) {
-                (Value::Text(new_text), Register::Value(Value::Text(existing_text))) => {
-                    existing_text.do_extend(new_text)?;
-                }
-                (Value::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
-                    existing_blob.do_extend(new_blob)?;
-                }
-                _ => {
-                    state.registers[dest].set_value(default.clone());
-                }
-            }
+            apply_column_default(default, &mut state.registers[dest])?;
         }
         CursorType::Sorter => {
             let record = {
@@ -2027,6 +2063,65 @@ fn op_column_fetch(
         }
         CursorType::VirtualTable(_) => {
             panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
+        }
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+fn apply_column_default(default: &Option<Value>, reg: &mut Register) -> Result<()> {
+    let Some(default) = default else {
+        reg.set_null();
+        return Ok(());
+    };
+    match (default, reg) {
+        (Value::Text(new_text), Register::Value(Value::Text(existing_text))) => {
+            existing_text.do_extend(new_text)?;
+        }
+        (Value::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
+            existing_blob.do_extend(new_blob)?;
+        }
+        (default, reg) => {
+            reg.set_value(default.clone());
+        }
+    }
+    Ok(())
+}
+
+fn op_column_range_fetch(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    start_column: usize,
+    dest: usize,
+    defaults: &[Option<Value>],
+) -> Result<InsnFunctionStepResult> {
+    let count = defaults.len();
+    let filled = {
+        let cursor_ref = must_be_btree_cursor!(cursor_id, program.cursor_ref, state, "ColumnRange");
+        let cursor = cursor_ref.as_btree_mut();
+        if cursor.get_null_flag() {
+            for reg in &mut state.registers[dest..dest + count] {
+                reg.set_null();
+            }
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        let Some(record) = return_if_io!(cursor.record()) else {
+            for reg in &mut state.registers[dest..dest + count] {
+                reg.set_null();
+            }
+            return Ok(InsnFunctionStepResult::Step);
+        };
+        record
+            .iter()?
+            .fill_n_into_registers(start_column, &mut state.registers[dest..dest + count])?
+    };
+    if filled < count {
+        branches::mark_unlikely();
+        for (default, reg) in defaults[filled..]
+            .iter()
+            .zip(&mut state.registers[dest + filled..dest + count])
+        {
+            apply_column_default(default, reg)?;
         }
     }
     Ok(InsnFunctionStepResult::Step)

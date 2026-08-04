@@ -1058,7 +1058,83 @@ impl ProgramBuilder {
         if matches!(insn, Insn::Function { .. }) {
             self.emitted_function_call = true;
         }
+        if let Insn::Column {
+            cursor_id,
+            column,
+            dest,
+            default,
+        } = insn
+        {
+            self.emit_column_insn(cursor_id, column, dest, default);
+            return;
+        }
         self.insns.push((insn, self.insns.len()));
+    }
+
+    fn emit_column_insn(
+        &mut self,
+        cursor_id: CursorID,
+        column: usize,
+        dest: usize,
+        default: Option<Value>,
+    ) {
+        let btree_cursor = matches!(
+            self.cursor_ref.get(cursor_id).map(|(_, kind)| kind),
+            Some(CursorType::BTreeTable(_) | CursorType::BTreeIndex(_))
+        );
+        // A label anchored to the previous instruction must continue to target
+        // this instruction, so it cannot be folded into the previous Column.
+        let previous_is_label_anchor = self
+            .insns
+            .len()
+            .checked_sub(1)
+            .is_some_and(|offset| self.label_to_resolved_offset.contains(&Some(offset as u32)));
+        if btree_cursor && !previous_is_label_anchor {
+            if let Some((prev_insn, _)) = self.insns.last_mut() {
+                match prev_insn {
+                    Insn::Column {
+                        cursor_id: prev_cursor,
+                        column: prev_column,
+                        dest: prev_dest,
+                        default: prev_default,
+                    } if *prev_cursor == cursor_id
+                        && column == *prev_column + 1
+                        && dest == *prev_dest + 1 =>
+                    {
+                        let defaults = vec![prev_default.take(), default];
+                        *prev_insn = Insn::ColumnRange {
+                            cursor_id,
+                            start_column: column - 1,
+                            dest: dest - 1,
+                            defaults,
+                        };
+                        return;
+                    }
+                    Insn::ColumnRange {
+                        cursor_id: prev_cursor,
+                        start_column,
+                        dest: prev_dest,
+                        defaults,
+                    } if *prev_cursor == cursor_id
+                        && column == *start_column + defaults.len()
+                        && dest == *prev_dest + defaults.len() =>
+                    {
+                        defaults.push(default);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.insns.push((
+            Insn::Column {
+                cursor_id,
+                column,
+                dest,
+                default,
+            },
+            self.insns.len(),
+        ));
     }
 
     /// Emit an instruction that should not start or extend a constant span on its own.

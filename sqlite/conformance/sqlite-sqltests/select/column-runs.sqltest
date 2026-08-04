@@ -1,0 +1,52 @@
+@database :memory:
+
+test consecutive-columns {
+    CREATE TABLE t(a INTEGER, b TEXT, c REAL, d BLOB);
+    INSERT INTO t VALUES
+        (1, 'one', 1.5, x'4142'),
+        (2, NULL, -0.5, NULL);
+    SELECT a, b, c, hex(d) FROM t;
+}
+expect {
+    1|one|1.5|4142
+    2||-0.5|
+}
+
+test short-record-defaults {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    INSERT INTO t VALUES (1, 'old');
+    ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'text';
+    ALTER TABLE t ADD COLUMN d INTEGER DEFAULT 42;
+    ALTER TABLE t ADD COLUMN e TEXT;
+    INSERT INTO t VALUES (2, 'new', 'value', 7, 'present');
+    SELECT a, b, c, d, e FROM t ORDER BY a;
+}
+expect {
+    1|old|text|42|
+    2|new|value|7|present
+}
+
+test covering-index-columns {
+    CREATE TABLE t(a INTEGER, b TEXT, c TEXT, d INTEGER);
+    CREATE INDEX idx ON t(b, c, d);
+    INSERT INTO t VALUES (1, 'b1', 'c1', 10), (2, 'b2', 'c2', 20);
+    SELECT b, c, d FROM t WHERE b >= 'b1' ORDER BY b;
+}
+expect {
+    b1|c1|10
+    b2|c2|20
+}
+
+test left-join-null-row {
+    CREATE TABLE l(id INTEGER);
+    CREATE TABLE r(id INTEGER, a TEXT, b TEXT, c TEXT);
+    INSERT INTO l VALUES (1), (2);
+    INSERT INTO r VALUES (1, 'a1', 'b1', 'c1');
+    SELECT l.id, r.a, r.b, r.c
+      FROM l LEFT JOIN r ON l.id = r.id
+      ORDER BY l.id;
+}
+expect {
+    1|a1|b1|c1
+    2|||
+}

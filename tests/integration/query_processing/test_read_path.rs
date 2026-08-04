@@ -1084,3 +1084,19 @@ fn test_parameter_column_names(tmp_db: TempDatabase) {
         assert_eq!(names, expected, "Turso column names mismatch for: {sql}");
     }
 }
+
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t(a, b, c);")]
+fn test_consecutive_column_reads_are_fused(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let mut stmt = conn.prepare("EXPLAIN SELECT a, b, c FROM t")?;
+    let mut column_opcodes = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        let opcode = row.get::<&str>(1)?;
+        if opcode.starts_with("Column") {
+            column_opcodes.push(opcode.to_owned());
+        }
+        Ok(())
+    })?;
+    assert_eq!(column_opcodes, ["ColumnRange"]);
+    Ok(())
+}

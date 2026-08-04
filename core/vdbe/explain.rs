@@ -614,6 +614,30 @@ pub fn insn_to_row(
                     ),
                 )
             }
+            Insn::ColumnRange {
+                cursor_id,
+                start_column,
+                dest,
+                defaults,
+            } => {
+                let count = defaults.len();
+                (
+                    "ColumnRange",
+                    *cursor_id as i64,
+                    *start_column as i64,
+                    *dest as i64,
+                    Value::from_i64(count as i64),
+                    0,
+                    format!(
+                        "r[{}..{}]={}.columns[{}..{}]",
+                        dest,
+                        dest + count - 1,
+                        get_table_or_index_name(*cursor_id),
+                        start_column,
+                        start_column + count - 1,
+                    ),
+                )
+            }
             Insn::ColumnHasField {
                 cursor_id,
                 column,
