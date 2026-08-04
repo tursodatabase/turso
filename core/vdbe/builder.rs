@@ -44,6 +44,7 @@ use super::{
     PreparedProgram, Program,
 };
 use crate::translate::plan::BitSet;
+use smallvec::smallvec;
 use std::num::NonZeroUsize;
 
 /// A key that uniquely identifies a cursor.
@@ -1082,10 +1083,7 @@ impl ProgramBuilder {
     /// the *next* instruction, so this Column must exist as a separate
     /// instruction for that jump to land on. A label anchored even earlier is
     /// fine — a jump onto the head of a run executes the whole run, exactly
-    /// like falling through the unfused Column sequence. Raw
-    /// `BranchOffset::Offset` captures of `self.offset()` would be invisible
-    /// here, but jump targets are label-based in this codebase precisely so
-    /// instructions can be reordered (see `preassign_label_to_next_insn`).
+    /// like falling through the unfused Column sequence..
     fn emit_column_maybe_fused(
         &mut self,
         cursor_id: CursorID,
@@ -1105,11 +1103,11 @@ impl ProgramBuilder {
                         && column == *prev_column + 1
                         && dest == *prev_dest + 1 =>
                     {
-                        let defaults = vec![prev_default.take(), default];
+                        let defaults = smallvec![prev_default.take(), default];
                         *prev_insn = Insn::ColumnRange {
                             cursor_id,
-                            start_column: column - 1,
-                            dest: dest - 1,
+                            start_column: *prev_column,
+                            dest: *prev_dest,
                             defaults,
                         };
                         return;
@@ -1130,6 +1128,7 @@ impl ProgramBuilder {
                 }
             }
         }
+        
         self.insns.push((
             Insn::Column {
                 cursor_id,
@@ -1141,11 +1140,6 @@ impl ProgramBuilder {
         ));
     }
 
-    /// A fused ColumnRange decodes a run of columns from one shared record
-    /// payload; only cursor kinds whose Column reads work that way are fused.
-    /// The rest (virtual tables never emit Column at all; materialized views
-    /// and index methods read column-at-a-time through their own APIs) keep
-    /// individual Column instructions.
     fn column_run_fusable(&self, cursor_id: CursorID) -> bool {
         matches!(
             self.cursor_ref.get(cursor_id).map(|(_, t)| t),
@@ -1158,8 +1152,6 @@ impl ProgramBuilder {
         )
     }
 
-    /// True when some label has been anchored to the last emitted instruction,
-    /// i.e. it must resolve to whatever instruction is emitted next.
     fn label_targets_next_insn(&self) -> bool {
         let Some(last) = self.insns.len().checked_sub(1) else {
             return false;
