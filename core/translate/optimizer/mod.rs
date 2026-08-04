@@ -2993,18 +2993,21 @@ impl Optimizable for ast::Expr {
             Expr::Binary(_, ast::Operator::Modulus | ast::Operator::Divide, _) => false, // 1 % 0, 1 / 0
             Expr::Binary(expr, _, expr1) => expr.is_nonnull(tables) && expr1.is_nonnull(tables),
             Expr::Case {
-                base,
                 when_then_pairs,
                 else_expr,
                 ..
             } => {
-                base.as_ref().is_none_or(|base| base.is_nonnull(tables))
-                    && when_then_pairs
-                        .iter()
-                        .all(|(_, then)| then.is_nonnull(tables))
+                // With no ELSE, the CASE yields NULL when no WHEN matches.
+                // Otherwise its result is one of the THEN values or the ELSE
+                // value, so it is non-null only when all of those are. The base
+                // is only compared in the WHEN tests and never becomes the
+                // result, so its nullability does not matter.
+                when_then_pairs
+                    .iter()
+                    .all(|(_, then)| then.is_nonnull(tables))
                     && else_expr
                         .as_ref()
-                        .is_none_or(|else_expr| else_expr.is_nonnull(tables))
+                        .is_some_and(|else_expr| else_expr.is_nonnull(tables))
             }
             Expr::Cast { expr, .. } => expr.is_nonnull(tables),
             Expr::Collate(expr, _) => expr.is_nonnull(tables),
