@@ -610,3 +610,75 @@ fn test_begin_deferred_emits_no_transaction_opcodes(_tmp_db: TempDatabase) -> an
     );
     Ok(())
 }
+
+/// Regression test: an I/O error while a write statement begins its
+/// transaction on an attached database must roll the attached transaction
+/// back. The attached Transaction opcode runs before the main-database one,
+/// so when it fails nothing has marked the implicit transaction for rollback
+/// on abort; without the attached-side marking the failed statement leaves
+/// the attached WAL write lock held, and the next statement on the
+/// connection — even one that never touches the attached database — tries to
+/// commit that leftover transaction at halt and fails in its place.
+#[test]
+fn test_attached_write_txn_rolled_back_after_io_error() -> anyhow::Result<()> {
+    use crate::queued_io::{QueuedIo, QueuedIoOpKind};
+
+    let io = Arc::new(QueuedIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        "queued-attach-lock.db",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+
+    let conn = db.connect()?;
+    conn.execute("ATTACH 'queued-attach-lock-aux.db' AS aux1")?;
+    conn.execute("CREATE TABLE main_t (x INTEGER)")?;
+    conn.execute("INSERT INTO main_t VALUES (1)")?;
+    conn.execute("CREATE TABLE aux1.t (a INTEGER)")?;
+    conn.execute("INSERT INTO aux1.t VALUES (1)")?;
+    // Move the attached database's pages out of its WAL so the header read
+    // below hits the database file, where the fault is targeted.
+    conn.execute("PRAGMA aux1.wal_checkpoint(TRUNCATE)")?;
+
+    // A write from another connection advances the attached WAL, so `conn`'s
+    // next attached read transaction sees the database as changed, drops its
+    // cached pages and cached schema cookie, and must re-read the header page
+    // from disk inside its attached Transaction opcode.
+    let conn2 = db.connect()?;
+    conn2.execute("ATTACH 'queued-attach-lock-aux.db' AS aux1")?;
+    conn2.execute("INSERT INTO aux1.t VALUES (2)")?;
+
+    // Fail every attached-database read from here on. The UPDATE dies inside
+    // its attached Transaction opcode: after the write lock is taken, while
+    // re-reading the header page for the schema-cookie check.
+    io.fault_after("queued-attach-lock-aux.db", QueuedIoOpKind::Pread, 0);
+    let result = conn.execute("UPDATE aux1.t SET a = a + 10");
+    assert!(
+        result.is_err(),
+        "UPDATE should fail under the injected read fault"
+    );
+
+    // The failed statement must have rolled back the attached write
+    // transaction. If it leaked, this main-only statement commits the
+    // leftover transaction at halt, hits the still-failing attached read,
+    // and errors even though it never touches the attached database.
+    let rows = limbo_exec_rows(&conn, "SELECT count(*) FROM main_t");
+    assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(1)]]);
+
+    io.clear_fault();
+
+    // The connection keeps working normally afterwards.
+    conn.execute("UPDATE aux1.t SET a = a + 10")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a FROM aux1.t ORDER BY a");
+    assert_eq!(
+        rows,
+        vec![
+            vec![rusqlite::types::Value::Integer(11)],
+            vec![rusqlite::types::Value::Integer(12)],
+        ]
+    );
+    Ok(())
+}

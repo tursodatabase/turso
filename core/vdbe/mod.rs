@@ -1081,9 +1081,6 @@ impl ProgramState {
         if is_already_committing {
             return true;
         }
-        if self.auto_txn_cleanup != TxnCleanup::RollbackTxn {
-            return false;
-        }
         let active_writers = connection.n_active_writes.load(Ordering::SeqCst);
         turso_assert!(
             active_writers <= 1,
@@ -1098,16 +1095,45 @@ impl ProgramState {
         if connection.mv_store().is_some() {
             // MVCC keeps one tx id on the connection. A writer waits for
             // sibling readers, and a reader waits for sibling readers/writers.
-            return connection.n_active_root_statements.load(Ordering::SeqCst) == 1
+            return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+                && connection.n_active_root_statements.load(Ordering::SeqCst) == 1
                 && (self.is_active_write || active_writers == 0);
         }
-        if self.is_active_write {
-            // Pager/WAL writers can finish while sibling readers remain active.
-            // The readers keep their cursors and release them when they finish.
+        if self.auto_txn_cleanup == TxnCleanup::RollbackTxn && self.is_active_write {
+            // Pager/WAL writers can finish while sibling readers remain
+            // active, like SQLite commits when the halting statement is the
+            // only writer (the nVdbeWrite check in sqlite3VdbeHalt). The
+            // readers keep their cursors and release them when they finish.
             return true;
         }
-        // Pager/WAL readers do not wait for sibling readers.
-        active_writers == 0
+        // Non-main pagers keep their transaction state on the pager itself,
+        // like SQLite keeps it on the Btree handle (Btree.inTrans), and the
+        // transaction is shared by every statement on the connection.
+        let attached_txn_open = || {
+            connection.with_all_attached_pagers_with_index(|pagers| {
+                pagers
+                    .iter()
+                    .any(|(_, pager)| pager.holds_read_lock() || pager.holds_write_lock())
+            })
+        };
+        if connection.n_active_root_statements.load(Ordering::SeqCst) > 1 {
+            // Readers can finish while sibling readers remain active, but a
+            // shared attached transaction may only be finished by the last
+            // active statement, like SQLite's btreeEndTransaction keeps the
+            // transaction open while db->nVdbeRead > 1.
+            return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+                && active_writers == 0
+                && !attached_txn_open();
+        }
+        // This is the last active statement: finish its own transaction, or
+        // an attached transaction a deferring sibling left behind — SQLite's
+        // vdbeCommit visits every database on halt, so leftovers are closed
+        // even by a statement that never started a transaction itself.
+        if active_writers != 0 {
+            return false;
+        }
+        self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+            || (connection.get_auto_commit() && attached_txn_open())
     }
 
     #[inline]
