@@ -680,6 +680,107 @@ fn test_wal_dropping_one_reader_does_not_close_sibling_reader_transaction() {
 }
 
 #[test]
+fn test_wal_dropping_one_attached_reader_keeps_sibling_reader_locked() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        ":memory:wal-attached-sibling-readers",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    drive_attach(&conn, ":memory:wal-attached-sibling-readers-aux", "aux");
+    conn.execute("CREATE TABLE aux.rows(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO aux.rows VALUES (10), (20)")
+        .unwrap();
+
+    let mut first = conn.prepare("SELECT id FROM aux.rows ORDER BY id").unwrap();
+    assert_eq!(step_returning_id(&mut first), 10);
+    let mut second = conn.prepare("SELECT id FROM aux.rows ORDER BY id").unwrap();
+    assert_eq!(step_returning_id(&mut second), 10);
+
+    drop(first);
+    let detach_err = conn
+        .execute("DETACH aux")
+        .expect_err("the sibling reader must keep the attached database locked");
+    assert!(
+        matches!(detach_err, LimboError::InvalidArgument(ref message) if message == "database aux is locked"),
+        "expected attached database lock error, got {detach_err:?}"
+    );
+    assert_eq!(
+        step_returning_id(&mut second),
+        20,
+        "dropping one attached reader must not close the transaction under its sibling"
+    );
+    finish_without_rows(&mut second);
+    conn.execute("DETACH aux").unwrap();
+}
+
+#[test]
+fn review_attached_writer_success_is_not_lost_when_sibling_dropped() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        ":memory:review-attached-writer-main",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    let aux = ":memory:review-attached-writer-aux";
+    drive_attach(&conn, aux, "aux");
+    conn.execute("CREATE TABLE rows(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO rows VALUES (1), (2)").unwrap();
+    conn.execute("CREATE TABLE aux.rows(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO aux.rows VALUES (10)").unwrap();
+
+    let mut reader = conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
+    assert_eq!(step_returning_id(&mut reader), 1);
+    conn.execute("UPDATE aux.rows SET id = 11").unwrap();
+    drop(reader);
+
+    assert_eq!(ids_from_query(&conn, "SELECT id FROM aux.rows"), vec![11]);
+}
+
+#[test]
+fn review_transactionless_last_sibling_closes_attached_txn() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        ":memory:review-attached-transactionless-main",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    let aux = ":memory:review-attached-transactionless-aux";
+    drive_attach(&conn, aux, "aux");
+    conn.execute("CREATE TABLE aux.rows(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO aux.rows VALUES (10), (20)")
+        .unwrap();
+
+    let mut literal = conn.prepare("SELECT 1").unwrap();
+    assert_eq!(step_returning_id(&mut literal), 1);
+    let mut attached = conn.prepare("SELECT id FROM aux.rows ORDER BY id").unwrap();
+    assert_eq!(step_returning_id(&mut attached), 10);
+    assert_eq!(drain_returning_ids(&mut attached), vec![20]);
+    finish_without_rows(&mut literal);
+
+    conn.execute("DETACH aux").unwrap();
+}
+
+#[test]
 fn test_insert_select_is_busy_while_returning_writer_is_active() {
     let env = SameConnectionMvcc::new(":memory:suspended-insert-select-resume");
     env.setup_rows_and_source_tables();

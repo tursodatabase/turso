@@ -3867,6 +3867,9 @@ pub fn op_transaction_inner(
                 // 2. Start transaction if needed
                 if let Some(mv_store) = mv_store.as_ref() {
                     if is_secondary_db {
+                        if conn.get_auto_commit() && !conn.is_nested_stmt() {
+                            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                        }
                         // Attached databases don't participate in the connection-level
                         // transaction state machine above (phase 1), so the pager read
                         // tx that the main DB path starts on None→Read isn't triggered
@@ -4062,6 +4065,9 @@ pub fn op_transaction_inner(
                     // transactions on the attached pager, since the connection-level
                     // transaction state may already be Read/Write from the main database.
                     if is_secondary_db {
+                        if conn.get_auto_commit() && !conn.is_nested_stmt() {
+                            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                        }
                         // If the pager already holds a read lock (e.g., after
                         // SchemaUpdated reprepare or prior write tx), skip
                         // locks that are already held.
