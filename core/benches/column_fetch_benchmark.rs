@@ -1,17 +1,8 @@
-//! Microbenchmark isolating the per-row record-header walk in op_column.
+//! Benchmark for SELECT * over different shapes of tables
 //!
-//! Every `Insn::Column` re-parses the record header from byte zero, so a
-//! `SELECT *` on an N-column table decodes O(N^2) serial-type varints per row.
-//! These benches time the shapes that matter for that walk:
-//!   - select_star_106 : SELECT * over a ClickBench-hits-width table (max pressure)
-//!   - select_star_21  : SELECT * over a TPC-C-customer-width table
-//!   - select_star_10  : SELECT * over a typical narrow OLTP table
-//!   - late_single_10  : SELECT c9 FROM the 10-column table -- a narrow
-//!     projection of one late column. This is the dominant OLTP access pattern
-//!     and must NOT regress when the wide-table walk is optimized.
-//!
-//! Columns alternate INTEGER and TEXT so header varint widths and serial types
-//! are non-uniform, like real schemas.
+//!   - select_star_106 : SELECT * over a 106-column table
+//!   - select_star_21  : SELECT * over a 21-column table
+//!   - select_star_10  : SELECT * over a 10-column table
 //!
 //! Run:  cargo bench -p turso_core --bench column_fetch_benchmark
 
@@ -43,12 +34,9 @@ const QUERIES: &[(&str, &str, usize)] = &[
     ("select_star_106", "SELECT * FROM t106", 20_000),
     ("select_star_21", "SELECT * FROM t21", 50_000),
     ("select_star_10", "SELECT * FROM t10", 100_000),
-    ("late_single_10", "SELECT c9 FROM t10", 100_000),
 ];
 
-/// Seed a self-contained db file via rusqlite. Even columns are INTEGER, odd
-/// columns are short TEXT, so serial types (and their varint sizes) vary
-/// across the header.
+//TODO use Turso for seeding
 fn seed_db() -> TempDir {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("columns.db");
@@ -94,7 +82,7 @@ fn seed_db() -> TempDir {
     dir
 }
 
-fn drain_turso(db: &Database, stmt: &mut turso_core::Statement) {
+fn drive_stmt_to_completion(db: &Database, stmt: &mut turso_core::Statement) {
     loop {
         match stmt.step().unwrap() {
             StepResult::Row => {
@@ -125,17 +113,15 @@ fn bench_column_fetch(criterion: &mut Criterion) {
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
-        // The whole db is ~30MB; a 64MB page cache keeps every scan CPU-bound
-        // so the measurement isolates record decoding rather than IO.
         {
-            let mut p = conn.prepare("PRAGMA cache_size=-65536").unwrap();
+            let mut p = conn.prepare("PRAGMA cache_size=-65536").unwrap(); //negative means kibibytes (https://sqlite.org/pragma.html#pragma_cache_size)
             while !matches!(p.step().unwrap(), StepResult::Done) {
                 db.io.step().unwrap();
             }
         }
         group.bench_with_input(BenchmarkId::new(*label, nrows), nrows, |b, _| {
             let mut stmt = conn.prepare(sql).unwrap();
-            b.iter(|| drain_turso(&db, &mut stmt));
+            b.iter(|| drive_stmt_to_completion(&db, &mut stmt));
         });
     }
     group.finish();
