@@ -1074,16 +1074,7 @@ impl ProgramBuilder {
 
     /// Emits a Column instruction, fusing it into an immediately preceding
     /// Column/ColumnRange on the same cursor when both the column index and
-    /// the destination register are exactly consecutive. The fused ColumnRange
-    /// walks the record header once for the whole run instead of once per
-    /// column.
-    ///
-    /// Fusion is skipped when a label has been anchored to the previous
-    /// instruction: `preassign_label_to_next_insn` promises a jump target at
-    /// the *next* instruction, so this Column must exist as a separate
-    /// instruction for that jump to land on. A label anchored even earlier is
-    /// fine — a jump onto the head of a run executes the whole run, exactly
-    /// like falling through the unfused Column sequence..
+    /// the destination register are exactly consecutive.
     fn emit_column_maybe_fused(
         &mut self,
         cursor_id: CursorID,
@@ -1091,7 +1082,8 @@ impl ProgramBuilder {
         dest: usize,
         default: Option<Value>,
     ) {
-        if self.column_run_fusable(cursor_id) && !self.label_targets_next_insn() {
+
+        if self.column_run_fusable(cursor_id) {
             if let Some((prev_insn, _)) = self.insns.last_mut() {
                 match prev_insn {
                     Insn::Column {
@@ -1128,7 +1120,7 @@ impl ProgramBuilder {
                 }
             }
         }
-        
+
         self.insns.push((
             Insn::Column {
                 cursor_id,
@@ -1150,14 +1142,6 @@ impl ProgramBuilder {
                     | CursorType::Sorter
             )
         )
-    }
-
-    fn label_targets_next_insn(&self) -> bool {
-        let Some(last) = self.insns.len().checked_sub(1) else {
-            return false;
-        };
-        let last = last as u32;
-        self.label_to_resolved_offset.contains(&Some(last))
     }
 
     /// Emit an instruction that should not start or extend a constant span on its own.
