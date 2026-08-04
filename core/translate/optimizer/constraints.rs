@@ -285,6 +285,42 @@ pub struct TableConstraints {
     pub candidates: Vec<ConstraintUseCandidate>,
 }
 
+/// Build the search terms for an automatic index.
+///
+/// Terms for the same table column use the same index column.
+pub(super) fn automatic_index_terms(
+    table: &JoinedTable,
+    constraints: &TableConstraints,
+) -> Vec<ConstraintRef> {
+    let columns = table.columns();
+    let is_strict = table.table.is_strict();
+    let mut index_columns: SmallVec<[usize; 4]> = constraints
+        .constraints
+        .iter()
+        .filter(|term| term.can_drive_index_seek(columns, is_strict))
+        .filter_map(|term| term.table_col_pos)
+        .collect();
+    index_columns.sort_unstable();
+    index_columns.dedup();
+
+    let mut terms: Vec<_> = constraints
+        .constraints
+        .iter()
+        .enumerate()
+        .filter(|(_, term)| term.can_drive_index_seek(columns, is_strict))
+        .filter_map(|(term_index, term)| {
+            Some(ConstraintRef {
+                constraint_vec_pos: term_index,
+                index_col_pos: index_columns.binary_search(&term.table_col_pos?).ok()?,
+                sort_order: SortOrder::Asc,
+                nulls_order: ast::NullsOrder::First,
+            })
+        })
+        .collect();
+    terms.sort_by_key(|term| term.index_col_pos);
+    terms
+}
+
 /// Estimate selectivity for IN expressions given the number of values and table row count.
 fn estimate_in_selectivity(in_list_len: f64, row_count: f64, not: bool) -> f64 {
     if not {

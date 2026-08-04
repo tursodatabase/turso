@@ -48,6 +48,40 @@ fn correlated_average_uses_one_grouped_table() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Keep one index search when the outer query reads one row.
+#[test]
+fn indexed_average_for_one_outer_row_stays_a_subquery() -> anyhow::Result<()> {
+    let database = TempDatabase::new_with_rusqlite(
+        "CREATE TABLE outer_rows(id INTEGER PRIMARY KEY, amount INT)",
+    );
+    let connection = database.connect_limbo();
+    connection.execute("CREATE TABLE inner_rows(key1 INT, amount INT)")?;
+    connection.execute("CREATE INDEX inner_rows_key1 ON inner_rows(key1)")?;
+
+    let details = explain(
+        &connection,
+        "SELECT id FROM outer_rows o
+         WHERE o.id = 1
+           AND amount < (
+               SELECT avg(i.amount)
+               FROM inner_rows i
+               WHERE i.key1 = o.id
+           )",
+    )?;
+
+    assert!(
+        details.iter().any(|detail| detail.contains("CORRELATED")),
+        "expected the indexed subquery to stay as written, got {details:?}"
+    );
+    assert!(
+        details
+            .iter()
+            .any(|detail| detail.contains("inner_rows_key1") && detail.contains("key1=?")),
+        "expected an indexed lookup for the correlated subquery, got {details:?}"
+    );
+    Ok(())
+}
+
 /// A TPC-H Q2 query should compute its minimum values once.
 #[test]
 fn minimum_over_a_join_becomes_a_joined_table() -> anyhow::Result<()> {

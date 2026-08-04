@@ -420,6 +420,7 @@ fn try_rewrite_single_value_aggregate(
     inner_plan.simple_aggregate = None;
     inner_plan.input_cardinality_hint = None;
     inner_plan.estimated_output_rows = None;
+    inner_plan.estimated_cost = None;
     inner_plan.table_references.clear_outer_query_refs();
 
     let mut group_columns: Vec<Expr> = Vec::new();

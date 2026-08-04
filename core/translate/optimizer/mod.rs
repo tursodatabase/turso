@@ -52,7 +52,7 @@ use crate::{
 };
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
 use constraints::{
-    can_use_partial_index, constraints_from_where_clause, partial_index,
+    automatic_index_terms, can_use_partial_index, constraints_from_where_clause, partial_index,
     partial_index_predicate_terms, usable_constraints_for_join_order, Constraint, ConstraintRef,
 };
 use cost::Cost;
@@ -63,6 +63,7 @@ use order::{
     EliminatesSortBy, OrderTargetPurpose,
 };
 use rustc_hash::FxHashMap as HashMap;
+use smallvec::SmallVec;
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::RefAct;
@@ -747,9 +748,17 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
     }
 }
 
+/// The table plan chosen for one SELECT.
 struct OptimizeTableAccessResult {
+    /// Tables in the order they will be read.
     join_order: Vec<JoinOrderMember>,
+    /// Rows expected from the full join.
     output_rows: f64,
+    /// Work expected from the full join.
+    cost: Cost,
+    /// Expected calls to each correlated subquery.
+    subquery_calls: SmallVec<[(TableInternalId, f64); 2]>,
+    /// Whether `min` or `max` can stop after the first row.
     min_max_fast_path: bool,
 }
 
@@ -760,24 +769,63 @@ struct OptimizeTableAccessResult {
  */
 #[turso_macros::trace_stack]
 pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
-    let schema = resolver.schema();
     // Transform MATCH expressions to fts_match() for FTS optimizer recognition
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
+    transform_match_to_fts_match(
+        &mut plan.where_clause,
+        resolver.schema(),
+        &plan.table_references,
+    )?;
 
-    unnest::rewrite_correlated_subqueries(plan, resolver)?;
-    // EXISTS only needs 1 row. Add LIMIT 1 to surviving (non-unnested) EXISTS
-    // subqueries. This is done here rather than in the subquery planner so that
-    // unnesting sees the plan without an artificial LIMIT.
-    for sub in &mut plan.non_from_clause_subqueries {
-        if matches!(sub.query_type, ast::SubqueryType::Exists { .. }) {
+    if !plan
+        .non_from_clause_subqueries
+        .iter()
+        .any(|subquery| subquery.correlated)
+    {
+        return optimize_select_plan_form(plan, resolver);
+    }
+
+    let mut rewritten = plan.clone();
+    if !unnest::rewrite_correlated_subqueries(&mut rewritten, resolver)? {
+        return optimize_select_plan_form(plan, resolver);
+    }
+
+    optimize_select_plan_form(plan, resolver)?;
+    optimize_select_plan_form(&mut rewritten, resolver)?;
+
+    if matches!(
+        (plan.estimated_cost, rewritten.estimated_cost),
+        (Some(original_cost), Some(rewritten_cost)) if rewritten_cost <= original_cost
+    ) {
+        // Equal work is better without one subquery call per outer row.
+        *plan = rewritten;
+    }
+
+    Ok(())
+}
+
+/// Choose table reads for one version of a query.
+fn optimize_select_plan_form(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
+    let schema = resolver.schema();
+    #[cfg(feature = "optimizer_params")]
+    let params: &cost_params::CostModelParams = &cost_params::LOADED_PARAMS;
+    #[cfg(not(feature = "optimizer_params"))]
+    let params: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
+    plan.estimated_output_rows = None;
+    plan.estimated_cost = None;
+
+    // EXISTS only needs one row. Add LIMIT 1 to subqueries left after the
+    // rewrite. The rewrite must see the limit written by the user, if any.
+    for subquery in &mut plan.non_from_clause_subqueries {
+        if matches!(subquery.query_type, ast::SubqueryType::Exists { .. }) {
             if let SubqueryState::Unevaluated {
-                plan: Some(inner), ..
-            } = &mut sub.state
+                plan: Some(inner_plan),
+                ..
+            } = &mut subquery.state
             {
-                if let Plan::Select(ref mut inner) = inner.as_mut() {
-                    if inner.limit.is_none() {
-                        inner.limit = Some(Box::new(Expr::Literal(ast::Literal::Numeric(
+                if let Plan::Select(ref mut inner_plan) = inner_plan.as_mut() {
+                    if inner_plan.limit.is_none() {
+                        inner_plan.limit = Some(Box::new(Expr::Literal(ast::Literal::Numeric(
                             "1".to_string(),
                         ))));
                     }
@@ -793,6 +841,8 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
         plan.contains_constant_false_condition = true;
+        plan.estimated_output_rows = Some(0.0);
+        plan.estimated_cost = Some(0.0);
         return Ok(());
     }
 
@@ -821,6 +871,12 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
         plan.simple_aggregate = None;
     }
 
+    let table_cost = best_join_order.as_ref().map(|result| result.cost);
+    let subquery_calls = best_join_order
+        .as_ref()
+        .map(|result| result.subquery_calls.clone())
+        .unwrap_or_default();
+
     if let Some(OptimizeTableAccessResult {
         join_order,
         output_rows,
@@ -828,32 +884,70 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
     }) = best_join_order
     {
         plan.join_order = join_order;
-        let mut est = output_rows;
+        let mut rows = estimate_select_output_rows(plan, output_rows, schema);
         // Clamp to LIMIT when it's a literal non-negative number.
         // Negative LIMIT means "no limit" in SQLite, so we skip those.
-        if let Some(limit_expr) = &plan.limit {
-            if let Ok(val) = crate::util::parse_signed_number(limit_expr) {
-                let limit_f64 = match val {
-                    crate::types::Value::Numeric(Numeric::Integer(i)) if i >= 0 => Some(i as f64),
-                    crate::types::Value::Numeric(Numeric::Float(f)) => {
-                        let f: f64 = f.into();
-                        if f >= 0.0 {
-                            Some(f)
+        if let Some(limit) = &plan.limit {
+            if let Ok(value) = crate::util::parse_signed_number(limit) {
+                let limit_rows = match value {
+                    crate::types::Value::Numeric(Numeric::Integer(value)) if value >= 0 => {
+                        Some(value as f64)
+                    }
+                    crate::types::Value::Numeric(Numeric::Float(value)) => {
+                        let value: f64 = value.into();
+                        if value >= 0.0 {
+                            Some(value)
                         } else {
                             None
                         }
                     }
                     _ => None,
                 };
-                if let Some(limit_val) = limit_f64 {
-                    est = est.min(limit_val);
+                if let Some(limit_rows) = limit_rows {
+                    rows = rows.min(limit_rows);
                 }
             }
         }
-        plan.estimated_output_rows = Some(est);
+        plan.estimated_output_rows = Some(rows);
     }
 
-    reoptimize_correlated_subqueries(plan, resolver)?;
+    replan_correlated_subqueries(plan, resolver, &subquery_calls)?;
+
+    let table_cost = table_cost.or_else(|| {
+        plan.table_references
+            .joined_tables()
+            .is_empty()
+            .then_some(Cost(0.0))
+    });
+    if let Some(table_cost) = table_cost {
+        let subquery_cost =
+            plan.non_from_clause_subqueries
+                .iter()
+                .try_fold(0.0, |total, subquery| {
+                    let SubqueryState::Unevaluated {
+                        plan: Some(inner_plan),
+                    } = &subquery.state
+                    else {
+                        return None;
+                    };
+                    let calls = if subquery.correlated {
+                        subquery_calls
+                            .iter()
+                            .find_map(|(id, calls)| (*id == subquery.internal_id).then_some(*calls))
+                            .unwrap_or_else(|| plan.input_cardinality_hint.unwrap_or(1.0))
+                    } else {
+                        1.0
+                    };
+                    // Starting the subquery program takes work on every call.
+                    let call_cost = calls.max(1.0) * params.cpu_cost_per_seek;
+                    inner_plan
+                        .estimated_cost()
+                        .map(|cost| total + cost + call_cost)
+                });
+        if let Some(subquery_cost) = subquery_cost {
+            plan.estimated_cost = Some(table_cost.0 + subquery_cost);
+        }
+    }
 
     Ok(())
 }
@@ -1255,6 +1349,7 @@ fn build_update_write_set_plan(
         window: None,
         input_cardinality_hint: None,
         estimated_output_rows: None,
+        estimated_cost: None,
         // For regular UPDATEs, only WHERE-clause subqueries move into the ephemeral plan.
         // For UPDATE ... FROM, SET expressions become part of the ephemeral SELECT payload,
         // so their subqueries move too.
@@ -1373,81 +1468,77 @@ fn optimize_subqueries(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()>
     Ok(())
 }
 
-/// Re-run correlated subqueries once the enclosing plan has learned a better
-/// estimate for how many times they will be invoked.
+/// Plan each correlated subquery again with its expected number of calls.
 ///
-/// This converges because `input_cardinality_hint` is monotonic within one
-/// optimization pass: once a plan receives a hint, later re-entry compares
-/// against that stored hint and skips re-optimization unless the new hint is
-/// strictly larger. The recursive call therefore only propagates larger hints
-/// down the subquery tree; it does not oscillate based on newly estimated row
-/// counts.
-fn reoptimize_correlated_subqueries(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
-    let Some(invocation_hint) = plan
-        .input_cardinality_hint
-        .or(plan.estimated_output_rows)
-        .filter(|hint| *hint > 1.0)
-    else {
-        return Ok(());
-    };
-
+/// Start from the saved plan because the first pass may have removed terms that
+/// are now part of an index search.
+fn replan_correlated_subqueries(
+    plan: &mut SelectPlan,
+    resolver: &Resolver,
+    subquery_calls: &[(TableInternalId, f64)],
+) -> Result<()> {
     for subquery in &mut plan.non_from_clause_subqueries {
         if !subquery.correlated {
             continue;
         }
+        let call_count = subquery_calls
+            .iter()
+            .find_map(|(id, calls)| (*id == subquery.internal_id).then_some(*calls))
+            .unwrap_or_else(|| plan.input_cardinality_hint.unwrap_or(1.0))
+            .max(1.0);
         let SubqueryState::Unevaluated {
             plan: Some(inner_plan),
         } = &mut subquery.state
         else {
             continue;
         };
-        let Plan::Select(ref mut inner_plan) = inner_plan.as_mut() else {
+        if call_count <= 1.0 {
+            continue;
+        }
+        let Some(saved_plan) = &subquery.saved_plan else {
             continue;
         };
-        if !select_plan_contains_cte_from_clause_subquery(inner_plan) {
-            continue;
+        *inner_plan = saved_plan.clone();
+        if matches!(subquery.query_type, ast::SubqueryType::Exists { .. }) {
+            if let Plan::Select(inner_plan) = inner_plan.as_mut() {
+                if inner_plan.limit.is_none() {
+                    inner_plan.limit = Some(Box::new(Expr::Literal(ast::Literal::Numeric(
+                        "1".to_string(),
+                    ))));
+                }
+            }
         }
-
-        if inner_plan
-            .input_cardinality_hint
-            .is_some_and(|hint| hint >= invocation_hint)
-        {
-            continue;
-        }
-
-        inner_plan.input_cardinality_hint = Some(invocation_hint);
-        optimize_select_plan(inner_plan, resolver)?;
+        optimize_plan_for_calls(inner_plan, resolver, call_count)?;
     }
 
     Ok(())
 }
 
-/// Return whether this plan contains any FROM-clause CTE reference whose
-/// access-path choice may change when the enclosing invocation count grows.
-fn select_plan_contains_cte_from_clause_subquery(plan: &SelectPlan) -> bool {
-    plan.table_references
-        .joined_tables()
-        .iter()
-        .any(|table| match &table.table {
-            Table::FromClauseSubquery(subquery) => {
-                subquery.cte_id().is_some()
-                    || match subquery.plan.as_ref() {
-                        Plan::Select(select_plan) => {
-                            select_plan_contains_cte_from_clause_subquery(select_plan)
-                        }
-                        Plan::CompoundSelect {
-                            left, right_most, ..
-                        } => {
-                            left.iter().any(|(select_plan, _)| {
-                                select_plan_contains_cte_from_clause_subquery(select_plan)
-                            }) || select_plan_contains_cte_from_clause_subquery(right_most)
-                        }
-                        Plan::RecursiveCte(_) => false,
-                        Plan::Delete(_) | Plan::Update(_) => false,
-                    }
+/// Set how many times a plan will run, then plan its table reads again.
+fn optimize_plan_for_calls(plan: &mut Plan, resolver: &Resolver, call_count: f64) -> Result<()> {
+    let optimize = |plan: &mut SelectPlan| -> Result<()> {
+        if plan
+            .input_cardinality_hint
+            .is_some_and(|hint| hint >= call_count)
+        {
+            return Ok(());
+        }
+        plan.input_cardinality_hint = Some(call_count);
+        optimize_select_plan(plan, resolver)
+    };
+
+    match plan {
+        Plan::Select(plan) => optimize(plan),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            for (plan, _) in left {
+                optimize(plan)?;
             }
-            _ => false,
-        })
+            optimize(right_most)
+        }
+        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => Ok(()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1668,6 +1759,58 @@ fn base_row_estimate(
         },
         _ => RowCountEstimate::hardcoded_fallback(params),
     }
+}
+
+/// Estimate the rows returned by a SELECT after grouping or an aggregate.
+fn estimate_select_output_rows(plan: &SelectPlan, input_rows: f64, schema: &Schema) -> f64 {
+    let calls = plan.input_cardinality_hint.unwrap_or(1.0);
+    let Some(group_by) = &plan.group_by else {
+        return if plan.aggregates.is_empty() {
+            input_rows
+        } else {
+            calls
+        };
+    };
+    if group_by.exprs.is_empty() {
+        return calls;
+    }
+
+    let mut table_ids: SmallVec<[TableInternalId; 2]> = SmallVec::new();
+    for expr in &group_by.exprs {
+        crate::translate::expr::walk_expr(expr, &mut |expr| -> Result<
+            crate::translate::expr::WalkControl,
+        > {
+            let table_id = match expr {
+                Expr::Column { table, .. } | Expr::RowId { table, .. } => Some(*table),
+                _ => None,
+            };
+            if let Some(table_id) = table_id {
+                if !table_ids.contains(&table_id) {
+                    table_ids.push(table_id);
+                }
+            }
+            Ok(crate::translate::expr::WalkControl::Continue)
+        })
+        .expect("walking a GROUP BY expression cannot fail");
+    }
+    if table_ids.is_empty() {
+        return calls;
+    }
+
+    #[cfg(feature = "optimizer_params")]
+    let params: &cost_params::CostModelParams = &cost_params::LOADED_PARAMS;
+    #[cfg(not(feature = "optimizer_params"))]
+    let params: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
+
+    let rows_per_call = table_ids.iter().try_fold(1.0, |rows, table_id| {
+        let table = plan
+            .table_references
+            .joined_tables()
+            .iter()
+            .find(|table| table.internal_id == *table_id)?;
+        Some(rows * *base_row_estimate(schema, table, params))
+    });
+    rows_per_call.map_or(input_rows, |rows| input_rows.min(calls * rows))
 }
 
 /// Returns true if a WHERE-term predicate is null-rejecting for a table: the
@@ -2240,65 +2383,18 @@ fn optimize_table_access(
                             });
                         continue;
                     };
-                    // Ephemeral indexes mirror rowid/column lookups; expression-index
-                    // constraints (table_col_pos == None) fall back to a scan.
-                    let table_columns = table_references.joined_tables()[table_idx].table.columns();
-                    let is_strict = table_references.joined_tables()[table_idx]
-                        .table
-                        .is_strict();
-                    let usable: Vec<(usize, &Constraint)> = table_constraints
-                        .constraints
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, c)| c.can_drive_index_seek(table_columns, is_strict))
-                        .collect();
                     // Find this table's position in best_join_order (which excludes build tables)
                     let join_order_pos = best_join_order
                         .iter()
                         .position(|m| m.original_idx == table_idx)
                         .unwrap_or_else(|| best_join_order.len().saturating_sub(1));
-
-                    // Build a mapping from table_col_pos to index_col_pos.
-                    // Multiple constraints on the same column should share the same index_col_pos.
-                    //
-                    // This is important when a column appears in multiple constraints.
-                    // For example, in:
-                    //   SELECT * FROM t1 LEFT JOIN t2 ON t1.a = t2.a AND t1.c = t2.c WHERE t2.a = 17
-                    //
-                    // The constraints on t2 are:
-                    //   t2.a = t1.a (from ON clause)
-                    //   t2.c = t1.c (from ON clause)
-                    //   t2.a = 17   (from WHERE clause)
-                    //
-                    // Both t2.a constraints must map to index_col_pos=0. If we incorrectly
-                    // assigned sequential index positions (0, 1, 2), the seek key would include
-                    // 3 components but the ephemeral index only has 2 key columns (t2.a, t2.c),
-                    // causing the seek to compare against the wrong columns and return no results.
-                    let unique_col_positions: BitSet = usable
-                        .iter()
-                        .map(|(_, c)| c.table_col_pos.expect("table_col_pos was Some above"))
-                        .try_collect()?;
-                    // Map each usable constraint to a ConstraintRef.
-                    // Multiple constraints with the same table_col_pos share the same index_col_pos.
-                    let mut temp_constraint_refs: Vec<ConstraintRef> = usable
-                        .iter()
-                        .map(|(orig_idx, c)| {
-                            let table_col_pos =
-                                c.table_col_pos.expect("table_col_pos was Some above");
-                            let index_col_pos = unique_col_positions.rank(table_col_pos);
-                            ConstraintRef {
-                                constraint_vec_pos: *orig_idx, // index in the original constraints vec
-                                index_col_pos,
-                                sort_order: SortOrder::Asc,
-                                nulls_order: ast::NullsOrder::First,
-                            }
-                        })
-                        .collect();
-
-                    temp_constraint_refs.sort_by_key(|x| x.index_col_pos);
+                    let index_terms = automatic_index_terms(
+                        &table_references.joined_tables()[table_idx],
+                        table_constraints,
+                    );
                     let usable_constraint_refs = usable_constraints_for_join_order(
                         &table_constraints.constraints,
-                        &temp_constraint_refs,
+                        &index_terms,
                         &best_join_order[..=join_order_pos],
                     )?;
 
@@ -2669,6 +2765,8 @@ fn optimize_table_access(
     Ok(Some(OptimizeTableAccessResult {
         join_order: best_join_order,
         output_rows: final_output_cardinality,
+        cost: best_plan.cost,
+        subquery_calls: best_plan.subquery_calls,
         min_max_fast_path: matches!(simple_aggregate, Some(SimpleAggregate::MinMax(_)))
             && sort_eliminated,
     }))

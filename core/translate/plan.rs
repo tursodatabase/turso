@@ -405,6 +405,21 @@ pub struct RecursiveCtePlan {
 }
 
 impl Plan {
+    /// Return the estimated work for this plan's expected number of calls.
+    pub(crate) fn estimated_cost(&self) -> Option<f64> {
+        match self {
+            Plan::Select(plan) => plan.estimated_cost,
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => left
+                .iter()
+                .map(|(plan, _)| plan.estimated_cost)
+                .chain(core::iter::once(right_most.estimated_cost))
+                .try_fold(0.0, |total, cost| cost.map(|cost| total + cost)),
+            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => None,
+        }
+    }
+
     /// Returns true if this SELECT plan contains a reference to the given table.
     /// For compound selects, checks all component selects.
     /// Returns false for Delete/Update plans.
@@ -767,6 +782,9 @@ pub struct SelectPlan {
     /// Estimated output rows from the optimizer's join order computation.
     /// Used to propagate cardinality estimates for CTE/subquery tables.
     pub estimated_output_rows: Option<f64>,
+    /// Estimated work for this query after its table reads are chosen.
+    /// Parent queries use this when they compare a subquery with a join.
+    pub(crate) estimated_cost: Option<f64>,
     /// When set, this query is a simple aggregate (COUNT(*), MIN, or MAX)
     /// that can be satisfied without a full table scan.
     pub simple_aggregate: Option<SimpleAggregate>,
@@ -3604,6 +3622,9 @@ pub struct NonFromClauseSubquery {
     pub internal_id: TableInternalId,
     pub query_type: SubqueryType,
     pub state: SubqueryState,
+    /// A copy saved before the optimizer changed the plan.
+    /// It is used when the subquery needs a new estimate for its number of calls.
+    pub(crate) saved_plan: Option<Box<Plan>>,
     pub correlated: bool,
     pub origin: SubqueryOrigin,
     pub eval_phase: SubqueryEvalPhase,
