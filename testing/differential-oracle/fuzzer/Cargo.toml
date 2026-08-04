@@ -18,6 +18,10 @@ path = "printf_fuzzer.rs"
 name = "custom_types_fuzzer"
 path = "custom_types_fuzzer.rs"
 
+[[bin]]
+name = "differential_probe"
+path = "probe.rs"
+
 [lib]
 path = "lib.rs"
 

@@ -35,7 +35,7 @@ const MAX_CANDIDATES: usize = 800;
 /// edit if the candidate reproduces the same class (and, for errors, the same
 /// error prefix), so the reduction cannot drift onto a different bug.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Divergence {
+pub enum Divergence {
     /// Turso returned an error, SQLite did not. Holds an error prefix.
     TursoErr(String),
     /// SQLite returned an error, Turso did not. Holds an error prefix.
@@ -54,7 +54,7 @@ fn error_prefix(msg: &str) -> String {
 }
 
 /// A fresh pair of engines with the failure state loaded.
-struct EnginePair {
+pub struct EnginePair {
     turso: Arc<turso_core::Connection>,
     sqlite: rusqlite::Connection,
     /// Keeps the database (and its in-memory IO) alive for `turso`.
@@ -67,7 +67,7 @@ impl EnginePair {
     /// from a live database, so failures here would only come from replay
     /// artifacts, and the baseline check below decides whether the replayed
     /// state is good enough to shrink against.
-    fn build(state_sql: &str) -> Result<Self> {
+    pub fn build(state_sql: &str) -> Result<Self> {
         let io = Arc::new(MemorySimIO::new(0));
         let opts = turso_core::DatabaseOpts::new().with_attach(true);
         let turso_db = Database::open_file_with_flags(
@@ -95,9 +95,17 @@ impl EnginePair {
         })
     }
 
+    /// Run `sql` on both engines and return both raw results (turso, sqlite).
+    pub fn run_both(&self, sql: &str) -> (QueryResult, QueryResult) {
+        (
+            DifferentialOracle::execute_turso(&self.turso, sql),
+            DifferentialOracle::execute_sqlite(&self.sqlite, sql),
+        )
+    }
+
     /// Run `sql` on both engines and classify the outcome. `None` means the
     /// engines agreed (no divergence).
-    fn classify(&self, sql: &str) -> Option<Divergence> {
+    pub fn classify(&self, sql: &str) -> Option<Divergence> {
         let t = DifferentialOracle::execute_turso(&self.turso, sql);
         let s = DifferentialOracle::execute_sqlite(&self.sqlite, sql);
         match (&t, &s) {
@@ -116,7 +124,7 @@ impl EnginePair {
     }
 
     /// Compare the full contents of every table on both engines.
-    fn states_differ(&self) -> bool {
+    pub fn states_differ(&self) -> bool {
         for db in ["main", "temp", "aux"] {
             let master = if db == "main" {
                 "sqlite_master".to_string()
@@ -148,7 +156,7 @@ impl EnginePair {
     }
 }
 
-fn query_results_differ(a: &QueryResult, b: &QueryResult) -> bool {
+pub fn query_results_differ(a: &QueryResult, b: &QueryResult) -> bool {
     match (a, b) {
         (QueryResult::Rows(ra), QueryResult::Rows(rb)) => {
             !sql_gen_prop::result::diff_results(ra, rb).is_empty()
