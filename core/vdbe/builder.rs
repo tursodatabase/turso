@@ -44,7 +44,6 @@ use super::{
     PreparedProgram, Program,
 };
 use crate::translate::plan::BitSet;
-use smallvec::smallvec;
 use std::num::NonZeroUsize;
 
 /// A key that uniquely identifies a cursor.
@@ -1103,7 +1102,7 @@ impl ProgramBuilder {
                         && column == *prev_column + 1
                         && dest == *prev_dest + 1 =>
                     {
-                        let defaults = smallvec![prev_default.take(), default];
+                        let defaults = vec![prev_default.take(), default];
                         *prev_insn = Insn::ColumnRange {
                             cursor_id,
                             start_column: *prev_column,

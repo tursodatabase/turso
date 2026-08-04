@@ -1,4 +1,3 @@
-use smallvec::SmallVec;
 use std::num::{NonZero, NonZeroUsize};
 
 /// Convert a usize to u32 for instruction fields (registers, counts).
@@ -600,7 +599,8 @@ pub enum Insn {
         cursor_id: CursorID,
         start_column: usize,
         dest: usize,
-        defaults: SmallVec<[Option<Value>; 2]>,
+        // this can't be a SmallVec because it would make the enum too large.
+        defaults: Vec<Option<Value>>,
     },
 
     /// Jump to `target_pc` if the cursor's current record contains a field at
