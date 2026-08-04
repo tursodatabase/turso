@@ -1088,6 +1088,10 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
                     self.hash_ctx
                         .inner_loop_gosub_reg
                         .zip(self.hash_ctx.labels.inner_loop_gosub),
+                    payload_regs(
+                        self.hash_ctx.payload_start_reg,
+                        self.hash_ctx.payload_columns.len(),
+                    ),
                 )?;
             }
         }
@@ -1181,6 +1185,7 @@ pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
         hash_ctx
             .inner_loop_gosub_reg
             .zip(hash_ctx.labels.inner_loop_gosub),
+        payload_regs(payload_dest_reg, num_payload),
     )?;
 
     program.preassign_label_to_next_insn(label_next_unmatched);
@@ -1196,6 +1201,15 @@ pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
     });
     program.preassign_label_to_next_insn(done_unmatched);
     Ok(())
+}
+
+/// The registers holding this hash join's payload, which the unmatched-row paths
+/// refill for every row they emit. Empty when the join carries no payload.
+fn payload_regs(start_reg: Option<usize>, num_payload: usize) -> Range<usize> {
+    match start_reg {
+        Some(start) => start..start + num_payload,
+        None => 0..0,
+    }
 }
 
 /// Grace Hash Join processing loop after the probe cursor is exhausted.
@@ -1373,6 +1387,7 @@ impl GraceHashLoop {
                     hash_ctx
                         .inner_loop_gosub_reg
                         .zip(hash_ctx.labels.inner_loop_gosub),
+                    payload_regs(payload_dest_reg, num_payload),
                 )?;
             }
 
@@ -1430,6 +1445,7 @@ impl GraceHashLoop {
                     hash_ctx
                         .inner_loop_gosub_reg
                         .zip(hash_ctx.labels.inner_loop_gosub),
+                    payload_regs(payload_dest_reg, num_payload),
                 )?;
 
                 program.preassign_label_to_next_insn(grace_next_unmatched);

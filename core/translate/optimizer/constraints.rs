@@ -21,7 +21,7 @@ use crate::{
 };
 use crate::{turso_assert, turso_debug_assert};
 use smallvec::SmallVec;
-use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
@@ -868,15 +868,11 @@ pub fn constraints_from_where_clause(
         }
         // sort equalities first so that index keys will be properly constructed.
         // see e.g.: https://www.solarwinds.com/blog/the-left-prefix-index-rule
-        cs.constraints.sort_by(|a, b| {
-            if is_equality_operator(a.operator) {
-                Ordering::Less
-            } else if is_equality_operator(b.operator) {
-                Ordering::Greater
-            } else {
-                Ordering::Equal
-            }
-        });
+        // A stable partition, not a comparison: comparing two equalities as
+        // "less" in both directions is not a valid ordering, and now that `IS`
+        // counts as an equality there are more pairs that would hit it.
+        cs.constraints
+            .sort_by_key(|c| !is_equality_operator(c.operator));
 
         // For each constraint we found, add a reference to it for each index that may be able to use it.
         for (i, constraint) in cs.constraints.iter_mut().enumerate() {

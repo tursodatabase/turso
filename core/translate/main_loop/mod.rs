@@ -36,7 +36,6 @@ use crate::{
     },
     turso_assert, turso_assert_eq,
     types::SeekOp,
-    util::expr_tables_subset_of,
     vdbe::{
         affinity::{self, Affinity},
         builder::{
@@ -48,7 +47,7 @@ use crate::{
     },
     Result,
 };
-use std::{borrow::Cow, collections::HashSet, sync::Arc};
+use std::{borrow::Cow, collections::HashSet, ops::Range, sync::Arc};
 use turso_macros::turso_assert_some;
 
 mod body;

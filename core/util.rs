@@ -3,8 +3,8 @@ use crate::numeric::StrToF64;
 use crate::schema::ColDef;
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
-use crate::translate::plan::{BitSet, JoinedTable, TableReferences};
-use crate::translate::planner::{parse_row_id, TableMask};
+use crate::translate::plan::{BitSet, JoinedTable};
+use crate::translate::planner::parse_row_id;
 use crate::types::IOResult;
 use crate::IO;
 use crate::{
@@ -422,36 +422,6 @@ pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
         (Literal::CurrentTimestamp, Literal::CurrentTimestamp) => true,
         _ => false,
     }
-}
-
-/// Returns true if every Column/RowId table reference in `expr` is contained
-/// in `allowed`. Constants (no table refs) pass.
-pub(crate) fn expr_tables_subset_of(
-    expr: &Expr,
-    table_references: &TableReferences,
-    allowed: &TableMask,
-) -> bool {
-    let mut ok = true;
-    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
-        match e {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                if let Some(idx) = table_references
-                    .joined_tables()
-                    .iter()
-                    .position(|t| t.internal_id == *table)
-                {
-                    if !allowed.get(idx) {
-                        ok = false;
-                        return Ok(WalkControl::SkipChildren);
-                    }
-                }
-                // Outer query references are already in scope — allow them.
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    });
-    ok
 }
 
 /// bind AST identifiers to either Column or Rowid if possible
