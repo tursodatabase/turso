@@ -6,7 +6,10 @@ use smallvec::SmallVec;
 use turso_parser::ast::{Expr, Operator, TableInternalId};
 
 use super::{
-    access_method::{find_best_access_method_for_join_order, AccessMethod},
+    access_method::{
+        collect_equijoin_candidates, find_best_access_method_for_join_order, AccessMethod,
+        EquijoinCandidate,
+    },
     constraints::{usable_constraints_for_lhs_mask, TableConstraints},
     cost_params::CostModelParams,
     order::OrderTarget,
@@ -78,6 +81,9 @@ struct JoinSearch<'query, 'arena> {
     context: JoinSearchContext<'query>,
     access_methods: &'arena mut Vec<AccessMethod>,
     where_term_table_masks: crate::alloc::Vec<TableMask>,
+    /// WHERE terms usable as hash-join keys, classified once so every
+    /// (build, probe) pair evaluation avoids re-walking the WHERE clause.
+    equijoin_candidates: Vec<EquijoinCandidate>,
     btree_access_methods: HashMap<BTreeAccessMethodKey, Option<AccessMethod>>,
 }
 
@@ -95,10 +101,12 @@ impl<'query, 'arena> JoinSearch<'query, 'arena> {
     ) -> Result<Self> {
         let where_term_table_masks =
             build_where_term_table_masks(context.where_clause, context.joined_tables)?;
+        let equijoin_candidates = collect_equijoin_candidates(context.where_clause);
         Ok(Self {
             context,
             access_methods,
             where_term_table_masks,
+            equijoin_candidates,
             btree_access_methods: HashMap::default(),
         })
     }
@@ -307,6 +315,7 @@ impl JoinSearch<'_, '_> {
                     join_order,
                     planning_context,
                     where_clause,
+                    &self.where_term_table_masks,
                     available_indexes,
                     table_references,
                     subqueries,
@@ -326,6 +335,7 @@ impl JoinSearch<'_, '_> {
                 join_order,
                 planning_context,
                 where_clause,
+                &self.where_term_table_masks,
                 available_indexes,
                 table_references,
                 subqueries,
@@ -631,6 +641,7 @@ impl JoinSearch<'_, '_> {
                         lhs_constraints,
                         rhs_constraints,
                         where_clause,
+                        &self.equijoin_candidates,
                         build_cardinality,
                         probe_cardinality,
                         probe_multiplier,
@@ -1907,7 +1918,7 @@ fn compute_naive_left_deep_plan(search: &mut JoinSearch<'_, '_>) -> Result<Optio
 }
 
 /// Precompute joined tables referenced by each WHERE term for join-order decisions.
-fn build_where_term_table_masks(
+pub(crate) fn build_where_term_table_masks(
     where_clause: &[WhereTerm],
     joined_tables: &[JoinedTable],
 ) -> Result<crate::alloc::Vec<TableMask>> {

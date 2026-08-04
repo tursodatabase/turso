@@ -15,7 +15,7 @@ use crate::translate::optimizer::access_method::{
     BranchReadMode, ChosenInSeekCandidate, ResidualConstraintMode,
 };
 use crate::translate::optimizer::constraints::{
-    analyze_binary_term_for_index, can_use_partial_index, constraints_from_where_clause,
+    analyze_binary_term_for_index, can_use_partial_index, constraints_for_table_from_where_clause,
     partial_index_predicate_terms, summarize_binary_term_for_index, Constraint, RangeConstraintRef,
     TableConstraints,
 };
@@ -133,7 +133,7 @@ fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
 /// Build temporary `WhereTerm`s from branch-local expressions and extract the
 /// constraints for exactly one target table.
 ///
-/// This is narrower than `constraints_from_where_clause()`:
+/// This is narrower than `constraints_for_table_from_where_clause()`:
 /// - `exprs` are synthetic planner inputs, not the query's real top-level
 ///   `WHERE` terms.
 /// - The returned `WhereTerm`s are only suitable for branch-local planning
@@ -141,9 +141,9 @@ fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
 ///   for global predicate consumption or join rewrites.
 ///
 /// FIXME: stop synthesizing `WhereTerm`s here just to reuse
-/// `constraints_from_where_clause()`. Branch-local planning should have a
-/// direct constraint-extraction path that does not fabricate top-level planner
-/// terms.
+/// `constraints_for_table_from_where_clause()`. Branch-local planning should
+/// have a direct constraint-extraction path that does not fabricate top-level
+/// planner terms.
 #[expect(clippy::too_many_arguments)]
 fn get_table_local_constraints_for_branch(
     exprs: &[ast::Expr],
@@ -164,18 +164,15 @@ fn get_table_local_constraints_for_branch(
             consumed: false,
         })
         .collect::<Vec<_>>();
-    let table_constraints = constraints_from_where_clause(
+    let mut table_constraints = constraints_for_table_from_where_clause(
+        table_reference,
         &synthetic_where_terms,
         table_references,
         available_indexes,
         subqueries,
         schema,
         params,
-    )?
-    .into_iter()
-    .find(|constraints| constraints.table_id == table_reference.internal_id)
-    .expect("constraints_from_where_clause must return constraints for every joined table");
-    let mut table_constraints = table_constraints;
+    )?;
     // Branch-local constraints originate from synthetic `WhereTerm`s, so copy
     // out their constraining expressions while those temporary terms still
     // exist.
@@ -775,6 +772,7 @@ fn evaluate_multi_index_branches(
 fn analyze_and_terms_for_multi_index(
     table_reference: &JoinedTable,
     where_clause: &[WhereTerm],
+    where_term_masks: &[TableMask],
     available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
@@ -782,6 +780,10 @@ fn analyze_and_terms_for_multi_index(
     params: &CostModelParams,
 ) -> Option<AndClauseDecomposition> {
     let table_id = table_reference.internal_id;
+    let table_pos = table_references
+        .joined_tables()
+        .iter()
+        .position(|t| t.internal_id == table_id)?;
     let indexes = available_indexes.indexes_for_table(table_reference.internal_id);
     let rowid_alias_column = table_reference
         .columns()
@@ -798,6 +800,12 @@ fn analyze_and_terms_for_multi_index(
 
     for (where_term_idx, term) in where_clause.iter().enumerate() {
         if term.consumed || matches!(&term.expr, ast::Expr::Binary(_, ast::Operator::Or, _)) {
+            continue;
+        }
+
+        // A term that never references this table cannot constrain it, so skip
+        // it before the per-term index analysis below.
+        if !where_term_masks[where_term_idx].get(table_pos) {
             continue;
         }
 
@@ -930,6 +938,7 @@ fn analyze_and_terms_for_multi_index(
 pub fn consider_multi_index_union(
     rhs_table: &JoinedTable,
     where_clause: &[WhereTerm],
+    where_term_masks: &[TableMask],
     available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
@@ -941,8 +950,22 @@ pub fn consider_multi_index_union(
     lhs_mask: &TableMask,
     analyze_stats: &AnalyzeStats,
 ) -> Result<Option<AccessMethod>> {
+    let Some(rhs_idx) = table_references
+        .joined_tables()
+        .iter()
+        .position(|t| t.internal_id == rhs_table.internal_id)
+    else {
+        return Ok(None);
+    };
     for (where_term_idx, term) in where_clause.iter().enumerate() {
         if term.consumed {
+            continue;
+        }
+
+        // Every union branch must seek the current table, so an OR term that
+        // never references it cannot produce one. Skip it before the expensive
+        // per-disjunct constraint analysis below.
+        if !where_term_masks[where_term_idx].get(rhs_idx) {
             continue;
         }
 
@@ -956,13 +979,6 @@ pub fn consider_multi_index_union(
         }
 
         let mut allowed_mask = lhs_mask.try_clone()?;
-        let Some(rhs_idx) = table_references
-            .joined_tables()
-            .iter()
-            .position(|t| t.internal_id == rhs_table.internal_id)
-        else {
-            continue;
-        };
         allowed_mask.set(rhs_idx)?;
 
         // Each disjunct is replanned with branch-local `TableConstraints`, so
@@ -1070,6 +1086,7 @@ pub fn consider_multi_index_union(
 pub fn consider_multi_index_intersection(
     rhs_table: &JoinedTable,
     where_clause: &[WhereTerm],
+    where_term_masks: &[TableMask],
     available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
@@ -1084,6 +1101,7 @@ pub fn consider_multi_index_intersection(
     let Some(decomposition) = analyze_and_terms_for_multi_index(
         rhs_table,
         where_clause,
+        where_term_masks,
         available_indexes,
         table_references,
         subqueries,
@@ -1184,6 +1202,7 @@ mod tests {
     };
     use crate::alloc::TursoIteratorExt;
     use crate::alloc::TursoSliceExt;
+    use crate::translate::optimizer::join::build_where_term_table_masks;
     use crate::{
         schema::{
             BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table,
@@ -1457,10 +1476,13 @@ mod tests {
         let table_references = TableReferences::new(joined_tables, vec![]);
         let base_row_count = RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS);
         let lhs_mask: TableMask = [LINK].into_iter().try_collect().unwrap();
+        let where_term_masks =
+            build_where_term_table_masks(&where_clause, table_references.joined_tables()).unwrap();
 
         let access_method = consider_multi_index_union(
             &table_references.joined_tables()[ITEM],
             &where_clause,
+            &where_term_masks,
             &available_indexes,
             &table_references,
             &[],
@@ -1539,10 +1561,13 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let base_row_count = RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS);
+        let where_term_masks =
+            build_where_term_table_masks(&where_clause, table_references.joined_tables()).unwrap();
 
         let access_method = consider_multi_index_intersection(
             &table_references.joined_tables()[0],
             &where_clause,
+            &where_term_masks,
             &available_indexes,
             &table_references,
             &[],
@@ -1712,10 +1737,13 @@ mod tests {
         let table_references = TableReferences::new(joined_tables, vec![]);
         let lhs_mask = [LINK].into_iter().try_collect().unwrap();
         let base_row_count = RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS);
+        let where_term_masks =
+            build_where_term_table_masks(&where_clause, table_references.joined_tables()).unwrap();
 
         let access_method = consider_multi_index_union(
             &table_references.joined_tables()[ITEM],
             &where_clause,
+            &where_term_masks,
             &available_indexes,
             &table_references,
             &[],
@@ -1849,10 +1877,17 @@ mod tests {
         let table_references = TableReferences::new(joined_tables, vec![]);
         let lhs_mask = [LINK].into_iter().try_collect().unwrap();
         let base_row_count = RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS);
+        let without_residual_clause = make_join_expr(None);
+        let without_residual_masks = build_where_term_table_masks(
+            &without_residual_clause,
+            table_references.joined_tables(),
+        )
+        .unwrap();
 
         let without_residual = consider_multi_index_union(
             &table_references.joined_tables()[ITEM],
-            &make_join_expr(None),
+            &without_residual_clause,
+            &without_residual_masks,
             &available_indexes,
             &table_references,
             &[],
@@ -1867,9 +1902,14 @@ mod tests {
         .unwrap()
         .expect("plain OR branches should produce a multi-index union");
 
+        let with_residual_clause = make_join_expr(Some("7"));
+        let with_residual_masks =
+            build_where_term_table_masks(&with_residual_clause, table_references.joined_tables())
+                .unwrap();
         let with_residual = consider_multi_index_union(
             &table_references.joined_tables()[ITEM],
-            &make_join_expr(Some("7")),
+            &with_residual_clause,
+            &with_residual_masks,
             &available_indexes,
             &table_references,
             &[],
