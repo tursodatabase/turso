@@ -87,7 +87,10 @@ mod fuzz_tests {
         let limbo_conn = db.connect_limbo();
         helpers::execute_on_both(&limbo_conn, &sqlite_conn, &insert, "");
 
-        const COMPARISONS: [&str; 4] = ["<", "<=", ">", ">="];
+        // `=` and `IS` both seek the rowid directly. A rowid is never NULL, so
+        // `x IS NULL` must find nothing, and the non-integer values below have to
+        // go through the same affinity handling as `=`.
+        const COMPARISONS: [&str; 6] = ["=", "IS", "<", "<=", ">", ">="];
         const ORDER_BY: [Option<&str>; 4] = [
             None,
             Some("ORDER BY x"),
@@ -183,8 +186,10 @@ mod fuzz_tests {
             .execute(db.init_sql.as_ref().unwrap(), [])
             .unwrap();
 
+        // A non-INTEGER PRIMARY KEY is a UNIQUE index, and a UNIQUE index accepts
+        // any number of NULLs. `x IS NULL` has to find all three of them.
         let insert = format!(
-            "INSERT INTO t VALUES {}",
+            "INSERT INTO t VALUES {}, (NULL), (NULL), (NULL)",
             (0..10000)
                 .map(|x| format!("({x})"))
                 .collect::<Vec<_>>()
@@ -196,7 +201,7 @@ mod fuzz_tests {
         let limbo_conn = db.connect_limbo();
         limbo_exec_rows(&limbo_conn, &insert);
 
-        const COMPARISONS: [&str; 5] = ["=", "<", "<=", ">", ">="];
+        const COMPARISONS: [&str; 6] = ["=", "IS", "<", "<=", ">", ">="];
 
         const ORDER_BY: [Option<&str>; 4] = [
             None,
@@ -207,7 +212,9 @@ mod fuzz_tests {
 
         for comp in COMPARISONS.iter() {
             for order_by in ORDER_BY.iter() {
-                for max in 0..=10000 {
+                // "NULL" as the last value: `=` matches nothing, `IS` matches the
+                // three NULL rows.
+                for max in (0..=10000).map(|x| x.to_string()).chain(["NULL".into()]) {
                     let query = format!(
                         "SELECT * FROM t WHERE x {} {} {} LIMIT 3",
                         comp,
@@ -321,29 +328,44 @@ mod fuzz_tests {
             }
         }
 
-        const COMPARISONS: [&str; 5] = ["=", "<", "<=", ">", ">="];
+        // `IS` seeks the index just like `=`, but it also matches rows whose key
+        // component is NULL. Both belong in the equality prefix of a seek key.
+        const EQUALITIES: [&str; 2] = ["=", "IS"];
+        const COMPARISONS: [&str; 6] = ["=", "IS", "<", "<=", ">", ">="];
 
-        // For verifying index scans, we only care about cases where all but potentially the last column are constrained by an equality (=),
+        // For verifying index scans, we only care about cases where all but potentially the last column are constrained by an equality (= or IS),
         // because this is the only way to utilize an index efficiently for seeking. This is called the "left-prefix rule" of indexes.
         // Hence we generate constraint combinations in this manner; as soon as a comparison is not an equality, we stop generating more constraints for the where clause.
         // Examples:
-        // x = 1 AND y = 2 AND z > 3
-        // x = 1 AND y > 2
+        // x = 1 AND y IS 2 AND z > 3
+        // x IS NULL AND y > 2
         // x > 1
         let col_comp_first = COMPARISONS
             .iter()
             .cloned()
             .map(|x| (Some(x), None, None))
             .collect::<Vec<_>>();
-        let col_comp_second = COMPARISONS
+        let col_comp_second = EQUALITIES
             .iter()
             .cloned()
-            .map(|x| (Some("="), Some(x), None))
+            .flat_map(|eq| {
+                COMPARISONS
+                    .iter()
+                    .cloned()
+                    .map(move |x| (Some(eq), Some(x), None))
+            })
             .collect::<Vec<_>>();
-        let col_comp_third = COMPARISONS
+        let col_comp_third = EQUALITIES
             .iter()
             .cloned()
-            .map(|x| (Some("="), Some("="), Some(x)))
+            .flat_map(|eq1| {
+                EQUALITIES.iter().cloned().flat_map(move |eq2| {
+                    COMPARISONS
+                        .iter()
+                        .cloned()
+                        .map(move |x| (Some(eq1), Some(eq2), Some(x)))
+                })
+            })
             .collect::<Vec<_>>();
 
         let all_comps = [col_comp_first, col_comp_second, col_comp_third].concat();
@@ -419,6 +441,12 @@ mod fuzz_tests {
             // Use a small limit to make the test complete faster
             let limit = 5;
 
+            /// Whether the operator pins the column to a single value, so it can be
+            /// part of an index seek key's equality prefix.
+            fn is_equality(operator: &str) -> bool {
+                operator == "=" || operator == "IS"
+            }
+
             /// Generate a comparison string (e.g. x > 10 AND x < 20) or just x > 10.
             fn generate_comparison(
                 operator: &str,
@@ -426,13 +454,16 @@ mod fuzz_tests {
                 col_val: i32,
                 rng: &mut ChaCha8Rng,
             ) -> String {
-                // 5% chance of using NULL as the comparison value
-                let val_str = if rng.random_range(0..20) == 0 {
+                // 5% chance of using NULL as the comparison value, except for `IS`,
+                // where a NULL key is the whole point: it matches the rows whose key
+                // component is NULL instead of matching nothing.
+                let null_chance = if operator == "IS" { 3 } else { 20 };
+                let val_str = if rng.random_range(0..null_chance) == 0 {
                     "NULL".to_string()
                 } else {
                     col_val.to_string()
                 };
-                if operator != "=" && rng.random_range(0..3) == 1 {
+                if !is_equality(operator) && rng.random_range(0..3) == 1 {
                     let val2 = if rng.random_range(0..20) == 0 {
                         "NULL".to_string()
                     } else {
@@ -499,11 +530,11 @@ mod fuzz_tests {
                     let order_by_only_equalities = !order_by_components.is_empty()
                         && order_by_components.iter().all(|o: &String| {
                             if o.starts_with("x ") {
-                                comp1 == Some("=")
+                                comp1.is_some_and(is_equality)
                             } else if o.starts_with("y ") {
-                                comp2 == Some("=")
+                                comp2.is_some_and(is_equality)
                             } else {
-                                comp3 == Some("=")
+                                comp3.is_some_and(is_equality)
                             }
                         });
 

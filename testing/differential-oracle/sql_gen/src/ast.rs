@@ -1806,7 +1806,7 @@ pub enum BinOp {
     BitOr,
     LeftShift,
     RightShift,
-    // Null-safe comparison (stubs — weight 0)
+    // Null-safe comparison
     Is,
     IsNot,
     // Pattern matching (stub — weight 0)
@@ -1853,6 +1853,10 @@ impl fmt::Display for BinOp {
 
 impl BinOp {
     /// Returns comparison operators.
+    ///
+    /// `IS` / `IS NOT` are here because they are ordinary comparisons that happen
+    /// to compare NULLs as equal, and because `IS` seeks an index the same way `=`
+    /// does — so leaving them out hid a whole class of query plans.
     pub fn comparison() -> &'static [BinOp] {
         &[
             BinOp::Eq,
@@ -1861,6 +1865,8 @@ impl BinOp {
             BinOp::Le,
             BinOp::Gt,
             BinOp::Ge,
+            BinOp::Is,
+            BinOp::IsNot,
         ]
     }
 
