@@ -206,10 +206,6 @@ name = "count_benchmark"
 harness = false
 
 [[bench]]
-name = "column_fetch_benchmark"
-harness = false
-
-[[bench]]
 name = "mvcc_benchmark"
 harness = false
 
