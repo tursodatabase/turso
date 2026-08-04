@@ -29,7 +29,7 @@ use crate::schema::{
     EXPR_INDEX_SENTINEL,
 };
 use crate::translate::fkeys::FkActionCompileStack;
-use crate::translate::plan::ColumnMask;
+use crate::translate::plan::{Aggregate, ColumnMask};
 use crate::vdbe::{
     affinity::Affinity,
     builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
@@ -164,6 +164,16 @@ pub struct Resolver<'a> {
     /// Context and metadata for resolving Expr::Column values that use
     /// [TableInternalId::SELF_TABLE] as a placeholder.
     self_table_scope: RefCell<Option<SelfTableScope>>,
+    /// One list per enclosing query, mirroring SQLite's NameContext chain
+    /// (resolve.c `resolveExprStep`). An aggregate whose argument columns
+    /// belong to an enclosing query is computed by that query, not by the
+    /// subquery it is written in. When a subquery resolves such an aggregate it
+    /// adds it to the enclosing query's list here (the last entry) instead of
+    /// keeping it, so the outer query never has to reach in and take it out
+    /// later. Each query adds an empty list before planning its subqueries and
+    /// removes it — folding the collected aggregates into its own aggregate
+    /// list — afterwards.
+    enclosing_query_aggregates: RefCell<Vec<Vec<Aggregate>>>,
     pub enable_custom_types: bool,
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
@@ -302,6 +312,7 @@ impl<'a> Resolver<'a> {
             register_collations: HashMap::default(),
             subquery_affinities: RefCell::new(HashMap::default()),
             self_table_scope: RefCell::new(None),
+            enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types,
             dqs_dml,
             dialect,
@@ -334,6 +345,7 @@ impl<'a> Resolver<'a> {
             register_collations: HashMap::default(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
+            enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             dialect: self.dialect.clone(),
@@ -358,6 +370,7 @@ impl<'a> Resolver<'a> {
             register_collations: self.register_collations.clone(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
+            enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             dialect: self.dialect.clone(),
@@ -498,6 +511,37 @@ impl<'a> Resolver<'a> {
 
     pub(crate) fn enable_expr_to_reg_cache(&mut self) {
         self.expr_to_reg_cache_enabled = true;
+    }
+
+    /// Start collecting aggregates that this query's subqueries find to belong
+    /// to this query, before planning those subqueries.
+    /// [`Self::take_aggregates_from_subqueries`] retrieves them afterwards.
+    pub(crate) fn begin_collecting_aggregates_from_subqueries(&self) {
+        self.enclosing_query_aggregates
+            .borrow_mut()
+            .push(Vec::new());
+    }
+
+    /// Stop collecting and return the aggregates this query's subqueries moved
+    /// up to it.
+    pub(crate) fn take_aggregates_from_subqueries(&self) -> Vec<Aggregate> {
+        self.enclosing_query_aggregates
+            .borrow_mut()
+            .pop()
+            .unwrap_or_default()
+    }
+
+    /// Move an aggregate up to the innermost enclosing query that is
+    /// collecting. Returns false when there is none — the aggregate then stays
+    /// with the query that resolved it.
+    pub(crate) fn move_aggregate_to_enclosing_query(&self, agg: Aggregate) -> bool {
+        match self.enclosing_query_aggregates.borrow_mut().last_mut() {
+            Some(collected) => {
+                collected.push(agg);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn cache_expr_reg(

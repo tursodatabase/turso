@@ -283,7 +283,7 @@ pub fn emit_query<'a>(
         group_by_emit_row_phase(program, t_ctx, plan, &mut grouped_output_subqueries)?;
     } else if !plan.aggregates.is_empty() {
         // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
-        emit_ungrouped_aggregation(program, t_ctx, plan)?;
+        emit_ungrouped_aggregation(program, t_ctx, plan, &mut grouped_output_subqueries)?;
     } else if plan.window.is_some() {
         emit_window_flush(program, t_ctx, plan)?;
     }

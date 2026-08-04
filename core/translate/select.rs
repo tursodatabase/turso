@@ -694,6 +694,18 @@ fn prepare_one_select_plan(
 
             plan.aggregates = aggregate_expressions;
 
+            // An aggregate whose argument columns belong to the enclosing query
+            // is computed by that query, not by this subquery (SQLite binds an
+            // aggregate to the nearest query that supplies a referenced column).
+            // Move those up so this subquery never computes them; the enclosing
+            // query collects them once its subqueries are planned. When there is
+            // no enclosing query the move fails and the aggregate stays here.
+            let tables = &plan.table_references;
+            plan.aggregates.retain(|agg| {
+                !(aggregate_belongs_to_enclosing_query(agg, tables)
+                    && resolver.move_aggregate_to_enclosing_query(agg.clone()))
+            });
+
             // HAVING without GROUP BY requires aggregates in the SELECT
             if let Some(ref group_by) = plan.group_by {
                 if group_by.exprs.is_empty()
@@ -826,7 +838,14 @@ fn prepare_one_select_plan(
                 plan_windows(program, &mut plan, resolver, connection, &mut windows)?;
             }
 
+            // Collect aggregates that this query's subqueries find to belong to
+            // this query. Collection starts before the subqueries are planned
+            // and ends after; the collected aggregates become this query's,
+            // making it an aggregate query.
+            resolver.begin_collecting_aggregates_from_subqueries();
             plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
+            let aggregates_from_subqueries = resolver.take_aggregates_from_subqueries();
+            plan.aggregates.extend(aggregates_from_subqueries);
 
             {
                 trace_stack!("validate_plan");
@@ -1786,6 +1805,41 @@ pub fn emit_simple_count(
         t_ctx.limit_ctx,
     )?;
     Ok(true)
+}
+
+/// True when this aggregate belongs to the immediate enclosing query rather
+/// than the subquery it is written in: every argument column is a reference to
+/// the enclosing query (scope depth 0), and none is this query's own column.
+/// SQLite binds an aggregate to the nearest query that supplies a referenced
+/// column; an argument column referencing a further ancestor (scope depth > 0)
+/// is not handled here, so the aggregate stays with this query.
+fn aggregate_belongs_to_enclosing_query(
+    agg: &super::plan::Aggregate,
+    tables: &TableReferences,
+) -> bool {
+    let mut belongs = false;
+    let mut disqualified = false;
+    for arg in agg.args.iter().chain(agg.filter_expr.iter()) {
+        let _ = walk_expr(arg, &mut |e: &ast::Expr| -> Result<WalkControl> {
+            if let ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } = e {
+                if tables
+                    .joined_tables()
+                    .iter()
+                    .any(|t| t.internal_id == *table)
+                {
+                    disqualified = true;
+                } else if let Some(outer) = tables.find_outer_query_ref_by_internal_id(*table) {
+                    if outer.scope_depth == 0 {
+                        belongs = true;
+                    } else {
+                        disqualified = true;
+                    }
+                }
+            }
+            Ok(WalkControl::Continue)
+        });
+    }
+    belongs && !disqualified
 }
 
 fn process_having_clause(
