@@ -655,6 +655,7 @@ fn allocate_window_minmax(
                     } else {
                         SortOrder::Asc
                     },
+                    nulls_order: None,
                     pos_in_table: 0,
                     collation,
                     default: None,
