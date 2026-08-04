@@ -257,11 +257,12 @@ fn generate_select_impl_inner<C: Capabilities>(
     // --- DISTINCT ---
     let distinct = match mode {
         SelectMode::Full => ctx.gen_bool_with_prob(select_config.distinct_probability),
-        // Scalar: only when not grouped
-        SelectMode::Scalar => {
-            group_by.is_none()
-                && ctx.gen_bool_with_prob(select_config.subquery_distinct_probability)
-        }
+        // Scalar subqueries carry LIMIT 1, and DISTINCT makes that pick
+        // undecidable: when duplicates collapse, which duplicate's ORDER BY
+        // key survives is the engine's choice, so SQLite and Turso can return
+        // different rows and both are allowed. No tiebreaker can help because
+        // a unique column cannot be added through the deduplication.
+        SelectMode::Scalar => false,
     };
 
     let from = {
@@ -363,6 +364,47 @@ fn generate_select_impl_inner<C: Capabilities>(
             } else {
                 generate_order_by(generator, ctx)?
             };
+        }
+
+        // A scalar subquery's LIMIT 1 must pick the same row in both engines,
+        // and an ORDER BY key with duplicate values leaves the pick to scan
+        // order. Grouped: order by every GROUP BY expression — groups are
+        // distinct combinations of them, so that is a total order. Ungrouped:
+        // append the table's primary key as a final tiebreaker.
+        if mode == SelectMode::Scalar {
+            if let Some(gb) = &group_by {
+                let covered: Vec<String> = order_by.iter().map(|i| i.expr.to_string()).collect();
+                for expr in &gb.exprs {
+                    if !covered.contains(&expr.to_string()) {
+                        let direction =
+                            select_order_direction(ctx, &select_config.order_direction_weights);
+                        order_by.push(OrderByItem {
+                            expr: expr.clone(),
+                            direction,
+                            nulls: None,
+                        });
+                    }
+                }
+            } else {
+                let scoped = &ctx.tables_in_scope()[0];
+                let qualifier = scoped.qualifier.clone();
+                let pk = scoped
+                    .table
+                    .columns
+                    .iter()
+                    .find(|c| c.primary_key)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| "rowid".to_string());
+                let direction = select_order_direction(ctx, &select_config.order_direction_weights);
+                order_by.push(OrderByItem {
+                    expr: Expr::ColumnRef(crate::ast::ColumnRef {
+                        table: Some(qualifier),
+                        column: pk,
+                    }),
+                    direction,
+                    nulls: None,
+                });
+            }
         }
 
         Ok(SelectStmt {
@@ -2059,6 +2101,45 @@ mod tests {
              offset_range={saw_offset_range}, \
              unexcluded_removable_prefix={saw_unexcluded_removable_prefix}"
         );
+    }
+
+    #[test]
+    fn scalar_subqueries_pick_a_deterministic_row() {
+        // LIMIT 1 must select the same row in both engines, so a scalar
+        // subquery may not use DISTINCT, and its ORDER BY must fully decide
+        // the winner: the primary key as a tiebreaker, or (when grouped)
+        // every GROUP BY expression.
+        let generator = test_generator();
+        for seed in 0..300 {
+            let mut ctx = Context::new_with_seed(seed);
+            ctx.with_table_scope(
+                [(generator.schema().tables[0].clone(), None)],
+                |ctx| -> Result<(), GenError> {
+                    let stmt = generate_simple_select(&generator, ctx)?;
+                    assert!(!stmt.distinct, "seed {seed}: scalar subquery uses DISTINCT");
+                    if let Some(gb) = &stmt.group_by {
+                        let ordered: Vec<String> =
+                            stmt.order_by.iter().map(|i| i.expr.to_string()).collect();
+                        for e in &gb.exprs {
+                            assert!(
+                                ordered.contains(&e.to_string()),
+                                "seed {seed}: GROUP BY expr {e} missing from ORDER BY"
+                            );
+                        }
+                    } else {
+                        let last = stmt.order_by.last().expect("scalar must have ORDER BY");
+                        assert!(
+                            matches!(&last.expr, Expr::ColumnRef(c) if c.column == "id"
+                                || c.column == "rowid"),
+                            "seed {seed}: last ORDER BY term is not the tiebreaker: {}",
+                            last.expr
+                        );
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
     }
 
     #[test]
