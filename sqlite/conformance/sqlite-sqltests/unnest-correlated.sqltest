@@ -1,0 +1,695 @@
+@database :memory:
+
+setup correlated_rows {
+    CREATE TABLE outer_rows(
+        id INTEGER PRIMARY KEY,
+        key1 INTEGER,
+        key2 INTEGER,
+        amount INTEGER,
+        text_key TEXT
+    );
+    CREATE TABLE inner_rows(key1 INTEGER, key2 INTEGER, amount INTEGER, text_key TEXT);
+    CREATE TABLE outer_key2(id INTEGER PRIMARY KEY, key2 INTEGER);
+    INSERT INTO outer_rows VALUES
+        (1, 1, 10, 5, 'A'),
+        (2, 1, 10, 15, 'a'),
+        (3, 2, 20, 7, 'B'),
+        (4, 3, 30, 9, 'C'),
+        (5, NULL, 40, 4, NULL),
+        (6, 2, NULL, NULL, 'b');
+    INSERT INTO inner_rows VALUES
+        (1, 10, 10, 'a'),
+        (1, 10, 20, 'A'),
+        (1, 99, 100, 'x'),
+        (2, 20, 6, 'b'),
+        (2, 20, NULL, 'B'),
+        (2, NULL, 7, NULL),
+        (NULL, 40, 99, NULL);
+    INSERT INTO outer_key2 VALUES (1, 10), (3, 20), (5, 40);
+}
+
+@setup correlated_rows
+test one-value-avg-in-select-list {
+    SELECT id, (SELECT avg(i.amount) FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|43.3333333333333
+    2|43.3333333333333
+    3|6.5
+    4|
+    5|
+    6|6.5
+}
+
+@setup correlated_rows
+test one-value-count-keeps-zero-for-empty-group {
+    SELECT id, (SELECT count(*) FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|3
+    2|3
+    3|3
+    4|0
+    5|0
+    6|3
+}
+
+@setup correlated_rows
+test one-value-total-keeps-zero-for-empty-group {
+    SELECT id, (SELECT total(i.amount) FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|130.0
+    2|130.0
+    3|13.0
+    4|0.0
+    5|0.0
+    6|13.0
+}
+expect @js {
+    1|130
+    2|130
+    3|13
+    4|0
+    5|0
+    6|13
+}
+
+@setup correlated_rows
+test one-value-two-link-columns {
+    SELECT id, (SELECT min(i.amount) FROM inner_rows i
+                WHERE i.key1 = o.key1 AND i.key2 = o.key2)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|10
+    2|10
+    3|6
+    4|
+    5|
+    6|
+}
+
+@setup correlated_rows
+test one-value-link-written-outer-first {
+    SELECT id, (SELECT max(i.amount) FROM inner_rows i WHERE o.key1 = i.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|100
+    2|100
+    3|7
+    4|
+    5|
+    6|7
+}
+
+@setup correlated_rows
+test one-value-inner-filter-stays-inside-grouping {
+    SELECT id, (SELECT sum(i.amount) FROM inner_rows i
+                WHERE i.key1 = o.key1 AND i.key2 = 10)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|30
+    2|30
+    3|
+    4|
+    5|
+    6|
+}
+
+@setup correlated_rows
+test one-value-aggregate-filter {
+    SELECT id, (SELECT sum(i.amount) FILTER (WHERE i.key2 = 10)
+                FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|30
+    2|30
+    3|
+    4|
+    5|
+    6|
+}
+
+@setup correlated_rows
+test one-value-group-concat {
+    SELECT id, (SELECT group_concat(i.text_key, ':')
+                FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    WHERE id IN (1, 3, 4)
+    ORDER BY id;
+}
+expect {
+    1|a:A:x
+    3|b:B
+    4|
+}
+
+@setup correlated_rows
+test one-value-distinct-aggregate {
+    SELECT id, (SELECT count(DISTINCT i.key2) FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|2
+    2|2
+    3|1
+    4|0
+    5|0
+    6|1
+}
+
+@setup correlated_rows
+test two-one-value-aggregates {
+    SELECT id,
+           (SELECT min(i.amount) FROM inner_rows i WHERE i.key1 = o.key1),
+           (SELECT max(i.amount) FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|10|100
+    2|10|100
+    3|6|7
+    4||
+    5||
+    6|6|7
+}
+
+@setup correlated_rows
+test one-value-inside-outer-aggregate {
+    SELECT key1, sum((SELECT min(i.amount) FROM inner_rows i WHERE i.key1 = o.key1))
+    FROM outer_rows o
+    WHERE key1 IS NOT NULL
+    GROUP BY key1
+    ORDER BY key1;
+}
+expect {
+    1|20
+    2|12
+    3|
+}
+
+@setup correlated_rows
+test one-value-used-in-having {
+    SELECT key1, count(*)
+    FROM outer_rows o
+    WHERE key1 IS NOT NULL
+    GROUP BY key1
+    HAVING count(*) >= (SELECT count(*) FROM inner_rows i WHERE i.key1 = o.key1)
+    ORDER BY key1;
+}
+expect {
+    3|1
+}
+
+@setup correlated_rows
+test one-value-used-for-ordering {
+    SELECT id
+    FROM outer_rows o
+    ORDER BY (SELECT max(i.amount) FROM inner_rows i WHERE i.key1 = o.key1) DESC, id;
+}
+expect {
+    1
+    2
+    3
+    6
+    4
+    5
+}
+
+@setup correlated_rows
+test one-value-math-with-null-result {
+    SELECT id
+    FROM outer_rows o
+    WHERE amount < (SELECT 0.2 * avg(i.amount) FROM inner_rows i WHERE i.key1 = o.key1)
+    ORDER BY id;
+}
+expect {
+    1
+}
+
+@setup correlated_rows
+test one-value-null-key-does-not-match-null-group {
+    SELECT id, (SELECT sum(i.amount) FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    WHERE id = 5;
+}
+expect {
+    5|
+}
+
+@setup correlated_rows
+test one-value-correlated-to-two-outer-tables {
+    SELECT o.id, (SELECT sum(i.amount) FROM inner_rows i
+                  WHERE i.key1 = o.key1 AND i.key2 = x.key2)
+    FROM outer_rows o JOIN outer_key2 x ON x.id = o.id
+    ORDER BY o.id;
+}
+expect {
+    1|30
+    3|6
+    5|
+}
+
+@setup correlated_rows
+test one-value-correlated-to-outer-table-that-may-be-null {
+    SELECT o.id, (SELECT count(*) FROM inner_rows i WHERE i.key2 = x.key2)
+    FROM outer_rows o LEFT JOIN outer_key2 x ON x.id = o.id
+    ORDER BY o.id;
+}
+expect {
+    1|2
+    2|0
+    3|2
+    4|0
+    5|1
+    6|0
+}
+
+@setup correlated_rows
+test correlated-in-basic {
+    SELECT id
+    FROM outer_rows o
+    WHERE 10 IN (SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1)
+    ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup correlated_rows
+test correlated-in-with-two-link-columns {
+    SELECT id
+    FROM outer_rows o
+    WHERE 6 IN (SELECT i.amount FROM inner_rows i
+                WHERE i.key1 = o.key1 AND i.key2 = o.key2)
+    ORDER BY id;
+}
+expect {
+    3
+}
+
+@setup correlated_rows
+test correlated-in-inner-filter {
+    SELECT id
+    FROM outer_rows o
+    WHERE 20 IN (SELECT i.amount FROM inner_rows i
+                 WHERE i.key1 = o.key1 AND i.text_key = 'A')
+    ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup correlated_rows
+test correlated-in-null-results-do-not-match {
+    SELECT id
+    FROM outer_rows o
+    WHERE amount IN (SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1)
+    ORDER BY id;
+}
+expect {
+    3
+}
+
+@setup correlated_rows
+test correlated-in-uses-left-collation {
+    SELECT id
+    FROM outer_rows o
+    WHERE text_key COLLATE NOCASE IN (
+        SELECT i.text_key FROM inner_rows i WHERE i.key1 = o.key1
+    )
+    ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    6
+}
+
+@setup correlated_rows
+test correlated-in-does-not-duplicate-outer-rows {
+    INSERT INTO inner_rows VALUES (1, 10, 10, 'a');
+    SELECT id
+    FROM outer_rows o
+    WHERE 10 IN (SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1)
+    ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup correlated_rows
+test correlated-in-with-outer-aggregate {
+    SELECT count(*)
+    FROM outer_rows o
+    WHERE 10 IN (SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1);
+}
+expect {
+    2
+}
+
+@setup correlated_rows
+test correlated-in-through-correlated-derived-table {
+    SELECT o.id
+    FROM outer_rows o
+    WHERE o.id IN (
+        SELECT amount
+        FROM (SELECT DISTINCT amount FROM inner_rows i WHERE i.key1 = o.key1)
+    )
+    ORDER BY o.id;
+}
+expect {
+    6
+}
+
+@setup correlated_rows
+test exists-through-correlated-derived-table {
+    SELECT o.id
+    FROM outer_rows o
+    WHERE EXISTS (
+        SELECT 1
+        FROM (SELECT DISTINCT amount FROM inner_rows i WHERE i.key1 = o.key1)
+    )
+    ORDER BY o.id;
+}
+expect {
+    1
+    2
+    3
+    6
+}
+
+# These forms stay correlated because the simple join rewrites would change
+# their result. They are included here to protect the safety checks.
+
+@setup correlated_rows
+test not-in-with-null-inner-value {
+    SELECT id
+    FROM outer_rows o
+    WHERE 11 NOT IN (SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1)
+    ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+    5
+}
+
+@setup correlated_rows
+test in-under-or {
+    SELECT id
+    FROM outer_rows o
+    WHERE id = 4 OR 10 IN (SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1)
+    ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+}
+
+@setup correlated_rows
+test one-value-link-that-does-not-use-equals {
+    SELECT id, (SELECT min(i.amount) FROM inner_rows i WHERE i.key1 <= o.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|10
+    2|10
+    3|6
+    4|6
+    5|
+    6|6
+}
+
+@setup correlated_rows
+test one-value-is-link-keeps-null-match {
+    SELECT id, (SELECT max(i.amount) FROM inner_rows i WHERE i.key1 IS o.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|100
+    2|100
+    3|7
+    4|
+    5|99
+    6|7
+}
+
+@setup correlated_rows
+test one-value-limit-zero {
+    SELECT id, (SELECT sum(i.amount) FROM inner_rows i WHERE i.key1 = o.key1 LIMIT 0)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|
+    2|
+    3|
+    4|
+    5|
+    6|
+}
+
+@setup correlated_rows
+test one-value-outer-only-filter {
+    SELECT id, (SELECT count(*) FROM inner_rows i
+                WHERE i.key1 = o.key1 AND o.amount > 10)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|0
+    2|3
+    3|0
+    4|0
+    5|0
+    6|0
+}
+
+@setup correlated_rows
+test one-value-expression-with-non-null-empty-result {
+    SELECT id, (SELECT coalesce(sum(i.amount), 0) FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    ORDER BY id;
+}
+expect {
+    1|130
+    2|130
+    3|13
+    4|0
+    5|0
+    6|13
+}
+
+@setup correlated_rows
+test one-value-in-outer-join-condition-stays-correlated {
+    SELECT o.id, x.id
+    FROM outer_rows o LEFT JOIN outer_key2 x
+      ON x.key2 = (SELECT min(i.key2) FROM inner_rows i WHERE i.key1 = o.key1)
+    ORDER BY o.id;
+}
+expect {
+    1|1
+    2|1
+    3|3
+    4|
+    5|
+    6|3
+}
+
+setup comparison_keys {
+    CREATE TABLE number_outer(id INTEGER PRIMARY KEY, key1 INTEGER);
+    CREATE TABLE text_inner(key1 TEXT, amount INTEGER, group_id INTEGER);
+    INSERT INTO number_outer VALUES (1, 1);
+    INSERT INTO text_inner VALUES ('1', 10, 1), ('01', 20, 1);
+
+    CREATE TABLE nocase_outer(id INTEGER PRIMARY KEY, key1 TEXT COLLATE NOCASE);
+    CREATE TABLE binary_inner(key1 TEXT COLLATE BINARY, amount INTEGER);
+    CREATE TABLE nocase_inner(key1 TEXT COLLATE NOCASE, amount INTEGER);
+    INSERT INTO nocase_outer VALUES (1, 'a');
+    INSERT INTO binary_inner VALUES ('a', 10), ('A', 20);
+    INSERT INTO nocase_inner VALUES ('a', 10), ('A', 20);
+}
+
+@setup comparison_keys
+test one-value-number-and-text-stay-correlated {
+    SELECT o.id, (SELECT sum(i.amount) FROM text_inner i WHERE i.key1 = o.key1)
+    FROM number_outer o;
+}
+expect {
+    1|30
+}
+
+@setup comparison_keys
+test one-value-different-text-order-stays-correlated {
+    SELECT o.id, (SELECT sum(i.amount) FROM binary_inner i WHERE o.key1 = i.key1)
+    FROM nocase_outer o;
+}
+expect {
+    1|30
+}
+
+@setup comparison_keys
+test one-value-same-text-order-is-rewritten {
+    SELECT o.id, (SELECT sum(i.amount) FROM nocase_inner i WHERE o.key1 = i.key1)
+    FROM nocase_outer o;
+}
+expect {
+    1|30
+}
+
+@setup comparison_keys
+test correlated-in-keeps-number-to-text-comparison {
+    SELECT o.id
+    FROM number_outer o
+    WHERE o.key1 IN (SELECT i.key1 FROM text_inner i WHERE i.group_id = o.id);
+}
+expect {
+    1
+}
+
+# These cases run every generated query against Turso and SQLite. The data has
+# repeated outer keys, repeated inner keys, NULL values, missing groups, and a
+# NULL outer key.
+
+@setup correlated_rows
+@var aggregate { avg(i.amount) | sum(i.amount) | min(i.amount) | max(i.amount) | count(*) | count(i.amount) | total(i.amount) | count(DISTINCT i.key2) }
+@var link { i.key1 = o.key1 | o.key1 = i.key1 | i.key1 = o.key1 AND i.key2 = o.key2 }
+@var inner_filter { | AND i.amount IS NOT NULL | AND i.amount >= 7 }
+matrix one-value-aggregate-cases {
+    SELECT o.id, (SELECT $aggregate FROM inner_rows i WHERE $link $inner_filter)
+    FROM outer_rows o ORDER BY o.id;
+}
+
+@setup correlated_rows
+@var aggregate { avg(i.amount) | sum(i.amount) | min(i.amount) | max(i.amount) | count(*) | total(i.amount) }
+@var operator { = | <> | < | <= | > | >= }
+@var link { i.key1 = o.key1 | i.key1 = o.key1 AND i.key2 = o.key2 }
+matrix one-value-aggregate-comparisons {
+    SELECT o.id FROM outer_rows o
+    WHERE o.amount $operator (SELECT $aggregate FROM inner_rows i WHERE $link)
+    ORDER BY o.id;
+}
+
+@setup correlated_rows
+@var left { o.amount | o.key2 | 10 | NULL }
+@var link { i.key1 = o.key1 | o.key1 = i.key1 | i.key1 = o.key1 AND i.key2 = o.key2 }
+@var inner_filter { | AND i.amount IS NOT NULL | AND i.amount >= 7 }
+matrix correlated-in-cases {
+    SELECT o.id FROM outer_rows o
+    WHERE $left IN (SELECT i.amount FROM inner_rows i WHERE $link $inner_filter)
+    ORDER BY o.id;
+}
+
+@setup correlated_rows
+@var aggregate { avg(i.amount) | sum(i.amount) }
+@var link { i.key1 < o.key1 | i.key1 IS o.key1 | i.key1 = o.key1 OR i.key2 = o.key2 | i.key1 = o.key1 AND o.amount > 10 }
+@var tail { | LIMIT 0 | LIMIT 1 OFFSET 1 }
+matrix one-value-cases-that-stay-as-subqueries {
+    SELECT o.id, (SELECT $aggregate FROM inner_rows i WHERE $link $tail)
+    FROM outer_rows o ORDER BY o.id;
+}
+
+setup tpch_rows {
+    CREATE TABLE part(partkey INTEGER PRIMARY KEY, brand TEXT, container TEXT);
+    CREATE TABLE lineitem(
+        partkey INTEGER,
+        suppkey INTEGER,
+        quantity INTEGER,
+        extendedprice INTEGER,
+        shipdate TEXT
+    );
+    CREATE TABLE partsupp(partkey INTEGER, suppkey INTEGER, availqty INTEGER, supplycost INTEGER);
+    CREATE TABLE supplier(suppkey INTEGER PRIMARY KEY, region INTEGER);
+    INSERT INTO part VALUES (1, 'Brand#1', 'SM BOX'), (2, 'Brand#2', 'LG CAN');
+    INSERT INTO supplier VALUES (10, 1), (11, 1), (12, 2);
+    INSERT INTO partsupp VALUES (1, 10, 20, 5), (1, 11, 20, 7), (1, 12, 20, 1),
+                                (2, 10, 4, 8), (2, 11, 20, 3);
+    INSERT INTO lineitem VALUES
+        (1, 10, 1, 70, '1994-02-01'),
+        (1, 10, 2, 140, '1994-03-01'),
+        (1, 11, 20, 700, '1996-01-01'),
+        (2, 10, 5, 210, '1994-04-01'),
+        (2, 11, 7, 280, '1994-05-01');
+}
+
+@setup tpch_rows
+test tpch-q17-average {
+    SELECT sum(l.extendedprice) / 7.0
+    FROM lineitem l JOIN part p ON p.partkey = l.partkey
+    WHERE p.brand = 'Brand#1'
+      AND p.container = 'SM BOX'
+      AND l.quantity < (
+          SELECT 0.2 * avg(l2.quantity)
+          FROM lineitem l2
+          WHERE l2.partkey = p.partkey
+      );
+}
+expect {
+    10.0
+}
+expect @js {
+    10
+}
+
+@setup tpch_rows
+test tpch-q20-sum-with-two-keys {
+    SELECT ps.partkey, ps.suppkey
+    FROM partsupp ps
+    WHERE ps.availqty > (
+        SELECT 0.5 * sum(l.quantity)
+        FROM lineitem l
+        WHERE l.partkey = ps.partkey
+          AND l.suppkey = ps.suppkey
+          AND l.shipdate >= '1994-01-01'
+          AND l.shipdate < '1995-01-01'
+    )
+    ORDER BY ps.partkey, ps.suppkey;
+}
+expect {
+    1|10
+    2|10
+    2|11
+}
+
+@setup tpch_rows
+test tpch-q2-minimum-over-join {
+    SELECT ps.partkey, ps.suppkey
+    FROM partsupp ps JOIN supplier s ON s.suppkey = ps.suppkey
+    WHERE s.region = 1
+      AND ps.supplycost = (
+          SELECT min(ps2.supplycost)
+          FROM partsupp ps2 JOIN supplier s2 ON s2.suppkey = ps2.suppkey
+          WHERE ps2.partkey = ps.partkey
+            AND s2.region = 1
+      )
+    ORDER BY ps.partkey, ps.suppkey;
+}
+expect {
+    1|10
+    2|11
+}
