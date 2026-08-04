@@ -2185,9 +2185,10 @@ fn op_column_range_fetch(
                     return Ok(InsnFunctionStepResult::Step);
                 };
 
-                record
-                    .iter()?
-                    .fill_n_into_registers(start_column, &mut state.registers[dest..dest + count])?
+                record.iter()?.decode_into_registers_after(
+                    start_column,
+                    &mut state.registers[dest..dest + count],
+                )?
             };
             if filled < count {
                 branches::mark_unlikely();
@@ -2203,7 +2204,7 @@ fn op_column_range_fetch(
         CursorType::Sorter => {
             if let Some(record) = get_cursor!(state, cursor_id).as_sorter_mut().record() {
                 let mut payload_iterator = record.iter()?;
-                let filled = payload_iterator.fill_n_into_registers(
+                let filled = payload_iterator.decode_into_registers_after(
                     start_column,
                     &mut state.registers[dest..dest + count],
                 )?;
@@ -2238,7 +2239,7 @@ fn op_column_range_fetch(
                 Register::Record(record) => {
                     let filled = record
                         .iter()?
-                        .fill_n_into_registers(start_column, dest_regs)?;
+                        .decode_into_registers_after(start_column, dest_regs)?;
                     if filled < count {
                         crate::bail_parse_error!("pseudo-cursor column out of range for record");
                     }
