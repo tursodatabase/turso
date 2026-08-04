@@ -1594,3 +1594,33 @@ test from-subquery-outer-ref-in-correlated-subquery {
 expect {
     2
 }
+
+@cross-check-integrity
+test from-subquery-alias-does-not-shadow-schema-table {
+    create table target(value);
+    create table source(id, marker);
+    insert into target values (1);
+    insert into source values (1, 0), (2, 0);
+    select target.id
+    from (select id, marker, 0 as value from source) as target
+    where not exists (
+        select 1 from target as inner_target
+        where inner_target.value = target.marker
+    )
+    order by target.id;
+}
+expect {
+    1
+    2
+}
+
+test from-subquery-alias-is-not-visible-as-inner-from-source {
+    create table source(id);
+    insert into source values (1);
+    select *
+    from (select id from source) as missing
+    where exists (select 1 from missing);
+}
+expect error {
+    no such table: missing
+}

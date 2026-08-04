@@ -1484,6 +1484,18 @@ impl TableReferences {
             .find(|t| t.identifier == identifier)
     }
 
+    pub(super) fn find_outer_cte_source_by_identifier(
+        &self,
+        identifier: &str,
+    ) -> Option<&OuterQueryReference> {
+        self.outer_query_refs.iter().find(|outer_ref| {
+            outer_ref.identifier == identifier
+                && ((outer_ref.cte_id.is_some()
+                    && (outer_ref.cte_definition_only || outer_ref.cte_select.is_some()))
+                    || matches!(outer_ref.table, Table::RecursiveCteInput(_)))
+        })
+    }
+
     /// Marks the pre-planned [OuterQueryReference] with the given identifier as
     /// "CTE definition only". This prevents it from being used for column
     /// resolution while still allowing CTE definition lookup in subquery FROM
