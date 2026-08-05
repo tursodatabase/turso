@@ -7,72 +7,191 @@ set testdir [file dirname $argv0]
 # summaries or exit.
 set ALL_TESTS 1
 
-source $testdir/select1.test
-source $testdir/select2.test
-# FIXME: source $testdir/select3.test
-# FIXME: source $testdir/select4.test
-source $testdir/select5.test
-# FIXME: source $testdir/select6.test
-# FIXME: source $testdir/select7.test
-source $testdir/select8.test
-# FIXME: source $testdir/select9.test
-# FIXME: source $testdir/selectA.test
-# FIXME: source $testdir/selectB.test
-source $testdir/selectC.test
-# FIXME: source $testdir/selectD.test
-# FIXME: source $testdir/selectE.test
-source $testdir/selectF.test
-# FIXME: source $testdir/selectG.test
-# FIXME: source $testdir/selectH.test
+# Every test file below runs on every invocation. Each file has a status:
+#
+#   pass - blessed: every test in the file must pass. Any failure (or a
+#          crash while sourcing the file) fails the run.
+#   fail - known-bad: the file runs and its failures are reported, but they
+#          do not fail the run. If such a file becomes fully green the run
+#          fails with a request to move it to "pass", so the known-bad list
+#          only ever shrinks.
+#   skip - not run at all. Reserved for files that hang or that die on a
+#          missing test-harness command; the reason is noted next to each.
+#
+# To bless a file: fix the remaining failures, then change its status here
+# from "fail" to "pass".
+set test_files {
+  select1  pass
+  select2  pass
+  select3  fail
+  select4  fail
+  select5  pass
+  select6  fail
+  select7  fail
+  select8  pass
+  select9  skip {needs "db collate" (custom TCL collations)}
+  selectA  fail
+  selectB  fail
+  selectC  pass
+  selectD  fail
+  selectE  fail
+  selectF  pass
+  selectG  skip {hangs on an INSERT with a 100,000-entry VALUES clause}
+  selectH  fail
 
-# FIXME: source $testdir/insert.test
-# FIXME: source $testdir/insert2.test
-# FIXME: source $testdir/insert3.test
-# FIXME: source $testdir/insert4.test
-source $testdir/insert5.test
+  insert   fail
+  insert2  fail
+  insert3  fail
+  insert4  fail
+  insert5  pass
 
-# FIXME: source $testdir/join.test
-# FIXME: source $testdir/join2.test
-# FIXME: source $testdir/join3.test
-# FIXME: source $testdir/join4.test
-# FIXME: source $testdir/join5.test
-source $testdir/join6.test
-# FIXME: source $testdir/join7.test
-# FIXME: source $testdir/join8.test
-# FIXME: source $testdir/join9.test
-# FIXME: source $testdir/joinA.test
-# FIXME: source $testdir/joinB.test
-# FIXME: source $testdir/joinC.test
-# FIXME: source $testdir/joinD.test
-# FIXME: source $testdir/joinE.test
-# FIXME: source $testdir/joinF.test
-# FIXME: source $testdir/joinH.test
+  join     fail
+  join2    skip {needs "do_vmstep_test"}
+  join3    skip {dies mid-file on a TCL error}
+  join4    fail
+  join5    fail
+  join6    pass
+  join7    fail
+  join8    skip {needs "load_static_extension" (series)}
+  join9    fail
+  joinA    fail
+  joinB    fail
+  joinC    fail
+  joinD    fail
+  joinE    fail
+  joinF    fail
+  joinH    fail
 
-# FIXME: source $testdir/alter.test
-# FIXME: source $testdir/alter2.test
-# FIXME: source $testdir/alter3.test
-# FIXME: source $testdir/alter4.test
+  alter    skip {dies mid-file on a TCL error}
+  alter2   skip {dies mid-file on a TCL error}
+  alter3   fail
+  alter4   fail
 
-# FIXME: source $testdir/func.test
-source $testdir/func2.test
-# FIXME: source $testdir/func3.test
-# FIXME: source $testdir/func4.test
-# FIXME: source $testdir/func5.test
-# FIXME: source $testdir/func6.test
-source $testdir/func7.test
-source $testdir/func8.test
-source $testdir/func9.test
-
-# Print aggregate summary and exit non-zero if any test failed.
-puts ""
-puts "=========================================="
-if {$TC(errors) == 0} {
-  puts "All $TC(count) tests passed!"
-  puts "=========================================="
-  exit 0
-} else {
-  puts "$TC(errors) errors out of $TC(count) tests"
-  puts "Failed tests: $TC(fail_list)"
-  puts "=========================================="
-  exit 1
+  func     skip {needs "sqlite3_connection_pointer"}
+  func2    pass
+  func3    fail
+  func4    skip {needs "load_static_extension" (totype)}
+  func5    skip {needs "sqlite3_create_function"}
+  func6    fail
+  func7    pass
+  func8    pass
+  func9    pass
 }
+
+# Aggregate counters; tester.tcl only initializes these if they don't exist.
+set TC(errors) 0
+set TC(count) 0
+set TC(fail_list) [list]
+
+# Runner variables use a __runner_ prefix so a sourced test file can't
+# accidentally clobber them with its own globals.
+set __runner_results [list]
+set __runner_blessed_failed [list]
+set __runner_xpassed [list]
+
+# The list above mixes 2-field (pass/fail) and 3-field (skip + reason)
+# entries, so walk it manually instead of with foreach.
+set __runner_i 0
+while {$__runner_i < [llength $test_files]} {
+  set __runner_name [lindex $test_files $__runner_i]
+  set __runner_status [lindex $test_files [expr {$__runner_i + 1}]]
+  incr __runner_i 2
+  set __runner_reason ""
+  if {$__runner_status eq "skip"} {
+    set __runner_reason [lindex $test_files $__runner_i]
+    incr __runner_i
+  }
+
+  if {$__runner_status eq "skip"} {
+    lappend __runner_results [list $__runner_name SKIP 0 0 $__runner_reason]
+    continue
+  }
+
+  set __runner_errors0 $TC(errors)
+  set __runner_count0 $TC(count)
+  set testprefix ""
+
+  # Contain TCL-level crashes (e.g. a missing harness command) so one bad
+  # file cannot abort the whole run.
+  set __runner_crashed 0
+  if {[catch {source $testdir/$__runner_name.test} __runner_err]} {
+    set __runner_crashed 1
+    puts "CRASH in $__runner_name.test: $__runner_err"
+  }
+
+  set __runner_nerr [expr {$TC(errors) - $__runner_errors0}]
+  set __runner_ntest [expr {$TC(count) - $__runner_count0}]
+
+  if {$__runner_status eq "pass"} {
+    if {$__runner_crashed || $__runner_nerr > 0} {
+      lappend __runner_blessed_failed $__runner_name
+      set __runner_verdict [expr {$__runner_crashed ? "CRASH" : "FAIL"}]
+    } else {
+      set __runner_verdict "OK"
+    }
+  } else {
+    if {$__runner_crashed} {
+      set __runner_verdict "XCRASH"
+    } elseif {$__runner_nerr > 0} {
+      set __runner_verdict "XFAIL"
+    } else {
+      lappend __runner_xpassed $__runner_name
+      set __runner_verdict "XPASS"
+    }
+  }
+  lappend __runner_results \
+      [list $__runner_name $__runner_verdict $__runner_ntest $__runner_nerr ""]
+}
+
+set __runner_namew [string length "File"]
+foreach __runner_row $__runner_results {
+  set __runner_len [string length "[lindex $__runner_row 0].test"]
+  if {$__runner_len > $__runner_namew} {
+    set __runner_namew $__runner_len
+  }
+}
+set __runner_tablew [expr {$__runner_namew + 25}]
+
+puts ""
+puts [string repeat = $__runner_tablew]
+puts [format "%-${__runner_namew}s %-7s %7s %7s" File Result Tests Failed]
+puts [string repeat - $__runner_tablew]
+foreach __runner_row $__runner_results {
+  lassign $__runner_row __runner_name __runner_verdict \
+      __runner_ntest __runner_nerr __runner_reason
+  set __runner_note ""
+  if {$__runner_reason ne ""} {
+    set __runner_note "  ($__runner_reason)"
+  }
+  puts [format "%-${__runner_namew}s %-7s %7d %7d%s" $__runner_name.test \
+      $__runner_verdict $__runner_ntest $__runner_nerr $__runner_note]
+}
+puts [string repeat - $__runner_tablew]
+set __runner_pct 0.0
+if {$TC(count) > 0} {
+  set __runner_pct \
+      [expr {100.0 * ($TC(count) - $TC(errors)) / $TC(count)}]
+}
+puts [format "Total: %d/%d tests passed (%.1f%%)" \
+    [expr {$TC(count) - $TC(errors)}] $TC(count) $__runner_pct]
+
+set __runner_exit 0
+if {[llength $__runner_blessed_failed] > 0} {
+  puts ""
+  puts "Blessed test files regressed: $__runner_blessed_failed"
+  set __runner_exit 1
+}
+if {[llength $__runner_xpassed] > 0} {
+  puts ""
+  puts "Known-bad test files now fully pass: $__runner_xpassed"
+  puts "Bless them by changing their status from \"fail\" to \"pass\" in all.test."
+  set __runner_exit 1
+}
+puts ""
+if {$__runner_exit == 0} {
+  puts "OK"
+} else {
+  puts "FAILED"
+}
+puts [string repeat = $__runner_tablew]
+exit $__runner_exit
