@@ -1443,20 +1443,28 @@ impl Value {
 
     pub fn exec_char<'a, T: Iterator<Item = &'a Self>>(values: T) -> Self {
         let result: String = values
-            .filter_map(|x| match x {
-                Value::Numeric(Numeric::Integer(i)) => {
-                    // Convert integer to Unicode codepoint.
-                    // For invalid codepoints (negative, surrogates, or > U+10FFFF),
-                    // output U+FFFD (replacement character) to match SQLite behavior.
-                    if *i >= 0 {
-                        Some(char::from_u32(*i as u32).unwrap_or('\u{FFFD}'))
-                    } else {
-                        Some('\u{FFFD}')
+            .map(|x| {
+                // char() coerces every argument to an integer codepoint, the
+                // same way sqlite3_value_int64 / CAST(... AS INTEGER) does:
+                // text and blobs by their numeric prefix (0 if none), floats by
+                // truncation, NULL as 0. Turso previously accepted only integer
+                // arguments and dropped the rest.
+                let codepoint = match x {
+                    Value::Numeric(Numeric::Integer(i)) => *i,
+                    Value::Numeric(Numeric::Float(f)) => real_to_i64(f64::from(*f)),
+                    Value::Text(t) => crate::numeric::str_to_i64(t.as_str()).unwrap_or(0),
+                    Value::Blob(b) => {
+                        crate::numeric::str_to_i64(String::from_utf8_lossy(b).as_ref()).unwrap_or(0)
                     }
+                    Value::Null => 0,
+                };
+                // Invalid codepoints (negative, surrogates, or > U+10FFFF)
+                // become U+FFFD, matching SQLite.
+                if codepoint >= 0 {
+                    char::from_u32(codepoint as u32).unwrap_or('\u{FFFD}')
+                } else {
+                    '\u{FFFD}'
                 }
-                // NULL arguments produce NUL characters to match SQLite behavior.
-                Value::Null => Some('\0'),
-                _ => None,
             })
             .collect();
         Value::build_text(result)
@@ -2761,13 +2769,15 @@ mod tests {
             ),
             Value::build_text("\0")
         );
+        // Non-numeric text coerces to integer 0, so char('a') is a NUL byte,
+        // the same as SQLite (it feeds every argument through integer coercion).
         assert_eq!(
             Value::exec_char(
                 [Register::Value(Value::build_text("a"))]
                     .iter()
                     .map(|reg| reg.get_value())
             ),
-            Value::build_text("")
+            Value::build_text("\0")
         );
     }
 
