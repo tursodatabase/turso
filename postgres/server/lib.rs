@@ -451,7 +451,11 @@ fn bind_portal_parameters(
                     .get(i)
                     .and_then(|t| t.as_ref())
                     .unwrap_or(&Type::UNKNOWN);
-                pg_bytes_to_value(bytes, pg_type)?
+                if portal.parameter_format.is_binary(i) {
+                    pg_binary_to_value(bytes, pg_type)?
+                } else {
+                    pg_bytes_to_value(bytes, pg_type)?
+                }
             }
         };
         // Portal parameter i corresponds to PostgreSQL $N where N = i + 1.
@@ -466,6 +470,57 @@ fn bind_portal_parameters(
         let _ = stmt.bind_at(idx, value);
     }
     Ok(())
+}
+
+/// Convert a binary-format parameter to a turso Value. Drivers switch to
+/// binary Bind for prepared statements (JDBC, asyncpg), so the network
+/// byte-order encodings of the wire-common types must decode; anything
+/// unhandled fails clearly rather than being misread as text.
+fn pg_binary_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
+    let exact = |n: usize| -> PgWireResult<&[u8]> {
+        if bytes.len() == n {
+            Ok(bytes)
+        } else {
+            Err(PgWireError::UserError(Box::new(param_error_info(
+                &format!(
+                    "invalid length {} for binary {} parameter",
+                    bytes.len(),
+                    pg_type.name()
+                ),
+            ))))
+        }
+    };
+    match *pg_type {
+        Type::BOOL => Ok(Value::from_i64((exact(1)?[0] != 0) as i64)),
+        Type::INT2 => Ok(Value::from_i64(
+            i16::from_be_bytes(exact(2)?.try_into().unwrap()) as i64,
+        )),
+        Type::INT4 => Ok(Value::from_i64(
+            i32::from_be_bytes(exact(4)?.try_into().unwrap()) as i64,
+        )),
+        Type::INT8 => Ok(Value::from_i64(i64::from_be_bytes(
+            exact(8)?.try_into().unwrap(),
+        ))),
+        Type::FLOAT4 => Ok(Value::from_f64(
+            f32::from_be_bytes(exact(4)?.try_into().unwrap()) as f64,
+        )),
+        Type::FLOAT8 => Ok(Value::from_f64(f64::from_be_bytes(
+            exact(8)?.try_into().unwrap(),
+        ))),
+        Type::BYTEA => Ok(Value::from_blob(bytes.to_vec())),
+        // The binary encoding of text types is the text itself.
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => {
+            let text = std::str::from_utf8(bytes).map_err(|e| {
+                PgWireError::UserError(Box::new(param_error_info(&format!(
+                    "invalid UTF-8 in parameter: {e}"
+                ))))
+            })?;
+            Ok(Value::from_text(text.to_owned()))
+        }
+        _ => Err(PgWireError::UserError(Box::new(param_error_info(
+            &format!("binary format for type {} is not supported", pg_type.name()),
+        )))),
+    }
 }
 
 /// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.

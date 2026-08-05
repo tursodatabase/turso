@@ -10,4 +10,5 @@ mod table;
 mod type_aliases;
 mod update_from;
 mod wire;
+mod wire_binary_params;
 mod wire_errors;

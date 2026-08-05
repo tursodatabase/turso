@@ -270,6 +270,63 @@ impl PgConn {
         }
     }
 
+    /// Runs one statement through the extended query protocol
+    /// (Parse/Bind/Describe/Execute/Sync) and collects every event up to and
+    /// including `ReadyForQuery`. `param_types` are type OIDs for `$N`
+    /// parameters (0 lets the server infer); `params` are the raw values;
+    /// `binary` sends every parameter in binary format instead of text.
+    pub fn extended_query(
+        &mut self,
+        sql: &str,
+        param_types: &[u32],
+        params: &[Option<Vec<u8>>],
+        binary: bool,
+    ) -> Result<Vec<BackendEvent>> {
+        // Parse: unnamed statement, query, parameter type OIDs.
+        let mut body = vec![0u8];
+        body.extend_from_slice(sql.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&(param_types.len() as u16).to_be_bytes());
+        for oid in param_types {
+            body.extend_from_slice(&oid.to_be_bytes());
+        }
+        self.write_message(b'P', &body)?;
+
+        // Bind: unnamed portal from unnamed statement, one format code for
+        // all parameters, then the values; results requested in text.
+        let mut body = vec![0u8, 0u8];
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&(binary as u16).to_be_bytes());
+        body.extend_from_slice(&(params.len() as u16).to_be_bytes());
+        for param in params {
+            match param {
+                None => body.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(bytes) => {
+                    body.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                    body.extend_from_slice(bytes);
+                }
+            }
+        }
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        self.write_message(b'B', &body)?;
+
+        // Describe portal, Execute (no row limit), Sync.
+        self.write_message(b'D', &[b'P', 0])?;
+        self.write_message(b'E', &[0, 0, 0, 0, 0])?;
+        self.write_message(b'S', &[])?;
+
+        let mut events = Vec::new();
+        loop {
+            let event = self.read_event()?;
+            let done = matches!(event, BackendEvent::ReadyForQuery(_));
+            events.push(event);
+            if done {
+                return Ok(events);
+            }
+        }
+    }
+
     fn write_message(&mut self, tag: u8, body: &[u8]) -> Result<()> {
         self.writer.write_all(&[tag])?;
         self.writer
