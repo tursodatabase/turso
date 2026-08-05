@@ -1802,6 +1802,9 @@ pub enum PragmaName {
     CacheSize,
     /// set the cache spill behavior
     CacheSpill,
+    /// When ON, each INSERT, UPDATE and DELETE returns one row with the
+    /// number of rows it changed.
+    CountChanges,
     /// encryption cipher algorithm name for encrypted databases
     #[strum(serialize = "cipher")]
     #[cfg_attr(feature = "serde", serde(rename = "cipher"))]

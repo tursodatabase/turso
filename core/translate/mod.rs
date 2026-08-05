@@ -198,6 +198,23 @@ pub fn translate_inner(
         ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }
     );
 
+    // PRAGMA count_changes: top-level INSERT/UPDATE/DELETE statements return one row
+    // with the number of rows they changed. Trigger bodies, foreign key actions and
+    // engine-internal nested statements never return count rows, matching SQLite.
+    let count_changes_column = if connection.get_count_changes()
+        && !connection.is_nested_stmt()
+        && !program.flags.is_subprogram()
+    {
+        match &stmt {
+            ast::Stmt::Insert { .. } => Some("rows inserted"),
+            ast::Stmt::Update { .. } => Some("rows updated"),
+            ast::Stmt::Delete { .. } => Some("rows deleted"),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     match stmt {
         ast::Stmt::AlterTable(alter) => {
             translate_alter_table(alter, resolver, program, connection, input)?;
@@ -487,6 +504,17 @@ pub fn translate_inner(
     // Indicate read operations so that in the epilogue we can emit the correct type of transaction
     if is_select && !program.table_references.is_empty() {
         program.begin_read_operation()?;
+    }
+
+    // A statement with RETURNING already produces rows, so it never also returns
+    // a count row (same as SQLite).
+    if let Some(column_name) = count_changes_column {
+        if program.result_columns.is_empty() {
+            let reg = program.alloc_register();
+            program.emit_insn(crate::vdbe::insn::Insn::ChangeCount { dest: reg });
+            program.emit_result_row(reg, 1);
+            program.add_pragma_result_column(column_name.to_string());
+        }
     }
 
     Ok(())

@@ -40,7 +40,7 @@ set test_files {
   selectH  fail
 
   insert   fail
-  insert2  fail
+  insert2  pass
   insert3  fail
   insert4  fail
   insert5  pass

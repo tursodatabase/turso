@@ -401,6 +401,9 @@ pub struct Connection {
     pub(super) vdbe_trace: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
+    /// PRAGMA count_changes: when ON, each INSERT, UPDATE and DELETE returns
+    /// one row with the number of rows it changed.
+    pub(super) count_changes: AtomicBool,
     /// SQLite DQS misfeature: when ON (default), unresolved double-quoted identifiers
     /// in DML statements fall back to string literals instead of raising an error.
     pub(super) dqs_dml: AtomicBool,
@@ -3822,6 +3825,14 @@ impl Connection {
 
     pub fn set_dml_require_where(&self, value: bool) {
         self.dml_require_where.store(value, Ordering::SeqCst);
+    }
+
+    pub fn get_count_changes(&self) -> bool {
+        self.count_changes.load(Ordering::SeqCst)
+    }
+
+    pub fn set_count_changes(&self, value: bool) {
+        self.count_changes.store(value, Ordering::SeqCst);
     }
 
     pub fn get_dqs_dml(&self) -> bool {

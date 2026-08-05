@@ -1032,6 +1032,15 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
+            Insn::ChangeCount { dest } => (
+                "ChangeCount",
+                0,
+                *dest as i64,
+                0,
+                Value::build_text(""),
+                0,
+                format!("r[{dest}]=changes"),
+            ),
             Insn::Real { value, dest } => (
                 "Real",
                 0,
