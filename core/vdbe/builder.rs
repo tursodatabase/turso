@@ -1058,7 +1058,91 @@ impl ProgramBuilder {
         if matches!(insn, Insn::Function { .. }) {
             self.emitted_function_call = true;
         }
+        if let Insn::Column {
+            cursor_id,
+            column,
+            dest,
+            default,
+        } = insn
+        {
+            self.emit_column_maybe_fused(cursor_id, column, dest, default);
+            return;
+        }
         self.insns.push((insn, self.insns.len()));
+    }
+
+    /// Emits a `Column` or `ColumnRange` opcode, fusing it into an immediately preceding `Column`
+    /// or `ColumnRange` on the same cursor when both the column index and the destination register
+    /// are exactly consecutive and no label is set to target the current opcode.
+    fn emit_column_maybe_fused(
+        &mut self,
+        cursor_id: CursorID,
+        column: usize,
+        dest: usize,
+        default: Option<Value>,
+    ) {
+        if self.column_run_fusable(cursor_id) && !self.label_targets_next_insn() {
+            if let Some((prev_insn, _)) = self.insns.last_mut() {
+                match prev_insn {
+                    Insn::Column {
+                        cursor_id: prev_cursor,
+                        column: prev_column,
+                        dest: prev_dest,
+                        default: prev_default,
+                    } if *prev_cursor == cursor_id
+                        && column == *prev_column + 1
+                        && dest == *prev_dest + 1 =>
+                    {
+                        let defaults = vec![prev_default.take(), default];
+                        *prev_insn = Insn::ColumnRange {
+                            cursor_id,
+                            start_column: *prev_column,
+                            dest: *prev_dest,
+                            defaults,
+                        };
+                        return;
+                    }
+                    Insn::ColumnRange {
+                        cursor_id: prev_cursor,
+                        start_column,
+                        dest: prev_dest,
+                        defaults,
+                    } if *prev_cursor == cursor_id
+                        && column == *start_column + defaults.len()
+                        && dest == *prev_dest + defaults.len() =>
+                    {
+                        defaults.push(default);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        self.insns.push((
+            Insn::Column {
+                cursor_id,
+                column,
+                dest,
+                default,
+            },
+            self.insns.len(),
+        ));
+    }
+
+    fn column_run_fusable(&self, cursor_id: CursorID) -> bool {
+        self.cursor_ref
+            .get(cursor_id)
+            .map(|(_, cursor_type)| cursor_type.accepts_column_range_fusing())
+            .unwrap_or(false)
+    }
+
+    fn label_targets_next_insn(&self) -> bool {
+        let Some(last) = self.insns.len().checked_sub(1) else {
+            return false;
+        };
+        let last = last as u32;
+        self.label_to_resolved_offset.contains(&Some(last))
     }
 
     /// Emit an instruction that should not start or extend a constant span on its own.
@@ -2046,5 +2130,21 @@ impl ProgramBuilder {
         let prepare_context = PrepareContext::from_connection(&connection);
         let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
+    }
+}
+
+pub(crate) trait CursorTypeExt {
+    fn accepts_column_range_fusing(&self) -> bool;
+}
+
+impl CursorTypeExt for CursorType {
+    fn accepts_column_range_fusing(&self) -> bool {
+        matches!(
+            self,
+            CursorType::BTreeTable(_)
+                | CursorType::BTreeIndex(_)
+                | CursorType::Pseudo(_)
+                | CursorType::Sorter
+        )
     }
 }

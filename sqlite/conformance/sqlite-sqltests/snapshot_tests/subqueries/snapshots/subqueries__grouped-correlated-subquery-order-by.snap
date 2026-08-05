@@ -25,7 +25,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode                    p1  p2  p3  p4              p5  comment
-   0            Init             0  67   0                   0  Start at 67
+   0            Init             0  66   0                   0  Start at 66
    1            SorterOpen       0   2   0  k(2,-B,Binary)   0  cursor=0
    2            Null             0  10   0                   0  r[10]=NULL
    3            Integer          0   7   0                   0  r[7]=0; clear group by abort flag
@@ -85,12 +85,11 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
   57    Integer                  0   6   0                   0  r[6]=0
   58  Return                    14   0   0                   0
   59  OpenPseudo                 5   4   4                   0  4 columns in r[4]
-  60  SorterSort                 0  66   0                   0
+  60  SorterSort                 0  65   0                   0
   61    SorterData               0   4   5                   0  r[4]=data
-  62    Column                   5   2   2                   0  r[2]=pseudo.column 2
-  63    Column                   5   3   3                   0  r[3]=pseudo.column 3
-  64    ResultRow                2   2   0                   0  output=r[2..3]
-  65  SorterNext                 0  61   0                   0
-  66  Halt                       0   0   0                   0
-  67  Transaction                0   1   2                   0  iDb=0 tx_mode=Read
-  68  Goto                       0   1   0                   0
+  62    ColumnRange              5   2   2  2                0  r[2..3]=pseudo.column 2..column 3
+  63    ResultRow                2   2   0                   0  output=r[2..3]
+  64  SorterNext                 0  61   0                   0
+  65  Halt                       0   0   0                   0
+  66  Transaction                0   1   2                   0  iDb=0 tx_mode=Read
+  67  Goto                       0   1   0                   0

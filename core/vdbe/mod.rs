@@ -3115,6 +3115,12 @@ pub trait ValueIteratorExt {
     /// Returns `Some(Ok(()))` on success, `Some(Err(...))` on parse error,
     /// or `None` if there are fewer than `n+1` elements.
     fn nth_into_register(&mut self, n: usize, dest: &mut Register) -> Option<Result<()>>;
+
+    /// Skips `skip` elements, then decodes one value into each register of `dests` in order.
+    /// Returns the number of registers filled, which is less than `dests.len()` when the record
+    /// has fewer elements; registers past the returned count are left untouched.
+    fn decode_into_registers_after(&mut self, skip: usize, dests: &mut [Register])
+        -> Result<usize>;
 }
 
 impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
@@ -3328,6 +3334,23 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
         }
 
         Some(Ok(()))
+    }
+
+    #[inline]
+    fn decode_into_registers_after(
+        &mut self,
+        skip: usize,
+        dests: &mut [Register],
+    ) -> Result<usize> {
+        for (i, dest) in dests.iter_mut().enumerate() {
+            let n = if i == 0 { skip } else { 0 };
+            match self.nth_into_register(n, dest) {
+                Some(Ok(())) => {}
+                Some(Err(e)) => return Err(e),
+                None => return Ok(i),
+            }
+        }
+        Ok(dests.len())
     }
 }
 

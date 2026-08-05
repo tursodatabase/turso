@@ -37,7 +37,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode                                       p1   p2   p3  p4            p5  comment
-   0                              Init              0  161    0                 0  Start at 161
+   0                              Init              0  160    0                 0  Start at 160
    1                              Once             54    0    0                 0  goto 54
    2                              BeginSubrtn       3    0    0                 0  r[3]=NULL
    3                              Null              0    1    0                 0  r[1]=NULL
@@ -184,19 +184,18 @@ addr  opcode                                       p1   p2   p3  p4            p
  144    Integer                                     0   44    0                 0  r[44]=0
  145  Return                                       52    0    0                 0
  146  OpenRead                                      7    6    0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
- 147  Rewind                                        4  160    0                 0  Rewind  ephemeral()
- 148    Column                                      4    0   39                 0  r[39]=ephemeral().customer_id
- 149    Column                                      4    1   40                 0  r[40]=ephemeral().total
- 150    Copy                                       40   59    0                 0  r[59]=r[40]
- 151    Copy                                        1   60    0                 0  r[60]=r[1]
- 152    Le                                         59   60  159  Binary         0  if r[59]<=r[60] goto 159
- 153    Copy                                       39   61    0                 0  r[61]=r[39]
- 154    SeekRowid                                   7   61  159                 0  if (r[61]!=cursor 7 for table customers.rowid) goto 159
- 155    Column                                      7    1   55                 0  r[55]=customers.name
- 156    Copy                                       40   56    0                 0  r[56]=r[40]
- 157    Copy                                        2   57    0                 0  r[57]=r[2]
- 158    ResultRow                                  55    3    0                 0  output=r[55..57]
- 159  Next                                          4  148    0                 0
- 160  Halt                                          0    0    0                 0
- 161  Transaction                                   0    1   11                 0  iDb=0 tx_mode=Read
- 162  Goto                                          0    1    0                 0
+ 147  Rewind                                        4  159    0                 0  Rewind  ephemeral()
+ 148    ColumnRange                                 4    0   39  2              0  r[39..40]=ephemeral().customer_id..total
+ 149    Copy                                       40   59    0                 0  r[59]=r[40]
+ 150    Copy                                        1   60    0                 0  r[60]=r[1]
+ 151    Le                                         59   60  158  Binary         0  if r[59]<=r[60] goto 158
+ 152    Copy                                       39   61    0                 0  r[61]=r[39]
+ 153    SeekRowid                                   7   61  158                 0  if (r[61]!=cursor 7 for table customers.rowid) goto 158
+ 154    Column                                      7    1   55                 0  r[55]=customers.name
+ 155    Copy                                       40   56    0                 0  r[56]=r[40]
+ 156    Copy                                        2   57    0                 0  r[57]=r[2]
+ 157    ResultRow                                  55    3    0                 0  output=r[55..57]
+ 158  Next                                          4  148    0                 0
+ 159  Halt                                          0    0    0                 0
+ 160  Transaction                                   0    1   11                 0  iDb=0 tx_mode=Read
+ 161  Goto                                          0    1    0                 0
