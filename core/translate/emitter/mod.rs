@@ -1749,6 +1749,13 @@ pub fn emit_cdc_explicit_commit_insns(
         collation: None,
     });
 
+    // The CDC record write needs a transaction; joins the open one (keeping its mode) if any.
+    program.emit_insn(Insn::Transaction {
+        db: crate::MAIN_DB_ID,
+        tx_mode: TransactionMode::Write,
+        schema_cookie: schema.schema_version,
+    });
+
     // A COMMIT record has no associated table, so pass `None` (no self-exclusion check).
     if let Some((cdc_cursor_id, _)) = prepare_cdc_if_necessary(program, schema, None)? {
         emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;

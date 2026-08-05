@@ -2921,6 +2921,7 @@ impl Program {
 
     fn rollback_current_txn(&self, pager: &Arc<Pager>) {
         self.connection.rollback_current_txn_state(pager, true);
+        self.connection.set_cdc_transaction_id(-1);
     }
 
     /// MVCC sequence operations run in a separate inner tx, which temporarily
