@@ -9,7 +9,10 @@ use super::{
     result_row::emit_select_result,
 };
 use crate::translate::{
-    aggregation::{emit_aggregate_final, emit_aggregate_step, AggArgumentSource},
+    aggregation::{
+        emit_aggregate_final, emit_aggregate_step, emit_saved_distinct_aggregate_steps,
+        AggArgumentSource,
+    },
     expression_index::selected_expression_index,
     order_by::EmitOrderBy,
     plan::{Aggregate, NonFromClauseSubquery},
@@ -1055,6 +1058,18 @@ pub fn group_by_emit_row_phase<'a>(
 
     // Resolve the label for the start of the group by output row subroutine
     program.preassign_label_to_next_insn(labels.label_agg_final);
+    if plan.aggregates.iter().any(Aggregate::is_distinct) {
+        let agg_start_reg = t_ctx
+            .reg_agg_start
+            .expect("aggregate registers must be initialized");
+        emit_saved_distinct_aggregate_steps(
+            program,
+            &plan.table_references,
+            &plan.aggregates,
+            agg_start_reg,
+            &t_ctx.resolver,
+        )?;
+    }
     // Finalize aggregate values for output
     for (i, agg) in plan.aggregates.iter().enumerate() {
         let agg_start_reg = t_ctx
