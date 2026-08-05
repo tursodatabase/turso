@@ -157,7 +157,11 @@ STATUS = {
     "domain": "fail",
     "prepare": "fail",
     "truncate": "fail",
-    "alter_table": "fail",
+    "alter_table": (
+        "skip",
+        "panics the server and corrupts the database file "
+        "(core/translate/alter.rs:917); re-enable when fixed",
+    ),
     "sequence": "fail",
     "rowtypes": "fail",
     "returning": "fail",
@@ -182,17 +186,35 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+def start_or_die(start_server):
+    """First server start: a failure here is an environment problem, not a
+    corrupted-database abort, so die with a plain error."""
+    try:
+        return start_server()
+    except ServerStartError as e:
+        sys.exit(f"error: {e}")
+
+
+class ServerStartError(Exception):
+    """tursopg did not come up. During the test loop this aborts the run
+    with a summary instead of dying summary-less: if the server cannot
+    reopen the database (e.g. a crashed test corrupted it), the remaining
+    tests cannot produce meaningful results."""
+
+
 def wait_for_server(proc: subprocess.Popen, port: int, timeout: float = 10.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            sys.exit(f"error: tursopg exited with status {proc.returncode} during startup")
+            raise ServerStartError(
+                f"tursopg exited with status {proc.returncode} during startup"
+            )
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.25):
                 return
         except OSError:
             time.sleep(0.05)
-    sys.exit(f"error: tursopg did not accept connections on port {port} within {timeout}s")
+    raise ServerStartError(f"tursopg did not accept connections on port {port} within {timeout}s")
 
 
 def schedule_order() -> list[str]:
@@ -285,6 +307,62 @@ class Tally:
         return 1 if self.regressions or self.unexpected_passes else 0
 
 
+class ServerHarness:
+    """Owns the tursopg process for a run and the per-test runner invocation,
+    restarting the server whenever a test crashed or wedged it. A crash still
+    fails the test that caused it, but stops poisoning every test after it —
+    needed until the engine guarantees a query cannot take the server down,
+    and harmless after. The database file persists across restarts, so
+    fixtures survive."""
+
+    def __init__(self, bins: Path, port: int, db_file: Path, env: dict, runner_args: list):
+        self.bins = bins
+        self.port = port
+        self.db_file = db_file
+        self.env = env
+        self.runner_args = runner_args
+        self.proc = None
+        self.restarts = 0
+
+    def start(self) -> None:
+        self.proc = subprocess.Popen(
+            [self.bins / "tursopg", "--server", f"127.0.0.1:{self.port}", self.db_file],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        wait_for_server(self.proc, self.port)
+
+    def ensure(self) -> None:
+        """Restarts the server lazily, only when the next test needs it —
+        a crash after the final test must not abort a finished run."""
+        if self.proc is None or self.proc.poll() is not None:
+            self.start()
+            self.restarts += 1
+
+    def drop(self) -> None:
+        """Stops the server; alive-but-wedged servers do not show up in
+        poll(), so callers drop the process to force a restart."""
+        if self.proc is not None:
+            stop(self.proc)
+            self.proc = None
+
+    def run_one(self, path: str) -> int:
+        try:
+            result = subprocess.run(
+                [self.bins / "pgregress", "--dsn",
+                 f"postgres://127.0.0.1:{self.port}/regression"]
+                + self.runner_args
+                + [path],
+                cwd=REPO_ROOT,
+                env=self.env,
+                timeout=60,
+            )
+            return result.returncode
+        except subprocess.TimeoutExpired:
+            print(f"{Path(path).stem} ... FAILED (runner timeout)")
+            return 3
+
+
 def main() -> int:
     validate_status()
     runner_args, tests = parse_argv()
@@ -311,41 +389,10 @@ def main() -> int:
         PG_DLSUFFIX=".so",
     )
     with tempfile.TemporaryDirectory(prefix="pgregress-") as tmp:
-        db_file = Path(tmp) / "regression.db"
-
-        def start_server() -> subprocess.Popen:
-            proc = subprocess.Popen(
-                [bins / "tursopg", "--server", f"127.0.0.1:{port}", db_file],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            wait_for_server(proc, port)
-            return proc
-
-        def run_one(path: str) -> int:
-            try:
-                result = subprocess.run(
-                    [bins / "pgregress", "--dsn", f"postgres://127.0.0.1:{port}/regression"]
-                    + runner_args
-                    + [path],
-                    cwd=REPO_ROOT,
-                    env=env,
-                    timeout=60,
-                )
-                return result.returncode
-            except subprocess.TimeoutExpired:
-                print(f"{Path(path).stem} ... FAILED (runner timeout)")
-                return 3
-
-        # One runner invocation per test, restarting the server whenever a
-        # test crashed or wedged it (exit code 3 = transport failure, or a
-        # runner timeout). A crash still fails the test that caused it, but
-        # stops poisoning every test after it — needed until the engine
-        # guarantees a query cannot take the server down, and harmless
-        # after. The database file persists across restarts, so fixtures
-        # survive.
-        server = start_server()
+        srv = ServerHarness(bins, port, Path(tmp) / "regression.db", env, runner_args)
+        start_or_die(srv.start)
         tally = Tally()
+        aborted = None
         try:
             for path in paths:
                 name = Path(path).stem
@@ -354,18 +401,23 @@ def main() -> int:
                     print(f"{name} ... skip ({reason})")
                     tally.skipped += 1
                     continue
-                if server.poll() is not None:
-                    server = start_server()
-                    tally.restarts += 1
-                returncode = run_one(path)
-                tally.classify(name, status, returncode)
-                if returncode == 3:
-                    stop(server)
-                    server = start_server()
-                    tally.restarts += 1
+                try:
+                    srv.ensure()
+                    returncode = srv.run_one(path)
+                    tally.classify(name, status, returncode)
+                    if returncode == 3:
+                        srv.drop()
+                except ServerStartError as e:
+                    aborted = f"{e} — aborting; a crashed test likely corrupted the database"
+                    break
         finally:
-            stop(server)
-        return tally.report()
+            srv.drop()
+        tally.restarts = srv.restarts
+        exit_code = tally.report()
+        if aborted:
+            print(f"ABORTED: {aborted}")
+            return 2
+        return exit_code
 
 
 if __name__ == "__main__":
