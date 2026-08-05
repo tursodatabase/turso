@@ -1278,7 +1278,6 @@ impl Limbo {
             match stepper.next_row() {
                 Ok(Some(row)) => {
                     let mut table_row = Row::new();
-                    table_row.max_height(1);
                     for (idx, value) in row.get_values().enumerate() {
                         let (content, alignment) = match value {
                             Value::Null => (null_value.clone(), CellAlignment::Left),
