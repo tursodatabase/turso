@@ -1675,6 +1675,32 @@ fn test_cdc_v2_txn_id_reset_after_commit(db: TempDatabase) {
     assert_ne!(rows[0][0], rows[1][0]);
 }
 
+#[turso_macros::test]
+fn test_cdc_mvcc_failed_insert_then_empty_commit(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    limbo_exec_rows_fallible(&db, &conn, "INSERT INTO t VALUES (3, 30), (4, 30)")
+        .expect_err("second row must violate the UNIQUE constraint");
+
+    let rows_before = limbo_exec_rows(&conn, "SELECT change_type FROM turso_cdc");
+    conn.execute("BEGIN DEFERRED").unwrap();
+    conn.execute("COMMIT").unwrap();
+    let rows_after_empty_commit = limbo_exec_rows(&conn, "SELECT change_type FROM turso_cdc");
+    assert_eq!(rows_after_empty_commit, rows_before);
+
+    conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT change_type FROM turso_cdc");
+    assert_eq!(
+        &rows[rows.len() - 2..],
+        &[vec![Value::Integer(1)], vec![Value::Integer(2)],]
+    );
+}
+
 /// Regression test for https://github.com/tursodatabase/turso/issues/7677.
 ///
 /// With CDC v2 enabled, an explicit COMMIT emits a CDC commit record. For a transaction that

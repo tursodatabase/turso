@@ -12529,6 +12529,10 @@ pub fn op_open_write(
                     mv_cursor_type,
                     btree_cursor,
                 )?))
+            } else if mv_store.is_some() {
+                Err(LimboError::InternalError(
+                    "OpenWrite requires an active MVCC transaction".to_string(),
+                ))
             } else {
                 Ok(btree_cursor)
             }
