@@ -9,7 +9,7 @@ use futures::stream;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::Value;
-use turso_pg::{split_statements, Connection, PgConnection};
+use turso_pg::{auto_attach_schemas, split_statements, PgConnection};
 
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::portal::{Format, Portal};
@@ -28,7 +28,7 @@ use pgwire::types::format::FormatOptions;
 pub struct TursoPgServer {
     address: String,
     db_file: String,
-    conn: Arc<Mutex<PgConnection>>,
+    db: Arc<turso_core::Database>,
     interrupt_count: Arc<AtomicUsize>,
 }
 
@@ -36,13 +36,13 @@ impl TursoPgServer {
     pub fn new(
         address: String,
         db_file: String,
-        conn: Connection,
+        db: Arc<turso_core::Database>,
         interrupt_count: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             address,
             db_file,
-            conn: Arc::new(Mutex::new(conn)),
+            db,
             interrupt_count,
         }
     }
@@ -52,6 +52,22 @@ impl TursoPgServer {
         rt.block_on(self.run_async())
     }
 
+    /// Opens a fresh session for one client connection: its own database
+    /// connection (PostgreSQL gives every client its own backend, so
+    /// transactions and session state must not be shared) with the schema
+    /// databases attached, since ATTACH is per-connection state.
+    fn open_session(&self) -> anyhow::Result<TursoPgFactory> {
+        let conn = PgConnection::new(self.db.connect()?);
+        auto_attach_schemas(&conn, &self.db_file);
+        Ok(TursoPgFactory {
+            handler: Arc::new(TursoPgHandler {
+                conn: Arc::new(Mutex::new(conn)),
+                db_file: self.db_file.clone(),
+                query_parser: Arc::new(NoopQueryParser::new()),
+            }),
+        })
+    }
+
     async fn run_async(&self) -> anyhow::Result<()> {
         let listener = TcpListener::bind(&self.address).await?;
         println!(
@@ -59,23 +75,21 @@ impl TursoPgServer {
             self.address, self.db_file
         );
 
-        let factory = Arc::new(TursoPgFactory {
-            handler: Arc::new(TursoPgHandler {
-                conn: self.conn.clone(),
-                db_file: self.db_file.clone(),
-                query_parser: Arc::new(NoopQueryParser::new()),
-            }),
-        });
-
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
                         Ok((socket, addr)) => {
                             info!("PostgreSQL client connected from {}", addr);
-                            let factory_ref = factory.clone();
+                            let factory = match self.open_session() {
+                                Ok(factory) => Arc::new(factory),
+                                Err(e) => {
+                                    error!("Error opening session for {}: {}", addr, e);
+                                    continue;
+                                }
+                            };
                             tokio::spawn(async move {
-                                if let Err(e) = process_socket(socket, None, factory_ref).await {
+                                if let Err(e) = process_socket(socket, None, factory).await {
                                     error!("Error processing connection from {}: {}", addr, e);
                                 }
                             });

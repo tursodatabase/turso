@@ -19,6 +19,8 @@ turso_ext.workspace = true
 turso_sdk_kit = { path = "../../sdk-kit" }
 turso = { workspace = true }
 turso_pg = { workspace = true }
+turso_pg_client = { workspace = true }
+turso_pg_server = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 rusqlite.workspace = true
 tempfile = { workspace = true }

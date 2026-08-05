@@ -72,6 +72,40 @@ pub fn open_database_with_io(
     )
 }
 
+/// Attaches every `turso-postgres-schema-<name>.db` file next to the main
+/// database as schema `<name>`. ATTACH is per-connection state in Turso, so
+/// every new session must do this to see previously created schemas.
+pub fn auto_attach_schemas(conn: &PgConnection, db_file: &str) {
+    if db_file == ":memory:" {
+        return;
+    }
+    let dir = std::path::Path::new(db_file)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(schema) = name
+            .strip_prefix("turso-postgres-schema-")
+            .and_then(|s| s.strip_suffix(".db"))
+        else {
+            continue;
+        };
+        let path = entry.path().to_string_lossy().to_string();
+        let sql = format!("ATTACH '{path}' AS \"{schema}\"");
+        tracing::info!("Auto-attaching PG schema '{}' from {}", schema, path);
+        if let Err(e) = conn.inner().execute(&sql) {
+            tracing::warn!("Failed to attach schema '{}': {}", schema, e);
+        }
+    }
+}
+
 impl PgConnection {
     pub fn new(conn: Arc<Connection>) -> Self {
         aliases::install(&conn);

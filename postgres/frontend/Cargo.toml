@@ -13,6 +13,7 @@ path = "lib.rs"
 [dependencies]
 chrono = { workspace = true, default-features = false, features = ["clock"] }
 parking_lot = { workspace = true }
+tracing = { workspace = true }
 rustc-hash = "2.0"
 tempfile = { workspace = true }
 turso_core = { workspace = true, default-features = true, features = [
