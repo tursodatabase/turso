@@ -439,17 +439,25 @@ fn test_copy_from_combined_options(db: TempDatabase) {
 }
 
 // ---------------------------------------------------------------------------
-// COPY TO should produce a clear error (unsupported)
+// COPY TO text format
 // ---------------------------------------------------------------------------
 
 #[turso_macros::test(mvcc)]
-fn test_copy_to_unsupported(db: TempDatabase) {
+fn test_copy_to_text(db: TempDatabase) {
     let conn = db.connect_postgres();
 
-    conn.execute("CREATE TABLE t (a INTEGER)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER, name TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'Alice')").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'Bob')").unwrap();
 
-    let result = conn.execute("COPY t TO '/tmp/out.tsv'");
-    assert!(result.is_err());
+    let out_dir = tempfile::tempdir().unwrap();
+    let out_path = out_dir.path().join("copy_to_text.tsv");
+    let sql = format!("COPY t TO '{}'", out_path.display());
+    conn.execute(&sql).unwrap();
+
+    let content = std::fs::read_to_string(&out_path).unwrap();
+    assert_eq!(content, "1\tAlice\n2\tBob\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -623,23 +631,25 @@ fn test_copy_from_nonexistent_column(db: TempDatabase) {
 }
 
 // ---------------------------------------------------------------------------
-// CSV format rejection — we only support text format
+// CSV format FROM
 // ---------------------------------------------------------------------------
 
 #[turso_macros::test(mvcc)]
-fn test_copy_from_csv_format_unsupported(db: TempDatabase) {
+fn test_copy_from_csv_format(db: TempDatabase) {
     let conn = db.connect_postgres();
 
     conn.execute("CREATE TABLE t (a INTEGER, b TEXT)").unwrap();
 
-    let csv = write_temp_file("1,hello\n");
+    let csv = write_temp_file("1,hello\n2,world\n");
     let sql = format!("COPY t FROM '{}' WITH (FORMAT csv)", csv.path().display());
-    let result = conn.execute(&sql);
-    // Should fail: CSV format is not supported
-    assert!(
-        result.is_err(),
-        "CSV format should not be silently accepted"
-    );
+    conn.execute(&sql).unwrap();
+
+    let rows = query_all(&conn, "SELECT a, b FROM t ORDER BY a");
+    assert_eq!(rows.len(), 2);
+    assert_int(&rows[0][0], 1);
+    assert_text(&rows[0][1], "hello");
+    assert_int(&rows[1][0], 2);
+    assert_text(&rows[1][1], "world");
 }
 
 // ---------------------------------------------------------------------------
@@ -756,4 +766,53 @@ fn test_copy_from_stdin_unsupported(db: TempDatabase) {
     let result = conn.execute("COPY t FROM STDIN");
     // STDIN is not supported — should produce an error
     assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// COPY TO CSV format
+// ---------------------------------------------------------------------------
+
+#[turso_macros::test(mvcc)]
+fn test_copy_to_csv(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    conn.execute("CREATE TABLE t (id INTEGER, name TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'Alice')").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'Bob, Jr.')")
+        .unwrap();
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let out_path = out_dir.path().join("copy_to_csv.csv");
+    let sql = format!("COPY t TO '{}' WITH (FORMAT csv)", out_path.display());
+    conn.execute(&sql).unwrap();
+
+    let content = std::fs::read_to_string(&out_path).unwrap();
+    // comma with a value that contains a comma must be quoted
+    assert_eq!(content, "1,Alice\n2,\"Bob, Jr.\"\n");
+}
+
+// ---------------------------------------------------------------------------
+// COPY TO: target file is not modified when the copy fails
+// ---------------------------------------------------------------------------
+
+#[turso_macros::test(mvcc)]
+fn test_copy_to_does_not_overwrite_on_failure(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    conn.execute("CREATE TABLE t (id INTEGER)").unwrap();
+
+    // Keep the target path closed so COPY TO can replace it.
+    let out_dir = tempfile::tempdir().unwrap();
+    let out_path = out_dir.path().join("copy_to_failure.tsv");
+    std::fs::write(&out_path, b"keep me\n").unwrap();
+
+    // COPY with a non-existent column fails during SELECT preparation,
+    // before writing anything to the output file.
+    let sql = format!("COPY t (missing_col) TO '{}'", out_path.display());
+    assert!(conn.execute(&sql).is_err());
+
+    // The original content must still be intact.
+    let content = std::fs::read_to_string(&out_path).unwrap();
+    assert_eq!(content, "keep me\n");
 }
