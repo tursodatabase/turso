@@ -195,7 +195,7 @@ def get_repo_full_name():
     sys.exit(1)
 
 
-def merge_rest_api(pr_number: int, commit_message: str, commit_title: str):
+def merge_async(pr_number: int, commit_message: str, commit_title: str):
     repo = get_repo_full_name()
 
     payload = json.dumps({
@@ -207,31 +207,53 @@ def merge_rest_api(pr_number: int, commit_message: str, commit_title: str):
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as f:
         f.write(payload)
         f.flush()
-        cmd = f"gh api -X PUT repos/{repo}/pulls/{pr_number}/merge --input {shlex.quote(f.name)}"
+        cmd = f"gh api -X PUT repos/{repo}/pulls/{pr_number}/merge-async --input {shlex.quote(f.name)}"
         output, error, returncode = run_command(cmd)
 
     if returncode != 0:
-        print(f"Error merging PR via REST API: {error}")
+        print(f"Error merging PR: {error}")
         sys.exit(1)
 
     result = json.loads(output) if output else {}
-    if result.get("merged"):
+    status = result.get("status")
+
+    if status == "merged":
         print(f"\nPull request #{pr_number} merged successfully!")
         print(f"\nMerge commit message:\n{commit_title}\n\n{commit_message}")
         return
 
+    if status == "failed":
+        print(f"Error merging PR: {result.get('message', 'unknown error')}")
+        sys.exit(1)
+
+    uuid = result.get("uuid")
+    if not uuid:
+        print(f"Error merging PR: unexpected response: {output}")
+        sys.exit(1)
+
     print("Merge queued, waiting for completion...")
-    for _ in range(30):
+    for _ in range(60):
         time.sleep(2)
-        state_out, _, rc = run_command(
-            f"gh pr view {pr_number} -R {repo} --json state -q .state"
+        poll_out, poll_err, rc = run_command(
+            f"gh api repos/{repo}/pulls/{pr_number}/merge-async/{uuid}"
         )
-        if rc == 0 and state_out == "MERGED":
+        if rc != 0:
+            print(f"Error polling merge status: {poll_err}")
+            sys.exit(1)
+
+        poll_result = json.loads(poll_out) if poll_out else {}
+        poll_status = poll_result.get("status")
+
+        if poll_status == "merged":
             print(f"\nPull request #{pr_number} merged successfully!")
             print(f"\nMerge commit message:\n{commit_title}\n\n{commit_message}")
             return
 
-    print("Warning: Merge was queued but hasn't completed within 60 seconds.")
+        if poll_status == "failed":
+            print(f"Error merging PR: {poll_result.get('message', 'unknown error')}")
+            sys.exit(1)
+
+    print("Warning: Merge hasn't completed within 120 seconds.")
     print("Check the PR status manually.")
     sys.exit(1)
 
@@ -255,7 +277,7 @@ def merge_remote(pr_number: int, commit_message: str, commit_title: str):
             exit(0)
 
     print(f"\nMerging PR #{pr_number} with custom commit message...")
-    merge_rest_api(pr_number, commit_message, commit_title)
+    merge_async(pr_number, commit_message, commit_title)
 
 
 def merge_local(pr_number: int, commit_message: str):
