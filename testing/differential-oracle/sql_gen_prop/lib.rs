@@ -31,6 +31,7 @@ pub mod profile;
 pub mod result;
 pub mod schema;
 pub mod select;
+pub mod spelling;
 pub mod statement;
 pub mod transaction;
 pub mod update;
