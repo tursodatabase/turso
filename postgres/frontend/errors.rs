@@ -85,6 +85,9 @@ fn parse_error(msg: &str, sql: &str) -> PgErrorInfo {
             position: Some(sql.chars().count() + 1),
         };
     }
+    if let Some(idx) = msg.find("unrecognized configuration parameter") {
+        return PgErrorInfo::new("42704", msg[idx..].to_string());
+    }
     if let Some(name) = msg.strip_prefix("no such table: ") {
         return PgErrorInfo::new("42P01", format!("relation \"{name}\" does not exist"));
     }

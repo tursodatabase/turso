@@ -9,7 +9,7 @@ use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_create_schema,
     try_extract_drop_schema, try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PgSetStmt, PostgreSQLTranslator,
+    PgDropSchemaStmt, PgSetKind, PgSetStmt, PgSetValue, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -34,6 +34,44 @@ impl PgConnectionInner {
 #[derive(Default)]
 struct SessionState {
     search_path: Vec<String>,
+    /// Session GUCs set via `SET`, keyed by lowercased name. Values fall
+    /// back to [`GUC_DEFAULTS`] when unset.
+    gucs: std::collections::HashMap<String, String>,
+}
+
+/// Built-in GUCs with their canonical display name (SHOW's column header
+/// preserves PostgreSQL's casing) and session defaults. `search_path` is
+/// special-cased against the session's live search path instead.
+const GUC_DEFAULTS: &[(&str, &str, &str)] = &[
+    ("application_name", "application_name", ""),
+    ("client_encoding", "client_encoding", "UTF8"),
+    ("client_min_messages", "client_min_messages", "notice"),
+    ("datestyle", "DateStyle", "ISO, MDY"),
+    ("extra_float_digits", "extra_float_digits", "1"),
+    ("intervalstyle", "IntervalStyle", "postgres"),
+    ("max_index_keys", "max_index_keys", "32"),
+    ("server_encoding", "server_encoding", "UTF8"),
+    ("server_version", "server_version", "17.0"),
+    (
+        "standard_conforming_strings",
+        "standard_conforming_strings",
+        "on",
+    ),
+    ("synchronous_commit", "synchronous_commit", "on"),
+    ("timezone", "TimeZone", "UTC"),
+    (
+        "transaction_isolation",
+        "transaction_isolation",
+        "read committed",
+    ),
+];
+
+/// Canonical display name and default value of a built-in GUC.
+fn guc_default(lower_name: &str) -> Option<(&'static str, &'static str)> {
+    GUC_DEFAULTS
+        .iter()
+        .find(|(name, _, _)| *name == lower_name)
+        .map(|(_, canonical, default)| (*canonical, *default))
 }
 
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
@@ -296,8 +334,7 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
     }
 
     if let Some(show_stmt) = try_extract_show(&parse_result) {
-        let pragma_sql = format!("PRAGMA {}", show_stmt.name);
-        return Ok(Some(pg_conn.conn.prepare(&pragma_sql)?));
+        return Ok(Some(handle_pg_show(pg_conn, &show_stmt.name)?));
     }
 
     if let Some(stmt) = try_extract_create_schema(&parse_result) {
@@ -338,21 +375,129 @@ fn execute_sqlite_internal(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Resu
 }
 
 fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {
-    if set_stmt.name == "search_path" {
-        let path = set_stmt
-            .values
-            .iter()
-            .map(|value| value.as_search_path_name().map(str::to_owned))
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| LimboError::ParseError("incorrect format".to_string()))?;
-        pg_conn.set_search_path(path);
-        return noop_statement(&pg_conn.conn);
+    let name = set_stmt.name.to_lowercase();
+    match set_stmt.kind {
+        PgSetKind::Value if name == "search_path" => {
+            let path = set_stmt
+                .values
+                .iter()
+                .map(|value| value.as_search_path_name().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| LimboError::ParseError("incorrect format".to_string()))?;
+            pg_conn.set_search_path(path);
+        }
+        PgSetKind::Value => {
+            if set_stmt.values.is_empty() {
+                return Err(LimboError::ParseError(format!(
+                    "SET {}: no value provided",
+                    set_stmt.name
+                )));
+            }
+            // Multi-part values display comma-separated, the way SHOW
+            // renders them (SET datestyle = ISO, MDY -> "ISO, MDY").
+            let value = set_stmt
+                .values
+                .iter()
+                .map(guc_value_text)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let value = canonicalize_guc(&name, value);
+            let mut state = pg_conn.session_state.lock().unwrap();
+            state.gucs.insert(name, value);
+        }
+        PgSetKind::Reset => {
+            let mut state = pg_conn.session_state.lock().unwrap();
+            state.gucs.remove(&name);
+        }
+        PgSetKind::ResetAll => {
+            let mut state = pg_conn.session_state.lock().unwrap();
+            state.gucs.clear();
+        }
     }
-    let value = set_stmt.values.first().ok_or_else(|| {
-        LimboError::ParseError(format!("SET {}: no value provided", set_stmt.name))
-    })?;
-    let pragma_sql = format!("PRAGMA {} = {}", set_stmt.name, value.to_sql_string());
-    pg_conn.conn.prepare(&pragma_sql)
+    noop_statement(&pg_conn.conn)
+}
+
+/// GUCs whose values SHOW displays in canonical PostgreSQL form. Booleans
+/// display as on/off however they were spelled; DateStyle tokens display in
+/// PostgreSQL's casing (unquoted SQL identifiers arrive lowercased).
+fn canonicalize_guc(lower_name: &str, value: String) -> String {
+    const BOOL_GUCS: &[&str] = &["standard_conforming_strings", "synchronous_commit"];
+    if BOOL_GUCS.contains(&lower_name) {
+        return match value.to_lowercase().as_str() {
+            "on" | "true" | "yes" | "1" => "on".to_string(),
+            "off" | "false" | "no" | "0" => "off".to_string(),
+            _ => value,
+        };
+    }
+    if lower_name == "datestyle" {
+        return value
+            .split(", ")
+            .map(|part| match part.to_lowercase().as_str() {
+                "iso" => "ISO",
+                "sql" => "SQL",
+                "postgres" => "Postgres",
+                "german" => "German",
+                "mdy" => "MDY",
+                "dmy" => "DMY",
+                "ymd" => "YMD",
+                _ => part,
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
+    // IntervalStyle values (postgres, postgres_verbose, sql_standard,
+    // iso_8601) display lowercase, which they already are.
+    value
+}
+
+/// How a SET argument reads back through SHOW.
+fn guc_value_text(value: &PgSetValue) -> String {
+    match value {
+        PgSetValue::Identifier(s) | PgSetValue::StringLiteral(s) | PgSetValue::Number(s) => {
+            s.clone()
+        }
+        PgSetValue::Bool(true) => "on".to_string(),
+        PgSetValue::Bool(false) => "off".to_string(),
+        PgSetValue::RawSql(s) => s.clone(),
+        PgSetValue::Null => String::new(),
+    }
+}
+
+/// Resolves a GUC for SHOW: session value, then built-in default. Unknown
+/// parameters error the way PostgreSQL does.
+fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, name: &str) -> Result<Statement> {
+    let lower = name.to_lowercase();
+    let state = pg_conn.session_state.lock().unwrap();
+    let value = if lower == "search_path" {
+        let path = &state.search_path;
+        if path.is_empty() {
+            "\"$user\", public".to_string()
+        } else {
+            path.join(", ")
+        }
+    } else if let Some(value) = state.gucs.get(&lower) {
+        value.clone()
+    } else if let Some((_, default)) = guc_default(&lower) {
+        default.to_string()
+    } else {
+        return Err(LimboError::ParseError(format!(
+            "unrecognized configuration parameter \"{lower}\""
+        )));
+    };
+    drop(state);
+    let column = if lower == "search_path" {
+        "search_path"
+    } else {
+        guc_default(&lower)
+            .map(|(canonical, _)| canonical)
+            .unwrap_or(&lower)
+    };
+    let sql = format!(
+        "SELECT '{}' AS \"{}\"",
+        value.replace('\'', "''"),
+        column.replace('"', "\"\"")
+    );
+    pg_conn.conn.prepare(&sql)
 }
 
 fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {

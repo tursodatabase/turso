@@ -1,0 +1,73 @@
+# Session configuration parameters (GUCs): SET / SHOW / RESET round-trips.
+# Expectations avoid environment-dependent defaults (TimeZone, DateStyle
+# can vary with initdb settings on real PostgreSQL); they assert values the
+# session itself set, and the errors PostgreSQL raises for unknown names.
+
+@database :memory:
+
+test guc-set-show-roundtrip {
+    SET extra_float_digits = 2;
+    SHOW extra_float_digits;
+}
+expect {
+    2
+}
+
+test guc-set-show-string {
+    SET datestyle = 'ISO, YMD';
+    SHOW datestyle;
+}
+expect {
+    ISO, YMD
+}
+
+test guc-set-multi-part-value {
+    SET datestyle = ISO, YMD;
+    SHOW datestyle;
+}
+expect {
+    ISO, YMD
+}
+
+test guc-reset-restores-default {
+    SET extra_float_digits = 3;
+    RESET extra_float_digits;
+    SET extra_float_digits = 2;
+    SHOW extra_float_digits;
+}
+expect {
+    2
+}
+
+test guc-set-to-default-acts-like-reset {
+    SET extra_float_digits = 3;
+    SET extra_float_digits TO DEFAULT;
+    SET extra_float_digits = 2;
+    SHOW extra_float_digits;
+}
+expect {
+    2
+}
+
+test guc-custom-dotted-parameter {
+    SET myapp.tenant = 'acme';
+    SHOW myapp.tenant;
+}
+expect {
+    acme
+}
+
+test guc-show-unknown-parameter-errors {
+    SHOW no_such_parameter;
+}
+expect error {
+    ^unrecognized configuration parameter "no_such_parameter"$
+}
+
+test guc-boolean-value-displays-as-on {
+    SET standard_conforming_strings = true;
+    SHOW standard_conforming_strings;
+}
+expect {
+    on
+}

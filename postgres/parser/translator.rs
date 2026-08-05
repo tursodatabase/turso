@@ -4452,6 +4452,18 @@ fn pg_fk_action_to_string(action: &str) -> Option<String> {
 pub struct PgSetStmt {
     pub name: String,
     pub values: Vec<PgSetValue>,
+    pub kind: PgSetKind,
+}
+
+/// Which form of SET/RESET the statement is.
+#[derive(Clone, Copy, PartialEq)]
+pub enum PgSetKind {
+    /// `SET name = value`
+    Value,
+    /// `SET name TO DEFAULT` or `RESET name` — both revert to the default.
+    Reset,
+    /// `RESET ALL`
+    ResetAll,
 }
 
 #[derive(Clone)]
@@ -4535,10 +4547,15 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
         _ => return None,
     };
 
-    // Only handle VAR_SET_VALUE (kind == 1)
-    if set_stmt.kind != 1 {
-        return None;
-    }
+    // VariableSetKind: 1 = SET value, 2 = SET ... TO DEFAULT, 5 = RESET,
+    // 6 = RESET ALL. SET SESSION CHARACTERISTICS (multi) and SET ... FROM
+    // CURRENT are not handled.
+    let kind = match set_stmt.kind {
+        1 => PgSetKind::Value,
+        2 | 5 => PgSetKind::Reset,
+        6 => PgSetKind::ResetAll,
+        _ => return None,
+    };
 
     // Extract the value from args
     let values = set_stmt
@@ -4550,6 +4567,7 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
     Some(PgSetStmt {
         name: set_stmt.name.clone(),
         values,
+        kind,
     })
 }
 
