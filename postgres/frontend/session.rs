@@ -109,6 +109,9 @@ pub fn auto_attach_schemas(conn: &PgConnection, db_file: &str) {
 impl PgConnection {
     pub fn new(conn: Arc<Connection>) -> Self {
         aliases::install(&conn);
+        // PostgreSQL always enforces foreign keys; the engine's SQLite-style
+        // default is off, so every session turns it on.
+        conn.set_foreign_keys_enabled(true);
         Self {
             inner: Arc::new(PgConnectionInner {
                 conn,

@@ -9,7 +9,7 @@ use futures::stream;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::Value;
-use turso_pg::{auto_attach_schemas, split_statements, PgConnection};
+use turso_pg::{auto_attach_schemas, pg_error, split_statements, LimboError, PgConnection};
 
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::portal::{Format, Portal};
@@ -196,13 +196,13 @@ impl SimpleQueryHandler for TursoPgHandler {
         // Per the PostgreSQL simple query protocol, a query string may contain
         // multiple semicolon-separated statements. Split and execute each one.
         let statements = split_statements(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e))))?;
 
         let mut responses = Vec::new();
         for sql in &statements {
             let mut stmt = conn
                 .prepare(sql)
-                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e))))?;
 
             self.cleanup_dropped_schema_file(sql);
 
@@ -241,7 +241,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
 
         let mut stmt = conn
             .prepare(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e))))?;
 
         // Clean up schema file after successful DROP SCHEMA
         self.cleanup_dropped_schema_file(query);
@@ -268,7 +268,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let conn = self.conn.lock().unwrap().clone();
         let stmt = conn
             .prepare(&target.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e))))?;
 
         let param_types: Vec<Type> = target
             .parameter_types
@@ -291,7 +291,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let conn = self.conn.lock().unwrap().clone();
         let stmt = conn
             .prepare(&portal.statement.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e))))?;
 
         let fields = build_field_info(&stmt, &portal.result_column_format);
         Ok(DescribePortalResponse::new(fields))
@@ -415,7 +415,7 @@ fn execute_query(
         rows.push(encoder.finish());
         Ok(())
     })
-    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e))))?;
 
     let data_stream = stream::iter(rows);
     Ok(Response::Query(QueryResponse::new(header, data_stream)))
@@ -424,7 +424,7 @@ fn execute_query(
 /// Execute a non-SELECT statement and build an Execution response.
 fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireResult<Response> {
     stmt.run_ignore_rows()
-        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e))))?;
 
     let affected = stmt.n_change();
     let tag = command_tag(query, affected as usize);
@@ -472,7 +472,7 @@ fn bind_portal_parameters(
 /// Assumes text format encoding (UTF-8 string representations).
 fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
     let text = std::str::from_utf8(bytes).map_err(|e| {
-        PgWireError::UserError(Box::new(error_info(&format!(
+        PgWireError::UserError(Box::new(param_error_info(&format!(
             "invalid UTF-8 in parameter: {e}"
         ))))
     })?;
@@ -480,7 +480,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
     match *pg_type {
         Type::INT2 | Type::INT4 | Type::INT8 => {
             let i: i64 = text.parse().map_err(|e| {
-                PgWireError::UserError(Box::new(error_info(&format!(
+                PgWireError::UserError(Box::new(param_error_info(&format!(
                     "invalid integer parameter: {e}"
                 ))))
             })?;
@@ -488,7 +488,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
         }
         Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => {
             let f: f64 = text.parse().map_err(|e| {
-                PgWireError::UserError(Box::new(error_info(&format!(
+                PgWireError::UserError(Box::new(param_error_info(&format!(
                     "invalid float parameter: {e}"
                 ))))
             })?;
@@ -497,15 +497,15 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
         Type::BOOL => match text {
             "t" | "true" | "TRUE" | "1" | "yes" | "on" => Ok(Value::from_i64(1)),
             "f" | "false" | "FALSE" | "0" | "no" | "off" => Ok(Value::from_i64(0)),
-            _ => Err(PgWireError::UserError(Box::new(error_info(&format!(
-                "invalid boolean parameter: {text}"
-            ))))),
+            _ => Err(PgWireError::UserError(Box::new(param_error_info(
+                &format!("invalid boolean parameter: {text}"),
+            )))),
         },
         Type::BYTEA => {
             // PostgreSQL text format for bytea uses \x hex encoding
             if let Some(hex_str) = text.strip_prefix("\\x") {
                 let data = decode_hex(hex_str).map_err(|e| {
-                    PgWireError::UserError(Box::new(error_info(&format!(
+                    PgWireError::UserError(Box::new(param_error_info(&format!(
                         "invalid bytea hex parameter: {e}"
                     ))))
                 })?;
@@ -769,8 +769,15 @@ fn is_create_table_as(upper: &str) -> bool {
     matches!(tokens.next(), Some(t) if t == "AS" || t.starts_with("AS("))
 }
 
-fn error_info(message: &str) -> ErrorInfo {
-    ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), message.to_owned())
+/// Maps an engine error to a PostgreSQL error response with its SQLSTATE.
+fn error_info(e: &LimboError) -> ErrorInfo {
+    let info = pg_error(e);
+    ErrorInfo::new("ERROR".to_owned(), info.code.to_owned(), info.message)
+}
+
+/// A malformed extended-protocol parameter value: invalid_text_representation.
+fn param_error_info(message: &str) -> ErrorInfo {
+    ErrorInfo::new("ERROR".to_owned(), "22P02".to_owned(), message.to_owned())
 }
 
 #[cfg(test)]

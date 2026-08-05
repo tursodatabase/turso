@@ -9,3 +9,5 @@ mod sessions;
 mod table;
 mod type_aliases;
 mod update_from;
+mod wire;
+mod wire_errors;
