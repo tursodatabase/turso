@@ -435,6 +435,10 @@ pub enum AggFunc {
     StringAgg,
     Sum,
     Total,
+    /// PostgreSQL bool_and()/every(): true when every non-NULL input is true.
+    BoolAnd,
+    /// PostgreSQL bool_or(): true when any non-NULL input is true.
+    BoolOr,
     #[cfg(feature = "json")]
     JsonbGroupArray,
     #[cfg(feature = "json")]
@@ -721,6 +725,7 @@ impl AggFunc {
             Self::StringAgg => 2,
             Self::Sum => 1,
             Self::Total => 1,
+            Self::BoolAnd | Self::BoolOr => 1,
             Self::ArrayAgg => 1,
             // Ordered-set aggregates: args are rewritten by the planner to
             // `[value]` (mode) or `[value, fraction]` (percentiles).
@@ -750,6 +755,7 @@ impl AggFunc {
             Self::StringAgg => &[2],
             Self::Sum => &[1],
             Self::Total => &[1],
+            Self::BoolAnd | Self::BoolOr => &[1],
             Self::ArrayAgg => &[1],
             Self::Mode => &[1],
             Self::PercentileCont | Self::PercentileDisc => &[2],
@@ -772,6 +778,8 @@ impl AggFunc {
             Self::StringAgg => "string_agg",
             Self::Sum => "sum",
             Self::Total => "total",
+            Self::BoolAnd => "bool_and",
+            Self::BoolOr => "bool_or",
             Self::ArrayAgg => "array_agg",
             Self::Mode => "mode",
             Self::PercentileCont => "percentile_cont",

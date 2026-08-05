@@ -6284,6 +6284,12 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
             payload.push(Value::from_i64(0));
         }
         AggFunc::Min | AggFunc::Max => payload.push(Value::Null),
+        // Counting both slots keeps the aggregate invertible for window
+        // frames: a plain boolean accumulator cannot undo a step.
+        AggFunc::BoolAnd | AggFunc::BoolOr => {
+            payload.push(Value::from_i64(0));
+            payload.push(Value::from_i64(0));
+        }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
             // Use Null as sentinel to distinguish "no values yet" from an
             // accumulated empty string. SQLite normally remembers one
@@ -6391,6 +6397,29 @@ fn update_agg_payload(
                 ));
             };
             *i = i.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+        }
+        AggFunc::BoolAnd | AggFunc::BoolOr => {
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
+            let truthy = arg.to_float_or_zero() != 0.0;
+            // invariant as per init_agg_payload: [count_nonnull, count_true]
+            let [Value::Numeric(Numeric::Integer(count_nonnull)), Value::Numeric(Numeric::Integer(count_true)), ..] =
+                payload.as_mut_slice()
+            else {
+                mark_unlikely();
+                return Err(LimboError::InternalError(
+                    "BoolAnd/BoolOr: payload is not two integers".to_string(),
+                ));
+            };
+            *count_nonnull = count_nonnull
+                .checked_add(1)
+                .ok_or(LimboError::IntegerOverflow)?;
+            if truthy {
+                *count_true = count_true
+                    .checked_add(1)
+                    .ok_or(LimboError::IntegerOverflow)?;
+            }
         }
         AggFunc::Avg => {
             if matches!(arg, Value::Null) {
@@ -6734,6 +6763,18 @@ fn update_agg_payload(
 fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
     let val = match func {
         AggFunc::Count | AggFunc::Count0 => payload[0].clone(),
+        AggFunc::BoolAnd | AggFunc::BoolOr => {
+            // Payload: [count_nonnull, count_true]
+            let count_nonnull = payload[0].as_int().unwrap_or(0);
+            let count_true = payload[1].as_int().unwrap_or(0);
+            if count_nonnull == 0 {
+                Value::Null
+            } else if matches!(func, AggFunc::BoolAnd) {
+                Value::from_i64((count_true == count_nonnull) as i64)
+            } else {
+                Value::from_i64((count_true > 0) as i64)
+            }
+        }
         AggFunc::Avg => {
             // Payload: [sum, r_err, count]
             let count = payload[2].as_int().unwrap_or(0);
@@ -7635,6 +7676,26 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             };
             debug_assert!(*i > 0, "Count(*) xInverse without matching xStep");
             *i -= 1;
+        }
+        AggFunc::BoolAnd | AggFunc::BoolOr => {
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
+            let truthy = arg.to_float_or_zero() != 0.0;
+            let [Value::Numeric(Numeric::Integer(count_nonnull)), Value::Numeric(Numeric::Integer(count_true)), ..] =
+                payload
+            else {
+                unreachable!("BoolAnd/BoolOr payload is two Integers per init_agg_payload");
+            };
+            debug_assert!(
+                *count_nonnull > 0,
+                "bool agg xInverse without matching xStep"
+            );
+            *count_nonnull -= 1;
+            if truthy {
+                debug_assert!(*count_true > 0, "bool agg xInverse without matching xStep");
+                *count_true -= 1;
+            }
         }
         AggFunc::Sum | AggFunc::Total => {
             let parsed = classify_numeric_arg(&arg);

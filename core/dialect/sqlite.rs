@@ -319,6 +319,9 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
             Ok(Some(Func::Scalar(ScalarFunc::TimeDiff)))
         }
         "array_agg" => Ok(Some(Func::Agg(AggFunc::ArrayAgg))),
+        // "every" is PostgreSQL's SQL-standard spelling of bool_and.
+        "bool_and" | "every" => Ok(Some(Func::Agg(AggFunc::BoolAnd))),
+        "bool_or" => Ok(Some(Func::Agg(AggFunc::BoolOr))),
         #[cfg(feature = "json")]
         "jsonb_group_array" => Ok(Some(Func::Agg(AggFunc::JsonbGroupArray))),
         #[cfg(feature = "json")]

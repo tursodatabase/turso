@@ -411,3 +411,60 @@ test regexp-match-invalid-pattern-errors {
 expect error {
     invalid regular expression
 }
+
+# bool_and/bool_or results are cast to int because bare boolean output
+# rendering (t/f) is not implemented yet; the int form matches PostgreSQL.
+test bool-and-bool-or-per-group {
+    CREATE TABLE boolagg (g int, x boolean);
+    INSERT INTO boolagg VALUES (1, true), (1, true), (2, true), (2, false), (3, NULL);
+    SELECT g, bool_and(x)::int, bool_or(x)::int FROM boolagg GROUP BY g ORDER BY g;
+}
+expect {
+    1|1|1
+    2|0|1
+    3||
+}
+
+test every-is-bool-and {
+    CREATE TABLE boolagg (g int, x boolean);
+    INSERT INTO boolagg VALUES (2, true), (2, false);
+    SELECT every(x)::int FROM boolagg WHERE g = 2;
+}
+expect {
+    0
+}
+
+test bool-and-skips-nulls {
+    CREATE TABLE boolagg (g int, x boolean);
+    INSERT INTO boolagg VALUES (4, true), (4, NULL);
+    SELECT bool_and(x)::int, bool_or(x)::int FROM boolagg WHERE g = 4;
+}
+expect {
+    1|1
+}
+
+test bool-and-empty-input-is-null {
+    CREATE TABLE boolagg (g int, x boolean);
+    SELECT coalesce(bool_and(x)::int::text, 'null') FROM boolagg WHERE g = 99;
+}
+expect {
+    null
+}
+
+test bool-and-as-window-function {
+    CREATE TABLE boolagg (g int, x boolean);
+    INSERT INTO boolagg VALUES (1, true), (1, true), (2, true), (2, false);
+    SELECT g, bool_and(x) OVER (PARTITION BY g)::int FROM boolagg ORDER BY g, x;
+}
+expect {
+    1|1
+    1|1
+    2|0
+    2|0
+}
+
+test bool-and-wrong-arity-errors {
+    CREATE TABLE boolagg (g int, x boolean);
+    SELECT bool_and(x, x) FROM boolagg;
+}
+expect error {}
