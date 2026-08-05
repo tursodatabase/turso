@@ -214,15 +214,15 @@ def validate_status() -> None:
         sys.exit(f"error: STATUS lists tests not in the schedule: {sorted(listed - scheduled)}")
 
 
-def main() -> int:
-    validate_status()
+def parse_argv() -> tuple[list[str], list[str]]:
     runner_args = []
     tests = []
     for arg in sys.argv[1:]:
         (runner_args if arg.startswith("-") else tests).append(arg)
+    return runner_args, tests
 
-    if not tests:
-        tests = schedule_order()
+
+def resolve_paths(tests: list[str]) -> list[str]:
     paths = []
     for test in tests:
         path = Path(test)
@@ -231,6 +231,64 @@ def main() -> int:
         if not path.exists():
             sys.exit(f"error: no such test: {test}")
         paths.append(str(path))
+    return paths
+
+
+def test_status(name: str) -> tuple[str, str]:
+    """Status and skip reason of a test. Tests outside the corpus must pass."""
+    status = STATUS.get(name, "pass")
+    if isinstance(status, str):
+        return status, ""
+    return status
+
+
+def stop(proc: subprocess.Popen) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+class Tally:
+    """Counts test outcomes against their statuses and renders the summary."""
+
+    def __init__(self) -> None:
+        self.ok = 0
+        self.known_bad = 0
+        self.skipped = 0
+        self.restarts = 0
+        self.regressions: list[str] = []
+        self.unexpected_passes: list[str] = []
+
+    def classify(self, name: str, status: str, returncode: int) -> None:
+        if returncode == 0:
+            if status == "fail":
+                self.unexpected_passes.append(name)
+            else:
+                self.ok += 1
+        elif status == "fail":
+            self.known_bad += 1
+        else:
+            self.regressions.append(name)
+
+    def report(self) -> int:
+        print(f"\n=== total: {self.ok} blessed ok, {self.known_bad} known-bad "
+              f"failure(s), {len(self.regressions)} regression(s), "
+              f"{len(self.unexpected_passes)} unexpected pass(es), "
+              f"{self.skipped} skipped, {self.restarts} server restart(s) ===")
+        for name in self.regressions:
+            print(f'REGRESSION: {name} is blessed "pass" but its output diverged')
+        for name in self.unexpected_passes:
+            print(f'XPASS: {name} now passes byte-exact; bless it by changing its '
+                  f'STATUS entry to "pass"')
+        return 1 if self.regressions or self.unexpected_passes else 0
+
+
+def main() -> int:
+    validate_status()
+    runner_args, tests = parse_argv()
+    paths = resolve_paths(tests or schedule_order())
 
     subprocess.run(
         ["cargo", "build", "-p", "tursopg", "-p", "turso_pg_regress"],
@@ -264,6 +322,21 @@ def main() -> int:
             wait_for_server(proc, port)
             return proc
 
+        def run_one(path: str) -> int:
+            try:
+                result = subprocess.run(
+                    [bins / "pgregress", "--dsn", f"postgres://127.0.0.1:{port}/regression"]
+                    + runner_args
+                    + [path],
+                    cwd=REPO_ROOT,
+                    env=env,
+                    timeout=60,
+                )
+                return result.returncode
+            except subprocess.TimeoutExpired:
+                print(f"{Path(path).stem} ... FAILED (runner timeout)")
+                return 3
+
         # One runner invocation per test, restarting the server whenever a
         # test crashed or wedged it (exit code 3 = transport failure, or a
         # runner timeout). A crash still fails the test that caused it, but
@@ -272,69 +345,27 @@ def main() -> int:
         # after. The database file persists across restarts, so fixtures
         # survive.
         server = start_server()
-        ok = known_bad = skipped = restarts = 0
-        regressions = []
-        unexpected_passes = []
+        tally = Tally()
         try:
             for path in paths:
                 name = Path(path).stem
-                # Tests outside the corpus have no status; they must pass.
-                status = STATUS.get(name, "pass")
-                if not isinstance(status, str):
-                    status, reason = status
+                status, reason = test_status(name)
                 if status == "skip":
                     print(f"{name} ... skip ({reason})")
-                    skipped += 1
+                    tally.skipped += 1
                     continue
                 if server.poll() is not None:
                     server = start_server()
-                    restarts += 1
-                try:
-                    result = subprocess.run(
-                        [bins / "pgregress", "--dsn", f"postgres://127.0.0.1:{port}/regression"]
-                        + runner_args
-                        + [path],
-                        cwd=REPO_ROOT,
-                        env=env,
-                        timeout=60,
-                    )
-                    returncode = result.returncode
-                except subprocess.TimeoutExpired:
-                    print(f"{name} ... FAILED (runner timeout)")
-                    returncode = 3
-                if returncode == 0:
-                    if status == "fail":
-                        unexpected_passes.append(name)
-                    else:
-                        ok += 1
-                elif status == "fail":
-                    known_bad += 1
-                else:
-                    regressions.append(name)
+                    tally.restarts += 1
+                returncode = run_one(path)
+                tally.classify(name, status, returncode)
                 if returncode == 3:
-                    server.terminate()
-                    try:
-                        server.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        server.kill()
+                    stop(server)
                     server = start_server()
-                    restarts += 1
+                    tally.restarts += 1
         finally:
-            server.terminate()
-            try:
-                server.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                server.kill()
-
-        print(f"\n=== total: {ok} blessed ok, {known_bad} known-bad failure(s), "
-              f"{len(regressions)} regression(s), {len(unexpected_passes)} unexpected "
-              f"pass(es), {skipped} skipped, {restarts} server restart(s) ===")
-        for name in regressions:
-            print(f"REGRESSION: {name} is blessed \"pass\" but its output diverged")
-        for name in unexpected_passes:
-            print(f"XPASS: {name} now passes byte-exact; bless it by changing its "
-                  f"STATUS entry to \"pass\"")
-        return 1 if regressions or unexpected_passes else 0
+            stop(server)
+        return tally.report()
 
 
 if __name__ == "__main__":
