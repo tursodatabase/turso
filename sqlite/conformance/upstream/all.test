@@ -58,7 +58,7 @@ set test_files {
   joinB    fail
   joinC    fail
   joinD    fail
-  joinE    fail
+  joinE    pass
   joinF    fail
   joinH    fail
 

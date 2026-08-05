@@ -345,7 +345,16 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             });
         }
 
-        if !config.use_materialized_keys {
+        // Pre-filtering build rows with WHERE terms is a pure optimization: the
+        // same terms are still evaluated in the probe loop. It is safe for INNER
+        // and LEFT OUTER joins because the build side is never null-extended, so
+        // a build row rejected here can never appear in the output. For FULL
+        // OUTER joins it is wrong: a build row removed from the hash table makes
+        // the probe rows that matched it look unmatched, so they would be
+        // emitted as spurious null-extended rows.
+        let push_where_filters_to_build = !config.use_materialized_keys
+            && planner.hash_join_op.join_type != HashJoinType::FullOuter;
+        if push_where_filters_to_build {
             let build_only_mask: TableMask = [planner.hash_join_op.build_table_idx]
                 .into_iter()
                 .try_collect()?;
