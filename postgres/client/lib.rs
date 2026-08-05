@@ -327,6 +327,16 @@ impl PgConn {
         }
     }
 
+    /// Sends one CopyData frame during an active `COPY ... FROM STDIN`.
+    pub fn send_copy_data(&mut self, data: &[u8]) -> Result<()> {
+        self.write_message(b'd', data)
+    }
+
+    /// Sends CopyDone, ending an active `COPY ... FROM STDIN`.
+    pub fn send_copy_done(&mut self) -> Result<()> {
+        self.write_message(b'c', &[])
+    }
+
     fn write_message(&mut self, tag: u8, body: &[u8]) -> Result<()> {
         self.writer.write_all(&[tag])?;
         self.writer

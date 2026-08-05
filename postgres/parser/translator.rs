@@ -4691,26 +4691,26 @@ pub struct PgCopyFromStmt {
     pub null_string: Option<String>,
 }
 
-/// Try to extract a COPY FROM file statement from pg_query parse output.
-/// Returns None if the statement is not a COPY FROM with a filename.
-pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStmt> {
-    use pg_query::NodeRef;
+/// Represents a parsed `COPY ... TO STDOUT` statement. The source is either
+/// a relation (`table_name`) or a parenthesized query (`has_query`); the
+/// query text itself is recovered from the original SQL by the caller.
+pub struct PgCopyToStmt {
+    pub table_name: Option<String>,
+    pub schema_name: Option<String>,
+    pub columns: Option<Vec<String>>,
+    pub has_query: bool,
+    pub delimiter: Option<String>,
+    pub header: bool,
+    pub null_string: Option<String>,
+}
 
-    let nodes = parse_result.protobuf.nodes();
-    if nodes.is_empty() {
-        return None;
-    }
-    let NodeRef::CopyStmt(copy) = &nodes[0].0 else {
-        return None;
+/// Relation name, schema, and column list of a COPY statement.
+fn copy_relation_parts(
+    copy: &pg_query::protobuf::CopyStmt,
+) -> (Option<String>, Option<String>, Option<Vec<String>>) {
+    let Some(relation) = copy.relation.as_ref() else {
+        return (None, None, None);
     };
-
-    // Only handle COPY FROM with a file path (not STDIN, not COPY TO)
-    if !copy.is_from || copy.filename.is_empty() || copy.is_program {
-        return None;
-    }
-
-    let relation = copy.relation.as_ref()?;
-    let table_name = relation.relname.clone();
     let schema_name = if relation.schemaname.is_empty()
         || matches!(
             relation.schemaname.to_lowercase().as_str(),
@@ -4720,35 +4720,39 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
     } else {
         Some(relation.schemaname.clone())
     };
-
     let columns = if copy.attlist.is_empty() {
         None
     } else {
-        let cols: Vec<String> = copy
-            .attlist
-            .iter()
-            .filter_map(|n| match &n.node {
-                Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
-                _ => None,
-            })
-            .collect();
-        Some(cols)
+        Some(
+            copy.attlist
+                .iter()
+                .filter_map(|n| match &n.node {
+                    Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect(),
+        )
     };
+    (Some(relation.relname.clone()), schema_name, columns)
+}
 
+/// COPY options this frontend understands. Returns None for formats other
+/// than text, so callers reject rather than misparse binary or csv data.
+fn copy_options(
+    copy: &pg_query::protobuf::CopyStmt,
+) -> Option<(Option<String>, bool, Option<String>)> {
     let mut delimiter = None;
     let mut header = false;
     let mut null_string = None;
-
     for opt in &copy.options {
         let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
             continue;
         };
         match def.defname.as_str() {
             "format" => {
-                // Only support text format for now
                 if let Some(val) = def_elem_string_val(def) {
                     if val.to_lowercase() != "text" {
-                        return None; // unsupported format
+                        return None;
                     }
                 }
             }
@@ -4758,12 +4762,82 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
             _ => {}
         }
     }
+    Some((delimiter, header, null_string))
+}
 
+fn copy_stmt_node(parse_result: &ParseResult) -> Option<&pg_query::protobuf::CopyStmt> {
+    use pg_query::NodeRef;
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    match &nodes[0].0 {
+        NodeRef::CopyStmt(copy) => Some(copy),
+        _ => None,
+    }
+}
+
+/// Try to extract a COPY FROM file statement from pg_query parse output.
+/// Returns None if the statement is not a COPY FROM with a filename.
+pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStmt> {
+    let copy = copy_stmt_node(parse_result)?;
+
+    // Only handle COPY FROM with a file path (not STDIN, not COPY TO)
+    if !copy.is_from || copy.filename.is_empty() || copy.is_program {
+        return None;
+    }
+
+    let (table_name, schema_name, columns) = copy_relation_parts(copy);
+    let (delimiter, header, null_string) = copy_options(copy)?;
     Some(PgCopyFromStmt {
-        table_name,
+        table_name: table_name?,
         schema_name,
         columns,
         filename: copy.filename.clone(),
+        delimiter,
+        header,
+        null_string,
+    })
+}
+
+/// Try to extract a `COPY ... FROM STDIN` statement: the data arrives over
+/// the wire protocol instead of from a server-side file. The descriptor
+/// reuses [`PgCopyFromStmt`] with an empty filename.
+pub fn try_extract_copy_stdin(parse_result: &ParseResult) -> Option<PgCopyFromStmt> {
+    let copy = copy_stmt_node(parse_result)?;
+    if !copy.is_from || !copy.filename.is_empty() || copy.is_program {
+        return None;
+    }
+    let (table_name, schema_name, columns) = copy_relation_parts(copy);
+    let (delimiter, header, null_string) = copy_options(copy)?;
+    Some(PgCopyFromStmt {
+        table_name: table_name?,
+        schema_name,
+        columns,
+        filename: String::new(),
+        delimiter,
+        header,
+        null_string,
+    })
+}
+
+/// Try to extract a `COPY ... TO STDOUT` statement.
+pub fn try_extract_copy_to_stdout(parse_result: &ParseResult) -> Option<PgCopyToStmt> {
+    let copy = copy_stmt_node(parse_result)?;
+    if copy.is_from || !copy.filename.is_empty() || copy.is_program {
+        return None;
+    }
+    let has_query = copy.query.is_some();
+    let (table_name, schema_name, columns) = copy_relation_parts(copy);
+    if !has_query && table_name.is_none() {
+        return None;
+    }
+    let (delimiter, header, null_string) = copy_options(copy)?;
+    Some(PgCopyToStmt {
+        table_name,
+        schema_name,
+        columns,
+        has_query,
         delimiter,
         header,
         null_string,

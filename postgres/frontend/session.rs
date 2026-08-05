@@ -7,9 +7,10 @@ use crate::catalog::{self, PostgresDialect};
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_create_schema,
-    try_extract_drop_schema, try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PgSetKind, PgSetStmt, PgSetValue, PostgreSQLTranslator,
+    is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_copy_stdin,
+    try_extract_copy_to_stdout, try_extract_create_schema, try_extract_drop_schema,
+    try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
+    PgSetKind, PgSetStmt, PgSetValue, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -196,6 +197,132 @@ impl PgConnection {
     pub fn query_runner<'a>(&'a self, sql: &'a [u8]) -> PgQueryRunner<'a> {
         PgQueryRunner::new(&self.inner, sql)
     }
+
+    /// Returns the COPY descriptor when `sql` is a `COPY ... FROM STDIN`
+    /// statement, whose data arrives over the wire protocol.
+    pub fn parse_copy_stdin(&self, sql: &str) -> Option<PgCopyFromStmt> {
+        let parse_result = turso_pg_parser::parse(sql).ok()?;
+        try_extract_copy_stdin(&parse_result)
+    }
+
+    /// Inserts the accumulated wire data of a `COPY ... FROM STDIN`. A
+    /// trailing `\.` end-of-data marker is accepted and ignored.
+    pub fn copy_stdin_finish(&self, stmt: &PgCopyFromStmt, data: &str) -> Result<usize> {
+        let data = data
+            .strip_suffix("\\.\n")
+            .or_else(|| data.strip_suffix("\\."))
+            .unwrap_or(data);
+        copy_rows_into(&self.inner.conn, stmt, data)
+    }
+
+    /// Runs a `COPY ... TO STDOUT` statement, returning the formatted text
+    /// rows to stream to the client, or None when `sql` is not one.
+    pub fn copy_to_stdout(&self, sql: &str) -> Result<Option<Vec<String>>> {
+        let Ok(parse_result) = turso_pg_parser::parse(sql) else {
+            return Ok(None);
+        };
+        let Some(stmt) = try_extract_copy_to_stdout(&parse_result) else {
+            return Ok(None);
+        };
+
+        let select = if stmt.has_query {
+            copy_query_text(sql).ok_or_else(|| {
+                LimboError::ParseError("COPY: cannot extract query text".to_string())
+            })?
+        } else {
+            let table = stmt
+                .table_name
+                .as_ref()
+                .expect("relation-form COPY always has a table");
+            let qualified = match &stmt.schema_name {
+                Some(schema) => format!("\"{schema}\".\"{table}\""),
+                None => format!("\"{table}\""),
+            };
+            let cols = match &stmt.columns {
+                Some(cols) => cols
+                    .iter()
+                    .map(|c| format!("\"{c}\""))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                None => "*".to_string(),
+            };
+            format!("SELECT {cols} FROM {qualified}")
+        };
+
+        let delimiter = stmt
+            .delimiter
+            .as_ref()
+            .and_then(|d| d.chars().next())
+            .unwrap_or('\t');
+        let null_string = stmt.null_string.as_deref().unwrap_or("\\N");
+
+        let mut rows = prepare_statement(&self.inner, &select)?;
+        let mut lines = Vec::new();
+        loop {
+            match rows.step()? {
+                turso_core::StepResult::Row => {
+                    let row = rows.row().ok_or_else(|| {
+                        LimboError::InternalError("row expected after StepResult::Row".to_string())
+                    })?;
+                    let fields: Vec<String> = row
+                        .get_values()
+                        .map(|value| match value {
+                            Value::Null => null_string.to_string(),
+                            other => escape_copy_field(&other.to_string()),
+                        })
+                        .collect();
+                    lines.push(fields.join(&delimiter.to_string()));
+                }
+                turso_core::StepResult::Done => break,
+                // The driver may yield IO mid-program; keep stepping.
+                turso_core::StepResult::IO => continue,
+                other => {
+                    return Err(LimboError::InternalError(format!(
+                        "unexpected step result during COPY: {other:?}"
+                    )))
+                }
+            }
+        }
+        Ok(Some(lines))
+    }
+}
+
+/// Extracts the parenthesized query text of a `COPY (query) TO STDOUT`,
+/// scanning for the matching close paren outside string literals.
+fn copy_query_text(sql: &str) -> Option<String> {
+    let start = sql.find('(')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    for (i, c) in sql[start..].char_indices() {
+        match c {
+            '\'' => in_string = !in_string,
+            '(' if !in_string => depth += 1,
+            ')' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(sql[start + 1..start + i].trim().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Escapes one field for PostgreSQL's COPY text format: backslash, tab,
+/// newline, and carriage return must not read back as delimiters.
+fn escape_copy_field(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    for c in field.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 pub struct PgQueryRunner<'a> {
@@ -591,7 +718,12 @@ fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<
     let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
         LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e))
     })?;
+    copy_rows_into(conn, stmt, &data)
+}
 
+/// Parses COPY text data and inserts the rows — the shared tail of the
+/// file-based and wire-protocol (STDIN) COPY FROM paths.
+fn copy_rows_into(conn: &Arc<Connection>, stmt: &PgCopyFromStmt, data: &str) -> Result<usize> {
     let table_name = match &stmt.schema_name {
         Some(schema) => format!("\"{schema}\".\"{}\"", stmt.table_name),
         None => format!("\"{}\"", stmt.table_name),

@@ -9,7 +9,16 @@ use futures::stream;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::Value;
-use turso_pg::{auto_attach_schemas, pg_error, split_statements, LimboError, PgConnection};
+use turso_pg::{
+    auto_attach_schemas, pg_error, split_statements, LimboError, PgConnection, PgCopyFromStmt,
+};
+
+use futures::sink::{Sink, SinkExt};
+use pgwire::api::copy::CopyHandler;
+use pgwire::api::results::CopyResponse;
+use pgwire::messages::copy::{CopyData, CopyDone};
+use pgwire::messages::PgWireBackendMessage;
+use std::fmt::Debug;
 
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::portal::{Format, Portal};
@@ -64,6 +73,7 @@ impl TursoPgServer {
                 conn: Arc::new(Mutex::new(conn)),
                 db_file: self.db_file.clone(),
                 query_parser: Arc::new(NoopQueryParser::new()),
+                copy_in: Mutex::new(None),
             }),
         })
     }
@@ -119,6 +129,10 @@ struct TursoPgHandler {
     conn: Arc<Mutex<PgConnection>>,
     db_file: String,
     query_parser: Arc<NoopQueryParser>,
+    /// An in-progress `COPY ... FROM STDIN`: the parsed statement and the
+    /// wire data accumulated so far. One per session; PostgreSQL allows
+    /// only one COPY at a time on a connection.
+    copy_in: Mutex<Option<(PgCopyFromStmt, Vec<u8>)>>,
 }
 
 impl TursoPgHandler {
@@ -183,13 +197,73 @@ impl PgWireServerHandlers for TursoPgFactory {
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
         Arc::new(NoopHandler)
     }
+
+    fn copy_handler(&self) -> Arc<impl CopyHandler> {
+        self.handler.clone()
+    }
+}
+
+#[async_trait]
+impl CopyHandler for TursoPgHandler {
+    async fn on_copy_data<C>(&self, _client: &mut C, copy_data: CopyData) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let mut copy_in = self.copy_in.lock().unwrap();
+        match copy_in.as_mut() {
+            Some((_, buffer)) => {
+                buffer.extend_from_slice(&copy_data.data);
+                Ok(())
+            }
+            None => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "08P01".to_owned(),
+                "COPY data received without an active COPY".to_owned(),
+            )))),
+        }
+    }
+
+    async fn on_copy_done<C>(&self, client: &mut C, _done: CopyDone) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let Some((stmt, buffer)) = self.copy_in.lock().unwrap().take() else {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "08P01".to_owned(),
+                "CopyDone received without an active COPY".to_owned(),
+            ))));
+        };
+        let data = String::from_utf8_lossy(&buffer);
+        let conn = self.conn.lock().unwrap().clone();
+        let rows = conn
+            .copy_stdin_finish(&stmt, &data)
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, ""))))?;
+        client
+            .send(PgWireBackendMessage::CommandComplete(
+                Tag::new("COPY").with_rows(rows).into(),
+            ))
+            .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl SimpleQueryHandler for TursoPgHandler {
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
-        C: ClientInfo + Unpin + Send + Sync,
+        C: ClientInfo
+            + pgwire::api::ClientPortalStore
+            + Sink<PgWireBackendMessage>
+            + Unpin
+            + Send
+            + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let conn = self.conn.lock().unwrap().clone();
 
@@ -200,6 +274,44 @@ impl SimpleQueryHandler for TursoPgHandler {
 
         let mut responses = Vec::new();
         for sql in &statements {
+            // COPY ... FROM STDIN: stash the descriptor and hand the
+            // sub-protocol to the CopyHandler. The framework sends
+            // CopyInResponse and routes the data messages there.
+            if let Some(copy_stmt) = conn.parse_copy_stdin(sql) {
+                *self.copy_in.lock().unwrap() = Some((copy_stmt, Vec::new()));
+                responses.push(Response::CopyIn(CopyResponse::new(0, 0, vec![])));
+                break;
+            }
+
+            // COPY ... TO STDOUT: stream the rows here — data frames must
+            // precede the CommandComplete the returned response produces.
+            match conn.copy_to_stdout(sql) {
+                Ok(None) => {}
+                Ok(Some(lines)) => {
+                    let rows = lines.len();
+                    client
+                        .send(PgWireBackendMessage::CopyOutResponse(
+                            pgwire::messages::copy::CopyOutResponse::new(0, 0, vec![]),
+                        ))
+                        .await?;
+                    for line in lines {
+                        let mut data = line.into_bytes();
+                        data.push(b'\n');
+                        client
+                            .send(PgWireBackendMessage::CopyData(CopyData::new(data.into())))
+                            .await?;
+                    }
+                    client
+                        .send(PgWireBackendMessage::CopyDone(CopyDone::new()))
+                        .await?;
+                    responses.push(Response::Execution(Tag::new("COPY").with_rows(rows)));
+                    continue;
+                }
+                Err(e) => {
+                    return Err(PgWireError::UserError(Box::new(error_info(&e, sql))));
+                }
+            }
+
             let mut stmt = conn
                 .prepare(sql)
                 .map_err(|e| PgWireError::UserError(Box::new(error_info(&e, sql))))?;
