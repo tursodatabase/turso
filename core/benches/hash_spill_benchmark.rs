@@ -314,18 +314,111 @@ fn bench_large_payload_spill(c: &mut Criterion) {
     group.finish();
 }
 
+/// Add DISTINCT values, then read back every value saved in spill parts.
+fn run_distinct_with_spill_parts(
+    hash_table: &mut HashTable,
+    rows: usize,
+    unique_values: usize,
+) -> usize {
+    let mut count = 0;
+    for row in 0..rows {
+        let key = turso_core::alloc::vec![Value::from_i64((row % unique_values) as i64)];
+        let key_refs = [key[0].as_ref()];
+        loop {
+            match hash_table
+                .insert_aggregate_distinct(&key, &key_refs, None)
+                .unwrap()
+            {
+                IOResult::Done(send_now) => {
+                    count += usize::from(send_now);
+                    break;
+                }
+                IOResult::IO(_) => continue,
+            }
+        }
+    }
+    loop {
+        match hash_table.next_saved_distinct_value(None).unwrap() {
+            IOResult::Done(Some(_)) => count += 1,
+            IOResult::Done(None) => break,
+            IOResult::IO(_) => continue,
+        }
+    }
+    count
+}
+
+/// Add COUNT(DISTINCT) values, then get the final count in one call.
+fn run_count_distinct_with_bitmap(
+    hash_table: &mut HashTable,
+    rows: usize,
+    unique_values: usize,
+) -> u64 {
+    for row in 0..rows {
+        let key = turso_core::alloc::vec![Value::from_i64((row % unique_values) as i64)];
+        let key_refs = [key[0].as_ref()];
+        loop {
+            match hash_table
+                .insert_count_distinct(&key, &key_refs, None)
+                .unwrap()
+            {
+                IOResult::Done(send_now) => {
+                    assert!(!send_now);
+                    break;
+                }
+                IOResult::IO(_) => continue,
+            }
+        }
+    }
+    loop {
+        match hash_table.count_saved_distinct_values(None).unwrap() {
+            IOResult::Done(count) => return count,
+            IOResult::IO(_) => continue,
+        }
+    }
+}
+
+/// Compare saved DISTINCT values with the COUNT(DISTINCT) integer bitmap.
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_aggregate_distinct(c: &mut Criterion) {
+    let rows = 100_000;
+    let unique_values = 20_000;
+    let mut group = c.benchmark_group("Aggregate DISTINCT");
+    group.throughput(Throughput::Elements(rows as u64));
+    group.bench_function("saved_values_100k_rows_20k_unique", |b| {
+        b.iter(|| {
+            let mut hash_table = create_hash_table(64 * 1024);
+            black_box(run_distinct_with_spill_parts(
+                &mut hash_table,
+                rows,
+                unique_values,
+            ))
+        });
+    });
+    group.bench_function("count_bitmap_100k_rows_20k_unique", |b| {
+        b.iter(|| {
+            let mut hash_table = create_hash_table(64 * 1024);
+            black_box(run_count_distinct_with_bitmap(
+                &mut hash_table,
+                rows,
+                unique_values,
+            ))
+        });
+    });
+    group.finish();
+}
+
 #[cfg(not(feature = "codspeed"))]
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_build_tight_budget, bench_build_relaxed_budget, bench_build_and_probe, bench_text_key_hashing, bench_large_payload_spill
+    targets = bench_build_tight_budget, bench_build_relaxed_budget, bench_build_and_probe, bench_text_key_hashing, bench_large_payload_spill, bench_aggregate_distinct
 }
 
 #[cfg(feature = "codspeed")]
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench_build_tight_budget, bench_build_relaxed_budget, bench_build_and_probe, bench_text_key_hashing, bench_large_payload_spill
+    targets = bench_build_tight_budget, bench_build_relaxed_budget, bench_build_and_probe, bench_text_key_hashing, bench_large_payload_spill, bench_aggregate_distinct
 }
 
 criterion_main!(benches);

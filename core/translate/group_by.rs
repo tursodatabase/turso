@@ -9,7 +9,9 @@ use super::{
 };
 use crate::function::AccumulatorFunc;
 use crate::translate::{
-    aggregation::{translate_aggregation_step, AggArgumentSource},
+    aggregation::{
+        emit_saved_distinct_aggregate_steps, translate_aggregation_step, AggArgumentSource,
+    },
     order_by::{custom_type_comparator, EmitOrderBy},
     plan::{Aggregate, NonFromClauseSubquery},
     subquery::emit_non_from_clause_subqueries_for_phase,
@@ -1033,6 +1035,18 @@ pub fn group_by_emit_row_phase<'a>(
 
     // Resolve the label for the start of the group by output row subroutine
     program.preassign_label_to_next_insn(labels.label_agg_final);
+    if plan.aggregates.iter().any(Aggregate::is_distinct) {
+        let agg_start_reg = t_ctx
+            .reg_agg_start
+            .expect("aggregate registers must be initialized");
+        emit_saved_distinct_aggregate_steps(
+            program,
+            &plan.table_references,
+            &plan.aggregates,
+            agg_start_reg,
+            &t_ctx.resolver,
+        )?;
+    }
     // Finalize aggregate values for output
     for (i, agg) in plan.aggregates.iter().enumerate() {
         let agg_start_reg = t_ctx

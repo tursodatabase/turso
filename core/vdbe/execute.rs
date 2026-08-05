@@ -16388,8 +16388,8 @@ pub fn op_hash_build(
 
     // Create hash table if it doesn't exist yet
     let temp_store = program.connection.get_temp_store();
-    // When temp_store=memory, disable the memory limit entirely to avoid spilling.
-    // Spilling to an in-memory file has serialization overhead - simpler to never spill.
+    // temp_store=memory asks us to keep the table in memory. Writing the same
+    // data to another memory file would only add work.
     let mem_budget = if matches!(temp_store, crate::TempStore::Memory) {
         usize::MAX
     } else {
@@ -16520,14 +16520,13 @@ pub fn op_hash_distinct(
         .get_mut(&data.hash_table_id)
         .expect("hash table exists");
 
-    // Stage the key values in a per-statement scratch Vec; try_clone_from
-    // reuses each slot's allocation across rows.
+    // Reuse one list for every row so text and blob space can also be reused.
     let key_values = &mut state.distinct_key_values;
     key_values.truncate(data.num_keys);
     for (i, dst) in key_values.iter_mut().enumerate() {
         dst.try_clone_from(state.registers[data.key_start_reg + i].get_value())?;
     }
-    // Clone new values
+    // Copy any values for which the list does not have a slot yet.
     if key_values.len() < data.num_keys {
         key_values.try_reserve(data.num_keys)?;
         for i in key_values.len()..data.num_keys {
@@ -16543,13 +16542,116 @@ pub fn op_hash_distinct(
 
     let mut key_refs: SmallVec<[ValueRef; 2]> = SmallVec::with_capacity(data.num_keys);
     key_refs.extend(key_values.iter().map(|v| v.as_ref()));
-    match hash_table.insert_distinct(key_values, &key_refs, Some(&mut state.metrics.hash_join))? {
+    let insert_result = if data.is_count {
+        turso_assert!(
+            data.save_after_spill,
+            "COUNT(DISTINCT) bitmap needs a final count"
+        );
+        hash_table.insert_count_distinct(
+            key_values,
+            &key_refs,
+            Some(&mut state.metrics.hash_join),
+        )?
+    } else if data.save_after_spill {
+        hash_table.insert_aggregate_distinct(
+            key_values,
+            &key_refs,
+            Some(&mut state.metrics.hash_join),
+        )?
+    } else {
+        hash_table.insert_distinct(key_values, &key_refs, Some(&mut state.metrics.hash_join))?
+    };
+    match insert_result {
         IOResult::Done(inserted) => {
             state.pc = if inserted {
                 state.pc + 1
             } else {
                 data.target_pc.as_offset_int()
             };
+            Ok(InsnFunctionStepResult::Step)
+        }
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+    }
+}
+
+/// Run `HashDistinctNext` and wait safely when the next spill read needs I/O.
+pub fn op_hash_distinct_next(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        HashDistinctNext {
+            hash_table_id,
+            dest_reg,
+            target_pc
+        },
+        insn
+    );
+    let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) else {
+        state.pc = target_pc.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    };
+
+    match hash_table.next_saved_distinct_value(Some(&mut state.metrics.hash_join))? {
+        IOResult::Done(Some(value)) => {
+            state.registers[*dest_reg].set_value(value);
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        IOResult::Done(None) => {
+            state.pc = target_pc.as_offset_int();
+            Ok(InsnFunctionStepResult::Step)
+        }
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+    }
+}
+
+/// Run `HashDistinctCount` and add all saved values to the count register.
+pub fn op_hash_distinct_count(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        HashDistinctCount {
+            hash_table_id,
+            acc_reg
+        },
+        insn
+    );
+    let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) else {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
+
+    match hash_table.count_saved_distinct_values(Some(&mut state.metrics.hash_join))? {
+        IOResult::Done(count) => {
+            if count != 0 {
+                if matches!(state.registers[*acc_reg], Register::Value(Value::Null)) {
+                    let mut payload = crate::alloc::vec![];
+                    init_agg_payload(&AggFunc::Count, &mut payload)?;
+                    state.registers[*acc_reg] = Register::Aggregate(AggContext::Builtin(payload));
+                }
+                let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
+                    return Err(LimboError::InternalError(
+                        "COUNT(DISTINCT) accumulator is not an aggregate".to_string(),
+                    ));
+                };
+                let payload = agg.payload_vec_mut();
+                let Value::Numeric(Numeric::Integer(old_count)) = &mut payload[0] else {
+                    return Err(LimboError::InternalError(
+                        "COUNT(DISTINCT) accumulator is not an integer".to_string(),
+                    ));
+                };
+                let count = i64::try_from(count).map_err(|_| LimboError::IntegerOverflow)?;
+                *old_count = old_count
+                    .checked_add(count)
+                    .ok_or(LimboError::IntegerOverflow)?;
+            }
+            state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
         IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
