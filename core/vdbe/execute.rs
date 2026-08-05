@@ -15324,6 +15324,26 @@ pub fn op_once(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Execute the [Insn::ResetOnce] instruction.
+///
+/// Forgets that any [Insn::Once] between this instruction and `region_end` has
+/// run, so a re-executed inlined trigger body re-evaluates its run-once blocks
+/// instead of reusing a value cached during an earlier firing.
+pub fn op_reset_once(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(ResetOnce { region_end }, insn);
+    assert!(region_end.is_offset());
+    let start = state.pc;
+    let end = region_end.as_offset_int();
+    state.once.retain(|pc| *pc <= start || *pc >= end);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_found(
     program: &Program,
     state: &mut ProgramState,

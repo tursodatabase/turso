@@ -1716,6 +1716,16 @@ pub enum Insn {
     Once {
         target_pc_when_reentered: BranchOffset,
     },
+    /// Forget that any [Insn::Once] between this instruction and `region_end`
+    /// has already run. Trigger bodies are inlined and re-executed once per
+    /// affected row, so their run-once blocks (uncorrelated subqueries,
+    /// hash/ephemeral builds) must re-run each firing instead of reusing a
+    /// value cached during an earlier firing. Emitted at the start of each
+    /// trigger firing, this restores the fresh once-state that SQLite gets from
+    /// a per-invocation trigger sub-program.
+    ResetOnce {
+        region_end: BranchOffset,
+    },
     /// Search for a record in the index cursor.
     /// If any entry for which the key is a prefix exists, jump to target_pc.
     /// Otherwise, continue to the next instruction.
@@ -2217,6 +2227,7 @@ impl InsnVariants {
             InsnVariants::SetCookie => execute::op_set_cookie,
             InsnVariants::OpenEphemeral | InsnVariants::OpenAutoindex => execute::op_open_ephemeral,
             InsnVariants::Once => execute::op_once,
+            InsnVariants::ResetOnce => execute::op_reset_once,
             InsnVariants::Found | InsnVariants::NotFound => execute::op_found,
             InsnVariants::Affinity => execute::op_affinity,
             InsnVariants::IdxDelete => execute::op_idx_delete,

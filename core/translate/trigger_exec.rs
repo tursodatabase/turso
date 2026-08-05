@@ -894,6 +894,19 @@ pub fn fire_trigger(
     let saved_register_collations = std::mem::take(&mut resolver.register_collations);
     populate_trigger_register_affinities(resolver, ctx);
     let result = (|| -> Result<()> {
+        // A trigger body is inlined and re-executed once per affected row. Any
+        // run-once block inside it (an uncorrelated subquery, a hash or
+        // ephemeral-index build) is guarded by Insn::Once, whose "already ran"
+        // state otherwise persists across firings and would reuse a value
+        // cached during an earlier firing. Clear that state at the start of
+        // each firing so every firing re-evaluates from the current table
+        // state, the same fresh start SQLite gets from a per-invocation trigger
+        // sub-program.
+        let firing_end = program.allocate_label();
+        program.emit_insn(Insn::ResetOnce {
+            region_end: firing_end,
+        });
+
         // Evaluate WHEN clause if present
         if let Some(mut when_expr) = trigger.when_clause.clone() {
             crate::stack::trace_stack!("when_clause");
@@ -960,6 +973,8 @@ pub fn fire_trigger(
             )?;
         }
 
+        // Marks the end of this firing's instruction range for ResetOnce above.
+        program.preassign_label_to_next_insn(firing_end);
         Ok(())
     })();
     resolver.register_affinities = saved_register_affinities;
