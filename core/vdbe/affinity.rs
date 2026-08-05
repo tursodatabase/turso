@@ -537,8 +537,17 @@ fn create_result_from_significand(
         }
     }
 
-    // For pure integers without exponent, try to return as integer
-    if !has_decimal && !has_exponent && exponent == 0 && significand <= i64::MAX as u64 {
+    // For pure integers without exponent, try to return as integer.
+    // The digits were accumulated as an unsigned magnitude, so the limit is
+    // sign-dependent: a negative number may reach |i64::MIN| == i64::MAX + 1.
+    // This mirrors sqlite3Atoi64, which compares against "9223372036854775807"
+    // for positives and "9223372036854775808" for negatives.
+    let magnitude_limit = if sign < 0 {
+        i64::MAX as u64 + 1
+    } else {
+        i64::MAX as u64
+    };
+    if !has_decimal && !has_exponent && exponent == 0 && significand <= magnitude_limit {
         let signed_val = (significand as i64).wrapping_mul(sign);
         return (parse_result, ParsedNumber::Integer(signed_val));
     }
