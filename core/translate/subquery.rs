@@ -737,17 +737,17 @@ fn get_subquery_parser<'a>(
                 // rows, which matches SQLite.
                 plan.order_by.clear();
                 plan.distinctness = crate::translate::plan::Distinctness::NonDistinct;
-                let saved_plan = Box::new(Plan::Select(plan.clone()));
-                optimize_select_plan(&mut plan, resolver)?;
                 let correlated = select_plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
+                if !correlated || origin.is_write_statement() {
+                    optimize_select_plan(&mut plan, resolver)?;
+                }
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
                     query_type: subquery_type,
                     state: SubqueryState::Unevaluated {
                         plan: Some(Box::new(Plan::Select(plan))),
                     },
-                    saved_plan: correlated.then_some(saved_plan),
                     correlated,
                     origin,
                     eval_phase: origin.phase_floor(),
@@ -812,8 +812,11 @@ fn get_subquery_parser<'a>(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
-                let mut saved_plan = plan.clone();
-                optimize_select_plan(&mut plan, resolver)?;
+                let correlated = select_plan_has_outer_scope_dependency(&plan);
+                handle_unsupported_correlation(correlated, position, allow_correlated)?;
+                if !correlated || origin.is_write_statement() {
+                    optimize_select_plan(&mut plan, resolver)?;
+                }
                 let reg_count = plan.result_columns.len();
                 let reg_start = program.alloc_registers(reg_count);
 
@@ -835,10 +838,6 @@ fn get_subquery_parser<'a>(
                     result_reg_start: reg_start,
                     num_regs: reg_count,
                 };
-                saved_plan.query_destination = QueryDestination::RowValueSubqueryResult {
-                    result_reg_start: reg_start,
-                    num_regs: reg_count,
-                };
 
                 // Only inject LIMIT 1 if there's no existing limit, or the existing limit is > 1,
                 // If LIMIT 0, subquery should return no rows (NULL).
@@ -855,7 +854,6 @@ fn get_subquery_parser<'a>(
                     plan.limit = Some(Box::new(ast::Expr::Literal(ast::Literal::Numeric(
                         "1".to_string(),
                     ))));
-                    saved_plan.limit.clone_from(&plan.limit);
                 }
 
                 let ast::Expr::SubqueryResult {
@@ -874,9 +872,6 @@ fn get_subquery_parser<'a>(
                 *result_reg_start = reg_start;
                 *num_regs = reg_count;
 
-                let correlated = select_plan_has_outer_scope_dependency(&plan);
-                handle_unsupported_correlation(correlated, position, allow_correlated)?;
-
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: *subquery_id,
                     query_type: SubqueryType::RowValue {
@@ -886,7 +881,6 @@ fn get_subquery_parser<'a>(
                     state: SubqueryState::Unevaluated {
                         plan: Some(Box::new(Plan::Select(plan))),
                     },
-                    saved_plan: correlated.then_some(Box::new(Plan::Select(saved_plan))),
                     correlated,
                     origin: effective_origin,
                     eval_phase: effective_origin.phase_floor(),
@@ -917,33 +911,25 @@ fn get_subquery_parser<'a>(
                     QueryDestination::Unset,
                     connection,
                 )?;
-                let mut saved_plan = plan.clone();
-                let mut plan = match plan {
-                    Plan::Select(mut select_plan) => {
-                        optimize_select_plan(&mut select_plan, resolver)?;
-                        Plan::Select(select_plan)
-                    }
-                    Plan::CompoundSelect {
-                        mut left,
-                        mut right_most,
-                        limit,
-                        offset,
-                        order_by,
-                    } => {
-                        optimize_select_plan(&mut right_most, resolver)?;
-                        for (select_plan, _) in left.iter_mut() {
+                let mut plan = plan;
+                let correlated = plan_has_outer_scope_dependency(&plan);
+                handle_unsupported_correlation(correlated, position, allow_correlated)?;
+                if !correlated || origin.is_write_statement() {
+                    match &mut plan {
+                        Plan::Select(select_plan) => {
                             optimize_select_plan(select_plan, resolver)?;
                         }
                         Plan::CompoundSelect {
-                            left,
-                            right_most,
-                            limit,
-                            offset,
-                            order_by,
+                            left, right_most, ..
+                        } => {
+                            optimize_select_plan(right_most, resolver)?;
+                            for (select_plan, _) in left.iter_mut() {
+                                optimize_select_plan(select_plan, resolver)?;
+                            }
                         }
+                        _ => unreachable!("prepare_select_plan cannot return Delete/Update"),
                     }
-                    _ => unreachable!("prepare_select_plan cannot return Delete/Update"),
-                };
+                }
                 let result_columns = plan.select_result_columns();
                 let table_references = plan.select_table_references();
                 // e.g. (x,y) IN (SELECT ...)
@@ -1023,9 +1009,6 @@ fn get_subquery_parser<'a>(
                     affinity_str: Some(in_affinity_str.clone()),
                     is_delete: false,
                 };
-                *saved_plan.select_query_destination_mut().unwrap() =
-                    plan.select_query_destination_mut().unwrap().clone();
-
                 *expr = ast::Expr::SubqueryResult {
                     subquery_id,
                     lhs: Some(lhs),
@@ -1036,9 +1019,6 @@ fn get_subquery_parser<'a>(
                     },
                 };
 
-                let correlated = plan_has_outer_scope_dependency(&plan);
-                handle_unsupported_correlation(correlated, position, allow_correlated)?;
-
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
                     query_type: SubqueryType::In {
@@ -1048,7 +1028,6 @@ fn get_subquery_parser<'a>(
                     state: SubqueryState::Unevaluated {
                         plan: Some(Box::new(plan)),
                     },
-                    saved_plan: correlated.then_some(Box::new(saved_plan)),
                     correlated,
                     origin,
                     eval_phase: origin.phase_floor(),

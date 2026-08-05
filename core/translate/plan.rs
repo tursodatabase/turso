@@ -354,6 +354,13 @@ impl SubqueryOrigin {
     pub fn is_post_write_returning(self) -> bool {
         matches!(self, SubqueryOrigin::DmlReturning)
     }
+
+    pub fn is_write_statement(self) -> bool {
+        matches!(
+            self,
+            SubqueryOrigin::DmlWhere | SubqueryOrigin::DmlSet | SubqueryOrigin::DmlReturning
+        )
+    }
 }
 
 /// One ORDER BY key of a compound SELECT:
@@ -3622,9 +3629,6 @@ pub struct NonFromClauseSubquery {
     pub internal_id: TableInternalId,
     pub query_type: SubqueryType,
     pub state: SubqueryState,
-    /// A copy saved before the optimizer changed the plan.
-    /// It is used when the subquery needs a new estimate for its number of calls.
-    pub(crate) saved_plan: Option<Box<Plan>>,
     pub correlated: bool,
     pub origin: SubqueryOrigin,
     pub eval_phase: SubqueryEvalPhase,

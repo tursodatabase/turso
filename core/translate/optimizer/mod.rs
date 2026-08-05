@@ -769,14 +769,6 @@ struct OptimizeTableAccessResult {
  */
 #[turso_macros::trace_stack]
 pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
-    // Transform MATCH expressions to fts_match() for FTS optimizer recognition
-    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    transform_match_to_fts_match(
-        &mut plan.where_clause,
-        resolver.schema(),
-        &plan.table_references,
-    )?;
-
     if !plan
         .non_from_clause_subqueries
         .iter()
@@ -785,6 +777,9 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
         return optimize_select_plan_form(plan, resolver);
     }
 
+    // TODO: Keep both forms in one optimizer run instead of copying the full
+    // plan. Query parts that do not change should be shared, and the join
+    // planner must compare choices with different table lists.
     let mut rewritten = plan.clone();
     if !unnest::rewrite_correlated_subqueries(&mut rewritten, resolver)? {
         return optimize_select_plan_form(plan, resolver);
@@ -813,6 +808,11 @@ fn optimize_select_plan_form(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
     let params: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
     plan.estimated_output_rows = None;
     plan.estimated_cost = None;
+
+    // A rewrite can move MATCH terms out of a subquery, so do this after the
+    // query form has been chosen.
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
 
     // EXISTS only needs one row. Add LIMIT 1 to subqueries left after the
     // rewrite. The rewrite must see the limit written by the user, if any.
@@ -843,6 +843,7 @@ fn optimize_select_plan_form(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
         plan.contains_constant_false_condition = true;
         plan.estimated_output_rows = Some(0.0);
         plan.estimated_cost = Some(0.0);
+        plan_correlated_subqueries(plan, resolver, &[])?;
         return Ok(());
     }
 
@@ -911,7 +912,7 @@ fn optimize_select_plan_form(plan: &mut SelectPlan, resolver: &Resolver) -> Resu
         plan.estimated_output_rows = Some(rows);
     }
 
-    replan_correlated_subqueries(plan, resolver, &subquery_calls)?;
+    plan_correlated_subqueries(plan, resolver, &subquery_calls)?;
 
     let table_cost = table_cost.or_else(|| {
         plan.table_references
@@ -1468,11 +1469,8 @@ fn optimize_subqueries(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()>
     Ok(())
 }
 
-/// Plan each correlated subquery again with its expected number of calls.
-///
-/// Start from the saved plan because the first pass may have removed terms that
-/// are now part of an index search.
-fn replan_correlated_subqueries(
+/// Plan each correlated subquery with its expected number of calls.
+fn plan_correlated_subqueries(
     plan: &mut SelectPlan,
     resolver: &Resolver,
     subquery_calls: &[(TableInternalId, f64)],
@@ -1492,22 +1490,6 @@ fn replan_correlated_subqueries(
         else {
             continue;
         };
-        if call_count <= 1.0 {
-            continue;
-        }
-        let Some(saved_plan) = &subquery.saved_plan else {
-            continue;
-        };
-        *inner_plan = saved_plan.clone();
-        if matches!(subquery.query_type, ast::SubqueryType::Exists { .. }) {
-            if let Plan::Select(inner_plan) = inner_plan.as_mut() {
-                if inner_plan.limit.is_none() {
-                    inner_plan.limit = Some(Box::new(Expr::Literal(ast::Literal::Numeric(
-                        "1".to_string(),
-                    ))));
-                }
-            }
-        }
         optimize_plan_for_calls(inner_plan, resolver, call_count)?;
     }
 
