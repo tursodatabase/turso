@@ -1,0 +1,63 @@
+@database :memory:
+
+# Aggregate functions are never allowed in WHERE. SQLite's error wording
+# depends on the query: an aggregate query (GROUP BY present, or aggregates
+# in the result set) reports "misuse of aggregate: f()", while a
+# non-aggregate query reports "misuse of aggregate function f()".
+
+# SQLite ticket #1514: aggregate in WHERE of a GROUP BY query.
+test where-agg-with-group-by {
+    CREATE TABLE t1(a int, b int);
+    SELECT a FROM t1 WHERE max(b)<10 GROUP BY a;
+}
+expect error {
+    misuse of aggregate: max()
+}
+
+# SQLite ticket #3508: WHERE references an alias of an aggregate result column.
+test where-aliased-agg {
+    CREATE TABLE t2(a int, b int);
+    SELECT b, count(a) AS c FROM t2 WHERE c > 1 GROUP BY b;
+}
+expect error {
+    misuse of aggregate: count()
+}
+
+# Aggregates in the result set make the query an aggregate query even
+# without GROUP BY.
+test where-agg-with-select-agg {
+    CREATE TABLE t3(a int, b int);
+    SELECT sum(a) FROM t3 WHERE max(b)>1;
+}
+expect error {
+    misuse of aggregate: max()
+}
+
+test where-count-star-with-group-by {
+    CREATE TABLE t4(a int, b int);
+    SELECT a, sum(b) FROM t4 WHERE count(*)>1 GROUP BY a;
+}
+expect error {
+    misuse of aggregate: count()
+}
+
+# In a non-aggregate query the wording is "misuse of aggregate function f()".
+test where-agg-non-aggregate-query {
+    CREATE TABLE t5(a int, b int);
+    SELECT a FROM t5 WHERE max(b)<10;
+}
+expect error {
+    misuse of aggregate function max()
+}
+
+# An aggregate inside a WHERE subquery is legal.
+test where-subquery-agg-ok {
+    CREATE TABLE t6(a int, b int);
+    CREATE TABLE t7(x int);
+    INSERT INTO t6 VALUES(1,2);
+    INSERT INTO t7 VALUES(1);
+    SELECT a, count(*) FROM t6 WHERE (SELECT max(x) FROM t7) >= 1 GROUP BY a;
+}
+expect {
+    1|1
+}

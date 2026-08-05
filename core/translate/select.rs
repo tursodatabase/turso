@@ -694,6 +694,17 @@ fn prepare_one_select_plan(
 
             plan.aggregates = aggregate_expressions;
 
+            // Aggregates are never allowed in WHERE. For an aggregate query
+            // (GROUP BY present, or aggregates in the result set) SQLite reports
+            // "misuse of aggregate: f()"; for a non-aggregate query it reports
+            // "misuse of aggregate function f()", which our generic expression
+            // translation already produces.
+            if plan.group_by.is_some() || !plan.aggregates.is_empty() {
+                for term in &plan.where_clause {
+                    check_where_clause_aggregate_misuse(&term.expr)?;
+                }
+            }
+
             // HAVING without GROUP BY requires aggregates in the SELECT
             if let Some(ref group_by) = plan.group_by {
                 if group_by.exprs.is_empty()
@@ -1825,6 +1836,39 @@ fn process_having_clause(
     }
 
     Ok(predicates)
+}
+
+/// Walk a WHERE-clause term looking for aggregate function calls. Aggregates are
+/// never legal in WHERE; the caller invokes this only for aggregate queries, where
+/// SQLite reports "misuse of aggregate: f()". Subqueries are not descended into
+/// (walk_expr skips them), because an aggregate inside a subquery is legal.
+fn check_where_clause_aggregate_misuse(expr: &ast::Expr) -> Result<()> {
+    use crate::translate::expr::{walk_expr, WalkControl};
+
+    walk_expr(expr, &mut |e| {
+        let (name, arg_count, filter_over) = match e {
+            Expr::FunctionCall {
+                name,
+                args,
+                filter_over,
+                ..
+            } => (name, args.len(), filter_over),
+            Expr::FunctionCallStar {
+                name, filter_over, ..
+            } => (name, 0, filter_over),
+            _ => return Ok(WalkControl::Continue),
+        };
+        if filter_over.over_clause.is_none()
+            && matches!(
+                crate::function::Func::resolve_function(name.as_str(), arg_count),
+                Ok(Some(crate::function::Func::Agg(_)))
+            )
+        {
+            crate::bail_parse_error!("misuse of aggregate: {}()", name.as_str());
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
 }
 
 /// Walk a HAVING expression looking for aggregate function calls whose arguments
