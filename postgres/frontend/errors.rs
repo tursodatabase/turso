@@ -100,6 +100,10 @@ fn parse_error(msg: &str, sql: &str) -> PgErrorInfo {
     if msg.contains("already exists") {
         return PgErrorInfo::new("42P07", format!("Parse error: {msg}"));
     }
+    // Messages already in PostgreSQL's own wording surface verbatim.
+    if msg.ends_with("is not implemented") {
+        return PgErrorInfo::new("0A000", msg.to_string());
+    }
     if msg.contains("not supported") || msg.contains("not yet supported") {
         return PgErrorInfo::new("0A000", format!("Parse error: {msg}"));
     }

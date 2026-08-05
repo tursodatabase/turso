@@ -27,3 +27,22 @@ test error-aborts-rest-of-batch {
     INSERT INTO t VALUES (2);
 }
 expect error {}
+
+# PostgreSQL rejects ORDER BY on a recursive query's UNION; accepting it
+# (SQLite semantics) turned this into an unbounded recursion that hung the
+# session forever.
+test error-recursive-cte-order-by {
+    WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x ORDER BY 1)
+      SELECT * FROM x;
+}
+expect error {
+    ^ORDER BY in a recursive query is not implemented$
+}
+
+test error-recursive-cte-limit {
+    WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x LIMIT 10)
+      SELECT * FROM x;
+}
+expect error {
+    ^LIMIT in a recursive query is not implemented$
+}

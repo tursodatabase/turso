@@ -3550,7 +3550,38 @@ impl PostgreSQLTranslator {
                 .as_ref()
                 .ok_or_else(|| ParseError::ParseError("CTE missing query body".into()))?;
             let select = match &cte_query.node {
-                Some(Node::SelectStmt(select_stmt)) => self.translate_select(select_stmt)?,
+                Some(Node::SelectStmt(select_stmt)) => {
+                    // PostgreSQL rejects these on a recursive query's UNION;
+                    // the engine would accept ORDER BY (SQLite semantics,
+                    // where it steers the recursion queue), turning queries
+                    // PostgreSQL refuses into unbounded recursions that hang
+                    // the session.
+                    if with_clause.recursive
+                        && select_stmt.op() != pg_query::protobuf::SetOperation::SetopNone
+                    {
+                        if !select_stmt.sort_clause.is_empty() {
+                            return Err(ParseError::ParseError(
+                                "ORDER BY in a recursive query is not implemented".into(),
+                            ));
+                        }
+                        if select_stmt.limit_count.is_some() {
+                            return Err(ParseError::ParseError(
+                                "LIMIT in a recursive query is not implemented".into(),
+                            ));
+                        }
+                        if select_stmt.limit_offset.is_some() {
+                            return Err(ParseError::ParseError(
+                                "OFFSET in a recursive query is not implemented".into(),
+                            ));
+                        }
+                        if !select_stmt.locking_clause.is_empty() {
+                            return Err(ParseError::ParseError(
+                                "FOR UPDATE/SHARE in a recursive query is not implemented".into(),
+                            ));
+                        }
+                    }
+                    self.translate_select(select_stmt)?
+                }
                 _ => {
                     return Err(ParseError::ParseError(
                         "CTE query is not a SELECT statement".into(),
