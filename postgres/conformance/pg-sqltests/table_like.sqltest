@@ -49,3 +49,11 @@ test like-if-not-exists {
 expect {
     0
 }
+
+test alter-column-type-keeps-constraints {
+    CREATE TABLE retype_t (c varchar(10) PRIMARY KEY);
+    ALTER TABLE retype_t ALTER c TYPE varchar(20);
+    INSERT INTO retype_t VALUES ('x');
+    INSERT INTO retype_t VALUES ('x');
+}
+expect error {}

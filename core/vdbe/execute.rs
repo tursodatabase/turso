@@ -10706,7 +10706,17 @@ pub fn op_function(
                                     };
 
                                     match alter_func {
-                                        AlterTableFunc::AlterColumn => *column = column_def.clone(),
+                                        AlterTableFunc::AlterColumn => {
+                                            if column_def.constraints.is_empty() {
+                                                // Bare retype (ALTER COLUMN c TYPE t): the
+                                                // constraints are not part of the change and
+                                                // must survive in the stored DDL too.
+                                                column.col_name = column_def.col_name.clone();
+                                                column.col_type = column_def.col_type.clone();
+                                            } else {
+                                                *column = column_def.clone();
+                                            }
+                                        }
                                         AlterTableFunc::RenameColumn => {
                                             column.col_name = column_def.col_name.clone()
                                         }

@@ -1843,8 +1843,14 @@ pub fn translate_alter_table(
             let (rewrites_physical_layout, replacement_column) = match rename {
                 true => (false, None),
                 false => {
-                    let replacement_column = Column::try_from(&definition)?;
+                    let mut replacement_column = Column::try_from(&definition)?;
                     let old_column = &btree.columns()[column_index];
+                    // A bare retype (ALTER COLUMN c TYPE t) sends a
+                    // definition with no constraints; they are not part of
+                    // the change and must survive.
+                    if definition.constraints.is_empty() {
+                        replacement_column.inherit_constraints_from(old_column);
+                    }
                     let becomes_generated =
                         !old_column.is_generated() && replacement_column.is_generated();
                     // Toggling the virtual-generated bit changes whether the column

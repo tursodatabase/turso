@@ -1893,11 +1893,21 @@ impl Schema {
 
             // In MVCC mode during recovery, not all automatic index schema rows might be visible yet
             // during incremental schema reparsing, so we may have extra entries
-            if !mvcc_enabled {
-                assert!(
-                    automatic_indexes.is_empty(),
-                    "all automatic indexes parsed from sqlite_schema should have been consumed, but {} remain",
-                    automatic_indexes.len()
+            if !mvcc_enabled && !automatic_indexes.is_empty() {
+                // Databases written before ALTER COLUMN TYPE preserved
+                // constraints can hold automatic-index rows whose constraint
+                // no longer exists in the table's DDL. The index btree is
+                // unused but harmless; refusing to open the database would
+                // punish the reader for the old writer's bug.
+                tracing::warn!(
+                    "ignoring {} automatic index entr{} in sqlite_schema with no matching \
+                     constraint (written by an older version?)",
+                    automatic_indexes.len(),
+                    if automatic_indexes.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
                 );
             }
         }
@@ -5199,6 +5209,25 @@ const ARRAY_DIM_SHIFT: u32 = BASE_AFF_SHIFT + 3;
 const ARRAY_DIM_MASK: u32 = 0b111 << ARRAY_DIM_SHIFT;
 
 impl Column {
+    /// Carries constraint state from `old` onto a rebuilt column whose
+    /// definition specified only a new type: ALTER COLUMN ... TYPE keeps
+    /// PRIMARY KEY, UNIQUE, NOT NULL, and DEFAULT (dropping them also
+    /// orphaned the constraints' automatic indexes in the stored schema).
+    /// The rowid-alias bit additionally requires the INTEGER type, which
+    /// the retype may have changed, so it is recomputed.
+    pub fn inherit_constraints_from(&mut self, old: &Column) {
+        const CONSTRAINT_MASK: u32 = F_PRIMARY_KEY | F_NOTNULL | F_UNIQUE | F_HIDDEN;
+        self.raw = (self.raw & !(CONSTRAINT_MASK | F_ROWID_ALIAS)) | (old.raw & CONSTRAINT_MASK);
+        self.explicit_notnull = old.explicit_notnull;
+        self.notnull_conflict_clause = old.notnull_conflict_clause;
+        if self.default.is_none() {
+            self.default = old.default.clone();
+        }
+        if old.is_rowid_alias() && self.ty_str.eq_ignore_ascii_case("INTEGER") {
+            self.raw |= F_ROWID_ALIAS;
+        }
+    }
+
     pub fn affinity(&self) -> Affinity {
         let v = ((self.raw & BASE_AFF_MASK) >> BASE_AFF_SHIFT) as u8;
         if v > 0 {

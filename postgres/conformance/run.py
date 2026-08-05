@@ -16,7 +16,7 @@ what already works and notices when a known-bad test starts passing:
            fail the run. If it becomes byte-exact the run fails with a
            request to bless it, so the known-bad list only ever shrinks.
     skip - not run at all; reserved for tests that cannot run, with the
-           reason noted. (Currently none.)
+           reason noted.
 
 To bless a test after fixing its remaining diffs, change its status from
 "fail" to "pass" in STATUS. Exit code: 0 when every test matched its
@@ -159,9 +159,9 @@ STATUS = {
     "truncate": "fail",
     "alter_table": (
         "skip",
-        "all statements now survive, but reopening the written database "
-        "panics (core/schema.rs:1897, unconsumed automatic index); "
-        "re-enable when fixed",
+        "wedges against corpus fixture data (standalone it completes in "
+        "seconds), and the timeout kill can leave the database unopenable; "
+        "same hang class as arrays/subselect",
     ),
     "sequence": "fail",
     "rowtypes": "fail",
